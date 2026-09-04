@@ -8,6 +8,9 @@ from urllib.parse import parse_qs
 # ===== CONFIG =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_ANON_KEY")
+PANEL_USER = os.environ.get("PANEL_USER", "admin")
+PANEL_PASS = os.environ.get("PANEL_PASS", "admin")
+PANEL_SECRET = os.environ.get("PANEL_SECRET", hashlib.sha256(os.urandom(32)).hexdigest())
 # ==================
 
 _sb = None
@@ -35,6 +38,29 @@ async def sb_query(fn):
     """Run blocking Supabase call in thread — prevents event loop freeze."""
     return await asyncio.to_thread(fn)
 
+# ===== PANEL =====
+_panel_html = None
+def serve_panel():
+    global _panel_html
+    if _panel_html is None:
+        p = os.path.join(os.path.dirname(__file__) or ".", "panel.html")
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                _panel_html = f.read()
+        except:
+            _panel_html = "<h1>panel.html not found</h1>"
+    return _panel_html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+_panel_tokens = set()
+
+def make_panel_token():
+    t = hashlib.sha256(os.urandom(32)).hexdigest()
+    _panel_tokens.add(t)
+    return t
+
+def check_panel_token(t):
+    return t in _panel_tokens
+
 # ===== HANDLER =====
 
 async def handle(method, path, body, qs):
@@ -50,7 +76,7 @@ async def handle(method, path, body, qs):
 
     # --- Fast routes (no DB) ---
     if method == "GET" and path == "/":
-        return ok({"status": "running"})
+        return serve_panel()
     if method == "GET" and path == "/api/ping":
         return ok({"pong": True, "time": now_iso()})
     if method == "GET" and path == "/api/stats":
@@ -240,6 +266,51 @@ async def handle(method, path, body, qs):
         res = await sb_query(lambda: sb.table("users").select("id,username").ilike("username", f"%{q}%").limit(20).execute())
         return ok(res.data or [])
 
+    # --- Panel Auth ---
+    if path == "/api/panel/login" and method == "POST":
+        u = data.get("username", "")
+        p = data.get("password", "")
+        if u == PANEL_USER and p == PANEL_PASS:
+            return ok({"token": make_panel_token()})
+        return er("Invalid credentials", 401)
+
+    if path == "/api/panel/verify" and method == "GET":
+        t = qs.get("token", [""])[0]
+        return ok({"valid": check_panel_token(t)})
+
+    # --- Admin delete user ---
+    m_pan_u = re.match(r"^/api/panel/users/([^/]+)$", path)
+    if m_pan_u and method == "DELETE":
+        t = data.get("token") or qs.get("token", [""])[0]
+        # Also check header
+        if not t: t = qs.get("token", [""])[0]
+        if not check_panel_token(t): return er("Unauthorized", 401)
+        uid_del = m_pan_u.group(1)
+        await sb_query(lambda: sb.table("messages").delete().eq("user_id", uid_del).execute())
+        await sb_query(lambda: sb.table("channel_members").delete().eq("user_id", uid_del).execute())
+        await sb_query(lambda: sb.table("users").delete().eq("id", uid_del).execute())
+        return ok({"deleted": uid_del})
+
+    # --- Admin delete channel ---
+    m_pan_ch = re.match(r"^/api/panel/channels/([^/]+)$", path)
+    if m_pan_ch and method == "DELETE":
+        t = qs.get("token", [""])[0]
+        if not check_panel_token(t): return er("Unauthorized", 401)
+        cid_del = m_pan_ch.group(1)
+        await sb_query(lambda: sb.table("messages").delete().eq("channel_id", cid_del).execute())
+        await sb_query(lambda: sb.table("channel_members").delete().eq("channel_id", cid_del).execute())
+        await sb_query(lambda: sb.table("channels").delete().eq("id", cid_del).execute())
+        return ok({"deleted": cid_del})
+
+    # --- Admin delete message ---
+    m_pan_msg = re.match(r"^/api/panel/messages/([^/]+)$", path)
+    if m_pan_msg and method == "DELETE":
+        t = qs.get("token", [""])[0]
+        if not check_panel_token(t): return er("Unauthorized", 401)
+        mid_del = m_pan_msg.group(1)
+        await sb_query(lambda: sb.table("messages").delete().eq("id", mid_del).execute())
+        return ok({"deleted": mid_del})
+
     # All users
     if path == "/api/users" and method == "GET":
         res = await sb_query(lambda: sb.table("users").select("id,username").order("username").execute())
@@ -304,6 +375,13 @@ async def app(scope, receive, send):
     except Exception as ex:
         resp, status = json.dumps({"ok": False, "error": str(ex)}), 500
         _stats["errors"] += 1
+    # Handle tuples with headers (for panel HTML)
+    extra_headers = []
+    if isinstance(resp, tuple):
+        resp, status, hdrs = resp
+        if isinstance(hdrs, dict):
+            for k, v in hdrs.items():
+                extra_headers.append([k.encode(), v.encode()])
     ms = round((_time.time() - t0) * 1000, 1)
     _stats["requests"] += 1
     _stats["total_ms"] += ms
@@ -311,7 +389,10 @@ async def app(scope, receive, send):
     if len(_stats["last_times"]) > 300: _stats["last_times"] = _stats["last_times"][-300:]
     if isinstance(resp, str):
         resp = resp.encode("utf-8")
-    await send({"type": "http.response.start", "status": status, "headers": HEADERS})
+    all_headers = [[b"access-control-allow-origin", b"*"]] + extra_headers
+    if not extra_headers:
+        all_headers = HEADERS
+    await send({"type": "http.response.start", "status": status, "headers": all_headers})
     await send({"type": "http.response.body", "body": resp})
 
 application = app
