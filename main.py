@@ -240,6 +240,33 @@ async def handle(method, path, body, qs):
         res = await sb_query(lambda: sb.table("users").select("id,username").ilike("username", f"%{q}%").limit(20).execute())
         return ok(res.data or [])
 
+    # All users
+    if path == "/api/users" and method == "GET":
+        res = await sb_query(lambda: sb.table("users").select("id,username").order("username").execute())
+        return ok(res.data or [])
+
+    # Edit profile
+    m3 = re.match(r"^/api/users/([^/]+)$", path)
+    if m3 and method == "PATCH":
+        uid_target = m3.group(1)
+        u = gk("user_id")
+        if not u: return er("user_id required", 401)
+        if u != uid_target: return er("Cannot edit other users", 403)
+        new_name = (data.get("username") or "").strip()
+        new_pass = (data.get("password") or "").strip()
+        updates = {}
+        if new_name:
+            if len(new_name) < 2 or len(new_name) > 30: return er("Username: 2-30 chars")
+            ex = await sb_query(lambda: sb.table("users").select("id").eq("username", new_name).execute())
+            if ex.data and ex.data[0]["id"] != u: return er("Username taken")
+            updates["username"] = new_name
+        if new_pass:
+            if len(new_pass) < 4: return er("Password: min 4 chars")
+            updates["password_hash"] = hp(new_pass)
+        if not updates: return er("Nothing to update")
+        await sb_query(lambda: sb.table("users").update(updates).eq("id", u).execute())
+        return ok({"updated": True, "username": updates.get("username")})
+
     return er("Not found", 404)
 
 
@@ -248,7 +275,7 @@ async def handle(method, path, body, qs):
 HEADERS = [
     [b"content-type", b"application/json"],
     [b"access-control-allow-origin", b"*"],
-    [b"access-control-allow-methods", b"GET,POST,OPTIONS"],
+    [b"access-control-allow-methods", b"GET,POST,PATCH,DELETE,OPTIONS"],
     [b"access-control-allow-headers", b"content-type"],
 ]
 
