@@ -24,8 +24,12 @@ async def get_sb():
 
 def hp(p): return hashlib.sha256(p.encode()).hexdigest()
 def now_iso(): return datetime.now(timezone.utc).isoformat()
-def ok(d=None): return json.dumps({"ok": True, "data": d}), 200
-def er(m, c=400): return json.dumps({"ok": False, "error": m}), c
+def ok(d=None): return json.dumps({"ok": True, "data": d}, ensure_ascii=False), 200
+def er(m, c=400): return json.dumps({"ok": False, "error": m}, ensure_ascii=False), c
+
+# ===== STATS =====
+import time as _time
+_stats = {"start": _time.time(), "requests": 0, "errors": 0, "total_ms": 0, "last_times": []}
 
 async def sb_query(fn):
     """Run blocking Supabase call in thread — prevents event loop freeze."""
@@ -49,6 +53,12 @@ async def handle(method, path, body, qs):
         return ok({"status": "running"})
     if method == "GET" and path == "/api/ping":
         return ok({"pong": True, "time": now_iso()})
+    if method == "GET" and path == "/api/stats":
+        uptime = int(_time.time() - _stats["start"])
+        avg = (_stats["total_ms"] / _stats["requests"]) if _stats["requests"] else 0
+        return ok({"uptime_seconds": uptime, "requests": _stats["requests"],
+                    "errors": _stats["errors"], "avg_response_ms": round(avg, 1),
+                    "last_times": _stats["last_times"][-60:]})
 
     # --- Auth ---
     if method == "POST" and path == "/api/register":
@@ -256,14 +266,22 @@ async def app(scope, receive, send):
         if not msg.get("more_body", False):
             break
     qs = parse_qs(scope.get("query_string", b"").decode())
+    t0 = _time.time()
     try:
         resp, status = await asyncio.wait_for(
             handle(scope["method"], scope["path"], body, qs), timeout=30
         )
     except asyncio.TimeoutError:
         resp, status = json.dumps({"ok": False, "error": "timeout"}), 504
+        _stats["errors"] += 1
     except Exception as ex:
         resp, status = json.dumps({"ok": False, "error": str(ex)}), 500
+        _stats["errors"] += 1
+    ms = round((_time.time() - t0) * 1000, 1)
+    _stats["requests"] += 1
+    _stats["total_ms"] += ms
+    _stats["last_times"].append(ms)
+    if len(_stats["last_times"]) > 300: _stats["last_times"] = _stats["last_times"][-300:]
     if isinstance(resp, str):
         resp = resp.encode("utf-8")
     await send({"type": "http.response.start", "status": status, "headers": HEADERS})
