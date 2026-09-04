@@ -4,4 +4,5 @@ websockets
 supabase
 flask
 asgiref
+flask-cors
 
