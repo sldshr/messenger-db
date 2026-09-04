@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from asgiref.wsgi import AsgiHandler
 
 # ===== CONFIG =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
@@ -199,10 +198,14 @@ def health():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  MESSENGER SERVER")
+    print("  MESSENGER SERVER (Flask)")
     print("=" * 50)
     print(f"  Supabase URL: {SUPABASE_URL}")
     print(f"  Supabase Key: {SUPABASE_KEY[:20]}...")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=True)
-asgi_app = AsgiHandler(app)
+
+# Uvicorn / ASGI entry point
+# Запуск: uvicorn server:application --host 0.0.0.0 --port 5000
+from asgiref.wsgi import WsgiToAsgi
+application = WsgiToAsgi(app)
