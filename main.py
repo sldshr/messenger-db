@@ -89,6 +89,7 @@ async def handle(method, path, body, qs):
         for ch in chs:
             res.append({"id": ch["id"], "name": ch["name"], "description": ch.get("description",""),
                          "created_by": ch.get("created_by"), "created_at": ch.get("created_at"),
+                         "channel_type": ch.get("channel_type", "user"),
                          "member_count": counts.get(ch["id"], 0), "is_member": ch["id"] in my_ids})
         return ok(res)
 
@@ -97,8 +98,9 @@ async def handle(method, path, body, qs):
         if not u: return er("user_id required", 401)
         name = (data.get("name") or "").strip()
         desc = (data.get("description") or "").strip()
+        ctype = data.get("channel_type", "user")
         if not name: return er("Channel name required")
-        res = await sb_query(lambda: sb.table("channels").insert({"name": name, "description": desc, "created_by": u}).execute())
+        res = await sb_query(lambda: sb.table("channels").insert({"name": name, "description": desc, "created_by": u, "channel_type": ctype}).execute())
         if res.data:
             ch = res.data[0]
             await sb_query(lambda: sb.table("channel_members").insert({"channel_id": ch["id"], "user_id": u, "role": "admin"}).execute())
@@ -156,24 +158,70 @@ async def handle(method, path, body, qs):
                 users_r = await sb_query(_get_users)
                 for usr in (users_r.data or []):
                     uc[usr["id"]] = usr["username"]
-            result = [{"id": mm["id"], "user_id": mm["user_id"],
+            # Batch-fetch reply_to messages
+            reply_ids = [mm["reply_to"] for mm in msgs if mm.get("reply_to")]
+            rc = {}
+            if reply_ids:
+                def _get_replies():
+                    return sb.table("messages").select("id,content,user_id").in_("id", reply_ids).execute()
+                reps_r = await sb_query(_get_replies)
+                for rep in (reps_r.data or []):
+                    rc[rep["id"]] = {"content": rep["content"][:100], "username": uc.get(rep.get("user_id",""), "?")}
+            result = []
+            for mm in msgs:
+                item = {"id": mm["id"], "user_id": mm["user_id"],
                         "username": uc.get(mm["user_id"], "?"),
-                        "content": mm["content"], "created_at": mm["created_at"]} for mm in msgs]
+                        "content": mm["content"], "created_at": mm["created_at"],
+                        "edited": bool(mm.get("edited", False)),
+                        "reply_to": mm.get("reply_to")}
+                if mm.get("reply_to") and mm["reply_to"] in rc:
+                    item["reply_to_content"] = rc[mm["reply_to"]]["content"]
+                    item["reply_to_user"] = rc[mm["reply_to"]]["username"]
+                result.append(item)
             return ok(result)
 
         if method == "POST" and action == "messages":
             u = gk("user_id")
             if not u: return er("user_id required", 401)
             content = (data.get("content") or "").strip()
+            reply_to = data.get("reply_to")
             if not content: return er("Content required")
             if len(content) > 5000: return er("Too long")
             member = await sb_query(lambda: sb.table("channel_members").select("channel_id").eq("channel_id", cid).eq("user_id", u).execute())
             if not member.data: return er("Not a member", 403)
-            res = await sb_query(lambda: sb.table("messages").insert({"channel_id": cid, "user_id": u, "content": content}).execute())
+            msg_data = {"channel_id": cid, "user_id": u, "content": content}
+            if reply_to: msg_data["reply_to"] = reply_to
+            res = await sb_query(lambda: sb.table("messages").insert(msg_data).execute())
             if res.data:
                 mm = res.data[0]
                 return ok({"id": mm["id"], "created_at": mm["created_at"]})
             return er("Failed", 500)
+
+    # --- Message edit/delete: PATCH/DELETE /api/channels/{cid}/messages/{mid} ---
+    m2 = re.match(r"^/api/channels/([^/]+)/messages/([^/]+)$", path)
+    if m2:
+        cid, mid = m2.group(1), m2.group(2)
+
+        if method == "PATCH":
+            u = gk("user_id")
+            if not u: return er("user_id required", 401)
+            content = (data.get("content") or "").strip()
+            if not content: return er("Content required")
+            if len(content) > 5000: return er("Too long")
+            msg_r = await sb_query(lambda: sb.table("messages").select("id,user_id").eq("id", mid).execute())
+            if not msg_r.data: return er("Message not found", 404)
+            if msg_r.data[0]["user_id"] != u: return er("Not your message", 403)
+            await sb_query(lambda: sb.table("messages").update({"content": content, "edited": True}).eq("id", mid).execute())
+            return ok({"id": mid})
+
+        if method == "DELETE":
+            u = gk("user_id")
+            if not u: return er("user_id required", 401)
+            msg_r = await sb_query(lambda: sb.table("messages").select("id,user_id").eq("id", mid).execute())
+            if not msg_r.data: return er("Message not found", 404)
+            if msg_r.data[0]["user_id"] != u: return er("Not your message", 403)
+            await sb_query(lambda: sb.table("messages").delete().eq("id", mid).execute())
+            return ok({"deleted": mid})
 
     # Users search
     if path == "/api/users/search" and method == "GET":
