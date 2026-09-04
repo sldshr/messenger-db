@@ -8,9 +8,6 @@ from urllib.parse import parse_qs
 # ===== CONFIG =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_ANON_KEY")
-PANEL_USER = os.environ.get("PANEL_USER", "admin")
-PANEL_PASS = os.environ.get("PANEL_PASS", "admin")
-PANEL_SECRET = os.environ.get("PANEL_SECRET", hashlib.sha256(os.urandom(32)).hexdigest())
 # ==================
 
 _sb = None
@@ -30,36 +27,13 @@ def now_iso(): return datetime.now(timezone.utc).isoformat()
 def ok(d=None): return json.dumps({"ok": True, "data": d}, ensure_ascii=False), 200
 def er(m, c=400): return json.dumps({"ok": False, "error": m}, ensure_ascii=False), c
 
-# ===== STATS =====
+# ===== STATS (minimal, only used by /api/ping) =====
 import time as _time
-_stats = {"start": _time.time(), "requests": 0, "errors": 0, "total_ms": 0, "last_times": []}
+_stats = {"start": _time.time(), "requests": 0}
 
 async def sb_query(fn):
     """Run blocking Supabase call in thread — prevents event loop freeze."""
     return await asyncio.to_thread(fn)
-
-# ===== PANEL =====
-_panel_html = None
-def serve_panel():
-    global _panel_html
-    if _panel_html is None:
-        p = os.path.join(os.path.dirname(__file__) or ".", "panel.html")
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                _panel_html = f.read()
-        except:
-            _panel_html = "<h1>panel.html not found</h1>"
-    return _panel_html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-_panel_tokens = set()
-
-def make_panel_token():
-    t = hashlib.sha256(os.urandom(32)).hexdigest()
-    _panel_tokens.add(t)
-    return t
-
-def check_panel_token(t):
-    return t in _panel_tokens
 
 # ===== HANDLER =====
 
@@ -72,19 +46,13 @@ async def handle(method, path, body, qs):
         v = qs.get(k, [None])[0]
         return v if v else data.get(k)
 
-    sb = await get_sb()
-
-    # --- Fast routes (no DB) ---
+    # --- Fast routes (no DB, no Supabase needed) ---
     if method == "GET" and path == "/":
-        return serve_panel()
+        return ok({"status": "running", "service": "messenger-server"})
     if method == "GET" and path == "/api/ping":
         return ok({"pong": True, "time": now_iso()})
-    if method == "GET" and path == "/api/stats":
-        uptime = int(_time.time() - _stats["start"])
-        avg = (_stats["total_ms"] / _stats["requests"]) if _stats["requests"] else 0
-        return ok({"uptime_seconds": uptime, "requests": _stats["requests"],
-                    "errors": _stats["errors"], "avg_response_ms": round(avg, 1),
-                    "last_times": _stats["last_times"][-60:]})
+
+    sb = await get_sb()
 
     # --- Auth ---
     if method == "POST" and path == "/api/register":
@@ -115,6 +83,11 @@ async def handle(method, path, body, qs):
         chs = chs_r.data or []
         my_r = await sb_query(lambda: sb.table("channel_members").select("channel_id").eq("user_id", u).execute())
         my_ids = {m["channel_id"] for m in (my_r.data or [])}
+        # Auto-join user to ALL channels (batch upsert missing memberships)
+        missing = [{"channel_id": ch["id"], "user_id": u, "role": "member"} for ch in chs if ch["id"] not in my_ids]
+        if missing:
+            await sb_query(lambda: sb.table("channel_members").upsert(missing, on_conflict="channel_id,user_id").execute())
+            my_ids = {m["channel_id"] for m in chs}
         # Single query: get ALL member counts at once (no N+1)
         all_m = await sb_query(lambda: sb.table("channel_members").select("channel_id").execute())
         counts = {}
@@ -170,9 +143,10 @@ async def handle(method, path, body, qs):
             res = await sb_query(lambda: sb.table("channel_members").select("user_id,role").eq("channel_id", cid).execute())
             result = []
             for mm in (res.data or []):
-                ur = await sb_query(lambda uid=mm["user_id"]: sb.table("users").select("username").eq("id", uid).execute())
+                ur = await sb_query(lambda uid=mm["user_id"]: sb.table("users").select("username,about").eq("id", uid).execute())
                 un = ur.data[0]["username"] if ur.data else "?"
-                result.append({"user_id": mm["user_id"], "username": un, "role": mm.get("role","member")})
+                ab = ur.data[0].get("about", "") if ur.data else ""
+                result.append({"user_id": mm["user_id"], "username": un, "about": ab, "role": mm.get("role","member")})
             return ok(result)
 
         if method == "GET" and action == "messages":
@@ -266,54 +240,9 @@ async def handle(method, path, body, qs):
         res = await sb_query(lambda: sb.table("users").select("id,username").ilike("username", f"%{q}%").limit(20).execute())
         return ok(res.data or [])
 
-    # --- Panel Auth ---
-    if path == "/api/panel/login" and method == "POST":
-        u = data.get("username", "")
-        p = data.get("password", "")
-        if u == PANEL_USER and p == PANEL_PASS:
-            return ok({"token": make_panel_token()})
-        return er("Invalid credentials", 401)
-
-    if path == "/api/panel/verify" and method == "GET":
-        t = qs.get("token", [""])[0]
-        return ok({"valid": check_panel_token(t)})
-
-    # --- Admin delete user ---
-    m_pan_u = re.match(r"^/api/panel/users/([^/]+)$", path)
-    if m_pan_u and method == "DELETE":
-        t = data.get("token") or qs.get("token", [""])[0]
-        # Also check header
-        if not t: t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        uid_del = m_pan_u.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("user_id", uid_del).execute())
-        await sb_query(lambda: sb.table("channel_members").delete().eq("user_id", uid_del).execute())
-        await sb_query(lambda: sb.table("users").delete().eq("id", uid_del).execute())
-        return ok({"deleted": uid_del})
-
-    # --- Admin delete channel ---
-    m_pan_ch = re.match(r"^/api/panel/channels/([^/]+)$", path)
-    if m_pan_ch and method == "DELETE":
-        t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        cid_del = m_pan_ch.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("channel_id", cid_del).execute())
-        await sb_query(lambda: sb.table("channel_members").delete().eq("channel_id", cid_del).execute())
-        await sb_query(lambda: sb.table("channels").delete().eq("id", cid_del).execute())
-        return ok({"deleted": cid_del})
-
-    # --- Admin delete message ---
-    m_pan_msg = re.match(r"^/api/panel/messages/([^/]+)$", path)
-    if m_pan_msg and method == "DELETE":
-        t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        mid_del = m_pan_msg.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("id", mid_del).execute())
-        return ok({"deleted": mid_del})
-
     # All users
     if path == "/api/users" and method == "GET":
-        res = await sb_query(lambda: sb.table("users").select("id,username").order("username").execute())
+        res = await sb_query(lambda: sb.table("users").select("id,username,about").order("username").execute())
         return ok(res.data or [])
 
     # Edit profile
@@ -334,6 +263,8 @@ async def handle(method, path, body, qs):
         if new_pass:
             if len(new_pass) < 4: return er("Password: min 4 chars")
             updates["password_hash"] = hp(new_pass)
+        if "about" in data:
+            updates["about"] = (data.get("about") or "").strip()[:500]
         if not updates: return er("Nothing to update")
         await sb_query(lambda: sb.table("users").update(updates).eq("id", u).execute())
         return ok({"updated": True, "username": updates.get("username")})
@@ -366,27 +297,25 @@ async def app(scope, receive, send):
     qs = parse_qs(scope.get("query_string", b"").decode())
     t0 = _time.time()
     try:
-        resp, status = await asyncio.wait_for(
+        result = await asyncio.wait_for(
             handle(scope["method"], scope["path"], body, qs), timeout=30
         )
     except asyncio.TimeoutError:
-        resp, status = json.dumps({"ok": False, "error": "timeout"}), 504
-        _stats["errors"] += 1
+        result = (json.dumps({"ok": False, "error": "timeout"}), 504)
     except Exception as ex:
-        resp, status = json.dumps({"ok": False, "error": str(ex)}), 500
-        _stats["errors"] += 1
-    # Handle tuples with headers (for panel HTML)
+        result = (json.dumps({"ok": False, "error": str(ex)}), 500)
+    # result can be (body, status) or (body, status, headers_dict)
     extra_headers = []
-    if isinstance(resp, tuple):
-        resp, status, hdrs = resp
+    if isinstance(result, tuple) and len(result) == 3:
+        resp, status, hdrs = result
         if isinstance(hdrs, dict):
             for k, v in hdrs.items():
                 extra_headers.append([k.encode(), v.encode()])
-    ms = round((_time.time() - t0) * 1000, 1)
+    elif isinstance(result, tuple) and len(result) == 2:
+        resp, status = result
+    else:
+        resp, status = json.dumps({"ok": False, "error": "bad handler return"}), 500
     _stats["requests"] += 1
-    _stats["total_ms"] += ms
-    _stats["last_times"].append(ms)
-    if len(_stats["last_times"]) > 300: _stats["last_times"] = _stats["last_times"][-300:]
     if isinstance(resp, str):
         resp = resp.encode("utf-8")
     all_headers = [[b"access-control-allow-origin", b"*"]] + extra_headers
