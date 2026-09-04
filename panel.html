@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="UTF-8"><title>Messenger Panel</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+body{background:#f2f3f5;color:#333;height:100vh;display:flex;overflow:hidden;font-size:13px}
+#ls{position:fixed;top:0;left:0;width:100vw;height:100vh;background:#1c1d21;display:flex;justify-content:center;align-items:center;z-index:2000}
+.lc{background:#2a2c33;padding:32px;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.5);width:100%;max-width:380px;border:1px solid #3a3d47;color:#f0f0f0}
+.lc h2{font-size:20px;margin-bottom:4px}.lc p{font-size:12px;color:#9a9ea8;margin-bottom:24px}
+.fg{margin-bottom:18px}.fg label{display:block;margin-bottom:6px;font-size:12px;color:#b2b6c1}
+.fg input{width:100%;padding:9px 12px;border-radius:4px;border:1px solid #404452;background:#17181c;color:#fff;font-size:13px;outline:none}
+.fg input:focus{border-color:#5c87e5}
+.btn{width:100%;padding:10px;background:#2d64d8;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer}
+.err{color:#ff5252;font-size:12px;margin-top:12px;text-align:center;display:none}
+#ac{display:flex;width:100vw;height:100vh}
+.sb{width:210px;min-width:210px;background:#1c1d21;color:#abb0be;display:flex;flex-direction:column;border-right:1px solid #101113;user-select:none}
+.sb b{padding:16px 14px;color:#fff;font-size:16px;border-bottom:1px solid #282a30;display:block}
+.si{padding:12px 14px;border-bottom:1px solid #282a30;font-size:11px;background:#17181c}
+.hst{display:flex;align-items:center;gap:6px;color:#4caf50;font-weight:bold;margin-top:4px}
+.ns{padding:8px 0;overflow-y:auto;flex-grow:1}
+.ni{padding:10px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;font-size:13px;color:#b2b8c6;transition:.15s}
+.ni:hover{background:#282a30;color:#fff}.ni.a{background:#282a30;color:#5c87e5;border-left:3px solid #5c87e5;font-weight:600}
+.mw{flex-grow:1;display:flex;flex-direction:column;background:#eef0f3;overflow:hidden}
+.tb{height:48px;background:#fff;border-bottom:1px solid #dcdfe6;display:flex;align-items:center;justify-content:space-between;padding:0 16px}
+.cv{padding:16px 20px;overflow-y:auto;flex-grow:1}
+.cd{background:#fff;border:1px solid #dcdfe6;border-radius:4px;padding:16px;margin-bottom:16px}
+.sg{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.si2{text-align:center;padding:12px;background:#f5f7fa;border-radius:4px}
+.sv{font-size:22px;font-weight:700;color:#2c3e50}.sl{font-size:11px;color:#909399;margin-top:4px}
+.dt{width:100%;border-collapse:collapse}.dt th{background:#f5f7fa;color:#606266;padding:10px 14px;font-weight:600;border-bottom:1px solid #dcdfe6;text-align:left}.dt td{padding:10px 14px;border-bottom:1px solid #eef0f3}.dt tr:hover{background:#f9fafc}
+.ba{background:#2d64d8;color:#fff;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:11px}
+.bd{background:#f56c6c;color:#fff;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:11px}
+.bs{background:#e4e7ed;color:#303133;border:none;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:11px;margin-right:4px}
+.tv{display:none}.tv.a{display:block}
+select{padding:6px 10px;border:1px solid #dcdfe6;border-radius:4px;font-size:12px;margin-bottom:12px}
+.tst{position:fixed;bottom:20px;right:20px;background:#303133;color:#fff;padding:10px 16px;border-radius:4px;font-size:12px;display:none;z-index:4000}
+.mo{position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,.4);display:none;justify-content:center;align-items:center;z-index:3000}
+.mx{background:#fff;padding:20px;border-radius:6px;width:320px;box-shadow:0 4px 12px rgba(0,0,0,.15)}
+.cb{background:#fff;border:1px solid #dcdfe6;border-radius:4px;display:flex;flex-direction:column;height:480px}
+.ch{padding:10px 16px;background:#f8f9fa;border-bottom:1px solid #dcdfe6;font-size:12px;color:#606266}
+.cm{flex-grow:1;padding:16px;overflow-y:auto;background:#fafafa;display:flex;flex-direction:column;gap:8px}
+.mi{background:#fff;border:1px solid #e4e7ed;padding:10px 12px;border-radius:4px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.ma{font-weight:bold;font-size:12px}.mc{font-size:13px;margin-top:2px}.mt{font-size:10px;color:#909399;margin-top:4px}
+</style></head><body>
+
+
+<div class="mo" id="cm"><div class="mx"><b style="font-size:14px">Create Channel</b>
+<input class="fg" style="margin-top:12px" id="cn" placeholder="Name">
+<input class="fg" id="cdesc" placeholder="Description">
+<div style="display:flex;justify-content:flex-end;gap:8px"><button class="bs" onclick="document.getElementById('cm').style.display='none'">Cancel</button><button class="ba" onclick="createCh()">Create</button></div></div></div>
+<div class="tst" id="tst"></div>
+<div id="ls"><div class="lc"><h2>Messenger Admin</h2><p>Server Control Panel</p>
+<form onsubmit="doLogin(event)"><div class="fg"><label>Username</label><input id="us" required></div>
+<div class="fg"><label>Password</label><input type="password" id="pw" required></div>
+<button type="submit" class="btn">Login</button><div id="em" class="err">Invalid credentials</div></form></div></div>
+<div id="ac" style="display:none">
+<div class="sb"><b>Messenger</b><div class="si"><div style="color:#8c92a4">Server Status</div><div class="hst">&#x25CF; Online</div></div>
+<div class="ns"><div class="ni a" onclick="nav('d',this)">Dashboard</div><div class="ni" onclick="nav('u',this)">Users</div><div class="ni" onclick="nav('c',this)">Channels</div><div class="ni" onclick="nav('m',this)">Chat</div><div class="ni" onclick="nav('s',this)">Stats</div></div></div>
+<div class="mw"><div class="tb"><div style="font-weight:600;color:#485a6a">Messenger Panel</div><div style="font-size:12px"><a href="#" onclick="sessionStorage.removeItem('ptk');location.reload()" style="color:#f56c6c;text-decoration:none">Logout</a></div></div>
+<div class="cv">
+<div id="td" class="tv a"><h2 style="margin-bottom:16px;color:#2c3e50">Dashboard</h2><div class="cd"><div class="sg">
+<div class="si2"><div class="sv" id="x1">-</div><div class="sl">Uptime</div></div>
+<div class="si2"><div class="sv" id="x2">-</div><div class="sl">Requests</div></div>
+<div class="si2"><div class="sv" id="x3">-</div><div class="sl">Errors</div></div>
+<div class="si2"><div class="sv" id="x4">-</div><div class="sl">Users</div></div>
+<div class="si2"><div class="sv" id="x5">-</div><div class="sl">Channels</div></div>
+<div class="si2"><div class="sv" id="x6">-</div><div class="sl">Avg MS</div></div>
+</div></div></div>
+<div id="tu" class="tv"><h2 style="margin-bottom:16px;color:#2c3e50">Users</h2><div class="cd"><table class="dt"><thead><tr><th>Username</th><th>ID</th><th>Action</th></tr></thead><tbody id="utb"></tbody></table></div></div>
+<div id="tc" class="tv"><h2 style="margin-bottom:16px;color:#2c3e50">Channels <button class="ba" style="margin-left:12px" onclick="document.getElementById('cm').style.display='flex'">+ New</button></h2><div class="cd"><table class="dt"><thead><tr><th>Name</th><th>Description</th><th>Members</th><th>Actions</th></tr></thead><tbody id="ctb"></tbody></table></div></div>
+<div id="tm" class="tv"><h2 style="margin-bottom:16px;color:#2c3e50">Chat Moderation</h2>
+<select id="cs" onchange="loadMsgs()"><option value="">Select channel...</option></select>
+
+<script>
+document.addEventListener('contextmenu',e=>e.preventDefault());
+const A=location.origin;let tk=sessionStorage.getItem('ptk')||'';
+function doLogin(e){e.preventDefault();fetch(A+'/api/panel/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('us').value,password:document.getElementById('pw').value})}).then(r=>r.json()).then(d=>{if(d.ok){tk=d.data.token;sessionStorage.setItem('ptk',tk);document.getElementById('ls').style.display='none';document.getElementById('ac').style.display='flex';loadDash()}else document.getElementById('em').style.display='block'}).catch(()=>document.getElementById('em').style.display='block')}
+if(tk)fetch(A+'/api/panel/verify?token='+tk).then(r=>r.json()).then(d=>{if(d.ok){document.getElementById('ls').style.display='none';document.getElementById('ac').style.display='flex';loadDash()}else sessionStorage.removeItem('ptk')});
+function H(){return{'Content-Type':'application/json','X-Panel-Token':tk}}
+function nav(n,el){document.querySelectorAll('.ni').forEach(x=>x.classList.remove('a'));if(el)el.classList.add('a');document.querySelectorAll('.tv').forEach(x=>x.classList.remove('a'));const m={d:'td',u:'tu',c:'tc',m:'tm',s:'ts'};const t=document.getElementById(m[n]);if(t)t.classList.add('a');if(n==='d')loadDash();if(n==='u')loadUsr();if(n==='c')loadCh();if(n==='m')loadCSel();if(n==='s')loadSt()}
+function fUp(s){const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return(d?d+'d ':'')+(h?h+'h ':'')+m+'m'}
+function esc(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function toast(m){const t=document.getElementById('tst');t.innerText=m;t.style.display='block';setTimeout(()=>t.style.display='none',2500)}
+function loadDash(){fetch(A+'/api/stats').then(r=>r.json()).then(d=>{if(!d.ok)return;const s=d.data;document.getElementById('x1').innerText=fUp(s.uptime_seconds);document.getElementById('x2').innerText=s.requests;document.getElementById('x3').innerText=s.errors;document.getElementById('x6').innerText=s.avg_response_ms});fetch(A+'/api/users').then(r=>r.json()).then(d=>{if(d.ok)document.getElementById('x4').innerText=(d.data||[]).length});fetch(A+'/api/channels?user_id=x').then(r=>r.json()).then(d=>{if(d.ok)document.getElementById('x5').innerText=(d.data||[]).length})}
+function loadUsr(){fetch(A+'/api/users').then(r=>r.json()).then(d=>{if(!d.ok)return;const tb=document.getElementById('utb');tb.innerHTML='';(d.data||[]).forEach(u=>{const tr=document.createElement('tr');tr.innerHTML='<td>'+esc(u.username)+'</td><td><code style="font-size:10px">'+u.id.substring(0,8)+'...</code></td><td><button class="bd" onclick="delU(\''+u.id+'\',\''+esc(u.username)+'\')">Delete</button></td>';tb.appendChild(tr)})})}
+function delU(id,n){if(!confirm('Delete '+n+'?'))return;fetch(A+'/api/panel/users/'+id,{method:'DELETE',headers:H()}).then(r=>r.json()).then(d=>{toast(d.ok?'Deleted':d.error);loadUsr()})}
+function loadCh(){fetch(A+'/api/channels?user_id=x').then(r=>r.json()).then(d=>{if(!d.ok)return;const tb=document.getElementById('ctb');tb.innerHTML='';(d.data||[]).forEach(ch=>{const t=ch.channel_type==='server'?'# ':'~ ';const tr=document.createElement('tr');tr.innerHTML='<td>'+t+esc(ch.name)+'</td><td>'+esc(ch.description||'')+'</td><td>'+ch.member_count+'</td><td><button class="bd" onclick="delC(\''+ch.id+'\',\''+esc(ch.name)+'\')">Del</button></td>';tb.appendChild(tr)})})}
+function delC(id,n){if(!confirm('Delete '+n+'?'))return;fetch(A+'/api/panel/channels/'+id,{method:'DELETE',headers:H()}).then(r=>r.json()).then(d=>{toast(d.ok?'Deleted':d.error);loadCh()})}
+function createCh(){const n=document.getElementById('cn').value.trim();const d=document.getElementById('cdesc').value.trim();if(!n)return;fetch(A+'/api/channels',{method:'POST',headers:H(),body:JSON.stringify({user_id:'00000000-0000-0000-0000-000000000000',name:n,description:d,channel_type:'server'})}).then(r=>r.json()).then(d=>{if(d.ok){document.getElementById('cm').style.display='none';loadCh();toast('Created')}else toast(d.error)})}
+let aCh='';
+function loadCSel(){fetch(A+'/api/channels?user_id=x').then(r=>r.json()).then(d=>{if(!d.ok)return;const s=document.getElementById('cs');s.innerHTML='<option value="">Select channel...</option>';(d.data||[]).forEach(c=>{s.innerHTML+='<option value="'+c.id+'">'+esc(c.name)+'</option>'})})}
+function loadMsgs(){const cid=document.getElementById('cs').value;if(!cid)return;aCh=cid;document.getElementById('chdr').innerText='Channel: '+cid;fetch(A+'/api/channels/'+cid+'/messages?user_id=x').then(r=>r.json()).then(d=>{if(!d.ok)return;const c=document.getElementById('cm2');c.innerHTML='';if(!d.data||!d.data.length){c.innerHTML='<div style="color:#909399;text-align:center;margin-top:40px">No messages</div>';return}(d.data||[]).forEach(m=>{const el=document.createElement('div');el.className='mi';el.innerHTML='<div><div class="ma">'+esc(m.username)+'</div><div class="mc">'+esc(m.content)+'</div><div class="mt">'+(m.created_at||'').substring(0,19).replace('T',' ')+'</div></div><button class="bd" onclick="delM(\''+m.id+'\')">Del</button>';c.appendChild(el)})})}
+function delM(mid){if(!aCh||!confirm('Delete?'))return;fetch(A+'/api/panel/messages/'+mid+'?channel_id='+aCh+'&token='+tk,{method:'DELETE'}).then(r=>r.json()).then(d=>{toast(d.ok?'Deleted':d.error);loadMsgs()})}
+function loadSt(){fetch(A+'/api/stats').then(r=>r.json()).then(d=>{if(!d.ok)return;const s=d.data;document.getElementById('sc').innerHTML='<p><b>Uptime:</b> '+fUp(s.uptime_seconds)+'</p><p><b>Requests:</b> '+s.requests+'</p><p><b>Errors:</b> '+s.errors+'</p><p><b>Avg Response:</b> '+s.avg_response_ms+'ms</p>'})}
+</script></body></html>
+
+<div class="cb"><div class="ch" id="chdr">Select a channel</div><div class="cm" id="cm2"><div style="color:#909399;text-align:center;margin-top:40px">Select a channel</div></div></div></div>
+<div id="ts" class="tv"><h2 style="margin-bottom:16px;color:#2c3e50">Statistics</h2><div class="cd" id="sc">Loading...</div></div>
+</div></div></div>
