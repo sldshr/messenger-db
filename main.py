@@ -211,3 +211,20 @@ async def app(scope, receive, send):
         resp = resp.encode("utf-8")
     await send({"type": "http.response.start", "status": status, "headers": CORS})
     await send({"type": "http.response.body", "body": resp})
+
+# Алиас для платформ, которые ищут 'application'
+application = app
+
+# Локальный запуск: python server.py
+if __name__ == "__main__":
+    import asyncio
+    async def main():
+        config = uvicorn.Config(app, host="0.0.0.0", port=5000)
+        server = uvicorn.Server(config)
+        await server.serve()
+    try:
+        import uvicorn
+        asyncio.run(main())
+    except ImportError:
+        print("Run: pip install uvicorn && uvicorn server:app")
+
