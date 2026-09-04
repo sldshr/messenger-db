@@ -1,8 +1,2 @@
-fastapi
 uvicorn
-websockets
 supabase
-flask
-asgiref
-flask-cors
-
