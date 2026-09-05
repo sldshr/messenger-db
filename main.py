@@ -71,9 +71,12 @@ async def handle(method, path, body, qs):
         u = (data.get("username") or "").strip()
         p = data.get("password") or ""
         if not u or not p: return er("Username and password required")
-        res = await sb_query(lambda: sb.table("users").select("id,username").eq("username", u).eq("password_hash", hp(p)).execute())
+        res = await sb_query(lambda: sb.table("users").select("id,username,about,avatar_data,created_at,last_login_at").eq("username", u).eq("password_hash", hp(p)).execute())
         if not res.data: return er("Invalid credentials", 401)
-        return ok({"user_id": res.data[0]["id"], "username": res.data[0]["username"]})
+        r = res.data[0]
+        await sb_query(lambda: sb.table("users").update({"last_login_at": now_iso()}).eq("id", r["id"]).execute())
+        return ok({"user_id": r["id"], "username": r["username"], "about": r.get("about",""),
+                    "avatar_data": r.get("avatar_data","")})
 
     # --- Channels ---
     if path == "/api/channels" and method == "GET":
@@ -143,10 +146,11 @@ async def handle(method, path, body, qs):
             res = await sb_query(lambda: sb.table("channel_members").select("user_id,role").eq("channel_id", cid).execute())
             result = []
             for mm in (res.data or []):
-                ur = await sb_query(lambda uid=mm["user_id"]: sb.table("users").select("username,about").eq("id", uid).execute())
-                un = ur.data[0]["username"] if ur.data else "?"
-                ab = ur.data[0].get("about", "") if ur.data else ""
-                result.append({"user_id": mm["user_id"], "username": un, "about": ab, "role": mm.get("role","member")})
+                ur = await sb_query(lambda uid=mm["user_id"]: sb.table("users").select("username,about,avatar_data,created_at,last_login_at").eq("id", uid).execute())
+                d = ur.data[0] if ur.data else {}
+                result.append({"user_id": mm["user_id"], "username": d.get("username","?"), "about": d.get("about",""),
+                    "avatar_data": d.get("avatar_data",""), "created_at": d.get("created_at",""), "last_login_at": d.get("last_login_at",""),
+                    "role": mm.get("role","member")})
             return ok(result)
 
         if method == "GET" and action == "messages":
@@ -164,10 +168,10 @@ async def handle(method, path, body, qs):
             uc = {}
             if uids:
                 def _get_users():
-                    return sb.table("users").select("id,username").in_("id", uids).execute()
+                    return sb.table("users").select("id,username,avatar_data").in_("id", uids).execute()
                 users_r = await sb_query(_get_users)
                 for usr in (users_r.data or []):
-                    uc[usr["id"]] = usr["username"]
+                    uc[usr["id"]] = {"username": usr["username"], "avatar_data": usr.get("avatar_data","")}
             # Batch-fetch reply_to messages
             reply_ids = [mm["reply_to"] for mm in msgs if mm.get("reply_to")]
             rc = {}
@@ -176,17 +180,21 @@ async def handle(method, path, body, qs):
                     return sb.table("messages").select("id,content,user_id").in_("id", reply_ids).execute()
                 reps_r = await sb_query(_get_replies)
                 for rep in (reps_r.data or []):
-                    rc[rep["id"]] = {"content": rep["content"][:100], "username": uc.get(rep.get("user_id",""), "?")}
+                    u2 = uc.get(rep.get("user_id",""), {"username": "?", "avatar_data": ""})
+                    rc[rep["id"]] = {"content": rep["content"][:100], "username": u2["username"],
+                                      "user_id": rep.get("user_id","")}
             result = []
             for mm in msgs:
+                u_info = uc.get(mm["user_id"], {"username": "?", "avatar_data": ""})
                 item = {"id": mm["id"], "user_id": mm["user_id"],
-                        "username": uc.get(mm["user_id"], "?"),
+                        "username": u_info["username"], "avatar_data": u_info.get("avatar_data",""),
                         "content": mm["content"], "created_at": mm["created_at"],
                         "edited": bool(mm.get("edited", False)),
                         "reply_to": mm.get("reply_to")}
                 if mm.get("reply_to") and mm["reply_to"] in rc:
                     item["reply_to_content"] = rc[mm["reply_to"]]["content"]
                     item["reply_to_user"] = rc[mm["reply_to"]]["username"]
+                    item["reply_to_user_id"] = rc[mm["reply_to"]]["user_id"]
                 result.append(item)
             return ok(result)
 
@@ -242,7 +250,7 @@ async def handle(method, path, body, qs):
 
     # All users
     if path == "/api/users" and method == "GET":
-        res = await sb_query(lambda: sb.table("users").select("id,username,about").order("username").execute())
+        res = await sb_query(lambda: sb.table("users").select("id,username,about,avatar_data,created_at,last_login_at").order("username").execute())
         return ok(res.data or [])
 
     # Edit profile
@@ -265,6 +273,8 @@ async def handle(method, path, body, qs):
             updates["password_hash"] = hp(new_pass)
         if "about" in data:
             updates["about"] = (data.get("about") or "").strip()[:500]
+        if "avatar_data" in data:
+            updates["avatar_data"] = (data.get("avatar_data") or "")[:300000]
         if not updates: return er("Nothing to update")
         await sb_query(lambda: sb.table("users").update(updates).eq("id", u).execute())
         return ok({"updated": True, "username": updates.get("username")})
