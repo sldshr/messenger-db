@@ -1,20 +1,30 @@
 """
-MESSENGER SERVER — Pure ASGI, optimized for low RAM (512MB)
+MESSENGER SERVER — Pure ASGI, optimized for fast startup & low RAM (512MB)
+No web panel, no stats tracking, no reply_to.
 """
-import asyncio, hashlib, json, os, re
+import asyncio, hashlib, json, os, re, time as _time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
 # ===== CONFIG =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "YOUR_SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "YOUR_SUPABASE_ANON_KEY")
-PANEL_USER = os.environ.get("PANEL_USER", "admin")
-PANEL_PASS = os.environ.get("PANEL_PASS", "admin")
-PANEL_SECRET = os.environ.get("PANEL_SECRET", hashlib.sha256(os.urandom(32)).hexdigest())
 # ==================
 
 _sb = None
 _sb_lock = asyncio.Lock()
+
+# ===== PSUTIL (optional, for /api/system) =====
+_psutil = None
+def _get_psutil():
+    global _psutil
+    if _psutil is None:
+        try:
+            import psutil as _p
+            _psutil = _p
+        except ImportError:
+            pass
+    return _psutil
 
 async def get_sb():
     global _sb
@@ -30,36 +40,9 @@ def now_iso(): return datetime.now(timezone.utc).isoformat()
 def ok(d=None): return json.dumps({"ok": True, "data": d}, ensure_ascii=False), 200
 def er(m, c=400): return json.dumps({"ok": False, "error": m}, ensure_ascii=False), c
 
-# ===== STATS =====
-import time as _time
-_stats = {"start": _time.time(), "requests": 0, "errors": 0, "total_ms": 0, "last_times": []}
-
 async def sb_query(fn):
     """Run blocking Supabase call in thread — prevents event loop freeze."""
     return await asyncio.to_thread(fn)
-
-# ===== PANEL =====
-_panel_html = None
-def serve_panel():
-    global _panel_html
-    if _panel_html is None:
-        p = os.path.join(os.path.dirname(__file__) or ".", "panel.html")
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                _panel_html = f.read()
-        except:
-            _panel_html = "<h1>panel.html not found</h1>"
-    return _panel_html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-_panel_tokens = set()
-
-def make_panel_token():
-    t = hashlib.sha256(os.urandom(32)).hexdigest()
-    _panel_tokens.add(t)
-    return t
-
-def check_panel_token(t):
-    return t in _panel_tokens
 
 # ===== HANDLER =====
 
@@ -72,19 +55,24 @@ async def handle(method, path, body, qs):
         v = qs.get(k, [None])[0]
         return v if v else data.get(k)
 
-    sb = await get_sb()
-
     # --- Fast routes (no DB) ---
-    if method == "GET" and path == "/":
-        return serve_panel()
     if method == "GET" and path == "/api/ping":
         return ok({"pong": True, "time": now_iso()})
-    if method == "GET" and path == "/api/stats":
-        uptime = int(_time.time() - _stats["start"])
-        avg = (_stats["total_ms"] / _stats["requests"]) if _stats["requests"] else 0
-        return ok({"uptime_seconds": uptime, "requests": _stats["requests"],
-                    "errors": _stats["errors"], "avg_response_ms": round(avg, 1),
-                    "last_times": _stats["last_times"][-60:]})
+
+    # --- System info (RAM / CPU) ---
+    if method == "GET" and path == "/api/system":
+        p = _get_psutil()
+        if p is None:
+            return ok({"ram_percent": 0, "ram_used_mb": 0, "ram_total_mb": 0, "cpu_percent": 0, "available": False})
+        vm = p.virtual_memory()
+        return ok({"ram_percent": round(vm.percent, 1),
+                    "ram_used_mb": round(vm.used / 1048576),
+                    "ram_total_mb": round(vm.total / 1048576),
+                    "cpu_percent": round(p.cpu_percent(interval=0.1), 1),
+                    "available": True})
+
+    # Lazy Supabase init — only for DB routes (fast routes above need no DB)
+    sb = await get_sb()
 
     # --- Auth ---
     if method == "POST" and path == "/api/register":
@@ -115,6 +103,11 @@ async def handle(method, path, body, qs):
         chs = chs_r.data or []
         my_r = await sb_query(lambda: sb.table("channel_members").select("channel_id").eq("user_id", u).execute())
         my_ids = {m["channel_id"] for m in (my_r.data or [])}
+        # AUTO-JOIN: user is automatically added to every public channel
+        need_join = [ch["id"] for ch in chs if ch["id"] not in my_ids and ch.get("is_public", True)]
+        for c in need_join:
+            await sb_query(lambda cid=c: sb.table("channel_members").insert({"channel_id": cid, "user_id": u}).execute())
+            my_ids.add(c)
         # Single query: get ALL member counts at once (no N+1)
         all_m = await sb_query(lambda: sb.table("channel_members").select("channel_id").execute())
         counts = {}
@@ -194,25 +187,11 @@ async def handle(method, path, body, qs):
                 users_r = await sb_query(_get_users)
                 for usr in (users_r.data or []):
                     uc[usr["id"]] = usr["username"]
-            # Batch-fetch reply_to messages
-            reply_ids = [mm["reply_to"] for mm in msgs if mm.get("reply_to")]
-            rc = {}
-            if reply_ids:
-                def _get_replies():
-                    return sb.table("messages").select("id,content,user_id").in_("id", reply_ids).execute()
-                reps_r = await sb_query(_get_replies)
-                for rep in (reps_r.data or []):
-                    rc[rep["id"]] = {"content": rep["content"][:100], "username": uc.get(rep.get("user_id",""), "?")}
             result = []
             for mm in msgs:
                 item = {"id": mm["id"], "user_id": mm["user_id"],
                         "username": uc.get(mm["user_id"], "?"),
-                        "content": mm["content"], "created_at": mm["created_at"],
-                        "edited": bool(mm.get("edited", False)),
-                        "reply_to": mm.get("reply_to")}
-                if mm.get("reply_to") and mm["reply_to"] in rc:
-                    item["reply_to_content"] = rc[mm["reply_to"]]["content"]
-                    item["reply_to_user"] = rc[mm["reply_to"]]["username"]
+                        "content": mm["content"], "created_at": mm["created_at"]}
                 result.append(item)
             return ok(result)
 
@@ -220,13 +199,11 @@ async def handle(method, path, body, qs):
             u = gk("user_id")
             if not u: return er("user_id required", 401)
             content = (data.get("content") or "").strip()
-            reply_to = data.get("reply_to")
             if not content: return er("Content required")
             if len(content) > 5000: return er("Too long")
             member = await sb_query(lambda: sb.table("channel_members").select("channel_id").eq("channel_id", cid).eq("user_id", u).execute())
             if not member.data: return er("Not a member", 403)
             msg_data = {"channel_id": cid, "user_id": u, "content": content}
-            if reply_to: msg_data["reply_to"] = reply_to
             res = await sb_query(lambda: sb.table("messages").insert(msg_data).execute())
             if res.data:
                 mm = res.data[0]
@@ -247,7 +224,7 @@ async def handle(method, path, body, qs):
             msg_r = await sb_query(lambda: sb.table("messages").select("id,user_id").eq("id", mid).execute())
             if not msg_r.data: return er("Message not found", 404)
             if msg_r.data[0]["user_id"] != u: return er("Not your message", 403)
-            await sb_query(lambda: sb.table("messages").update({"content": content, "edited": True}).eq("id", mid).execute())
+            await sb_query(lambda: sb.table("messages").update({"content": content}).eq("id", mid).execute())
             return ok({"id": mid})
 
         if method == "DELETE":
@@ -258,58 +235,6 @@ async def handle(method, path, body, qs):
             if msg_r.data[0]["user_id"] != u: return er("Not your message", 403)
             await sb_query(lambda: sb.table("messages").delete().eq("id", mid).execute())
             return ok({"deleted": mid})
-
-    # Users search
-    if path == "/api/users/search" and method == "GET":
-        q = (qs.get("q", [""])[0]).strip()
-        if not q: return ok([])
-        res = await sb_query(lambda: sb.table("users").select("id,username").ilike("username", f"%{q}%").limit(20).execute())
-        return ok(res.data or [])
-
-    # --- Panel Auth ---
-    if path == "/api/panel/login" and method == "POST":
-        u = data.get("username", "")
-        p = data.get("password", "")
-        if u == PANEL_USER and p == PANEL_PASS:
-            return ok({"token": make_panel_token()})
-        return er("Invalid credentials", 401)
-
-    if path == "/api/panel/verify" and method == "GET":
-        t = qs.get("token", [""])[0]
-        return ok({"valid": check_panel_token(t)})
-
-    # --- Admin delete user ---
-    m_pan_u = re.match(r"^/api/panel/users/([^/]+)$", path)
-    if m_pan_u and method == "DELETE":
-        t = data.get("token") or qs.get("token", [""])[0]
-        # Also check header
-        if not t: t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        uid_del = m_pan_u.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("user_id", uid_del).execute())
-        await sb_query(lambda: sb.table("channel_members").delete().eq("user_id", uid_del).execute())
-        await sb_query(lambda: sb.table("users").delete().eq("id", uid_del).execute())
-        return ok({"deleted": uid_del})
-
-    # --- Admin delete channel ---
-    m_pan_ch = re.match(r"^/api/panel/channels/([^/]+)$", path)
-    if m_pan_ch and method == "DELETE":
-        t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        cid_del = m_pan_ch.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("channel_id", cid_del).execute())
-        await sb_query(lambda: sb.table("channel_members").delete().eq("channel_id", cid_del).execute())
-        await sb_query(lambda: sb.table("channels").delete().eq("id", cid_del).execute())
-        return ok({"deleted": cid_del})
-
-    # --- Admin delete message ---
-    m_pan_msg = re.match(r"^/api/panel/messages/([^/]+)$", path)
-    if m_pan_msg and method == "DELETE":
-        t = qs.get("token", [""])[0]
-        if not check_panel_token(t): return er("Unauthorized", 401)
-        mid_del = m_pan_msg.group(1)
-        await sb_query(lambda: sb.table("messages").delete().eq("id", mid_del).execute())
-        return ok({"deleted": mid_del})
 
     # All users
     if path == "/api/users" and method == "GET":
@@ -364,35 +289,17 @@ async def app(scope, receive, send):
         if not msg.get("more_body", False):
             break
     qs = parse_qs(scope.get("query_string", b"").decode())
-    t0 = _time.time()
     try:
         resp, status = await asyncio.wait_for(
             handle(scope["method"], scope["path"], body, qs), timeout=30
         )
     except asyncio.TimeoutError:
         resp, status = json.dumps({"ok": False, "error": "timeout"}), 504
-        _stats["errors"] += 1
     except Exception as ex:
         resp, status = json.dumps({"ok": False, "error": str(ex)}), 500
-        _stats["errors"] += 1
-    # Handle tuples with headers (for panel HTML)
-    extra_headers = []
-    if isinstance(resp, tuple):
-        resp, status, hdrs = resp
-        if isinstance(hdrs, dict):
-            for k, v in hdrs.items():
-                extra_headers.append([k.encode(), v.encode()])
-    ms = round((_time.time() - t0) * 1000, 1)
-    _stats["requests"] += 1
-    _stats["total_ms"] += ms
-    _stats["last_times"].append(ms)
-    if len(_stats["last_times"]) > 300: _stats["last_times"] = _stats["last_times"][-300:]
     if isinstance(resp, str):
         resp = resp.encode("utf-8")
-    all_headers = [[b"access-control-allow-origin", b"*"]] + extra_headers
-    if not extra_headers:
-        all_headers = HEADERS
-    await send({"type": "http.response.start", "status": status, "headers": all_headers})
+    await send({"type": "http.response.start", "status": status, "headers": HEADERS})
     await send({"type": "http.response.body", "body": resp})
 
 application = app
