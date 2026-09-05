@@ -240,16 +240,31 @@ async def on_shutdown():
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
 def get_token_from_header(authorization: Optional[str]) -> Optional[str]:
-    if authorization and authorization.startswith("Bearer "):
-        return authorization[7:]
-    return None
+    """Извлекает JWT из значения заголовка Authorization (Bearer ...)."""
+    if not authorization:
+        return None
+    parts = authorization.split()
+    # Поддерживаем "Bearer <token>" и просто "<token>"
+    if parts[0].lower() == "bearer" and len(parts) == 2:
+        return parts[1]
+    return authorization.strip()
 
 
-async def auth_user(authorization: Optional[str]) -> Optional[dict]:
+async def auth_user(request: Request) -> Optional[dict]:
+    """Читает Authorization-заголовок напрямую из request и проверяет токен."""
+    # Явно извлекаем заголовок: так надёжнее, чем магия имён параметров FastAPI
+    authorization = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not authorization:
+        return None
     token = get_token_from_header(authorization)
     if not token:
         return None
-    return decode_token(token)
+    payload = decode_token(token)
+    if payload is None:
+        # Диагностика: токен получен, но не прошёл проверку
+        print(f"[auth] Токен отклонён. len={len(token)}, нач.={token[:12]}...")
+    return payload
+
 
 
 # ---------- API: РЕГИСТРАЦИЯ ----------
@@ -320,8 +335,8 @@ async def login(request: Request):
 # ---------- API: ПОЛУЧИТЬ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ ----------
 
 @app.get("/api/me")
-async def me(authorization: Optional[str] = None):
-    payload = await auth_user(authorization)
+async def me(request: Request):
+    payload = await auth_user(request)
     if not payload:
         raise HTTPException(401, "Не авторизован")
     row = await db.fetchrow(
@@ -335,8 +350,8 @@ async def me(authorization: Optional[str] = None):
 # ---------- API: СПИСОК ПОЛЬЗОВАТЕЛЕЙ ----------
 
 @app.get("/api/users")
-async def list_users(authorization: Optional[str] = None):
-    payload = await auth_user(authorization)
+async def list_users(request: Request):
+    payload = await auth_user(request)
     if not payload:
         raise HTTPException(401, "Не авторизован")
 
@@ -356,8 +371,9 @@ async def list_users(authorization: Optional[str] = None):
 # ---------- API: ИСТОРИЯ ПЕРЕПИСКИ ----------
 
 @app.get("/api/messages/{peer_id}")
-async def get_messages(peer_id: int, before: int = 0, authorization: Optional[str] = None):
-    payload = await auth_user(authorization)
+async def get_messages(peer_id: int, before: int = 0, request: Request = None):
+    # request инжектируется FastAPI (объект Request)
+    payload = await auth_user(request)
     if not payload:
         raise HTTPException(401, "Не авторизован")
     me_id = int(payload["sub"])
@@ -400,8 +416,8 @@ async def get_messages(peer_id: int, before: int = 0, authorization: Optional[st
 # ---------- API: ОТПРАВКА СООБЩЕНИЯ (HTTP fallback) ----------
 
 @app.post("/api/send")
-async def send_message(request: Request, authorization: Optional[str] = None):
-    payload = await auth_user(authorization)
+async def send_message(request: Request):
+    payload = await auth_user(request)
     if not payload:
         raise HTTPException(401, "Не авторизован")
     me_id = int(payload["sub"])
@@ -1008,8 +1024,9 @@ async function sendMessage() {
 //  WEBSOCKET
 // ============================================================
 function connectWS() {
+  if (!TOKEN) return;                       // не подключаемся без токена
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?token=${TOKEN}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(TOKEN)}`);
 
   ws.onmessage = (e) => {
     let data;
