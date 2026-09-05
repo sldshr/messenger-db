@@ -1,5 +1,35 @@
+# -*- coding: utf-8 -*-
+"""
+=============================
+ YouTube → Hugging Face Datasets
+ Прямая загрузка без использования диска
+=============================
+
+Бэкенд на FastAPI для RunxBuild (uvicorn app:app).
+
+КЛЮЧЕВЫЕ ОГРАНИЧЕНИЯ (важно соблюдать):
+  1. Временного диска НЕТ (0 МБ). Мы НИКОГДА не пишем файлы на диск.
+  2. Память — строго 512 МБ RAM. Скрипт работает неделями и качает файлы по 1 ГБ+.
+  3. Стриминг на лету: yt-dlp отдаёт только DIRECT URL стрима, который мы читаем
+     через requests.get(stream=True) чанками по 10 МБ и сразу передаём в HF.
+  4. ffmpeg НЕ используется: выбираем только готовые «single-file» форматы
+     (ext=mp4), где видео и аудио уже объединены (например 360p/720p).
+  5. После каждого видео вызываем gc.collect(). Все данные (очередь, логи,
+     статистика) хранятся в лёгких списках/словарях с лимитами на размер.
+
+Запуск:
+    uvicorn app:app --host 0.0.0.0 --port 8000
+
+Переменные окружения:
+    HF_TOKEN  — токен Hugging Face (обязательно, доступ на запись в датасет).
+    REPO_ID   — id датасета вида "user/my-dataset" (обязательно).
+"""
+
 import asyncio
 import gc
+import hashlib
+import io
+import json
 import os
 import re
 import time
@@ -148,6 +178,32 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
     return name[:max_len]
 
 
+# Протоколы, которые можно качать ОДНИМ прямым потоком (не плейлисты).
+# m3u8/mhtml — это HLS/манифесты: их нельзя залить как готовый файл.
+_DIRECT_PROTOCOLS = {"https", "http", "https_dash_seeks", "http_dash_seeks"}
+
+
+def _is_direct_stream(fmt) -> bool:
+    """
+    True, если формат отдаётся одним прямым байтовым потоком (DASH/progressive),
+    а не HLS-манифестом или RTMP. Только такие форматы можно заливать стримом.
+    """
+    if not isinstance(fmt, dict):
+        return False
+    protocol = str(fmt.get("protocol") or "")
+    if not protocol:
+        # Протокол не указан — считаем прямым (как правила yt-dlp для fallback).
+        return True
+    if protocol.startswith(("m3u8", "mhtml", "rtsp", "rtmp")):
+        return False
+    if protocol in _DIRECT_PROTOCOLS:
+        return True
+    # https_dash_seeks / http_dash_seeks / и т.п.
+    if "_dash_seeks" in protocol or protocol.endswith("-dash"):
+        return True
+    return True
+
+
 def _extract_direct_url(info, format_id):
     """
     Достаёт DIRECT URL стрима из словаря info для выбранного формата.
@@ -182,11 +238,13 @@ def _extract_direct_url(info, format_id):
     if not isinstance(fmt, dict):
         return None, None, None
 
+    # HLS/манифест или не сетевой формат — не можем залить одним прямом стримом.
+    if not _is_direct_stream(fmt):
+        return None, None, None
+
     url = fmt.get("url")
     if not url:
         return None, None, None
-
-    # Должна быть видео-дорожка (без видео файл заливать бессмысленно).
     vcodec = str(fmt.get("vcodec") or "")
     if "none" in vcodec or not vcodec:
         return None, None, None
@@ -220,6 +278,8 @@ def _get_available_formats(info):
             continue  # чисто аудио-поток
         if not f.get("url"):
             continue
+        if not _is_direct_stream(f):
+            continue  # m3u8/mhtml — плейлисты, не готовый файл
         height = f.get("height") or 0
         filesize = f.get("filesize") or f.get("filesize_approx")
         # kind = "combined" если видео+аудио уже вместе, иначе "video_only".
@@ -241,97 +301,251 @@ def _get_available_formats(info):
 
 # ---------------------------------------------------------------------------
 # ЗАГРУЗКА В HUGGING FACE (прямой стриминг чанками, без диска)
+# Современный протокол HF Hub (2025+): LFS batch -> PUT -> verify -> commit
 # ---------------------------------------------------------------------------
 
-def hf_upload_stream(direct_url: str, filename: str, filesize, progress_cb=None):
+# Заголовки git-lfs для batch-запроса.
+LFS_HEADERS = {
+    "Accept": "application/vnd.git-lfs+json",
+    "Content-Type": "application/vnd.git-lfs+json",
+}
+
+
+_STREAM_HEADERS = {
+    # Play-запросы к googlevideo/CDN работают только с «браузерным» UA.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    # Требуем сырые байты без сжатия (видео уже сжато, gzip-обёртки не нужны;
+    # м3u8-манифесты мы и так отфильтровали — но «identity» лишним не будет).
+    "Accept-Encoding": "identity",
+}
+
+
+def _open_stream(url):
+    """Открывает поток прямой ссылки с правильными заголовками."""
+    return requests.get(url, stream=True, timeout=300, headers=_STREAM_HEADERS)
+
+
+def stream_sha256(direct_url, progress_cb=None):
     """
-    Скачиваем видео по direct_url и грузим его в HF Datasets прямо из памяти,
-    чанками по CHUNK_SIZE. Никаких файлов на диске.
+    ПРОХОД 1: потоково читает видео из YouTube и вычисляет sha256 + точный размер.
 
-    Используется «решумаблий» (resumable) протокол загрузки HF Hub:
-      1) POST  {endpoint}/api/datasets/{repo_id}/upload/{filename}  -> upload_url
-      2) PUT   {upload_url}  с заголовком X-Upload-Part: {n}, тело = чанк (10 МБ)
-      3) PUT   {upload_url}  с заголовком X-Upload-Parts: {total}  -> commit_url
-
-    Память: в любой момент времени держим максимум один чанк (10 МБ) + небольшой
-    служебный буфер requests. Это безопасно для лимита в 512 МБ RAM даже при
-    файлах по 1 ГБ+.
-
-    Возвращает commit_url (ссылку на датасет).
-    progress_cb(bytes_so_far) вызывается после каждого чанка.
+    Ничего не хранит: каждый чанк (10 МБ) мгновенно идёт в хеш и освобождается.
+    Возвращает (oid_hex, size_bytes).
     """
-    auth_headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-
-    # 1) Инициализация загрузки: получаем upload_url (внутри S3/CDN).
-    init_url = f"{HF_ENDPOINT}/api/datasets/{REPO_ID}/upload/{filename}"
-    resp = requests.post(init_url, headers=auth_headers, timeout=60)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"HF init upload failed: HTTP {resp.status_code}: {resp.text[:300]}"
-        )
-    payload = resp.json()
-    upload_url = payload.get("upload_url") or payload.get("url")
-    if not upload_url:
-        raise RuntimeError(f"HF init upload: нет upload_url в ответе: {resp.text[:300]}")
-    log("info", f"HF: инициализирована загрузка файла {filename}")
-
-    # 2) Скачиваем стрим чанками и отправляем каждый чанк как отдельную часть.
-    part_number = 0
-    total_uploaded = 0
-
-    r = requests.get(direct_url, stream=True, timeout=300)
+    sha = hashlib.sha256()
+    total = 0
+    r = _open_stream(direct_url)
     try:
         if r.status_code != 200:
-            raise RuntimeError(
-                f"Не удалось скачать стрим: HTTP {r.status_code} для {direct_url[:120]}"
-            )
+            raise RuntimeError(f"Не удалось скачать стрим (HTTP {r.status_code})")
         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
             if not chunk:
                 continue
-            # Заголовок X-Upload-Part указывает номер части (0-based).
-            part_headers = {
-                **auth_headers,
-                "X-Upload-Part": str(part_number),
-                "Content-Type": "application/octet-stream",
-            }
-            up = requests.put(upload_url, headers=part_headers, data=chunk, timeout=300)
-            if up.status_code != 200:
-                raise RuntimeError(
-                    f"Upload part {part_number} failed: HTTP {up.status_code}: {up.text[:300]}"
-                )
-            part_number += 1
-            total_uploaded += len(chunk)
+            sha.update(chunk)
+            total += len(chunk)
             if progress_cb:
-                progress_cb(total_uploaded)
-
-            # Локально освобождаем чанк — важный момент для контроля памяти.
+                progress_cb(total)
             del chunk
     finally:
         r.close()
+    if total == 0:
+        raise RuntimeError("Видео пустое: не получено ни одного байта.")
+    return sha.hexdigest(), total
 
-    if part_number == 0:
-        raise RuntimeError("Видео пустое: не получено ни одного байта стрима.")
 
-    # 3) Финализация: сообщаем HF количество загруженных частей.
-    final_headers = {
-        **auth_headers,
-        "X-Upload-Parts": str(part_number),
-        "Content-Type": "application/json",
-    }
-    fin = requests.put(upload_url, headers=final_headers, data=b"{}", timeout=120)
-    if fin.status_code != 200:
+class YouTubeStreamFile:
+
+    """
+    File-like объект для потокового PUT в LFS.
+
+    - Лениво открывает сетевой поток при первом read().
+    - Виртуальный seek/tell: размер известен заранее (из pass-1), поэтому
+      requests выставит Content-Length = size (для S3 это обязательно).
+    - В памяти в любой момент максимум CHUNK_SIZE байт.
+    Поток однонаправленный, используется один раз.
+    """
+
+    def __init__(self, url, size, progress_cb=None):
+        self._url = url
+        self._size = size
+        self._progress_cb = progress_cb
+        self._resp = None
+        self._iterator = None
+        self._buffer = b""
+        self._pos = 0
+
+    def _open(self):
+        if self._resp is None:
+            r = _open_stream(self._url)
+            if r.status_code != 200:
+                r.close()
+                raise RuntimeError(f"Не удалось скачать стрим (HTTP {r.status_code})")
+            self._resp = r
+            self._iterator = r.iter_content(chunk_size=CHUNK_SIZE)
+
+    def read(self, size=-1):
+        self._open()
+        if size is None or size < 0:
+            out = self._buffer
+            self._buffer = b""
+            for chunk in self._iterator:
+                out += chunk
+            self._pos += len(out)
+            if self._progress_cb:
+                self._progress_cb(self._pos)
+            return out
+        while len(self._buffer) < size:
+            try:
+                chunk = next(self._iterator)
+            except StopIteration:
+                break
+            self._buffer += chunk
+        out = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        self._pos += len(out)
+        if self._progress_cb:
+            self._progress_cb(self._pos)
+        return out
+
+    def seek(self, offset, whence=0):
+        # Виртуальная навигация: до первого read() не трогает сетевой поток.
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        elif whence == 2:
+            self._pos = self._size + offset
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def fileno(self):
+        raise io.UnsupportedOperation("stream has no fileno")
+
+    def close(self):
+        if self._resp is not None:
+            self._resp.close()
+            self._resp = None
+
+
+def hf_upload_stream(direct_url, filename, oid, size, progress_cb=None):
+    """
+    ПРОХОД 2: заливает уже «захешированный» файл в HF Datasets.
+
+    Схема (актуальный протокол HF Hub; старый /upload/{filename} упразднён):
+      1) POST {HF}/datasets/{repo}.git/info/lfs/objects/batch (transfers=["basic"])
+         -> actions.upload.href (прямой URL в S3); если actions нет — объект уже есть
+      2) PUT {upload.href} — стримим видео из YouTube прямо в S3
+      3) POST {verify.href} — если сервер вернул verify-шаг
+      4) POST {HF}/api/datasets/{repo}/commit/main — NDJSON {"key":"lfsFile", ...}
+
+    Память: в любой момент максимум один чанк (10 МБ).
+    Возвращает commit_url.
+    """
+    auth = {"Authorization": f"Bearer {HF_TOKEN}"}
+    batch_url = f"{HF_ENDPOINT}/datasets/{REPO_ID}.git/info/lfs/objects/batch"
+
+    # 1) LFS batch. Просим ONLY "basic"-трансфер (один PUT). Multipart требует
+    #    seek назад, чего нет у однонаправленного сетевого потока.
+    resp = requests.post(
+        batch_url,
+        headers={**LFS_HEADERS, **auth},
+        json={
+            "operation": "upload",
+            "transfers": ["basic"],
+            "objects": [{"oid": oid, "size": size}],
+            "hash_algo": "sha256",
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"LFS batch failed: HTTP {resp.status_code}: {resp.text[:400]}")
+    objects = resp.json().get("objects") or []
+    if not objects:
+        raise RuntimeError(f"LFS batch: пустой список objects: {resp.text[:300]}")
+    obj = objects[0]
+    if obj.get("error"):
+        raise RuntimeError(f"LFS batch error: {obj['error']}")
+
+    actions = obj.get("actions") or {}
+    upload_action = actions.get("upload")
+
+    if upload_action is None:
+        # Объект с таким sha256 уже есть на HF — тело не загружаем.
+        log("info", "LFS: объект уже существует на HF, тело не загружаем")
+    else:
+        upload_href = upload_action.get("href")
+        if not upload_href:
+            raise RuntimeError(f"LFS batch: нет href для upload: {obj}")
+        if (upload_action.get("header") or {}).get("chunk_size"):
+            raise RuntimeError(
+                "HF выбрал multipart-протокол (chunk_size), но он требует seek "
+                "назад, а стрим однонаправленный. Попробуйте ещё раз."
+            )
+
+        # 2) PUT тела: requests сам выставит Content-Length = size через
+        #    виртуальный seek/tell обёртки YouTubeStreamFile.
+        log("info", f"LFS: загрузка тела {size / 1024 / 1024:.1f} МБ в S3...")
+        stream = YouTubeStreamFile(direct_url, size, progress_cb)
+        try:
+            put_resp = requests.put(
+                upload_href,
+                data=stream,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=6 * 60 * 60,  # до 6 часов на большой файл
+            )
+            if put_resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"LFS PUT failed: HTTP {put_resp.status_code}: {put_resp.text[:300]}"
+                )
+        finally:
+            stream.close()
+
+        # 3) Verify (если сервер его вернул)
+        verify_action = actions.get("verify")
+        if verify_action and verify_action.get("href"):
+            ver_resp = requests.post(
+                verify_action["href"],
+                headers={**LFS_HEADERS, **auth},
+                json={"oid": oid, "size": size},
+                timeout=120,
+            )
+            if ver_resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"LFS verify failed: HTTP {ver_resp.status_code}: {ver_resp.text[:300]}"
+                )
+
+    # 4) Коммит через актуальный endpoint /commit/main (NDJSON).
+    commit_url = f"{HF_ENDPOINT}/api/datasets/{REPO_ID}/commit/main"
+    ndjson_lines = [
+        {"key": "header", "value": {"summary": f"Upload {filename}", "description": ""}},
+        {"key": "lfsFile", "value": {
+            "path": filename, "algo": "sha256", "oid": oid, "size": size,
+        }},
+    ]
+    ndjson_body = "".join(json.dumps(item) + "\n" for item in ndjson_lines)
+    com_resp = requests.post(
+        commit_url,
+        headers={"Content-Type": "application/x-ndjson", **auth},
+        data=ndjson_body.encode("utf-8"),
+        timeout=120,
+    )
+    if com_resp.status_code not in (200, 201):
         raise RuntimeError(
-            f"Finalize upload failed: HTTP {fin.status_code}: {fin.text[:300]}"
+            f"Commit failed: HTTP {com_resp.status_code}: {com_resp.text[:400]}"
         )
-    commit_data = fin.json()
-    commit_url = (
+    commit_data = com_resp.json()
+    hf_commit_url = (
         commit_data.get("commitUrl")
         or commit_data.get("commit_url")
-        or f"{HF_ENDPOINT}/datasets/{REPO_ID}"
+        or f"{HF_ENDPOINT}/datasets/{REPO_ID}/tree/main"
     )
-
-    log("info", f"HF: загрузка завершена, {part_number} частей, commit_url укорочен {filename[:40]}...")
-    return commit_url
+    log("info", f"HF: коммит создан, файл {filename}")
+    return hf_commit_url
 
 # ---------------------------------------------------------------------------
 # ЯДРО ОБРАБОТКИ ОДНОГО ВИДЕО
@@ -420,10 +634,19 @@ async def process_video(task: dict):
             pass
         gc.collect()
 
-        # --- Шаг 2: стриминг direct_url в HF ---
+        # --- Шаг 2a: ПРОХОД 1 — sha256 + точный размер (не хранит данные) ---
         filename = f"{VIDEO_FOLDER}/{sanitize_filename(title)}_{task_id[:8]}.mp4"
-        task["message"] = "Скачивание и загрузка в Hugging Face..."
-        commit_url = hf_upload_stream(direct_url, filename, filesize, progress_cb)
+        task["message"] = "Шаг 1/2: вычисление SHA-256... "
+        oid, real_size = stream_sha256(direct_url, progress_cb)
+        task["total_bytes"] = real_size
+        log("info", f"Хеш готов: {real_size / 1024 / 1024:.1f} МБ, oid={oid[:12]}...")
+
+        # --- Шаг 2b: ПРОХОД 2 — загрузка тела в LFS + коммит ---
+        task["message"] = "Шаг 2/2: загрузка в Hugging Face..."
+        task["bytes_downloaded"] = 0
+        task["_speed_prev"] = 0
+        task["_speed_start"] = time.time()
+        commit_url = hf_upload_stream(direct_url, filename, oid, real_size, progress_cb)
 
         # --- Шаг 3: финал, статистика, «база данных» ---
         downloaded = task["bytes_downloaded"]
@@ -515,6 +738,10 @@ async def worker_loop():
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="YouTube → Hugging Face Datasets uploader")
+
+# Алиас для максимальной совместимости с платформами, которые ищут
+# `application` или `app` в качестве ASGI-приложения.
+application = app
 
 # Разрешаем CORS (нужно, если фронтенд открыт с другого origin).
 app.add_middleware(
