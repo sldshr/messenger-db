@@ -1,2 +1,4 @@
 uvicorn
 supabase
+aiohttp==3.11.11
+PyJWT==2.10.1
