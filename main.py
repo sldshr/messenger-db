@@ -151,6 +151,11 @@ class Database:
                 min_size=1,
                 max_size=5,          # мало соединений => мало памяти
                 command_timeout=30,
+                # ВАЖНО для Supabase pooler (pgbouncer transaction mode):
+                # asyncpg кэширует prepared statements, а pgbouncer их не
+                # переживает -> периодические 500 InvalidSQLStatementNameError.
+                # statement_cache_size=0 полностью отключает кэш.
+                statement_cache_size=0,
             )
         return self._pool
 
@@ -159,26 +164,65 @@ class Database:
             await self._pool.close()
             self._pool = None
 
+    @staticmethod
+    def _retryable(exc: Exception) -> bool:
+        """Ошибки, после которых запрос можно безопасно повторить."""
+        if isinstance(exc, (TimeoutError, ConnectionRefusedError, ConnectionResetError)):
+            return True
+        PG = getattr(asyncpg, "exceptions", None)
+        if PG is not None:
+            return isinstance(exc, (
+                PG.InvalidSQLStatementNameError,
+                PG.ConnectionDoesNotExistError,
+                PG.InterfaceError,
+                PG.TooManyConnectionsError,
+            ))
+        return False
+
     async def execute(self, query, *args):
-        pool = await self.connect()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                return await conn.execute(query, *args)
+        for attempt in range(3):
+            pool = await self.connect()
+            try:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        return await conn.execute(query, *args)
+            except Exception as exc:
+                if attempt == 2 or not self._retryable(exc):
+                    raise
+                await asyncio.sleep(0.15 * (attempt + 1))
 
     async def fetchrow(self, query, *args):
-        pool = await self.connect()
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
+        for attempt in range(3):
+            pool = await self.connect()
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetchrow(query, *args)
+            except Exception as exc:
+                if attempt == 2 or not self._retryable(exc):
+                    raise
+                await asyncio.sleep(0.15 * (attempt + 1))
 
     async def fetchval(self, query, *args):
-        pool = await self.connect()
-        async with pool.acquire() as conn:
-            return await conn.fetchval(query, *args)
+        for attempt in range(3):
+            pool = await self.connect()
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetchval(query, *args)
+            except Exception as exc:
+                if attempt == 2 or not self._retryable(exc):
+                    raise
+                await asyncio.sleep(0.15 * (attempt + 1))
 
     async def fetch(self, query, *args):
-        pool = await self.connect()
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
+        for attempt in range(3):
+            pool = await self.connect()
+            try:
+                async with pool.acquire() as conn:
+                    return await conn.fetch(query, *args)
+            except Exception as exc:
+                if attempt == 2 or not self._retryable(exc):
+                    raise
+                await asyncio.sleep(0.15 * (attempt + 1))
 
 
 db = Database()
@@ -754,9 +798,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .chat-input textarea:focus { border-color: var(--accent); }
   .chat-input button {
-    align-self: flex-end; padding: 12px 20px; border: none;
+    align-self: flex-end; padding: 12px 16px; border: none;
     border-radius: 10px; background: var(--accent); color: #fff;
     font-size: 15px; font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
   }
   .chat-input button:hover { background: var(--accent-dark); }
   .empty-chat { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 16px; }
@@ -773,7 +818,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .back-btn { display: inline-flex; background: none; border: none; color: var(--text); font-size: 20px; cursor: pointer; margin-right: 4px; }
     .msg { max-width: 80%; }
   }
-  .back-btn { display: none; }
+  .back-btn { display: none; cursor: pointer; align-items: center; justify-content: center; background: none; border: none; color: var(--text); }
   /* Welcome (чат не выбран) */
   .welcome {
     flex: 1; display: flex; align-items: center; justify-content: center;
@@ -799,7 +844,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 16px 20px; border-bottom: 1px solid #1f232c;
   }
   .modal-header h3 { font-size: 18px; }
-  .modal-close { background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; line-height: 1; }
+  .modal-close { background: none; border: none; color: var(--muted); font-size: 24px; cursor: pointer; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
   .modal-close:hover { color: var(--danger); }
   .modal-body { padding: 20px; display: flex; flex-direction: column; gap: 14px; }
   .modal-body textarea {
@@ -821,13 +866,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     width: 100%; height: 100%; border-radius: 50%; object-fit: cover;
   }
   /* Кнопки в me */
-  .me .logout { padding: 6px 10px; font-size: 13px; border-radius: 6px; border: 1px solid #2a2f3a; }
+  .me .logout { padding: 6px 10px; font-size: 13px; border-radius: 6px; border: 1px solid #2a2f3a; cursor: pointer; background: #0f1115; color: var(--muted); }
+  .me .logout:hover { color: var(--text); }
+  .me .icon-btn { display: inline-flex; align-items: center; justify-content: center; padding: 6px 8px; }
   .side-tabs {
     display: flex; gap: 6px; padding: 0 12px 8px;
   }
   .side-tab {
     flex: 1; padding: 8px; border-radius: 8px; border: 1px solid #2a2f3a;
     background: #0f1115; color: var(--text); cursor: pointer; font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     text-align: center;
   }
   .side-tab.active { background: rgba(79,140,255,.18); border-color: var(--accent); }
@@ -867,22 +915,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="me">
       <div class="avatar" id="meAvatar" onclick="openProfile()">?</div>
       <div class="name" id="meName" onclick="openProfile()">—</div>
-      <button class="logout" title="Профиль" onclick="openProfile()">⚙</button>
+      <button class="logout icon-btn" title="Профиль" onclick="openProfile()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
       <button class="logout" title="Выйти" onclick="logout()">Выход</button>
     </div>
     <div class="search-box">
       <input type="text" id="userSearch" placeholder="Поиск собеседника..." oninput="onSearch()">
     </div>
     <div class="side-tabs">
-      <button class="side-tab active" id="tabDialogs" onclick="setTab('dialogs')">💬 Диалоги</button>
-      <button class="side-tab" id="tabUsers" onclick="setTab('users')">👥 Люди</button>
+      <button class="side-tab active" id="tabDialogs" onclick="setTab('dialogs')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>Диалоги</span>
+      </button>
+      <button class="side-tab" id="tabUsers" onclick="setTab('users')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Люди</span>
+      </button>
     </div>
     <div class="users-list" id="usersList"></div>
   </div>
 
   <div class="chat" id="chat">
     <div class="chat-header">
-      <button class="back-btn" onclick="closeChatMobile()">←</button>
+      <button class="back-btn" onclick="closeChatMobile()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      </button>
       <div class="avatar" id="peerAvatar">?</div>
       <div>
         <div class="name" id="peerName">—</div>
@@ -894,14 +952,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="chat-input">
       <textarea id="msgInput" placeholder="Введите сообщение..." rows="1"
         onkeydown="onInputKey(event)"></textarea>
-      <button onclick="sendMessage()">➤</button>
+      <button class="send-btn" onclick="sendMessage()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
     </div>
   </div>
 
   <!-- ===== ПУСТОЙ СТАРТ (когда чат не открыт) ===== -->
   <div class="welcome" id="welcome">
     <div class="welcome-box">
-      <div class="welcome-icon">💬</div>
+      <div class="welcome-icon">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </div>
       <h2>Выберите собеседника</h2>
       <p>Откройте диалог слева, чтобы начать переписку</p>
     </div>
@@ -913,7 +975,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="modal">
     <div class="modal-header">
       <h3>Мой профиль</h3>
-      <button class="modal-close" onclick="closeProfile()">×</button>
+      <button class="modal-close" onclick="closeProfile()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
     </div>
     <div class="modal-body">
       <div class="profile-avatar-preview" id="profileAvatarPreview" onclick="document.getElementById('avatarInput').click()">
@@ -1108,7 +1172,7 @@ function renderSidebar() {
 function renderDialogs() {
   const list = document.getElementById('usersList');
   if (dialogs.length === 0) {
-    list.innerHTML = `<div class="empty-list">Пока нет диалогов.<br>Нажмите «👥 Люди», чтобы найти собеседника.</div>`;
+    list.innerHTML = `<div class="empty-list">Пока нет диалогов.<br>Нажмите «<svg style="vertical-align:-3px" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> Люди», чтобы найти собеседника.</div>`;
     return;
   }
   // учитываем поиск
@@ -1202,7 +1266,14 @@ async function openChat(peerId) {
   // ВСЕГДА тянем свежую историю из БД (чтобы переписка появлялась)
   try {
     const data = await api('/api/messages/' + peerId);
-    messagesCache[peerId] = data.messages || [];
+    const fresh = data.messages || [];
+    // Сохраняем те temp-сообщения, которых ещё нет в истории
+    const existing = messagesCache[peerId] || [];
+    const pendingTemps = existing.filter(x =>
+      typeof x.id === 'string' && x.id.indexOf('temp-') === 0 &&
+      !fresh.some(m => m.content === x.content && m.sender_id === ME.id)
+    );
+    messagesCache[peerId] = fresh.concat(pendingTemps);
   } catch (e) {
     if (!messagesCache[peerId]) messagesCache[peerId] = [];
   }
@@ -1357,27 +1428,23 @@ async function sendMessage() {
 
   // Оптимистично показываем сообщение сразу (без ожидания сервера)
   const tempMsg = {
-    id: 'temp-' + Date.now(),
+    id: 'temp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
     sender_id: ME.id,
     receiver_id: activePeer,
     content,
     created_at: new Date().toISOString(),
   };
-  if (!messagesCache[activePeer]) messagesCache[activePeer] = [];
-  messagesCache[activePeer].push(tempMsg);
+  pushMessage(activePeer, tempMsg);
   renderMessages();
   scrollToBottom();
 
-  // Try WS first (fast realtime), fallback to HTTP
+  // Отправляем ВСЕГДА через HTTP POST (гарантированно доходит и сохраняется).
+  // Эхо от сервера придёт по WS и заменит временное сообщение на настоящее.
   try {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'message', receiver_id: activePeer, content }));
-    } else {
-      await api('/api/send', {
-        method: 'POST',
-        body: JSON.stringify({ receiver_id: activePeer, content })
-      });
-    }
+    await api('/api/send', {
+      method: 'POST',
+      body: JSON.stringify({ receiver_id: activePeer, content })
+    });
     // Обновляем список диалогов (превью последнего сообщения)
     await loadDialogs();
     renderSidebar();
@@ -1388,6 +1455,31 @@ async function sendMessage() {
     alert(e.message);
   }
   el.focus();
+}
+
+// Добавляет сообщение в кэш БЕЗ дубликатов.
+// WS-эхо подтверждает моё оптимистичное сообщение: temp-запись ЗАМЕНЯЕТСЯ
+// на настоящую (на том же месте, чтобы сохранить порядок).
+// Повторные эхо с одинаковым id игнорируются.
+function pushMessage(peerId, m) {
+  if (!messagesCache[peerId]) messagesCache[peerId] = [];
+  const arr = messagesCache[peerId];
+
+  // Предотвращаем дубликаты по реальному id
+  if (typeof m.id === 'number' && arr.some(x => x.id === m.id)) return;
+
+  // Серверное подтверждение моего оптимистичного сообщения (temp-...)
+  if (typeof m.id === 'number' && m.sender_id === ME.id) {
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const x = arr[i];
+      if (typeof x.id === 'string' && x.id.indexOf('temp-') === 0 &&
+          x.sender_id === ME.id && x.content === m.content) {
+        arr[i] = m;      // заменяем на месте, сохраняя позицию
+        return;
+      }
+    }
+  }
+  arr.push(m);
 }
 
 // ============================================================
@@ -1404,10 +1496,9 @@ function connectWS() {
 
     if (data.type === 'message') {
       const m = data.message;
-      // add to cache for the involved chats
+      // add to cache for the involved chats (без дубликатов)
       const peerId = (m.sender_id === ME.id) ? m.receiver_id : m.sender_id;
-      if (!messagesCache[peerId]) messagesCache[peerId] = [];
-      messagesCache[peerId].push(m);
+      pushMessage(peerId, m);
 
       // If it's the active chat, rerender
       if (peerId === activePeer) {
