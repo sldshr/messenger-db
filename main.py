@@ -14,7 +14,7 @@ from typing import Optional, Dict, List
 
 # ---------- ЗАГРУЗКА .env (без внешних зависимостей) ----------
 def _load_env_file(path: str = ".env"):
-    """Примитивный парсер .env (VARIABLE=value). Возвращает True при успехе."""
+    """Примтивный парсер .env (VARIABLE=value). Возвращает True при успехе."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
