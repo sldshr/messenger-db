@@ -7,10 +7,9 @@ import uuid
 from typing import Dict, List, Optional
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, status, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status, Depends
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -19,9 +18,6 @@ SECRET_KEY = os.getenv("SECRET_KEY", "discord-ram-chat-secret-key-12345")
 
 app = FastAPI(title="RAM Discord-like Server Platform")
 
-# Добавляем middleware сессий
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,6 +25,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ОЗУ структура хранилища сессий (без сторонних зависимостей типа itsdangerous)
+sessions_db: Dict[str, dict] = {}
 
 # ОЗУ структура серверов
 # {
@@ -61,44 +60,67 @@ def generate_server_code(length: int = 6) -> str:
             return code
 
 
+def get_current_user(request: Request) -> Optional[dict]:
+    """Получение авторизованного пользователя из Cookie/ОЗУ сессий."""
+    session_id = request.cookies.get("session_id")
+    if session_id and session_id in sessions_db:
+        return sessions_db[session_id]
+    return None
+
+
 @app.get("/api/me")
 async def get_me(request: Request):
     """Получение текущего залогиненного пользователя."""
-    user = request.session.get("user")
+    user = get_current_user(request)
     if not user:
         return {"authenticated": False}
     return {"authenticated": True, "user": user}
 
 
 @app.post("/api/login")
-async def login(request: Request, nickname: str):
-    """Вход по никнейму."""
+async def login(nickname: str):
+    """Вход по никнейму с сохранением сессии в ОЗУ."""
     nickname = nickname.strip()
     if not nickname:
         raise HTTPException(status_code=400, detail="Никнейм не может быть пустым")
     
+    session_id = str(uuid.uuid4())
     user_id = str(uuid.uuid4())
     avatar_url = f"https://api.dicebear.com/7.x/bottts/svg?seed={nickname}"
     
-    request.session["user"] = {
+    user_data = {
         "id": user_id,
         "nickname": nickname,
         "picture": avatar_url
     }
-    return {"status": "ok", "user": request.session["user"]}
+    sessions_db[session_id] = user_data
+
+    response = JSONResponse(content={"status": "ok", "user": user_data})
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        max_age=86400 * 30,
+        samesite="lax"
+    )
+    return response
 
 
 @app.get("/logout")
 async def logout(request: Request):
     """Выход из аккаунта."""
-    request.session.clear()
-    return RedirectResponse("/")
+    session_id = request.cookies.get("session_id")
+    if session_id in sessions_db:
+        del sessions_db[session_id]
+    response = RedirectResponse("/")
+    response.delete_cookie("session_id")
+    return response
 
 
 @app.post("/api/create-server")
 async def create_server(req: CreateServerRequest, request: Request):
     """Создание нового сервера с Discord-структурой каналов."""
-    user = request.session.get("user")
+    user = get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Необходима авторизация")
 
@@ -130,7 +152,7 @@ async def create_server(req: CreateServerRequest, request: Request):
 @app.get("/api/server/{code}")
 async def get_server_info(code: str, request: Request):
     """Получение информации о сервере."""
-    user = request.session.get("user")
+    user = get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="Необходима авторизация")
 
