@@ -386,6 +386,29 @@ async def get_index():
             body.obs-mode .chat-main-area { background-color: transparent !important; }
             body.obs-mode #chat-window { padding-bottom: 40px; }
             body.obs-mode ::-webkit-scrollbar { display: none; }
+            
+            /* Twitch Style Chat for OBS */
+            body.obs-mode #chat-window {
+                justify-content: flex-end;
+                padding: 10px;
+                padding-bottom: 20px;
+            }
+            .twitch-msg {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                font-size: 18px;
+                font-weight: bold;
+                color: #ffffff;
+                text-shadow: 1px 1px 0 #000, -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 2px 2px 4px rgba(0,0,0,0.8);
+                margin-bottom: 8px;
+                line-height: 1.4;
+                word-wrap: break-word;
+                animation: fadeIn 0.3s ease-in;
+            }
+            .twitch-time { font-size: 0.75em; color: #cccccc; margin-right: 6px; }
+            .twitch-name { margin-right: 6px; }
+            .twitch-sys { color: #ffff00; font-style: italic; }
+            
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         </style>
     </head>
     <body>
@@ -454,13 +477,7 @@ async def get_index():
             </div>
         </div>
 
-        <footer class="site-footer">
-            <div class="footer-links">
-                <span data-i18n="sectionsTitle">Разделы:</span>
-                <a href="#" data-i18n="homeLink">Главная</a>
-                <a href="#" data-i18n="aboutLink">О нас</a>
-                <a href="#" data-i18n="contactLink">Контакты</a>
-            </div>
+        <footer class="site-footer" style="justify-content: flex-end;">
             <div class="footer-controls">
                 <button class="btn btn-default btn-sm" id="btn-toggle-lang"><i class="fa fa-language"></i> <span data-i18n="btnLang">English</span></button>
                 <button class="btn btn-default btn-sm" id="btn-toggle-theme"><i class="fa fa-moon-o"></i> <span data-i18n="btnTheme">Сменить тему</span></button>
@@ -609,11 +626,28 @@ async def get_index():
 
             const urlParams = new URLSearchParams(window.location.search);
             const obsCode = urlParams.get('obs');
+            const chatCode = urlParams.get('chat');
             
             if (obsCode) {
                 $('body').addClass('obs-mode');
                 currentNickname = "OBS_Viewer_" + Math.floor(Math.random() * 10000);
                 joinWebSocketRoom(obsCode);
+            }
+
+            // Восстановление никнейма из local storage
+            const savedNick = localStorage.getItem('irc_nickname');
+            if (savedNick) {
+                $('#nickname-input').val(savedNick);
+                
+                // Если есть код комнаты в ссылке, автоматически сохраняем ник и входим
+                if (chatCode) {
+                    setTimeout(() => $('#btn-set-nickname').click(), 100);
+                }
+            }
+
+            // Авто-заполнение кода комнаты из ссылки
+            if (chatCode) {
+                $('#join-code-input').val(chatCode);
             }
 
             $('#btn-obs').click(function() {
@@ -627,11 +661,18 @@ async def get_index():
                 if (!val) { showToast(i18n[currentLang].nickError); return; }
                 
                 currentNickname = val;
+                localStorage.setItem('irc_nickname', currentNickname); // Сохраняем ник
+                
                 $('#nickname-input').prop('disabled', true);
                 $('#btn-set-nickname').prop('disabled', true).removeClass('btn-primary').addClass('btn-success').html('<i class="fa fa-check"></i>');
                 $('#nickname-hint').html('<b class="text-success">' + i18n[currentLang].nickSaved + currentNickname + '</b>');
                 
                 $('#actions-panel').css({'opacity': '1', 'pointer-events': 'auto'});
+                
+                // Авто-вход если комната указана в ссылке
+                if (chatCode && !socket) {
+                    $('#btn-join-room').click();
+                }
             });
 
             $('#nickname-input').keypress(function(e) { if (e.which === 13) $('#btn-set-nickname').click(); });
@@ -678,6 +719,14 @@ async def get_index():
                     $('#chat-page').css('display', 'flex');
                     $('#display-room-code').text(code);
                     $('#chat-window').empty();
+                    
+                    // Обновляем ссылку для сохранения сессии без перезагрузки страницы
+                    if (!$('body').hasClass('obs-mode')) {
+                        window.history.replaceState(null, '', '?chat=' + code);
+                    }
+                    
+                    // Автоматический фокус на поле ввода
+                    setTimeout(() => $('#msg-input').focus(), 100);
                 };
 
                 socket.onmessage = function(event) {
@@ -721,11 +770,19 @@ async def get_index():
                 $('.site-footer').css('display', 'flex');
                 currentRoomCode = "";
                 $('#users-list-ul').empty();
+                
+                // Очищаем ссылку при выходе
+                window.history.replaceState(null, '', '/');
             }
 
             function appendSystemMessage(text) {
                 const win = $('#chat-window');
-                win.append(`<div class="msg-system">${text}</div>`);
+                if ($('body').hasClass('obs-mode')) {
+                    win.append(`<div class="twitch-msg twitch-sys">${text}</div>`);
+                } else {
+                    win.append(`<div class="msg-system">${text}</div>`);
+                }
+                optimizeDOM(win);
                 win.scrollTop(win[0].scrollHeight);
             }
 
@@ -733,22 +790,42 @@ async def get_index():
                 const win = $('#chat-window');
                 const isSelf = sender === currentNickname;
                 const color = getAvatarColor(sender);
-                
-                const alignClass = isSelf ? "msg-row-self" : "msg-row-other";
-                const bubbleClass = isSelf ? "msg-self" : "msg-other";
-                
-                let senderHtml = !isSelf ? `<div class="msg-sender" style="color: ${color};">${escapeHtml(sender)}</div>` : "";
+                const isObs = $('body').hasClass('obs-mode');
 
-                win.append(`
-                    <div class="msg-row ${alignClass}">
-                        <div class="msg-bubble ${bubbleClass}">
-                            ${senderHtml}
-                            <div class="msg-text">${escapeHtml(text)}</div>
-                            <div class="msg-time">${time}</div>
+                if (isObs) {
+                    win.append(`
+                        <div class="twitch-msg">
+                            <span class="twitch-time">[${time}]</span>
+                            <span class="twitch-name" style="color: ${color};">${escapeHtml(sender)}:</span>
+                            <span class="twitch-text">${escapeHtml(text)}</span>
                         </div>
-                    </div>
-                `);
+                    `);
+                } else {
+                    const alignClass = isSelf ? "msg-row-self" : "msg-row-other";
+                    const bubbleClass = isSelf ? "msg-self" : "msg-other";
+                    
+                    let senderHtml = !isSelf ? `<div class="msg-sender" style="color: ${color};">${escapeHtml(sender)}</div>` : "";
+
+                    win.append(`
+                        <div class="msg-row ${alignClass}">
+                            <div class="msg-bubble ${bubbleClass}">
+                                ${senderHtml}
+                                <div class="msg-text">${escapeHtml(text)}</div>
+                                <div class="msg-time">${time}</div>
+                            </div>
+                        </div>
+                    `);
+                }
+                optimizeDOM(win);
                 win.scrollTop(win[0].scrollHeight);
+            }
+
+            // Оптимизация: Удаление старых сообщений, чтобы не засорять память в OBS и долгих сессиях
+            function optimizeDOM(win) {
+                const maxMessages = 150;
+                if (win.children().length > maxMessages) {
+                    win.children().first().remove();
+                }
             }
 
             function updateSidebar(users) {
