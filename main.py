@@ -1,457 +1,355 @@
-import os
-import uvicorn
-import hashlib
-import random
-import smtplib
 import asyncio
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict
+import json
+from collections import deque
+from typing import List, Set
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
-import jwt
-import asyncpg
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-JWT_SECRET = os.getenv("JWT_SECRET")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_EMAIL = "sldshr.confirmation@gmail.com"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30
+app = FastAPI(title="In-Memory Fast Streamer")
 
-if not DATABASE_URL or not JWT_SECRET:
-    raise RuntimeError("DATABASE_URL or JWT_SECRET is not set in env variables")
+# Хранение подключенных зрителей
+viewers: Set[WebSocket] = set()
 
-app = FastAPI(title="PySer API Optimized")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+# Хранение последних 50 сообщений чата в памяти
+chat_history = deque(maxlen=50)
 
-db_pool = None
-verification_codes: Dict[str, dict] = {}
-rate_limit_store: Dict[str, List[datetime]] = {}
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="ru" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>In-Memory Streamer</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+        .main-container {
+            flex-grow: 1;
+            display: flex;
+            padding: 15px;
+            gap: 15px;
+            height: 100%;
+        }
+        .stream-container {
+            flex: 3;
+            background-color: #000;
+            border-radius: 8px;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+        }
+        #streamImage {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        .live-indicator {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 0, 0, 0.8);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-family: monospace;
+            z-index: 10;
+        }
+        .chat-container {
+            flex: 1;
+            background-color: #1e1e1e;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            border: 1px solid #333;
+        }
+        .chat-header {
+            padding: 10px;
+            background-color: #2c2c2c;
+            border-bottom: 1px solid #444;
+            font-weight: bold;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }
+        .chat-messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 0.9em;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .chat-message {
+            word-wrap: break-word;
+        }
+        .chat-input-area {
+            padding: 10px;
+            background-color: #2c2c2c;
+            border-top: 1px solid #444;
+            border-bottom-left-radius: 8px;
+            border-bottom-right-radius: 8px;
+        }
+        @media (max-width: 768px) {
+            .main-container {
+                flex-direction: column;
+            }
+            .stream-container {
+                flex: none;
+                height: 50vh;
+            }
+            .chat-container {
+                flex: 1;
+            }
+        }
+    </style>
+</head>
+<body>
 
-@app.on_event("startup")
-async def startup():
-    global db_pool
-    # Ограничиваем пул соединений DB (max_size=4), чтобы сохранить ОЗУ на сервере 512MB
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=4,
-        max_inactive_connection_lifetime=300
-    )
+    <div class="main-container container-fluid">
+        <!-- Левая часть: Стрим -->
+        <div class="stream-container">
+            <div class="live-indicator">LIVE 50 FPS</div>
+            <img id="streamImage" src="" alt="Ожидание трансляции...">
+        </div>
 
-@app.on_event("shutdown")
-async def shutdown():
-    if db_pool:
-        await db_pool.close()
-
-class SendCodeReq(BaseModel):
-    email: str
-
-class UserRegister(BaseModel):
-    email: str
-    display_name: str
-    password: str
-    code: str
-
-class UserLogin(BaseModel):
-    email: str
-    code: str
-
-class LoginCodeReq(BaseModel):
-    email: str
-    password: str
-
-class ProfileUpdate(BaseModel):
-    display_name: Optional[str] = None
-    bio: Optional[str] = ""
-    avatar_base64: Optional[str] = ""
-
-class UserResponse(BaseModel):
-    id: int
-    email: str
-    display_name: str
-    bio: str
-    avatar_base64: str
-
-class FriendAdd(BaseModel):
-    email: str
-
-class FriendRequestResponse(BaseModel):
-    request_id: int
-    sender_id: int
-    sender_email: str
-    sender_display_name: str
-    avatar_base64: str
-
-class RequestAction(BaseModel):
-    request_id: int
-
-class BlockAction(BaseModel):
-    target_id: int
-
-class MessageEdit(BaseModel):
-    message_id: int
-    new_text: str
-
-class MessageAction(BaseModel):
-    message_id: int
-
-class MessageBulkAction(BaseModel):
-    message_ids: List[int]
-
-class MessageSend(BaseModel):
-    receiver_id: int
-    message: str
-    reply_to_id: Optional[int] = None
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)})
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
-
-async def get_current_user_id(token: str = Depends(oauth2_scheme)) -> int:
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        return int(payload.get("sub"))
-    except:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def is_rate_limited(key: str, max_requests: int = 3, window_seconds: int = 60) -> bool:
-    """Защита от спама: максимум max_requests за window_seconds"""
-    now = datetime.utcnow()
-    history = rate_limit_store.get(key, [])
-    history = [t for t in history if (now - t).total_seconds() < window_seconds]
-    rate_limit_store[key] = history
-    if len(history) >= max_requests:
-        return True
-    history.append(now)
-    return False
-
-def send_email_sync(receiver_email: str, code: str):
-    if not SMTP_PASSWORD:
-        return
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_EMAIL
-        msg['To'] = receiver_email
-        msg['Subject'] = "Код подтверждения PySer"
-        html = f"""
-        <html><body style="font-family: Arial, sans-serif; padding: 20px; text-align: center; background: #f9fafb;">
-            <div style="max-width: 400px; margin: 0 auto; background: white; padding: 30px; border-radius: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                <h2 style="color: #4F46E5; margin-bottom: 8px;">PySer Messenger</h2>
-                <p style="color: #4B5563;">Ваш одноразовый код доступа:</p>
-                <div style="background: #F3F4F6; padding: 15px; border-radius: 12px; margin: 20px 0;">
-                    <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #1F2937;">{code}</span>
-                </div>
+        <!-- Правая часть: Чат -->
+        <div class="chat-container">
+            <div class="chat-header">IRC Чат</div>
+            <div class="chat-messages" id="chatMessages">
+                <!-- Сообщения будут добавляться сюда -->
             </div>
-        </body></html>
-        """
-        msg.attach(MIMEText(html, 'html'))
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-    except Exception as e:
-        print("SMTP Error:", e)
+            <div class="chat-input-area">
+                <form id="chatForm" class="d-flex gap-2">
+                    <input type="text" id="chatInput" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Сообщение..." autocomplete="off">
+                    <button type="submit" class="btn btn-primary btn-sm">Отправить</button>
+                </form>
+            </div>
+        </div>
+    </div>
 
-async def generate_and_send_code(email: str):
-    email_clean = email.lower().strip()
-    code = str(random.randint(100000, 999999))
-    verification_codes[email_clean] = {
-        "code": code,
-        "expires": datetime.utcnow() + timedelta(minutes=10),
-        "attempts": 0
-    }
-    # Неблокирующий запуск отправки
-    asyncio.create_task(asyncio.to_thread(send_email_sync, email_clean, code))
+    <!-- Скрипт логики клиента -->
+    <script>
+        const streamImage = document.getElementById('streamImage');
+        const chatMessages = document.getElementById('chatMessages');
+        const chatForm = document.getElementById('chatForm');
+        const chatInput = document.getElementById('chatInput');
+        
+        let currentObjectURL = null;
 
-def verify_code(email: str, code: str):
-    email_clean = email.lower().strip()
-    record = verification_codes.get(email_clean)
-    if not record:
-        raise HTTPException(status_code=400, detail="Код не запрошен")
-    if datetime.utcnow() > record["expires"]:
-        del verification_codes[email_clean]
-        raise HTTPException(status_code=400, detail="Код истёк")
-    if record["code"] != code.strip():
-        record["attempts"] += 1
-        if record["attempts"] >= 3:
-            del verification_codes[email_clean]
-            raise HTTPException(status_code=400, detail="Попытки исчерпаны")
-        raise HTTPException(status_code=400, detail="Неверный код")
-    del verification_codes[email_clean]
+        // Определение URL для WebSocket
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws_viewer`;
+        
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'blob'; // Важно для приема бинарных данных
 
-@app.post("/auth/send-code")
-async def send_auth_code(req: SendCodeReq):
-    email_clean = req.email.lower().strip()
-    if is_rate_limited(email_clean, max_requests=3, window_seconds=60):
-        # Если превышен лимит, не шлем новое письмо, просто сообщаем что код уже отправлен
-        return {"msg": "Code already sent recently"}
+        ws.onopen = () => {
+            console.log("WebSocket подключен");
+            appendSystemMessage("Подключено к серверу.");
+        };
 
-    async with db_pool.acquire() as conn:
-        if await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", email_clean):
-            raise HTTPException(status_code=400, detail="Email taken")
-    await generate_and_send_code(email_clean)
-    return {"msg": "Code sent"}
+        ws.onclose = () => {
+            console.log("WebSocket отключен");
+            appendSystemMessage("Отключено от сервера. Попытка переподключения...");
+            // В реальном приложении здесь должна быть логика реконнекта
+        };
 
-@app.post("/register")
-async def register(user: UserRegister):
-    email_clean = user.email.lower().strip()
-    verify_code(email_clean, user.code)
-    async with db_pool.acquire() as conn:
-        if await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", email_clean):
-            raise HTTPException(status_code=400, detail="Email taken")
-        row = await conn.fetchrow(
-            "INSERT INTO users (email, display_name, password_hash) VALUES ($1, $2, $3) RETURNING id", 
-            email_clean, user.display_name, hash_password(user.password)
-        )
-        token = create_access_token({"sub": str(row['id'])})
-        # Возвращаем token прямо при регистрации для мгновенного авто-входа
-        return {"access_token": token, "token_type": "bearer", "msg": "User created"}
+        ws.onerror = (error) => {
+            console.error("WebSocket ошибка:", error);
+            appendSystemMessage("Ошибка соединения.");
+        };
 
-@app.post("/auth/login-code")
-async def login_send_code(req: LoginCodeReq):
-    email_clean = req.email.lower().strip()
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id, password_hash FROM users WHERE LOWER(email) = $1", email_clean)
-        if not row or row['password_hash'] != hash_password(req.password):
-            raise HTTPException(status_code=400, detail="Неверный email или пароль")
-    
-    if is_rate_limited(email_clean, max_requests=3, window_seconds=60):
-        return {"msg": "Code already sent recently"}
+        ws.onmessage = (event) => {
+            // Обработка бинарных данных (кадры трансляции)
+            if (event.data instanceof Blob) {
+                if (currentObjectURL) {
+                    URL.revokeObjectURL(currentObjectURL); // Освобождаем память от старого кадра
+                }
+                currentObjectURL = URL.createObjectURL(event.data);
+                streamImage.src = currentObjectURL;
+            } 
+            // Обработка текстовых данных (сообщения чата)
+            else if (typeof event.data === 'string') {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'chat') {
+                        appendChatMessage(data.message);
+                    } else if (data.type === 'history') {
+                        data.messages.forEach(msg => appendChatMessage(msg));
+                    }
+                } catch (e) {
+                    console.error("Ошибка разбора сообщения:", e);
+                }
+            }
+        };
 
-    await generate_and_send_code(email_clean)
-    return {"msg": "Code sent"}
+        // Обработка отправки сообщения в чат
+        chatForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const message = chatInput.value.trim();
+            if (message && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'chat', message: message }));
+                chatInput.value = '';
+            }
+        });
 
-@app.post("/login")
-async def login(user: UserLogin):
-    email_clean = user.email.lower().strip()
-    verify_code(email_clean, user.code)
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", email_clean)
-        if not row:
-            raise HTTPException(status_code=404, detail="User not found")
-        token = create_access_token({"sub": str(row['id'])})
-        return {"access_token": token, "token_type": "bearer"}
-
-@app.get("/profile/me", response_model=UserResponse)
-async def get_profile(user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="User not found")
-        return {
-            "id": row['id'],
-            "email": row['email'],
-            "display_name": row['display_name'],
-            "bio": row['bio'] or "",
-            "avatar_base64": row['avatar_base64'] or ""
+        // Функция добавления сообщения пользователя в чат
+        function appendChatMessage(msg) {
+            const div = document.createElement('div');
+            div.className = 'chat-message';
+            // Простая защита от XSS
+            div.textContent = `> ${msg}`; 
+            chatMessages.appendChild(div);
+            scrollToBottom();
         }
 
-@app.post("/profile/me")
-async def update_profile(profile: ProfileUpdate, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET display_name=COALESCE($1, display_name), bio=$2, avatar_base64=$3 WHERE id=$4", 
-            profile.display_name, profile.bio, profile.avatar_base64, user_id
-        )
-        return {"msg": "Updated"}
+        // Функция добавления системного сообщения в чат
+        function appendSystemMessage(msg) {
+            const div = document.createElement('div');
+            div.className = 'chat-message text-muted';
+            div.textContent = `*** ${msg}`;
+            chatMessages.appendChild(div);
+            scrollToBottom();
+        }
 
-@app.post("/friends/request")
-async def send_friend_request(payload: FriendAdd, user_id: int = Depends(get_current_user_id)):
-    target_email = payload.email.lower().strip()
-    async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", target_email)
-        if not target:
-            raise HTTPException(status_code=404, detail="Пользователь не найден")
-        if target['id'] == user_id:
-            raise HTTPException(status_code=400, detail="Нельзя добавить самого себя")
-        
-        existing = await conn.fetchrow(
-            "SELECT status FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)", 
-            user_id, target['id']
-        )
-        if existing:
-            raise HTTPException(status_code=400, detail=f"Заявка уже существует ({existing['status']})")
+        // Прокрутка чата вниз
+        function scrollToBottom() {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    """Отдает главную страницу с плеером и чатом."""
+    return HTML_CONTENT
+
+@app.websocket("/stream_input")
+async def websocket_stream_input(websocket: WebSocket):
+    """
+    Эндпоинт для стримера. Принимает бинарные кадры (JPEG) и рассылает их зрителям.
+    """
+    await websocket.accept()
+    print("Стример подключен.")
+    try:
+        while True:
+            # Ожидаем бинарные данные (сырые байты кадра)
+            # Используем receive_bytes для минимизации накладных расходов
+            data = await websocket.receive_bytes()
             
-        await conn.execute("INSERT INTO friendships (user_id, friend_id, status) VALUES ($1, $2, 'pending')", user_id, target['id'])
-        return {"msg": "Request sent"}
+            # Асинхронно рассылаем кадр всем подключенным зрителям
+            # Собираем задачи рассылки
+            if viewers:
+                send_tasks = []
+                # Копируем сет viewers, чтобы избежать ошибки изменения размера во время итерации
+                disconnected_viewers = set()
+                for viewer_ws in viewers.copy():
+                    try:
+                         # Отправляем бинарные данные
+                         send_tasks.append(viewer_ws.send_bytes(data))
+                    except Exception:
+                         # Если не удалось отправить (например, зритель отключился), помечаем на удаление
+                         disconnected_viewers.add(viewer_ws)
+                
+                # Выполняем рассылку конкурентно
+                if send_tasks:
+                     await asyncio.gather(*send_tasks, return_exceptions=True)
+                
+                # Удаляем отключившихся зрителей
+                if disconnected_viewers:
+                     viewers.difference_update(disconnected_viewers)
 
-@app.get("/friends/requests", response_model=List[FriendRequestResponse])
-async def get_friend_requests(user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        query = """
-            SELECT f.id as request_id, u.id as sender_id, u.email as sender_email, 
-                   u.display_name as sender_display_name, u.avatar_base64
-            FROM friendships f JOIN users u ON f.user_id = u.id
-            WHERE f.friend_id = $1 AND f.status = 'pending'
-        """
-        rows = await conn.fetch(query, user_id)
-        return [dict(r) for r in rows]
+    except WebSocketDisconnect:
+        print("Стример отключился.")
+    except Exception as e:
+         print(f"Ошибка стримера: {e}")
 
-@app.post("/friends/accept")
-async def accept_request(payload: RequestAction, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE friendships SET status='accepted' WHERE id=$1 AND friend_id=$2", payload.request_id, user_id)
-        return {"msg": "Accepted"}
-
-@app.post("/friends/reject")
-async def reject_request(payload: RequestAction, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM friendships WHERE id=$1 AND friend_id=$2", payload.request_id, user_id)
-        return {"msg": "Rejected"}
-
-@app.post("/friends/remove")
-async def remove_friend(payload: BlockAction, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM friendships WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)", user_id, payload.target_id)
-        await conn.execute("DELETE FROM messages WHERE (sender_id=$1 AND receiver_id=$2) OR (sender_id=$2 AND receiver_id=$1)", user_id, payload.target_id)
-        return {"msg": "Removed"}
-
-@app.get("/friends", response_model=List[UserResponse])
-async def get_friends(user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        query = """
-            SELECT u.id, u.email, u.display_name, u.bio, u.avatar_base64
-            FROM users u
-            WHERE u.id IN (
-                SELECT friend_id FROM friendships WHERE user_id = $1 AND status = 'accepted'
-                UNION
-                SELECT user_id FROM friendships WHERE friend_id = $1 AND status = 'accepted'
-            ) AND u.id != $1
-        """
-        rows = await conn.fetch(query, user_id)
-        return [
-            {
-                "id": r['id'],
-                "email": r['email'],
-                "display_name": r['display_name'],
-                "bio": r['bio'] or "",
-                "avatar_base64": r['avatar_base64'] or ""
-            }
-            for r in rows
-        ]
-
-@app.get("/chats")
-async def get_chats(user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        query = """
-            SELECT DISTINCT u.id, u.email, u.display_name, u.bio, u.avatar_base64,
-            (
-                SELECT message FROM messages 
-                WHERE (sender_id = u.id AND receiver_id = $1) OR (sender_id = $1 AND receiver_id = u.id)
-                ORDER BY created_at DESC LIMIT 1
-            ) as last_message
-            FROM users u
-            WHERE u.id IN (
-                SELECT friend_id FROM friendships WHERE user_id = $1 AND status = 'accepted'
-                UNION 
-                SELECT user_id FROM friendships WHERE friend_id = $1 AND status = 'accepted'
-            ) AND u.id != $1
-        """
-        rows = await conn.fetch(query, user_id)
-        chat_list = [
-            {
-                "id": r['id'],
-                "email": r['email'],
-                "display_name": r['display_name'],
-                "bio": r['bio'] or "",
-                "avatar_base64": r['avatar_base64'] or "",
-                "last_message": r['last_message'] or ""
-            }
-            for r in rows
-        ]
-        
-        me = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if me: 
-            last_msg_me = await conn.fetchval("SELECT message FROM messages WHERE sender_id=$1 AND receiver_id=$1 ORDER BY created_at DESC LIMIT 1", user_id)
-            chat_list.insert(0, {
-                "id": me['id'],
-                "email": me['email'],
-                "display_name": "Избранное (Saved)",
-                "bio": "Ваши сохраненные сообщения",
-                "avatar_base64": me['avatar_base64'] or "",
-                "last_message": last_msg_me or ""
+@app.websocket("/ws_viewer")
+async def websocket_viewer(websocket: WebSocket):
+    """
+    Эндпоинт для зрителей. Отправляет историю чата при подключении.
+    Принимает текстовые сообщения от зрителя и рассылает их всем.
+    Бинарные данные (видео) отправляются этому сокету из /stream_input.
+    """
+    await websocket.accept()
+    viewers.add(websocket)
+    print(f"Зритель подключен. Всего зрителей: {len(viewers)}")
+    
+    try:
+        # При подключении отправляем историю чата
+        if chat_history:
+            history_msg = json.dumps({
+                "type": "history",
+                "messages": list(chat_history)
             })
-        return chat_list
+            await websocket.send_text(history_msg)
 
-@app.post("/messages/send")
-async def send_msg(payload: MessageSend, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO messages (sender_id, receiver_id, message, reply_to_id) VALUES ($1, $2, $3, $4)", 
-            user_id, payload.receiver_id, payload.message.strip(), payload.reply_to_id
-        )
-        return {"msg": "Sent"}
+        while True:
+            # Ожидаем текстовые сообщения от зрителя (для чата)
+            text_data = await websocket.receive_text()
+            
+            try:
+                data = json.loads(text_data)
+                if data.get("type") == "chat":
+                    msg = data.get("message")
+                    if msg:
+                        # Ограничиваем длину сообщения для безопасности и экономии памяти
+                        sanitized_msg = str(msg)[:200]
+                        
+                        # Сохраняем в историю
+                        chat_history.append(sanitized_msg)
+                        
+                        # Формируем JSON для рассылки
+                        broadcast_msg = json.dumps({
+                            "type": "chat",
+                            "message": sanitized_msg
+                        })
+                        
+                        # Рассылаем всем зрителям
+                        send_tasks = []
+                        disconnected_viewers = set()
+                        for viewer_ws in viewers.copy():
+                            try:
+                                send_tasks.append(viewer_ws.send_text(broadcast_msg))
+                            except Exception:
+                                disconnected_viewers.add(viewer_ws)
+                        
+                        if send_tasks:
+                             await asyncio.gather(*send_tasks, return_exceptions=True)
+                        
+                        if disconnected_viewers:
+                             viewers.difference_update(disconnected_viewers)
 
-@app.get("/messages/conversation/{friend_id}")
-async def get_conv(friend_id: int, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        if user_id != friend_id:
-            await conn.execute("UPDATE messages SET is_read = TRUE WHERE sender_id = $1 AND receiver_id = $2 AND is_read = FALSE", friend_id, user_id)
+            except json.JSONDecodeError:
+                # Игнорируем невалидный JSON
+                pass
 
-        if user_id == friend_id:
-            query = """
-                SELECT m.id, m.sender_id, u.display_name as sender_name, m.receiver_id, m.message, m.created_at, m.is_read, m.is_edited,
-                       m.reply_to_id, r.message as reply_text, u_reply.display_name as reply_sender_name
-                FROM messages m 
-                JOIN users u ON m.sender_id = u.id
-                LEFT JOIN messages r ON m.reply_to_id = r.id
-                LEFT JOIN users u_reply ON r.sender_id = u_reply.id
-                WHERE m.sender_id = $1 AND m.receiver_id = $1
-                ORDER BY m.created_at ASC LIMIT 150
-            """
-            rows = await conn.fetch(query, user_id)
-        else:
-            query = """
-                SELECT m.id, m.sender_id, u.display_name as sender_name, m.receiver_id, m.message, m.created_at, m.is_read, m.is_edited,
-                       m.reply_to_id, r.message as reply_text, u_reply.display_name as reply_sender_name
-                FROM messages m 
-                JOIN users u ON m.sender_id = u.id
-                LEFT JOIN messages r ON m.reply_to_id = r.id
-                LEFT JOIN users u_reply ON r.sender_id = u_reply.id
-                WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
-                ORDER BY m.created_at ASC LIMIT 150
-            """
-            rows = await conn.fetch(query, user_id, friend_id)
-        return [dict(r) for r in rows]
-
-@app.post("/messages/edit")
-async def edit_msg(payload: MessageEdit, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        res = await conn.execute("UPDATE messages SET message = $1, is_edited = TRUE WHERE id = $2 AND sender_id = $3", payload.new_text.strip(), payload.message_id, user_id)
-        if res == "UPDATE 0":
-            raise HTTPException(status_code=403, detail="Not authorized or not found")
-        return {"msg": "Edited"}
-
-@app.post("/messages/delete")
-async def delete_msg(payload: MessageAction, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        res = await conn.execute("DELETE FROM messages WHERE id = $1 AND sender_id = $2", payload.message_id, user_id)
-        if res == "DELETE 0":
-            raise HTTPException(status_code=403, detail="Not authorized or not found")
-        return {"msg": "Deleted"}
-
-@app.post("/messages/delete-bulk")
-async def delete_msgs_bulk(payload: MessageBulkAction, user_id: int = Depends(get_current_user_id)):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM messages WHERE id = ANY($1) AND sender_id = $2", payload.message_ids, user_id)
-        return {"msg": "Deleted"}
+    except WebSocketDisconnect:
+        viewers.remove(websocket)
+        print(f"Зритель отключился. Осталось зрителей: {len(viewers)}")
+    except Exception as e:
+        if websocket in viewers:
+            viewers.remove(websocket)
+        print(f"Ошибка зрителя: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    # Запуск сервера с ограничением по worker'ам для экономии памяти
+    # workers=1 достаточно для небольших нагрузок и строгого лимита ОЗУ
+    uvicorn.run("streamer:app", host="0.0.0.0", port=8000, workers=1, log_level="warning")
