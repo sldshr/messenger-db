@@ -1,5 +1,20 @@
 import os
-# Единый глобальный сервер с категориями каналов
+import uuid
+import json
+import datetime
+from typing import Dict, Optional, List, Set, Any
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
+import uvicorn
+
+app = FastAPI()
+
+sessions_db: Dict[str, dict] = {}
+BANNED_USERS: Set[str] = set()
+CONNECTIONS: Dict[WebSocket, dict] = {}
+
 CHANNELS = [
     # 📌 ИНФОРМАЦИЯ
     {"id": "rules", "name": "правила", "category": "📌 ИНФОРМАЦИЯ"},
@@ -31,39 +46,79 @@ CHANNELS = [
     {"id": "art", "name": "арт-дизайн", "category": "🎨 ТВОРЧЕСТВО"},
     {"id": "music", "name": "музыка", "category": "🎨 ТВОРЧЕСТВО"}
 ]
-MESSAGES = {ch["id"]: [] for ch in CHANNELS}
-CONNECTIONS: Dict[WebSocket, dict] = {}
+
+MESSAGES: Dict[str, List[dict]] = {ch["id"]: [] for ch in CHANNELS}
 
 class AdminLoginReq(BaseModel):
     username: str
     password: str
 
+class BroadcastReq(BaseModel):
+    text: str
+    channel_id: Optional[str] = None # Если None - во все каналы
+
+class UserActionReq(BaseModel):
+    user_id: str
+
 def get_current_user(request: Request) -> Optional[dict]:
-    """Получение авторизованного пользователя из Cookie/ОЗУ сессий."""
     session_id = request.cookies.get("session_id")
     if session_id and session_id in sessions_db:
-        return sessions_db[session_id]
+        user = sessions_db[session_id]
+        if user["id"] in BANNED_USERS:
+            return None # Забанен
+        return user
     return None
 
+async def broadcast_to_all(message: dict):
+    dead = []
+    for ws in CONNECTIONS.keys():
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in CONNECTIONS:
+            del CONNECTIONS[ws]
+
+async def broadcast_members_update():
+    members = [
+        {"id": info["id"], "nickname": info["nickname"], "picture": info["picture"]}
+        for info in CONNECTIONS.values()
+    ]
+    await broadcast_to_all({"type": "members_update", "members": members})
+
+async def disconnect_user(user_id: str, reason: str = "Вы были отключены администратором."):
+    """Принудительно отключает все WebSocket сессии конкретного пользователя."""
+    to_disconnect = []
+    for ws, info in CONNECTIONS.items():
+        if info["id"] == user_id:
+            to_disconnect.append(ws)
+    
+    for ws in to_disconnect:
+        try:
+            await ws.send_json({"type": "force_disconnect", "reason": reason})
+            await ws.close()
+        except:
+            pass
+        if ws in CONNECTIONS:
+            del CONNECTIONS[ws]
+    await broadcast_members_update()
 
 @app.get("/api/me")
 async def get_me(request: Request):
-    """Получение текущего залогиненного пользователя."""
     user = get_current_user(request)
     if not user:
         return {"authenticated": False}
     return {"authenticated": True, "user": user}
 
-
 @app.post("/api/login")
 async def login(nickname: str):
-    """Вход по никнейму с сохранением сессии в ОЗУ."""
     nickname = nickname.strip()
     if not nickname:
         raise HTTPException(status_code=400, detail="Никнейм не может быть пустым")
     
     session_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4()) # В реальном приложении ID генерируется на основе уникальных данных
     avatar_url = f"https://api.dicebear.com/7.x/bottts/svg?seed={nickname}"
     
     user_data = {
@@ -74,19 +129,11 @@ async def login(nickname: str):
     sessions_db[session_id] = user_data
 
     response = JSONResponse(content={"status": "ok", "user": user_data})
-    response.set_cookie(
-        key="session_id",
-        value=session_id,
-        httponly=True,
-        max_age=86400 * 30,
-        samesite="lax"
-    )
+    response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400 * 30, samesite="lax")
     return response
-
 
 @app.get("/logout")
 async def logout(request: Request):
-    """Выход из аккаунта."""
     session_id = request.cookies.get("session_id")
     if session_id in sessions_db:
         del sessions_db[session_id]
@@ -94,22 +141,115 @@ async def logout(request: Request):
     response.delete_cookie("session_id")
     return response
 
+def is_admin(request: Request) -> bool:
+    return request.cookies.get("admin_auth") == "true"
+
+@app.post("/admin/login")
+async def admin_login_api(data: AdminLoginReq):
+    if data.username == "admin" and data.password == "admin":
+        response = JSONResponse({"status": "ok"})
+        response.set_cookie("admin_auth", "true", max_age=86400, httponly=True)
+        return response
+    raise HTTPException(status_code=401, detail="Неверные данные")
+
+@app.get("/admin/logout")
+async def admin_logout():
+    response = RedirectResponse("/admin")
+    response.delete_cookie("admin_auth")
+    return response
+
+@app.get("/admin/api/data")
+async def admin_get_data(request: Request):
+    """Возвращает данные для админ-панели."""
+    if not is_admin(request): raise HTTPException(status_code=401)
+    
+    users_list = []
+    for ws, info in CONNECTIONS.items():
+        users_list.append({"id": info["id"], "nickname": info["nickname"]})
+        
+    banned_list = list(BANNED_USERS)
+    
+    return {
+        "stats": {
+            "online": len(CONNECTIONS),
+            "sessions": len(sessions_db),
+            "channels": len(CHANNELS)
+        },
+        "channels": CHANNELS,
+        "online_users": users_list,
+        "banned_users": banned_list
+    }
+
+@app.post("/admin/api/clear_channel")
+async def admin_clear_ch(req: BroadcastReq, request: Request):
+    if not is_admin(request): raise HTTPException(status_code=401)
+    ch_id = req.channel_id
+    if ch_id in MESSAGES:
+        MESSAGES[ch_id] = []
+        await broadcast_to_all({"type": "channel_cleared", "channel_id": ch_id})
+    return {"status": "ok"}
+
+@app.post("/admin/api/broadcast")
+async def admin_send_broadcast(req: BroadcastReq, request: Request):
+    """Отправка системного сообщения."""
+    if not is_admin(request): raise HTTPException(status_code=401)
+    
+    targets = [req.channel_id] if req.channel_id and req.channel_id != "all" else [ch["id"] for ch in CHANNELS]
+    
+    msg_obj = {
+        "id": str(uuid.uuid4()),
+        "sender_id": "system",
+        "sender_name": "Система",
+        "sender_picture": "",
+        "text": req.text,
+        "time": datetime.datetime.now().strftime("%H:%M"),
+        "timestamp": int(datetime.datetime.now().timestamp()),
+        "is_system": True
+    }
+    
+    for ch_id in targets:
+        if ch_id in MESSAGES:
+            msg_obj["channel_id"] = ch_id
+            MESSAGES[ch_id].append(msg_obj)
+            if len(MESSAGES[ch_id]) > 100: MESSAGES[ch_id].pop(0)
+            
+    await broadcast_to_all({
+        "type": "new_message",
+        "message": msg_obj,
+        "global": req.channel_id == "all"
+    })
+    return {"status": "ok"}
+
+@app.post("/admin/api/kick")
+async def admin_kick(req: UserActionReq, request: Request):
+    if not is_admin(request): raise HTTPException(status_code=401)
+    await disconnect_user(req.user_id, "Вы были кикнуты администратором.")
+    return {"status": "ok"}
+
+@app.post("/admin/api/ban")
+async def admin_ban(req: UserActionReq, request: Request):
+    if not is_admin(request): raise HTTPException(status_code=401)
+    BANNED_USERS.add(req.user_id)
+    await disconnect_user(req.user_id, "Ваш аккаунт был заблокирован.")
+    return {"status": "ok"}
+
+@app.post("/admin/api/unban")
+async def admin_unban(req: UserActionReq, request: Request):
+    if not is_admin(request): raise HTTPException(status_code=401)
+    if req.user_id in BANNED_USERS:
+        BANNED_USERS.remove(req.user_id)
+    return {"status": "ok"}
 
 @app.get("/admin", response_class=HTMLResponse)
 async def get_admin_page(request: Request):
-    """Панель администратора."""
-    is_admin = request.cookies.get("admin_auth") == "true"
-    
-    if not is_admin:
-        # Страница авторизации админа
-        return HTMLResponse("""
+    if not is_admin(request):
+        return HTMLResponse(r"""
         <!DOCTYPE html>
         <html lang="ru">
         <head>
-            <meta charset="UTF-8">
-            <title>Admin Login</title>
+            <meta charset="UTF-8"><title>Admin Login</title>
             <style>
-                body { background-color: #313338; color: #dbdee1; font-family: sans-serif; display: flex; height: 100vh; align-items: center; justify-content: center; margin: 0;}
+                body { background-color: #1e1f22; color: #dbdee1; font-family: sans-serif; display: flex; height: 100vh; align-items: center; justify-content: center; margin: 0;}
                 .card { background-color: #2b2d31; padding: 40px; border-radius: 12px; text-align: center; width: 320px; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
                 input { margin-bottom: 15px; background: #1e1f22; border: 1px solid #111214; color: white; padding: 12px; width: 100%; border-radius: 4px; box-sizing: border-box; }
                 button { background: #5865f2; border: none; color: white; padding: 12px; width: 100%; border-radius: 4px; font-weight: bold; cursor: pointer; }
@@ -118,7 +258,7 @@ async def get_admin_page(request: Request):
         </head>
         <body>
             <div class="card">
-                <h3 style="margin-top:0;">Админ-панель</h3>
+                <h3 style="margin-top:0;">Admin Access</h3>
                 <input type="text" id="u" placeholder="Логин (admin)">
                 <input type="password" id="p" placeholder="Пароль (admin)">
                 <button onclick="login()">Войти</button>
@@ -138,81 +278,204 @@ async def get_admin_page(request: Request):
         </html>
         """)
     
-    # Дашборд админа
-    channels_html = "".join([
-        f"<li style='margin-bottom: 6px; display:flex; justify-content:space-between; align-items:center; background:#1e1f22; padding:8px 12px; border-radius:4px;'>"
-        f"<span><small style='color:#949ba4; margin-right:8px;'>[{ch.get('category','General')}]</small><b>#{ch['name']}</b></span>"
-        f"<a href='/admin/clear?channel_id={ch['id']}' style='color: #f23f43; margin-left:10px; text-decoration:none; font-weight:bold;'>[Очистить]</a></li>"
-        for ch in CHANNELS
-    ])
-    
-    return HTMLResponse(f"""
+    return HTMLResponse(r"""
     <!DOCTYPE html>
     <html lang="ru">
     <head>
-        <meta charset="UTF-8">
-        <title>Admin Dashboard</title>
+        <meta charset="UTF-8"><title>Admin Dashboard</title>
         <style>
-            body {{ background-color: #313338; color: #dbdee1; font-family: sans-serif; padding: 40px; margin: 0; }}
-            .card {{ background-color: #2b2d31; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }}
-            a.btn {{ display: inline-block; padding: 10px 15px; border-radius: 4px; text-decoration: none; color: white; margin-right: 10px; font-weight: bold; }}
-            .btn-gray {{ background: #4e5058; }}
-            .btn-gray:hover {{ background: #6d6f78; }}
-            .btn-red {{ background: #da373c; }}
-            .btn-red:hover {{ background: #a1282c; }}
-            h2 {{ margin-top: 0; color: white; }}
+            :root { --bg-base: #1e1f22; --bg-panel: #2b2d31; --brand: #5865f2; --text: #dbdee1; --text-muted: #949ba4; --danger: #da373c; --success: #23a55a; }
+            body { background-color: var(--bg-base); color: var(--text); font-family: sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+            .sidebar { width: 260px; background-color: var(--bg-panel); display: flex; flex-direction: column; }
+            .sidebar-header { padding: 20px; font-weight: bold; font-size: 18px; border-bottom: 1px solid #1e1f22; display: flex; justify-content: space-between; align-items: center;}
+            .menu-item { padding: 15px 20px; cursor: pointer; color: var(--text-muted); font-weight: 500; }
+            .menu-item:hover { background: rgba(255,255,255,0.05); color: white; }
+            .menu-item.active { background: rgba(255,255,255,0.1); color: white; }
+            
+            .content { flex: 1; padding: 40px; overflow-y: auto; }
+            .card { background: var(--bg-panel); padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+            .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+            
+            h2, h3 { margin-top: 0; color: white; }
+            .btn { display: inline-block; padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; color: white; }
+            .btn-brand { background: var(--brand); }
+            .btn-brand:hover { background: #4752c4; }
+            .btn-danger { background: var(--danger); }
+            .btn-danger:hover { background: #a1282c; }
+            .btn-sm { padding: 5px 10px; font-size: 12px; }
+            
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #3f4147; }
+            th { color: var(--text-muted); text-transform: uppercase; font-size: 12px; }
+            
+            input, select { background: var(--bg-base); border: 1px solid #111214; color: white; padding: 10px; border-radius: 4px; width: 100%; box-sizing: border-box; margin-bottom: 10px;}
+            
+            .tab-content { display: none; }
+            .tab-content.active { display: block; }
         </style>
     </head>
     <body>
-        <h2>Управление сервером</h2>
-        <div style="margin-bottom: 20px;">
-            <a href="/" class="btn btn-gray">Вернуться в чат</a>
-            <a href="/admin/logout" class="btn btn-red">Выйти из админки</a>
+        <div class="sidebar">
+            <div class="sidebar-header">
+                Админ Панель
+                <a href="/" target="_blank" style="color: var(--text-muted); text-decoration: none;" title="В чат">↗</a>
+            </div>
+            <div class="menu-item active" onclick="switchTab('dashboard', this)">Обзор</div>
+            <div class="menu-item" onclick="switchTab('users', this)">Пользователи</div>
+            <div class="menu-item" onclick="switchTab('channels', this)">Каналы & Объявления</div>
+            <div style="flex:1;"></div>
+            <a href="/admin/logout" class="menu-item" style="color: var(--danger); text-decoration: none;">Выход</a>
         </div>
         
-        <div style="display: flex; gap: 20px; max-width: 900px;">
-            <div class="card" style="flex: 1;">
-                <h3 style="margin-top:0;">Статистика (ОЗУ)</h3>
-                <p>Пользователей онлайн: <b style="color: #23a55a; font-size: 18px;">{len(CONNECTIONS)}</b></p>
-                <p>Всего сессий: <b>{len(sessions_db)}</b></p>
-                <p>Всего каналов: <b>{len(CHANNELS)}</b></p>
+        <div class="content">
+            <!-- DASHBOARD -->
+            <div id="dashboard" class="tab-content active">
+                <h2>Обзор сервера</h2>
+                <div class="grid-3">
+                    <div class="card">
+                        <h3>Онлайн</h3>
+                        <div style="font-size: 32px; font-weight: bold; color: var(--success);" id="stat-online">0</div>
+                    </div>
+                    <div class="card">
+                        <h3>Всего сессий</h3>
+                        <div style="font-size: 32px; font-weight: bold;" id="stat-sessions">0</div>
+                    </div>
+                    <div class="card">
+                        <h3>Каналов</h3>
+                        <div style="font-size: 32px; font-weight: bold;" id="stat-channels">0</div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Быстрая рассылка (System Broadcast)</h3>
+                    <input type="text" id="br-text" placeholder="Введите важное объявление для всех...">
+                    <button class="btn btn-brand" onclick="sendBroadcast('all')">Отправить всем</button>
+                </div>
             </div>
-            <div class="card" style="flex: 2;">
-                <h3 style="margin-top:0;">Управление каналами</h3>
-                <ul style="list-style: none; padding: 0; max-height: 420px; overflow-y: auto;">
-                    {channels_html}
-                </ul>
+            
+            <!-- USERS -->
+            <div id="users" class="tab-content">
+                <h2>Управление пользователями</h2>
+                <div class="card">
+                    <h3>Сейчас онлайн</h3>
+                    <table>
+                        <thead><tr><th>ID</th><th>Никнейм</th><th>Действия</th></tr></thead>
+                        <tbody id="table-online"></tbody>
+                    </table>
+                </div>
+                <div class="card">
+                    <h3>Заблокированные (Бан-лист)</h3>
+                    <table>
+                        <thead><tr><th>ID</th><th>Действия</th></tr></thead>
+                        <tbody id="table-banned"></tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- CHANNELS -->
+            <div id="channels" class="tab-content">
+                <h2>Каналы</h2>
+                <div class="card">
+                    <table style="max-height: 500px; display: block; overflow-y: auto;">
+                        <tbody id="table-channels" style="width: 100%; display: table;"></tbody>
+                    </table>
+                </div>
             </div>
         </div>
+
+        <script>
+            function switchTab(tabId, el) {
+                document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.menu-item').forEach(t => t.classList.remove('active'));
+                document.getElementById(tabId).classList.add('active');
+                el.classList.add('active');
+            }
+
+            async function loadData() {
+                const res = await fetch('/admin/api/data');
+                if(!res.ok) return;
+                const data = await res.json();
+                
+                // Stats
+                document.getElementById('stat-online').innerText = data.stats.online;
+                document.getElementById('stat-sessions').innerText = data.stats.sessions;
+                document.getElementById('stat-channels').innerText = data.stats.channels;
+                
+                // Users
+                const onlineHtml = data.online_users.map(u => `
+                    <tr>
+                        <td style="font-family: monospace; font-size: 11px;">${u.id}</td>
+                        <td style="font-weight: bold;">${u.nickname}</td>
+                        <td>
+                            <button class="btn btn-brand btn-sm" onclick="action('kick', '${u.id}')">Кик</button>
+                            <button class="btn btn-danger btn-sm" onclick="action('ban', '${u.id}')">Бан</button>
+                        </td>
+                    </tr>
+                `).join('');
+                document.getElementById('table-online').innerHTML = onlineHtml || '<tr><td colspan="3">Нет пользователей онлайн</td></tr>';
+                
+                // Banned
+                const bannedHtml = data.banned_users.map(id => `
+                    <tr>
+                        <td style="font-family: monospace; font-size: 11px;">${id}</td>
+                        <td><button class="btn btn-brand btn-sm" onclick="action('unban', '${id}')">Разбанить</button></td>
+                    </tr>
+                `).join('');
+                document.getElementById('table-banned').innerHTML = bannedHtml || '<tr><td colspan="2">Бан-лист пуст</td></tr>';
+                
+                // Channels
+                const chHtml = data.channels.map(ch => `
+                    <tr>
+                        <td style="color: var(--text-muted); font-size: 11px;">${ch.category}</td>
+                        <td style="font-weight: bold;">#${ch.name}</td>
+                        <td style="text-align: right;">
+                            <button class="btn btn-brand btn-sm" onclick="promptBroadcast('${ch.id}', '${ch.name}')">Объявление</button>
+                            <button class="btn btn-danger btn-sm" onclick="clearChannel('${ch.id}')">Очистить историю</button>
+                        </td>
+                    </tr>
+                `).join('');
+                document.getElementById('table-channels').innerHTML = chHtml;
+            }
+
+            async function action(type, userId) {
+                if(!confirm(`Вы уверены, что хотите применить ${type} к пользователю?`)) return;
+                await fetch(`/admin/api/${type}`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({user_id: userId})
+                });
+                loadData();
+            }
+
+            async function clearChannel(chId) {
+                if(!confirm('Очистить всю историю этого канала?')) return;
+                await fetch('/admin/api/clear_channel', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({channel_id: chId, text: ""})
+                });
+            }
+
+            async function sendBroadcast(channelId, text = null) {
+                const msg = text || document.getElementById('br-text').value;
+                if(!msg) return;
+                await fetch('/admin/api/broadcast', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({channel_id: channelId, text: msg})
+                });
+                document.getElementById('br-text').value = '';
+                alert('Отправлено!');
+            }
+            
+            function promptBroadcast(chId, chName) {
+                const msg = prompt(`Введите системное сообщение для канала #${chName}:`);
+                if(msg) sendBroadcast(chId, msg);
+            }
+
+            // Auto-refresh
+            loadData();
+            setInterval(loadData, 5000);
+        </script>
     </body>
     </html>
     """)
-
-@app.post("/admin/login")
-async def admin_login_api(data: AdminLoginReq):
-    """API авторизации админа."""
-    if data.username == "admin" and data.password == "admin":
-        response = JSONResponse({"status": "ok"})
-        response.set_cookie("admin_auth", "true", max_age=86400, httponly=True)
-        return response
-    raise HTTPException(status_code=401, detail="Неверные данные")
-
-@app.get("/admin/logout")
-async def admin_logout():
-    """Выход из админки."""
-    response = RedirectResponse("/admin")
-    response.delete_cookie("admin_auth")
-    return response
-
-@app.get("/admin/clear")
-async def admin_clear_channel(channel_id: str, request: Request):
-    """Очистка истории канала."""
-    if request.cookies.get("admin_auth") == "true":
-        if channel_id in MESSAGES:
-            MESSAGES[channel_id] = []
-            await broadcast_to_all({"type": "channel_cleared", "channel_id": channel_id})
-    return RedirectResponse("/admin")
-
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -220,7 +483,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     client_id = str(uuid.uuid4())
     user_info = {"id": client_id, "nickname": "Guest", "picture": ""}
-    CONNECTIONS[websocket] = user_info
 
     try:
         while True:
@@ -228,22 +490,33 @@ async def websocket_endpoint(websocket: WebSocket):
             data = json.loads(raw_text)
             msg_type = data.get("type")
 
-            # 1. Инициализация
             if msg_type == "init":
-                user_info["id"] = data.get("user_id", client_id)
+                user_id = data.get("user_id", client_id)
+                # Проверка на бан при инициализации сокета
+                if user_id in BANNED_USERS:
+                    await websocket.send_json({"type": "force_disconnect", "reason": "Вы забанены на этом сервере."})
+                    await websocket.close()
+                    return
+
+                user_info["id"] = user_id
                 user_info["nickname"] = data.get("nickname", "Guest")
                 user_info["picture"] = data.get("picture", "")
+                
+                CONNECTIONS[websocket] = user_info
                 
                 await websocket.send_json({
                     "type": "init_success",
                     "channels": {"text": CHANNELS},
                     "history": MESSAGES
                 })
-                
                 await broadcast_members_update()
 
-            # 2. Текстовое сообщение
             elif msg_type == "chat_message":
+                # Дополнительная проверка на бан при отправке
+                if user_info["id"] in BANNED_USERS:
+                    await websocket.close()
+                    return
+
                 channel_id = data.get("channel_id", "general")
                 text = data.get("text", "").strip()
                 if text and channel_id in MESSAGES:
@@ -255,7 +528,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "text": text,
                         "time": datetime.datetime.now().strftime("%H:%M"),
                         "timestamp": int(datetime.datetime.now().timestamp()),
-                        "channel_id": channel_id
+                        "is_system": False
                     }
                     MESSAGES[channel_id].append(msg_obj)
                     if len(MESSAGES[channel_id]) > 100:
@@ -271,43 +544,16 @@ async def websocket_endpoint(websocket: WebSocket):
             del CONNECTIONS[websocket]
             await broadcast_members_update()
 
-
-async def broadcast_to_all(message: dict):
-    """Отправка сообщения всем подключенным клиентам."""
-    dead = []
-    for ws in CONNECTIONS.keys():
-        try:
-            await ws.send_json(message)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        if ws in CONNECTIONS:
-            del CONNECTIONS[ws]
-
-
-async def broadcast_members_update():
-    """Рассылка обновленного списка онлайн участников."""
-    members = [
-        {
-            "id": info["id"],
-            "nickname": info["nickname"],
-            "picture": info["picture"]
-        }
-        for info in CONNECTIONS.values()
-    ]
-    await broadcast_to_all({"type": "members_update", "members": members})
-
-
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
-    html_content = """
+    # Используем сырую строку (raw string) 'r"""' чтобы Python не ругался на '\*' в регулярках JS
+    html_content = r"""
     <!DOCTYPE html>
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Global Chat Server</title>
-        <!-- Bootstrap 3 & FontAwesome -->
         <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
         <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
@@ -321,38 +567,21 @@ async def get_index():
                 --text-muted: #949ba4;
                 --brand: #5865f2;
                 --border: #1e1f22;
+                --system: #faa61a;
             }
 
             * { box-sizing: border-box; }
-            body {
-                background-color: var(--bg-primary);
-                color: var(--text-normal);
-                font-family: 'gg sans', 'Noto Sans', Helvetica, Arial, sans-serif;
-                margin: 0; padding: 0; height: 100vh; overflow: hidden;
-            }
+            body { background-color: var(--bg-primary); color: var(--text-normal); font-family: 'gg sans', 'Noto Sans', Helvetica, Arial, sans-serif; margin: 0; padding: 0; height: 100vh; overflow: hidden; }
 
-            #auth-screen {
-                display: flex; height: 100vh; justify-content: center; align-items: center;
-                background: linear-gradient(135deg, #1e1f22 0%, #2b2d31 100%);
-            }
-            .auth-card {
-                background-color: var(--bg-secondary); padding: 40px; border-radius: 12px;
-                box-shadow: 0 8px 32px rgba(0,0,0,0.5); width: 100%; max-width: 440px; text-align: center;
-            }
+            #auth-screen { display: flex; height: 100vh; justify-content: center; align-items: center; background: linear-gradient(135deg, #1e1f22 0%, #2b2d31 100%); }
+            .auth-card { background-color: var(--bg-secondary); padding: 40px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); width: 100%; max-width: 440px; text-align: center; }
 
             #app-layout { display: none; height: 100vh; width: 100vw; flex-direction: row; }
 
             .channels-sidebar { width: 240px; background-color: var(--bg-secondary); display: flex; flex-direction: column; }
-            .server-header {
-                height: 48px; padding: 0 16px; border-bottom: 1px solid rgba(0,0,0,0.2);
-                display: flex; align-items: center; justify-content: space-between; font-weight: bold; font-size: 16px;
-                box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-            }
+            .server-header { height: 48px; padding: 0 16px; border-bottom: 1px solid rgba(0,0,0,0.2); display: flex; align-items: center; justify-content: space-between; font-weight: bold; font-size: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
             .channels-list { flex: 1; overflow-y: auto; padding: 12px 8px; }
-            .channel-item {
-                display: flex; align-items: center; padding: 8px 10px; border-radius: 4px;
-                color: var(--text-muted); cursor: pointer; margin-bottom: 2px; font-size: 15px;
-            }
+            .channel-item { display: flex; align-items: center; padding: 8px 10px; border-radius: 4px; color: var(--text-muted); cursor: pointer; margin-bottom: 2px; font-size: 15px; }
             .channel-item i { margin-right: 8px; width: 18px; text-align: center; }
             .channel-item:hover { background-color: rgba(255,255,255,0.05); color: var(--text-normal); }
             .channel-item.active { background-color: var(--bg-accent); color: white; }
@@ -365,7 +594,6 @@ async def get_index():
             .main-content { flex: 1; display: flex; flex-direction: column; background-color: var(--bg-primary); }
             .chat-top-bar { height: 48px; padding: 0 16px; border-bottom: 1px solid rgba(0,0,0,0.2); display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
             
-            /* Стилизация сообщений */
             .chat-messages { flex: 1; padding: 16px 0; overflow-y: auto; display: flex; flex-direction: column; scroll-behavior: auto; }
             .msg-item { display: flex; padding: 2px 16px; margin-top: 14px; position: relative; min-height: 40px; }
             .msg-item:hover { background-color: rgba(255, 255, 255, 0.03); }
@@ -375,7 +603,6 @@ async def get_index():
             .msg-avatar { width: 40px; height: 40px; border-radius: 50%; background-color: var(--brand); flex-shrink: 0; cursor: pointer; object-fit: cover; }
             .msg-body { flex: 1; display: flex; flex-direction: column; min-width: 0; }
             
-            /* Стили для сгруппированных сообщений (смещение ровно 56px = 40px аватар + 16px отступ) */
             .msg-item.grouped .msg-body { margin-left: 56px; }
             
             .msg-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; line-height: 1.25; }
@@ -386,13 +613,15 @@ async def get_index():
             
             .msg-time-hover { position: absolute; left: 0px; top: 2px; width: 52px; text-align: right; font-size: 10px; color: var(--text-muted); display: none; line-height: 1.4; user-select: none; }
             .msg-item.grouped:hover .msg-time-hover { display: block; }
+            
+            /* Markdown styles */
+            .md-bold { font-weight: bold; }
+            .md-italic { font-style: italic; }
+            .md-strike { text-decoration: line-through; }
+            .md-code { background: #1e1f22; font-family: monospace; padding: 2px 4px; border-radius: 3px; font-size: 13px; }
 
-            .category-header {
-                font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;
-                margin: 16px 0 4px 8px; letter-spacing: 0.5px; display: flex; align-items: center; user-select: none;
-            }
-
-            /* Статус онлайна */
+            .category-header { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; margin: 16px 0 4px 8px; letter-spacing: 0.5px; display: flex; align-items: center; user-select: none; }
+            
             .status-wrapper { position: relative; display: inline-flex; }
             .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background-color: #23a55a; border-radius: 50%; border: 3px solid var(--bg-secondary); }
 
@@ -430,9 +659,7 @@ async def get_index():
                 </div>
 
                 <div class="channels-list">
-                    <div id="text-channels-list">
-                        <!-- Категории и каналы рендерятся тут -->
-                    </div>
+                    <div id="text-channels-list"></div>
                 </div>
 
                 <div class="user-profile-bar">
@@ -453,9 +680,7 @@ async def get_index():
                     <span id="current-channel-title">general</span>
                 </div>
 
-                <div class="chat-messages" id="messages-container">
-                    <!-- Сообщения -->
-                </div>
+                <div class="chat-messages" id="messages-container"></div>
 
                 <div class="chat-input-container">
                     <div class="chat-input-box">
@@ -468,9 +693,7 @@ async def get_index():
                 <div style="font-size: 12px; font-weight: bold; color: var(--text-muted); text-transform: uppercase; margin-bottom: 10px; padding-left: 8px;">
                     В сети — <span id="members-count">0</span>
                 </div>
-                <div id="members-list-container">
-                    <!-- Участники -->
-                </div>
+                <div id="members-list-container"></div>
             </div>
         </div>
 
@@ -509,9 +732,7 @@ async def get_index():
                 if (res.ok) checkAuth();
             });
 
-            $('#nick-input').keypress(function(e) {
-                if (e.which === 13) $('#btn-login').click();
-            });
+            $('#nick-input').keypress(function(e) { if (e.which === 13) $('#btn-login').click(); });
 
             function connectToServer() {
                 if(socket) socket.close();
@@ -521,10 +742,8 @@ async def get_index():
 
                 socket.onopen = function() {
                     socket.send(JSON.stringify({
-                        type: 'init',
-                        user_id: currentUser.id,
-                        nickname: currentUser.nickname,
-                        picture: currentUser.picture
+                        type: 'init', user_id: currentUser.id,
+                        nickname: currentUser.nickname, picture: currentUser.picture
                     }));
                 };
 
@@ -536,7 +755,7 @@ async def get_index():
                         loadChatHistory(data.history[currentChannelId] || []);
                     }
                     else if (data.type === 'new_message') {
-                        if (data.message.channel_id === currentChannelId) {
+                        if (data.message.channel_id === currentChannelId || data.global) {
                             appendChatMessage(data.message);
                         }
                     }
@@ -549,12 +768,21 @@ async def get_index():
                             $('#messages-container').append('<div style="text-align:center; color:var(--text-muted); margin-top:20px;">История очищена администратором.</div>');
                         }
                     }
+                    else if (data.type === 'force_disconnect') {
+                        socket.close();
+                        alert(data.reason);
+                        window.location.href = '/logout';
+                    }
+                };
+                
+                socket.onclose = function() {
+                    // Prevent auto-reconnect loops if banned, but try reconnecting if just dropped
+                    console.log("WebSocket closed");
                 };
             }
 
             function renderChannels(channels) {
                 const textList = $('#text-channels-list').empty();
-
                 const categories = {};
                 channels.forEach(ch => {
                     const cat = ch.category || 'КАНАЛЫ';
@@ -563,20 +791,10 @@ async def get_index():
                 });
 
                 for (const [catName, catChannels] of Object.entries(categories)) {
-                    textList.append(`
-                        <div class="category-header">
-                            <i class="fa fa-chevron-down" style="font-size: 8px; margin-right: 6px;"></i>
-                            ${catName}
-                        </div>
-                    `);
-
+                    textList.append(`<div class="category-header"><i class="fa fa-chevron-down" style="font-size: 8px; margin-right: 6px;"></i>${catName}</div>`);
                     catChannels.forEach(ch => {
                         const activeClass = ch.id === currentChannelId ? 'active' : '';
-                        textList.append(`
-                            <div class="channel-item ${activeClass}" onclick="switchChannel('${ch.id}', '${ch.name}', this)">
-                                <i class="fa fa-hashtag"></i> ${ch.name}
-                            </div>
-                        `);
+                        textList.append(`<div class="channel-item ${activeClass}" onclick="switchChannel('${ch.id}', '${ch.name}', this)"><i class="fa fa-hashtag"></i> ${ch.name}</div>`);
                     });
                 }
             }
@@ -592,19 +810,14 @@ async def get_index():
                 lastMsgSenderId = null;
                 lastMsgTimestamp = 0;
                 
-                // Переподключение для получения новой истории (простой метод)
                 connectToServer();
             }
 
             $('#chat-input').keypress(function(e) {
                 if (e.which === 13) {
                     const txt = $(this).val().trim();
-                    if (txt && socket) {
-                        socket.send(JSON.stringify({
-                            type: 'chat_message',
-                            channel_id: currentChannelId,
-                            text: txt
-                        }));
+                    if (txt && socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({ type: 'chat_message', channel_id: currentChannelId, text: txt }));
                         $(this).val('');
                     }
                 }
@@ -622,53 +835,64 @@ async def get_index():
             function appendChatMessage(msg) {
                 const container = $('#messages-container');
                 const ts = msg.timestamp || 0;
-                
-                // Проверяем, можно ли сгруппировать сообщение (тот же автор и прошло менее 5 минут)
-                const isGrouped = (lastMsgSenderId === msg.sender_id) && (ts - lastMsgTimestamp < 300); 
-                
                 const formattedText = parseMarkdown(msg.text);
-
-                if (isGrouped) {
+                
+                // Системное сообщение от администратора (выделяется желтым)
+                if (msg.is_system) {
                     container.append(`
-                        <div class="msg-item grouped">
-                            <span class="msg-time-hover">${msg.time}</span>
-                            <div class="msg-body">
-                                <div class="msg-text">${formattedText}</div>
-                            </div>
-                        </div>
-                    `);
-                } else {
-                    container.append(`
-                        <div class="msg-item">
-                            <div class="msg-avatar-container">
-                                <img src="${msg.sender_picture}" class="msg-avatar">
+                        <div class="msg-item" style="background-color: rgba(250, 166, 26, 0.08); border-left: 3px solid var(--system); margin-top: 20px; padding-top: 10px; padding-bottom: 10px;">
+                            <div class="msg-avatar-container" style="display:flex; justify-content:center; align-items:flex-start;">
+                                <i class="fa fa-bell" style="color: var(--system); font-size: 20px; margin-top: 4px;"></i>
                             </div>
                             <div class="msg-body">
                                 <div class="msg-header">
-                                    <span class="msg-author">${msg.sender_name}</span>
+                                    <span class="msg-author" style="color: var(--system); text-transform: uppercase; font-size: 13px; font-weight: 800;">${msg.sender_name}</span>
                                     <span class="msg-time">${msg.time}</span>
                                 </div>
-                                <div class="msg-text">${formattedText}</div>
+                                <div class="msg-text" style="color: white; font-weight: 500;">${formattedText}</div>
                             </div>
                         </div>
                     `);
+                    lastMsgSenderId = null; 
+                } 
+                else {
+                    const isGrouped = (lastMsgSenderId === msg.sender_id) && (ts - lastMsgTimestamp < 300); 
+
+                    if (isGrouped) {
+                        container.append(`
+                            <div class="msg-item grouped">
+                                <span class="msg-time-hover">${msg.time}</span>
+                                <div class="msg-body"><div class="msg-text">${formattedText}</div></div>
+                            </div>
+                        `);
+                    } else {
+                        container.append(`
+                            <div class="msg-item">
+                                <div class="msg-avatar-container">
+                                    <img src="${msg.sender_picture}" class="msg-avatar">
+                                </div>
+                                <div class="msg-body">
+                                    <div class="msg-header">
+                                        <span class="msg-author">${msg.sender_name}</span>
+                                        <span class="msg-time">${msg.time}</span>
+                                    </div>
+                                    <div class="msg-text">${formattedText}</div>
+                                </div>
+                            </div>
+                        `);
+                    }
+                    lastMsgSenderId = msg.sender_id;
+                    lastMsgTimestamp = ts;
                 }
                 
-                lastMsgSenderId = msg.sender_id;
-                lastMsgTimestamp = ts;
-                
-                // Умный скролл: скроллим вниз только если мы уже внизу, или если сообщение наше
                 const domEl = container[0];
                 const atBottom = domEl.scrollHeight - domEl.scrollTop <= domEl.clientHeight + 150;
-                if (atBottom || msg.sender_id === currentUser.id) {
-                    container.scrollTop(domEl.scrollHeight);
-                }
+                if (atBottom || msg.sender_id === currentUser.id) container.scrollTop(domEl.scrollHeight);
             }
 
             function loadChatHistory(history) {
                 $('#messages-container').empty();
-                lastMsgSenderId = null;
-                lastMsgTimestamp = 0;
+                lastMsgSenderId = null; lastMsgTimestamp = 0;
                 history.forEach(appendChatMessage);
             }
 
@@ -696,6 +920,5 @@ async def get_index():
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
-    print("Запуск Discord RAM Сервера...")
-    print("Откройте в браузере: http://127.0.0.1:8000")
+    print("Запуск сервера с обновленной Админ Панелью...")
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
