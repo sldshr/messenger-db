@@ -1,355 +1,529 @@
-import asyncio
-import json
-from collections import deque
-from typing import List, Set
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import random
+import string
+import datetime
+from typing import Dict, Optional
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="In-Memory Fast Streamer")
+app = FastAPI(title="RAM-based IRC Chat")
 
-# Хранение подключенных зрителей
-viewers: Set[WebSocket] = set()
+# Data structure to hold active rooms in RAM
+# Structure: { room_code: { "max_users": int, "connections": { websocket: nickname } } }
+rooms: Dict[str, dict] = {}
 
-# Хранение последних 50 сообщений чата в памяти
-chat_history = deque(maxlen=50)
 
-HTML_CONTENT = """
-<!DOCTYPE html>
-<html lang="ru" data-bs-theme="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>In-Memory Streamer</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        body {
-            background-color: #121212;
-            color: #e0e0e0;
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
-            margin: 0;
-            overflow: hidden;
-        }
-        .main-container {
-            flex-grow: 1;
-            display: flex;
-            padding: 15px;
-            gap: 15px;
-            height: 100%;
-        }
-        .stream-container {
-            flex: 3;
-            background-color: #000;
-            border-radius: 8px;
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
-        }
-        #streamImage {
-            max-width: 100%;
-            max-height: 100%;
-            object-fit: contain;
-        }
-        .live-indicator {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            background-color: rgba(255, 0, 0, 0.8);
-            color: white;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-family: monospace;
-            z-index: 10;
-        }
-        .chat-container {
-            flex: 1;
-            background-color: #1e1e1e;
-            border-radius: 8px;
-            display: flex;
-            flex-direction: column;
-            border: 1px solid #333;
-        }
-        .chat-header {
-            padding: 10px;
-            background-color: #2c2c2c;
-            border-bottom: 1px solid #444;
-            font-weight: bold;
-            border-top-left-radius: 8px;
-            border-top-right-radius: 8px;
-        }
-        .chat-messages {
-            flex-grow: 1;
-            overflow-y: auto;
-            padding: 10px;
-            font-family: monospace;
-            font-size: 0.9em;
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-        }
-        .chat-message {
-            word-wrap: break-word;
-        }
-        .chat-input-area {
-            padding: 10px;
-            background-color: #2c2c2c;
-            border-top: 1px solid #444;
-            border-bottom-left-radius: 8px;
-            border-bottom-right-radius: 8px;
-        }
-        @media (max-width: 768px) {
-            .main-container {
-                flex-direction: column;
-            }
-            .stream-container {
-                flex: none;
-                height: 50vh;
-            }
-            .chat-container {
-                flex: 1;
-            }
-        }
-    </style>
-</head>
-<body>
+class CreateRoomRequest(BaseModel):
+    max_users: int = Field(..., ge=2, le=100, description="Максимальное количество людей в комнате")
 
-    <div class="main-container container-fluid">
-        <!-- Левая часть: Стрим -->
-        <div class="stream-container">
-            <div class="live-indicator">LIVE 50 FPS</div>
-            <img id="streamImage" src="" alt="Ожидание трансляции...">
-        </div>
 
-        <!-- Правая часть: Чат -->
-        <div class="chat-container">
-            <div class="chat-header">IRC Чат</div>
-            <div class="chat-messages" id="chatMessages">
-                <!-- Сообщения будут добавляться сюда -->
-            </div>
-            <div class="chat-input-area">
-                <form id="chatForm" class="d-flex gap-2">
-                    <input type="text" id="chatInput" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Сообщение..." autocomplete="off">
-                    <button type="submit" class="btn btn-primary btn-sm">Отправить</button>
-                </form>
-            </div>
-        </div>
-    </div>
+class RoomStatusResponse(BaseModel):
+    exists: bool
+    current_users: int
+    max_users: int
 
-    <!-- Скрипт логики клиента -->
-    <script>
-        const streamImage = document.getElementById('streamImage');
-        const chatMessages = document.getElementById('chatMessages');
-        const chatForm = document.getElementById('chatForm');
-        const chatInput = document.getElementById('chatInput');
-        
-        let currentObjectURL = null;
 
-        // Определение URL для WebSocket
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws_viewer`;
-        
-        const ws = new WebSocket(wsUrl);
-        ws.binaryType = 'blob'; // Важно для приема бинарных данных
+def generate_room_code(length: int = 6) -> str:
+    """Генерация уникального 6-значного кода комнаты из букв и цифр."""
+    while True:
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+        if code not in rooms:
+            return code
 
-        ws.onopen = () => {
-            console.log("WebSocket подключен");
-            appendSystemMessage("Подключено к серверу.");
-        };
 
-        ws.onclose = () => {
-            console.log("WebSocket отключен");
-            appendSystemMessage("Отключено от сервера. Попытка переподключения...");
-            // В реальном приложении здесь должна быть логика реконнекта
-        };
+@app.post("/api/create-room")
+async def create_room(req: CreateRoomRequest):
+    """Создание новой чат-комнаты в ОЗУ."""
+    code = generate_room_code()
+    rooms[code] = {
+        "max_users": req.max_users,
+        "connections": {}  # websocket: nickname
+    }
+    return {"room_code": code, "max_users": req.max_users}
 
-        ws.onerror = (error) => {
-            console.error("WebSocket ошибка:", error);
-            appendSystemMessage("Ошибка соединения.");
-        };
 
-        ws.onmessage = (event) => {
-            // Обработка бинарных данных (кадры трансляции)
-            if (event.data instanceof Blob) {
-                if (currentObjectURL) {
-                    URL.revokeObjectURL(currentObjectURL); // Освобождаем память от старого кадра
+@app.get("/api/check-room/{code}")
+async def check_room(code: str):
+    """Проверка существования комнаты и количества участников."""
+    code = code.upper().strip()
+    if code not in rooms:
+        return {"exists": False, "current_users": 0, "max_users": 0}
+
+    room = rooms[code]
+    return {
+        "exists": True,
+        "current_users": len(room["connections"]),
+        "max_users": room["max_users"]
+    }
+
+
+@app.websocket("/ws/{code}/{nickname}")
+async def websocket_endpoint(websocket: WebSocket, code: str, nickname: str):
+    code = code.upper().strip()
+    nickname = nickname.strip()
+
+    # Валидация существования комнаты
+    if code not in rooms:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    room = rooms[code]
+
+    # Проверка на лимит пользователей
+    if len(room["connections"]) >= room["max_users"]:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # Принимаем соединение
+    await websocket.accept()
+    room["connections"][websocket] = nickname
+
+    # Уведомляем остальных о новом участнике
+    # ОБРАТИТЕ ВНИМАНИЕ: Старые сообщения НЕ отправляются новому пользователю!
+    join_time = datetime.datetime.now().strftime("%H:%M")
+    system_msg = {
+        "type": "system",
+        "text": f"Пользователь {nickname} вошел в чат.",
+        "time": join_time,
+        "online": len(room["connections"]),
+        "max": room["max_users"]
+    }
+    await broadcast_to_room(code, system_msg)
+
+    try:
+        while True:
+            # Получение текста сообщения от клиента
+            text = await websocket.receive_text()
+            if text.strip():
+                msg_time = datetime.datetime.now().strftime("%H:%M")
+                user_msg = {
+                    "type": "message",
+                    "sender": nickname,
+                    "text": text,
+                    "time": msg_time
                 }
-                currentObjectURL = URL.createObjectURL(event.data);
-                streamImage.src = currentObjectURL;
-            } 
-            // Обработка текстовых данных (сообщения чата)
-            else if (typeof event.data === 'string') {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'chat') {
-                        appendChatMessage(data.message);
-                    } else if (data.type === 'history') {
-                        data.messages.forEach(msg => appendChatMessage(msg));
-                    }
-                } catch (e) {
-                    console.error("Ошибка разбора сообщения:", e);
+                # Рассылка сообщения ВСЕМ подключенным участникам комнаты в данный момент
+                await broadcast_to_room(code, user_msg)
+    except WebSocketDisconnect:
+        # Удаление соединения при отключении
+        if code in rooms and websocket in rooms[code]["connections"]:
+            del rooms[code]["connections"][websocket]
+            leave_time = datetime.datetime.now().strftime("%H:%M")
+
+            # Если в комнате никого не осталось — удаляем ее из памяти
+            if len(rooms[code]["connections"]) == 0:
+                del rooms[code]
+            else:
+                # Оповещаем остальных об уходе пользователя
+                leave_msg = {
+                    "type": "system",
+                    "text": f"Пользователь {nickname} вышел из чата.",
+                    "time": leave_time,
+                    "online": len(rooms[code]["connections"]),
+                    "max": rooms[code]["max_users"]
                 }
-            }
-        };
+                await broadcast_to_room(code, leave_msg)
 
-        // Обработка отправки сообщения в чат
-        chatForm.addEventListener('submit', (e) => {
-            e.preventDefault();
-            const message = chatInput.value.trim();
-            if (message && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'chat', message: message }));
-                chatInput.value = '';
-            }
-        });
 
-        // Функция добавления сообщения пользователя в чат
-        function appendChatMessage(msg) {
-            const div = document.createElement('div');
-            div.className = 'chat-message';
-            // Простая защита от XSS
-            div.textContent = `> ${msg}`; 
-            chatMessages.appendChild(div);
-            scrollToBottom();
-        }
+async def broadcast_to_room(code: str, message: dict):
+    """Отправка JSON-сообщения всем активным клиентам комнаты."""
+    if code in rooms:
+        dead_connections = []
+        for ws in rooms[code]["connections"].keys():
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead_connections.append(ws)
 
-        // Функция добавления системного сообщения в чат
-        function appendSystemMessage(msg) {
-            const div = document.createElement('div');
-            div.className = 'chat-message text-muted';
-            div.textContent = `*** ${msg}`;
-            chatMessages.appendChild(div);
-            scrollToBottom();
-        }
+        for ws in dead_connections:
+            if ws in rooms[code]["connections"]:
+                del rooms[code]["connections"][ws]
 
-        // Прокрутка чата вниз
-        function scrollToBottom() {
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-    </script>
-</body>
-</html>
-"""
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
-    """Отдает главную страницу с плеером и чатом."""
-    return HTML_CONTENT
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>FastAPI RAM IRC Chat</title>
+        <!-- Bootstrap 3 CSS -->
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
+        <!-- jQuery and Bootstrap 3 JS -->
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+        <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/js/bootstrap.min.js"></script>
+        <style>
+            body {
+                background-color: #f4f6f9;
+                font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                padding-top: 20px;
+            }
+            .main-container {
+                max-width: 800px;
+                margin: 0 auto;
+            }
+            .panel {
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            }
+            .panel-heading {
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+                font-weight: bold;
+            }
+            #chat-window {
+                height: 380px;
+                overflow-y: auto;
+                background: #1e1e2f;
+                color: #e0e0e0;
+                padding: 15px;
+                border-radius: 4px;
+                margin-bottom: 15px;
+                font-family: 'Courier New', Courier, monospace;
+            }
+            .msg-item {
+                margin-bottom: 8px;
+                word-wrap: break-word;
+            }
+            .msg-time {
+                color: #888;
+                font-size: 0.85em;
+                margin-right: 5px;
+            }
+            .msg-system {
+                color: #f39c12;
+                font-style: italic;
+            }
+            .msg-user {
+                color: #2ecc71;
+                font-weight: bold;
+            }
+            .msg-self {
+                color: #3498db;
+                font-weight: bold;
+            }
+            .msg-text {
+                color: #ffffff;
+            }
+            .status-badge {
+                font-size: 0.9em;
+                padding: 5px 10px;
+            }
+            .disabled-overlay {
+                opacity: 0.5;
+                pointer-events: none;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container main-container">
+            <!-- 1. НИКНЕЙМ (В самом верху, обязательный) -->
+            <div class="panel panel-primary">
+                <div class="panel-heading">
+                    <span class="glyphicon glyphicon-user"></span> 1. Шаг: Ваш никнейм (Обязательно)
+                </div>
+                <div class="panel-body">
+                    <div class="form-group" id="nickname-group">
+                        <label for="nickname-input">Введите никнейм для входа в чат:</label>
+                        <div class="input-group">
+                            <input type="text" id="nickname-input" class="form-control" placeholder="Например: CyberNinja" maxlength="20">
+                            <span class="input-group-btn">
+                                <button class="btn btn-primary" type="button" id="btn-set-nickname">Сохранить ник</button>
+                            </span>
+                        </div>
+                        <p class="help-block" id="nickname-hint">Без никнейма выбор комнат недоступен.</p>
+                    </div>
+                </div>
+            </div>
 
-@app.websocket("/stream_input")
-async def websocket_stream_input(websocket: WebSocket):
-    """
-    Эндпоинт для стримера. Принимает бинарные кадры (JPEG) и рассылает их зрителям.
-    """
-    await websocket.accept()
-    print("Стример подключен.")
-    try:
-        while True:
-            # Ожидаем бинарные данные (сырые байты кадра)
-            # Используем receive_bytes для минимизации накладных расходов
-            data = await websocket.receive_bytes()
-            
-            # Асинхронно рассылаем кадр всем подключенным зрителям
-            # Собираем задачи рассылки
-            if viewers:
-                send_tasks = []
-                # Копируем сет viewers, чтобы избежать ошибки изменения размера во время итерации
-                disconnected_viewers = set()
-                for viewer_ws in viewers.copy():
-                    try:
-                         # Отправляем бинарные данные
-                         send_tasks.append(viewer_ws.send_bytes(data))
-                    except Exception:
-                         # Если не удалось отправить (например, зритель отключился), помечаем на удаление
-                         disconnected_viewers.add(viewer_ws)
+            <!-- 2. ВЫБОР ДЕЙСТВИЯ: ВХОД ИЛИ СОЗДАНИЕ -->
+            <div id="actions-panel" class="disabled-overlay">
+                <div class="panel panel-default">
+                    <div class="panel-heading">
+                        <span class="glyphicon glyphicon-option-horizontal"></span> 2. Шаг: Выберите действие
+                    </div>
+                    <div class="panel-body">
+                        <ul class="nav nav-tabs nav-justified" id="action-tabs">
+                            <li class="active"><a data-toggle="tab" href="#tab-join">Войти по коду</a></li>
+                            <li><a data-toggle="tab" href="#tab-create">Создать комнату</a></li>
+                        </ul>
+
+                        <div class="tab-content" style="padding-top: 20px;">
+                            <!-- Вход по коду -->
+                            <div id="tab-join" class="tab-pane fade in active">
+                                <div class="row">
+                                    <div class="col-sm-8 col-sm-offset-2">
+                                        <div class="form-group">
+                                            <label for="join-code-input">Код комнаты (6 символов):</label>
+                                            <input type="text" id="join-code-input" class="form-control text-uppercase" placeholder="X Y Z 1 2 3" maxlength="6">
+                                        </div>
+                                        <button class="btn btn-success btn-block btn-lg" id="btn-join-room">
+                                            <span class="glyphicon glyphicon-log-in"></span> Войти в комнату
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Создание комнаты -->
+                            <div id="tab-create" class="tab-pane fade">
+                                <div class="row">
+                                    <div class="col-sm-8 col-sm-offset-2">
+                                        <div class="form-group">
+                                            <label for="max-users-select">Максимум участников в комнате:</label>
+                                            <select id="max-users-select" class="form-control">
+                                                <option value="2">2 человека (Приватный)</option>
+                                                <option value="5" selected>5 человек</option>
+                                                <option value="10">10 человек</option>
+                                                <option value="20">20 человек</option>
+                                                <option value="50">50 человек</option>
+                                            </select>
+                                        </div>
+                                        <button class="btn btn-primary btn-block btn-lg" id="btn-create-room">
+                                            <span class="glyphicon glyphicon-plus"></span> Создать комнату
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3. ИНТЕРФЕЙС IRC ЧАТА (Скрыт по умолчанию) -->
+            <div id="chat-panel" style="display: none;">
+                <div class="panel panel-dark" style="background-color: #2b2b3d; color: white;">
+                    <div class="panel-heading" style="background-color: #1a1a26; color: white; border-bottom: 1px solid #333;">
+                        <div class="row">
+                            <div class="col-xs-6">
+                                <strong>Код комнаты:</strong> <span id="display-room-code" class="label label-warning" style="font-size: 1.1em;">------</span>
+                            </div>
+                            <div class="col-xs-6 text-right">
+                                <span class="label label-info status-badge" id="online-counter">Онлайн: 0 / 0</span>
+                                <button class="btn btn-danger btn-xs" id="btn-leave-room" style="margin-left: 10px;">
+                                    <span class="glyphicon glyphicon-off"></span> Выйти
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="panel-body" style="background-color: #181824;">
+                        <!-- Окно чата -->
+                        <div id="chat-window"></div>
+
+                        <!-- Форма отправки сообщения -->
+                        <form id="msg-form" onsubmit="return false;">
+                            <div class="input-group">
+                                <input type="text" id="msg-input" class="form-control" placeholder="Напишите сообщение..." autocomplete="off">
+                                <span class="input-group-btn">
+                                    <button class="btn btn-success" type="submit" id="btn-send-msg">
+                                        <span class="glyphicon glyphicon-send"></span> Отправить
+                                    </button>
+                                </span>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Уведомления и системные сообщения -->
+            <div id="alert-box" class="alert alert-danger" style="display: none; margin-top: 15px;"></div>
+        </div>
+
+        <!-- JS Логика приложения -->
+        <script>
+            let currentNickname = "";
+            let currentRoomCode = "";
+            let socket = null;
+
+            // Вспомогательная функция для всплывающих уведомлений
+            function showAlert(msg) {
+                const box = $('#alert-box');
+                box.text(msg).fadeIn();
+                setTimeout(() => box.fadeOut(), 4000);
+            }
+
+            // 1. Установка и сохранение никнейма
+            $('#btn-set-nickname').click(function() {
+                const val = $('#nickname-input').val().trim();
+                if (!val) {
+                    showAlert("Пожалуйста, введите корректный никнейм!");
+                    return;
+                }
+                currentNickname = val;
+                $('#nickname-input').prop('disabled', true);
+                $('#btn-set-nickname').prop('disabled', true).addClass('btn-success').removeClass('btn-primary').html('<span class="glyphicon glyphicon-check"></span> Ник сохранен');
+                $('#nickname-hint').html('<b class="text-success">Никнейм установлен: ' + currentNickname + '</b>');
                 
-                # Выполняем рассылку конкурентно
-                if send_tasks:
-                     await asyncio.gather(*send_tasks, return_exceptions=True)
+                // Разблокируем панель выбора комнат
+                $('#actions-panel').removeClass('disabled-overlay');
+            });
+
+            // Нажатие Enter в поле никнейма
+            $('#nickname-input').keypress(function(e) {
+                if (e.which === 13) $('#btn-set-nickname').click();
+            });
+
+            // 2. Создание комнаты
+            $('#btn-create-room').click(async function() {
+                if (!currentNickname) {
+                    showAlert("Сначала введите никнейм вверху страницы!");
+                    return;
+                }
+
+                const maxUsers = parseInt($('#max-users-select').val());
+
+                try {
+                    const response = await fetch('/api/create-room', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ max_users: maxUsers })
+                    });
+                    const data = await response.json();
+                    
+                    if (data.room_code) {
+                        joinWebSocketRoom(data.room_code);
+                    }
+                } catch (err) {
+                    showAlert("Ошибка при создании комнаты. Попробуйте еще раз.");
+                }
+            });
+
+            // 3. Вход в комнату по коду
+            $('#btn-join-room').click(async function() {
+                if (!currentNickname) {
+                    showAlert("Сначала введите никнейм вверху страницы!");
+                    return;
+                }
+
+                const code = $('#join-code-input').val().trim().toUpperCase();
+                if (code.length !== 6) {
+                    showAlert("Код комнаты должен состоять ровно из 6 символов!");
+                    return;
+                }
+
+                try {
+                    // Проверяем существование и наполненность комнаты перед подключением
+                    const res = await fetch('/api/check-room/' + code);
+                    const info = await res.json();
+
+                    if (!info.exists) {
+                        showAlert("Комната с таким кодом не найдена!");
+                        return;
+                    }
+
+                    if (info.current_users >= info.max_users) {
+                        showAlert("Комната переполнена (" + info.current_users + "/" + info.max_users + ")!");
+                        return;
+                    }
+
+                    joinWebSocketRoom(code);
+                } catch (err) {
+                    showAlert("Ошибка при проверке комнаты.");
+                }
+            });
+
+            // 4. Подключение к WebSocket чата
+            function joinWebSocketRoom(code) {
+                currentRoomCode = code;
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/${code}/${encodeURIComponent(currentNickname)}`;
+
+                socket = new WebSocket(wsUrl);
+
+                socket.onopen = function() {
+                    // Скрываем панели настройки и показываем интерфейс чата
+                    $('#actions-panel').hide();
+                    $('.panel-primary').hide(); // Скрываем поле никнейма во время чата
+                    $('#chat-panel').show();
+                    $('#display-room-code').text(code);
+                    $('#chat-window').empty(); // Очищаем старые записи
+                    
+                    appendSystemMessage("Вы успешно подключились к комнате " + code + ". История предыдущих сообщений недоступна.");
+                };
+
+                socket.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === "system") {
+                        appendSystemMessage(`[${data.time}] ${data.text}`);
+                        if (data.online !== undefined) {
+                            $('#online-counter').text(`Онлайн: ${data.online} / ${data.max}`);
+                        }
+                    } else if (data.type === "message") {
+                        appendUserMessage(data.time, data.sender, data.text);
+                    }
+                };
+
+                socket.onclose = function(event) {
+                    showAlert("Соединение с чатом закрыто.");
+                    leaveRoomUI();
+                };
+
+                socket.onerror = function() {
+                    showAlert("Ошибка соединения WebSocket.");
+                    leaveRoomUI();
+                };
+            }
+
+            // Отправка сообщений
+            $('#msg-form').submit(function() {
+                const text = $('#msg-input').val().trim();
+                if (text && socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(text);
+                    $('#msg-input').val('');
+                }
+                return false;
+            });
+
+            // Выход из комнаты
+            $('#btn-leave-room').click(function() {
+                if (socket) {
+                    socket.close();
+                }
+                leaveRoomUI();
+            });
+
+            function leaveRoomUI() {
+                $('#chat-panel').hide();
+                $('.panel-primary').show();
+                $('#actions-panel').show();
+                currentRoomCode = "";
+            }
+
+            function appendSystemMessage(text) {
+                const win = $('#chat-window');
+                win.append(`<div class="msg-item msg-system"><span class="glyphicon glyphicon-info-sign"></span> ${escapeHtml(text)}</div>`);
+                win.scrollTop(win[0].scrollHeight);
+            }
+
+            function appendUserMessage(time, sender, text) {
+                const win = $('#chat-window');
+                const isSelf = sender === currentNickname;
+                const senderClass = isSelf ? "msg-self" : "msg-user";
                 
-                # Удаляем отключившихся зрителей
-                if disconnected_viewers:
-                     viewers.difference_update(disconnected_viewers)
+                win.append(`
+                    <div class="msg-item">
+                        <span class="msg-time">[${time}]</span>
+                        <span class="${senderClass}">&lt;${escapeHtml(sender)}&gt;:</span>
+                        <span class="msg-text">${escapeHtml(text)}</span>
+                    </div>
+                `);
+                win.scrollTop(win[0].scrollHeight);
+            }
 
-    except WebSocketDisconnect:
-        print("Стример отключился.")
-    except Exception as e:
-         print(f"Ошибка стримера: {e}")
-
-@app.websocket("/ws_viewer")
-async def websocket_viewer(websocket: WebSocket):
+            function escapeHtml(string) {
+                return String(string).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            }
+        </script>
+    </body>
+    </html>
     """
-    Эндпоинт для зрителей. Отправляет историю чата при подключении.
-    Принимает текстовые сообщения от зрителя и рассылает их всем.
-    Бинарные данные (видео) отправляются этому сокету из /stream_input.
-    """
-    await websocket.accept()
-    viewers.add(websocket)
-    print(f"Зритель подключен. Всего зрителей: {len(viewers)}")
-    
-    try:
-        # При подключении отправляем историю чата
-        if chat_history:
-            history_msg = json.dumps({
-                "type": "history",
-                "messages": list(chat_history)
-            })
-            await websocket.send_text(history_msg)
+    return HTMLResponse(content=html_content)
 
-        while True:
-            # Ожидаем текстовые сообщения от зрителя (для чата)
-            text_data = await websocket.receive_text()
-            
-            try:
-                data = json.loads(text_data)
-                if data.get("type") == "chat":
-                    msg = data.get("message")
-                    if msg:
-                        # Ограничиваем длину сообщения для безопасности и экономии памяти
-                        sanitized_msg = str(msg)[:200]
-                        
-                        # Сохраняем в историю
-                        chat_history.append(sanitized_msg)
-                        
-                        # Формируем JSON для рассылки
-                        broadcast_msg = json.dumps({
-                            "type": "chat",
-                            "message": sanitized_msg
-                        })
-                        
-                        # Рассылаем всем зрителям
-                        send_tasks = []
-                        disconnected_viewers = set()
-                        for viewer_ws in viewers.copy():
-                            try:
-                                send_tasks.append(viewer_ws.send_text(broadcast_msg))
-                            except Exception:
-                                disconnected_viewers.add(viewer_ws)
-                        
-                        if send_tasks:
-                             await asyncio.gather(*send_tasks, return_exceptions=True)
-                        
-                        if disconnected_viewers:
-                             viewers.difference_update(disconnected_viewers)
-
-            except json.JSONDecodeError:
-                # Игнорируем невалидный JSON
-                pass
-
-    except WebSocketDisconnect:
-        viewers.remove(websocket)
-        print(f"Зритель отключился. Осталось зрителей: {len(viewers)}")
-    except Exception as e:
-        if websocket in viewers:
-            viewers.remove(websocket)
-        print(f"Ошибка зрителя: {e}")
 
 if __name__ == "__main__":
-    import uvicorn
-    # Запуск сервера с ограничением по worker'ам для экономии памяти
-    # workers=1 достаточно для небольших нагрузок и строгого лимита ОЗУ
-    uvicorn.run("streamer:app", host="0.0.0.0", port=8000, workers=1, log_level="warning")
+    print("Запуск FastAPI IRC сервера...")
+    print("Откройте в браузере: http://127.0.0.1:8000")
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
