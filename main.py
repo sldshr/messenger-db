@@ -1,39 +1,35 @@
 import os
-import json
-import random
-import string
-import datetime
-import uuid
-from typing import Dict, List, Optional
-import uvicorn
-from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
-load_dotenv()
-
-SECRET_KEY = os.getenv("SECRET_KEY", "discord-ram-chat-secret-key-12345")
-
-app = FastAPI(title="RAM Discord-like Server Platform")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ОЗУ структура хранилища сессий (без сторонних зависимостей типа itsdangerous)
-sessions_db: Dict[str, dict] = {}
-
-# Единый глобальный сервер
+# Единый глобальный сервер с категориями каналов
 CHANNELS = [
-    {"id": "general", "name": "General"},
-    {"id": "off-topic", "name": "Off-Topic"},
-    {"id": "memes", "name": "Memes"}
+    # 📌 ИНФОРМАЦИЯ
+    {"id": "rules", "name": "правила", "category": "📌 ИНФОРМАЦИЯ"},
+    {"id": "announcements", "name": "объявления", "category": "📌 ИНФОРМАЦИЯ"},
+    {"id": "faq", "name": "faq", "category": "📌 ИНФОРМАЦИЯ"},
+    
+    # 💬 ТЕКСТОВЫЕ КАНАЛЫ
+    {"id": "general", "name": "основной", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    {"id": "off-topic", "name": "флудилка", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    {"id": "memes", "name": "мемы", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    {"id": "media", "name": "медиа", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    {"id": "pets", "name": "питомцы", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    {"id": "food", "name": "кулинария", "category": "💬 ТЕКСТОВЫЕ КАНАЛЫ"},
+    
+    # 🎮 ИГРЫ
+    {"id": "gaming", "name": "игровой-чат", "category": "🎮 ИГРЫ"},
+    {"id": "find-party", "name": "поиск-пати", "category": "🎮 ИГРЫ"},
+    {"id": "clips", "name": "клипы-хайлайты", "category": "🎮 ИГРЫ"},
+    {"id": "minecraft", "name": "minecraft", "category": "🎮 ИГРЫ"},
+    {"id": "dota2", "name": "dota-2", "category": "🎮 ИГРЫ"},
+    {"id": "cs2", "name": "cs2", "category": "🎮 ИГРЫ"},
+
+    # 💻 ТЕХНОЛОГИИ
+    {"id": "tech", "name": "железо-софт", "category": "💻 ТЕХНОЛОГИИ"},
+    {"id": "coding", "name": "программирование", "category": "💻 ТЕХНОЛОГИИ"},
+    {"id": "ai", "name": "нейросети", "category": "💻 ТЕХНОЛОГИИ"},
+
+    # 🎨 ТВОРЧЕСТВО
+    {"id": "art", "name": "арт-дизайн", "category": "🎨 ТВОРЧЕСТВО"},
+    {"id": "music", "name": "музыка", "category": "🎨 ТВОРЧЕСТВО"}
 ]
 MESSAGES = {ch["id"]: [] for ch in CHANNELS}
 CONNECTIONS: Dict[WebSocket, dict] = {}
@@ -143,7 +139,12 @@ async def get_admin_page(request: Request):
         """)
     
     # Дашборд админа
-    channels_html = "".join([f"<li style='margin-bottom: 10px;'><b>#{ch['name']}</b> <a href='/admin/clear?channel_id={ch['id']}' style='color: #f23f43; margin-left:10px; text-decoration:none;'>[Очистить сообщения]</a></li>" for ch in CHANNELS])
+    channels_html = "".join([
+        f"<li style='margin-bottom: 6px; display:flex; justify-content:space-between; align-items:center; background:#1e1f22; padding:8px 12px; border-radius:4px;'>"
+        f"<span><small style='color:#949ba4; margin-right:8px;'>[{ch.get('category','General')}]</small><b>#{ch['name']}</b></span>"
+        f"<a href='/admin/clear?channel_id={ch['id']}' style='color: #f23f43; margin-left:10px; text-decoration:none; font-weight:bold;'>[Очистить]</a></li>"
+        for ch in CHANNELS
+    ])
     
     return HTMLResponse(f"""
     <!DOCTYPE html>
@@ -178,7 +179,7 @@ async def get_admin_page(request: Request):
             </div>
             <div class="card" style="flex: 2;">
                 <h3 style="margin-top:0;">Управление каналами</h3>
-                <ul style="list-style: none; padding: 0;">
+                <ul style="list-style: none; padding: 0; max-height: 420px; overflow-y: auto;">
                     {channels_html}
                 </ul>
             </div>
@@ -366,29 +367,31 @@ async def get_index():
             
             /* Стилизация сообщений */
             .chat-messages { flex: 1; padding: 16px 0; overflow-y: auto; display: flex; flex-direction: column; scroll-behavior: auto; }
-            .msg-item { display: flex; padding: 2px 16px; margin-top: 16px; position: relative; }
+            .msg-item { display: flex; padding: 2px 16px; margin-top: 14px; position: relative; min-height: 40px; }
             .msg-item:hover { background-color: rgba(255, 255, 255, 0.03); }
-            .msg-item.grouped { margin-top: 0; padding-top: 2px; padding-bottom: 2px; }
+            .msg-item.grouped { margin-top: 0; padding-top: 1px; padding-bottom: 1px; min-height: 22px; }
             
+            .msg-avatar-container { width: 40px; height: 40px; margin-right: 16px; flex-shrink: 0; position: relative; }
             .msg-avatar { width: 40px; height: 40px; border-radius: 50%; background-color: var(--brand); flex-shrink: 0; cursor: pointer; object-fit: cover; }
-            .msg-body { margin-left: 16px; display: flex; flex-direction: column; flex: 1; }
-            .msg-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
-            .msg-author { font-weight: 500; color: white; cursor: pointer; }
+            .msg-body { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+            
+            /* Стили для сгруппированных сообщений (смещение ровно 56px = 40px аватар + 16px отступ) */
+            .msg-item.grouped .msg-body { margin-left: 56px; }
+            
+            .msg-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; line-height: 1.25; }
+            .msg-author { font-weight: 600; color: white; cursor: pointer; font-size: 15px; }
             .msg-author:hover { text-decoration: underline; }
             .msg-time { font-size: 12px; color: var(--text-muted); }
-            .msg-text { color: var(--text-normal); word-break: break-word; line-height: 1.4; white-space: pre-wrap; }
+            .msg-text { color: var(--text-normal); word-break: break-word; line-height: 1.375; font-size: 15px; white-space: pre-wrap; }
             
-            /* Стили для сгруппированных сообщений */
-            .msg-item.grouped .msg-body { margin-left: 56px; }
-            .msg-time-hover { position: absolute; left: 12px; width: 40px; text-align: right; font-size: 10px; color: var(--text-muted); display: none; line-height: 1.6; font-weight: bold; }
+            .msg-time-hover { position: absolute; left: 0px; top: 2px; width: 52px; text-align: right; font-size: 10px; color: var(--text-muted); display: none; line-height: 1.4; user-select: none; }
             .msg-item.grouped:hover .msg-time-hover { display: block; }
 
-            /* Markdown стили */
-            .md-bold { font-weight: bold; }
-            .md-italic { font-style: italic; }
-            .md-strike { text-decoration: line-through; }
-            .md-code { background: #1e1f22; padding: 3px 5px; border-radius: 3px; font-family: monospace; font-size: 13px; }
-            
+            .category-header {
+                font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;
+                margin: 16px 0 4px 8px; letter-spacing: 0.5px; display: flex; align-items: center; user-select: none;
+            }
+
             /* Статус онлайна */
             .status-wrapper { position: relative; display: inline-flex; }
             .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background-color: #23a55a; border-radius: 50%; border: 3px solid var(--bg-secondary); }
@@ -427,9 +430,8 @@ async def get_index():
                 </div>
 
                 <div class="channels-list">
-                    <div style="font-size: 12px; font-weight: bold; color: var(--text-muted); text-transform: uppercase; margin: 16px 0 6px 8px;">Текстовые каналы</div>
                     <div id="text-channels-list">
-                        <!-- Каналы рендерятся тут -->
+                        <!-- Категории и каналы рендерятся тут -->
                     </div>
                 </div>
 
@@ -553,14 +555,30 @@ async def get_index():
             function renderChannels(channels) {
                 const textList = $('#text-channels-list').empty();
 
+                const categories = {};
                 channels.forEach(ch => {
-                    const activeClass = ch.id === currentChannelId ? 'active' : '';
+                    const cat = ch.category || 'КАНАЛЫ';
+                    if (!categories[cat]) categories[cat] = [];
+                    categories[cat].push(ch);
+                });
+
+                for (const [catName, catChannels] of Object.entries(categories)) {
                     textList.append(`
-                        <div class="channel-item ${activeClass}" onclick="switchChannel('${ch.id}', '${ch.name}', this)">
-                            <i class="fa fa-hashtag"></i> ${ch.name}
+                        <div class="category-header">
+                            <i class="fa fa-chevron-down" style="font-size: 8px; margin-right: 6px;"></i>
+                            ${catName}
                         </div>
                     `);
-                });
+
+                    catChannels.forEach(ch => {
+                        const activeClass = ch.id === currentChannelId ? 'active' : '';
+                        textList.append(`
+                            <div class="channel-item ${activeClass}" onclick="switchChannel('${ch.id}', '${ch.name}', this)">
+                                <i class="fa fa-hashtag"></i> ${ch.name}
+                            </div>
+                        `);
+                    });
+                }
             }
 
             window.switchChannel = function(chId, chName, element) {
@@ -622,7 +640,7 @@ async def get_index():
                 } else {
                     container.append(`
                         <div class="msg-item">
-                            <div class="status-wrapper" style="margin-right: 16px; height: 40px;">
+                            <div class="msg-avatar-container">
                                 <img src="${msg.sender_picture}" class="msg-avatar">
                             </div>
                             <div class="msg-body">
