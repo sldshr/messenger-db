@@ -1,6 +1,8 @@
 import random
 import string
 import datetime
+import uuid
+import json
 from typing import Dict, Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, status
@@ -77,10 +79,15 @@ async def websocket_endpoint(websocket: WebSocket, code: str, nickname: str):
 
     # Принимаем соединение
     await websocket.accept()
-    room["connections"][websocket] = nickname
+    
+    # Генерируем уникальный ID клиента для маршрутизации WebRTC P2P сообщений
+    client_id = str(uuid.uuid4())
+    room["connections"][websocket] = {"nickname": nickname, "id": client_id}
+
+    # Отправляем клиенту его ID
+    await websocket.send_json({"type": "welcome", "client_id": client_id})
 
     # Уведомляем остальных о новом участнике
-    # ОБРАТИТЕ ВНИМАНИЕ: Старые сообщения НЕ отправляются новому пользователю!
     join_time = datetime.datetime.now().strftime("%H:%M")
     system_msg = {
         "type": "system",
@@ -92,26 +99,44 @@ async def websocket_endpoint(websocket: WebSocket, code: str, nickname: str):
     }
     await broadcast_to_room(code, system_msg)
 
-    users_list = list(room["connections"].values())
+    users_list = [info["nickname"] for info in room["connections"].values()]
     await broadcast_to_room(code, {"type": "users_update", "users": users_list})
 
     try:
         while True:
-            # Получение текста сообщения от клиента
             text = await websocket.receive_text()
-            if text.strip():
-                msg_time = datetime.datetime.now().strftime("%H:%M")
-                user_msg = {
-                    "type": "message",
-                    "sender": nickname,
-                    "text": text,
-                    "time": msg_time
-                }
-                # Рассылка сообщения ВСЕМ подключенным участникам комнаты в данный момент
-                await broadcast_to_room(code, user_msg)
+            try:
+                data = json.loads(text)
+                msg_type = data.get("type")
+                
+                if msg_type == "message":
+                    if data.get("text", "").strip():
+                        msg_time = datetime.datetime.now().strftime("%H:%M")
+                        user_msg = {
+                            "type": "message",
+                            "sender": nickname,
+                            "text": data.get("text"),
+                            "time": msg_time
+                        }
+                        await broadcast_to_room(code, user_msg)
+                        
+                elif msg_type in ["webrtc_start", "webrtc_stop"]:
+                    # Уведомляем всех в комнате о начале/конце стрима (кроме отправителя)
+                    await broadcast_to_room(code, data, exclude_ws=websocket)
+                    
+                elif msg_type in ["webrtc_request", "webrtc_offer", "webrtc_answer", "webrtc_ice"]:
+                    # P2P Маршрутизация сигналов WebRTC конкретному участнику по его ID
+                    target_id = data.get("target_id")
+                    if target_id:
+                        await send_to_client(code, target_id, data)
+                        
+            except json.JSONDecodeError:
+                pass # Игнорируем не-JSON сообщения
+                
     except WebSocketDisconnect:
         # Удаление соединения при отключении
         if code in rooms and websocket in rooms[code]["connections"]:
+            user_info = rooms[code]["connections"][websocket]
             del rooms[code]["connections"][websocket]
             leave_time = datetime.datetime.now().strftime("%H:%M")
 
@@ -130,15 +155,20 @@ async def websocket_endpoint(websocket: WebSocket, code: str, nickname: str):
                 }
                 await broadcast_to_room(code, leave_msg)
                 
-                users_list = list(rooms[code]["connections"].values())
+                users_list = [info["nickname"] for info in rooms[code]["connections"].values()]
                 await broadcast_to_room(code, {"type": "users_update", "users": users_list})
+                
+                # Сообщаем, что этот пир отключился, чтобы закрыть P2P
+                await broadcast_to_room(code, {"type": "webrtc_stop", "sender_id": user_info["id"]})
 
 
-async def broadcast_to_room(code: str, message: dict):
+async def broadcast_to_room(code: str, message: dict, exclude_ws: WebSocket = None):
     """Отправка JSON-сообщения всем активным клиентам комнаты."""
     if code in rooms:
         dead_connections = []
         for ws in rooms[code]["connections"].keys():
+            if ws == exclude_ws:
+                continue
             try:
                 await ws.send_json(message)
             except Exception:
@@ -147,6 +177,17 @@ async def broadcast_to_room(code: str, message: dict):
         for ws in dead_connections:
             if ws in rooms[code]["connections"]:
                 del rooms[code]["connections"][ws]
+
+async def send_to_client(code: str, target_id: str, message: dict):
+    """Отправка сообщения конкретному клиенту по ID."""
+    if code in rooms:
+        for ws, info in list(rooms[code]["connections"].items()):
+            if info["id"] == target_id:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    pass
+                break
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -260,29 +301,74 @@ async def get_index():
 
             .chat-body-wrapper {
                 display: flex;
+                flex-direction: row; /* Изменили на ряд для 3-х колонок */
                 flex: 1;
                 overflow: hidden;
-            }
-
-            .chat-main-area {
-                flex: 1;
-                display: flex;
-                flex-direction: column;
-                background-color: var(--chat-bg);
             }
 
             .chat-sidebar {
                 width: 250px;
                 background-color: var(--sidebar-bg);
-                border-left: 1px solid var(--border-color);
+                border-right: 1px solid var(--border-color); /* Слева, поэтому бордер справа */
                 display: flex;
                 flex-direction: column;
                 transition: width 0.3s;
+                order: 1; /* Первая колонка */
             }
 
-            @media (max-width: 768px) {
-                .chat-sidebar { width: 120px; }
-                .sidebar-title { font-size: 12px; }
+            .chat-center-area {
+                flex: 2; /* Занимает центральное пространство */
+                background-color: #000;
+                display: flex;
+                flex-direction: column;
+                order: 2; /* Вторая колонка */
+                position: relative;
+                justify-content: center;
+                align-items: center;
+            }
+
+            .chat-main-area {
+                width: 350px; /* Фиксированная или адаптивная ширина чата */
+                display: flex;
+                flex-direction: column;
+                background-color: var(--chat-bg);
+                border-left: 1px solid var(--border-color);
+                order: 3; /* Третья колонка */
+            }
+
+            /* Стили трансляции */
+            #remote-video {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+                display: none;
+            }
+
+            .stream-controls {
+                position: absolute;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 100;
+                display: flex;
+                gap: 10px;
+            }
+
+            .no-stream-placeholder {
+                color: #555;
+                font-size: 1.5em;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 10px;
+            }
+            [data-theme="dark"] .no-stream-placeholder { color: #aaa; }
+
+            @media (max-width: 992px) {
+                .chat-body-wrapper { flex-direction: column; }
+                .chat-sidebar { width: 100%; height: 150px; border-right: none; border-bottom: 1px solid var(--border-color); }
+                .chat-center-area { flex: 1; min-height: 300px; }
+                .chat-main-area { width: 100%; flex: 1; border-left: none; }
             }
 
             #chat-window {
@@ -383,7 +469,8 @@ async def get_index():
                 display: flex !important;
                 background-color: transparent !important;
             }
-            body.obs-mode .chat-main-area { background-color: transparent !important; }
+            body.obs-mode .chat-main-area { width: 100% !important; background-color: transparent !important; border: none !important; }
+            body.obs-mode .chat-center-area { display: none !important; }
             body.obs-mode #chat-window { padding-bottom: 40px; }
             body.obs-mode ::-webkit-scrollbar { display: none; }
             
@@ -501,6 +588,31 @@ async def get_index():
             </div>
             
             <div class="chat-body-wrapper">
+                <!-- Левая колонка: Участники -->
+                <div class="chat-sidebar">
+                    <div class="sidebar-header sidebar-title">
+                        <i class="fa fa-users"></i> <span data-i18n="chatOnline">Участники</span> (<span id="online-count">0</span>)
+                    </div>
+                    <ul class="user-list" id="users-list-ul">
+                        <!-- Список пользователей -->
+                    </ul>
+                </div>
+
+                <!-- Центральная колонка: Трансляция -->
+                <div class="chat-center-area">
+                    <video id="remote-video" autoplay playsinline></video>
+                    <div class="no-stream-placeholder" id="no-stream-msg">
+                        <i class="fa fa-television" style="font-size: 3em;"></i>
+                        <span data-i18n="noStream">Трансляция не запущена</span>
+                    </div>
+                    <div class="stream-controls">
+                        <button class="btn btn-success btn-lg" id="btn-share-screen" style="box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+                            <i class="fa fa-desktop"></i> <span data-i18n="btnShare">Начать трансляцию</span>
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Правая колонка: Чат -->
                 <div class="chat-main-area">
                     <div id="chat-window"></div>
                     <div class="chat-input-area">
@@ -548,6 +660,12 @@ async def get_index():
             let currentRoomCode = "";
             let socket = null;
             let currentLang = 'ru';
+            
+            // WebRTC переменные
+            let myClientId = null;
+            let peers = {}; // Храним RTCPeerConnection для каждого получателя
+            let localStream = null;
+            const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
             const i18n = {
                 ru: {
@@ -556,7 +674,6 @@ async def get_index():
                     nickError: "Пожалуйста, введите корректный никнейм!", step2Title: "2. Выберите действие:",
                     tabJoin: "Войти по коду", tabCreate: "Создать комнату", codeLabel: "Код комнаты (6 символов):",
                     joinBtn: "Войти в комнату", maxUsersLabel: "Максимум участников:", createBtn: "Создать комнату",
-                    sectionsTitle: "Разделы:", homeLink: "Главная", aboutLink: "О нас", contactLink: "Контакты",
                     btnLang: "English", btnTheme: "Сменить тему", chatRoomCode: "Комната:",
                     btnLeave: "Выйти", btnObs: "OBS Код", chatOnline: "Участники",
                     msgSend: "Отправить", obsModalTitle: "Ссылка для OBS",
@@ -564,7 +681,8 @@ async def get_index():
                     obsModalClose: "Закрыть", sysJoined: "вошел в чат.", sysLeft: "вышел из чата.",
                     errCodeFormat: "Код комнаты должен состоять ровно из 6 символов!", errNeedNick: "Сначала введите никнейм!",
                     errCreate: "Ошибка при создании комнаты.", errCheck: "Ошибка при проверке комнаты.",
-                    errNotFound: "Комната не найдена!", errFull: "Комната переполнена!", msgPlaceholder: "Написать сообщение..."
+                    errNotFound: "Комната не найдена!", errFull: "Комната переполнена!", msgPlaceholder: "Написать сообщение...",
+                    btnShare: "Начать трансляцию", btnStopShare: "Остановить трансляцию", noStream: "Трансляция не запущена"
                 },
                 en: {
                     appTitle: "FastAPI RAM IRC Chat", step1Title: "1. Your Nickname (Required):",
@@ -572,7 +690,6 @@ async def get_index():
                     nickError: "Please enter a valid nickname!", step2Title: "2. Choose an action:",
                     tabJoin: "Join by Code", tabCreate: "Create Room", codeLabel: "Room Code (6 chars):",
                     joinBtn: "Join Room", maxUsersLabel: "Max participants:", createBtn: "Create Room",
-                    sectionsTitle: "Sections:", homeLink: "Home", aboutLink: "About", contactLink: "Contact",
                     btnLang: "Русский", btnTheme: "Toggle Theme", chatRoomCode: "Room:",
                     btnLeave: "Leave", btnObs: "OBS Code", chatOnline: "Participants",
                     msgSend: "Send", obsModalTitle: "OBS Link",
@@ -580,7 +697,8 @@ async def get_index():
                     obsModalClose: "Close", sysJoined: "joined the chat.", sysLeft: "left the chat.",
                     errCodeFormat: "Room code must be exactly 6 characters!", errNeedNick: "Enter a nickname first!",
                     errCreate: "Error creating room.", errCheck: "Error checking room.",
-                    errNotFound: "Room not found!", errFull: "Room is full!", msgPlaceholder: "Type a message..."
+                    errNotFound: "Room not found!", errFull: "Room is full!", msgPlaceholder: "Type a message...",
+                    btnShare: "Share Screen", btnStopShare: "Stop Sharing", noStream: "No active stream"
                 }
             };
 
@@ -732,17 +850,91 @@ async def get_index():
                 socket.onmessage = function(event) {
                     const data = JSON.parse(event.data);
 
-                    if (data.type === "system") {
+                    if (data.type === "welcome") {
+                        myClientId = data.client_id;
+                    } else if (data.type === "system") {
                         const actionText = data.text === 'joined' ? i18n[currentLang].sysJoined : i18n[currentLang].sysLeft;
                         appendSystemMessage(`[${data.time}] ${escapeHtml(data.nickname)} ${actionText}`);
                     } else if (data.type === "message") {
                         appendUserMessage(data.time, data.sender, data.text);
                     } else if (data.type === "users_update") {
                         updateSidebar(data.users);
+                    } 
+                    // ====== WebRTC Сигналы ======
+                    else if (data.type === "webrtc_start") {
+                        // Кто-то начал трансляцию, запрашиваем у него Offer
+                        if (data.sender_id !== myClientId) {
+                            socket.send(JSON.stringify({ type: "webrtc_request", target_id: data.sender_id, sender_id: myClientId }));
+                        }
+                    } else if (data.type === "webrtc_request") {
+                        // Я стример, кто-то запросил мой поток
+                        if (localStream) {
+                            const target = data.sender_id;
+                            const pc = new RTCPeerConnection(rtcConfig);
+                            peers[target] = pc;
+
+                            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+                            pc.onicecandidate = e => {
+                                if (e.candidate) {
+                                    socket.send(JSON.stringify({ type: "webrtc_ice", target_id: target, sender_id: myClientId, candidate: e.candidate }));
+                                }
+                            };
+
+                            pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => {
+                                socket.send(JSON.stringify({ type: "webrtc_offer", target_id: target, sender_id: myClientId, sdp: pc.localDescription }));
+                            });
+                        }
+                    } else if (data.type === "webrtc_offer") {
+                        // Я зритель, стример прислал мне Offer
+                        const pc = new RTCPeerConnection(rtcConfig);
+                        peers[data.sender_id] = pc;
+
+                        pc.onicecandidate = e => {
+                            if (e.candidate) {
+                                socket.send(JSON.stringify({ type: "webrtc_ice", target_id: data.sender_id, sender_id: myClientId, candidate: e.candidate }));
+                            }
+                        };
+
+                        pc.ontrack = e => {
+                            const video = document.getElementById('remote-video');
+                            if (video.srcObject !== e.streams[0]) {
+                                video.srcObject = e.streams[0];
+                                video.style.display = 'block';
+                                $('#no-stream-msg').hide();
+                            }
+                        };
+
+                        pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
+                          .then(() => pc.createAnswer())
+                          .then(answer => pc.setLocalDescription(answer))
+                          .then(() => {
+                              socket.send(JSON.stringify({ type: "webrtc_answer", target_id: data.sender_id, sender_id: myClientId, sdp: pc.localDescription }));
+                          });
+                    } else if (data.type === "webrtc_answer") {
+                        // Я стример, получил Answer от зрителя
+                        const pc = peers[data.sender_id];
+                        if (pc) pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                    } else if (data.type === "webrtc_ice") {
+                        // Обмен ICE кандидатами (и стример и зритель)
+                        const pc = peers[data.sender_id];
+                        if (pc) pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(e => console.log(e));
+                    } else if (data.type === "webrtc_stop") {
+                        // Стример завершил трансляцию или вышел
+                        if (peers[data.sender_id]) {
+                            peers[data.sender_id].close();
+                            delete peers[data.sender_id];
+                        }
+                        const video = document.getElementById('remote-video');
+                        video.srcObject = null;
+                        video.style.display = 'none';
+                        $('#no-stream-msg').show();
                     }
                 };
 
                 socket.onclose = function() {
+                    // Очистка WebRTC при обрыве
+                    stopLocalStream();
                     if(!$('body').hasClass('obs-mode')) {
                         showToast("Соединение закрыто.");
                         leaveRoomUI();
@@ -753,11 +945,64 @@ async def get_index():
             $('#msg-form').submit(function() {
                 const text = $('#msg-input').val().trim();
                 if (text && socket && socket.readyState === WebSocket.OPEN) {
-                    socket.send(text);
+                    socket.send(JSON.stringify({ type: "message", text: text })); // Отправляем в формате JSON
                     $('#msg-input').val('');
                 }
                 return false;
             });
+
+            // --- Управление трансляцией ---
+            $('#btn-share-screen').click(async function() {
+                if (localStream) {
+                    // Остановка трансляции
+                    stopLocalStream();
+                } else {
+                    // Запуск трансляции
+                    try {
+                        localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+                        
+                        // Меняем кнопку
+                        $(this).removeClass('btn-success').addClass('btn-danger').html(`<i class="fa fa-stop"></i> <span data-i18n="btnStopShare">${i18n[currentLang].btnStopShare}</span>`);
+                        
+                        // Показываем у себя
+                        const video = document.getElementById('remote-video');
+                        video.srcObject = localStream;
+                        video.style.display = 'block';
+                        video.muted = true; // Себя не слушаем (избегаем эхо)
+                        $('#no-stream-msg').hide();
+
+                        // Если закрыли доступ через панель браузера
+                        localStream.getVideoTracks()[0].onended = () => { stopLocalStream(); };
+
+                        // Сообщаем всем, что мы начали стримить
+                        socket.send(JSON.stringify({ type: "webrtc_start", sender_id: myClientId }));
+
+                    } catch (err) {
+                        showToast("Доступ к экрану запрещен или ошибка.");
+                    }
+                }
+            });
+
+            function stopLocalStream() {
+                if (localStream) {
+                    localStream.getTracks().forEach(t => t.stop());
+                    localStream = null;
+                }
+                $('#btn-share-screen').removeClass('btn-danger').addClass('btn-success').html(`<i class="fa fa-desktop"></i> <span data-i18n="btnShare">${i18n[currentLang].btnShare}</span>`);
+                
+                const video = document.getElementById('remote-video');
+                video.srcObject = null;
+                video.style.display = 'none';
+                $('#no-stream-msg').show();
+
+                if (socket && socket.readyState === WebSocket.OPEN && myClientId) {
+                    socket.send(JSON.stringify({ type: "webrtc_stop", sender_id: myClientId }));
+                }
+
+                // Закрываем все соединения
+                Object.values(peers).forEach(pc => pc.close());
+                peers = {};
+            }
 
             $('#btn-leave-room').click(function() {
                 if (socket) socket.close();
