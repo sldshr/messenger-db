@@ -618,20 +618,11 @@ async def get_index():
                     <div class="chat-input-area">
                         <form id="msg-form" onsubmit="return false;" style="display: flex;">
                             <input type="text" id="msg-input" class="form-control input-lg" placeholder="Написать сообщение..." autocomplete="off" style="flex: 1; border-top-right-radius: 0; border-bottom-right-radius: 0;">
-                            <button class="btn btn-primary btn-lg" type="submit" id="btn-send-msg" style="border-top-left-radius: 0; border-bottom-left-radius: 0;">
-                                <i class="fa fa-paper-plane"></i> <span data-i18n="msgSend">Отправить</span>
+                            <button class="btn btn-primary btn-lg" type="submit" id="btn-send-msg" style="border-top-left-radius: 0; border-bottom-left-radius: 0; width: 60px;" title="Отправить">
+                                <i class="fa fa-paper-plane"></i>
                             </button>
                         </form>
                     </div>
-                </div>
-                
-                <div class="chat-sidebar">
-                    <div class="sidebar-header sidebar-title">
-                        <i class="fa fa-users"></i> <span data-i18n="chatOnline">Участники</span> (<span id="online-count">0</span>)
-                    </div>
-                    <ul class="user-list" id="users-list-ul">
-                        <!-- Список пользователей -->
-                    </ul>
                 </div>
             </div>
         </div>
