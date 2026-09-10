@@ -253,6 +253,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "sender_picture": user_info["picture"],
                         "text": text,
                         "time": datetime.datetime.now().strftime("%H:%M"),
+                        "timestamp": int(datetime.datetime.now().timestamp()),
                         "channel_id": channel_id
                     }
                     MESSAGES[channel_id].append(msg_obj)
@@ -362,13 +363,35 @@ async def get_index():
 
             .main-content { flex: 1; display: flex; flex-direction: column; background-color: var(--bg-primary); }
             .chat-top-bar { height: 48px; padding: 0 16px; border-bottom: 1px solid rgba(0,0,0,0.2); display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-            .chat-messages { flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; scroll-behavior: smooth; }
-            .msg-group { display: flex; gap: 16px; }
-            .msg-avatar { width: 40px; height: 40px; border-radius: 50%; background-color: var(--brand); }
-            .msg-header { display: flex; gap: 8px; align-items: baseline; }
-            .msg-author { font-weight: bold; color: white; }
+            
+            /* Стилизация сообщений */
+            .chat-messages { flex: 1; padding: 16px 0; overflow-y: auto; display: flex; flex-direction: column; scroll-behavior: auto; }
+            .msg-item { display: flex; padding: 2px 16px; margin-top: 16px; position: relative; }
+            .msg-item:hover { background-color: rgba(255, 255, 255, 0.03); }
+            .msg-item.grouped { margin-top: 0; padding-top: 2px; padding-bottom: 2px; }
+            
+            .msg-avatar { width: 40px; height: 40px; border-radius: 50%; background-color: var(--brand); flex-shrink: 0; cursor: pointer; object-fit: cover; }
+            .msg-body { margin-left: 16px; display: flex; flex-direction: column; flex: 1; }
+            .msg-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
+            .msg-author { font-weight: 500; color: white; cursor: pointer; }
+            .msg-author:hover { text-decoration: underline; }
             .msg-time { font-size: 12px; color: var(--text-muted); }
-            .msg-text { margin-top: 4px; color: var(--text-normal); word-break: break-word; }
+            .msg-text { color: var(--text-normal); word-break: break-word; line-height: 1.4; white-space: pre-wrap; }
+            
+            /* Стили для сгруппированных сообщений */
+            .msg-item.grouped .msg-body { margin-left: 56px; }
+            .msg-time-hover { position: absolute; left: 12px; width: 40px; text-align: right; font-size: 10px; color: var(--text-muted); display: none; line-height: 1.6; font-weight: bold; }
+            .msg-item.grouped:hover .msg-time-hover { display: block; }
+
+            /* Markdown стили */
+            .md-bold { font-weight: bold; }
+            .md-italic { font-style: italic; }
+            .md-strike { text-decoration: line-through; }
+            .md-code { background: #1e1f22; padding: 3px 5px; border-radius: 3px; font-family: monospace; font-size: 13px; }
+            
+            /* Статус онлайна */
+            .status-wrapper { position: relative; display: inline-flex; }
+            .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background-color: #23a55a; border-radius: 50%; border: 3px solid var(--bg-secondary); }
 
             .chat-input-container { padding: 0 16px 24px 16px; }
             .chat-input-box { background-color: #383a40; border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; }
@@ -411,7 +434,10 @@ async def get_index():
                 </div>
 
                 <div class="user-profile-bar">
-                    <img src="" id="user-avatar-img" class="user-avatar-small" alt="">
+                    <div class="status-wrapper">
+                        <img src="" id="user-avatar-img" class="user-avatar-small" alt="">
+                        <div class="status-dot" style="width: 10px; height: 10px; border-width: 2px;"></div>
+                    </div>
                     <div class="user-info-text">
                         <div class="nick" id="user-nickname-display">User</div>
                     </div>
@@ -450,6 +476,8 @@ async def get_index():
             let currentUser = null;
             let currentChannelId = 'general';
             let socket = null;
+            let lastMsgSenderId = null;
+            let lastMsgTimestamp = 0;
 
             async function checkAuth() {
                 try {
@@ -543,6 +571,8 @@ async def get_index():
                 $(element).addClass('active');
                 
                 $('#messages-container').empty();
+                lastMsgSenderId = null;
+                lastMsgTimestamp = 0;
                 
                 // Переподключение для получения новой истории (простой метод)
                 connectToServer();
@@ -562,25 +592,65 @@ async def get_index():
                 }
             });
 
+            function parseMarkdown(text) {
+                let html = text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                html = html.replace(/\*\*(.*?)\*\*/g, '<span class="md-bold">$1</span>');
+                html = html.replace(/\*(.*?)\*/g, '<span class="md-italic">$1</span>');
+                html = html.replace(/~~(.*?)~~/g, '<span class="md-strike">$1</span>');
+                html = html.replace(/`(.*?)`/g, '<span class="md-code">$1</span>');
+                return html;
+            }
+
             function appendChatMessage(msg) {
                 const container = $('#messages-container');
-                container.append(`
-                    <div class="msg-group">
-                        <img src="${msg.sender_picture}" class="msg-avatar">
-                        <div>
-                            <div class="msg-header">
-                                <span class="msg-author">${msg.sender_name}</span>
-                                <span class="msg-time">${msg.time}</span>
+                const ts = msg.timestamp || 0;
+                
+                // Проверяем, можно ли сгруппировать сообщение (тот же автор и прошло менее 5 минут)
+                const isGrouped = (lastMsgSenderId === msg.sender_id) && (ts - lastMsgTimestamp < 300); 
+                
+                const formattedText = parseMarkdown(msg.text);
+
+                if (isGrouped) {
+                    container.append(`
+                        <div class="msg-item grouped">
+                            <span class="msg-time-hover">${msg.time}</span>
+                            <div class="msg-body">
+                                <div class="msg-text">${formattedText}</div>
                             </div>
-                            <div class="msg-text">${msg.text}</div>
                         </div>
-                    </div>
-                `);
-                container.scrollTop(container[0].scrollHeight);
+                    `);
+                } else {
+                    container.append(`
+                        <div class="msg-item">
+                            <div class="status-wrapper" style="margin-right: 16px; height: 40px;">
+                                <img src="${msg.sender_picture}" class="msg-avatar">
+                            </div>
+                            <div class="msg-body">
+                                <div class="msg-header">
+                                    <span class="msg-author">${msg.sender_name}</span>
+                                    <span class="msg-time">${msg.time}</span>
+                                </div>
+                                <div class="msg-text">${formattedText}</div>
+                            </div>
+                        </div>
+                    `);
+                }
+                
+                lastMsgSenderId = msg.sender_id;
+                lastMsgTimestamp = ts;
+                
+                // Умный скролл: скроллим вниз только если мы уже внизу, или если сообщение наше
+                const domEl = container[0];
+                const atBottom = domEl.scrollHeight - domEl.scrollTop <= domEl.clientHeight + 150;
+                if (atBottom || msg.sender_id === currentUser.id) {
+                    container.scrollTop(domEl.scrollHeight);
+                }
             }
 
             function loadChatHistory(history) {
                 $('#messages-container').empty();
+                lastMsgSenderId = null;
+                lastMsgTimestamp = 0;
                 history.forEach(appendChatMessage);
             }
 
@@ -590,7 +660,10 @@ async def get_index():
                 members.forEach(m => {
                     container.append(`
                         <div class="member-item">
-                            <img src="${m.picture}" class="member-avatar">
+                            <div class="status-wrapper">
+                                <img src="${m.picture}" class="member-avatar">
+                                <div class="status-dot"></div>
+                            </div>
                             <span style="font-weight: 500;">${m.nickname}</span>
                         </div>
                     `);
