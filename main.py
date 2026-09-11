@@ -8,6 +8,23 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
 
+# =====================================================================
+# --- НАСТРОЙКИ СЕРВЕРА (API & КОНФИГУРАЦИЯ) ---
+# =====================================================================
+SERVER_NAME = "sldshr.onrunxbuild.com"
+
+WELCOME_MESSAGE = r""" ___ _    ___  ___ _  _ ___ 
+ / __| |  |   \| __| || | _ \
+ \__ \ |__| |) |__ \ __ |   /
+ |___/____|___/|___/_||_|_|_\
+-[ sldshr.onrunxbuild.com ]-"""
+
+SERVER_RULES = """1. Не флудить и не спамить.
+2. Уважать других участников чата.
+3. Запрещено использование ботов без разрешения.
+4. Приятного общения в нашем уютном терминале!"""
+# =====================================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -42,7 +59,7 @@ class ServerState:
         self.clients: Set[Client] = set()
         self.nicks: Dict[str, Client] = {}
         self.channels: Dict[str, Set[Client]] = {}
-        self.server_name = "sldshr.onrunxbuild.com"
+        self.server_name = SERVER_NAME
 
 state = ServerState()
 
@@ -182,6 +199,24 @@ async def handle_irc_line(client: Client, line: str):
     elif command == "QUIT":
         await disconnect_client(client)
 
+    elif command == "RULES":
+        # Отправляем правила построчно
+        for line in SERVER_RULES.split('\n'):
+            await client.send(f":{state.server_name} 211 {client.nick} :{line}")
+
+    elif command == "SETCOLOR":
+        # Кастомная команда для передачи цвета HTML клиентам
+        if args and client.nick:
+            color = args[0][:7] # Ограничиваем длину (напр. #FFA500)
+            notified = set()
+            # Рассылаем новый цвет всем участникам общих каналов
+            for channel in client.channels:
+                if channel in state.channels:
+                    for c in state.channels[channel]:
+                        if c not in notified:
+                            await c.send(f":{client.nick} SETCOLOR :{color}")
+                            notified.add(c)
+
 async def handle_tcp_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Обслуживание классических TCP клиентов (порт 6667)."""
     client = Client(writer=writer)
@@ -250,13 +285,13 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/", response_class=HTMLResponse)
 async def get_web_chat():
     """Аутентичный классический IRC веб-интерфейс в стиле mIRC / HexChat / WeeChat."""
-    return """
+    html_template = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SLDSHR IRC Network</title>
+    <title>{{SERVER_NAME}}</title>
     <style>
         /* Reset & Base: Early 2010s Web Style */
         * { box-sizing: border-box; }
@@ -360,6 +395,7 @@ async def get_web_chat():
         .log-line { 
             display: flex; 
             margin-bottom: 2px;
+            border-left: 2px solid transparent;
         }
         .log-line:hover { background: rgba(255,255,255,0.03); }
         .log-time { 
@@ -386,12 +422,25 @@ async def get_web_chat():
             white-space: pre-wrap;
         }
         
-        /* System Messages styling */
+        /* System Messages & Mentions styling */
         .log-sys .log-nick { color: #888; font-weight: normal; }
         .log-sys .log-text { color: #00af5f; }
         .log-notice .log-text { color: #d78700; }
         .log-action .log-text { color: #af77a7; font-style: italic; }
         .log-error .log-text { color: #ff5f5f; }
+        
+        /* Highlight Mentions */
+        .log-mention { 
+            background: rgba(255, 165, 0, 0.15) !important; 
+            border-left: 2px solid #ffa500; 
+        }
+        .mention-highlight { 
+            background: rgba(255, 165, 0, 0.4); 
+            font-weight: bold; 
+            padding: 0 3px; 
+            border-radius: 3px; 
+            color: #fff; 
+        }
 
         /* Bottom Command & Input Bar */
         #irc-status-bar {
@@ -520,11 +569,7 @@ async def get_web_chat():
     <!-- Startup Login Box with ASCII Art -->
     <div id="login-overlay">
         <div class="login-box">
-            <div class="ascii-art">  ___ _    ___  ___ _  _ ___ 
- / __| |  |   \\| __| || | _ \\
- \\__ \\ |__| |) |__ \\ __ |   /
- |___/____|___/|___/_||_|_|_\\
--[ sldshr.onrunxbuild.com ]-</div>
+            <div class="ascii-art">{{WELCOME_MESSAGE}}</div>
             <label>ВВЕДИТЕ НИКНЕЙМ:</label>
             <input type="text" id="nick-input" maxlength="15" autocomplete="off" onkeypress="if(event.key==='Enter') connectChat()">
             <button onclick="connectChat()">ПОДКЛЮЧИТЬСЯ К СЕТИ</button>
@@ -534,7 +579,7 @@ async def get_web_chat():
     <!-- Header / Channel Topic -->
     <div id="irc-header">
         <span id="header-chan">#general</span>
-        <span class="topic" id="header-topic">Добро пожаловать на сервер sldshr</span>
+        <span class="topic" id="header-topic">Добро пожаловать на сервер {{SERVER_NAME}}</span>
     </div>
 
     <!-- Main Section -->
@@ -560,13 +605,13 @@ async def get_web_chat():
             <!-- Status Bar -->
             <div id="irc-status-bar">
                 <div>[<span id="st-time">00:00</span>] [<span id="st-nick">Guest</span>] [<span id="st-chan">#general</span>]</div>
-                <div>Server: sldshr.onrunxbuild.com <span id="ascii-loader">[|]</span></div>
+                <div>Server: {{SERVER_NAME}} <span id="ascii-loader">[|]</span></div>
             </div>
 
             <!-- Input Box -->
             <div id="irc-input-container">
                 <span id="irc-prompt">#general &gt;</span>
-                <input type="text" id="irc-input" autocomplete="off" placeholder="Напишите сообщение или IRC команду (/help, /nick, /join)...">
+                <input type="text" id="irc-input" autocomplete="off" placeholder="Напишите сообщение или команду (/help, /nick, /join, /rules)...">
             </div>
         </div>
     </div>
@@ -576,6 +621,8 @@ async def get_web_chat():
         let currentNick = '';
         let currentChannel = '#general';
         let users = new Set();
+        let customColors = {}; // Хранилище кастомных цветов
+        
         const NICK_COLORS = ['#ff5f5f', '#00af5f', '#d78700', '#5f87ff', '#af77a7', '#00afaf', '#d75ffd', '#5fd700'];
 
         // ASCII Loading Animation
@@ -593,6 +640,8 @@ async def get_web_chat():
         document.getElementById('nick-input').focus();
 
         function getNickColor(nick) {
+            if (customColors[nick]) return customColors[nick]; // Если есть кастомный цвет, используем его
+            
             let hash = 0;
             for (let i = 0; i < nick.length; i++) {
                 hash = nick.charCodeAt(i) + ((hash << 5) - hash);
@@ -633,7 +682,7 @@ async def get_web_chat():
                 ws.send(`NICK ${currentNick}\\r\\n`);
                 ws.send(`USER ${currentNick} 0 * :Web User\\r\\n`);
                 ws.send(`JOIN ${currentChannel}\\r\\n`);
-                addSysMessage(`Подключение к серверу sldshr.onrunxbuild.com установлено.`);
+                addSysMessage(`Подключение к серверу {{SERVER_NAME}} установлено.`);
             };
 
             ws.onmessage = (event) => {
@@ -675,13 +724,26 @@ async def get_web_chat():
 
             if (command === 'PRIVMSG') {
                 const sender = prefix;
+                const target = params[0] || currentChannel;
                 const text = trailing;
                 if (text && text.startsWith('\\x01ACTION') && text.endsWith('\\x01')) {
                     const actionText = text.substring(8, text.length - 1);
                     addActionMessage(sender, actionText);
                 } else {
-                    addChatMessage(sender, text);
+                    // Проверка на личное сообщение (Whisper)
+                    if (!target.startsWith('#')) {
+                        addChatMessage(sender, `[ЛС от ${sender}] ${text}`, false);
+                    } else {
+                        addChatMessage(sender, text);
+                    }
                 }
+            } else if (command === 'SETCOLOR') {
+                const sender = prefix;
+                const color = trailing || params[0];
+                customColors[sender] = color;
+                updateUsersUI();
+            } else if (command === '211') { // Код для правил
+                addNoticeMessage(`[Правило] ${trailing}`);
             } else if (command === 'JOIN') {
                 const sender = prefix;
                 users.add(sender);
@@ -706,6 +768,11 @@ async def get_web_chat():
                 }
                 users.delete(oldNick);
                 users.add(newNick);
+                // Сохраняем цвет для нового ника
+                if (customColors[oldNick]) {
+                    customColors[newNick] = customColors[oldNick];
+                    delete customColors[oldNick];
+                }
                 updateUsersUI();
                 addSysMessage(`--- ${oldNick} теперь известен как ${newNick}`);
             } else if (command === 'NOTICE' || command === '001' || command === '002' || command === '003') {
@@ -731,10 +798,26 @@ async def get_web_chat():
         function handleCommand(cmdStr) {
             const parts = cmdStr.substring(1).split(' ');
             const cmd = parts[0].toUpperCase();
-            const arg = parts.slice(1).join(' ');
+            const args = parts.slice(1);
+            const arg = args.join(' ');
 
             if (cmd === 'NICK') {
-                if (arg) ws.send(`NICK ${arg}\\r\\n`);
+                const newNick = args[0];
+                const newColor = args[1]; // Опциональный цвет: /nick Slava #00ff00
+                
+                if (newNick) ws.send(`NICK ${newNick}\\r\\n`);
+                if (newColor && newColor.startsWith('#')) {
+                    ws.send(`SETCOLOR ${newColor}\\r\\n`);
+                }
+            } else if (cmd === 'MSG' || cmd === 'W') {
+                const target = args[0];
+                const text = args.slice(1).join(' ');
+                if (target && text) {
+                    ws.send(`PRIVMSG ${target} :${text}\\r\\n`);
+                    addChatMessage(currentNick, `-> [ЛС для ${target}] ${text}`, true);
+                }
+            } else if (cmd === 'RULES') {
+                ws.send(`RULES\\r\\n`);
             } else if (cmd === 'JOIN') {
                 if (arg) switchChannel(arg.startsWith('#') ? arg : '#' + arg);
             } else if (cmd === 'ME') {
@@ -745,7 +828,7 @@ async def get_web_chat():
             } else if (cmd === 'CLEAR') {
                 document.getElementById('irc-log').innerHTML = '';
             } else if (cmd === 'HELP') {
-                addNoticeMessage("Команды: /nick <ник>, /join <#канал>, /me <действие>, /clear, /help");
+                addNoticeMessage("Команды: /nick <ник> [#цвет], /join <#канал>, /msg <ник> <текст>, /me <действие>, /rules, /clear");
             } else {
                 ws.send(`${cmd} ${arg}\\r\\n`);
             }
@@ -764,8 +847,20 @@ async def get_web_chat():
 
         function addChatMessage(author, text, isSelf = false) {
             const color = isSelf ? '#5f87ff' : getNickColor(author);
+            let className = '';
+            let safeTextHtml = escapeHtml(text);
+            
+            // Логика упоминаний (Highlight Mentions)
+            if (!isSelf && currentNick && text.toLowerCase().includes(currentNick.toLowerCase())) {
+                className = 'log-mention';
+                // Экранируем ник для безопасного регулярного выражения
+                const safeNick = currentNick.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+                const regex = new RegExp(`(${safeNick})`, 'gi');
+                safeTextHtml = safeTextHtml.replace(regex, '<span class="mention-highlight">$1</span>');
+            }
+
             const nickHtml = `<span style="color: ${color};">${escapeHtml(author)}</span>`;
-            createLogLine(getTimeStr(), nickHtml, escapeHtml(text));
+            createLogLine(getTimeStr(), nickHtml, safeTextHtml, className);
         }
 
         function addActionMessage(author, actionText) {
@@ -803,6 +898,11 @@ async def get_web_chat():
 </body>
 </html>
     """
+    
+    # Внедряем переменные API прямо в HTML с помощью строковой замены
+    html_rendered = html_template.replace("{{SERVER_NAME}}", SERVER_NAME).replace("{{WELCOME_MESSAGE}}", WELCOME_MESSAGE)
+    
+    return HTMLResponse(content=html_rendered)
 
 if __name__ == "__main__":
     uvicorn.run("irc_server:app", host="0.0.0.0", port=8000, log_level="warning")
