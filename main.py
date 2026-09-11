@@ -439,7 +439,7 @@ HTML_TEMPLATE = f"""<!DOCTYPE html>
                 if (msg.startsWith('\x01ACTION ') && msg.endsWith('\x01')) {{
                     appendLog(senderNick, msg.substring(8, msg.length - 1), 'action');
                 }} else if (target === currentNick) {{
-                    appendLog(senderNick, `[ЛС] ${msg}`, 'msg');
+                    appendLog(senderNick, `[ЛС] ${{msg}}`, 'msg');
                 }} else {{
                     appendLog(senderNick, msg, 'msg');
                 }}
