@@ -42,7 +42,7 @@ class ServerState:
         self.clients: Set[Client] = set()
         self.nicks: Dict[str, Client] = {}
         self.channels: Dict[str, Set[Client]] = {}
-        self.server_name = "uvicorn.light.irc"
+        self.server_name = "sldshr.onrunxbuild.com"
 
 state = ServerState()
 
@@ -256,213 +256,285 @@ async def get_web_chat():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRC Web Client</title>
-    <!-- Classic Bootstrap 1.4.0 -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/1.4.0/css/bootstrap.min.css">
+    <title>SLDSHR IRC Network</title>
     <style>
+        /* Reset & Base: Early 2010s Web Style */
         * { box-sizing: border-box; }
         html, body {
-            height: 100%;
-            margin: 0;
-            padding: 0;
-            background-color: #121212 !important;
-            color: #d8d8d8;
-            font-family: 'Consolas', 'Lucida Console', 'Courier New', monospace;
+            height: 100%; margin: 0; padding: 0;
+            background: #2b2b2b;
+            background-image: linear-gradient(to bottom, #333 0%, #222 100%);
+            color: #e0e0e0;
+            font-family: 'Tahoma', 'Verdana', sans-serif;
             font-size: 13px;
             overflow: hidden;
         }
 
         /* Top Header Bar */
         #irc-header {
-            height: 32px;
-            background: #1e1e1e;
-            border-bottom: 1px solid #333;
+            height: 38px;
+            background: linear-gradient(to bottom, #4a4a4a, #2a2a2a);
+            border-bottom: 1px solid #111;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.5);
             display: flex;
             align-items: center;
-            padding: 0 10px;
+            padding: 0 15px;
             font-weight: bold;
-            color: #33a1fd;
+            color: #fff;
+            text-shadow: 0 -1px 0 #000;
+            z-index: 10;
+            position: relative;
         }
         #irc-header .topic {
-            color: #888;
+            color: #aaa;
             font-weight: normal;
-            margin-left: 15px;
+            margin-left: 20px;
             font-size: 12px;
+            font-style: italic;
         }
 
         /* Main Workspace */
         #irc-main {
             display: flex;
-            height: calc(100% - 62px);
+            height: calc(100% - 68px); /* 38px header + 30px footer */
             width: 100%;
-            background: #141414;
         }
 
-        /* Left/Right Sidebar */
+        /* Sidebar (Channels / Users) */
         #irc-sidebar {
             width: 200px;
-            background: #1a1a1a;
-            border-right: 1px solid #2e2e2e;
+            background: #2a2a2a;
+            border-right: 1px solid #1a1a1a;
+            box-shadow: inset -1px 0 5px rgba(0,0,0,0.2);
             display: flex;
-            flex-column: column;
-            overflow: hidden;
+            flex-direction: column;
             flex-shrink: 0;
         }
         .sidebar-section {
-            padding: 5px 8px;
-            background: #222;
-            color: #888;
+            padding: 6px 10px;
+            background: linear-gradient(to bottom, #3a3a3a, #303030);
+            color: #fff;
             font-size: 11px;
             text-transform: uppercase;
-            border-bottom: 1px solid #333;
+            border-bottom: 1px solid #1a1a1a;
+            border-top: 1px solid #444;
+            text-shadow: 0 -1px 0 #000;
         }
+        .sidebar-section:first-child { border-top: none; }
         .sidebar-list {
-            list-style: none;
-            margin: 0;
-            padding: 0;
-            overflow-y: auto;
-            flex-grow: 1;
+            list-style: none; margin: 0; padding: 0;
+            overflow-y: auto; flex-grow: 1;
         }
         .sidebar-list li {
-            padding: 3px 8px;
-            cursor: pointer;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            padding: 5px 10px; cursor: pointer;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            border-bottom: 1px solid #222;
+            color: #ccc;
         }
-        .sidebar-list li:hover {
-            background: #2a2a2a;
-        }
+        .sidebar-list li:hover { background: #333; color: #fff; }
         .sidebar-list li.active {
-            background: #005f87;
+            background: linear-gradient(to bottom, #007bb5, #005f8c);
             color: #fff;
+            border-bottom: 1px solid #003f5e;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.2);
         }
 
-        /* Center Chat Log */
+        /* Center Chat Log (Strict WeeChat style) */
         #irc-log-container {
             flex-grow: 1;
             display: flex;
             flex-direction: column;
-            background: #0f0f0f;
-            overflow: hidden;
+            background: #181818; 
+            box-shadow: inset 2px 2px 5px rgba(0,0,0,0.3);
         }
         #irc-log {
             flex-grow: 1;
-            padding: 8px 12px;
+            padding: 10px;
             overflow-y: auto;
-            word-wrap: break-word;
-            white-space: pre-wrap;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
             line-height: 1.4;
         }
 
-        /* IRC Log Line Styles */
-        .log-line { margin-bottom: 2px; }
-        .log-time { color: #555; margin-right: 6px; }
-        .log-nick { font-weight: bold; margin-right: 6px; }
-        .log-nick-self { color: #5f87ff !important; }
-        .log-text { color: #e0e0e0; }
-        .log-sys { color: #00af5f; }
-        .log-notice { color: #d78700; }
-        .log-action { color: #af77a7; font-style: italic; }
-        .log-error { color: #ff5f5f; }
+        /* WeeChat Column Layout */
+        .log-line { 
+            display: flex; 
+            margin-bottom: 2px;
+        }
+        .log-line:hover { background: rgba(255,255,255,0.03); }
+        .log-time { 
+            color: #666; 
+            width: 70px; 
+            flex-shrink: 0; 
+        }
+        .log-nick { 
+            width: 120px; 
+            text-align: right; 
+            padding-right: 8px; 
+            margin-right: 8px; 
+            border-right: 1px solid #333; 
+            font-weight: bold; 
+            flex-shrink: 0; 
+            white-space: nowrap; 
+            overflow: hidden; 
+            text-overflow: ellipsis;
+        }
+        .log-text { 
+            color: #d0d0d0; 
+            flex-grow: 1; 
+            word-break: break-word; 
+            white-space: pre-wrap;
+        }
+        
+        /* System Messages styling */
+        .log-sys .log-nick { color: #888; font-weight: normal; }
+        .log-sys .log-text { color: #00af5f; }
+        .log-notice .log-text { color: #d78700; }
+        .log-action .log-text { color: #af77a7; font-style: italic; }
+        .log-error .log-text { color: #ff5f5f; }
 
         /* Bottom Command & Input Bar */
         #irc-status-bar {
-            height: 18px;
-            background: #262626;
-            color: #aaa;
+            height: 24px;
+            background: linear-gradient(to bottom, #3a3a3a, #2a2a2a);
+            color: #ccc;
             font-size: 11px;
-            padding: 1px 10px;
-            border-top: 1px solid #333;
+            padding: 0 10px;
+            border-top: 1px solid #111;
+            border-bottom: 1px solid #111;
             display: flex;
+            align-items: center;
             justify-content: space-between;
+            text-shadow: 0 -1px 0 #000;
         }
         #irc-input-container {
             height: 30px;
-            background: #181818;
-            border-top: 1px solid #333;
+            background: #222;
             display: flex;
             align-items: center;
-            padding: 0 5px;
+            padding: 0 10px;
+            border-top: 1px solid #444;
         }
         #irc-prompt {
             color: #00ff66;
             font-weight: bold;
-            padding-right: 8px;
+            padding-right: 10px;
             white-space: nowrap;
+            font-family: 'Consolas', monospace;
         }
         #irc-input {
             width: 100%;
-            background: transparent;
-            border: none;
-            outline: none;
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 3px;
+            padding: 4px 8px;
             color: #fff;
-            font-family: inherit;
+            font-family: 'Consolas', monospace;
             font-size: 13px;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+            outline: none;
         }
+        #irc-input:focus { border-color: #007bb5; }
 
         /* Overlay Nick Modal */
         #login-overlay {
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.85);
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.75);
+            display: flex; align-items: center; justify-content: center;
             z-index: 9999;
         }
         .login-box {
-            background: #1e1e1e;
-            border: 1px solid #444;
-            padding: 20px;
-            width: 320px;
-            box-shadow: 0 0 15px rgba(0,0,0,0.8);
+            background: linear-gradient(to bottom, #333, #1f1f1f);
+            border: 1px solid #000;
+            border-radius: 8px;
+            padding: 20px 30px;
+            width: 380px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.1);
+            text-align: center;
         }
-        .login-box h3 {
-            margin: 0 0 15px 0;
-            color: #33a1fd;
-            font-size: 16px;
-            border-bottom: 1px solid #333;
-            padding-bottom: 5px;
+        /* ASCII Banner */
+        .ascii-art {
+            font-family: 'Consolas', monospace;
+            color: #00ff66;
+            font-size: 12px;
+            line-height: 1.1;
+            margin-bottom: 20px;
+            text-shadow: 0 0 5px rgba(0, 255, 102, 0.3);
+            white-space: pre;
+            text-align: center;
+        }
+        .login-box label {
+            display: block;
+            color: #aaa;
+            font-size: 12px;
+            margin-bottom: 8px;
+            text-align: left;
+            font-weight: bold;
+            text-shadow: 0 -1px 0 #000;
         }
         .login-box input {
             width: 100%;
             background: #111;
-            border: 1px solid #444;
+            border: 1px solid #000;
+            border-radius: 4px;
             color: #fff;
-            padding: 6px;
-            margin-bottom: 12px;
-            font-family: inherit;
+            padding: 8px 10px;
+            margin-bottom: 20px;
+            font-family: 'Tahoma', sans-serif;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.6);
+            outline: none;
         }
+        .login-box input:focus { border-color: #0088cc; }
         .login-box button {
             width: 100%;
-            background: #005f87;
-            border: none;
+            background: linear-gradient(to bottom, #0088cc, #0044cc);
+            border: 1px solid #002266;
+            border-radius: 4px;
             color: #fff;
-            padding: 6px;
+            padding: 10px;
             cursor: pointer;
-            font-family: inherit;
+            font-family: 'Tahoma', sans-serif;
             font-weight: bold;
+            font-size: 14px;
+            text-shadow: 0 -1px 0 rgba(0,0,0,0.5);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 2px 3px rgba(0,0,0,0.4);
+            transition: all 0.1s;
         }
-        .login-box button:hover { background: #0087bd; }
+        .login-box button:hover {
+            background: linear-gradient(to bottom, #0099dd, #0055dd);
+        }
+        .login-box button:active {
+            background: #0044cc;
+            box-shadow: inset 0 2px 5px rgba(0,0,0,0.5);
+        }
+        
+        #ascii-loader {
+            color: #00ff66;
+            font-family: 'Consolas', monospace;
+            margin-left: 10px;
+        }
     </style>
 </head>
 <body>
 
-    <!-- Startup Login Box -->
+    <!-- Startup Login Box with ASCII Art -->
     <div id="login-overlay">
         <div class="login-box">
-            <h3>[ Light IRC Client ]</h3>
-            <label style="color: #aaa; font-size: 11px;">ВВЕДИТЕ НИКНЕЙМ:</label>
-            <input type="text" id="nick-input" maxlength="15" autocomplete="off">
-            <button onclick="connectChat()">ПОДКЛЮЧИТЬСЯ</button>
+            <div class="ascii-art">  ___ _    ___  ___ _  _ ___ 
+ / __| |  |   \\| __| || | _ \\
+ \\__ \\ |__| |) |__ \\ __ |   /
+ |___/____|___/|___/_||_|_|_\\
+-[ sldshr.onrunxbuild.com ]-</div>
+            <label>ВВЕДИТЕ НИКНЕЙМ:</label>
+            <input type="text" id="nick-input" maxlength="15" autocomplete="off" onkeypress="if(event.key==='Enter') connectChat()">
+            <button onclick="connectChat()">ПОДКЛЮЧИТЬСЯ К СЕТИ</button>
         </div>
     </div>
 
     <!-- Header / Channel Topic -->
     <div id="irc-header">
         <span id="header-chan">#general</span>
-        <span class="topic" id="header-topic">Канал чата</span>
+        <span class="topic" id="header-topic">Добро пожаловать на сервер sldshr</span>
     </div>
 
     <!-- Main Section -->
@@ -488,7 +560,7 @@ async def get_web_chat():
             <!-- Status Bar -->
             <div id="irc-status-bar">
                 <div>[<span id="st-time">00:00</span>] [<span id="st-nick">Guest</span>] [<span id="st-chan">#general</span>]</div>
-                <div>Server: uvicorn.light.irc</div>
+                <div>Server: sldshr.onrunxbuild.com <span id="ascii-loader">[|]</span></div>
             </div>
 
             <!-- Input Box -->
@@ -506,7 +578,19 @@ async def get_web_chat():
         let users = new Set();
         const NICK_COLORS = ['#ff5f5f', '#00af5f', '#d78700', '#5f87ff', '#af77a7', '#00afaf', '#d75ffd', '#5fd700'];
 
+        // ASCII Loading Animation
+        const loaderFrames = ['[|]', '[/]', '[-]', '[\\\\]'];
+        let loaderIdx = 0;
+        setInterval(() => {
+            const el = document.getElementById('ascii-loader');
+            if (el) {
+                el.innerText = loaderFrames[loaderIdx];
+                loaderIdx = (loaderIdx + 1) % loaderFrames.length;
+            }
+        }, 150);
+
         document.getElementById('nick-input').value = 'User' + Math.floor(Math.random() * 899 + 100);
+        document.getElementById('nick-input').focus();
 
         function getNickColor(nick) {
             let hash = 0;
@@ -536,6 +620,7 @@ async def get_web_chat():
 
             currentNick = input;
             document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('irc-input').focus();
             updateStatusBar();
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -548,7 +633,7 @@ async def get_web_chat():
                 ws.send(`NICK ${currentNick}\\r\\n`);
                 ws.send(`USER ${currentNick} 0 * :Web User\\r\\n`);
                 ws.send(`JOIN ${currentChannel}\\r\\n`);
-                addSysMessage(`*** Подключение к серверу выполнено как ${currentNick}`);
+                addSysMessage(`Подключение к серверу sldshr.onrunxbuild.com установлено.`);
             };
 
             ws.onmessage = (event) => {
@@ -557,7 +642,7 @@ async def get_web_chat():
             };
 
             ws.onclose = () => {
-                addErrorMessage("*** Соединение с сервером разорвано.");
+                addErrorMessage("Соединение с сервером разорвано.");
             };
         }
 
@@ -566,11 +651,12 @@ async def get_web_chat():
             currentChannel = chan;
             document.getElementById('header-chan').innerText = chan;
             document.getElementById('irc-log').innerHTML = '';
-            addSysMessage(`*** Переключено на ${chan}`);
+            addSysMessage(`Переключено на ${chan}`);
             updateStatusBar();
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(`JOIN ${currentChannel}\\r\\n`);
             }
+            document.getElementById('irc-input').focus();
         }
 
         function parseIRCLine(line) {
@@ -600,12 +686,12 @@ async def get_web_chat():
                 const sender = prefix;
                 users.add(sender);
                 updateUsersUI();
-                addSysMessage(`*** ${sender} вошел в ${currentChannel}`);
+                addSysMessage(`--> ${sender} присоединился к ${currentChannel}`);
             } else if (command === 'QUIT') {
                 const sender = prefix;
                 users.delete(sender);
                 updateUsersUI();
-                addSysMessage(`*** ${sender} вышел (${trailing || 'Connection closed'})`);
+                addSysMessage(`<-- ${sender} вышел (${trailing || 'Connection closed'})`);
             } else if (command === '353') {
                 if (trailing) {
                     trailing.split(' ').forEach(u => u && users.add(u));
@@ -621,7 +707,7 @@ async def get_web_chat():
                 users.delete(oldNick);
                 users.add(newNick);
                 updateUsersUI();
-                addSysMessage(`*** ${oldNick} сменил ник на ${newNick}`);
+                addSysMessage(`--- ${oldNick} теперь известен как ${newNick}`);
             } else if (command === 'NOTICE' || command === '001' || command === '002' || command === '003') {
                 if (trailing) addNoticeMessage(`*** ${trailing}`);
             }
@@ -659,61 +745,43 @@ async def get_web_chat():
             } else if (cmd === 'CLEAR') {
                 document.getElementById('irc-log').innerHTML = '';
             } else if (cmd === 'HELP') {
-                addNoticeMessage("*** Команды: /nick <ник>, /join <#канал>, /me <действие>, /clear, /help");
+                addNoticeMessage("Команды: /nick <ник>, /join <#канал>, /me <действие>, /clear, /help");
             } else {
                 ws.send(`${cmd} ${arg}\\r\\n`);
             }
         }
 
-        function addChatMessage(author, text, isSelf = false) {
+        function createLogLine(time, nickHtml, textHtml, className = '') {
             const log = document.getElementById('irc-log');
             const div = document.createElement('div');
-            div.className = 'log-line';
-
-            const color = isSelf ? '#5f87ff' : getNickColor(author);
-
-            div.innerHTML = `<span class="log-time">[${getTimeStr()}]</span>` +
-                            `<span class="log-nick" style="color: ${color};">&lt;${escapeHtml(author)}&gt;</span>` +
-                            `<span class="log-text">${escapeHtml(text)}</span>`;
-
+            div.className = `log-line ${className}`;
+            div.innerHTML = `<div class="log-time">[${time}]</div>` +
+                            `<div class="log-nick">${nickHtml}</div>` +
+                            `<div class="log-text">${textHtml}</div>`;
             log.appendChild(div);
             log.scrollTop = log.scrollHeight;
+        }
+
+        function addChatMessage(author, text, isSelf = false) {
+            const color = isSelf ? '#5f87ff' : getNickColor(author);
+            const nickHtml = `<span style="color: ${color};">${escapeHtml(author)}</span>`;
+            createLogLine(getTimeStr(), nickHtml, escapeHtml(text));
         }
 
         function addActionMessage(author, actionText) {
-            const log = document.getElementById('irc-log');
-            const div = document.createElement('div');
-            div.className = 'log-line log-action';
-            div.innerHTML = `<span class="log-time">[${getTimeStr()}]</span>* ${escapeHtml(author)} ${escapeHtml(actionText)}`;
-            log.appendChild(div);
-            log.scrollTop = log.scrollHeight;
+            createLogLine(getTimeStr(), '*', `${escapeHtml(author)} ${escapeHtml(actionText)}`, 'log-action');
         }
 
         function addSysMessage(text) {
-            const log = document.getElementById('irc-log');
-            const div = document.createElement('div');
-            div.className = 'log-line log-sys';
-            div.innerHTML = `<span class="log-time">[${getTimeStr()}]</span>${escapeHtml(text)}`;
-            log.appendChild(div);
-            log.scrollTop = log.scrollHeight;
+            createLogLine(getTimeStr(), '==', escapeHtml(text), 'log-sys');
         }
 
         function addNoticeMessage(text) {
-            const log = document.getElementById('irc-log');
-            const div = document.createElement('div');
-            div.className = 'log-line log-notice';
-            div.innerHTML = `<span class="log-time">[${getTimeStr()}]</span>${escapeHtml(text)}`;
-            log.appendChild(div);
-            log.scrollTop = log.scrollHeight;
+            createLogLine(getTimeStr(), '--', escapeHtml(text), 'log-notice');
         }
 
         function addErrorMessage(text) {
-            const log = document.getElementById('irc-log');
-            const div = document.createElement('div');
-            div.className = 'log-line log-error';
-            div.innerHTML = `<span class="log-time">[${getTimeStr()}]</span>${escapeHtml(text)}`;
-            log.appendChild(div);
-            log.scrollTop = log.scrollHeight;
+            createLogLine(getTimeStr(), '!!', escapeHtml(text), 'log-error');
         }
 
         function updateUsersUI() {
