@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import time
+import os
 
 # Настройка логирования для отслеживания событий сервера
 logging.basicConfig(
@@ -77,6 +78,26 @@ class Client:
         """Основной цикл обработки входящих сообщений клиента."""
         logger.info(f"Новое подключение от {self.addr}")
         try:
+            # Читаем первую строку для проверки типа протокола
+            first_line = await self.reader.readline()
+            if not first_line:
+                return
+
+            # Хак для облачных платформ: отвечаем на HTTP Health Checks
+            if first_line.startswith(b"GET ") or first_line.startswith(b"HEAD "):
+                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nIRC Server OK\r\n"
+                self.writer.write(response.encode('utf-8'))
+                await self.writer.drain()
+                logger.info(f"Обработан HTTP Health Check от платформы ({self.addr})")
+                return
+
+            # Если это не HTTP, обрабатываем первую строку как IRC-команду
+            message = first_line.decode('utf-8', errors='ignore').strip()
+            if message:
+                logger.debug(f"Получено от {self.nickname or self.addr}: {message}")
+                await self.process_command(message)
+
+            # Основной цикл чтения остальных команд
             while True:
                 line = await self.reader.readline()
                 if not line:
@@ -307,9 +328,9 @@ class IRCServer:
             await server.serve_forever()
 
 if __name__ == "__main__":
-    # Запуск сервера (по умолчанию на порту 6667)
-    HOST = '0.0.0.0' # Измените на '0.0.0.0', чтобы сервер был доступен из локальной сети
-    PORT = 6667
+    # Запуск сервера
+    HOST = '0.0.0.0' # Для облачных платформ обязательно '0.0.0.0'
+    PORT = int(os.environ.get("PORT", 6667)) # Получаем порт от провайдера
     
     server = IRCServer(host=HOST, port=PORT)
     try:
