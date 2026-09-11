@@ -249,38 +249,45 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def get_web_chat():
-    """Вшитый HTML/JS Веб-интерфейс чата."""
+    """Вшитый HTML/JS Веб-интерфейс чата на Bootstrap 5."""
     return """
 <!DOCTYPE html>
-<html lang="ru" class="h-full bg-slate-900">
+<html lang="ru" data-bs-theme="dark" class="h-100">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IRC Web Chat</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Bootstrap 5 CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
+        body, html { height: 100%; overflow: hidden; }
         ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.6); }
-        ::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); border-radius: 4px; }
+        ::-webkit-scrollbar-track { background: #121212; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        .chat-box { overflow-y: auto; }
+        .sidebar { width: 260px; min-width: 260px; }
+        @media (max-width: 767.98px) {
+            .sidebar { width: 100%; min-width: 100%; height: auto !important; }
+        }
+        .msg-bubble { background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 10px; max-width: 85%; }
     </style>
 </head>
-<body class="h-full font-sans text-slate-100 flex flex-col antialiased">
+<body class="bg-dark text-light d-flex flex-column h-100">
 
     <!-- Modal Nickname Prompt -->
-    <div id="login-modal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-        <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl">
-            <div class="text-center mb-6">
-                <div class="w-12 h-12 bg-indigo-600/20 text-indigo-400 rounded-xl flex items-center justify-center mx-auto mb-3 text-2xl">
-                    <i class="fa-solid fa-comments"></i>
+    <div id="login-modal" class="position-fixed top-0 start-0 w-100 h-100 bg-black bg-opacity-75 d-flex align-items-center justify-content-center p-3" style="z-index: 1050;">
+        <div class="card bg-dark border-secondary shadow-lg p-4" style="max-width: 400px; width: 100%;">
+            <div class="text-center mb-4">
+                <div class="rounded-circle bg-primary bg-opacity-20 text-primary d-inline-flex align-items-center justify-content-center mb-3" style="width: 50px; height: 50px;">
+                    <i class="fa-solid fa-comments fs-4"></i>
                 </div>
-                <h2 class="text-xl font-bold">Добро пожаловать в IRC Чат</h2>
-                <p class="text-xs text-slate-400 mt-1">Введите псевдоним для входа в сеть</p>
+                <h4 class="fw-bold mb-1">IRC Чат</h4>
+                <p class="text-secondary small mb-0">Введите псевдоним для входа</p>
             </div>
             <form id="login-form" onsubmit="connectChat(event)">
-                <input type="text" id="nick-input" required maxlength="15" placeholder="Ваш никнейм..." 
-                       class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:outline-none mb-4 text-sm">
-                <button type="submit" class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 font-semibold rounded-xl transition shadow-lg shadow-indigo-600/30 text-sm">
+                <input type="text" id="nick-input" required maxlength="15" placeholder="Ваш никнейм..." class="form-control bg-body-tertiary border-secondary text-light mb-3">
+                <button type="submit" class="btn btn-primary w-100 fw-semibold">
                     Войти в чат
                 </button>
             </form>
@@ -288,64 +295,63 @@ async def get_web_chat():
     </div>
 
     <!-- Main Layout -->
-    <div class="flex-1 flex flex-col md:flex-row overflow-hidden">
+    <div class="d-flex flex-column flex-md-row flex-grow-1 overflow-hidden">
         
         <!-- Sidebar -->
-        <div class="w-full md:w-64 bg-slate-950 border-r border-slate-800 flex flex-col flex-shrink-0">
+        <div class="sidebar bg-body-tertiary border-end border-secondary d-flex flex-column flex-shrink-0">
             <!-- Header -->
-            <div class="p-4 border-b border-slate-800 flex items-center justify-between">
-                <div class="flex items-center gap-2">
-                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span class="font-bold text-sm tracking-wide">Light IRC</span>
+            <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between">
+                <div class="d-flex align-items-center gap-2">
+                    <span class="spinner-grow spinner-grow-sm text-success" role="status"></span>
+                    <span class="fw-bold">Light IRC</span>
                 </div>
-                <span id="current-user" class="text-xs bg-slate-800 px-2.5 py-1 rounded-md text-slate-300 font-mono">Guest</span>
+                <span id="current-user" class="badge bg-secondary font-monospace">Guest</span>
             </div>
 
             <!-- Channel List -->
             <div class="p-3">
-                <div class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 px-2">Каналы</div>
-                <button onclick="switchChannel('#general')" class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-600/10 text-indigo-400 font-medium text-sm">
-                    <i class="fa-solid fa-hashtag text-xs"></i> general
+                <div class="text-uppercase text-secondary fw-semibold small mb-2" style="font-size: 0.75rem;">Каналы</div>
+                <button onclick="switchChannel('#general')" class="btn btn-outline-primary btn-sm w-100 text-start d-flex align-items-center gap-2">
+                    <i class="fa-solid fa-hashtag"></i> general
                 </button>
             </div>
 
             <!-- Online Users List -->
-            <div class="flex-1 overflow-y-auto p-3 border-t border-slate-800/60">
-                <div class="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 px-2">
+            <div class="flex-grow-1 overflow-auto p-3 border-top border-secondary">
+                <div class="text-uppercase text-secondary fw-semibold small mb-2" style="font-size: 0.75rem;">
                     Участники (<span id="user-count">0</span>)
                 </div>
-                <div id="users-list" class="space-y-1">
+                <div id="users-list" class="d-flex flex-column gap-1">
                     <!-- Dynamic users -->
                 </div>
             </div>
         </div>
 
         <!-- Chat Area -->
-        <div class="flex-1 flex flex-col bg-slate-900 overflow-hidden">
+        <div class="d-flex flex-column flex-grow-1 bg-dark overflow-hidden">
             <!-- Channel Header -->
-            <div class="h-14 border-b border-slate-800 px-6 flex items-center justify-between bg-slate-900/50">
-                <div class="flex items-center gap-2">
-                    <i class="fa-solid fa-hashtag text-indigo-400"></i>
-                    <span class="font-semibold text-sm">general</span>
+            <div class="p-3 border-bottom border-secondary d-flex align-items-center justify-content-between bg-body-tertiary">
+                <div class="d-flex align-items-center gap-2">
+                    <i class="fa-solid fa-hashtag text-primary"></i>
+                    <span id="channel-name" class="fw-bold">general</span>
                 </div>
-                <div class="text-xs text-slate-500">Авто-подключение заблокировано на порт 80/443</div>
+                <span class="text-secondary small d-none d-sm-inline">Подключено через WebSocket</span>
             </div>
 
             <!-- Messages Window -->
-            <div id="chat-messages" class="flex-1 overflow-y-auto p-4 space-y-3 font-sans text-sm">
-                <div class="text-center my-4">
-                    <span class="text-xs bg-slate-800/80 text-slate-400 px-3 py-1.5 rounded-full">
-                        Система готова. Ожидание подключения...
+            <div id="chat-messages" class="chat-box flex-grow-1 p-3 d-flex flex-column gap-2">
+                <div class="text-center my-3">
+                    <span class="badge bg-body-tertiary text-secondary px-3 py-2 border border-secondary">
+                        Система готова. Введите ник для подключения...
                     </span>
                 </div>
             </div>
 
             <!-- Input Box -->
-            <div class="p-4 border-t border-slate-800 bg-slate-950">
-                <form id="chat-form" onsubmit="sendMessage(event)" class="flex gap-2">
-                    <input type="text" id="message-input" autocomplete="off" placeholder="Напишите сообщение в #general..." 
-                           class="flex-1 px-4 py-2.5 bg-slate-900 border border-slate-800 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:outline-none text-sm">
-                    <button type="submit" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl transition flex items-center justify-center">
+            <div class="p-3 border-top border-secondary bg-body-tertiary">
+                <form id="chat-form" onsubmit="sendMessage(event)" class="d-flex gap-2">
+                    <input type="text" id="message-input" autocomplete="off" placeholder="Напишите сообщение в чат..." class="form-control bg-dark border-secondary text-light">
+                    <button type="submit" class="btn btn-primary px-4">
                         <i class="fa-solid fa-paper-plane"></i>
                     </button>
                 </form>
@@ -353,14 +359,14 @@ async def get_web_chat():
         </div>
     </div>
 
-    <!-- Client Logic JS -->
+    <!-- Bootstrap 5 JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let ws = null;
         let currentNick = '';
         let currentChannel = '#general';
         let users = new Set();
 
-        // Auto generation of random default nickname
         document.getElementById('nick-input').value = 'User' + Math.floor(Math.random() * 899 + 100);
 
         function connectChat(e) {
@@ -370,16 +376,14 @@ async def get_web_chat():
 
             currentNick = nickInput;
             document.getElementById('current-user').innerText = currentNick;
-            document.getElementById('login-modal').classList.add('hidden');
+            document.getElementById('login-modal').classList.add('d-none');
 
-            // Connect via WebSocket (same host and port)
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
 
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
-                // Send IRC Handshake
                 ws.send(`CAP LS 302\\r\\n`);
                 ws.send(`NICK ${currentNick}\\r\\n`);
                 ws.send(`USER ${currentNick} 0 * :Web User\\r\\n`);
@@ -396,16 +400,25 @@ async def get_web_chat():
             };
         }
 
+        function switchChannel(channel) {
+            if (channel === currentChannel) return;
+            currentChannel = channel;
+            document.getElementById('channel-name').innerText = channel.replace('#', '');
+            document.getElementById('chat-messages').innerHTML = '';
+            addSystemMessage(`Переключено на канал ${channel}`);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(`JOIN ${currentChannel}\\r\\n`);
+            }
+        }
+
         function parseIRCLine(line) {
             if (!line) return;
 
-            // Ping Handling
             if (line.startsWith('PING')) {
                 ws.send(`PONG ${line.split(' ')[1]}\\r\\n`);
                 return;
             }
 
-            // Regex parsing standard IRC syntax
             const match = line.match(/^(?::([^ !]+)(?:![^ ]+)? )?([A-Z0-9]+) (?:([^:]+)?)(?::(.*))?$/);
             if (!match) return;
 
@@ -426,7 +439,7 @@ async def get_web_chat():
                 users.delete(sender);
                 updateUsersUI();
                 addSystemMessage(`Пользователь ${sender} вышел`);
-            } else if (command === '353') { // NAMES list
+            } else if (command === '353') {
                 if (trailing) {
                     trailing.split(' ').forEach(u => u && users.add(u));
                     updateUsersUI();
@@ -452,11 +465,10 @@ async def get_web_chat():
             if (!msg || !ws) return;
 
             if (msg.startsWith('/')) {
-                // Command support like /nick or /join
                 const parts = msg.substring(1).split(' ');
                 const cmd = parts[0].toUpperCase();
                 if (cmd === 'NICK') ws.send(`NICK ${parts[1]}\\r\\n`);
-                else if (cmd === 'JOIN') ws.send(`JOIN ${parts[1]}\\r\\n`);
+                else if (cmd === 'JOIN') switchChannel(parts[1].startsWith('#') ? parts[1] : '#' + parts[1]);
             } else {
                 ws.send(`PRIVMSG ${currentChannel} :${msg}\\r\\n`);
                 addChatMessage(currentNick, msg, true);
@@ -467,16 +479,16 @@ async def get_web_chat():
         function addChatMessage(author, text, isSelf = false) {
             const box = document.getElementById('chat-messages');
             const div = document.createElement('div');
-            div.className = "flex flex-col gap-1";
+            div.className = "d-flex flex-column align-items-start gap-1";
             
             const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
             div.innerHTML = `
-                <div class="flex items-center gap-2">
-                    <span class="font-semibold text-xs ${isSelf ? 'text-indigo-400' : 'text-emerald-400'}">${escapeHtml(author)}</span>
-                    <span class="text-[10px] text-slate-500">${time}</span>
+                <div class="d-flex align-items-center gap-2">
+                    <span class="fw-bold small ${isSelf ? 'text-primary' : 'text-success'}">${escapeHtml(author)}</span>
+                    <span class="text-secondary" style="font-size: 0.7rem;">${time}</span>
                 </div>
-                <div class="bg-slate-800/60 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 w-fit max-w-[85%] break-words">
+                <div class="msg-bubble p-2 text-light text-break">
                     ${escapeHtml(text)}
                 </div>
             `;
@@ -488,7 +500,7 @@ async def get_web_chat():
             const box = document.getElementById('chat-messages');
             const div = document.createElement('div');
             div.className = "text-center my-2";
-            div.innerHTML = `<span class="text-[11px] text-slate-500 bg-slate-950 px-2.5 py-1 rounded-md border border-slate-800/80">${escapeHtml(text)}</span>`;
+            div.innerHTML = `<span class="badge bg-body-tertiary text-secondary border border-secondary px-2 py-1">${escapeHtml(text)}</span>`;
             box.appendChild(div);
             box.scrollTop = box.scrollHeight;
         }
@@ -499,8 +511,8 @@ async def get_web_chat():
             list.innerHTML = '';
             users.forEach(u => {
                 const userEl = document.createElement('div');
-                userEl.className = "flex items-center gap-2 px-2 py-1.5 rounded text-xs text-slate-300 hover:bg-slate-800/50";
-                userEl.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${u === currentNick ? 'bg-indigo-400' : 'bg-slate-500'}"></span> ${escapeHtml(u)}`;
+                userEl.className = "d-flex align-items-center gap-2 p-1 rounded small text-light";
+                userEl.innerHTML = `<span class="badge rounded-pill ${u === currentNick ? 'bg-primary' : 'bg-secondary'}" style="width: 8px; height: 8px; padding: 0;"> </span> ${escapeHtml(u)}`;
                 list.appendChild(userEl);
             });
         }
