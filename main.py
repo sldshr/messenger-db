@@ -20,16 +20,15 @@ DEFAULT_CHANNELS = [
     "#fitness", "#food", "#travel", "#cars", "#help"
 ]
 
-# Validation Regex Rules
 NICK_REGEX = re.compile(r"^[a-zA-Z0-9_\-\u0400-\u04FF]{2,20}$")
 CHANNEL_REGEX = re.compile(r"^#[a-zA-Z0-9_\-\u0400-\u04FF]{2,30}$")
 
-# Security Storage (In-Memory ONLY)
-VALID_SESSIONS: dict[str, dict] = {}  # token -> {username, created_at, ip}
+# In-memory security and session management
+VALID_SESSIONS: dict[str, dict] = {}
 MAX_SESSION_AGE = 86400  # 24 hours
-IP_CONNECTIONS: dict[str, int] = {}   # ip -> connection_count
+IP_CONNECTIONS: dict[str, int] = {}
 MAX_CONNS_PER_IP = 5
-MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}  # ws -> list of msg timestamps
+MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -37,176 +36,191 @@ HTML_CONTENT = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRC Lite Web Modern</title>
+    <title>IRC Lite Web</title>
     <!-- CDN Bootstrap 1.4.0 -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/twbs/bootstrap@v1.4.0/bootstrap.min.css">
     <!-- Cloudflare Turnstile SDK -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
         :root {
-            --bg-main: #0f172a;
-            --bg-card: #1e293b;
-            --bg-input: #334155;
-            --bg-hover: #334155;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --text-label: #cbd5e1;
-            --accent: #3b82f6;
-            --accent-hover: #2563eb;
-            --success: #10b981;
-            --border-color: #334155;
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --bg-panel: #21262d;
+            --bg-input: #0d1117;
+            --border-main: #30363d;
+            --text-primary: #c9d1d9;
+            --text-muted: #8b949e;
+            --text-heading: #f0f6fc;
+            --accent-blue: #2f81f7;
+            --accent-hover: #58a6ff;
+            --status-green: #3fb950;
         }
 
         * {
-            box-sizing: border-box;
+            box-sizing: border-box !important;
         }
 
         body {
             margin: 0;
             padding: 0;
-            background-color: var(--bg-main);
-            color: var(--text-main);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
             height: 100vh;
             overflow: hidden;
         }
 
         .hidden { display: none !important; }
 
+        /* SVG Icon styling */
+        .icon {
+            display: inline-block;
+            vertical-align: middle;
+            fill: currentColor;
+            flex-shrink: 0;
+        }
+
+        /* Login Layout Fixes */
         .login-page {
             display: flex;
             align-items: center;
             justify-content: center;
             min-height: 100vh;
-            background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);
-            padding: 20px;
+            background: radial-gradient(circle at center, #161b22 0%, #0d1117 100%);
+            padding: 16px;
         }
 
         .login-card {
             background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 32px;
+            border: 1px solid var(--border-main);
+            border-radius: 8px;
+            padding: 32px 28px;
             width: 100%;
-            max-width: 440px;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.6);
+            max-width: 420px;
+            box-shadow: 0 16px 32px rgba(0, 0, 0, 0.6);
+        }
+
+        .login-card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
         }
 
         .login-card h2 {
-            color: #ffffff;
-            font-size: 24px;
-            margin-bottom: 8px;
+            color: var(--text-heading);
+            font-size: 20px;
+            margin: 0;
             font-weight: 700;
         }
 
         .login-card p {
             color: var(--text-muted);
             font-size: 13px;
+            margin-top: 4px;
             margin-bottom: 24px;
-            line-height: 1.5;
+            line-height: 1.4;
         }
 
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 18px;
         }
 
         .form-group label {
             display: block;
-            color: var(--text-main);
+            color: var(--text-primary);
             font-size: 13px;
             font-weight: 600;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
 
         .form-control-custom {
             width: 100%;
-            padding: 12px 14px;
+            padding: 10px 12px;
             background: var(--bg-input);
-            border: 1px solid #475569;
-            border-radius: 8px;
-            color: #ffffff;
+            border: 1px solid var(--border-main);
+            border-radius: 6px;
+            color: var(--text-heading);
             font-size: 14px;
             outline: none;
-            transition: border-color 0.2s, box-shadow 0.2s;
+            transition: border-color 0.15s ease;
         }
 
         .form-control-custom:focus {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+            border-color: var(--accent-blue);
         }
 
+        /* Checkbox Box Fix */
         .checkbox-container {
             display: flex;
             align-items: flex-start;
-            gap: 12px;
-            font-size: 13px;
-            color: #e2e8f0;
-            margin-bottom: 20px;
-            line-height: 1.4;
-            background: rgba(15, 23, 42, 0.4);
+            gap: 10px;
+            background: var(--bg-panel);
             padding: 12px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            border: 1px solid var(--border-main);
+            margin-bottom: 18px;
         }
 
         .checkbox-container input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            margin-top: 1px;
+            width: 16px;
+            height: 16px;
+            margin-top: 2px;
             cursor: pointer;
-            accent-color: var(--accent);
             flex-shrink: 0;
+            accent-color: var(--accent-blue);
         }
 
         .checkbox-container label {
-            color: #e2e8f0;
+            font-size: 12px;
+            color: var(--text-primary);
+            line-height: 1.4;
+            margin: 0;
             cursor: pointer;
             user-select: none;
-            margin: 0;
-            font-weight: 400;
         }
 
         .checkbox-container a {
-            color: #60a5fa;
+            color: var(--accent-hover);
             text-decoration: underline;
         }
 
-        .checkbox-container a:hover {
-            color: #93c5fd;
-        }
-
+        /* Turnstile Container Strict Sizing */
         .turnstile-box {
             display: flex;
             justify-content: center;
-            background: rgba(15, 23, 42, 0.5);
-            padding: 12px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
+            align-items: center;
+            background: var(--bg-panel);
+            border: 1px solid var(--border-main);
+            border-radius: 6px;
+            padding: 10px;
             margin-bottom: 20px;
-            min-height: 70px;
+            min-height: 75px;
+            overflow: hidden;
         }
 
         .btn-primary-custom {
             width: 100%;
-            padding: 12px;
-            background: var(--accent);
-            color: white;
-            border: none;
-            border-radius: 8px;
+            padding: 10px 16px;
+            background: #238636;
+            color: #ffffff;
+            border: 1px solid rgba(240,246,252,0.1);
+            border-radius: 6px;
             font-weight: 600;
-            font-size: 15px;
+            font-size: 14px;
             cursor: pointer;
-            transition: background 0.2s, transform 0.1s;
+            transition: background 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
         }
 
         .btn-primary-custom:hover {
-            background: var(--accent-hover);
+            background: #2ea043;
         }
 
-        .btn-primary-custom:active {
-            transform: scale(0.99);
-        }
-
+        /* Chat Application Interface */
         .app-container {
             display: flex;
             height: 100vh;
@@ -215,32 +229,34 @@ HTML_CONTENT = """
 
         .sidebar-left, .sidebar-right {
             background: var(--bg-card);
-            border-right: 1px solid var(--border-color);
+            border-right: 1px solid var(--border-main);
             display: flex;
             flex-direction: column;
             user-select: none;
         }
 
         .sidebar-left {
-            width: 260px;
-            min-width: 260px;
+            width: 250px;
+            min-width: 250px;
         }
 
         .sidebar-right {
             width: 240px;
             min-width: 240px;
             border-right: none;
-            border-left: 1px solid var(--border-color);
+            border-left: 1px solid var(--border-main);
         }
 
         .sidebar-header {
-            padding: 16px;
-            border-bottom: 1px solid var(--border-color);
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-main);
             font-weight: 700;
-            font-size: 15px;
+            font-size: 14px;
+            color: var(--text-heading);
             display: flex;
             align-items: center;
-            justify-content: space-between;
+            gap: 8px;
+            background: var(--bg-dark);
         }
 
         .sidebar-scroll {
@@ -254,265 +270,241 @@ HTML_CONTENT = """
             text-transform: uppercase;
             letter-spacing: 0.05em;
             color: var(--text-muted);
-            padding: 8px 8px 4px 8px;
+            padding: 6px 8px;
             font-weight: 700;
         }
 
         .channel-item, .user-item {
             display: flex;
             align-items: center;
-            padding: 8px 10px;
-            border-radius: 6px;
+            padding: 6px 10px;
+            border-radius: 4px;
             cursor: pointer;
-            font-size: 14px;
-            color: var(--text-label);
+            font-size: 13px;
+            color: var(--text-primary);
             margin-bottom: 2px;
-            transition: background 0.15s, color 0.15s;
+            gap: 8px;
         }
 
         .channel-item:hover, .user-item:hover {
-            background: var(--bg-hover);
-            color: var(--text-main);
+            background: var(--bg-panel);
+            color: var(--text-heading);
         }
 
         .channel-item.active {
-            background: var(--accent);
+            background: var(--accent-blue);
             color: #ffffff;
             font-weight: 600;
         }
 
-        .channel-icon {
-            margin-right: 8px;
-            opacity: 0.7;
-            font-weight: bold;
-        }
-
         .user-status-dot {
-            width: 8px;
-            height: 8px;
-            background-color: var(--success);
+            width: 7px;
+            height: 7px;
+            background-color: var(--status-green);
             border-radius: 50%;
-            margin-right: 10px;
-            display: inline-block;
+            flex-shrink: 0;
         }
 
         .user-badge {
             margin-left: auto;
             font-size: 10px;
-            background: rgba(255, 255, 255, 0.12);
-            padding: 2px 6px;
-            border-radius: 10px;
-            color: var(--text-label);
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1px 5px;
+            border-radius: 4px;
+            color: var(--text-muted);
         }
 
         .chat-main {
             flex: 1;
             display: flex;
             flex-direction: column;
-            background: var(--bg-main);
+            background: var(--bg-dark);
         }
 
         .chat-header {
-            height: 56px;
-            border-bottom: 1px solid var(--border-color);
-            padding: 0 20px;
+            height: 50px;
+            border-bottom: 1px solid var(--border-main);
+            padding: 0 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
             background: var(--bg-card);
         }
 
-        .chat-header h3 {
-            margin: 0;
-            font-size: 18px;
-            color: var(--text-main);
+        .chat-header-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-heading);
             font-weight: 700;
-        }
-
-        .chat-header .subtext {
-            font-size: 12px;
-            color: var(--text-muted);
+            font-size: 16px;
         }
 
         .chat-messages {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 16px;
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 8px;
+            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
         }
 
-        .msg-row {
-            display: flex;
-            flex-direction: column;
-            max-width: 85%;
-        }
-
-        .msg-meta {
-            font-size: 11px;
-            color: var(--text-muted);
-            margin-bottom: 4px;
+        .msg-line {
+            font-size: 13px;
+            line-height: 1.5;
+            word-break: break-word;
             display: flex;
             gap: 8px;
-            align-items: center;
+            align-items: baseline;
+        }
+
+        .msg-time {
+            color: var(--text-muted);
+            font-size: 11px;
+            flex-shrink: 0;
         }
 
         .msg-sender {
             font-weight: 600;
-            color: #60a5fa;
+            color: var(--accent-hover);
+            flex-shrink: 0;
         }
 
-        .msg-bubble {
-            background: var(--bg-card);
-            padding: 10px 14px;
-            border-radius: 8px;
-            border: 1px solid var(--border-color);
-            color: var(--text-main);
-            font-size: 14px;
-            line-height: 1.45;
-            word-break: break-word;
+        .msg-sender.me {
+            color: var(--status-green);
         }
 
-        .msg-row.me {
-            align-self: flex-end;
+        .msg-text {
+            color: var(--text-primary);
         }
 
-        .msg-row.me .msg-sender {
-            color: #a7f3d0;
-        }
-
-        .msg-row.me .msg-bubble {
-            background: #1e3a8a;
-            border-color: #1d4ed8;
-        }
-
-        .sys-msg {
-            align-self: center;
-            background: rgba(51, 65, 85, 0.5);
-            border: 1px solid var(--border-color);
-            border-radius: 20px;
-            padding: 6px 16px;
+        .sys-line {
             font-size: 12px;
-            color: #cbd5e1;
+            color: var(--text-muted);
             font-style: italic;
-            text-align: center;
+            padding: 2px 0;
         }
 
         .chat-input-area {
-            padding: 16px 20px;
+            padding: 12px 16px;
             background: var(--bg-card);
-            border-top: 1px solid var(--border-color);
+            border-top: 1px solid var(--border-main);
         }
 
         .chat-input-form {
             display: flex;
-            gap: 10px;
+            gap: 8px;
             margin: 0;
         }
 
         .chat-input-form input {
             flex: 1;
-            padding: 12px 16px;
+            padding: 10px 12px;
             background: var(--bg-input);
-            border: 1px solid #475569;
-            border-radius: 8px;
-            color: #ffffff;
-            font-size: 14px;
+            border: 1px solid var(--border-main);
+            border-radius: 6px;
+            color: var(--text-heading);
+            font-size: 13px;
             outline: none;
         }
 
         .chat-input-form input:focus {
-            border-color: var(--accent);
+            border-color: var(--accent-blue);
         }
 
         .chat-input-form button {
-            padding: 0 24px;
-            background: var(--accent);
-            color: white;
+            padding: 0 16px;
+            background: var(--accent-blue);
+            color: #ffffff;
             border: none;
-            border-radius: 8px;
+            border-radius: 6px;
             font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .chat-input-form button:hover {
-            background: var(--accent-hover);
+            background: #388bfd;
         }
 
-        ::-webkit-scrollbar {
-            width: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #334155;
-            border-radius: 3px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #475569;
-        }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #484f58; }
     </style>
 </head>
 <body>
 
     <div class="login-page" id="login-view">
         <div class="login-card">
-            <h2>IRC Lite Web</h2>
-            <p>Защищённый мессенджер без сохранения истории. ОЗУ: 512 МБ.</p>
+            <div class="login-card-header">
+                <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                <h2>IRC Lite Web</h2>
+            </div>
+            <p>Защищённый мессенджер без сохранения истории (RAM 512MB)</p>
             
             <form id="login-form" onsubmit="login(event)">
                 <div class="form-group">
                     <label for="username">Имя пользователя</label>
-                    <input type="text" id="username" class="form-control-custom" placeholder="Например: Hacker99" maxlength="20" required autocomplete="off">
+                    <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
                 </div>
 
                 <div class="checkbox-container">
                     <input type="checkbox" id="privacy" required>
-                    <label for="privacy">Мне есть 18 лет, я соглашаюсь с <a href="#" onclick="alert('История сообщений и персональные данные не сохраняются на сервере.'); return false;">условиями конфиденциальности</a>.</label>
+                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="#" onclick="alert('Сообщения не сохраняются на диске.'); return false;">условия конфиденциальности</a>.</label>
                 </div>
 
                 <div class="form-group">
-                    <label>Проверка безопасности</label>
+                    <label>Защита Cloudflare</label>
                     <div class="turnstile-box">
                         <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER" data-theme="dark"></div>
                     </div>
                 </div>
 
-                <button type="submit" id="login-btn" class="btn-primary-custom">Войти в чат</button>
-                <div id="login-error" style="color: #f87171; font-size: 13px; margin-top: 12px; text-align: center; font-weight: 600;"></div>
+                <button type="submit" id="login-btn" class="btn-primary-custom">
+                    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                    <span>Войти в чат</span>
+                </button>
+                <div id="login-error" style="color: #f85149; font-size: 12px; margin-top: 12px; text-align: center; font-weight: 600;"></div>
             </form>
         </div>
     </div>
 
     <div class="app-container hidden" id="chat-view">
         
+        <!-- Left Sidebar: Channels -->
         <div class="sidebar-left">
             <div class="sidebar-header">
-                <span>💬 IRC Channels</span>
+                <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
+                <span>Каналы</span>
             </div>
             
             <div class="sidebar-scroll">
-                <div class="section-title">Публичные каналы</div>
+                <div class="section-title">Публичные</div>
                 <div id="channel-list"></div>
 
                 <div class="section-title" style="margin-top: 16px;">Секретная комната</div>
-                <div style="padding: 0 8px;">
+                <div style="padding: 0 6px;">
                     <form onsubmit="joinCustomChannel(event)" style="margin:0;">
-                        <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секретный-чат" style="padding:8px 10px; font-size:12px; margin-bottom:6px;" maxlength="30" required>
-                        <button type="submit" class="btn-primary-custom" style="padding:6px; font-size:12px;">Перейти / Создать</button>
+                        <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секрет" style="padding:6px 8px; font-size:12px; margin-bottom:6px;" maxlength="30" required>
+                        <button type="submit" class="btn-primary-custom" style="padding:6px; font-size:12px; background:var(--accent-blue);">
+                            <svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                            <span>Войти / Создать</span>
+                        </button>
                     </form>
                 </div>
             </div>
         </div>
 
+        <!-- Central Chat Box -->
         <div class="chat-main">
             <div class="chat-header">
-                <div>
-                    <h3 id="current-channel-title">#general</h3>
-                    <div class="subtext">Память только в ОЗУ • Сообщения не сохраняются</div>
+                <div class="chat-header-title">
+                    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
+                    <span id="current-channel-title">general</span>
                 </div>
                 <div>
                     <span class="user-badge" id="channel-users-count">Участников: 0</span>
@@ -520,24 +512,28 @@ HTML_CONTENT = """
             </div>
 
             <div class="chat-messages" id="chat-box">
-                <div class="sys-msg">Добро пожаловать в IRC Lite Web. Вы успешно подключены к защищённой сети.</div>
+                <div class="sys-line">*** Добро пожаловать в IRC Lite Web. История сообщений не сохраняется.</div>
             </div>
 
             <div class="chat-input-area">
                 <form class="chat-input-form" onsubmit="sendMessage(event)">
-                    <input type="text" id="message-input" placeholder="Напишите сообщение..." maxlength="500" autocomplete="off" required>
-                    <button type="submit">Отправить</button>
+                    <input type="text" id="message-input" placeholder="Написать сообщение..." maxlength="500" autocomplete="off" required>
+                    <button type="submit">
+                        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                    </button>
                 </form>
             </div>
         </div>
 
+        <!-- Right Sidebar: Users -->
         <div class="sidebar-right">
             <div class="sidebar-header">
-                <span>👥 Участники</span>
+                <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+                <span>Участники</span>
             </div>
 
             <div class="sidebar-scroll">
-                <div class="section-title">В этом канале (<span id="count-in-channel">0</span>)</div>
+                <div class="section-title">В канале (<span id="count-in-channel">0</span>)</div>
                 <div id="users-in-channel-list"></div>
 
                 <div class="section-title" style="margin-top: 20px;">Все онлайн (<span id="count-global">0</span>)</div>
@@ -554,6 +550,8 @@ HTML_CONTENT = """
         let ws = null;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
 
+        const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
+
         async function login(e) {
             e.preventDefault();
             const btn = document.getElementById('login-btn');
@@ -563,12 +561,12 @@ HTML_CONTENT = """
             const turnstileResponse = turnstileElem ? turnstileElem.value : "";
 
             if (!turnstileResponse) {
-                errorSpan.innerText = "Пожалуйста, пройдите проверку капчи.";
+                errorSpan.innerText = "Пожалуйста, пройдите капчу.";
                 return;
             }
 
             btn.disabled = true;
-            errorSpan.innerText = "Проверка безопасности...";
+            errorSpan.innerText = "Проверка...";
 
             const formData = new FormData();
             formData.append('username', username);
@@ -580,17 +578,17 @@ HTML_CONTENT = """
 
                 if (data.status === "ok") {
                     currentUser = data.username;
-                    sessionToken = data.token; // Receive one-time session token
+                    sessionToken = data.token;
                     document.getElementById('login-view').classList.add('hidden');
                     document.getElementById('chat-view').classList.remove('hidden');
                     renderChannels();
                     connectWs(currentChannel);
                 } else {
-                    errorSpan.innerText = data.message || "Ошибка авторизации.";
+                    errorSpan.innerText = data.message || "Ошибка входа.";
                     btn.disabled = false;
                 }
             } catch (err) {
-                errorSpan.innerText = "Ошибка соединения с сервером.";
+                errorSpan.innerText = "Ошибка соединения.";
                 btn.disabled = false;
             }
         }
@@ -601,7 +599,7 @@ HTML_CONTENT = """
             defaultChannels.forEach(ch => {
                 const div = document.createElement('div');
                 div.className = "channel-item" + (ch === currentChannel ? " active" : "");
-                div.innerHTML = `<span class="channel-icon">#</span>${ch.replace('#', '')}`;
+                div.innerHTML = `${hashSvg} <span>${ch.replace('#', '')}</span>`;
                 div.onclick = () => switchChannel(ch);
                 list.appendChild(div);
             });
@@ -612,10 +610,10 @@ HTML_CONTENT = """
             if (channelName === currentChannel) return;
             
             currentChannel = channelName;
-            document.getElementById('current-channel-title').innerText = currentChannel;
+            document.getElementById('current-channel-title').innerText = currentChannel.replace('#', '');
             
             const chatBox = document.getElementById('chat-box');
-            chatBox.innerHTML = `<div class="sys-msg">Переход в канал ${escapeHtml(currentChannel)}...</div>`;
+            chatBox.innerHTML = `<div class="sys-line">*** Переход в канал ${escapeHtml(currentChannel)}...</div>`;
             
             renderChannels();
             connectWs(currentChannel);
@@ -632,12 +630,9 @@ HTML_CONTENT = """
         }
 
         function connectWs(channel) {
-            if (ws) {
-                ws.close();
-            }
+            if (ws) ws.close();
             
             const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-            // Secure connection passing session token instead of unauthenticated username
             const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(sessionToken) + "/" + encodeURIComponent(channel);
             
             ws = new WebSocket(wsUrl);
@@ -646,19 +641,13 @@ HTML_CONTENT = """
                 try {
                     const data = JSON.parse(event.data);
                     handleIncomingPacket(data);
-                } catch(e) {
-                    console.error("Invalid packet format", event.data);
-                }
+                } catch(e) {}
             };
             
             ws.onclose = function(e) {
-                if (e.code === 4001) {
-                    appendSystemMessage("Сессия недействительна. Пожалуйста, войдите снова.");
-                } else if (e.code === 4002) {
-                    appendSystemMessage("Превышен лимит подключений с вашего IP адреса.");
-                } else {
-                    appendSystemMessage("Соединение с сервером потеряно.");
-                }
+                if (e.code === 4001) appendSystemMessage("*** Сессия недействительна.");
+                else if (e.code === 4002) appendSystemMessage("*** Превышен лимит подключений.");
+                else appendSystemMessage("*** Соединение потеряно.");
             };
         }
 
@@ -666,7 +655,7 @@ HTML_CONTENT = """
             if (packet.type === "message") {
                 appendMessage(packet.username, packet.text, packet.timestamp);
             } else if (packet.type === "system") {
-                appendSystemMessage(packet.text);
+                appendSystemMessage("*** " + packet.text);
             } else if (packet.type === "presence") {
                 updateUserLists(packet.channel_users, packet.global_users);
             }
@@ -677,14 +666,12 @@ HTML_CONTENT = """
             const isMe = sender === currentUser;
             
             const row = document.createElement('div');
-            row.className = "msg-row" + (isMe ? " me" : "");
+            row.className = "msg-line";
 
             row.innerHTML = `
-                <div class="msg-meta">
-                    <span class="msg-sender">${escapeHtml(sender)}</span>
-                    <span>${timestamp}</span>
-                </div>
-                <div class="msg-bubble">${escapeHtml(text)}</div>
+                <span class="msg-time">[${timestamp}]</span>
+                <span class="msg-sender ${isMe ? 'me' : ''}">&lt;${escapeHtml(sender)}&gt;</span>
+                <span class="msg-text">${escapeHtml(text)}</span>
             `;
 
             chatBox.appendChild(row);
@@ -694,7 +681,7 @@ HTML_CONTENT = """
         function appendSystemMessage(text) {
             const chatBox = document.getElementById('chat-box');
             const div = document.createElement('div');
-            div.className = "sys-msg";
+            div.className = "sys-line";
             div.innerText = text;
             chatBox.appendChild(div);
             chatBox.scrollTop = chatBox.scrollHeight;
@@ -702,30 +689,25 @@ HTML_CONTENT = """
 
         function updateUserLists(channelUsers, globalUsers) {
             const channelUsersBox = document.getElementById('users-in-channel-list');
-            const channelCountSpan = document.getElementById('count-in-channel');
-            const badgeCount = document.getElementById('channel-users-count');
+            document.getElementById('count-in-channel').innerText = channelUsers.length;
+            document.getElementById('channel-users-count').innerText = `Участников: ${channelUsers.length}`;
             
             channelUsersBox.innerHTML = "";
-            channelCountSpan.innerText = channelUsers.length;
-            badgeCount.innerText = `Участников: ${channelUsers.length}`;
-
             channelUsers.forEach(u => {
                 const div = document.createElement('div');
                 div.className = "user-item";
-                div.innerHTML = `<span class="user-status-dot"></span><span>${escapeHtml(u)}</span>${u === currentUser ? ' <span class="user-badge">вы</span>' : ''}`;
+                div.innerHTML = `<span class="user-status-dot"></span><span>${escapeHtml(u)}</span>${u === currentUser ? '<span class="user-badge">вы</span>' : ''}`;
                 channelUsersBox.appendChild(div);
             });
 
             const globalUsersBox = document.getElementById('users-global-list');
-            const globalCountSpan = document.getElementById('count-global');
+            document.getElementById('count-global').innerText = globalUsers.length;
             
             globalUsersBox.innerHTML = "";
-            globalCountSpan.innerText = globalUsers.length;
-
             globalUsers.forEach(u => {
                 const div = document.createElement('div');
                 div.className = "user-item";
-                div.innerHTML = `<span class="user-status-dot" style="background:#3b82f6;"></span><span>${escapeHtml(u)}</span>`;
+                div.innerHTML = `<span class="user-status-dot" style="background:#58a6ff;"></span><span>${escapeHtml(u)}</span>`;
                 globalUsersBox.appendChild(div);
             });
         }
@@ -750,7 +732,6 @@ HTML_CONTENT = """
 
 app = FastAPI()
 
-# Connection Manager for Multi-Channel Messaging
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, dict[WebSocket, str]] = {
@@ -765,7 +746,7 @@ class ConnectionManager:
         
         await self.broadcast_json({
             "type": "system",
-            "text": f"Пользователь {username} присоединился к каналу."
+            "text": f"Пользователь {username} вошел в канал."
         }, channel)
         
         await self.broadcast_presence(channel)
@@ -775,7 +756,6 @@ class ConnectionManager:
             if websocket in self.active_connections[channel]:
                 del self.active_connections[channel][websocket]
             
-            # Auto-purge empty secret channels to keep RAM clean for 512MB
             if channel not in DEFAULT_CHANNELS and len(self.active_connections[channel]) == 0:
                 del self.active_connections[channel]
             else:
@@ -833,9 +813,8 @@ async def login(request: Request, username: str = Form(...), cf_turnstile_respon
     
     username = username.strip()
     if not NICK_REGEX.match(username):
-        return {"status": "error", "message": "Имя должно содержать от 2 до 20 символов (буквы, цифры, _ или -)."}
+        return {"status": "error", "message": "Никнейм должен содержать 2-20 символов."}
 
-    # Cloudflare Turnstile Server-Side Siteverify
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", data={
@@ -845,17 +824,15 @@ async def login(request: Request, username: str = Form(...), cf_turnstile_respon
             }, timeout=5.0)
             data = resp.json()
             if not data.get("success"):
-                return {"status": "error", "message": "Проверка безопасности Cloudflare не пройдена."}
+                return {"status": "error", "message": "Капча Cloudflare не пройдена."}
         except Exception:
-            return {"status": "error", "message": "Ошибка связи с сервером капчи Cloudflare."}
+            return {"status": "error", "message": "Ошибка соединения с Cloudflare."}
 
-    # Clean up expired sessions
     now = time.time()
     expired = [t for t, s in VALID_SESSIONS.items() if now - s["created_at"] > MAX_SESSION_AGE]
     for t in expired:
         del VALID_SESSIONS[t]
 
-    # Generate one-time secure session token
     token = secrets.token_hex(16)
     VALID_SESSIONS[token] = {
         "username": username,
@@ -875,13 +852,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     username = session["username"]
     client_ip = websocket.client.host if websocket.client else "127.0.0.1"
     
-    # Enforce IP Connection Limits
     current_conns = IP_CONNECTIONS.get(client_ip, 0)
     if current_conns >= MAX_CONNS_PER_IP:
-        await websocket.close(code=4002, reason="Too many connections from this IP")
+        await websocket.close(code=4002, reason="Too many connections")
         return
 
-    # Sanitize Channel Name
     channel = channel.strip().lower()
     if not channel.startswith("#"):
         channel = "#" + channel
@@ -896,14 +871,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
         while True:
             raw_data = await websocket.receive_text()
             
-            # Rate Limiting Check (Max 5 msgs per 3s)
             now = time.time()
             timestamps = MESSAGE_TIMESTAMPS.get(websocket, [])
             timestamps = [t for t in timestamps if now - t < 3.0]
             if len(timestamps) >= 5:
                 await websocket.send_json({
                     "type": "system",
-                    "text": "⚠️ Слишком частая отправка сообщений! Подождите пару секунд."
+                    "text": "⚠️ Слишком частые сообщения. Подождите 3 секунды."
                 })
                 continue
             
@@ -914,7 +888,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
                 packet = json.loads(raw_data)
                 text = packet.get("text", "").strip()
                 if text:
-                    # Enforce max 500 chars & filter unprintable characters
                     text = text[:500]
                     text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
                     now_str = datetime.datetime.now().strftime("%H:%M")
