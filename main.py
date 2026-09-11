@@ -1,339 +1,346 @@
-import asyncio
-import logging
-import re
-import time
 import os
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
+from fastapi.responses import HTMLResponse
+import uvicorn
 
-# Настройка логирования для отслеживания событий сервера
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("IRC_Server")
+# Настройки Cloudflare Turnstile
+# Твой секретный ключ (указан в задании)
+TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
+# ВАЖНО: Ниже укажи свой SITEKEY от Cloudflare (публичный ключ). 
+# По умолчанию я взял стандартный префикс из твоего секрета, но он может отличаться!
+TURNSTILE_SITEKEY = "0x4AAAAAAEt2kX9fNPZNVSsC" 
 
-SERVER_NAME = "python.irc.server"
-SERVER_VERSION = "1.0"
-CREATION_TIME = time.strftime("%Y-%m-%d %H:%M:%S")
+# Список из более чем 20 стандартных каналов
+DEFAULT_CHANNELS = [
+    "#general", "#random", "#news", "#music", "#gaming",
+    "#programming", "#python", "#javascript", "#movies", "#anime",
+    "#books", "#science", "#space", "#technology", "#hardware",
+    "#art", "#design", "#photography", "#memes", "#sports",
+    "#fitness", "#food", "#travel", "#cars", "#help"
+]
 
-class Channel:
-    """Представляет IRC канал (чат-комнату)."""
-    def __init__(self, name):
-        self.name = name
-        self.clients = set() # Множество подключенных клиентов
-
-    def add_client(self, client):
-        self.clients.add(client)
-
-    def remove_client(self, client):
-        if client in self.clients:
-            self.clients.remove(client)
-
-    async def broadcast(self, message, exclude_client=None):
-        """Отправка сообщения всем пользователям в канале."""
-        for client in self.clients:
-            if client != exclude_client:
-                await client.send_raw(message)
-
-class Client:
-    """Представляет подключенного IRC клиента."""
-    def __init__(self, server, reader, writer):
-        self.server = server
-        self.reader = reader
-        self.writer = writer
-        self.addr = writer.get_extra_info('peername')
+# Весь фронтенд в одной переменной (HTML + CSS + JS)
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>IRC Lite Web</title>
+    <!-- Bootstrap 1.4.0 CDN -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/1.4.0/bootstrap.min.css">
+    <!-- Cloudflare Turnstile -->
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <style>
+        body { padding-top: 60px; background-color: #f5f5f5; }
+        .hidden { display: none !important; }
+        .chat-container { background: #fff; border: 1px solid #ccc; border-radius: 4px; height: 65vh; overflow-y: auto; padding: 15px; margin-bottom: 15px; box-shadow: inset 0 1px 1px rgba(0,0,0,.05); }
+        .sidebar { background: #fff; border: 1px solid #ccc; border-radius: 4px; height: 65vh; overflow-y: auto; padding: 15px; }
+        .message { margin-bottom: 5px; word-wrap: break-word; }
+        .sys-message { color: #888; font-style: italic; }
+        .channel-item { cursor: pointer; padding: 5px; border-radius: 3px; }
+        .channel-item:hover { background-color: #e6e6e6; }
+        .channel-active { background-color: #0064cd; color: white !important; }
+        .channel-active:hover { background-color: #004b9a; }
         
-        self.nickname = None
-        self.username = None
-        self.realname = None
-        self.registered = False
-        
-        self.channels = set() # Каналы, в которых находится клиент
+        /* Исправления для форм Bootstrap 1.4 */
+        form { margin-bottom: 0; }
+        .login-wrapper { background: #fff; padding: 30px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); margin-top: 50px; }
+    </style>
+</head>
+<body>
 
-    @property
-    def prefix(self):
-        """Формирует префикс клиента (nick!user@host)."""
-        nick = self.nickname or "*"
-        user = self.username or "unknown"
-        host = self.addr[0]
-        return f"{nick}!{user}@{host}"
+    <div class="topbar">
+      <div class="fill">
+        <div class="container">
+          <h3><a href="#">IRC Lite Web (No History)</a></h3>
+        </div>
+      </div>
+    </div>
 
-    async def send_raw(self, message):
-        """Отправка сырого сообщения клиенту."""
-        if not message.endswith("\r\n"):
-            message += "\r\n"
+    <div class="container" id="login-view">
+        <div class="row">
+            <div class="span10 offset3 login-wrapper">
+                <h2>Вход в мессенджер</h2>
+                <p>Представьтесь для входа. История сообщений не сохраняется.</p>
+                <form id="login-form" onsubmit="login(event)">
+                    <div class="clearfix">
+                        <label for="username">Имя пользователя</label>
+                        <div class="input">
+                            <input class="xlarge" id="username" name="username" type="text" maxlength="20" required placeholder="Например: Hacker99">
+                        </div>
+                    </div>
+                    
+                    <div class="clearfix">
+                        <label>Конфиденциальность</label>
+                        <div class="input">
+                            <ul class="inputs-list">
+                                <li>
+                                    <label>
+                                        <input type="checkbox" name="privacy" required>
+                                        <span>Я подтверждаю, что мне есть 18 лет, и принимаю <a href="#">условия конфиденциальности</a>.</span>
+                                    </label>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <div class="clearfix">
+                        <label>Защита от ботов</label>
+                        <div class="input">
+                            <!-- Cloudflare Turnstile Widget -->
+                            <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER"></div>
+                        </div>
+                    </div>
+
+                    <div class="actions">
+                        <button type="submit" class="btn primary large" id="login-btn">Присоединиться</button>
+                        <span id="login-error" style="color: red; margin-left: 10px;"></span>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="container hidden" id="chat-view">
+        <div class="row">
+            <div class="span4">
+                <div class="sidebar">
+                    <h4>Публичные каналы</h4>
+                    <ul class="unstyled" id="channel-list">
+                        <!-- Каналы будут добавлены через JS -->
+                    </ul>
+                    
+                    <hr>
+                    <h4>Секретный канал</h4>
+                    <p style="font-size: 11px; color:#666;">Создайте или присоединитесь к скрытому каналу по точному имени.</p>
+                    <form onsubmit="joinCustomChannel(event)">
+                        <input type="text" id="custom-channel" class="span3" placeholder="#секрет" required>
+                        <button type="submit" class="btn small" style="margin-top: 5px;">Перейти</button>
+                    </form>
+                </div>
+            </div>
+            
+            <div class="span12">
+                <h3 id="current-channel-title">#general</h3>
+                <div class="chat-container" id="chat-box">
+                    <div class="sys-message">Добро пожаловать! История сообщений отключена.</div>
+                </div>
+                
+                <form id="message-form" onsubmit="sendMessage(event)">
+                    <div class="row">
+                        <div class="span10">
+                            <input class="span10" type="text" id="message-input" autocomplete="off" placeholder="Введите сообщение..." required>
+                        </div>
+                        <div class="span2">
+                            <button type="submit" class="btn primary span2">Отправить</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentUser = "";
+        let currentChannel = "#general";
+        let ws = null;
+        const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
+
+        async function login(e) {
+            e.preventDefault();
+            const btn = document.getElementById('login-btn');
+            const errorSpan = document.getElementById('login-error');
+            const username = document.getElementById('username').value.trim();
+            const turnstileResponse = document.querySelector('[name="cf-turnstile-response"]').value;
+
+            if (!turnstileResponse) {
+                errorSpan.innerText = "Пожалуйста, пройдите проверку капчи.";
+                return;
+            }
+
+            btn.disabled = true;
+            errorSpan.innerText = "Вход...";
+
+            const formData = new FormData();
+            formData.append('username', username);
+            formData.append('cf_turnstile_response', turnstileResponse);
+
+            try {
+                const res = await fetch('/login', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (data.status === "ok") {
+                    currentUser = data.username;
+                    document.getElementById('login-view').classList.add('hidden');
+                    document.getElementById('chat-view').classList.remove('hidden');
+                    renderChannels();
+                    connectWs(currentChannel);
+                } else {
+                    errorSpan.innerText = data.message || "Ошибка входа.";
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                errorSpan.innerText = "Ошибка соединения с сервером.";
+                btn.disabled = false;
+            }
+        }
+
+        function renderChannels() {
+            const list = document.getElementById('channel-list');
+            list.innerHTML = "";
+            defaultChannels.forEach(ch => {
+                const li = document.createElement('li');
+                li.className = "channel-item" + (ch === currentChannel ? " channel-active" : "");
+                li.innerText = ch;
+                li.onclick = () => switchChannel(ch);
+                list.appendChild(li);
+            });
+        }
+
+        function switchChannel(channelName) {
+            if (channelName === currentChannel) return;
+            
+            if (!channelName.startsWith('#')) channelName = '#' + channelName;
+            
+            currentChannel = channelName;
+            document.getElementById('current-channel-title').innerText = currentChannel;
+            document.getElementById('chat-box').innerHTML = '<div class="sys-message">Подключение к ' + currentChannel + '...</div>';
+            
+            renderChannels(); // Обновляем выделение
+            connectWs(currentChannel);
+        }
+
+        function joinCustomChannel(e) {
+            e.preventDefault();
+            const customInput = document.getElementById('custom-channel');
+            let ch = customInput.value.trim();
+            if (ch) {
+                customInput.value = "";
+                switchChannel(ch);
+            }
+        }
+
+        function connectWs(channel) {
+            if (ws) {
+                ws.close();
+            }
+            
+            const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+            const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(currentUser) + "/" + encodeURIComponent(channel);
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onmessage = function(event) {
+                const chatBox = document.getElementById('chat-box');
+                const div = document.createElement('div');
+                div.className = "message";
+                div.innerHTML = event.data; // Ожидаем безопасный HTML с бэкенда
+                chatBox.appendChild(div);
+                chatBox.scrollTop = chatBox.scrollHeight;
+            };
+            
+            ws.onclose = function() {
+                const chatBox = document.getElementById('chat-box');
+                chatBox.innerHTML += '<div class="sys-message" style="color:red;">Соединение потеряно.</div>';
+            };
+        }
+
+        function sendMessage(e) {
+            e.preventDefault();
+            const input = document.getElementById('message-input');
+            const msg = input.value.trim();
+            if (msg && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(msg);
+                input.value = "";
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+app = FastAPI()
+
+class ConnectionManager:
+    def __init__(self):
+        # Хранит все активные WebSocket соединения в памяти: dict[str, list[WebSocket]]
+        # При достижении 0 пользователей в кастомном канале, он автоматически очищается для экономии ОЗУ.
+        self.active_connections: dict[str, list[WebSocket]] = {
+            ch: [] for ch in DEFAULT_CHANNELS
+        }
+
+    async def connect(self, websocket: WebSocket, channel: str):
+        await websocket.accept()
+        if channel not in self.active_connections:
+            self.active_connections[channel] = []
+        self.active_connections[channel].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, channel: str):
+        if channel in self.active_connections:
+            self.active_connections[channel].remove(websocket)
+            # Очистка пустых кастомных каналов для предотвращения утечки памяти
+            if channel not in DEFAULT_CHANNELS and len(self.active_connections[channel]) == 0:
+                del self.active_connections[channel]
+
+    async def broadcast(self, message: str, channel: str):
+        if channel in self.active_connections:
+            for connection in self.active_connections[channel]:
+                try:
+                    await connection.send_text(message)
+                except Exception:
+                    pass # Игнорируем ошибки отправки (например, клиент резко отключился)
+
+manager = ConnectionManager()
+
+@app.get("/")
+async def get_home():
+    import json
+    # Подстановка переменных в HTML перед отдачей пользователю
+    html = HTML_CONTENT.replace("TURNSTILE_SITEKEY_PLACEHOLDER", TURNSTILE_SITEKEY)
+    html = html.replace("DEFAULT_CHANNELS_PLACEHOLDER", json.dumps(DEFAULT_CHANNELS))
+    return HTMLResponse(html)
+
+@app.post("/login")
+async def login(username: str = Form(...), cf_turnstile_response: str = Form(...)):
+    # Проверка Cloudflare Turnstile (Асинхронный POST-запрос к API)
+    async with httpx.AsyncClient() as client:
         try:
-            self.writer.write(message.encode('utf-8'))
-            await self.writer.drain()
-            logger.debug(f"Отправлено {self.nickname or self.addr}: {message.strip()}")
-        except Exception as e:
-            logger.error(f"Ошибка отправки клиенту {self.addr}: {e}")
+            resp = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", data={
+                "secret": TURNSTILE_SECRET,
+                "response": cf_turnstile_response
+            })
+            data = resp.json()
+            if not data.get("success"):
+                return {"status": "error", "message": "Проверка безопасности не пройдена. Попробуйте еще раз."}
+        except Exception:
+            return {"status": "error", "message": "Ошибка связи с серверами Cloudflare."}
 
-    async def send_numeric(self, code, text):
-        """Отправка числового ответа (numeric reply)."""
-        target = self.nickname or "*"
-        message = f":{SERVER_NAME} {code:03d} {target} {text}"
-        await self.send_raw(message)
+    # Возвращаем подтверждение входа
+    return {"status": "ok", "username": username}
 
-    async def handle(self):
-        """Основной цикл обработки входящих сообщений клиента."""
-        logger.info(f"Новое подключение от {self.addr}")
-        try:
-            # Читаем первую строку для проверки типа протокола
-            first_line = await self.reader.readline()
-            if not first_line:
-                return
-
-            # Хак для облачных платформ: отвечаем на HTTP Health Checks
-            if first_line.startswith(b"GET ") or first_line.startswith(b"HEAD "):
-                response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nIRC Server OK\r\n"
-                self.writer.write(response.encode('utf-8'))
-                await self.writer.drain()
-                logger.info(f"Обработан HTTP Health Check от платформы ({self.addr})")
-                return
-
-            # Если это не HTTP, обрабатываем первую строку как IRC-команду
-            message = first_line.decode('utf-8', errors='ignore').strip()
-            if message:
-                logger.debug(f"Получено от {self.nickname or self.addr}: {message}")
-                await self.process_command(message)
-
-            # Основной цикл чтения остальных команд
-            while True:
-                line = await self.reader.readline()
-                if not line:
-                    break # Клиент отключился
-                
-                message = line.decode('utf-8', errors='ignore').strip()
-                if message:
-                    logger.debug(f"Получено от {self.nickname or self.addr}: {message}")
-                    await self.process_command(message)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"Ошибка при работе с клиентом {self.addr}: {e}")
-        finally:
-            await self.disconnect()
-
-    async def process_command(self, message):
-        """Разбор и обработка IRC команд."""
-        parts = message.split(' ')
-        command = parts[0].upper()
-        
-        # Разделение аргументов (включая trailing параметры, начинающиеся с ':')
-        args = []
-        trailing = None
-        for i, part in enumerate(parts[1:]):
-            if part.startswith(':'):
-                trailing = ' '.join(parts[1+i:])[1:]
-                break
-            else:
-                args.append(part)
-        
-        if trailing is not None:
-            args.append(trailing)
-
-        handler_name = f"cmd_{command}"
-        handler = getattr(self, handler_name, self.cmd_unknown)
-        await handler(args)
-
-    async def cmd_NICK(self, args):
-        if not args:
-            await self.send_numeric(431, ":No nickname given")
-            return
-        
-        new_nick = args[0]
-        # Проверка на занятость ника
-        if new_nick in self.server.clients and self.server.clients[new_nick] != self:
-            await self.send_numeric(433, f"{new_nick} :Nickname is already in use")
-            return
-
-        old_prefix = self.prefix if self.nickname else None
-        
-        if self.nickname:
-            del self.server.clients[self.nickname]
-        
-        self.nickname = new_nick
-        self.server.clients[self.nickname] = self
-
-        if old_prefix:
-            # Оповещение других пользователей о смене ника
-            msg = f":{old_prefix} NICK :{new_nick}"
-            await self.send_raw(msg)
-            # Уведомляем каналы
-            for channel in self.channels:
-                await channel.broadcast(msg, exclude_client=self)
-        
-        await self.check_registration()
-
-    async def cmd_USER(self, args):
-        if len(args) < 4:
-            await self.send_numeric(461, "USER :Not enough parameters")
-            return
-        if self.registered:
-            await self.send_numeric(462, ":Unauthorized command (already registered)")
-            return
+@app.websocket("/ws/{username}/{channel}")
+async def websocket_endpoint(websocket: WebSocket, username: str, channel: str):
+    await manager.connect(websocket, channel)
+    
+    # Защита от XSS (очень базовая), так как сообщения транслируются в HTML
+    safe_username = username.replace("<", "&lt;").replace(">", "&gt;")
+    await manager.broadcast(f"<div class='sys-message'><i>Пользователь <b>{safe_username}</b> присоединился к каналу.</i></div>", channel)
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Санитаризация сообщений (в памяти, не пишем на диск!)
+            safe_data = data.replace("<", "&lt;").replace(">", "&gt;")
             
-        self.username = args[0]
-        self.realname = args[3]
-        await self.check_registration()
-
-    async def check_registration(self):
-        if not self.registered and self.nickname and self.username:
-            self.registered = True
-            logger.info(f"Клиент {self.addr} зарегистрирован как {self.prefix}")
+            # Трансляция всем участникам
+            await manager.broadcast(f"<b>{safe_username}:</b> {safe_data}", channel)
             
-            # Отправка стандартного приветствия IRC (RPL_WELCOME, etc.)
-            await self.send_numeric(1, f":Welcome to the {SERVER_NAME} IRC Network {self.prefix}")
-            await self.send_numeric(2, f":Your host is {SERVER_NAME}, running version {SERVER_VERSION}")
-            await self.send_numeric(3, f":This server was created {CREATION_TIME}")
-            await self.send_numeric(4, f"{SERVER_NAME} {SERVER_VERSION} o o")
-            await self.send_numeric(422, ":MOTD File is missing") # Пропускаем Message of the Day
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, channel)
+        await manager.broadcast(f"<div class='sys-message'><i>Пользователь <b>{safe_username}</b> покинул канал.</i></div>", channel)
 
-    async def cmd_PING(self, args):
-        if not args:
-            await self.send_numeric(409, ":No origin specified")
-            return
-        await self.send_raw(f":{SERVER_NAME} PONG {SERVER_NAME} :{args[0]}")
-
-    async def cmd_unknown(self, args):
-        # Игнорируем неизвестные команды (или можно отправлять 421 ERR_UNKNOWNCOMMAND)
-        pass
-
-    async def cmd_JOIN(self, args):
-        if not self.registered:
-            return
-        if not args:
-            await self.send_numeric(461, "JOIN :Not enough parameters")
-            return
-            
-        channel_names = args[0].split(',')
-        for chan_name in channel_names:
-            if not chan_name.startswith('#'):
-                chan_name = '#' + chan_name
-                
-            channel = self.server.get_or_create_channel(chan_name)
-            channel.add_client(self)
-            self.channels.add(channel)
-            
-            # Сообщаем всем в канале (включая самого себя), что пользователь вошел
-            join_msg = f":{self.prefix} JOIN :{chan_name}"
-            await channel.broadcast(join_msg)
-            
-            # Отправляем список пользователей в канале (RPL_NAMREPLY)
-            names = " ".join([c.nickname for c in channel.clients])
-            await self.send_numeric(353, f"= {chan_name} :{names}")
-            await self.send_numeric(366, f"{chan_name} :End of /NAMES list.")
-
-    async def cmd_PART(self, args):
-        if not self.registered or not args:
-            return
-        
-        channel_names = args[0].split(',')
-        reason = args[1] if len(args) > 1 else "Leaving"
-        
-        for chan_name in channel_names:
-            channel = self.server.channels.get(chan_name)
-            if channel and self in channel.clients:
-                part_msg = f":{self.prefix} PART {chan_name} :{reason}"
-                await channel.broadcast(part_msg)
-                
-                channel.remove_client(self)
-                self.channels.remove(channel)
-                
-                # Удаляем канал из сервера, если он пуст
-                if not channel.clients:
-                    del self.server.channels[chan_name]
-
-    async def cmd_PRIVMSG(self, args):
-        if not self.registered or len(args) < 2:
-            return
-            
-        target_name = args[0]
-        message = args[1]
-        
-        msg_to_send = f":{self.prefix} PRIVMSG {target_name} :{message}"
-        
-        if target_name.startswith('#'): # Сообщение в канал
-            channel = self.server.channels.get(target_name)
-            if channel:
-                if self in channel.clients:
-                    await channel.broadcast(msg_to_send, exclude_client=self)
-                else:
-                    await self.send_numeric(404, f"{target_name} :Cannot send to channel")
-            else:
-                await self.send_numeric(401, f"{target_name} :No such nick/channel")
-        else: # Приватное сообщение пользователю
-            target_client = self.server.clients.get(target_name)
-            if target_client:
-                await target_client.send_raw(msg_to_send)
-            else:
-                await self.send_numeric(401, f"{target_name} :No such nick/channel")
-
-    async def cmd_QUIT(self, args):
-        reason = args[0] if args else "Client Quit"
-        await self.disconnect(reason)
-
-    async def disconnect(self, reason="Connection closed"):
-        """Обработка отключения клиента и очистка ресурсов."""
-        if not hasattr(self, '_disconnected'):
-            self._disconnected = True
-            logger.info(f"Отключение клиента: {self.addr} ({self.nickname})")
-            
-            # Уведомляем каналы
-            quit_msg = f":{self.prefix} QUIT :{reason}"
-            for channel in list(self.channels):
-                await channel.broadcast(quit_msg, exclude_client=self)
-                channel.remove_client(self)
-                if not channel.clients:
-                    del self.server.channels[channel.name]
-            
-            # Удаляем из сервера
-            if self.nickname and self.nickname in self.server.clients:
-                del self.server.clients[self.nickname]
-                
-            self.writer.close()
-            try:
-                await self.writer.wait_closed()
-            except Exception:
-                pass
-
-
-class IRCServer:
-    """Главный класс IRC сервера."""
-    def __init__(self, host='0.0.0.0', port=6667):
-        self.host = host
-        self.port = port
-        self.clients = {}  # nickname -> Client object
-        self.channels = {} # channel_name -> Channel object
-
-    def get_or_create_channel(self, name):
-        if name not in self.channels:
-            self.channels[name] = Channel(name)
-        return self.channels[name]
-
-    async def handle_client_connection(self, reader, writer):
-        """Фабрика для новых подключений."""
-        client = Client(self, reader, writer)
-        await client.handle()
-
-    async def start(self):
-        """Запуск сервера."""
-        server = await asyncio.start_server(
-            self.handle_client_connection, self.host, self.port
-        )
-        addr = server.sockets[0].getsockname()
-        logger.info(f"IRC Сервер запущен на {addr}")
-        
-        async with server:
-            await server.serve_forever()
 
 if __name__ == "__main__":
-    # Запуск сервера
-    HOST = '0.0.0.0' # Для облачных платформ обязательно '0.0.0.0'
-    PORT = int(os.environ.get("PORT", 6667)) # Получаем порт от провайдера
-    
-    server = IRCServer(host=HOST, port=PORT)
-    try:
-        asyncio.run(server.start())
-    except KeyboardInterrupt:
-        logger.info("Сервер остановлен вручную.")
+    # Запуск сервера. Подходит для минимальных VPS с 512MB RAM
+    uvicorn.run(app, host="0.0.0.0", port=8000)
