@@ -8,8 +8,7 @@ import uvicorn
 # Твой секретный ключ (указан в задании)
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
 # ВАЖНО: Ниже укажи свой SITEKEY от Cloudflare (публичный ключ). 
-# По умолчанию я взял стандартный префикс из твоего секрета, но он может отличаться!
-TURNSTILE_SITEKEY = "0x4AAAAAAEt2kX9fNPZNVSsC" 
+TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r" 
 
 # Список из более чем 20 стандартных каналов
 DEFAULT_CHANNELS = [
@@ -27,8 +26,8 @@ HTML_CONTENT = """
 <head>
     <meta charset="utf-8">
     <title>IRC Lite Web</title>
-    <!-- Bootstrap 1.4.0 CDN -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/1.4.0/bootstrap.min.css">
+    <!-- Исправленный CDN для Bootstrap 1.4.0 (загрузка напрямую из архива GitHub через jsDelivr) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/twbs/bootstrap@v1.4.0/bootstrap.min.css">
     <!-- Cloudflare Turnstile -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
