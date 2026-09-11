@@ -5,8 +5,10 @@ import secrets
 import re
 import time
 import httpx
+import uuid
+import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 import uvicorn
 
 SERVER_START_TIME = time.time()
@@ -29,6 +31,11 @@ MAX_SESSION_AGE = 86400  # 24 hours
 IP_CONNECTIONS: dict[str, int] = {}
 MAX_CONNS_PER_IP = 5
 MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}
+
+# Глобальное хранилище изображений в оперативной памяти сервера.
+# Ограничим до 1000 изображений, чтобы RAM (512mb) никогда не переполнилась.
+IMAGE_STORE: dict[str, str] = {}
+MAX_IMAGES_IN_RAM = 1000
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -81,6 +88,7 @@ HTML_CONTENT = """
             flex-shrink: 0;
         }
 
+        /* Top bar styling */
         .top-bar {
             height: 42px;
             background: var(--bg-card);
@@ -131,6 +139,7 @@ HTML_CONTENT = """
             100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
         }
 
+        /* Login Page */
         .login-page {
             display: flex;
             flex-direction: column;
@@ -202,7 +211,10 @@ HTML_CONTENT = """
             border-color: var(--accent-blue);
         }
 
-        /* Checkbox Container Fix */
+        /* 
+           ИСПРАВЛЕНИЕ: Растягиваем текст чекбоксов на весь фрейм. 
+           Добавлено flex: 1 для label и width: 100% для контейнера.
+        */
         .checkbox-container {
             display: flex;
             align-items: flex-start;
@@ -211,7 +223,8 @@ HTML_CONTENT = """
             padding: 12px 14px;
             border-radius: 6px;
             border: 1px solid var(--border-main);
-            margin-bottom: 20px;
+            margin-bottom: 12px;
+            width: 100%;
         }
 
         .checkbox-container input[type="checkbox"] {
@@ -225,12 +238,15 @@ HTML_CONTENT = """
         }
 
         .checkbox-container label {
+            flex: 1; /* Растягиваем текст на всё свободное пространство */
             font-size: 13px;
             color: var(--text-primary);
             line-height: 1.4;
             margin: 0;
             cursor: pointer;
             user-select: none;
+            display: block;
+            width: 100%;
         }
 
         .checkbox-container a {
@@ -277,6 +293,13 @@ HTML_CONTENT = """
             background: #2ea043;
         }
 
+        .btn-primary-custom:disabled {
+            background: #194a21;
+            cursor: not-allowed;
+            opacity: 0.8;
+        }
+
+        /* Modal */
         .modal-overlay {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -313,10 +336,7 @@ HTML_CONTENT = """
             margin-bottom: 16px;
         }
 
-        .modal-card ul {
-            padding-left: 20px;
-        }
-
+        /* App Chat Area */
         .app-container {
             display: flex;
             flex: 1;
@@ -333,17 +353,8 @@ HTML_CONTENT = """
             user-select: none;
         }
 
-        .sidebar-left {
-            width: 250px;
-            min-width: 250px;
-        }
-
-        .sidebar-right {
-            width: 240px;
-            min-width: 240px;
-            border-right: none;
-            border-left: 1px solid var(--border-main);
-        }
+        .sidebar-left { width: 250px; min-width: 250px; }
+        .sidebar-right { width: 240px; min-width: 240px; border-right: none; border-left: 1px solid var(--border-main); }
 
         .sidebar-header {
             padding: 14px 16px;
@@ -384,33 +395,11 @@ HTML_CONTENT = """
             gap: 8px;
         }
 
-        .channel-item:hover, .user-item:hover {
-            background: var(--bg-panel);
-            color: var(--text-heading);
-        }
+        .channel-item:hover, .user-item:hover { background: var(--bg-panel); color: var(--text-heading); }
+        .channel-item.active { background: var(--accent-blue); color: #ffffff; font-weight: 600; }
 
-        .channel-item.active {
-            background: var(--accent-blue);
-            color: #ffffff;
-            font-weight: 600;
-        }
-
-        .user-status-dot {
-            width: 7px;
-            height: 7px;
-            background-color: var(--status-green);
-            border-radius: 50%;
-            flex-shrink: 0;
-        }
-
-        .user-badge {
-            margin-left: auto;
-            font-size: 10px;
-            background: rgba(255, 255, 255, 0.1);
-            padding: 1px 5px;
-            border-radius: 4px;
-            color: var(--text-muted);
-        }
+        .user-status-dot { width: 7px; height: 7px; background-color: var(--status-green); border-radius: 50%; flex-shrink: 0; }
+        .user-badge { margin-left: auto; font-size: 10px; background: rgba(255, 255, 255, 0.1); padding: 1px 5px; border-radius: 4px; color: var(--text-muted); }
 
         .chat-main {
             flex: 1;
@@ -457,31 +446,21 @@ HTML_CONTENT = """
             align-items: baseline;
         }
 
-        .msg-time {
-            color: var(--text-muted);
-            font-size: 11px;
-            flex-shrink: 0;
-        }
+        .msg-time { color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
+        .msg-sender { font-weight: 600; color: var(--accent-hover); flex-shrink: 0; }
+        .msg-sender.me { color: var(--status-green); }
+        .msg-text { color: var(--text-primary); }
 
-        .msg-sender {
-            font-weight: 600;
-            color: var(--accent-hover);
-            flex-shrink: 0;
-        }
+        .sys-line { font-size: 12px; color: var(--text-muted); font-style: italic; padding: 2px 0; }
 
-        .msg-sender.me {
-            color: var(--status-green);
-        }
-
-        .msg-text {
-            color: var(--text-primary);
-        }
-
-        .sys-line {
-            font-size: 12px;
-            color: var(--text-muted);
-            font-style: italic;
-            padding: 2px 0;
+        .chat-image {
+            max-width: 256px;
+            max-height: 256px;
+            border-radius: 6px;
+            margin-top: 6px;
+            border: 1px solid var(--border-main);
+            display: block;
+            background: var(--bg-panel);
         }
 
         .chat-input-area {
@@ -494,11 +473,13 @@ HTML_CONTENT = """
             display: flex;
             gap: 8px;
             margin: 0;
+            align-items: center;
         }
 
-        .chat-input-form input {
+        .chat-input-form input[type="text"] {
             flex: 1;
-            padding: 10px 12px;
+            height: 38px;
+            padding: 0 12px;
             background: var(--bg-input);
             border: 1px solid var(--border-main);
             border-radius: 6px;
@@ -507,11 +488,27 @@ HTML_CONTENT = """
             outline: none;
         }
 
-        .chat-input-form input:focus {
-            border-color: var(--accent-blue);
+        .chat-input-form input[type="text"]:focus { border-color: var(--accent-blue); }
+
+        .btn-icon {
+            padding: 0 12px;
+            height: 38px;
+            background: var(--bg-panel);
+            color: var(--text-primary);
+            border: 1px solid var(--border-main);
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.15s;
         }
 
-        .chat-input-form button {
+        .btn-icon:hover { background: var(--border-main); }
+        .btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .chat-input-form button[type="submit"] {
+            height: 38px;
             padding: 0 16px;
             background: var(--accent-blue);
             color: #ffffff;
@@ -524,9 +521,7 @@ HTML_CONTENT = """
             gap: 6px;
         }
 
-        .chat-input-form button:hover {
-            background: #388bfd;
-        }
+        .chat-input-form button[type="submit"]:hover { background: #388bfd; }
 
         ::-webkit-scrollbar { width: 6px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -535,7 +530,6 @@ HTML_CONTENT = """
     </style>
 </head>
 <body>
-
     <div class="top-bar">
         <div class="top-bar-brand">
             <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
@@ -543,11 +537,12 @@ HTML_CONTENT = """
         </div>
         <div class="top-bar-uptime">
             <span class="pulse-dot"></span>
-            <span>Uptime сервера: </span>
+            <span>Uptime: </span>
             <strong id="uptime-counter">00d 00h 00m 00s</strong>
         </div>
     </div>
 
+    <!-- Страница входа -->
     <div class="login-page" id="login-view">
         <div class="login-card">
             <div class="login-card-header">
@@ -562,7 +557,14 @@ HTML_CONTENT = """
                     <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
                 </div>
 
+                <!-- Новая галочка: Запомнить меня -->
                 <div class="checkbox-container">
+                    <input type="checkbox" id="remember-me">
+                    <label for="remember-me">Запомнить меня (Автоматический вход)</label>
+                </div>
+
+                <!-- Галочка соглашения (Текст теперь полностью растягивается) -->
+                <div class="checkbox-container" style="margin-bottom: 20px;">
                     <input type="checkbox" id="privacy" required>
                     <label for="privacy">Мне есть 18 лет, я принимаю <a href="javascript:void(0)" onclick="togglePrivacyModal(true)">условия конфиденциальности</a>.</label>
                 </div>
@@ -583,23 +585,22 @@ HTML_CONTENT = """
         </div>
     </div>
 
+    <!-- Модальное окно политики -->
     <div id="privacy-modal" class="modal-overlay hidden">
         <div class="modal-card">
             <h3>Условия конфиденциальности</h3>
             <p>Наш мессенджер функционирует исключительно в оперативной памяти (RAM) сервера:</p>
             <ul>
-                <li>Сообщения <strong>не сохраняются</strong> на диск.</li>
-                <li>История сообщений удаляется сразу после отправки.</li>
-                <li>Секретные каналы полностью очищаются при выходе участников.</li>
+                <li>Сообщения и изображения <strong>не сохраняются</strong> на диск.</li>
+                <li>История удаляется при перезагрузке, фотографии хранятся во временном буфере.</li>
                 <li>Логирование персональных данных не ведется.</li>
             </ul>
             <button type="button" class="btn-primary-custom" onclick="togglePrivacyModal(false)">Понятно</button>
         </div>
     </div>
 
+    <!-- Интерфейс чата -->
     <div class="app-container hidden" id="chat-view">
-        
-        <!-- Left Sidebar: Channels -->
         <div class="sidebar-left">
             <div class="sidebar-header">
                 <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
@@ -623,7 +624,6 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Central Chat Box -->
         <div class="chat-main">
             <div class="chat-header">
                 <div class="chat-header-title">
@@ -636,12 +636,18 @@ HTML_CONTENT = """
             </div>
 
             <div class="chat-messages" id="chat-box">
-                <div class="sys-line">*** Добро пожаловать в IRC Lite Web. История сообщений не сохраняется.</div>
+                <div class="sys-line">*** Добро пожаловать в IRC Lite Web.</div>
             </div>
 
             <div class="chat-input-area">
                 <form class="chat-input-form" onsubmit="sendMessage(event)">
-                    <input type="text" id="message-input" placeholder="Написать сообщение..." maxlength="500" autocomplete="off" required>
+                    <!-- Кнопка загрузки картинки -->
+                    <input type="file" id="file-input" accept="image/*" class="hidden" onchange="handleFileUpload(event)">
+                    <button type="button" class="btn-icon" id="upload-btn" onclick="document.getElementById('file-input').click()" title="Отправить фото">
+                        <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                    </button>
+
+                    <input type="text" id="message-input" placeholder="Написать сообщение..." maxlength="500" autocomplete="off">
                     <button type="submit">
                         <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
                     </button>
@@ -649,7 +655,6 @@ HTML_CONTENT = """
             </div>
         </div>
 
-        <!-- Right Sidebar: Users -->
         <div class="sidebar-right">
             <div class="sidebar-header">
                 <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
@@ -664,7 +669,6 @@ HTML_CONTENT = """
                 <div id="users-global-list"></div>
             </div>
         </div>
-
     </div>
 
     <script>
@@ -677,20 +681,28 @@ HTML_CONTENT = """
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
 
+        // Авто-логин (Запомнить меня) при загрузке страницы
+        window.addEventListener('DOMContentLoaded', () => {
+            const savedToken = localStorage.getItem('irc_token');
+            const savedUser = localStorage.getItem('irc_user');
+            if (savedToken && savedUser) {
+                currentUser = savedUser;
+                sessionToken = savedToken;
+                document.getElementById('login-view').classList.add('hidden');
+                document.getElementById('chat-view').classList.remove('hidden');
+                renderChannels();
+                connectWs(currentChannel);
+            }
+        });
+
         function updateUptime() {
             const now = Math.floor(Date.now() / 1000);
             let diff = Math.max(0, now - serverStartTimestamp);
-            
-            const days = Math.floor(diff / 86400);
-            diff %= 86400;
-            const hours = Math.floor(diff / 3600);
-            diff %= 3600;
-            const minutes = Math.floor(diff / 60);
-            const seconds = diff % 60;
-
+            const days = Math.floor(diff / 86400); diff %= 86400;
+            const hours = Math.floor(diff / 3600); diff %= 3600;
+            const minutes = Math.floor(diff / 60); const seconds = diff % 60;
             const pad = (n) => String(n).padStart(2, '0');
             const uptimeStr = `${days > 0 ? days + 'd ' : ''}${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
-            
             const elem = document.getElementById('uptime-counter');
             if (elem) elem.innerText = uptimeStr;
         }
@@ -731,6 +743,16 @@ HTML_CONTENT = """
                 if (data.status === "ok") {
                     currentUser = data.username;
                     sessionToken = data.token;
+                    
+                    // Сохранение сессии (Запомнить меня)
+                    if (document.getElementById('remember-me').checked) {
+                        localStorage.setItem('irc_token', sessionToken);
+                        localStorage.setItem('irc_user', currentUser);
+                    } else {
+                        localStorage.removeItem('irc_token');
+                        localStorage.removeItem('irc_user');
+                    }
+
                     document.getElementById('login-view').classList.add('hidden');
                     document.getElementById('chat-view').classList.remove('hidden');
                     renderChannels();
@@ -797,7 +819,12 @@ HTML_CONTENT = """
             };
             
             ws.onclose = function(e) {
-                if (e.code === 4001) appendSystemMessage("*** Сессия недействительна.");
+                if (e.code === 4001) {
+                    appendSystemMessage("*** Сессия недействительна. Требуется повторный вход.");
+                    localStorage.removeItem('irc_token');
+                    localStorage.removeItem('irc_user');
+                    setTimeout(() => location.reload(), 2000);
+                }
                 else if (e.code === 4002) appendSystemMessage("*** Превышен лимит подключений.");
                 else appendSystemMessage("*** Соединение потеряно.");
             };
@@ -805,7 +832,7 @@ HTML_CONTENT = """
 
         function handleIncomingPacket(packet) {
             if (packet.type === "message") {
-                appendMessage(packet.username, packet.text, packet.timestamp);
+                appendMessage(packet.username, packet.text, packet.timestamp, packet.image_id);
             } else if (packet.type === "system") {
                 appendSystemMessage("*** " + packet.text);
             } else if (packet.type === "presence") {
@@ -813,21 +840,25 @@ HTML_CONTENT = """
             }
         }
 
-        function appendMessage(sender, text, timestamp) {
+        function appendMessage(sender, text, timestamp, image_id) {
             const chatBox = document.getElementById('chat-box');
             const isMe = sender === currentUser;
-            
             const row = document.createElement('div');
             row.className = "msg-line";
+
+            let contentHtml = `<span class="msg-text">${escapeHtml(text)}</span>`;
+            if (image_id) {
+                contentHtml += `<br><img src="/image/${image_id}" class="chat-image" onload="scrollToBottom()">`;
+            }
 
             row.innerHTML = `
                 <span class="msg-time">[${timestamp}]</span>
                 <span class="msg-sender ${isMe ? 'me' : ''}">&lt;${escapeHtml(sender)}&gt;</span>
-                <span class="msg-text">${escapeHtml(text)}</span>
+                <div style="display:inline-block; flex:1;">${contentHtml}</div>
             `;
 
             chatBox.appendChild(row);
-            chatBox.scrollTop = chatBox.scrollHeight;
+            scrollToBottom();
         }
 
         function appendSystemMessage(text) {
@@ -836,6 +867,11 @@ HTML_CONTENT = """
             div.className = "sys-line";
             div.innerText = text;
             chatBox.appendChild(div);
+            scrollToBottom();
+        }
+
+        function scrollToBottom() {
+            const chatBox = document.getElementById('chat-box');
             chatBox.scrollTop = chatBox.scrollHeight;
         }
 
@@ -872,6 +908,88 @@ HTML_CONTENT = """
                 ws.send(JSON.stringify({ type: "chat", text: msg }));
                 input.value = "";
             }
+        }
+
+        // Захват файла и сжатие на клиенте (256x256, 16 цветов)
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            const btn = document.getElementById('upload-btn');
+            const oldHtml = btn.innerHTML;
+            btn.innerHTML = `<span class="pulse-dot" style="background:#fff;box-shadow:none;"></span>`;
+            btn.disabled = true;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = async function() {
+                    const canvas = document.createElement('canvas');
+                    let width = img.width;
+                    let height = img.height;
+
+                    // Ограничение до 256x256
+                    if (width > 256 || height > 256) {
+                        if (width > height) {
+                            height = Math.round((height * 256) / width);
+                            width = 256;
+                        } else {
+                            width = Math.round((width * 256) / height);
+                            height = 256;
+                        }
+                    }
+
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+
+                    // Квантование до классической палитры 16 цветов (Web/VGA)
+                    const imgData = ctx.getImageData(0, 0, width, height);
+                    const data = imgData.data;
+                    const palette = [
+                        [0,0,0], [255,255,255], [255,0,0], [0,255,0], [0,0,255], [255,255,0], [0,255,255], [255,0,255],
+                        [128,128,128], [192,192,192], [128,0,0], [128,128,0], [0,128,0], [128,0,128], [0,128,128], [0,0,128]
+                    ];
+
+                    for (let i = 0; i < data.length; i += 4) {
+                        let r = data[i], g = data[i+1], b = data[i+2];
+                        let minD = Infinity, match = palette[0];
+                        for (let j = 0; j < 16; j++) {
+                            let p = palette[j];
+                            let d = (r-p[0])**2 + (g-p[1])**2 + (b-p[2])**2;
+                            if (d < minD) { minD = d; match = p; }
+                        }
+                        data[i] = match[0];
+                        data[i+1] = match[1];
+                        data[i+2] = match[2];
+                    }
+                    ctx.putImageData(imgData, 0, 0);
+                    
+                    // Конвертируем в base64 PNG. Благодаря квантованию и размеру, вес составит около 10-30кб.
+                    const b64 = canvas.toDataURL('image/png');
+
+                    try {
+                        const res = await fetch('/upload_image', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ image: b64, token: sessionToken })
+                        });
+                        const resData = await res.json();
+                        if (resData.id && ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: "chat", text: "", image_id: resData.id }));
+                        }
+                    } catch(err) {
+                        console.error("Ошибка загрузки", err);
+                    } finally {
+                        btn.innerHTML = oldHtml;
+                        btn.disabled = false;
+                        document.getElementById('file-input').value = ""; // Сброс
+                    }
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
         }
 
         function escapeHtml(str) {
@@ -995,6 +1113,42 @@ async def login(request: Request, username: str = Form(...), cf_turnstile_respon
 
     return {"status": "ok", "username": username, "token": token}
 
+@app.post("/upload_image")
+async def upload_image_endpoint(request: Request):
+    try:
+        data = await request.json()
+        token = data.get("token")
+        image_b64 = data.get("image")
+        
+        if token not in VALID_SESSIONS or not image_b64:
+            return {"error": "Invalid request"}
+            
+        img_id = str(uuid.uuid4())
+        
+        # Хранение в RAM с защитой от переполнения
+        IMAGE_STORE[img_id] = image_b64
+        if len(IMAGE_STORE) > MAX_IMAGES_IN_RAM:
+            oldest_key = next(iter(IMAGE_STORE))
+            del IMAGE_STORE[oldest_key]
+            
+        return {"id": img_id}
+    except Exception:
+        return {"error": "Server error"}
+
+@app.get("/image/{img_id}")
+async def get_image_endpoint(img_id: str):
+    if img_id in IMAGE_STORE:
+        b64_str = IMAGE_STORE[img_id]
+        if "," in b64_str:
+            b64_str = b64_str.split(",")[1]
+        try:
+            img_data = base64.b64decode(b64_str)
+            # Благодаря Canvas на клиенте, мы гарантируем PNG
+            return Response(content=img_data, media_type="image/png")
+        except Exception:
+            pass
+    return Response(status_code=404)
+
 @app.websocket("/ws/{token}/{channel}")
 async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     session = VALID_SESSIONS.get(token)
@@ -1040,7 +1194,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
             try:
                 packet = json.loads(raw_data)
                 text = packet.get("text", "").strip()
-                if text:
+                image_id = packet.get("image_id", "").strip()
+                
+                if text or image_id:
                     text = text[:500]
                     text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
                     now_str = datetime.datetime.now().strftime("%H:%M")
@@ -1048,6 +1204,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
                         "type": "message",
                         "username": username,
                         "text": text,
+                        "image_id": image_id,
                         "timestamp": now_str
                     }, channel)
             except json.JSONDecodeError:
