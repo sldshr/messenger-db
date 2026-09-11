@@ -29,13 +29,8 @@ CHANNEL_REGEX = re.compile(r"^#[a-zA-Z0-9_\-\u0400-\u04FF]{2,30}$")
 VALID_SESSIONS: dict[str, dict] = {}
 MAX_SESSION_AGE = 86400  # 24 hours
 IP_CONNECTIONS: dict[str, int] = {}
-MAX_CONNS_PER_IP = 5
+MAX_CONNS_PER_IP = 15
 MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}
-
-# Глобальное хранилище изображений в оперативной памяти сервера.
-# Ограничим до 1000 изображений, чтобы RAM (512mb) никогда не переполнилась.
-IMAGE_STORE: dict[str, str] = {}
-MAX_IMAGES_IN_RAM = 1000
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -454,13 +449,47 @@ HTML_CONTENT = """
         .sys-line { font-size: 12px; color: var(--text-muted); font-style: italic; padding: 2px 0; }
 
         .chat-image {
-            max-width: 256px;
-            max-height: 256px;
+            max-width: 300px;
+            max-height: 300px;
             border-radius: 6px;
             margin-top: 6px;
             border: 1px solid var(--border-main);
             display: block;
+            object-fit: contain;
+        }
+
+        .attachment-preview {
+            display: none;
+            padding: 10px 16px;
+            background: var(--bg-card);
+            border-top: 1px solid var(--border-main);
+        }
+        .attachment-preview.active {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .attachment-thumb {
+            width: 48px;
+            height: 48px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid var(--border-main);
+        }
+        .attachment-remove {
             background: var(--bg-panel);
+            border: 1px solid var(--border-main);
+            color: var(--text-primary);
+            border-radius: 4px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: 0.15s;
+        }
+        .attachment-remove:hover {
+            background: #f85149;
+            color: white;
+            border-color: #f85149;
         }
 
         .chat-input-area {
@@ -639,6 +668,12 @@ HTML_CONTENT = """
                 <div class="sys-line">*** Добро пожаловать в IRC Lite Web.</div>
             </div>
 
+            <!-- Зона превью прикрепленного фото -->
+            <div id="attachment-container" class="attachment-preview">
+                <img id="attachment-img" class="attachment-thumb" src="">
+                <button type="button" class="attachment-remove" onclick="clearAttachment()">Удалить фото</button>
+            </div>
+
             <div class="chat-input-area">
                 <form class="chat-input-form" onsubmit="sendMessage(event)">
                     <!-- Кнопка загрузки картинки -->
@@ -676,6 +711,8 @@ HTML_CONTENT = """
         let sessionToken = "";
         let currentChannel = "#general";
         let ws = null;
+        let pendingImageBase64 = null;
+        let pingInterval = null;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
         const serverStartTimestamp = SERVER_START_TIME_PLACEHOLDER;
 
@@ -811,6 +848,16 @@ HTML_CONTENT = """
             
             ws = new WebSocket(wsUrl);
             
+            ws.onopen = function() {
+                if (pingInterval) clearInterval(pingInterval);
+                // Отправка пинга каждые 20 секунд для предотвращения разрыва соединения
+                pingInterval = setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "ping" }));
+                    }
+                }, 20000);
+            };
+
             ws.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
@@ -819,6 +866,7 @@ HTML_CONTENT = """
             };
             
             ws.onclose = function(e) {
+                if (pingInterval) clearInterval(pingInterval);
                 if (e.code === 4001) {
                     appendSystemMessage("*** Сессия недействительна. Требуется повторный вход.");
                     localStorage.removeItem('irc_token');
@@ -832,7 +880,7 @@ HTML_CONTENT = """
 
         function handleIncomingPacket(packet) {
             if (packet.type === "message") {
-                appendMessage(packet.username, packet.text, packet.timestamp, packet.image_id);
+                appendMessage(packet.username, packet.text, packet.timestamp, packet.image_b64);
             } else if (packet.type === "system") {
                 appendSystemMessage("*** " + packet.text);
             } else if (packet.type === "presence") {
@@ -840,15 +888,15 @@ HTML_CONTENT = """
             }
         }
 
-        function appendMessage(sender, text, timestamp, image_id) {
+        function appendMessage(sender, text, timestamp, image_b64) {
             const chatBox = document.getElementById('chat-box');
             const isMe = sender === currentUser;
             const row = document.createElement('div');
             row.className = "msg-line";
 
             let contentHtml = `<span class="msg-text">${escapeHtml(text)}</span>`;
-            if (image_id) {
-                contentHtml += `<br><img src="/image/${image_id}" class="chat-image" onload="scrollToBottom()">`;
+            if (image_b64) {
+                contentHtml += `<br><img src="${image_b64}" class="chat-image" onload="scrollToBottom()">`;
             }
 
             row.innerHTML = `
@@ -904,38 +952,42 @@ HTML_CONTENT = """
             e.preventDefault();
             const input = document.getElementById('message-input');
             const msg = input.value.trim();
-            if (msg && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "chat", text: msg }));
+            if ((msg || pendingImageBase64) && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "chat", text: msg, image_b64: pendingImageBase64 }));
                 input.value = "";
+                clearAttachment();
             }
         }
 
-        // Захват файла и сжатие на клиенте (256x256, 16 цветов)
+        function clearAttachment() {
+            pendingImageBase64 = null;
+            document.getElementById('attachment-container').classList.remove('active');
+            document.getElementById('attachment-img').src = "";
+            document.getElementById('file-input').value = "";
+        }
+
+        // Захват файла и локальное сжатие
         function handleFileUpload(event) {
             const file = event.target.files[0];
             if (!file) return;
             
-            const btn = document.getElementById('upload-btn');
-            const oldHtml = btn.innerHTML;
-            btn.innerHTML = `<span class="pulse-dot" style="background:#fff;box-shadow:none;"></span>`;
-            btn.disabled = true;
-
             const reader = new FileReader();
             reader.onload = function(e) {
                 const img = new Image();
-                img.onload = async function() {
+                img.onload = function() {
                     const canvas = document.createElement('canvas');
                     let width = img.width;
                     let height = img.height;
 
-                    // Ограничение до 256x256
-                    if (width > 256 || height > 256) {
+                    // Ограничение размера до 512x512 для передачи по WebSocket
+                    const maxSize = 512;
+                    if (width > maxSize || height > maxSize) {
                         if (width > height) {
-                            height = Math.round((height * 256) / width);
-                            width = 256;
+                            height = Math.round((height * maxSize) / width);
+                            width = maxSize;
                         } else {
-                            width = Math.round((width * 256) / height);
-                            height = 256;
+                            width = Math.round((width * maxSize) / height);
+                            height = maxSize;
                         }
                     }
 
@@ -944,48 +996,11 @@ HTML_CONTENT = """
                     const ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0, width, height);
 
-                    // Квантование до классической палитры 16 цветов (Web/VGA)
-                    const imgData = ctx.getImageData(0, 0, width, height);
-                    const data = imgData.data;
-                    const palette = [
-                        [0,0,0], [255,255,255], [255,0,0], [0,255,0], [0,0,255], [255,255,0], [0,255,255], [255,0,255],
-                        [128,128,128], [192,192,192], [128,0,0], [128,128,0], [0,128,0], [128,0,128], [0,128,128], [0,0,128]
-                    ];
-
-                    for (let i = 0; i < data.length; i += 4) {
-                        let r = data[i], g = data[i+1], b = data[i+2];
-                        let minD = Infinity, match = palette[0];
-                        for (let j = 0; j < 16; j++) {
-                            let p = palette[j];
-                            let d = (r-p[0])**2 + (g-p[1])**2 + (b-p[2])**2;
-                            if (d < minD) { minD = d; match = p; }
-                        }
-                        data[i] = match[0];
-                        data[i+1] = match[1];
-                        data[i+2] = match[2];
-                    }
-                    ctx.putImageData(imgData, 0, 0);
+                    // Конвертируем в JPEG, качество 0.8 (вес будет около 20-60кб)
+                    pendingImageBase64 = canvas.toDataURL('image/jpeg', 0.8);
                     
-                    // Конвертируем в base64 PNG. Благодаря квантованию и размеру, вес составит около 10-30кб.
-                    const b64 = canvas.toDataURL('image/png');
-
-                    try {
-                        const res = await fetch('/upload_image', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ image: b64, token: sessionToken })
-                        });
-                        const resData = await res.json();
-                        if (resData.id && ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: "chat", text: "", image_id: resData.id }));
-                        }
-                    } catch(err) {
-                        console.error("Ошибка загрузки", err);
-                    } finally {
-                        btn.innerHTML = oldHtml;
-                        btn.disabled = false;
-                        document.getElementById('file-input').value = ""; // Сброс
-                    }
+                    document.getElementById('attachment-img').src = pendingImageBase64;
+                    document.getElementById('attachment-container').classList.add('active');
                 };
                 img.src = e.target.result;
             };
@@ -1113,42 +1128,6 @@ async def login(request: Request, username: str = Form(...), cf_turnstile_respon
 
     return {"status": "ok", "username": username, "token": token}
 
-@app.post("/upload_image")
-async def upload_image_endpoint(request: Request):
-    try:
-        data = await request.json()
-        token = data.get("token")
-        image_b64 = data.get("image")
-        
-        if token not in VALID_SESSIONS or not image_b64:
-            return {"error": "Invalid request"}
-            
-        img_id = str(uuid.uuid4())
-        
-        # Хранение в RAM с защитой от переполнения
-        IMAGE_STORE[img_id] = image_b64
-        if len(IMAGE_STORE) > MAX_IMAGES_IN_RAM:
-            oldest_key = next(iter(IMAGE_STORE))
-            del IMAGE_STORE[oldest_key]
-            
-        return {"id": img_id}
-    except Exception:
-        return {"error": "Server error"}
-
-@app.get("/image/{img_id}")
-async def get_image_endpoint(img_id: str):
-    if img_id in IMAGE_STORE:
-        b64_str = IMAGE_STORE[img_id]
-        if "," in b64_str:
-            b64_str = b64_str.split(",")[1]
-        try:
-            img_data = base64.b64decode(b64_str)
-            # Благодаря Canvas на клиенте, мы гарантируем PNG
-            return Response(content=img_data, media_type="image/png")
-        except Exception:
-            pass
-    return Response(status_code=404)
-
 @app.websocket("/ws/{token}/{channel}")
 async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     session = VALID_SESSIONS.get(token)
@@ -1193,10 +1172,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
 
             try:
                 packet = json.loads(raw_data)
-                text = packet.get("text", "").strip()
-                image_id = packet.get("image_id", "").strip()
                 
-                if text or image_id:
+                # Обработка heartbeats (пингов) для удержания соединения
+                if packet.get("type") == "ping":
+                    continue
+                    
+                text = packet.get("text", "").strip()
+                image_b64 = packet.get("image_b64", "")
+                
+                if text or image_b64:
                     text = text[:500]
                     text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
                     now_str = datetime.datetime.now().strftime("%H:%M")
@@ -1204,7 +1188,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
                         "type": "message",
                         "username": username,
                         "text": text,
-                        "image_id": image_id,
+                        "image_b64": image_b64,
                         "timestamp": now_str
                     }, channel)
             except json.JSONDecodeError:
