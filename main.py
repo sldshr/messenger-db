@@ -1,16 +1,17 @@
 import os
 import json
 import datetime
+import secrets
+import re
+import time
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-# Cloudflare Turnstile credentials
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
-TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r" 
+TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 
-# Standard list of public IRC channels
 DEFAULT_CHANNELS = [
     "#general", "#random", "#news", "#music", "#gaming",
     "#programming", "#python", "#javascript", "#movies", "#anime",
@@ -19,6 +20,17 @@ DEFAULT_CHANNELS = [
     "#fitness", "#food", "#travel", "#cars", "#help"
 ]
 
+# Validation Regex Rules
+NICK_REGEX = re.compile(r"^[a-zA-Z0-9_\-\u0400-\u04FF]{2,20}$")
+CHANNEL_REGEX = re.compile(r"^#[a-zA-Z0-9_\-\u0400-\u04FF]{2,30}$")
+
+# Security Storage (In-Memory ONLY)
+VALID_SESSIONS: dict[str, dict] = {}  # token -> {username, created_at, ip}
+MAX_SESSION_AGE = 86400  # 24 hours
+IP_CONNECTIONS: dict[str, int] = {}   # ip -> connection_count
+MAX_CONNS_PER_IP = 5
+MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}  # ws -> list of msg timestamps
+
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -26,7 +38,7 @@ HTML_CONTENT = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IRC Lite Web Modern</title>
-    <!-- CDN Bootstrap 1.4.0 (Compatibility) -->
+    <!-- CDN Bootstrap 1.4.0 -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/twbs/bootstrap@v1.4.0/bootstrap.min.css">
     <!-- Cloudflare Turnstile SDK -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
@@ -38,6 +50,7 @@ HTML_CONTENT = """
             --bg-hover: #334155;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
+            --text-label: #cbd5e1;
             --accent: #3b82f6;
             --accent-hover: #2563eb;
             --success: #10b981;
@@ -60,13 +73,13 @@ HTML_CONTENT = """
 
         .hidden { display: none !important; }
 
-        /* Login Screen */
         .login-page {
             display: flex;
             align-items: center;
             justify-content: center;
             min-height: 100vh;
             background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%);
+            padding: 20px;
         }
 
         .login-card {
@@ -76,11 +89,11 @@ HTML_CONTENT = """
             padding: 32px;
             width: 100%;
             max-width: 440px;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.6);
         }
 
         .login-card h2 {
-            color: var(--text-main);
+            color: #ffffff;
             font-size: 24px;
             margin-bottom: 8px;
             font-weight: 700;
@@ -90,10 +103,11 @@ HTML_CONTENT = """
             color: var(--text-muted);
             font-size: 13px;
             margin-bottom: 24px;
+            line-height: 1.5;
         }
 
         .form-group {
-            margin-bottom: 18px;
+            margin-bottom: 20px;
         }
 
         .form-group label {
@@ -101,23 +115,75 @@ HTML_CONTENT = """
             color: var(--text-main);
             font-size: 13px;
             font-weight: 600;
-            margin-bottom: 6px;
+            margin-bottom: 8px;
         }
 
         .form-control-custom {
             width: 100%;
-            padding: 10px 14px;
+            padding: 12px 14px;
             background: var(--bg-input);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: #fff;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            color: #ffffff;
             font-size: 14px;
             outline: none;
-            transition: border-color 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
 
         .form-control-custom:focus {
             border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+        }
+
+        .checkbox-container {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            font-size: 13px;
+            color: #e2e8f0;
+            margin-bottom: 20px;
+            line-height: 1.4;
+            background: rgba(15, 23, 42, 0.4);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .checkbox-container input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            margin-top: 1px;
+            cursor: pointer;
+            accent-color: var(--accent);
+            flex-shrink: 0;
+        }
+
+        .checkbox-container label {
+            color: #e2e8f0;
+            cursor: pointer;
+            user-select: none;
+            margin: 0;
+            font-weight: 400;
+        }
+
+        .checkbox-container a {
+            color: #60a5fa;
+            text-decoration: underline;
+        }
+
+        .checkbox-container a:hover {
+            color: #93c5fd;
+        }
+
+        .turnstile-box {
+            display: flex;
+            justify-content: center;
+            background: rgba(15, 23, 42, 0.5);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            margin-bottom: 20px;
+            min-height: 70px;
         }
 
         .btn-primary-custom {
@@ -126,38 +192,27 @@ HTML_CONTENT = """
             background: var(--accent);
             color: white;
             border: none;
-            border-radius: 6px;
+            border-radius: 8px;
             font-weight: 600;
             font-size: 15px;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.2s, transform 0.1s;
         }
 
         .btn-primary-custom:hover {
             background: var(--accent-hover);
         }
 
-        .checkbox-container {
-            display: flex;
-            align-items: flex-start;
-            gap: 10px;
-            font-size: 12px;
-            color: var(--text-muted);
-            margin-bottom: 18px;
+        .btn-primary-custom:active {
+            transform: scale(0.99);
         }
 
-        .checkbox-container input {
-            margin-top: 2px;
-        }
-
-        /* App Layout */
         .app-container {
             display: flex;
             height: 100vh;
             width: 100vw;
         }
 
-        /* Sidebars Shared */
         .sidebar-left, .sidebar-right {
             background: var(--bg-card);
             border-right: 1px solid var(--border-color);
@@ -210,7 +265,7 @@ HTML_CONTENT = """
             border-radius: 6px;
             cursor: pointer;
             font-size: 14px;
-            color: var(--text-muted);
+            color: var(--text-label);
             margin-bottom: 2px;
             transition: background 0.15s, color 0.15s;
         }
@@ -222,7 +277,7 @@ HTML_CONTENT = """
 
         .channel-item.active {
             background: var(--accent);
-            color: #fff;
+            color: #ffffff;
             font-weight: 600;
         }
 
@@ -232,7 +287,6 @@ HTML_CONTENT = """
             font-weight: bold;
         }
 
-        /* User List Items */
         .user-status-dot {
             width: 8px;
             height: 8px;
@@ -245,13 +299,12 @@ HTML_CONTENT = """
         .user-badge {
             margin-left: auto;
             font-size: 10px;
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.12);
             padding: 2px 6px;
             border-radius: 10px;
-            color: var(--text-muted);
+            color: var(--text-label);
         }
 
-        /* Main Chat Panel */
         .chat-main {
             flex: 1;
             display: flex;
@@ -290,7 +343,6 @@ HTML_CONTENT = """
             gap: 12px;
         }
 
-        /* Message Bubbles */
         .msg-row {
             display: flex;
             flex-direction: column;
@@ -318,7 +370,7 @@ HTML_CONTENT = """
             border: 1px solid var(--border-color);
             color: var(--text-main);
             font-size: 14px;
-            line-height: 1.4;
+            line-height: 1.45;
             word-break: break-word;
         }
 
@@ -337,16 +389,16 @@ HTML_CONTENT = """
 
         .sys-msg {
             align-self: center;
-            background: rgba(51, 65, 85, 0.4);
+            background: rgba(51, 65, 85, 0.5);
             border: 1px solid var(--border-color);
             border-radius: 20px;
-            padding: 4px 14px;
+            padding: 6px 16px;
             font-size: 12px;
-            color: var(--text-muted);
+            color: #cbd5e1;
             font-style: italic;
+            text-align: center;
         }
 
-        /* Chat Input Bar */
         .chat-input-area {
             padding: 16px 20px;
             background: var(--bg-card);
@@ -363,9 +415,9 @@ HTML_CONTENT = """
             flex: 1;
             padding: 12px 16px;
             background: var(--bg-input);
-            border: 1px solid var(--border-color);
+            border: 1px solid #475569;
             border-radius: 8px;
-            color: #fff;
+            color: #ffffff;
             font-size: 14px;
             outline: none;
         }
@@ -389,7 +441,6 @@ HTML_CONTENT = """
             background: var(--accent-hover);
         }
 
-        /* Custom Scrollbar */
         ::-webkit-scrollbar {
             width: 6px;
         }
@@ -410,7 +461,7 @@ HTML_CONTENT = """
     <div class="login-page" id="login-view">
         <div class="login-card">
             <h2>IRC Lite Web</h2>
-            <p>Вход без сохранения истории. Оперативная память 512 МБ.</p>
+            <p>Защищённый мессенджер без сохранения истории. ОЗУ: 512 МБ.</p>
             
             <form id="login-form" onsubmit="login(event)">
                 <div class="form-group">
@@ -420,23 +471,24 @@ HTML_CONTENT = """
 
                 <div class="checkbox-container">
                     <input type="checkbox" id="privacy" required>
-                    <label for="privacy">Мне есть 18 лет, соглашаюсь с <a href="#" style="color:var(--accent);">условиями конфиденциальности</a>.</label>
+                    <label for="privacy">Мне есть 18 лет, я соглашаюсь с <a href="#" onclick="alert('История сообщений и персональные данные не сохраняются на сервере.'); return false;">условиями конфиденциальности</a>.</label>
                 </div>
 
                 <div class="form-group">
                     <label>Проверка безопасности</label>
-                    <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER"></div>
+                    <div class="turnstile-box">
+                        <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER" data-theme="dark"></div>
+                    </div>
                 </div>
 
                 <button type="submit" id="login-btn" class="btn-primary-custom">Войти в чат</button>
-                <div id="login-error" style="color: #ef4444; font-size: 13px; margin-top: 12px; text-align: center;"></div>
+                <div id="login-error" style="color: #f87171; font-size: 13px; margin-top: 12px; text-align: center; font-weight: 600;"></div>
             </form>
         </div>
     </div>
 
     <div class="app-container hidden" id="chat-view">
         
-        <!-- Left Sidebar: Channels -->
         <div class="sidebar-left">
             <div class="sidebar-header">
                 <span>💬 IRC Channels</span>
@@ -444,21 +496,18 @@ HTML_CONTENT = """
             
             <div class="sidebar-scroll">
                 <div class="section-title">Публичные каналы</div>
-                <div id="channel-list">
-                    <!-- Dynamic Channels -->
-                </div>
+                <div id="channel-list"></div>
 
                 <div class="section-title" style="margin-top: 16px;">Секретная комната</div>
                 <div style="padding: 0 8px;">
                     <form onsubmit="joinCustomChannel(event)" style="margin:0;">
-                        <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секретный-чат" style="padding:8px 10px; font-size:12px; margin-bottom:6px;" required>
+                        <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секретный-чат" style="padding:8px 10px; font-size:12px; margin-bottom:6px;" maxlength="30" required>
                         <button type="submit" class="btn-primary-custom" style="padding:6px; font-size:12px;">Перейти / Создать</button>
                     </form>
                 </div>
             </div>
         </div>
 
-        <!-- Middle: Main Chat Area -->
         <div class="chat-main">
             <div class="chat-header">
                 <div>
@@ -471,18 +520,17 @@ HTML_CONTENT = """
             </div>
 
             <div class="chat-messages" id="chat-box">
-                <div class="sys-msg">Добро пожаловать в IRC Lite Web. Вы подключены к защищённой сети.</div>
+                <div class="sys-msg">Добро пожаловать в IRC Lite Web. Вы успешно подключены к защищённой сети.</div>
             </div>
 
             <div class="chat-input-area">
                 <form class="chat-input-form" onsubmit="sendMessage(event)">
-                    <input type="text" id="message-input" placeholder="Напишите сообщение..." autocomplete="off" required>
+                    <input type="text" id="message-input" placeholder="Напишите сообщение..." maxlength="500" autocomplete="off" required>
                     <button type="submit">Отправить</button>
                 </form>
             </div>
         </div>
 
-        <!-- Right Sidebar: Users Online -->
         <div class="sidebar-right">
             <div class="sidebar-header">
                 <span>👥 Участники</span>
@@ -490,14 +538,10 @@ HTML_CONTENT = """
 
             <div class="sidebar-scroll">
                 <div class="section-title">В этом канале (<span id="count-in-channel">0</span>)</div>
-                <div id="users-in-channel-list">
-                    <!-- Dynamic Channel Users -->
-                </div>
+                <div id="users-in-channel-list"></div>
 
                 <div class="section-title" style="margin-top: 20px;">Все онлайн (<span id="count-global">0</span>)</div>
-                <div id="users-global-list">
-                    <!-- Dynamic Global Users -->
-                </div>
+                <div id="users-global-list"></div>
             </div>
         </div>
 
@@ -505,6 +549,7 @@ HTML_CONTENT = """
 
     <script>
         let currentUser = "";
+        let sessionToken = "";
         let currentChannel = "#general";
         let ws = null;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
@@ -523,7 +568,7 @@ HTML_CONTENT = """
             }
 
             btn.disabled = true;
-            errorSpan.innerText = "Авторизация...";
+            errorSpan.innerText = "Проверка безопасности...";
 
             const formData = new FormData();
             formData.append('username', username);
@@ -535,6 +580,7 @@ HTML_CONTENT = """
 
                 if (data.status === "ok") {
                     currentUser = data.username;
+                    sessionToken = data.token; // Receive one-time session token
                     document.getElementById('login-view').classList.add('hidden');
                     document.getElementById('chat-view').classList.remove('hidden');
                     renderChannels();
@@ -569,7 +615,7 @@ HTML_CONTENT = """
             document.getElementById('current-channel-title').innerText = currentChannel;
             
             const chatBox = document.getElementById('chat-box');
-            chatBox.innerHTML = `<div class="sys-msg">Переход в канал ${currentChannel}...</div>`;
+            chatBox.innerHTML = `<div class="sys-msg">Переход в канал ${escapeHtml(currentChannel)}...</div>`;
             
             renderChannels();
             connectWs(currentChannel);
@@ -591,7 +637,8 @@ HTML_CONTENT = """
             }
             
             const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-            const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(currentUser) + "/" + encodeURIComponent(channel);
+            // Secure connection passing session token instead of unauthenticated username
+            const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(sessionToken) + "/" + encodeURIComponent(channel);
             
             ws = new WebSocket(wsUrl);
             
@@ -600,12 +647,18 @@ HTML_CONTENT = """
                     const data = JSON.parse(event.data);
                     handleIncomingPacket(data);
                 } catch(e) {
-                    console.error("Invalid JSON format", event.data);
+                    console.error("Invalid packet format", event.data);
                 }
             };
             
-            ws.onclose = function() {
-                appendSystemMessage("Соединение с сервером потеряно.");
+            ws.onclose = function(e) {
+                if (e.code === 4001) {
+                    appendSystemMessage("Сессия недействительна. Пожалуйста, войдите снова.");
+                } else if (e.code === 4002) {
+                    appendSystemMessage("Превышен лимит подключений с вашего IP адреса.");
+                } else {
+                    appendSystemMessage("Соединение с сервером потеряно.");
+                }
             };
         }
 
@@ -648,7 +701,6 @@ HTML_CONTENT = """
         }
 
         function updateUserLists(channelUsers, globalUsers) {
-            // Update channel list
             const channelUsersBox = document.getElementById('users-in-channel-list');
             const channelCountSpan = document.getElementById('count-in-channel');
             const badgeCount = document.getElementById('channel-users-count');
@@ -664,7 +716,6 @@ HTML_CONTENT = """
                 channelUsersBox.appendChild(div);
             });
 
-            // Update global users list
             const globalUsersBox = document.getElementById('users-global-list');
             const globalCountSpan = document.getElementById('count-global');
             
@@ -690,7 +741,7 @@ HTML_CONTENT = """
         }
 
         function escapeHtml(str) {
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
         }
     </script>
 </body>
@@ -699,9 +750,9 @@ HTML_CONTENT = """
 
 app = FastAPI()
 
+# Connection Manager for Multi-Channel Messaging
 class ConnectionManager:
     def __init__(self):
-        # Dictionary storing channel -> dict of {websocket: username}
         self.active_connections: dict[str, dict[WebSocket, str]] = {
             ch: {} for ch in DEFAULT_CHANNELS
         }
@@ -712,13 +763,11 @@ class ConnectionManager:
             self.active_connections[channel] = {}
         self.active_connections[channel][websocket] = username
         
-        # Notify channel about join
         await self.broadcast_json({
             "type": "system",
             "text": f"Пользователь {username} присоединился к каналу."
         }, channel)
         
-        # Broadcast updated presence list
         await self.broadcast_presence(channel)
 
     async def disconnect(self, websocket: WebSocket, channel: str, username: str):
@@ -726,7 +775,7 @@ class ConnectionManager:
             if websocket in self.active_connections[channel]:
                 del self.active_connections[channel][websocket]
             
-            # Remove secret channel if empty to optimize 512MB RAM
+            # Auto-purge empty secret channels to keep RAM clean for 512MB
             if channel not in DEFAULT_CHANNELS and len(self.active_connections[channel]) == 0:
                 del self.active_connections[channel]
             else:
@@ -751,7 +800,6 @@ class ConnectionManager:
         global_users = self.get_global_users()
         channel_users = self.get_channel_users(channel)
 
-        # Update presence for current channel users
         await self.broadcast_json({
             "type": "presence",
             "channel_users": channel_users,
@@ -760,7 +808,6 @@ class ConnectionManager:
 
     async def broadcast_json(self, data: dict, channel: str):
         if channel in self.active_connections:
-            # Send message to all sockets in channel
             dead_sockets = []
             for ws in list(self.active_connections[channel].keys()):
                 try:
@@ -768,7 +815,6 @@ class ConnectionManager:
                 except Exception:
                     dead_sockets.append(ws)
             
-            # Clean up dead sockets
             for ws in dead_sockets:
                 if ws in self.active_connections[channel]:
                     del self.active_connections[channel][ws]
@@ -782,31 +828,95 @@ async def get_home():
     return HTMLResponse(html)
 
 @app.post("/login")
-async def login(username: str = Form(...), cf_turnstile_response: str = Form(...)):
+async def login(request: Request, username: str = Form(...), cf_turnstile_response: str = Form(...)):
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    
+    username = username.strip()
+    if not NICK_REGEX.match(username):
+        return {"status": "error", "message": "Имя должно содержать от 2 до 20 символов (буквы, цифры, _ или -)."}
+
+    # Cloudflare Turnstile Server-Side Siteverify
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", data={
                 "secret": TURNSTILE_SECRET,
-                "response": cf_turnstile_response
-            })
+                "response": cf_turnstile_response,
+                "remoteip": client_ip
+            }, timeout=5.0)
             data = resp.json()
             if not data.get("success"):
                 return {"status": "error", "message": "Проверка безопасности Cloudflare не пройдена."}
         except Exception:
-            return {"status": "error", "message": "Ошибка связи с Cloudflare Turnstile."}
+            return {"status": "error", "message": "Ошибка связи с сервером капчи Cloudflare."}
 
-    return {"status": "ok", "username": username}
+    # Clean up expired sessions
+    now = time.time()
+    expired = [t for t, s in VALID_SESSIONS.items() if now - s["created_at"] > MAX_SESSION_AGE]
+    for t in expired:
+        del VALID_SESSIONS[t]
 
-@app.websocket("/ws/{username}/{channel}")
-async def websocket_endpoint(websocket: WebSocket, username: str, channel: str):
+    # Generate one-time secure session token
+    token = secrets.token_hex(16)
+    VALID_SESSIONS[token] = {
+        "username": username,
+        "created_at": now,
+        "ip": client_ip
+    }
+
+    return {"status": "ok", "username": username, "token": token}
+
+@app.websocket("/ws/{token}/{channel}")
+async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
+    session = VALID_SESSIONS.get(token)
+    if not session:
+        await websocket.close(code=4001, reason="Unauthorized session token")
+        return
+    
+    username = session["username"]
+    client_ip = websocket.client.host if websocket.client else "127.0.0.1"
+    
+    # Enforce IP Connection Limits
+    current_conns = IP_CONNECTIONS.get(client_ip, 0)
+    if current_conns >= MAX_CONNS_PER_IP:
+        await websocket.close(code=4002, reason="Too many connections from this IP")
+        return
+
+    # Sanitize Channel Name
+    channel = channel.strip().lower()
+    if not channel.startswith("#"):
+        channel = "#" + channel
+    if not CHANNEL_REGEX.match(channel):
+        channel = "#general"
+
+    IP_CONNECTIONS[client_ip] = current_conns + 1
+    MESSAGE_TIMESTAMPS[websocket] = []
+
     await manager.connect(websocket, channel, username)
     try:
         while True:
             raw_data = await websocket.receive_text()
+            
+            # Rate Limiting Check (Max 5 msgs per 3s)
+            now = time.time()
+            timestamps = MESSAGE_TIMESTAMPS.get(websocket, [])
+            timestamps = [t for t in timestamps if now - t < 3.0]
+            if len(timestamps) >= 5:
+                await websocket.send_json({
+                    "type": "system",
+                    "text": "⚠️ Слишком частая отправка сообщений! Подождите пару секунд."
+                })
+                continue
+            
+            timestamps.append(now)
+            MESSAGE_TIMESTAMPS[websocket] = timestamps
+
             try:
                 packet = json.loads(raw_data)
                 text = packet.get("text", "").strip()
                 if text:
+                    # Enforce max 500 chars & filter unprintable characters
+                    text = text[:500]
+                    text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
                     now_str = datetime.datetime.now().strftime("%H:%M")
                     await manager.broadcast_json({
                         "type": "message",
@@ -818,6 +928,12 @@ async def websocket_endpoint(websocket: WebSocket, username: str, channel: str):
                 pass
 
     except WebSocketDisconnect:
+        pass
+    finally:
+        if websocket in MESSAGE_TIMESTAMPS:
+            del MESSAGE_TIMESTAMPS[websocket]
+        if client_ip in IP_CONNECTIONS:
+            IP_CONNECTIONS[client_ip] = max(0, IP_CONNECTIONS[client_ip] - 1)
         await manager.disconnect(websocket, channel, username)
 
 if __name__ == "__main__":
