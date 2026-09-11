@@ -9,6 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
 from fastapi.responses import HTMLResponse
 import uvicorn
 
+SERVER_START_TIME = time.time()
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 
@@ -23,7 +24,6 @@ DEFAULT_CHANNELS = [
 NICK_REGEX = re.compile(r"^[a-zA-Z0-9_\-\u0400-\u04FF]{2,20}$")
 CHANNEL_REGEX = re.compile(r"^#[a-zA-Z0-9_\-\u0400-\u04FF]{2,30}$")
 
-# In-memory security and session management
 VALID_SESSIONS: dict[str, dict] = {}
 MAX_SESSION_AGE = 86400  # 24 hours
 IP_CONNECTIONS: dict[str, int] = {}
@@ -67,12 +67,13 @@ HTML_CONTENT = """
             color: var(--text-primary);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
             height: 100vh;
+            display: flex;
+            flex-direction: column;
             overflow: hidden;
         }
 
         .hidden { display: none !important; }
 
-        /* SVG Icon styling */
         .icon {
             display: inline-block;
             vertical-align: middle;
@@ -80,41 +81,92 @@ HTML_CONTENT = """
             flex-shrink: 0;
         }
 
-        /* Login Layout Fixes */
-        .login-page {
+        .top-bar {
+            height: 42px;
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border-main);
             display: flex;
             align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            font-size: 13px;
+            color: var(--text-primary);
+            flex-shrink: 0;
+            z-index: 100;
+        }
+
+        .top-bar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 700;
+            color: var(--text-heading);
+        }
+
+        .top-bar-uptime {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
+            background: var(--bg-dark);
+            padding: 4px 12px;
+            border-radius: 20px;
+            border: 1px solid var(--border-main);
+            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+        }
+
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--status-green);
+            border-radius: 50%;
+            box-shadow: 0 0 8px var(--status-green);
+            animation: pulse-animation 2s infinite;
+        }
+
+        @keyframes pulse-animation {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(63, 185, 80, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
+        }
+
+        .login-page {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
             justify-content: center;
-            min-height: 100vh;
+            flex: 1;
             background: radial-gradient(circle at center, #161b22 0%, #0d1117 100%);
-            padding: 16px;
+            padding: 24px;
+            overflow-y: auto;
         }
 
         .login-card {
             background: var(--bg-card);
             border: 1px solid var(--border-main);
-            border-radius: 8px;
+            border-radius: 12px;
             padding: 32px 28px;
             width: 100%;
-            max-width: 420px;
-            box-shadow: 0 16px 32px rgba(0, 0, 0, 0.6);
+            max-width: 440px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
         }
 
         .login-card-header {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
             margin-bottom: 8px;
         }
 
         .login-card h2 {
             color: var(--text-heading);
-            font-size: 20px;
+            font-size: 22px;
             margin: 0;
             font-weight: 700;
         }
 
-        .login-card p {
+        .login-card p.subtitle {
             color: var(--text-muted);
             font-size: 13px;
             margin-top: 4px;
@@ -123,20 +175,20 @@ HTML_CONTENT = """
         }
 
         .form-group {
-            margin-bottom: 18px;
+            margin-bottom: 20px;
         }
 
-        .form-group label {
+        .form-label {
             display: block;
-            color: var(--text-primary);
+            color: var(--text-heading);
             font-size: 13px;
             font-weight: 600;
-            margin-bottom: 6px;
+            margin-bottom: 8px;
         }
 
         .form-control-custom {
             width: 100%;
-            padding: 10px 12px;
+            padding: 10px 14px;
             background: var(--bg-input);
             border: 1px solid var(--border-main);
             border-radius: 6px;
@@ -150,29 +202,30 @@ HTML_CONTENT = """
             border-color: var(--accent-blue);
         }
 
-        /* Checkbox Box Fix */
+        /* Checkbox Container Fix */
         .checkbox-container {
             display: flex;
             align-items: flex-start;
-            gap: 10px;
+            gap: 12px;
             background: var(--bg-panel);
-            padding: 12px;
+            padding: 12px 14px;
             border-radius: 6px;
             border: 1px solid var(--border-main);
-            margin-bottom: 18px;
+            margin-bottom: 20px;
         }
 
         .checkbox-container input[type="checkbox"] {
-            width: 16px;
-            height: 16px;
+            width: 18px;
+            height: 18px;
+            min-width: 18px;
+            min-height: 18px;
             margin-top: 2px;
             cursor: pointer;
-            flex-shrink: 0;
             accent-color: var(--accent-blue);
         }
 
         .checkbox-container label {
-            font-size: 12px;
+            font-size: 13px;
             color: var(--text-primary);
             line-height: 1.4;
             margin: 0;
@@ -185,23 +238,27 @@ HTML_CONTENT = """
             text-decoration: underline;
         }
 
-        /* Turnstile Container Strict Sizing */
-        .turnstile-box {
+        .turnstile-wrapper {
             display: flex;
             justify-content: center;
             align-items: center;
             background: var(--bg-panel);
             border: 1px solid var(--border-main);
             border-radius: 6px;
-            padding: 10px;
+            padding: 8px;
             margin-bottom: 20px;
             min-height: 75px;
-            overflow: hidden;
+            width: 100%;
+        }
+
+        .cf-turnstile {
+            display: inline-block;
+            margin: 0 auto;
         }
 
         .btn-primary-custom {
             width: 100%;
-            padding: 10px 16px;
+            padding: 12px 16px;
             background: #238636;
             color: #ffffff;
             border: 1px solid rgba(240,246,252,0.1);
@@ -220,11 +277,52 @@ HTML_CONTENT = """
             background: #2ea043;
         }
 
-        /* Chat Application Interface */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(4px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            padding: 16px;
+        }
+
+        .modal-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-main);
+            border-radius: 8px;
+            padding: 24px;
+            max-width: 420px;
+            width: 100%;
+            box-shadow: 0 16px 32px rgba(0, 0, 0, 0.8);
+        }
+
+        .modal-card h3 {
+            margin-top: 0;
+            color: var(--text-heading);
+            font-size: 18px;
+            margin-bottom: 12px;
+        }
+
+        .modal-card p, .modal-card ul {
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text-primary);
+            margin-bottom: 16px;
+        }
+
+        .modal-card ul {
+            padding-left: 20px;
+        }
+
         .app-container {
             display: flex;
-            height: 100vh;
+            flex: 1;
+            height: calc(100vh - 42px);
             width: 100vw;
+            overflow: hidden;
         }
 
         .sidebar-left, .sidebar-right {
@@ -438,28 +536,40 @@ HTML_CONTENT = """
 </head>
 <body>
 
+    <div class="top-bar">
+        <div class="top-bar-brand">
+            <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+            <span>IRC Lite Web</span>
+        </div>
+        <div class="top-bar-uptime">
+            <span class="pulse-dot"></span>
+            <span>Uptime сервера: </span>
+            <strong id="uptime-counter">00d 00h 00m 00s</strong>
+        </div>
+    </div>
+
     <div class="login-page" id="login-view">
         <div class="login-card">
             <div class="login-card-header">
-                <svg class="icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                <svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
                 <h2>IRC Lite Web</h2>
             </div>
-            <p>Защищённый мессенджер без сохранения истории (RAM 512MB)</p>
+            <p class="subtitle">Защищённый мессенджер без сохранения истории (RAM 512MB)</p>
             
             <form id="login-form" onsubmit="login(event)">
                 <div class="form-group">
-                    <label for="username">Имя пользователя</label>
+                    <label class="form-label" for="username">Имя пользователя</label>
                     <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
                 </div>
 
                 <div class="checkbox-container">
                     <input type="checkbox" id="privacy" required>
-                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="#" onclick="alert('Сообщения не сохраняются на диске.'); return false;">условия конфиденциальности</a>.</label>
+                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="javascript:void(0)" onclick="togglePrivacyModal(true)">условия конфиденциальности</a>.</label>
                 </div>
 
                 <div class="form-group">
-                    <label>Защита Cloudflare</label>
-                    <div class="turnstile-box">
+                    <label class="form-label">Защита Cloudflare</label>
+                    <div class="turnstile-wrapper">
                         <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER" data-theme="dark"></div>
                     </div>
                 </div>
@@ -470,6 +580,20 @@ HTML_CONTENT = """
                 </button>
                 <div id="login-error" style="color: #f85149; font-size: 12px; margin-top: 12px; text-align: center; font-weight: 600;"></div>
             </form>
+        </div>
+    </div>
+
+    <div id="privacy-modal" class="modal-overlay hidden">
+        <div class="modal-card">
+            <h3>Условия конфиденциальности</h3>
+            <p>Наш мессенджер функционирует исключительно в оперативной памяти (RAM) сервера:</p>
+            <ul>
+                <li>Сообщения <strong>не сохраняются</strong> на диск.</li>
+                <li>История сообщений удаляется сразу после отправки.</li>
+                <li>Секретные каналы полностью очищаются при выходе участников.</li>
+                <li>Логирование персональных данных не ведется.</li>
+            </ul>
+            <button type="button" class="btn-primary-custom" onclick="togglePrivacyModal(false)">Понятно</button>
         </div>
     </div>
 
@@ -549,8 +673,36 @@ HTML_CONTENT = """
         let currentChannel = "#general";
         let ws = null;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
+        const serverStartTimestamp = SERVER_START_TIME_PLACEHOLDER;
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
+
+        function updateUptime() {
+            const now = Math.floor(Date.now() / 1000);
+            let diff = Math.max(0, now - serverStartTimestamp);
+            
+            const days = Math.floor(diff / 86400);
+            diff %= 86400;
+            const hours = Math.floor(diff / 3600);
+            diff %= 3600;
+            const minutes = Math.floor(diff / 60);
+            const seconds = diff % 60;
+
+            const pad = (n) => String(n).padStart(2, '0');
+            const uptimeStr = `${days > 0 ? days + 'd ' : ''}${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
+            
+            const elem = document.getElementById('uptime-counter');
+            if (elem) elem.innerText = uptimeStr;
+        }
+
+        setInterval(updateUptime, 1000);
+        updateUptime();
+
+        function togglePrivacyModal(show) {
+            const modal = document.getElementById('privacy-modal');
+            if (show) modal.classList.remove('hidden');
+            else modal.classList.add('hidden');
+        }
 
         async function login(e) {
             e.preventDefault();
@@ -561,7 +713,7 @@ HTML_CONTENT = """
             const turnstileResponse = turnstileElem ? turnstileElem.value : "";
 
             if (!turnstileResponse) {
-                errorSpan.innerText = "Пожалуйста, пройдите капчу.";
+                errorSpan.innerText = "Пожалуйста, пройдите проверку капчи.";
                 return;
             }
 
@@ -805,6 +957,7 @@ manager = ConnectionManager()
 async def get_home():
     html = HTML_CONTENT.replace("TURNSTILE_SITEKEY_PLACEHOLDER", TURNSTILE_SITEKEY)
     html = html.replace("DEFAULT_CHANNELS_PLACEHOLDER", json.dumps(DEFAULT_CHANNELS))
+    html = html.replace("SERVER_START_TIME_PLACEHOLDER", str(int(SERVER_START_TIME)))
     return HTMLResponse(html)
 
 @app.post("/login")
