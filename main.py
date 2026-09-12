@@ -36,7 +36,7 @@ class EmailMessageModel(BaseModel):
     date: str
 
 def deliver_message_locally(to_user: str, message_data: dict):
-    """Доставляет письмо в локальный словарь пользователя"""
+    """Доставляет письмо в локальный словар пользователя"""
     global MESSAGE_COUNTER
     if to_user not in MAILBOX:
         MAILBOX[to_user] = []
