@@ -9,9 +9,10 @@ import uuid
 import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
 from fastapi.responses import HTMLResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 
-SERVER_START_TIME = time.time()
+SERVER_START_TIME = datetime.datetime.now(datetime.timezone.utc).isoformat()
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 
@@ -39,8 +40,6 @@ HTML_CONTENT = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IRC Lite Web</title>
-    <!-- CDN Bootstrap 1.4.0 -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/twbs/bootstrap@v1.4.0/bootstrap.min.css">
     <!-- Cloudflare Turnstile SDK -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
@@ -714,7 +713,8 @@ HTML_CONTENT = """
         let pendingImageBase64 = null;
         let pingInterval = null;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
-        const serverStartTimestamp = SERVER_START_TIME_PLACEHOLDER;
+        const serverStartIso = "SERVER_START_TIME_PLACEHOLDER";
+        const serverStartTimestamp = Math.floor(new Date(serverStartIso).getTime() / 1000);
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
 
@@ -1017,6 +1017,28 @@ HTML_CONTENT = """
 
 app = FastAPI()
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "frame-src https://challenges.cloudflare.com; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self' ws: wss:; "
+            "frame-ancestors 'none';"
+        )
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, dict[WebSocket, str]] = {
@@ -1090,7 +1112,7 @@ manager = ConnectionManager()
 async def get_home():
     html = HTML_CONTENT.replace("TURNSTILE_SITEKEY_PLACEHOLDER", TURNSTILE_SITEKEY)
     html = html.replace("DEFAULT_CHANNELS_PLACEHOLDER", json.dumps(DEFAULT_CHANNELS))
-    html = html.replace("SERVER_START_TIME_PLACEHOLDER", str(int(SERVER_START_TIME)))
+    html = html.replace("SERVER_START_TIME_PLACEHOLDER", SERVER_START_TIME)
     return HTMLResponse(html)
 
 @app.post("/login")
