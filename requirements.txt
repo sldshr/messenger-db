@@ -3,3 +3,6 @@ uvicorn[standard]>=0.29
 websockets 
 httpx
 python-multipart
+aiosmtpd 
+dnspython 
+pydantic
