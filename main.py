@@ -5,6 +5,7 @@ import dns.resolver
 from email.message import EmailMessage
 from email import policy
 from email.parser import BytesParser
+from email.utils import make_msgid
 from datetime import datetime
 from typing import List, Optional
 
@@ -36,7 +37,7 @@ class EmailMessageModel(BaseModel):
     date: str
 
 def deliver_message_locally(to_user: str, message_data: dict):
-    """Доставляет письмо в локальный словар пользователя"""
+    """Доставляет письмо в локальный словарь пользователя"""
     global MESSAGE_COUNTER
     if to_user not in MAILBOX:
         MAILBOX[to_user] = []
@@ -65,6 +66,7 @@ def send_external_email(from_addr: str, to_addr: str, subject: str, body: str):
         msg['Subject'] = subject
         msg['From'] = from_addr
         msg['To'] = to_addr
+        msg['Message-ID'] = make_msgid(domain=from_addr.split('@')[1])
 
         # Отправляем через SMTP
         with smtplib.SMTP(mx_record, 25) as server:
