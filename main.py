@@ -42,7 +42,7 @@ HTML_CONTENT = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IRC Lite Web</title>
-    <!-- Cloudflare Turnstile SDK (SRI не используется, так как скрипт динамически обновляется CDN) -->
+    <!-- Cloudflare Turnstile SDK -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style nonce="NONCE_PLACEHOLDER">
         :root {
@@ -207,10 +207,6 @@ HTML_CONTENT = """
             border-color: var(--accent-blue);
         }
 
-        /* 
-           ИСПРАВЛЕНИЕ: Растягиваем текст чекбоксов на весь фрейм. 
-           Добавлено flex: 1 для label и width: 100% для контейнера.
-        */
         .checkbox-container {
             display: flex;
             align-items: flex-start;
@@ -234,7 +230,7 @@ HTML_CONTENT = """
         }
 
         .checkbox-container label {
-            flex: 1; /* Растягиваем текст на всё свободное пространство */
+            flex: 1;
             font-size: 13px;
             color: var(--text-primary);
             line-height: 1.4;
@@ -558,7 +554,7 @@ HTML_CONTENT = """
         ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #484f58; }
 
-        /* Новые классы для замены инлайн-стилей */
+        /* Вспомогательные CSS классы вместо инлайновых стилей */
         .mb-20 { margin-bottom: 20px; }
         .mt-16 { margin-top: 16px; }
         .secret-room-container { padding: 0 6px; margin-bottom: 20px; }
@@ -600,13 +596,11 @@ HTML_CONTENT = """
                     <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
                 </div>
 
-                <!-- Новая галочка: Запомнить меня -->
                 <div class="checkbox-container">
                     <input type="checkbox" id="remember-me">
                     <label for="remember-me">Запомнить меня (Автоматический вход)</label>
                 </div>
 
-                <!-- Галочка соглашения -->
                 <div class="checkbox-container mb-20">
                     <input type="checkbox" id="privacy" required>
                     <label for="privacy">Мне есть 18 лет, я принимаю <a href="#" id="privacy-link">условия конфиденциальности</a>.</label>
@@ -689,7 +683,6 @@ HTML_CONTENT = """
                 <div class="sys-line">*** Добро пожаловать в IRC Lite Web.</div>
             </div>
 
-            <!-- Зона превью прикрепленного фото -->
             <div id="attachment-container" class="attachment-preview">
                 <img id="attachment-img" class="attachment-thumb" src="">
                 <button type="button" class="attachment-remove" id="clear-attachment-btn">Удалить фото</button>
@@ -697,7 +690,6 @@ HTML_CONTENT = """
 
             <div class="chat-input-area">
                 <form id="chat-form" class="chat-input-form">
-                    <!-- Кнопка загрузки картинки -->
                     <input type="file" id="file-input" accept="image/*" class="hidden">
                     <button type="button" class="btn-icon" id="upload-btn" title="Отправить фото">
                         <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
@@ -721,7 +713,7 @@ HTML_CONTENT = """
                 <div class="section-title">В канале (<span id="count-in-channel">0</span>)</div>
                 <div id="users-in-channel-list"></div>
 
-                <div class="section-title" style="margin-top: 20px;">Все онлайн (<span id="count-global">0</span>)</div>
+                <div class="section-title mt-16">Все онлайн (<span id="count-global">0</span>)</div>
                 <div id="users-global-list"></div>
             </div>
         </div>
@@ -741,9 +733,7 @@ HTML_CONTENT = """
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
 
-        // Авто-логин и привязка событий
         window.addEventListener('DOMContentLoaded', () => {
-            // Привязываем обработчики событий (CSP без unsafe-inline)
             document.getElementById('login-form').addEventListener('submit', login);
             document.getElementById('privacy-link').addEventListener('click', (e) => { e.preventDefault(); togglePrivacyModal(true); });
             document.getElementById('privacy-close').addEventListener('click', () => togglePrivacyModal(false));
@@ -815,7 +805,6 @@ HTML_CONTENT = """
                     currentUser = data.username;
                     sessionToken = data.token;
                     
-                    // Сохранение сессии (Запомнить меня)
                     if (document.getElementById('remember-me').checked) {
                         localStorage.setItem('irc_token', sessionToken);
                         localStorage.setItem('irc_user', currentUser);
@@ -885,7 +874,6 @@ HTML_CONTENT = """
             
             ws.onopen = function() {
                 if (pingInterval) clearInterval(pingInterval);
-                // Отправка пинга каждые 20 секунд для предотвращения разрыва соединения
                 pingInterval = setInterval(() => {
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: "ping" }));
@@ -907,9 +895,8 @@ HTML_CONTENT = """
             ws.onclose = function(e) {
                 if (pingInterval) clearInterval(pingInterval);
                 
-                // Если закрылось почти сразу (ошибка авторизации или бан)
                 if (Date.now() - wsStartTime < 2000 || e.code === 4001 || e.code === 403) {
-                    forceLogout("Ошибка сессии. Пожалуйста, авторизуйтесь заново.");
+                    forceLogout("Сессия истекла. Пожалуйста, авторизуйтесь заново.");
                 } else if (e.code === 4002) {
                     appendSystemMessage("*** Превышен лимит подключений.");
                 } else {
@@ -1036,7 +1023,6 @@ HTML_CONTENT = """
             document.getElementById('file-input').value = "";
         }
 
-        // Захват файла и локальное сжатие
         function handleFileUpload(event) {
             const file = event.target.files[0];
             if (!file) return;
@@ -1049,7 +1035,6 @@ HTML_CONTENT = """
                     let width = img.width;
                     let height = img.height;
 
-                    // Ограничение размера до 512x512 для передачи по WebSocket
                     const maxSize = 512;
                     if (width > maxSize || height > maxSize) {
                         if (width > height) {
@@ -1066,7 +1051,6 @@ HTML_CONTENT = """
                     const ctx = canvas.getContext('2d');
                     ctx.drawImage(img, 0, 0, width, height);
 
-                    // Конвертируем в JPEG, качество 0.8 (вес будет около 20-60кб)
                     pendingImageBase64 = canvas.toDataURL('image/jpeg', 0.8);
                     
                     document.getElementById('attachment-img').src = pendingImageBase64;
@@ -1094,20 +1078,6 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        
-        # CSP устанавливается в маршрутах для поддержки динамического Nonce, 
-        # но если его нет, ставим базовый fallback
-        if "Content-Security-Policy" not in response.headers:
-            response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; "
-                "script-src 'self' https://challenges.cloudflare.com; "
-                "style-src 'self'; "
-                "frame-src https://challenges.cloudflare.com; "
-                "img-src 'self' data: blob:; "
-                "connect-src 'self' ws: wss:; "
-                "frame-ancestors 'none';"
-            )
-            
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         return response
@@ -1195,15 +1165,15 @@ async def get_home():
     
     response = HTMLResponse(html)
     
-    # Строгий CSP с Nonce для устранения уязвимости unsafe-inline
+    # Специфичный CSP с Nonce для стилей и скриптов, а также поддержка фреймов Cloudflare Turnstile
     response.headers["Content-Security-Policy"] = (
         f"default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}' https://challenges.cloudflare.com; "
         f"style-src 'self' 'nonce-{nonce}'; "
-        "frame-src https://challenges.cloudflare.com; "
-        "img-src 'self' data: blob:; "
-        "connect-src 'self' ws: wss:; "
-        "frame-ancestors 'none';"
+        f"frame-src https://challenges.cloudflare.com; "
+        f"img-src 'self' data: blob:; "
+        f"connect-src 'self' ws: wss: https://challenges.cloudflare.com; "
+        f"frame-ancestors 'none';"
     )
     return response
 
@@ -1253,8 +1223,6 @@ def get_hashed_ip(ip: str) -> str:
 
 @app.websocket("/ws/{token}/{channel}")
 async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
-    # Принимаем соединение СРАЗУ, чтобы избежать жесткой ошибки HTTP 403.
-    # Если сессия неверна, мы закроем его корректным кодом.
     await websocket.accept()
 
     session = VALID_SESSIONS.get(token)
@@ -1265,7 +1233,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     
     username = session["username"]
     raw_ip = websocket.client.host if websocket.client else "127.0.0.1"
-    hashed_ip = get_hashed_ip(raw_ip) # Хэшируем IP для безопасности
+    hashed_ip = get_hashed_ip(raw_ip)
     
     current_conns = IP_CONNECTIONS.get(hashed_ip, 0)
     if current_conns >= MAX_CONNS_PER_IP:
@@ -1302,7 +1270,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
             try:
                 packet = json.loads(raw_data)
                 
-                # Обработка heartbeats (пингов) для удержания соединения
                 if packet.get("type") == "ping":
                     continue
                     
