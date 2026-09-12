@@ -1,1303 +1,420 @@
-import os
-import json
-import datetime
-import secrets
-import re
-import time
-import httpx
-import uuid
-import base64
-import hashlib
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
-from fastapi.responses import HTMLResponse, Response
-from starlette.middleware.base import BaseHTTPMiddleware
+import asyncio
+import smtplib
 import uvicorn
+import dns.resolver
+from email.message import EmailMessage
+from email import policy
+from email.parser import BytesParser
+from datetime import datetime
+from typing import List, Optional
 
-SERVER_START_TIME = datetime.datetime.now(datetime.timezone.utc).isoformat()
-TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
-TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
-SALT_IP = secrets.token_bytes(32)  # Соль для хэширования IP-адресов
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from aiosmtpd.controller import Controller
+from contextlib import asynccontextmanager
 
-DEFAULT_CHANNELS = [
-    "#general", "#random", "#news", "#music", "#gaming",
-    "#programming", "#python", "#javascript", "#movies", "#anime",
-    "#books", "#science", "#space", "#technology", "#hardware",
-    "#art", "#design", "#photography", "#memes", "#sports",
-    "#fitness", "#food", "#travel", "#cars", "#help"
-]
+# База данных в оперативной памяти
+# Формат: {"username": [{"id": 1, "from": "...", "to": "...", "subject": "...", "body": "...", "date": "..."}]}
+MAILBOX = {}
+MESSAGE_COUNTER = 1
+LOCAL_DOMAIN = "0.0.0.0" # Поменяй на свой IP, если сервер смотрит в интернет (например "123.45.67.89")
 
-NICK_REGEX = re.compile(r"^[a-zA-Z0-9_\-\u0400-\u04FF]{2,20}$")
-CHANNEL_REGEX = re.compile(r"^#[a-zA-Z0-9_\-\u0400-\u04FF]{2,30}$")
+# Модели Pydantic для API
+class EmailSendRequest(BaseModel):
+    from_user: str # Например 'admin' (будет превращено в admin@LOCAL_DOMAIN)
+    to_address: str # Куда отправляем (может быть gmail.com)
+    subject: str
+    body: str
 
-VALID_SESSIONS: dict[str, dict] = {}
-MAX_SESSION_AGE = 86400  # 24 hours
-IP_CONNECTIONS: dict[str, int] = {}
-MAX_CONNS_PER_IP = 15
-MESSAGE_TIMESTAMPS: dict[WebSocket, list[float]] = {}
+class EmailMessageModel(BaseModel):
+    id: int
+    from_address: str
+    to_address: str
+    subject: str
+    body: str
+    date: str
 
-HTML_CONTENT = """
+def deliver_message_locally(to_user: str, message_data: dict):
+    """Доставляет письмо в локальный словарь пользователя"""
+    global MESSAGE_COUNTER
+    if to_user not in MAILBOX:
+        MAILBOX[to_user] = []
+    
+    msg_copy = message_data.copy()
+    msg_copy["id"] = MESSAGE_COUNTER
+    MESSAGE_COUNTER += 1
+    
+    # Добавляем в начало списка (новые сверху)
+    MAILBOX[to_user].insert(0, msg_copy)
+    print(f"[LOCAL] Письмо доставлено локальному пользователю: {to_user}")
+
+def send_external_email(from_addr: str, to_addr: str, subject: str, body: str):
+    """Отправляет письмо на внешний домен (например, Gmail) путем поиска MX записей"""
+    try:
+        domain = to_addr.split('@')[1]
+        
+        # Получаем MX запись для домена получателя (адрес почтового сервера)
+        answers = dns.resolver.resolve(domain, 'MX')
+        mx_record = str(answers[0].exchange)
+        print(f"[SMTP] Найден MX сервер для {domain}: {mx_record}")
+
+        # Формируем письмо
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg['Subject'] = subject
+        msg['From'] = from_addr
+        msg['To'] = to_addr
+
+        # Отправляем через SMTP
+        with smtplib.SMTP(mx_record, 25) as server:
+            # Для отладки можно раскомментировать следующую строку
+            # server.set_debuglevel(1)
+            server.send_message(msg)
+        print(f"[SMTP] Письмо успешно отправлено на {to_addr}")
+    except Exception as e:
+        print(f"[ERROR] Ошибка отправки письма на {to_addr}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка отправки на внешний сервер: {str(e)}")
+
+class LocalSMTPHandler:
+    """Обрабатывает входящие SMTP подключения на наш сервер"""
+    async def handle_DATA(self, server, session, envelope):
+        try:
+            # Парсим входящее письмо
+            msg = BytesParser(policy=policy.default).parsebytes(envelope.content)
+            
+            # Извлекаем данные
+            from_addr = envelope.mail_from
+            subject = msg['subject'] if msg['subject'] else "(Без темы)"
+            body = msg.get_body(preferencelist=('plain')).get_content() if msg.get_body(preferencelist=('plain')) else ""
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            for rcpt in envelope.rcpt_tos:
+                print(f"[SMTP-IN] Получено письмо для: {rcpt}")
+                if f"@{LOCAL_DOMAIN}" in rcpt:
+                    # Извлекаем имя пользователя (все до @)
+                    username = rcpt.split('@')[0]
+                    message_data = {
+                        "from_address": from_addr,
+                        "to_address": rcpt,
+                        "subject": subject,
+                        "body": body,
+                        "date": date_str
+                    }
+                    deliver_message_locally(username, message_data)
+                else:
+                    print(f"[SMTP-IN] Игнорируем письмо для чужого домена: {rcpt}")
+
+            return '250 Message accepted for delivery'
+        except Exception as e:
+            print(f"[SMTP-IN ERROR] {str(e)}")
+            return '500 Could not process your message'
+
+# Запуск и остановка SMTP сервера вместе с FastAPI
+smtp_controller = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global smtp_controller
+    # Запускаем SMTP сервер на порту 2525 (или 25, если есть права суперпользователя)
+    # Если хочешь принимать реальные письма из интернета, нужно использовать порт 25 и белый IP
+    smtp_controller = Controller(LocalSMTPHandler(), hostname='0.0.0.0', port=2525)
+    smtp_controller.start()
+    print("[SYSTEM] Внутренний SMTP сервер запущен на порту 2525")
+    yield
+    smtp_controller.stop()
+    print("[SYSTEM] Внутренний SMTP сервер остановлен")
+
+app = FastAPI(lifespan=lifespan, title="PyMail Server")
+
+@app.get("/api/messages/{username}", response_model=List[EmailMessageModel])
+def get_messages(username: str):
+    """Возвращает список писем для указанного пользователя"""
+    return MAILBOX.get(username, [])
+
+@app.post("/api/send")
+def send_message(req: EmailSendRequest):
+    """Отправляет письмо (внутреннее или внешнее)"""
+    from_full_address = f"{req.from_user}@{LOCAL_DOMAIN}"
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Сохраняем исходящее письмо у отправителя для истории
+    sent_msg_data = {
+        "from_address": from_full_address,
+        "to_address": req.to_address,
+        "subject": req.subject,
+        "body": req.body,
+        "date": date_str
+    }
+    deliver_message_locally(req.from_user, sent_msg_data)
+
+    # Проверяем, локальная это доставка или внешняя
+    if req.to_address.endswith(f"@{LOCAL_DOMAIN}"):
+        to_user = req.to_address.split('@')[0]
+        deliver_message_locally(to_user, sent_msg_data)
+        return {"status": "success", "message": "Локальное письмо доставлено"}
+    else:
+        # Внешняя доставка (например, на Gmail)
+        send_external_email(from_full_address, req.to_address, req.subject, req.body)
+        return {"status": "success", "message": "Письмо отправлено на внешний сервер"}
+
+@app.post("/api/reset")
+def reset_server():
+    """Сбрасывает всю оперативную память (удаляет все письма)"""
+    global MAILBOX, MESSAGE_COUNTER
+    MAILBOX.clear()
+    MESSAGE_COUNTER = 1
+    return {"status": "success", "message": "ОЗУ очищена, все письма удалены"}
+
+# Веб-интерфейс, встроенный прямо в приложение
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IRC Lite Web</title>
-    <!-- Cloudflare Turnstile SDK -->
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-    <style nonce="NONCE_PLACEHOLDER">
-        :root {
-            --bg-dark: #0d1117;
-            --bg-card: #161b22;
-            --bg-panel: #21262d;
-            --bg-input: #0d1117;
-            --border-main: #30363d;
-            --text-primary: #c9d1d9;
-            --text-muted: #8b949e;
-            --text-heading: #f0f6fc;
-            --accent-blue: #2f81f7;
-            --accent-hover: #58a6ff;
-            --status-green: #3fb950;
-        }
-
-        * {
-            box-sizing: border-box !important;
-        }
-
-        body {
-            margin: 0;
-            padding: 0;
-            background-color: var(--bg-dark);
-            color: var(--text-primary);
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .hidden { display: none !important; }
-
-        .icon {
-            display: inline-block;
-            vertical-align: middle;
-            fill: currentColor;
-            flex-shrink: 0;
-        }
-
-        /* Top bar styling */
-        .top-bar {
-            height: 42px;
-            background: var(--bg-card);
-            border-bottom: 1px solid var(--border-main);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 20px;
-            font-size: 13px;
-            color: var(--text-primary);
-            flex-shrink: 0;
-            z-index: 100;
-        }
-
-        .top-bar-brand {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-weight: 700;
-            color: var(--text-heading);
-        }
-
-        .top-bar-uptime {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 12px;
-            color: var(--text-muted);
-            background: var(--bg-dark);
-            padding: 4px 12px;
-            border-radius: 20px;
-            border: 1px solid var(--border-main);
-            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-        }
-
-        .pulse-dot {
-            width: 8px;
-            height: 8px;
-            background-color: var(--status-green);
-            border-radius: 50%;
-            box-shadow: 0 0 8px var(--status-green);
-            animation: pulse-animation 2s infinite;
-        }
-
-        @keyframes pulse-animation {
-            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.7); }
-            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(63, 185, 80, 0); }
-            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
-        }
-
-        /* Login Page */
-        .login-page {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            flex: 1;
-            background: radial-gradient(circle at center, #161b22 0%, #0d1117 100%);
-            padding: 24px;
-            overflow-y: auto;
-        }
-
-        .login-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-main);
-            border-radius: 12px;
-            padding: 32px 28px;
-            width: 100%;
-            max-width: 440px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
-        }
-
-        .login-card-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 8px;
-        }
-
-        .login-card h2 {
-            color: var(--text-heading);
-            font-size: 22px;
-            margin: 0;
-            font-weight: 700;
-        }
-
-        .login-card p.subtitle {
-            color: var(--text-muted);
-            font-size: 13px;
-            margin-top: 4px;
-            margin-bottom: 24px;
-            line-height: 1.4;
-        }
-
-        .form-group {
-            margin-bottom: 20px;
-        }
-
-        .form-label {
-            display: block;
-            color: var(--text-heading);
-            font-size: 13px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }
-
-        .form-control-custom {
-            width: 100%;
-            padding: 10px 14px;
-            background: var(--bg-input);
-            border: 1px solid var(--border-main);
-            border-radius: 6px;
-            color: var(--text-heading);
-            font-size: 14px;
-            outline: none;
-            transition: border-color 0.15s ease;
-        }
-
-        .form-control-custom:focus {
-            border-color: var(--accent-blue);
-        }
-
-        .checkbox-container {
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-            background: var(--bg-panel);
-            padding: 12px 14px;
-            border-radius: 6px;
-            border: 1px solid var(--border-main);
-            margin-bottom: 12px;
-            width: 100%;
-        }
-
-        .checkbox-container input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            min-width: 18px;
-            min-height: 18px;
-            margin-top: 2px;
-            cursor: pointer;
-            accent-color: var(--accent-blue);
-        }
-
-        .checkbox-container label {
-            flex: 1;
-            font-size: 13px;
-            color: var(--text-primary);
-            line-height: 1.4;
-            margin: 0;
-            cursor: pointer;
-            user-select: none;
-            display: block;
-            width: 100%;
-        }
-
-        .checkbox-container a {
-            color: var(--accent-hover);
-            text-decoration: underline;
-        }
-
-        .turnstile-wrapper {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            background: var(--bg-panel);
-            border: 1px solid var(--border-main);
-            border-radius: 6px;
-            padding: 8px;
-            margin-bottom: 20px;
-            min-height: 75px;
-            width: 100%;
-        }
-
-        .cf-turnstile {
-            display: inline-block;
-            margin: 0 auto;
-        }
-
-        .btn-primary-custom {
-            width: 100%;
-            padding: 12px 16px;
-            background: #238636;
-            color: #ffffff;
-            border: 1px solid rgba(240,246,252,0.1);
-            border-radius: 6px;
-            font-weight: 600;
-            font-size: 14px;
-            cursor: pointer;
-            transition: background 0.15s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-
-        .btn-primary-custom:hover {
-            background: #2ea043;
-        }
-
-        .btn-primary-custom:disabled {
-            background: #194a21;
-            cursor: not-allowed;
-            opacity: 0.8;
-        }
-
-        /* Modal */
-        .modal-overlay {
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(4px);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 9999;
-            padding: 16px;
-        }
-
-        .modal-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-main);
-            border-radius: 8px;
-            padding: 24px;
-            max-width: 420px;
-            width: 100%;
-            box-shadow: 0 16px 32px rgba(0, 0, 0, 0.8);
-        }
-
-        .modal-card h3 {
-            margin-top: 0;
-            color: var(--text-heading);
-            font-size: 18px;
-            margin-bottom: 12px;
-        }
-
-        .modal-card p, .modal-card ul {
-            font-size: 13px;
-            line-height: 1.5;
-            color: var(--text-primary);
-            margin-bottom: 16px;
-        }
-
-        /* App Chat Area */
-        .app-container {
-            display: flex;
-            flex: 1;
-            height: calc(100vh - 42px);
-            width: 100vw;
-            overflow: hidden;
-        }
-
-        .sidebar-left, .sidebar-right {
-            background: var(--bg-card);
-            border-right: 1px solid var(--border-main);
-            display: flex;
-            flex-direction: column;
-            user-select: none;
-        }
-
-        .sidebar-left { width: 250px; min-width: 250px; }
-        .sidebar-right { width: 240px; min-width: 240px; border-right: none; border-left: 1px solid var(--border-main); }
-
-        .sidebar-header {
-            padding: 14px 16px;
-            border-bottom: 1px solid var(--border-main);
-            font-weight: 700;
-            font-size: 14px;
-            color: var(--text-heading);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            background: var(--bg-dark);
-        }
-
-        .sidebar-scroll {
-            flex: 1;
-            overflow-y: auto;
-            padding: 12px 8px;
-        }
-
-        .section-title {
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-muted);
-            padding: 6px 8px;
-            font-weight: 700;
-        }
-
-        .channel-item, .user-item {
-            display: flex;
-            align-items: center;
-            padding: 6px 10px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-            color: var(--text-primary);
-            margin-bottom: 2px;
-            gap: 8px;
-        }
-
-        .channel-item:hover, .user-item:hover { background: var(--bg-panel); color: var(--text-heading); }
-        .channel-item.active { background: var(--accent-blue); color: #ffffff; font-weight: 600; }
-
-        .user-status-dot { width: 7px; height: 7px; background-color: var(--status-green); border-radius: 50%; flex-shrink: 0; }
-        .user-badge { margin-left: auto; font-size: 10px; background: rgba(255, 255, 255, 0.1); padding: 1px 5px; border-radius: 4px; color: var(--text-muted); }
-
-        .chat-main {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            background: var(--bg-dark);
-        }
-
-        .chat-header {
-            height: 50px;
-            border-bottom: 1px solid var(--border-main);
-            padding: 0 16px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: var(--bg-card);
-        }
-
-        .chat-header-title {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            color: var(--text-heading);
-            font-weight: 700;
-            font-size: 16px;
-        }
-
-        .chat-messages {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-        }
-
-        .msg-line {
-            font-size: 13px;
-            line-height: 1.5;
-            word-break: break-word;
-            display: flex;
-            gap: 8px;
-            align-items: baseline;
-        }
-
-        .msg-time { color: var(--text-muted); font-size: 11px; flex-shrink: 0; }
-        .msg-sender { font-weight: 600; color: var(--accent-hover); flex-shrink: 0; }
-        .msg-sender.me { color: var(--status-green); }
-        .msg-text { color: var(--text-primary); }
-
-        .sys-line { font-size: 12px; color: var(--text-muted); font-style: italic; padding: 2px 0; }
-
-        .chat-image {
-            max-width: 300px;
-            max-height: 300px;
-            border-radius: 6px;
-            margin-top: 6px;
-            border: 1px solid var(--border-main);
-            display: block;
-            object-fit: contain;
-        }
-
-        .attachment-preview {
-            display: none;
-            padding: 10px 16px;
-            background: var(--bg-card);
-            border-top: 1px solid var(--border-main);
-        }
-        .attachment-preview.active {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .attachment-thumb {
-            width: 48px;
-            height: 48px;
-            object-fit: cover;
-            border-radius: 4px;
-            border: 1px solid var(--border-main);
-        }
-        .attachment-remove {
-            background: var(--bg-panel);
-            border: 1px solid var(--border-main);
-            color: var(--text-primary);
-            border-radius: 4px;
-            padding: 4px 10px;
-            cursor: pointer;
-            font-size: 12px;
-            transition: 0.15s;
-        }
-        .attachment-remove:hover {
-            background: #f85149;
-            color: white;
-            border-color: #f85149;
-        }
-
-        .chat-input-area {
-            padding: 12px 16px;
-            background: var(--bg-card);
-            border-top: 1px solid var(--border-main);
-        }
-
-        .chat-input-form {
-            display: flex;
-            gap: 8px;
-            margin: 0;
-            align-items: center;
-        }
-
-        .chat-input-form input[type="text"] {
-            flex: 1;
-            height: 38px;
-            padding: 0 12px;
-            background: var(--bg-input);
-            border: 1px solid var(--border-main);
-            border-radius: 6px;
-            color: var(--text-heading);
-            font-size: 13px;
-            outline: none;
-        }
-
-        .chat-input-form input[type="text"]:focus { border-color: var(--accent-blue); }
-
-        .btn-icon {
-            padding: 0 12px;
-            height: 38px;
-            background: var(--bg-panel);
-            color: var(--text-primary);
-            border: 1px solid var(--border-main);
-            border-radius: 6px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: background 0.15s;
-        }
-
-        .btn-icon:hover { background: var(--border-main); }
-        .btn-icon:disabled { opacity: 0.5; cursor: not-allowed; }
-
-        .chat-input-form button[type="submit"] {
-            height: 38px;
-            padding: 0 16px;
-            background: var(--accent-blue);
-            color: #ffffff;
-            border: none;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .chat-input-form button[type="submit"]:hover { background: #388bfd; }
-
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #484f58; }
-
-        /* Вспомогательные CSS классы вместо инлайновых стилей */
-        .mb-20 { margin-bottom: 20px; }
-        .mt-16 { margin-top: 16px; }
-        .secret-room-container { padding: 0 6px; margin-bottom: 20px; }
-        .m-0 { margin: 0; }
-        .custom-channel-input { padding: 6px 8px; font-size: 12px; margin-bottom: 6px; }
-        .custom-channel-btn { padding: 6px; font-size: 12px; background: var(--accent-blue); }
-        .logout-container { padding: 12px; border-top: 1px solid var(--border-main); background: var(--bg-dark); }
-        .logout-btn-style { background: transparent; border: 1px solid var(--border-main); color: #f85149; }
-        .msg-content { display: inline-block; flex: 1; }
-        .global-user-dot { background: #58a6ff; }
-        .login-error-text { color: #f85149; font-size: 12px; margin-top: 12px; text-align: center; font-weight: 600; }
+    <title>PyMail - Локальный Почтовик</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .tab-active { border-bottom: 2px solid #3b82f6; color: #1d4ed8; font-weight: 600; }
+        .tab-inactive { color: #6b7280; }
+        .tab-inactive:hover { color: #374151; }
     </style>
 </head>
-<body>
-    <div class="top-bar">
-        <div class="top-bar-brand">
-            <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-            <span>IRC Lite Web</span>
-        </div>
-        <div class="top-bar-uptime">
-            <span class="pulse-dot"></span>
-            <span>Uptime: </span>
-            <strong id="uptime-counter">00d 00h 00m 00s</strong>
-        </div>
-    </div>
+<body class="h-screen flex flex-col">
 
-    <!-- Страница входа -->
-    <div class="login-page" id="login-view">
-        <div class="login-card">
-            <div class="login-card-header">
-                <svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-                <h2>IRC Lite Web</h2>
+    <!-- Navbar -->
+    <header class="bg-white shadow-sm px-6 py-4 flex justify-between items-center">
+        <div class="flex items-center gap-2">
+            <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold text-xl">M</div>
+            <h1 class="text-xl font-bold text-gray-800">PyMail</h1>
+        </div>
+        <div class="flex items-center gap-4">
+            <span class="text-sm text-gray-500">Домен сервера: <strong id="server-domain"></strong></span>
+            <button onclick="resetServer()" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors shadow-sm">
+                Сбросить ОЗУ
+            </button>
+        </div>
+    </header>
+
+    <div class="flex flex-1 overflow-hidden">
+        <!-- Sidebar / Auth -->
+        <div class="w-64 bg-white border-r border-gray-200 p-6 flex flex-col gap-6">
+            <div>
+                <label class="block text-sm font-semibold text-gray-700 mb-2">Твой Username</label>
+                <div class="flex border rounded-md overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 transition-shadow">
+                    <input type="text" id="username" placeholder="admin" value="admin" class="w-full px-3 py-2 outline-none" onkeyup="loadEmails()">
+                </div>
+                <p class="text-xs text-gray-500 mt-2">Твой адрес: <span id="full-address" class="font-mono bg-gray-100 px-1 rounded">admin@localhost</span></p>
             </div>
-            <p class="subtitle">Защищённый мессенджер без сохранения истории (RAM 512MB)</p>
             
-            <form id="login-form">
-                <div class="form-group">
-                    <label class="form-label" for="username">Имя пользователя</label>
-                    <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
-                </div>
+            <nav class="flex flex-col gap-2">
+                <button onclick="switchTab('inbox')" id="btn-inbox" class="flex items-center gap-3 px-3 py-2 rounded-md bg-blue-50 text-blue-700 font-medium transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4"></path></svg>
+                    Входящие / История
+                </button>
+                <button onclick="switchTab('compose')" id="btn-compose" class="flex items-center gap-3 px-3 py-2 rounded-md hover:bg-gray-100 text-gray-700 font-medium transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
+                    Написать письмо
+                </button>
+            </nav>
+        </div>
 
-                <div class="checkbox-container">
-                    <input type="checkbox" id="remember-me">
-                    <label for="remember-me">Запомнить меня (Автоматический вход)</label>
-                </div>
+        <!-- Main Content -->
+        <main class="flex-1 bg-gray-50 overflow-y-auto p-8 relative">
+            
+            <!-- Toast Notification -->
+            <div id="toast" class="absolute top-4 right-8 bg-gray-800 text-white px-4 py-2 rounded shadow-lg transform transition-all duration-300 translate-y-[-150%] opacity-0 z-50">
+                Уведомление
+            </div>
 
-                <div class="checkbox-container mb-20">
-                    <input type="checkbox" id="privacy" required>
-                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="#" id="privacy-link">условия конфиденциальности</a>.</label>
+            <!-- Inbox View -->
+            <div id="view-inbox" class="block max-w-4xl mx-auto">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6 flex items-center gap-3">
+                    Почтовый ящик
+                    <button onclick="loadEmails()" class="text-sm font-normal text-blue-600 hover:underline cursor-pointer bg-blue-100 px-2 py-1 rounded-md">Обновить</button>
+                </h2>
+                
+                <div id="emails-container" class="space-y-4">
+                    <!-- Загрузка писем -->
+                    <p class="text-gray-500">Загрузка...</p>
                 </div>
+            </div>
 
-                <div class="form-group">
-                    <label class="form-label">Защита Cloudflare</label>
-                    <div class="turnstile-wrapper">
-                        <div class="cf-turnstile" data-sitekey="TURNSTILE_SITEKEY_PLACEHOLDER" data-theme="dark"></div>
+            <!-- Compose View -->
+            <div id="view-compose" class="hidden max-w-3xl mx-auto bg-white p-8 rounded-xl shadow-sm border border-gray-100">
+                <h2 class="text-2xl font-bold text-gray-800 mb-6">Новое письмо</h2>
+                <form id="compose-form" onsubmit="sendEmail(event)" class="flex flex-col gap-5">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Кому (можно на gmail)</label>
+                        <input type="email" id="to_address" required placeholder="example@gmail.com или test@localhost" class="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-shadow">
                     </div>
-                </div>
-
-                <button type="submit" id="login-btn" class="btn-primary-custom">
-                    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-                    <span>Войти в чат</span>
-                </button>
-                <div id="login-error" class="login-error-text"></div>
-            </form>
-        </div>
-    </div>
-
-    <!-- Модальное окно политики -->
-    <div id="privacy-modal" class="modal-overlay hidden">
-        <div class="modal-card">
-            <h3>Условия конфиденциальности</h3>
-            <p>Наш мессенджер функционирует исключительно в оперативной памяти (RAM) сервера:</p>
-            <ul>
-                <li>Сообщения и изображения <strong>не сохраняются</strong> на диск.</li>
-                <li>История удаляется при перезагрузке, фотографии хранятся во временном буфере.</li>
-                <li>Логирование персональных данных не ведется.</li>
-            </ul>
-            <button type="button" class="btn-primary-custom" id="privacy-close">Понятно</button>
-        </div>
-    </div>
-
-    <!-- Интерфейс чата -->
-    <div class="app-container hidden" id="chat-view">
-        <div class="sidebar-left">
-            <div class="sidebar-header">
-                <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
-                <span>Каналы</span>
-            </div>
-            
-            <div class="sidebar-scroll">
-                <div class="section-title">Публичные</div>
-                <div id="channel-list"></div>
-
-                <div class="section-title mt-16">Секретная комната</div>
-                <div class="secret-room-container">
-                    <form id="custom-channel-form" class="m-0">
-                        <input type="text" id="custom-channel" class="form-control-custom custom-channel-input" placeholder="#секрет" maxlength="30" required>
-                        <button type="submit" class="btn-primary-custom custom-channel-btn">
-                            <svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                            <span>Войти / Создать</span>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Тема</label>
+                        <input type="text" id="subject" required placeholder="Важное сообщение" class="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-shadow">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Сообщение</label>
+                        <textarea id="body" required rows="8" placeholder="Текст письма..." class="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-shadow resize-none"></textarea>
+                    </div>
+                    <div class="flex justify-end pt-2">
+                        <button type="submit" id="send-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2.5 rounded-md font-medium transition-colors shadow-sm flex items-center gap-2">
+                            <span>Отправить</span>
+                            <svg class="w-4 h-4 transform rotate-45 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path></svg>
                         </button>
-                    </form>
-                </div>
-            </div>
-            
-            <div class="logout-container">
-                <button type="button" class="btn-primary-custom logout-btn-style" id="logout-btn-action">
-                    <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
-                    <span>Выйти</span>
-                </button>
-            </div>
-        </div>
-
-        <div class="chat-main">
-            <div class="chat-header">
-                <div class="chat-header-title">
-                    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
-                    <span id="current-channel-title">general</span>
-                </div>
-                <div>
-                    <span class="user-badge" id="channel-users-count">Участников: 0</span>
-                </div>
-            </div>
-
-            <div class="chat-messages" id="chat-box">
-                <div class="sys-line">*** Добро пожаловать в IRC Lite Web.</div>
-            </div>
-
-            <div id="attachment-container" class="attachment-preview">
-                <img id="attachment-img" class="attachment-thumb" src="">
-                <button type="button" class="attachment-remove" id="clear-attachment-btn">Удалить фото</button>
-            </div>
-
-            <div class="chat-input-area">
-                <form id="chat-form" class="chat-input-form">
-                    <input type="file" id="file-input" accept="image/*" class="hidden">
-                    <button type="button" class="btn-icon" id="upload-btn" title="Отправить фото">
-                        <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
-                    </button>
-
-                    <input type="text" id="message-input" placeholder="Написать сообщение..." maxlength="500" autocomplete="off">
-                    <button type="submit">
-                        <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-                    </button>
+                    </div>
                 </form>
             </div>
-        </div>
 
-        <div class="sidebar-right">
-            <div class="sidebar-header">
-                <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
-                <span>Участники</span>
-            </div>
-
-            <div class="sidebar-scroll">
-                <div class="section-title">В канале (<span id="count-in-channel">0</span>)</div>
-                <div id="users-in-channel-list"></div>
-
-                <div class="section-title mt-16">Все онлайн (<span id="count-global">0</span>)</div>
-                <div id="users-global-list"></div>
-            </div>
-        </div>
+        </main>
     </div>
 
-    <script nonce="NONCE_PLACEHOLDER">
-        let currentUser = "";
-        let sessionToken = "";
-        let currentChannel = "#general";
-        let ws = null;
-        let pendingImageBase64 = null;
-        let pingInterval = null;
-        let wsStartTime = 0;
-        const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
-        const serverUptimeSec = SERVER_UPTIME_PLACEHOLDER; 
-        const localStartTimestamp = Math.floor(Date.now() / 1000) - serverUptimeSec;
+    <!-- Application Logic -->
+    <script>
+        const LOCAL_DOMAIN = "localhost"; // Отражение переменной из Python
+        document.getElementById('server-domain').textContent = LOCAL_DOMAIN;
 
-        const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `absolute top-4 right-8 px-4 py-2 rounded shadow-lg transform transition-all duration-300 z-50 ${isError ? 'bg-red-500 text-white' : 'bg-gray-800 text-white'}`;
+            toast.style.transform = 'translateY(0)';
+            toast.style.opacity = '1';
+            setTimeout(() => {
+                toast.style.transform = 'translateY(-150%)';
+                toast.style.opacity = '0';
+            }, 3000);
+        }
 
-        window.addEventListener('DOMContentLoaded', () => {
-            document.getElementById('login-form').addEventListener('submit', login);
-            document.getElementById('privacy-link').addEventListener('click', (e) => { e.preventDefault(); togglePrivacyModal(true); });
-            document.getElementById('privacy-close').addEventListener('click', () => togglePrivacyModal(false));
-            document.getElementById('custom-channel-form').addEventListener('submit', joinCustomChannel);
-            document.getElementById('logout-btn-action').addEventListener('click', doLogout);
-            document.getElementById('clear-attachment-btn').addEventListener('click', clearAttachment);
-            document.getElementById('file-input').addEventListener('change', handleFileUpload);
-            document.getElementById('upload-btn').addEventListener('click', () => document.getElementById('file-input').click());
-            document.getElementById('chat-form').addEventListener('submit', sendMessage);
-
-            const savedToken = localStorage.getItem('irc_token');
-            const savedUser = localStorage.getItem('irc_user');
-            if (savedToken && savedUser) {
-                currentUser = savedUser;
-                sessionToken = savedToken;
-                document.getElementById('login-view').classList.add('hidden');
-                document.getElementById('chat-view').classList.remove('hidden');
-                renderChannels();
-                connectWs(currentChannel);
-            }
+        // Обновление отображаемого адреса при вводе username
+        document.getElementById('username').addEventListener('input', (e) => {
+            const user = e.target.value.trim() || 'anonymous';
+            document.getElementById('full-address').textContent = `${user}@${LOCAL_DOMAIN}`;
         });
 
-        function updateUptime() {
-            const now = Math.floor(Date.now() / 1000);
-            let diff = Math.max(0, now - localStartTimestamp);
-            const days = Math.floor(diff / 86400); diff %= 86400;
-            const hours = Math.floor(diff / 3600); diff %= 3600;
-            const minutes = Math.floor(diff / 60); const seconds = diff % 60;
-            const pad = (n) => String(n).padStart(2, '0');
-            const uptimeStr = `${days > 0 ? days + 'd ' : ''}${pad(hours)}h ${pad(minutes)}m ${pad(seconds)}s`;
-            const elem = document.getElementById('uptime-counter');
-            if (elem) elem.innerText = uptimeStr;
-        }
+        function switchTab(tabName) {
+            document.getElementById('view-inbox').classList.add('hidden');
+            document.getElementById('view-compose').classList.add('hidden');
+            
+            document.getElementById('btn-inbox').className = 'flex items-center gap-3 px-3 py-2 rounded-md hover:bg-gray-100 text-gray-700 font-medium transition-colors';
+            document.getElementById('btn-compose').className = 'flex items-center gap-3 px-3 py-2 rounded-md hover:bg-gray-100 text-gray-700 font-medium transition-colors';
 
-        setInterval(updateUptime, 1000);
-        updateUptime();
-
-        function togglePrivacyModal(show) {
-            const modal = document.getElementById('privacy-modal');
-            if (show) modal.classList.remove('hidden');
-            else modal.classList.add('hidden');
-        }
-
-        async function login(e) {
-            e.preventDefault();
-            const btn = document.getElementById('login-btn');
-            const errorSpan = document.getElementById('login-error');
-            const username = document.getElementById('username').value.trim();
-            const turnstileElem = document.querySelector('[name="cf-turnstile-response"]');
-            const turnstileResponse = turnstileElem ? turnstileElem.value : "";
-
-            if (!turnstileResponse) {
-                errorSpan.innerText = "Пожалуйста, пройдите проверку капчи.";
-                return;
+            if (tabName === 'inbox') {
+                document.getElementById('view-inbox').classList.remove('hidden');
+                document.getElementById('btn-inbox').className = 'flex items-center gap-3 px-3 py-2 rounded-md bg-blue-50 text-blue-700 font-medium transition-colors';
+                loadEmails();
+            } else {
+                document.getElementById('view-compose').classList.remove('hidden');
+                document.getElementById('btn-compose').className = 'flex items-center gap-3 px-3 py-2 rounded-md bg-blue-50 text-blue-700 font-medium transition-colors';
             }
+        }
 
+        async function loadEmails() {
+            const username = document.getElementById('username').value.trim() || 'admin';
+            const container = document.getElementById('emails-container');
+            
+            try {
+                const res = await fetch(`/api/messages/${username}`);
+                const emails = await res.json();
+                
+                if (emails.length === 0) {
+                    container.innerHTML = `
+                        <div class="bg-white p-10 rounded-xl shadow-sm text-center border border-gray-100">
+                            <svg class="w-16 h-16 text-gray-300 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                            <h3 class="text-lg font-medium text-gray-900">Писем пока нет</h3>
+                            <p class="text-gray-500 mt-1">Тут появятся все входящие и исходящие сообщения.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = emails.map(email => `
+                    <div class="bg-white p-5 rounded-xl shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
+                        <div class="flex justify-between items-start mb-2">
+                            <div>
+                                <span class="font-bold text-gray-900">${email.subject}</span>
+                            </div>
+                            <span class="text-xs text-gray-400 font-mono">${email.date}</span>
+                        </div>
+                        <div class="text-sm text-gray-600 mb-3 flex flex-col gap-1">
+                            <div><span class="text-gray-400">От:</span> <span class="bg-gray-100 px-1 rounded font-mono text-xs">${email.from_address}</span></div>
+                            <div><span class="text-gray-400">Кому:</span> <span class="bg-gray-100 px-1 rounded font-mono text-xs">${email.to_address}</span></div>
+                        </div>
+                        <div class="text-gray-800 text-sm whitespace-pre-wrap bg-gray-50 p-4 rounded-lg border border-gray-100">${email.body}</div>
+                    </div>
+                `).join('');
+
+            } catch (error) {
+                console.error("Ошибка загрузки писем", error);
+                showToast("Ошибка загрузки писем", true);
+            }
+        }
+
+        async function sendEmail(e) {
+            e.preventDefault();
+            const btn = document.getElementById('send-btn');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = 'Отправка...';
             btn.disabled = true;
-            errorSpan.innerText = "Проверка...";
 
-            const formData = new FormData();
-            formData.append('username', username);
-            formData.append('cf_turnstile_response', turnstileResponse);
+            const from_user = document.getElementById('username').value.trim() || 'admin';
+            const to_address = document.getElementById('to_address').value.trim();
+            const subject = document.getElementById('subject').value.trim();
+            const body = document.getElementById('body').value.trim();
 
             try {
-                const res = await fetch('/login', { method: 'POST', body: formData });
+                const res = await fetch('/api/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ from_user, to_address, subject, body })
+                });
+                
                 const data = await res.json();
-
-                if (data.status === "ok") {
-                    currentUser = data.username;
-                    sessionToken = data.token;
-                    
-                    if (document.getElementById('remember-me').checked) {
-                        localStorage.setItem('irc_token', sessionToken);
-                        localStorage.setItem('irc_user', currentUser);
-                    } else {
-                        localStorage.removeItem('irc_token');
-                        localStorage.removeItem('irc_user');
-                    }
-
-                    document.getElementById('login-view').classList.add('hidden');
-                    document.getElementById('chat-view').classList.remove('hidden');
-                    renderChannels();
-                    connectWs(currentChannel);
+                
+                if (res.ok) {
+                    showToast(data.message);
+                    document.getElementById('compose-form').reset();
+                    setTimeout(() => switchTab('inbox'), 500);
                 } else {
-                    errorSpan.innerText = data.message || "Ошибка входа.";
-                    btn.disabled = false;
+                    showToast(data.detail || "Ошибка отправки", true);
                 }
-            } catch (err) {
-                errorSpan.innerText = "Ошибка соединения.";
+            } catch (error) {
+                showToast("Сетевая ошибка", true);
+            } finally {
+                btn.innerHTML = originalText;
                 btn.disabled = false;
             }
         }
 
-        function renderChannels() {
-            const list = document.getElementById('channel-list');
-            list.innerHTML = "";
-            defaultChannels.forEach(ch => {
-                const div = document.createElement('div');
-                div.className = "channel-item" + (ch === currentChannel ? " active" : "");
-                div.innerHTML = `${hashSvg} <span>${ch.replace('#', '')}</span>`;
-                div.onclick = () => switchChannel(ch);
-                list.appendChild(div);
-            });
-        }
-
-        function switchChannel(channelName) {
-            if (!channelName.startsWith('#')) channelName = '#' + channelName;
-            if (channelName === currentChannel) return;
-            
-            currentChannel = channelName;
-            document.getElementById('current-channel-title').innerText = currentChannel.replace('#', '');
-            
-            const chatBox = document.getElementById('chat-box');
-            chatBox.innerHTML = `<div class="sys-line">*** Переход в канал ${escapeHtml(currentChannel)}...</div>`;
-            
-            renderChannels();
-            connectWs(currentChannel);
-        }
-
-        function joinCustomChannel(e) {
-            e.preventDefault();
-            const customInput = document.getElementById('custom-channel');
-            let ch = customInput.value.trim();
-            if (ch) {
-                customInput.value = "";
-                switchChannel(ch);
-            }
-        }
-
-        function connectWs(channel) {
-            if (ws) ws.close();
-            
-            const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-            const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(sessionToken) + "/" + encodeURIComponent(channel);
-            
-            ws = new WebSocket(wsUrl);
-            wsStartTime = Date.now();
-            
-            ws.onopen = function() {
-                if (pingInterval) clearInterval(pingInterval);
-                pingInterval = setInterval(() => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: "ping" }));
-                    }
-                }, 20000);
-            };
-
-            ws.onmessage = function(event) {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.type === "system" && data.text === "AUTH_ERROR") {
-                        forceLogout("Сессия устарела. Пожалуйста, войдите заново.");
-                        return;
-                    }
-                    handleIncomingPacket(data);
-                } catch(e) {}
-            };
-            
-            ws.onclose = function(e) {
-                if (pingInterval) clearInterval(pingInterval);
-                
-                if (Date.now() - wsStartTime < 2000 || e.code === 4001 || e.code === 403) {
-                    forceLogout("Сессия истекла. Пожалуйста, авторизуйтесь заново.");
-                } else if (e.code === 4002) {
-                    appendSystemMessage("*** Превышен лимит подключений.");
-                } else {
-                    appendSystemMessage("*** Соединение потеряно.");
-                }
-            };
-        }
-
-        function forceLogout(errorMsg = null) {
-            localStorage.removeItem('irc_token');
-            localStorage.removeItem('irc_user');
-            document.getElementById('chat-view').classList.add('hidden');
-            document.getElementById('login-view').classList.remove('hidden');
-            
-            if (errorMsg) {
-                document.getElementById('login-error').innerText = errorMsg;
-            }
-            
-            if (ws) {
-                ws.close();
-                ws = null;
-            }
-        }
-
-        async function doLogout() {
+        async function resetServer() {
             try {
-                const fd = new FormData();
-                fd.append('token', sessionToken);
-                await fetch('/logout', { method: 'POST', body: fd });
-            } catch (e) {}
-            forceLogout();
-        }
-
-        function handleIncomingPacket(packet) {
-            if (packet.type === "message") {
-                appendMessage(packet.username, packet.text, packet.timestamp, packet.image_b64);
-            } else if (packet.type === "system") {
-                appendSystemMessage("*** " + packet.text);
-            } else if (packet.type === "presence") {
-                updateUserLists(packet.channel_users, packet.global_users);
+                const res = await fetch('/api/reset', { method: 'POST' });
+                const data = await res.json();
+                showToast(data.message);
+                loadEmails();
+            } catch (error) {
+                showToast("Ошибка сброса", true);
             }
         }
 
-        function appendMessage(sender, text, timestamp, image_b64) {
-            const chatBox = document.getElementById('chat-box');
-            const isMe = sender === currentUser;
-            const row = document.createElement('div');
-            row.className = "msg-line";
-
-            let contentHtml = `<span class="msg-text">${escapeHtml(text)}</span>`;
-            if (image_b64) {
-                contentHtml += `<br><img src="${image_b64}" class="chat-image">`;
-            }
-
-            row.innerHTML = `
-                <span class="msg-time">[${timestamp}]</span>
-                <span class="msg-sender ${isMe ? 'me' : ''}">&lt;${escapeHtml(sender)}&gt;</span>
-                <div class="msg-content">${contentHtml}</div>
-            `;
-
-            chatBox.appendChild(row);
-            
-            const imgEl = row.querySelector('.chat-image');
-            if (imgEl) {
-                imgEl.addEventListener('load', scrollToBottom);
-            }
-            scrollToBottom();
-        }
-
-        function appendSystemMessage(text) {
-            const chatBox = document.getElementById('chat-box');
-            const div = document.createElement('div');
-            div.className = "sys-line";
-            div.innerText = text;
-            chatBox.appendChild(div);
-            scrollToBottom();
-        }
-
-        function scrollToBottom() {
-            const chatBox = document.getElementById('chat-box');
-            chatBox.scrollTop = chatBox.scrollHeight;
-        }
-
-        function updateUserLists(channelUsers, globalUsers) {
-            const channelUsersBox = document.getElementById('users-in-channel-list');
-            document.getElementById('count-in-channel').innerText = channelUsers.length;
-            document.getElementById('channel-users-count').innerText = `Участников: ${channelUsers.length}`;
-            
-            channelUsersBox.innerHTML = "";
-            channelUsers.forEach(u => {
-                const div = document.createElement('div');
-                div.className = "user-item";
-                div.innerHTML = `<span class="user-status-dot"></span><span>${escapeHtml(u)}</span>${u === currentUser ? '<span class="user-badge">вы</span>' : ''}`;
-                channelUsersBox.appendChild(div);
-            });
-
-            const globalUsersBox = document.getElementById('users-global-list');
-            document.getElementById('count-global').innerText = globalUsers.length;
-            
-            globalUsersBox.innerHTML = "";
-            globalUsers.forEach(u => {
-                const div = document.createElement('div');
-                div.className = "user-item";
-                div.innerHTML = `<span class="user-status-dot global-user-dot"></span><span>${escapeHtml(u)}</span>`;
-                globalUsersBox.appendChild(div);
-            });
-        }
-
-        function sendMessage(e) {
-            e.preventDefault();
-            const input = document.getElementById('message-input');
-            const msg = input.value.trim();
-            if ((msg || pendingImageBase64) && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "chat", text: msg, image_b64: pendingImageBase64 }));
-                input.value = "";
-                clearAttachment();
-            }
-        }
-
-        function clearAttachment() {
-            pendingImageBase64 = null;
-            document.getElementById('attachment-container').classList.remove('active');
-            document.getElementById('attachment-img').src = "";
-            document.getElementById('file-input').value = "";
-        }
-
-        function handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                const img = new Image();
-                img.onload = function() {
-                    const canvas = document.createElement('canvas');
-                    let width = img.width;
-                    let height = img.height;
-
-                    const maxSize = 512;
-                    if (width > maxSize || height > maxSize) {
-                        if (width > height) {
-                            height = Math.round((height * maxSize) / width);
-                            width = maxSize;
-                        } else {
-                            width = Math.round((width * maxSize) / height);
-                            height = maxSize;
-                        }
-                    }
-
-                    canvas.width = width;
-                    canvas.height = height;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, width, height);
-
-                    pendingImageBase64 = canvas.toDataURL('image/jpeg', 0.8);
-                    
-                    document.getElementById('attachment-img').src = pendingImageBase64;
-                    document.getElementById('attachment-container').classList.add('active');
-                };
-                img.src = e.target.result;
-            };
-            reader.readAsDataURL(file);
-        }
-
-        function escapeHtml(str) {
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
-        }
+        // Инициализация
+        document.getElementById('full-address').textContent = `${document.getElementById('username').value || 'admin'}@${LOCAL_DOMAIN}`;
+        loadEmails();
     </script>
 </body>
 </html>
 """
 
-app = FastAPI()
-
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "SAMEORIGIN"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        return response
-
-app.add_middleware(SecurityHeadersMiddleware)
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[str, dict[WebSocket, str]] = {
-            ch: {} for ch in DEFAULT_CHANNELS
-        }
-
-    async def connect(self, websocket: WebSocket, channel: str, username: str):
-        await websocket.accept()
-        if channel not in self.active_connections:
-            self.active_connections[channel] = {}
-        self.active_connections[channel][websocket] = username
-        
-        await self.broadcast_json({
-            "type": "system",
-            "text": f"Пользователь {username} вошел в канал."
-        }, channel)
-        
-        await self.broadcast_presence(channel)
-
-    async def disconnect(self, websocket: WebSocket, channel: str, username: str):
-        if channel in self.active_connections:
-            if websocket in self.active_connections[channel]:
-                del self.active_connections[channel][websocket]
-            
-            if channel not in DEFAULT_CHANNELS and len(self.active_connections[channel]) == 0:
-                del self.active_connections[channel]
-            else:
-                await self.broadcast_json({
-                    "type": "system",
-                    "text": f"Пользователь {username} покинул канал."
-                }, channel)
-                await self.broadcast_presence(channel)
-
-    def get_channel_users(self, channel: str) -> list[str]:
-        if channel in self.active_connections:
-            return list(self.active_connections[channel].values())
-        return []
-
-    def get_global_users(self) -> list[str]:
-        all_users = set()
-        for ch_conns in self.active_connections.values():
-            all_users.update(ch_conns.values())
-        return sorted(list(all_users))
-
-    async def broadcast_presence(self, channel: str):
-        global_users = self.get_global_users()
-        channel_users = self.get_channel_users(channel)
-
-        await self.broadcast_json({
-            "type": "presence",
-            "channel_users": channel_users,
-            "global_users": global_users
-        }, channel)
-
-    async def broadcast_json(self, data: dict, channel: str):
-        if channel in self.active_connections:
-            dead_sockets = []
-            for ws in list(self.active_connections[channel].keys()):
-                try:
-                    await ws.send_json(data)
-                except Exception:
-                    dead_sockets.append(ws)
-            
-            for ws in dead_sockets:
-                if ws in self.active_connections[channel]:
-                    del self.active_connections[channel][ws]
-
-manager = ConnectionManager()
-
-@app.get("/")
-async def get_home():
-    nonce = secrets.token_urlsafe(16)
-    uptime_sec = int(time.time() - datetime.datetime.fromisoformat(SERVER_START_TIME).timestamp())
-    
-    html = HTML_CONTENT.replace("TURNSTILE_SITEKEY_PLACEHOLDER", TURNSTILE_SITEKEY)
-    html = html.replace("DEFAULT_CHANNELS_PLACEHOLDER", json.dumps(DEFAULT_CHANNELS))
-    html = html.replace("SERVER_UPTIME_PLACEHOLDER", str(uptime_sec))
-    html = html.replace("NONCE_PLACEHOLDER", nonce)
-    
-    response = HTMLResponse(html)
-    
-    # Специфичный CSP с Nonce для стилей и скриптов, а также поддержка фреймов Cloudflare Turnstile
-    response.headers["Content-Security-Policy"] = (
-        f"default-src 'self'; "
-        f"script-src 'self' 'nonce-{nonce}' https://challenges.cloudflare.com; "
-        f"style-src 'self' 'nonce-{nonce}'; "
-        f"frame-src https://challenges.cloudflare.com; "
-        f"img-src 'self' data: blob:; "
-        f"connect-src 'self' ws: wss: https://challenges.cloudflare.com; "
-        f"frame-ancestors 'none';"
-    )
-    return response
-
-@app.post("/logout")
-async def logout_endpoint(token: str = Form(...)):
-    if token in VALID_SESSIONS:
-        del VALID_SESSIONS[token]
-    return {"status": "ok"}
-
-@app.post("/login")
-async def login(request: Request, username: str = Form(...), cf_turnstile_response: str = Form(...)):
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    
-    username = username.strip()
-    if not NICK_REGEX.match(username):
-        return {"status": "error", "message": "Никнейм должен содержать 2-20 символов."}
-
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", data={
-                "secret": TURNSTILE_SECRET,
-                "response": cf_turnstile_response,
-                "remoteip": client_ip
-            }, timeout=5.0)
-            data = resp.json()
-            if not data.get("success"):
-                return {"status": "error", "message": "Капча Cloudflare не пройдена."}
-        except Exception:
-            return {"status": "error", "message": "Ошибка соединения с Cloudflare."}
-
-    now = time.time()
-    expired = [t for t, s in VALID_SESSIONS.items() if now - s["created_at"] > MAX_SESSION_AGE]
-    for t in expired:
-        del VALID_SESSIONS[t]
-
-    token = secrets.token_hex(16)
-    VALID_SESSIONS[token] = {
-        "username": username,
-        "created_at": now,
-        "ip": client_ip
-    }
-
-    return {"status": "ok", "username": username, "token": token}
-
-def get_hashed_ip(ip: str) -> str:
-    return hashlib.sha256(ip.encode() + SALT_IP).hexdigest()
-
-@app.websocket("/ws/{token}/{channel}")
-async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
-    await websocket.accept()
-
-    session = VALID_SESSIONS.get(token)
-    if not session:
-        await websocket.send_json({"type": "system", "text": "AUTH_ERROR"})
-        await websocket.close(code=4001, reason="Unauthorized session token")
-        return
-    
-    username = session["username"]
-    raw_ip = websocket.client.host if websocket.client else "127.0.0.1"
-    hashed_ip = get_hashed_ip(raw_ip)
-    
-    current_conns = IP_CONNECTIONS.get(hashed_ip, 0)
-    if current_conns >= MAX_CONNS_PER_IP:
-        await websocket.close(code=4002, reason="Too many connections")
-        return
-
-    channel = channel.strip().lower()
-    if not channel.startswith("#"):
-        channel = "#" + channel
-    if not CHANNEL_REGEX.match(channel):
-        channel = "#general"
-
-    IP_CONNECTIONS[hashed_ip] = current_conns + 1
-    MESSAGE_TIMESTAMPS[websocket] = []
-
-    await manager.connect(websocket, channel, username)
-    try:
-        while True:
-            raw_data = await websocket.receive_text()
-            
-            now = time.time()
-            timestamps = MESSAGE_TIMESTAMPS.get(websocket, [])
-            timestamps = [t for t in timestamps if now - t < 3.0]
-            if len(timestamps) >= 5:
-                await websocket.send_json({
-                    "type": "system",
-                    "text": "⚠️ Слишком частые сообщения. Подождите 3 секунды."
-                })
-                continue
-            
-            timestamps.append(now)
-            MESSAGE_TIMESTAMPS[websocket] = timestamps
-
-            try:
-                packet = json.loads(raw_data)
-                
-                if packet.get("type") == "ping":
-                    continue
-                    
-                text = packet.get("text", "").strip()
-                image_b64 = packet.get("image_b64", "")
-                
-                if text or image_b64:
-                    text = text[:500]
-                    text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
-                    now_str = datetime.datetime.now().strftime("%H:%M")
-                    await manager.broadcast_json({
-                        "type": "message",
-                        "username": username,
-                        "text": text,
-                        "image_b64": image_b64,
-                        "timestamp": now_str
-                    }, channel)
-            except json.JSONDecodeError:
-                pass
-
-    except WebSocketDisconnect:
-        pass
-    finally:
-        if websocket in MESSAGE_TIMESTAMPS:
-            del MESSAGE_TIMESTAMPS[websocket]
-        if hashed_ip in IP_CONNECTIONS:
-            IP_CONNECTIONS[hashed_ip] = max(0, IP_CONNECTIONS[hashed_ip] - 1)
-        await manager.disconnect(websocket, channel, username)
+@app.get("/", response_class=HTMLResponse)
+def serve_html():
+    """Отдает HTML интерфейс при заходе на корень сайта"""
+    return HTML_TEMPLATE
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Запуск сервера
+    print("\n--- Запуск PyMail ---")
+    print("Веб-интерфейс: http://localhost:8000")
+    print("---------------------\n")
+    uvicorn.run("mail_server:app", host="0.0.0.0", port=8000, reload=False)
