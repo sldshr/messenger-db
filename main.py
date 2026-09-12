@@ -557,6 +557,19 @@ HTML_CONTENT = """
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+        /* Новые классы для замены инлайн-стилей */
+        .mb-20 { margin-bottom: 20px; }
+        .mt-16 { margin-top: 16px; }
+        .secret-room-container { padding: 0 6px; margin-bottom: 20px; }
+        .m-0 { margin: 0; }
+        .custom-channel-input { padding: 6px 8px; font-size: 12px; margin-bottom: 6px; }
+        .custom-channel-btn { padding: 6px; font-size: 12px; background: var(--accent-blue); }
+        .logout-container { padding: 12px; border-top: 1px solid var(--border-main); background: var(--bg-dark); }
+        .logout-btn-style { background: transparent; border: 1px solid var(--border-main); color: #f85149; }
+        .msg-content { display: inline-block; flex: 1; }
+        .global-user-dot { background: #58a6ff; }
+        .login-error-text { color: #f85149; font-size: 12px; margin-top: 12px; text-align: center; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -581,7 +594,7 @@ HTML_CONTENT = """
             </div>
             <p class="subtitle">Защищённый мессенджер без сохранения истории (RAM 512MB)</p>
             
-            <form id="login-form" onsubmit="login(event)">
+            <form id="login-form">
                 <div class="form-group">
                     <label class="form-label" for="username">Имя пользователя</label>
                     <input type="text" id="username" class="form-control-custom" placeholder="Hacker99" maxlength="20" required autocomplete="off">
@@ -593,10 +606,10 @@ HTML_CONTENT = """
                     <label for="remember-me">Запомнить меня (Автоматический вход)</label>
                 </div>
 
-                <!-- Галочка соглашения (Текст теперь полностью растягивается) -->
-                <div class="checkbox-container" style="margin-bottom: 20px;">
+                <!-- Галочка соглашения -->
+                <div class="checkbox-container mb-20">
                     <input type="checkbox" id="privacy" required>
-                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="javascript:void(0)" onclick="togglePrivacyModal(true)">условия конфиденциальности</a>.</label>
+                    <label for="privacy">Мне есть 18 лет, я принимаю <a href="#" id="privacy-link">условия конфиденциальности</a>.</label>
                 </div>
 
                 <div class="form-group">
@@ -610,7 +623,7 @@ HTML_CONTENT = """
                     <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
                     <span>Войти в чат</span>
                 </button>
-                <div id="login-error" style="color: #f85149; font-size: 12px; margin-top: 12px; text-align: center; font-weight: 600;"></div>
+                <div id="login-error" class="login-error-text"></div>
             </form>
         </div>
     </div>
@@ -625,7 +638,7 @@ HTML_CONTENT = """
                 <li>История удаляется при перезагрузке, фотографии хранятся во временном буфере.</li>
                 <li>Логирование персональных данных не ведется.</li>
             </ul>
-            <button type="button" class="btn-primary-custom" onclick="togglePrivacyModal(false)">Понятно</button>
+            <button type="button" class="btn-primary-custom" id="privacy-close">Понятно</button>
         </div>
     </div>
 
@@ -641,11 +654,11 @@ HTML_CONTENT = """
                 <div class="section-title">Публичные</div>
                 <div id="channel-list"></div>
 
-                <div class="section-title" style="margin-top: 16px;">Секретная комната</div>
-                <div style="padding: 0 6px; margin-bottom: 20px;">
-                    <form onsubmit="joinCustomChannel(event)" style="margin:0;">
-                        <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секрет" style="padding:6px 8px; font-size:12px; margin-bottom:6px;" maxlength="30" required>
-                        <button type="submit" class="btn-primary-custom" style="padding:6px; font-size:12px; background:var(--accent-blue);">
+                <div class="section-title mt-16">Секретная комната</div>
+                <div class="secret-room-container">
+                    <form id="custom-channel-form" class="m-0">
+                        <input type="text" id="custom-channel" class="form-control-custom custom-channel-input" placeholder="#секрет" maxlength="30" required>
+                        <button type="submit" class="btn-primary-custom custom-channel-btn">
                             <svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
                             <span>Войти / Создать</span>
                         </button>
@@ -653,8 +666,8 @@ HTML_CONTENT = """
                 </div>
             </div>
             
-            <div style="padding: 12px; border-top: 1px solid var(--border-main); background: var(--bg-dark);">
-                <button type="button" class="btn-primary-custom" style="background: transparent; border: 1px solid var(--border-main); color: #f85149;" onclick="doLogout()">
+            <div class="logout-container">
+                <button type="button" class="btn-primary-custom logout-btn-style" id="logout-btn-action">
                     <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
                     <span>Выйти</span>
                 </button>
@@ -679,14 +692,14 @@ HTML_CONTENT = """
             <!-- Зона превью прикрепленного фото -->
             <div id="attachment-container" class="attachment-preview">
                 <img id="attachment-img" class="attachment-thumb" src="">
-                <button type="button" class="attachment-remove" onclick="clearAttachment()">Удалить фото</button>
+                <button type="button" class="attachment-remove" id="clear-attachment-btn">Удалить фото</button>
             </div>
 
             <div class="chat-input-area">
-                <form class="chat-input-form" onsubmit="sendMessage(event)">
+                <form id="chat-form" class="chat-input-form">
                     <!-- Кнопка загрузки картинки -->
-                    <input type="file" id="file-input" accept="image/*" class="hidden" onchange="handleFileUpload(event)">
-                    <button type="button" class="btn-icon" id="upload-btn" onclick="document.getElementById('file-input').click()" title="Отправить фото">
+                    <input type="file" id="file-input" accept="image/*" class="hidden">
+                    <button type="button" class="btn-icon" id="upload-btn" title="Отправить фото">
                         <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
                     </button>
 
@@ -728,8 +741,19 @@ HTML_CONTENT = """
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
 
-        // Авто-логин (Запомнить меня) при загрузке страницы
+        // Авто-логин и привязка событий
         window.addEventListener('DOMContentLoaded', () => {
+            // Привязываем обработчики событий (CSP без unsafe-inline)
+            document.getElementById('login-form').addEventListener('submit', login);
+            document.getElementById('privacy-link').addEventListener('click', (e) => { e.preventDefault(); togglePrivacyModal(true); });
+            document.getElementById('privacy-close').addEventListener('click', () => togglePrivacyModal(false));
+            document.getElementById('custom-channel-form').addEventListener('submit', joinCustomChannel);
+            document.getElementById('logout-btn-action').addEventListener('click', doLogout);
+            document.getElementById('clear-attachment-btn').addEventListener('click', clearAttachment);
+            document.getElementById('file-input').addEventListener('change', handleFileUpload);
+            document.getElementById('upload-btn').addEventListener('click', () => document.getElementById('file-input').click());
+            document.getElementById('chat-form').addEventListener('submit', sendMessage);
+
             const savedToken = localStorage.getItem('irc_token');
             const savedUser = localStorage.getItem('irc_user');
             if (savedToken && savedUser) {
@@ -937,16 +961,21 @@ HTML_CONTENT = """
 
             let contentHtml = `<span class="msg-text">${escapeHtml(text)}</span>`;
             if (image_b64) {
-                contentHtml += `<br><img src="${image_b64}" class="chat-image" onload="scrollToBottom()">`;
+                contentHtml += `<br><img src="${image_b64}" class="chat-image">`;
             }
 
             row.innerHTML = `
                 <span class="msg-time">[${timestamp}]</span>
                 <span class="msg-sender ${isMe ? 'me' : ''}">&lt;${escapeHtml(sender)}&gt;</span>
-                <div style="display:inline-block; flex:1;">${contentHtml}</div>
+                <div class="msg-content">${contentHtml}</div>
             `;
 
             chatBox.appendChild(row);
+            
+            const imgEl = row.querySelector('.chat-image');
+            if (imgEl) {
+                imgEl.addEventListener('load', scrollToBottom);
+            }
             scrollToBottom();
         }
 
@@ -984,7 +1013,7 @@ HTML_CONTENT = """
             globalUsers.forEach(u => {
                 const div = document.createElement('div');
                 div.className = "user-item";
-                div.innerHTML = `<span class="user-status-dot" style="background:#58a6ff;"></span><span>${escapeHtml(u)}</span>`;
+                div.innerHTML = `<span class="user-status-dot global-user-dot"></span><span>${escapeHtml(u)}</span>`;
                 globalUsersBox.appendChild(div);
             });
         }
