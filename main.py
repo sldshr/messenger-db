@@ -7,6 +7,7 @@ import time
 import httpx
 import uuid
 import base64
+import hashlib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, Request
 from fastapi.responses import HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -15,6 +16,7 @@ import uvicorn
 SERVER_START_TIME = datetime.datetime.now(datetime.timezone.utc).isoformat()
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
+SALT_IP = secrets.token_bytes(32)  # Соль для хэширования IP-адресов
 
 DEFAULT_CHANNELS = [
     "#general", "#random", "#news", "#music", "#gaming",
@@ -40,9 +42,9 @@ HTML_CONTENT = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IRC Lite Web</title>
-    <!-- Cloudflare Turnstile SDK -->
+    <!-- Cloudflare Turnstile SDK (SRI не используется, так как скрипт динамически обновляется CDN) -->
     <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-    <style>
+    <style nonce="NONCE_PLACEHOLDER">
         :root {
             --bg-dark: #0d1117;
             --bg-card: #161b22;
@@ -640,7 +642,7 @@ HTML_CONTENT = """
                 <div id="channel-list"></div>
 
                 <div class="section-title" style="margin-top: 16px;">Секретная комната</div>
-                <div style="padding: 0 6px;">
+                <div style="padding: 0 6px; margin-bottom: 20px;">
                     <form onsubmit="joinCustomChannel(event)" style="margin:0;">
                         <input type="text" id="custom-channel" class="form-control-custom" placeholder="#секрет" style="padding:6px 8px; font-size:12px; margin-bottom:6px;" maxlength="30" required>
                         <button type="submit" class="btn-primary-custom" style="padding:6px; font-size:12px; background:var(--accent-blue);">
@@ -649,6 +651,13 @@ HTML_CONTENT = """
                         </button>
                     </form>
                 </div>
+            </div>
+            
+            <div style="padding: 12px; border-top: 1px solid var(--border-main); background: var(--bg-dark);">
+                <button type="button" class="btn-primary-custom" style="background: transparent; border: 1px solid var(--border-main); color: #f85149;" onclick="doLogout()">
+                    <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+                    <span>Выйти</span>
+                </button>
             </div>
         </div>
 
@@ -705,16 +714,17 @@ HTML_CONTENT = """
         </div>
     </div>
 
-    <script>
+    <script nonce="NONCE_PLACEHOLDER">
         let currentUser = "";
         let sessionToken = "";
         let currentChannel = "#general";
         let ws = null;
         let pendingImageBase64 = null;
         let pingInterval = null;
+        let wsStartTime = 0;
         const defaultChannels = DEFAULT_CHANNELS_PLACEHOLDER;
-        const serverStartIso = "SERVER_START_TIME_PLACEHOLDER";
-        const serverStartTimestamp = Math.floor(new Date(serverStartIso).getTime() / 1000);
+        const serverUptimeSec = SERVER_UPTIME_PLACEHOLDER; 
+        const localStartTimestamp = Math.floor(Date.now() / 1000) - serverUptimeSec;
 
         const hashSvg = `<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`;
 
@@ -734,7 +744,7 @@ HTML_CONTENT = """
 
         function updateUptime() {
             const now = Math.floor(Date.now() / 1000);
-            let diff = Math.max(0, now - serverStartTimestamp);
+            let diff = Math.max(0, now - localStartTimestamp);
             const days = Math.floor(diff / 86400); diff %= 86400;
             const hours = Math.floor(diff / 3600); diff %= 3600;
             const minutes = Math.floor(diff / 60); const seconds = diff % 60;
@@ -847,6 +857,7 @@ HTML_CONTENT = """
             const wsUrl = protocol + window.location.host + "/ws/" + encodeURIComponent(sessionToken) + "/" + encodeURIComponent(channel);
             
             ws = new WebSocket(wsUrl);
+            wsStartTime = Date.now();
             
             ws.onopen = function() {
                 if (pingInterval) clearInterval(pingInterval);
@@ -861,21 +872,51 @@ HTML_CONTENT = """
             ws.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
+                    if (data.type === "system" && data.text === "AUTH_ERROR") {
+                        forceLogout("Сессия устарела. Пожалуйста, войдите заново.");
+                        return;
+                    }
                     handleIncomingPacket(data);
                 } catch(e) {}
             };
             
             ws.onclose = function(e) {
                 if (pingInterval) clearInterval(pingInterval);
-                if (e.code === 4001) {
-                    appendSystemMessage("*** Сессия недействительна. Требуется повторный вход.");
-                    localStorage.removeItem('irc_token');
-                    localStorage.removeItem('irc_user');
-                    setTimeout(() => location.reload(), 2000);
+                
+                // Если закрылось почти сразу (ошибка авторизации или бан)
+                if (Date.now() - wsStartTime < 2000 || e.code === 4001 || e.code === 403) {
+                    forceLogout("Ошибка сессии. Пожалуйста, авторизуйтесь заново.");
+                } else if (e.code === 4002) {
+                    appendSystemMessage("*** Превышен лимит подключений.");
+                } else {
+                    appendSystemMessage("*** Соединение потеряно.");
                 }
-                else if (e.code === 4002) appendSystemMessage("*** Превышен лимит подключений.");
-                else appendSystemMessage("*** Соединение потеряно.");
             };
+        }
+
+        function forceLogout(errorMsg = null) {
+            localStorage.removeItem('irc_token');
+            localStorage.removeItem('irc_user');
+            document.getElementById('chat-view').classList.add('hidden');
+            document.getElementById('login-view').classList.remove('hidden');
+            
+            if (errorMsg) {
+                document.getElementById('login-error').innerText = errorMsg;
+            }
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        async function doLogout() {
+            try {
+                const fd = new FormData();
+                fd.append('token', sessionToken);
+                await fetch('/logout', { method: 'POST', body: fd });
+            } catch (e) {}
+            forceLogout();
         }
 
         function handleIncomingPacket(packet) {
@@ -1021,18 +1062,23 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; "
-            "style-src 'self' 'unsafe-inline'; "
-            "frame-src https://challenges.cloudflare.com; "
-            "img-src 'self' data: blob:; "
-            "connect-src 'self' ws: wss:; "
-            "frame-ancestors 'none';"
-        )
+        
+        # CSP устанавливается в маршрутах для поддержки динамического Nonce, 
+        # но если его нет, ставим базовый fallback
+        if "Content-Security-Policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' https://challenges.cloudflare.com; "
+                "style-src 'self'; "
+                "frame-src https://challenges.cloudflare.com; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self' ws: wss:; "
+                "frame-ancestors 'none';"
+            )
+            
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         return response
@@ -1110,10 +1156,33 @@ manager = ConnectionManager()
 
 @app.get("/")
 async def get_home():
+    nonce = secrets.token_urlsafe(16)
+    uptime_sec = int(time.time() - datetime.datetime.fromisoformat(SERVER_START_TIME).timestamp())
+    
     html = HTML_CONTENT.replace("TURNSTILE_SITEKEY_PLACEHOLDER", TURNSTILE_SITEKEY)
     html = html.replace("DEFAULT_CHANNELS_PLACEHOLDER", json.dumps(DEFAULT_CHANNELS))
-    html = html.replace("SERVER_START_TIME_PLACEHOLDER", SERVER_START_TIME)
-    return HTMLResponse(html)
+    html = html.replace("SERVER_UPTIME_PLACEHOLDER", str(uptime_sec))
+    html = html.replace("NONCE_PLACEHOLDER", nonce)
+    
+    response = HTMLResponse(html)
+    
+    # Строгий CSP с Nonce для устранения уязвимости unsafe-inline
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'self'; "
+        f"script-src 'self' 'nonce-{nonce}' https://challenges.cloudflare.com; "
+        f"style-src 'self' 'nonce-{nonce}'; "
+        "frame-src https://challenges.cloudflare.com; "
+        "img-src 'self' data: blob:; "
+        "connect-src 'self' ws: wss:; "
+        "frame-ancestors 'none';"
+    )
+    return response
+
+@app.post("/logout")
+async def logout_endpoint(token: str = Form(...)):
+    if token in VALID_SESSIONS:
+        del VALID_SESSIONS[token]
+    return {"status": "ok"}
 
 @app.post("/login")
 async def login(request: Request, username: str = Form(...), cf_turnstile_response: str = Form(...)):
@@ -1150,17 +1219,26 @@ async def login(request: Request, username: str = Form(...), cf_turnstile_respon
 
     return {"status": "ok", "username": username, "token": token}
 
+def get_hashed_ip(ip: str) -> str:
+    return hashlib.sha256(ip.encode() + SALT_IP).hexdigest()
+
 @app.websocket("/ws/{token}/{channel}")
 async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
+    # Принимаем соединение СРАЗУ, чтобы избежать жесткой ошибки HTTP 403.
+    # Если сессия неверна, мы закроем его корректным кодом.
+    await websocket.accept()
+
     session = VALID_SESSIONS.get(token)
     if not session:
+        await websocket.send_json({"type": "system", "text": "AUTH_ERROR"})
         await websocket.close(code=4001, reason="Unauthorized session token")
         return
     
     username = session["username"]
-    client_ip = websocket.client.host if websocket.client else "127.0.0.1"
+    raw_ip = websocket.client.host if websocket.client else "127.0.0.1"
+    hashed_ip = get_hashed_ip(raw_ip) # Хэшируем IP для безопасности
     
-    current_conns = IP_CONNECTIONS.get(client_ip, 0)
+    current_conns = IP_CONNECTIONS.get(hashed_ip, 0)
     if current_conns >= MAX_CONNS_PER_IP:
         await websocket.close(code=4002, reason="Too many connections")
         return
@@ -1171,7 +1249,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     if not CHANNEL_REGEX.match(channel):
         channel = "#general"
 
-    IP_CONNECTIONS[client_ip] = current_conns + 1
+    IP_CONNECTIONS[hashed_ip] = current_conns + 1
     MESSAGE_TIMESTAMPS[websocket] = []
 
     await manager.connect(websocket, channel, username)
@@ -1221,8 +1299,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str, channel: str):
     finally:
         if websocket in MESSAGE_TIMESTAMPS:
             del MESSAGE_TIMESTAMPS[websocket]
-        if client_ip in IP_CONNECTIONS:
-            IP_CONNECTIONS[client_ip] = max(0, IP_CONNECTIONS[client_ip] - 1)
+        if hashed_ip in IP_CONNECTIONS:
+            IP_CONNECTIONS[hashed_ip] = max(0, IP_CONNECTIONS[hashed_ip] - 1)
         await manager.disconnect(websocket, channel, username)
 
 if __name__ == "__main__":
