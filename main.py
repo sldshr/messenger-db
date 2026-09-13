@@ -1,19 +1,22 @@
 # ============================================================
-#  FastAPI Messenger — full stack in one file
+#  SldClient — FastAPI Messenger, full stack in one file
 #  Storage: in-memory (dicts), no disk, <512MB RAM target
-#  Security: PBKDF2-SHA256 (200k iters), token auth, E2EE (AES-GCM 256)
+#  Security: PBKDF2-SHA256, Turnstile, IP rate-limit, E2EE AES-GCM-256
 #  Run: python main.py  →  http://0.0.0.0:8000
 # ============================================================
+import asyncio
 import hashlib
 import json
 import os
 import secrets
 import time
+import urllib.parse
+import urllib.request
 from typing import Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -33,14 +36,28 @@ RATE_LIMIT_WINDOW = 10.0
 RATE_LIMIT_MAX = 20
 MUTE_SECONDS = 30
 TOKEN_TTL = 60 * 60 * 24 * 7
-MAX_USER_CHANNELS = 500   # per-account channel membership cap
+MAX_USER_CHANNELS = 500
+MAX_BODY_SIZE = 64 * 1024           # 64 KB
+GLOBAL_RATE_WINDOW = 60.0
+GLOBAL_RATE_MAX = 300               # requests per minute per IP
+AUTH_RATE_WINDOW = 60.0
+AUTH_RATE_MAX = 8                   # auth attempts per minute per IP
+WS_PER_IP_MAX = 5                   # concurrent websocket conns per IP
+
+# Cloudflare Turnstile
+TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
+TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
+TURNSTILE_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+SKIP_TURNSTILE = os.environ.get("SKIP_TURNSTILE", "").lower() in ("1", "true", "yes")
 
 # ---------------- In-memory storage ----------------
 USERS: Dict[str, dict] = {}
 TOKENS: Dict[str, dict] = {}
 CHANNELS: Dict[str, dict] = {}
-USER_CHANNELS: Dict[str, Set[str]] = {}   # username -> set of channel_ids (PERSISTENT)
+USER_CHANNELS: Dict[str, Set[str]] = {}
 MSG_TIMES: Dict[str, List[float]] = {}
+IP_RATE: Dict[str, List[float]] = {}
+WS_PER_IP: Dict[str, int] = {}
 
 # ---------------- Security helpers ----------------
 def hash_password(password: str, salt: bytes) -> str:
@@ -80,8 +97,74 @@ def user_channel_set(username: str) -> Set[str]:
         USER_CHANNELS[username] = s
     return s
 
+# ---------- IP helpers / rate limiting ----------
+def get_client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    return request.client.host if request.client else "0.0.0.0"
+
+def get_ws_ip(ws: WebSocket) -> str:
+    try:
+        fwd = ws.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        cf = ws.headers.get("cf-connecting-ip")
+        if cf:
+            return cf.strip()
+    except Exception:
+        pass
+    return ws.client.host if ws.client else "0.0.0.0"
+
+def rate_check(key: str, window: float, limit: int) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    lst = IP_RATE.get(key)
+    if lst is None:
+        IP_RATE[key] = [now]
+        return True
+    # In-place filter (old entries)
+    cutoff = now - window
+    i = 0
+    for t in lst:
+        if t >= cutoff:
+            break
+        i += 1
+    if i:
+        del lst[:i]
+    if len(lst) >= limit:
+        return False
+    lst.append(now)
+    return True
+
+# ---------- Turnstile verification (async wrapper around sync urllib) ----------
+def _verify_turnstile_sync(token: str, remote_ip: str) -> bool:
+    try:
+        body = urllib.parse.urlencode({
+            "secret": TURNSTILE_SECRET,
+            "response": token,
+            "remoteip": remote_ip,
+        }).encode("utf-8")
+        req = urllib.request.Request(TURNSTILE_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return bool(data.get("success"))
+    except Exception:
+        return False
+
+async def verify_turnstile(token: str, remote_ip: str) -> bool:
+    if SKIP_TURNSTILE:
+        return True
+    if not token:
+        return False
+    return await asyncio.to_thread(_verify_turnstile_sync, token, remote_ip)
+
 # ---------------- App ----------------
-app = FastAPI(title="Messenger", docs_url=None, redoc_url=None)
+app = FastAPI(title="SldClient", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -90,18 +173,38 @@ app.add_middleware(
 )
 
 @app.middleware("http")
-async def security_headers(request: Request, call_next):
+async def security_middleware(request: Request, call_next):
+    # 1) Body size limit
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl:
+            try:
+                if int(cl) > MAX_BODY_SIZE:
+                    return JSONResponse({"detail": "payload_too_large"}, status_code=413)
+            except ValueError:
+                return JSONResponse({"detail": "bad_request"}, status_code=400)
+
+    # 2) Global IP rate limit
+    ip = get_client_ip(request)
+    if not rate_check(f"req:{ip}", GLOBAL_RATE_WINDOW, GLOBAL_RATE_MAX):
+        return JSONResponse({"detail": "rate_limited"}, status_code=429)
+
     response = await call_next(request)
+
+    # 3) Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Server"] = "SldClient"
     return response
 
 # ---------------- Models ----------------
 class AuthReq(BaseModel):
     username: str
     password: str
+    turnstile_token: str = ""
 
 class CreateChannelReq(BaseModel):
     name: str
@@ -112,6 +215,9 @@ class ConnectChannelReq(BaseModel):
 
 class LeaveChannelReq(BaseModel):
     channel_id: str
+
+class PrefsReq(BaseModel):
+    show_in_list: bool
 
 # ---------------- Default public channels (seed, no members) ----------------
 def init_defaults() -> None:
@@ -131,8 +237,17 @@ init_defaults()
 
 # ---------------- REST ----------------
 @app.post("/api/auth")
-async def auth_endpoint(req: AuthReq):
-    """Login + register combined."""
+async def auth_endpoint(req: AuthReq, request: Request):
+    """Login + register combined, protected by Turnstile + rate limit."""
+    ip = get_client_ip(request)
+    if not rate_check(f"auth:{ip}", AUTH_RATE_WINDOW, AUTH_RATE_MAX):
+        raise HTTPException(429, "too_many_attempts")
+
+    # Turnstile verification
+    ok = await verify_turnstile(req.turnstile_token, ip)
+    if not ok:
+        raise HTTPException(400, "turnstile_failed")
+
     username = req.username.strip()
     if not (MIN_USERNAME_LEN <= len(username) <= MAX_USERNAME_LEN):
         raise HTTPException(400, "bad_username")
@@ -152,8 +267,9 @@ async def auth_endpoint(req: AuthReq):
             "pwd": hash_password(req.password, salt),
             "salt": salt.hex(),
             "created": time.time(),
+            "show_in_list": True,
         }
-        USER_CHANNELS[username] = set()   # init empty channel list
+        USER_CHANNELS[username] = set()
         is_new = True
 
     token = new_token()
@@ -174,16 +290,39 @@ async def uptime():
         "users": len(USERS),
         "channels": len(CHANNELS),
         "online": len(TOKENS),
+        "name": "SldClient",
     }
 
 @app.get("/api/me")
 async def me(request: Request):
     username = await auth(request)
-    return {"username": username}
+    return {
+        "username": username,
+        "show_in_list": USERS[username].get("show_in_list", True),
+    }
+
+@app.post("/api/me/preferences")
+async def update_prefs(req: PrefsReq, request: Request):
+    username = await auth(request)
+    USERS[username]["show_in_list"] = bool(req.show_in_list)
+    return {"ok": True, "show_in_list": USERS[username]["show_in_list"]}
+
+@app.get("/api/users")
+async def list_users(request: Request):
+    """Return users who have opted in to be visible. Self is always included."""
+    me = await auth(request)
+    online = manager.get_online_users()
+    out = []
+    for u, data in USERS.items():
+        if u == me:
+            out.append({"username": u, "online": u in online, "self": True})
+        elif data.get("show_in_list", True):
+            out.append({"username": u, "online": u in online, "self": False})
+    out.sort(key=lambda x: x["username"].lower())
+    return {"users": out, "online": len(online)}
 
 @app.get("/api/channels")
 async def list_channels(request: Request):
-    """Return channels the current user is a member of."""
     username = await auth(request)
     cids = USER_CHANNELS.get(username, set())
     out = []
@@ -220,7 +359,7 @@ async def create_channel(req: CreateChannelReq, request: Request):
         "id": cid, "name": name, "private": bool(req.private),
         "owner": username, "created": time.time(), "messages": [],
     }
-    my_ch.add(cid)   # persist membership
+    my_ch.add(cid)
     return {"id": cid, "name": name, "private": bool(req.private), "messages": []}
 
 @app.post("/api/channels/connect")
@@ -234,7 +373,7 @@ async def connect_channel(req: ConnectChannelReq, request: Request):
             my_ch = user_channel_set(username)
             if len(my_ch) >= MAX_USER_CHANNELS and cid not in my_ch:
                 raise HTTPException(503, "user_channel_limit")
-            my_ch.add(cid)   # persist membership
+            my_ch.add(cid)
             return {
                 "id": cid, "name": ch["name"], "private": ch["private"],
                 "owner": ch["owner"],
@@ -268,24 +407,41 @@ class WSManager:
             _, cid = entry
             self.rooms.get(cid, set()).discard(ws)
 
+    def get_online_users(self) -> Set[str]:
+        return set(u for (u, c) in self.info.values())
+
     def online_users(self, channel_id: str) -> List[str]:
         return sorted(set(u for (u, c) in self.info.values() if c == channel_id))
 
     async def broadcast(self, channel_id: str, payload: dict):
-        dead = []
-        for ws in list(self.rooms.get(channel_id, set())):
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.leave(ws)
+        """Serialized once, delivered in parallel — instant delivery."""
+        sockets = list(self.rooms.get(channel_id, set()))
+        if not sockets:
+            return
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        results = await asyncio.gather(
+            *(ws.send_text(text) for ws in sockets),
+            return_exceptions=True,
+        )
+        for ws, res in zip(sockets, results):
+            if isinstance(res, Exception):
+                self.leave(ws)
 
 manager = WSManager()
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    ip = get_ws_ip(ws)
+    current = WS_PER_IP.get(ip, 0)
+    if current >= WS_PER_IP_MAX:
+        try:
+            await ws.close(code=1008)
+        except Exception:
+            pass
+        return
+    WS_PER_IP[ip] = current + 1
+
     username: Optional[str] = None
     channel_id: Optional[str] = None
     try:
@@ -297,7 +453,6 @@ async def ws_endpoint(ws: WebSocket):
         channel_id = init.get("channel_id", "")
         username = user_from_token(token)
 
-        # auth: user must be an actual member (persisted)
         if (not username
                 or channel_id not in CHANNELS
                 or channel_id not in USER_CHANNELS.get(username, set())):
@@ -317,7 +472,15 @@ async def ws_endpoint(ws: WebSocket):
                 key = f"{username}|{channel_id}"
                 now = time.time()
                 times = MSG_TIMES.setdefault(key, [])
-                times[:] = [t for t in times if now - t < RATE_LIMIT_WINDOW]
+                # Fast window trim
+                cutoff = now - RATE_LIMIT_WINDOW
+                i = 0
+                for tt in times:
+                    if tt >= cutoff:
+                        break
+                    i += 1
+                if i:
+                    del times[:i]
                 if len(times) >= RATE_LIMIT_MAX:
                     await ws.send_json({"type": "muted", "seconds": MUTE_SECONDS})
                     continue
@@ -332,7 +495,8 @@ async def ws_endpoint(ws: WebSocket):
                 ch = CHANNELS[channel_id]
                 ch["messages"].append(msg)
                 if len(ch["messages"]) > MAX_MESSAGES_PER_CHANNEL:
-                    ch["messages"] = ch["messages"][-MAX_MESSAGES_PER_CHANNEL:]
+                    del ch["messages"][:-MAX_MESSAGES_PER_CHANNEL]
+                # Instant delivery
                 await manager.broadcast(channel_id, {"type": "message", "msg": msg})
     except WebSocketDisconnect:
         pass
@@ -340,6 +504,7 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         manager.leave(ws)
+        WS_PER_IP[ip] = max(0, WS_PER_IP.get(ip, 1) - 1)
         if channel_id:
             try:
                 await manager.broadcast(channel_id, {"type": "presence", "users": manager.online_users(channel_id)})
@@ -347,29 +512,29 @@ async def ws_endpoint(ws: WebSocket):
                 pass
 
 # ============================================================
-#  i18n — 20 real languages
+#  i18n — 20 real languages (extended)
 # ============================================================
 I18N = {
- "en": {"login_title":"Messenger","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Create a channel with «+» or connect to an existing one","header_msgs":"{n} messages","header_private_tag":"· private","empty_no_channels":"You have no channels yet.<br>Create a new one («+») or connect to an existing one.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create channel","modal_name":"Name","modal_name_ph":"E.g. Work","modal_private":"Private channel","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_ph":"Search channels and messages...","search_close":"Close","search_empty":"Nothing found","search_no_channels":"You have no channels yet","tag_channel":"channel","tag_msg":"msg.","in_channel":"in «{name}»","title_search":"Search (Ctrl+K)","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_network":"Network error","err_generic":"Error","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","welcome_new":"Welcome! Account created.","welcome_back":"Welcome back!"},
- "ru": {"login_title":"Мессенджер","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Создайте канал кнопкой «+» или подключитесь к существующему","header_msgs":"{n} сообщений","header_private_tag":"· приватный","empty_no_channels":"У вас пока нет каналов.<br>Создайте новый («+») или подключитесь к существующему.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать канал","modal_name":"Название","modal_name_ph":"Например, Работа","modal_private":"Приватный канал","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_ph":"Поиск по каналам и сообщениям...","search_close":"Закрыть","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","tag_channel":"канал","tag_msg":"сообщ.","in_channel":"в «{name}»","title_search":"Поиск (Ctrl+K)","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_network":"Ошибка сети","err_generic":"Ошибка","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","welcome_new":"Добро пожаловать! Аккаунт создан.","welcome_back":"С возвращением!"},
- "es": {"login_title":"Mensajero","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","ph_nick":"Tu apodo","ph_password":"Tu contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_no_channels":"Sin canales","header_no_channels_sub":"Crea un canal con «+» o conéctate a uno existente","header_msgs":"{n} mensajes","empty_no_channels":"Aún no tienes canales.<br>Crea uno nuevo («+») o conéctate a uno existente.","empty_no_messages":"No hay mensajes. ¡Sé el primero en escribir!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","composer_muted":"Silenciado: {n}s","modal_create_title":"Crear canal","modal_name":"Nombre","modal_name_ph":"Ej.: Trabajo","modal_private":"Canal privado","btn_cancel":"Cancelar","btn_create":"Crear","modal_connect_title":"Conectar al canal","modal_connect_name":"Nombre del canal","modal_connect_ph":"Introduce el nombre exacto del canal","btn_connect":"Conectar","connect_not_found":"Canal «{name}» no encontrado","search_ph":"Buscar canales y mensajes...","search_close":"Cerrar","search_empty":"Nada encontrado","search_no_channels":"Aún no tienes canales","tag_channel":"canal","tag_msg":"msg.","in_channel":"en «{name}»","title_search":"Buscar (Ctrl+K)","title_add":"Crear canal","title_connect":"Conectar al canal","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","online_label":"en línea","err_bad_credentials":"Contraseña incorrecta","err_bad_username":"Apodo 2–32 caracteres","err_bad_password":"Contraseña mín. 4 caracteres","err_generic":"Error","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar"},
- "de": {"login_title":"Messenger","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","ph_nick":"Dein Spitzname","ph_password":"Dein Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_no_channels":"Keine Kanäle","header_no_channels_sub":"Erstelle einen Kanal mit «+» oder verbinde dich mit einem bestehenden","header_msgs":"{n} Nachrichten","empty_no_channels":"Du hast noch keine Kanäle.<br>Erstelle einen neuen («+») oder verbinde dich mit einem bestehenden.","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","composer_muted":"Stumm: {n}s","modal_create_title":"Kanal erstellen","modal_name":"Name","modal_name_ph":"Z.B. Arbeit","modal_private":"Privater Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","modal_connect_title":"Mit Kanal verbinden","modal_connect_name":"Kanalname","modal_connect_ph":"Exakten Kanalnamen eingeben","btn_connect":"Verbinden","connect_not_found":"Kanal «{name}» nicht gefunden","search_ph":"Kanäle und Nachrichten durchsuchen...","search_close":"Schließen","search_empty":"Nichts gefunden","search_no_channels":"Du hast noch keine Kanäle","tag_channel":"Kanal","tag_msg":"Nachr.","in_channel":"in «{name}»","title_search":"Suchen (Strg+K)","title_add":"Kanal erstellen","title_connect":"Mit Kanal verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","online_label":"online","err_bad_credentials":"Falsches Passwort","err_bad_username":"Spitzname 2–32 Zeichen","err_bad_password":"Passwort mind. 4 Zeichen","err_generic":"Fehler","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen"},
- "fr": {"login_title":"Messagerie","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","ph_nick":"Votre pseudo","ph_password":"Votre mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_no_channels":"Aucun canal","header_no_channels_sub":"Créez un canal avec «+» ou connectez-vous à un existant","header_msgs":"{n} messages","empty_no_channels":"Vous n'avez pas encore de canaux.<br>Créez-en un («+») ou connectez-vous à un existant.","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","composer_muted":"Muet : {n}s","modal_create_title":"Créer un canal","modal_name":"Nom","modal_name_ph":"Ex : Travail","modal_private":"Canal privé","btn_cancel":"Annuler","btn_create":"Créer","modal_connect_title":"Se connecter à un canal","modal_connect_name":"Nom du canal","modal_connect_ph":"Entrez le nom exact du canal","btn_connect":"Se connecter","connect_not_found":"Canal «{name}» introuvable","search_ph":"Rechercher canaux et messages...","search_close":"Fermer","search_empty":"Rien trouvé","search_no_channels":"Pas encore de canaux","tag_channel":"canal","tag_msg":"msg.","in_channel":"dans «{name}»","title_search":"Rechercher (Ctrl+K)","title_add":"Créer un canal","title_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","online_label":"en ligne","err_bad_credentials":"Mot de passe incorrect","err_bad_username":"Pseudo 2 à 32 caractères","err_bad_password":"Mot de passe min. 4 caractères","err_generic":"Erreur","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer"},
- "it": {"login_title":"Messaggero","login_subtitle":"Accedi o crea un account","field_nick":"Nickname","field_password":"Password","btn_login":"Continua","remember_me":"Ricordami","logged_as":"Connesso come","header_no_channels":"Nessun canale","header_msgs":"{n} messaggi","empty_no_messages":"Nessun messaggio. Scrivi per primo!","composer_ph":"Scrivi un messaggio...","composer_no_channel":"Nessun canale attivo","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","search_ph":"Cerca canali e messaggi...","search_close":"Chiudi","search_empty":"Nessun risultato","title_search":"Cerca (Ctrl+K)","title_add":"Crea canale","title_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","uptime_label":"Attività","err_bad_credentials":"Password errata","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi"},
- "pt": {"login_title":"Mensageiro","login_subtitle":"Entre ou crie uma conta","field_nick":"Apelido","field_password":"Senha","btn_login":"Continuar","remember_me":"Lembrar-me","logged_as":"Conectado como","header_no_channels":"Sem canais","header_msgs":"{n} mensagens","empty_no_messages":"Sem mensagens. Seja o primeiro!","composer_ph":"Escrever mensagem...","composer_no_channel":"Nenhum canal ativo","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","search_ph":"Pesquisar canais e mensagens...","search_close":"Fechar","search_empty":"Nada encontrado","title_search":"Pesquisar (Ctrl+K)","title_add":"Criar canal","title_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","uptime_label":"Tempo ativo","err_bad_credentials":"Senha incorreta","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar"},
- "nl": {"login_title":"Messenger","login_subtitle":"Meld aan of maak een account","field_nick":"Bijnaam","field_password":"Wachtwoord","btn_login":"Doorgaan","remember_me":"Onthoud mij","logged_as":"Ingelogd als","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","search_close":"Sluiten","title_settings":"Instellingen","title_search":"Zoeken (Ctrl+K)","title_add":"Kanaal aanmaken","title_connect":"Verbinden","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","uptime_label":"Uptime","err_bad_credentials":"Onjuist wachtwoord","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten"},
- "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","search_close":"Zamknij","btn_cancel":"Anuluj","btn_create":"Utwórz","btn_connect":"Połącz"},
- "uk": {"login_title":"Месенджер","login_subtitle":"Увійдіть або створіть акаунт","field_nick":"Нік","field_password":"Пароль","btn_login":"Продовжити","remember_me":"Запам'ятати мене","logged_as":"Ви увійшли як","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","search_close":"Закрити","title_settings":"Налаштування","title_search":"Пошук (Ctrl+K)","title_add":"Створити канал","title_connect":"Підключитися","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","uptime_label":"Аптайм","err_bad_credentials":"Невірний пароль","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити"},
- "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení"},
- "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar"},
- "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις"},
- "tr": {"login_title":"Anlık Mesajlaşma","login_subtitle":"Giriş yap veya hesap oluştur","field_nick":"Takma ad","field_password":"Şifre","btn_login":"Devam et","remember_me":"Beni hatırla","logged_as":"Giriş yapan:","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","search_close":"Kapat","title_settings":"Ayarlar","title_search":"Ara (Ctrl+K)","title_add":"Kanal oluştur","title_connect":"Bağlan","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","uptime_label":"Çalışma süresi","err_bad_credentials":"Yanlış şifre","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat"},
- "ja": {"login_title":"メッセンジャー","login_subtitle":"サインインまたはアカウント作成","field_nick":"ニックネーム","field_password":"パスワード","btn_login":"続行","remember_me":"ログイン状態を保持","logged_as":"ログイン中:","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","search_close":"閉じる","title_settings":"設定","title_search":"検索 (Ctrl+K)","title_add":"チャンネル作成","title_connect":"接続","theme_toggle":"テーマ切替","lang_toggle":"言語変更","uptime_label":"稼働時間","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる"},
- "ko": {"login_title":"메신저","login_subtitle":"로그인 또는 계정 만들기","field_nick":"닉네임","field_password":"비밀번호","btn_login":"계속","remember_me":"로그인 상태 유지","logged_as":"로그인:","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","search_close":"닫기","title_settings":"설정","title_search":"검색 (Ctrl+K)","title_add":"채널 만들기","title_connect":"연결","theme_toggle":"테마 전환","lang_toggle":"언어 변경","uptime_label":"가동 시간","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기"},
- "zh": {"login_title":"即时通讯","login_subtitle":"登录或创建账号","field_nick":"昵称","field_password":"密码","btn_login":"继续","remember_me":"记住我","logged_as":"登录为","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","search_close":"关闭","title_settings":"设置","title_search":"搜索 (Ctrl+K)","title_add":"创建频道","title_connect":"连接","theme_toggle":"切换主题","lang_toggle":"切换语言","uptime_label":"运行时间","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭"},
- "ar": {"login_title":"ماسنجر","login_subtitle":"سجّل الدخول أو أنشئ حسابًا","field_nick":"الاسم","field_password":"كلمة المرور","btn_login":"متابعة","remember_me":"تذكرني","logged_as":"مسجل باسم","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","search_close":"إغلاق","title_settings":"الإعدادات","title_search":"بحث (Ctrl+K)","title_add":"إنشاء قناة","title_connect":"اتصال","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","uptime_label":"مدة التشغيل","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق"},
- "he": {"login_title":"מסנג'ר","login_subtitle":"התחבר או צור חשבון","field_nick":"כינוי","field_password":"סיסמה","btn_login":"המשך","remember_me":"זכור אותי","logged_as":"מחובר בתור","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","search_close":"סגור","title_settings":"הגדרות","title_search":"חפש (Ctrl+K)","title_add":"צור ערוץ","title_connect":"התחבר","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","uptime_label":"זמן פעילות","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור"},
- "hi": {"login_title":"मैसेंजर","login_subtitle":"साइन इन करें या खाता बनाएं","field_nick":"उपनाम","field_password":"पासवर्ड","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","logged_as":"इस रूप में साइन इन:","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","search_close":"बंद करें","title_settings":"सेटिंग्स","title_search":"खोजें (Ctrl+K)","title_add":"चैनल बनाएं","title_connect":"जुड़ें","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","uptime_label":"अपटाइम","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_user":"इस रूप में साइन इन:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें"},
+ "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Create a channel with «+» or connect to an existing one","header_msgs":"{n} messages","header_private_tag":"· private","empty_no_channels":"You have no channels yet.<br>Create a new one («+») or connect to an existing one.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create channel","modal_name":"Name","modal_name_ph":"E.g. Work","modal_private":"Private channel","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_ph":"Search channels and messages...","search_close":"Close","search_empty":"Nothing found","search_no_channels":"You have no channels yet","tag_channel":"channel","tag_msg":"msg.","in_channel":"in «{name}»","title_search":"Search (Ctrl+K)","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_network":"Network error","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed, please refresh the page","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","welcome_new":"Welcome! Account created.","welcome_back":"Welcome back!"},
+ "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Создайте канал кнопкой «+» или подключитесь к существующему","header_msgs":"{n} сообщений","header_private_tag":"· приватный","empty_no_channels":"У вас пока нет каналов.<br>Создайте новый («+») или подключитесь к существующему.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать канал","modal_name":"Название","modal_name_ph":"Например, Работа","modal_private":"Приватный канал","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_ph":"Поиск по каналам и сообщениям...","search_close":"Закрыть","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","tag_channel":"канал","tag_msg":"сообщ.","in_channel":"в «{name}»","title_search":"Поиск (Ctrl+K)","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_network":"Ошибка сети","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена, обновите страницу","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","welcome_new":"Добро пожаловать! Аккаунт создан.","welcome_back":"С возвращением!"},
+ "es": {"login_title":"SldClient","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","ph_nick":"Tu apodo","ph_password":"Tu contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_no_channels":"Sin canales","header_msgs":"{n} mensajes","empty_no_messages":"No hay mensajes. ¡Sé el primero en escribir!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","btn_cancel":"Cancelar","btn_create":"Crear","btn_connect":"Conectar","search_ph":"Buscar canales y mensajes...","search_close":"Cerrar","search_empty":"Nada encontrado","title_search":"Buscar (Ctrl+K)","title_add":"Crear canal","title_connect":"Conectar","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","err_bad_credentials":"Contraseña incorrecta","err_generic":"Error","err_rate_limited":"Demasiadas solicitudes, inténtalo más tarde","err_turnstile":"Verificación de seguridad fallida","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_users":"Lista de usuarios","settings_show_in_list":"Mostrarme en la lista","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar","users_list_empty":"Sin usuarios","users_you":"(tú)","users_online":"en línea"},
+ "de": {"login_title":"SldClient","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","ph_nick":"Dein Spitzname","ph_password":"Dein Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_no_channels":"Keine Kanäle","header_msgs":"{n} Nachrichten","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","btn_connect":"Verbinden","search_ph":"Kanäle und Nachrichten durchsuchen...","search_close":"Schließen","search_empty":"Nichts gefunden","title_search":"Suchen (Strg+K)","title_add":"Kanal erstellen","title_connect":"Verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","err_bad_credentials":"Falsches Passwort","err_generic":"Fehler","err_rate_limited":"Zu viele Anfragen, später versuchen","err_turnstile":"Sicherheitsprüfung fehlgeschlagen","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_users":"Benutzerliste","settings_show_in_list":"Mich in der Liste anzeigen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen","users_list_empty":"Keine Benutzer","users_you":"(du)","users_online":"online"},
+ "fr": {"login_title":"SldClient","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","ph_nick":"Votre pseudo","ph_password":"Votre mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_no_channels":"Aucun canal","header_msgs":"{n} messages","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","btn_cancel":"Annuler","btn_create":"Créer","btn_connect":"Se connecter","search_ph":"Rechercher canaux et messages...","search_close":"Fermer","search_empty":"Rien trouvé","title_search":"Rechercher (Ctrl+K)","title_add":"Créer un canal","title_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","err_bad_credentials":"Mot de passe incorrect","err_generic":"Erreur","err_rate_limited":"Trop de requêtes, réessayez plus tard","err_turnstile":"Échec de la vérification de sécurité","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_users":"Liste des utilisateurs","settings_show_in_list":"Me montrer dans la liste","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer","users_list_empty":"Aucun utilisateur","users_you":"(vous)","users_online":"en ligne"},
+ "it": {"login_title":"SldClient","login_subtitle":"Accedi o crea un account","field_nick":"Nickname","field_password":"Password","btn_login":"Continua","remember_me":"Ricordami","logged_as":"Connesso come","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","search_close":"Chiudi","title_search":"Cerca (Ctrl+K)","title_add":"Crea canale","title_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_users":"Lista utenti","settings_show_in_list":"Mostrami nella lista","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi","users_list_empty":"Nessun utente","users_you":"(tu)","users_online":"online"},
+ "pt": {"login_title":"SldClient","login_subtitle":"Entre ou crie uma conta","field_nick":"Apelido","field_password":"Senha","btn_login":"Continuar","remember_me":"Lembrar-me","logged_as":"Conectado como","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","search_close":"Fechar","title_search":"Pesquisar (Ctrl+K)","title_add":"Criar canal","title_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_users":"Lista de usuários","settings_show_in_list":"Mostrar-me na lista","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar","users_list_empty":"Nenhum usuário","users_you":"(você)","users_online":"online"},
+ "nl": {"login_title":"SldClient","login_subtitle":"Meld aan of maak een account","field_nick":"Bijnaam","field_password":"Wachtwoord","btn_login":"Doorgaan","remember_me":"Onthoud mij","logged_as":"Ingelogd als","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","search_close":"Sluiten","title_settings":"Instellingen","title_search":"Zoeken (Ctrl+K)","title_add":"Kanaal aanmaken","title_connect":"Verbinden","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","uptime_label":"Uptime","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_users":"Gebruikerslijst","settings_show_in_list":"Toon mij in de lijst","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten","users_list_empty":"Geen gebruikers","users_you":"(jij)","users_online":"online"},
+ "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_users":"Lista użytkowników","settings_show_in_list":"Pokaż mnie na liście","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","users_you":"(ty)","users_online":"online","users_list_empty":"Brak użytkowników"},
+ "uk": {"login_title":"SldClient","login_subtitle":"Увійдіть або створіть акаунт","field_nick":"Нік","field_password":"Пароль","btn_login":"Продовжити","remember_me":"Запам'ятати мене","logged_as":"Ви увійшли як","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","search_close":"Закрити","title_settings":"Налаштування","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","uptime_label":"Аптайм","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_users":"Список користувачів","settings_show_in_list":"Показувати мене в списку","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити","users_you":"(ви)","users_online":"онлайн","users_list_empty":"Немає користувачів"},
+ "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_users":"Seznam uživatelů","settings_show_in_list":"Zobrazit mě v seznamu","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení","users_you":"(vy)","users_online":"online"},
+ "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_users":"Användarlista","settings_show_in_list":"Visa mig i listan","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar","users_you":"(du)","users_online":"online"},
+ "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_users":"Λίστα χρηστών","settings_show_in_list":"Να εμφανίζομαι στη λίστα","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις","users_you":"(εσύ)","users_online":"συνδεδεμένοι"},
+ "tr": {"login_title":"SldClient","login_subtitle":"Giriş yap veya hesap oluştur","field_nick":"Takma ad","field_password":"Şifre","btn_login":"Devam et","remember_me":"Beni hatırla","logged_as":"Giriş yapan:","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","search_close":"Kapat","title_settings":"Ayarlar","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","uptime_label":"Çalışma süresi","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_users":"Kullanıcı listesi","settings_show_in_list":"Listede göster","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat","users_you":"(sen)","users_online":"çevrimiçi","users_list_empty":"Kullanıcı yok"},
+ "ja": {"login_title":"SldClient","login_subtitle":"サインインまたはアカウント作成","field_nick":"ニックネーム","field_password":"パスワード","btn_login":"続行","remember_me":"ログイン状態を保持","logged_as":"ログイン中:","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","search_close":"閉じる","title_settings":"設定","theme_toggle":"テーマ切替","lang_toggle":"言語変更","uptime_label":"稼働時間","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_users":"ユーザー一覧","settings_show_in_list":"一覧に自分を表示","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる","users_you":"(あなた)","users_online":"オンライン","users_list_empty":"ユーザーがいません"},
+ "ko": {"login_title":"SldClient","login_subtitle":"로그인 또는 계정 만들기","field_nick":"닉네임","field_password":"비밀번호","btn_login":"계속","remember_me":"로그인 상태 유지","logged_as":"로그인:","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","search_close":"닫기","title_settings":"설정","theme_toggle":"테마 전환","lang_toggle":"언어 변경","uptime_label":"가동 시간","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_users":"사용자 목록","settings_show_in_list":"목록에 나를 표시","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기","users_you":"(나)","users_online":"온라인","users_list_empty":"사용자 없음"},
+ "zh": {"login_title":"SldClient","login_subtitle":"登录或创建账号","field_nick":"昵称","field_password":"密码","btn_login":"继续","remember_me":"记住我","logged_as":"登录为","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","search_close":"关闭","title_settings":"设置","theme_toggle":"切换主题","lang_toggle":"切换语言","uptime_label":"运行时间","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_users":"用户列表","settings_show_in_list":"在列表中显示我","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭","users_you":"(你)","users_online":"在线","users_list_empty":"没有用户"},
+ "ar": {"login_title":"SldClient","login_subtitle":"سجّل الدخول أو أنشئ حسابًا","field_nick":"الاسم","field_password":"كلمة المرور","btn_login":"متابعة","remember_me":"تذكرني","logged_as":"مسجل باسم","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","search_close":"إغلاق","title_settings":"الإعدادات","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","uptime_label":"مدة التشغيل","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_users":"قائمة المستخدمين","settings_show_in_list":"إظهاري في القائمة","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق","users_you":"(أنت)","users_online":"متصل","users_list_empty":"لا مستخدمين"},
+ "he": {"login_title":"SldClient","login_subtitle":"התחבר או צור חשבון","field_nick":"כינוי","field_password":"סיסמה","btn_login":"המשך","remember_me":"זכור אותי","logged_as":"מחובר בתור","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","search_close":"סגור","title_settings":"הגדרות","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","uptime_label":"זמן פעילות","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_users":"רשימת משתמשים","settings_show_in_list":"הצג אותי ברשימה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור","users_you":"(אתה)","users_online":"מחובר","users_list_empty":"אין משתמשים"},
+ "hi": {"login_title":"SldClient","login_subtitle":"साइन इन करें या खाता बनाएं","field_nick":"उपनाम","field_password":"पासवर्ड","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","logged_as":"इस रूप में साइन इन:","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","search_close":"बंद करें","title_settings":"सेटिंग्स","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","uptime_label":"अपटाइम","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_users":"उपयोगकर्ता सूची","settings_show_in_list":"सूची में मुझे दिखाएं","settings_user":"इस रूप में साइन इन:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें","users_you":"(आप)","users_online":"ऑनलाइन","users_list_empty":"कोई उपयोगकर्ता नहीं"},
 }
 
 # ---------------- SVG flags ----------------
@@ -408,8 +573,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0088cc">
-<title>Messenger</title>
+<title>SldClient</title>
 <link rel="stylesheet" href="https://getbootstrap.com/1.4.0/assets/css/bootstrap.min.css">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoaded&render=explicit" async defer></script>
 <style>
 * { scrollbar-width: none; -ms-overflow-style: none; -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
 *::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
@@ -428,8 +594,7 @@ body {
 input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
 
-/* Tap-friendly interactive elements */
-button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn, .settings-tab, .search-result {
+button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn, .settings-tab, .search-result, .user-list-item {
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
@@ -443,7 +608,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   z-index: 500; padding: 16px; box-sizing: border-box;
   overflow-y: auto;
 }
-.login-box { width: 320px; max-width: 100%; background: #fff; border: 1px solid #b8c4d0; box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 20px 20px 14px; text-align: center; margin: auto; }
+.login-box { width: 340px; max-width: 100%; background: #fff; border: 1px solid #b8c4d0; box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 20px 20px 14px; text-align: center; margin: auto; }
 .login-box h2 { margin: 0 0 4px; font-size: 18px; color: #2b3d51; }
 .login-box p { margin: 0 0 16px; color: #7b8a99; font-size: 12px; }
 .my-label { display: block !important; text-align: left !important; font-size: 11px !important; font-weight: bold !important; color: #667788 !important; margin: 0 0 4px 0 !important; padding: 0 !important; line-height: 1.4 !important; text-transform: uppercase !important; letter-spacing: .3px; }
@@ -457,6 +622,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .login-error.show { display: block; }
 .uptime-line { margin-top: 12px; padding-top: 10px; border-top: 1px solid #e0e5eb; font-size: 11px; color: #7b8a99; display: flex; justify-content: space-between; }
 .uptime-line .u-val { font-weight: bold; color: #4a5a6a; font-family: "Courier New", monospace; }
+#turnstileWidget { margin-top: 8px; display: flex; justify-content: center; min-height: 65px; }
 
 /* ---- Lang picker ---- */
 .login-settings { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e0e5eb; display: flex; gap: 6px; }
@@ -523,14 +689,42 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .chat-feed { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 8px 12px; background: #fdfdfd; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
-.msg-row { padding: 2px 4px; line-height: 1.55; font-size: 12.5px; word-wrap: break-word; transition: background .3s; }
+
+/* FIXED message layout — grid: author | content(text+time). Wrapped lines stay indented. */
+.msg-row {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 6px;
+  padding: 2px 4px;
+  align-items: start;
+  font-size: 12.5px;
+  line-height: 1.55;
+  border-radius: 3px;
+  transition: background .3s;
+  word-wrap: break-word;
+}
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
-.msg-author { font-weight: bold; margin-right: 4px; }
-.msg-author.hidden { visibility: hidden; }
+.msg-author {
+  font-weight: bold;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+.msg-content {
+  min-width: 0;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
 .msg-text { color: #222; }
-.msg-time { color: #b0b8c0; font-size: 10.5px; margin-left: 6px; }
-.msg-system { color: #a94442; background: #fcebeb; border: 1px solid #f5c6c6; font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex; align-items: center; }
+.msg-time {
+  color: #b0b8c0;
+  font-size: 10.5px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+.msg-system { color: #a94442; background: #fcebeb; border: 1px solid #f5c6c6; font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex; align-items: center; border-radius: 3px; }
 .msg-system .sys-icon { margin-right: 6px; display: inline-flex; align-items: center; }
 .msg-system.info { color: #31708f; background: #eaf4fb; border-color: #bce0f0; }
 
@@ -557,13 +751,13 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .error-msg .sys-icon { margin-right: 6px; display: inline-flex; }
 
 /* Settings modal */
-#settingsModal { width: 520px; }
-.settings-body { display: flex; min-height: 260px; }
-.settings-tabs { width: 140px; background: #f5f5f5; border-right: 1px solid #ddd; padding: 8px 0; }
-.settings-tab { display: block; width: 100%; text-align: left; padding: 8px 14px; background: transparent; border: 0; border-left: 3px solid transparent; cursor: pointer; font-size: 12px; color: #444; font-family: inherit; border-radius: 0; }
+#settingsModal { width: 560px; }
+.settings-body { display: flex; min-height: 280px; }
+.settings-tabs { width: 160px; background: #f5f5f5; border-right: 1px solid #ddd; padding: 8px 0; flex-shrink: 0; }
+.settings-tab { display: block; width: 100%; text-align: left; padding: 9px 14px; background: transparent; border: 0; border-left: 3px solid transparent; cursor: pointer; font-size: 12px; color: #444; font-family: inherit; border-radius: 0; }
 .settings-tab:hover { background: #e9ecef; }
 .settings-tab.active { background: #fff; border-left-color: #0088cc; color: #006dcc; font-weight: bold; }
-.settings-content { flex: 1; padding: 16px; overflow-y: auto; max-height: 60vh; }
+.settings-content { flex: 1; padding: 16px; overflow-y: auto; max-height: 60vh; min-width: 0; }
 .settings-pane { display: none; }
 .settings-pane.active { display: block; }
 .settings-row { margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
@@ -573,6 +767,19 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .settings-lang-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-top: 8px; }
 .settings-lang-grid .lang-menu-item { padding: 5px 7px; }
 .settings-section-title { font-size: 13px; font-weight: bold; color: #222; padding-bottom: 8px; border-bottom: 1px solid #eee; margin-bottom: 12px; }
+.settings-toggle-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; color: #333; cursor: pointer; user-select: none; }
+.settings-toggle-row input { width: 16px; height: 16px; margin: 0; }
+
+/* Users list */
+.users-list { display: flex; flex-direction: column; }
+.user-list-item { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+.user-list-item:last-child { border-bottom: 0; }
+.user-dot { width: 8px; height: 8px; border-radius: 50%; background: #bbb; flex-shrink: 0; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
+.user-dot.online { background: #4caf50; box-shadow: 0 0 0 2px rgba(76,175,80,.25); }
+.user-list-item .user-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: bold; color: #222; }
+.user-list-item.self .user-name { color: #006dcc; }
+.user-list-item .user-you { font-size: 11px; color: #999; margin-left: 4px; font-weight: normal; }
+.users-empty { padding: 30px 10px; text-align: center; color: #999; font-size: 12px; }
 
 /* Dark theme */
 body.dark { background: #1a1a1a; color: #ccc; }
@@ -627,39 +834,34 @@ body.dark .settings-tab.active { background: #252526; border-left-color: #0e639c
 body.dark .settings-label { color: #777; }
 body.dark .settings-value { color: #eaeaea; }
 body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c; }
+body.dark .settings-toggle-row { color: #ccc; }
+body.dark .user-list-item { border-bottom-color: #3c3c3c; }
+body.dark .user-list-item .user-name { color: #eaeaea; }
+body.dark .user-list-item.self .user-name { color: #6cb6ff; }
 
-/* ============================================================
-   MOBILE / TABLET
-   ============================================================ */
-
-/* Active feedback on touch devices */
+/* Mobile / Tablet */
 @media (hover: none) {
   .channel-tab:active { background: #c9c9c9; background-image: none; }
-  .icon-btn-tab:active { background: #c9c9c9; background-image: none; }
-  .scroll-arrow:active { background: #c9c9c9; background-image: none; }
-  .settings-btn:active { background: #c9c9c9; background-image: none; }
+  .icon-btn-tab:active, .scroll-arrow:active, .settings-btn:active { background: #c9c9c9; background-image: none; }
   .lang-menu-item:active { background: #d6e8f7; }
   .search-result:active { background: #eaf4fb; }
   .msg-row:hover { background: transparent; }
 }
 
-/* Phones & small tablets */
 @media (max-width: 768px) {
-  /* Login */
   .login-screen { padding: 16px; align-items: flex-start; padding-top: 40px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
   .login-box h2 { font-size: 20px; }
   .login-box p { font-size: 13px; }
   .login-box .btn { padding: 12px; font-size: 15px; }
-  .my-label { font-size: 11px !important; }
   .my-input, .login-box .my-input, .my-modal .my-input { font-size: 16px !important; padding: 11px 12px !important; }
   .remember-row { font-size: 14px; }
   .remember-row input { width: 18px; height: 18px; }
   .settings-btn { height: 40px; font-size: 14px; }
   .settings-btn .lang-code { font-size: 12px; }
   .uptime-line { font-size: 12px; }
+  #turnstileWidget { transform: scale(.95); transform-origin: center top; }
 
-  /* App layout */
   .tabs-bar { padding: 8px 6px; gap: 6px; }
   .tabs-scroll { gap: 4px; }
   .channel-tab { padding: 8px 12px; font-size: 13px; margin-right: 4px; min-height: 36px; }
@@ -676,8 +878,8 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   .chat-header .user-info { display: none; }
 
   .chat-feed { padding: 10px; }
-  .msg-row { font-size: 14px; padding: 4px 6px; line-height: 1.5; }
-  .msg-author { font-size: 14px; }
+  .msg-row { grid-template-columns: 84px 1fr; gap: 5px; font-size: 14px; padding: 3px 4px; line-height: 1.5; }
+  .msg-author { font-size: 13px; }
   .msg-time { font-size: 11px; }
   .msg-system { font-size: 12.5px; padding: 6px 10px; }
 
@@ -686,42 +888,34 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   .composer .icon-btn { width: 42px; height: 42px; }
   .composer .icon-btn svg { width: 18px !important; height: 18px !important; }
 
-  /* Search */
   .search-panel .search-head { padding: 8px; gap: 6px; }
   .search-panel .search-head input { font-size: 16px !important; padding: 9px 11px !important; }
   .search-panel .close-search { padding: 8px 12px; font-size: 13px; }
   .search-result { padding: 10px 12px; }
-  .search-result .title-line { font-size: 13px; }
-  .search-result .sub-line { font-size: 12px; }
 
-  /* Modals */
   .my-modal-backdrop { padding: 10px; align-items: flex-start; padding-top: 20px; padding-bottom: 20px; overflow-y: auto; }
   .my-modal { width: 100%; max-width: 500px; margin: auto; }
   #settingsModal { width: 100%; max-width: 500px; }
   .modal-head { padding: 12px 14px; font-size: 15px; }
-  .modal-head .close-m { padding: 6px; }
   .modal-body { padding: 16px; }
   .modal-foot { padding: 12px; }
   .modal-foot .btn { padding: 10px 18px; font-size: 14px; }
   .checkbox-row { font-size: 13px; padding: 4px 0; }
   .checkbox-row input { width: 18px; height: 18px; }
 
-  /* Settings on mobile — tabs on top */
   .settings-body { flex-direction: column; min-height: 0; }
   .settings-tabs { width: 100%; border-right: 0; border-bottom: 1px solid #ddd; padding: 0; display: flex; }
-  .settings-tab { flex: 1; text-align: center; padding: 12px 8px; border-left: 0; border-bottom: 3px solid transparent; font-size: 13px; }
+  .settings-tab { flex: 1; text-align: center; padding: 12px 4px; border-left: 0; border-bottom: 3px solid transparent; font-size: 12px; }
   .settings-tab.active { border-left-color: transparent; border-bottom-color: #0088cc; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
   .settings-lang-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-lang-grid .lang-menu-item { padding: 8px; font-size: 12px; }
 
-  /* Lang menu — 2 columns on phones */
   .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 6px; gap: 4px; }
   .lang-menu-item { padding: 8px; font-size: 12px; }
 }
 
-/* Small phones */
 @media (max-width: 400px) {
   .channel-tab { padding: 7px 10px; font-size: 12px; min-height: 34px; }
   .icon-btn-tab { width: 34px; height: 34px; }
@@ -730,13 +924,14 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   .composer .icon-btn { width: 38px; height: 38px; }
   .lang-menu { grid-template-columns: 1fr; }
   .settings-lang-grid { grid-template-columns: 1fr; }
+  .msg-row { grid-template-columns: 70px 1fr; gap: 4px; }
+  .msg-author { font-size: 12px; }
 }
 
-/* Tablets */
 @media (min-width: 769px) and (max-width: 1024px) {
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
-  #settingsModal { width: 540px; }
+  #settingsModal { width: 600px; }
 }
 </style>
 </head>
@@ -744,7 +939,7 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
 
 <div class="login-screen" id="loginScreen">
   <div class="login-box">
-    <h2 id="loginTitle">Messenger</h2>
+    <h2 id="loginTitle">SldClient</h2>
     <p id="loginSubtitle"></p>
 
     <div class="field-group">
@@ -761,6 +956,8 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
       <input type="checkbox" id="rememberMe" checked>
       <span id="rememberLbl"></span>
     </label>
+
+    <div id="turnstileWidget"></div>
 
     <button class="btn primary" id="loginBtn" type="button"></button>
 
@@ -902,6 +1099,7 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
       <div class="settings-tabs">
         <button class="settings-tab active" data-tab="account" id="tabAccount"></button>
         <button class="settings-tab" data-tab="appearance" id="tabAppearance"></button>
+        <button class="settings-tab" data-tab="users" id="tabUsers"></button>
       </div>
       <div class="settings-content">
         <div class="settings-pane active" data-pane="account">
@@ -912,7 +1110,11 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
               <div class="settings-value" id="settingsUser">—</div>
             </div>
           </div>
-          <button class="btn" id="settingsLogoutBtn" type="button" style="width:100%;"></button>
+          <label class="settings-toggle-row">
+            <input type="checkbox" id="showInListToggle">
+            <span id="showInListLabel"></span>
+          </label>
+          <button class="btn" id="settingsLogoutBtn" type="button" style="width:100%; margin-top:14px;"></button>
         </div>
         <div class="settings-pane" data-pane="appearance">
           <div class="settings-section-title" id="settingsAppearanceHead"></div>
@@ -928,6 +1130,10 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
             <div class="settings-lang-grid" id="settingsLangGrid"></div>
           </div>
         </div>
+        <div class="settings-pane" data-pane="users">
+          <div class="settings-section-title" id="settingsUsersHead">Users List</div>
+          <div class="users-list" id="usersList"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -939,6 +1145,7 @@ const I18N = %%I18N%%;
 const FLAGS = %%FLAGS%%;
 const LANG_ORDER = %%LANG_ORDER%%;
 const LANG_NAMES = {en:"English",ru:"Русский",es:"Español",de:"Deutsch",fr:"Français",it:"Italiano",pt:"Português",nl:"Nederlands",pl:"Polski",uk:"Українська",cs:"Čeština",sv:"Svenska",el:"Ελληνικά",tr:"Türkçe",ja:"日本語",ko:"한국어",zh:"中文",ar:"العربية",he:"עברית",hi:"हिन्दी"};
+const TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r";
 
 const SVG = {
   x:'<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
@@ -949,7 +1156,7 @@ const SVG = {
   moon:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
 };
 
-// ---------- Mobile viewport fix (keyboard-aware) ----------
+// ---------- Viewport fix ----------
 function updateAppVH() {
   const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
   document.documentElement.style.setProperty('--app-vh', h + 'px');
@@ -961,6 +1168,9 @@ if (window.visualViewport) {
 window.addEventListener('resize', updateAppVH);
 window.addEventListener('orientationchange', () => setTimeout(updateAppVH, 100));
 updateAppVH();
+
+// ---------- Right-click disable ----------
+document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 let currentLang = localStorage.getItem('lang') || 'en';
 let currentTheme = localStorage.getItem('theme') || 'light';
@@ -974,6 +1184,9 @@ let channelKeyCache = {};
 let onlineUsers = [];
 let uptimeBase = 0;
 let uptimeFetchAt = 0;
+let showInListPref = true;
+let turnstileReady = false;
+let turnstileWidgetId = null;
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => {
@@ -984,6 +1197,40 @@ const t = (key, vars) => {
   if (vars) for (const k in vars) s = s.replace(new RegExp('\\{'+k+'\\}','g'), vars[k]);
   return s;
 };
+
+// ---------- Turnstile ----------
+function onTurnstileLoaded() {
+  turnstileReady = true;
+  renderTurnstile();
+}
+window.onTurnstileLoaded = onTurnstileLoaded;
+
+function renderTurnstile() {
+  if (!window.turnstile) return;
+  const el = $('turnstileWidget');
+  if (!el) return;
+  // Remove existing widget
+  if (turnstileWidgetId !== null) {
+    try { window.turnstile.remove(turnstileWidgetId); } catch (e) {}
+    turnstileWidgetId = null;
+  }
+  el.innerHTML = '';
+  try {
+    turnstileWidgetId = window.turnstile.render(el, {
+      sitekey: TURNSTILE_SITEKEY,
+      theme: currentTheme === 'dark' ? 'dark' : 'light',
+    });
+  } catch (e) {}
+}
+
+function getTurnstileToken() {
+  if (!window.turnstile || turnstileWidgetId === null) return '';
+  try { return window.turnstile.getResponse(turnstileWidgetId) || ''; } catch (e) { return ''; }
+}
+function resetTurnstile() {
+  if (!window.turnstile || turnstileWidgetId === null) return;
+  try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
+}
 
 // ---------- Crypto ----------
 const enc = new TextEncoder();
@@ -1095,12 +1342,15 @@ function applyLanguage() {
   $('settingsTitle').textContent = t('settings_title');
   $('tabAccount').textContent = t('settings_account');
   $('tabAppearance').textContent = t('settings_appearance');
+  $('tabUsers').textContent = t('settings_users');
   $('settingsAccountHead').textContent = t('settings_account');
   $('settingsUserLabel').textContent = t('settings_user');
   $('settingsLogoutBtn').textContent = t('settings_logout');
   $('settingsAppearanceHead').textContent = t('settings_appearance');
   $('settingsThemeLabel').textContent = t('settings_theme');
   $('settingsLangLabel').textContent = t('settings_lang');
+  $('showInListLabel').textContent = t('settings_show_in_list');
+  $('settingsUsersHead').textContent = t('settings_users');
 
   $('langFlag').innerHTML = FLAGS[currentLang] || '';
   $('langCode').textContent = currentLang.toUpperCase();
@@ -1110,6 +1360,7 @@ function applyLanguage() {
   buildSettingsLangGrid();
   renderTabs(); renderHeader(); renderMessages(); updateMuteUI();
   renderSearchResults($('searchInput').value);
+  renderUsersList();
 }
 
 function buildLangMenu() {
@@ -1144,7 +1395,7 @@ function showLoginError(msg) {
   $('loginErrorText').textContent = msg;
   box.classList.add('show');
   clearTimeout(loginErrTimer);
-  loginErrTimer = setTimeout(() => box.classList.remove('show'), 3500);
+  loginErrTimer = setTimeout(() => box.classList.remove('show'), 4500);
 }
 
 // ---------- Auth ----------
@@ -1154,8 +1405,12 @@ async function doAuth() {
   if (!username || !password) { showLoginError(t('err_bad_credentials')); return; }
   if (username.length < 2) { showLoginError(t('err_bad_username')); return; }
   if (password.length < 4) { showLoginError(t('err_bad_password')); return; }
+  const tsToken = getTurnstileToken();
+  if (!tsToken) { showLoginError(t('err_turnstile')); resetTurnstile(); return; }
   try {
-    const res = await api('/api/auth', 'POST', { username, password }, false);
+    const res = await api('/api/auth', 'POST', {
+      username, password, turnstile_token: tsToken,
+    }, false);
     authToken = res.token;
     currentUser = res.username;
     if ($('rememberMe').checked) {
@@ -1166,10 +1421,17 @@ async function doAuth() {
       localStorage.removeItem('auth_token');
     }
     $('loginName').value = ''; $('loginPass').value = '';
+    resetTurnstile();
     enterApp();
   } catch (e) {
-    const map = { 401: 'err_bad_credentials', 400: 'err_bad_username', 503: 'err_generic' };
-    showLoginError(t(map[e.status] || 'err_generic'));
+    const map = { 401: 'err_bad_credentials', 400: 'err_bad_password', 429: 'err_rate_limited' };
+    let msg;
+    if (e.detail === 'turnstile_failed') msg = t('err_turnstile');
+    else if (e.detail === 'bad_username') msg = t('err_bad_username');
+    else if (e.detail === 'too_many_attempts') msg = t('err_rate_limited');
+    else msg = t(map[e.status] || 'err_generic');
+    showLoginError(msg);
+    resetTurnstile();
   }
 }
 $('loginBtn').addEventListener('click', doAuth);
@@ -1183,6 +1445,15 @@ function enterApp() {
   $('settingsUser').textContent = currentUser;
   updateAppVH();
   loadChannels();
+  loadMyPrefs();
+}
+
+async function loadMyPrefs() {
+  try {
+    const res = await api('/api/me');
+    showInListPref = !!res.show_in_list;
+    $('showInListToggle').checked = showInListPref;
+  } catch (e) {}
 }
 
 async function tryRestoreSession() {
@@ -1211,15 +1482,29 @@ $('langBackdrop').addEventListener('click', closeLangMenu);
 $('settingsBtn').addEventListener('click', () => {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
+  $('showInListToggle').checked = showInListPref;
+  // Refresh users if that tab is currently active
+  const activeTab = document.querySelector('.settings-tab.active');
+  if (activeTab && activeTab.dataset.tab === 'users') loadUsersList();
 });
 document.querySelectorAll('.settings-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     const target = tab.dataset.tab;
     document.querySelectorAll('.settings-tab').forEach(x => x.classList.toggle('active', x === tab));
     document.querySelectorAll('.settings-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === target));
+    if (target === 'users') loadUsersList();
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
+$('showInListToggle').addEventListener('change', async (e) => {
+  const val = e.target.checked;
+  try {
+    await api('/api/me/preferences', 'POST', { show_in_list: val });
+    showInListPref = val;
+  } catch (err) {
+    e.target.checked = !val;
+  }
+});
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
   authToken = null; currentUser = null;
@@ -1232,7 +1517,42 @@ $('settingsLogoutBtn').addEventListener('click', async () => {
   $('loginScreen').style.display = 'flex';
   closeLangMenu();
   updateAppVH();
+  resetTurnstile();
 });
+
+// ---------- Users list ----------
+let usersListCache = [];
+async function loadUsersList() {
+  const box = $('usersList');
+  if (!box) return;
+  box.innerHTML = '<div class="users-empty">…</div>';
+  try {
+    const res = await api('/api/users');
+    usersListCache = res.users || [];
+    renderUsersList();
+  } catch (e) {
+    box.innerHTML = '<div class="users-empty">'+t('err_generic')+'</div>';
+  }
+}
+function renderUsersList() {
+  const box = $('usersList');
+  if (!box) return;
+  if (!usersListCache.length) {
+    box.innerHTML = '<div class="users-empty">'+t('users_list_empty')+'</div>';
+    return;
+  }
+  box.innerHTML = '';
+  usersListCache.forEach(u => {
+    const row = document.createElement('div');
+    row.className = 'user-list-item' + (u.self ? ' self' : '');
+    row.innerHTML =
+      '<span class="user-dot'+(u.online?' online':'')+'"></span>' +
+      '<span class="user-name">'+escapeHtml(u.username)+
+        (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '') +
+      '</span>';
+    box.appendChild(row);
+  });
+}
 
 // ---------- Channels ----------
 async function loadChannels() {
@@ -1319,25 +1639,49 @@ function renderMessages() {
   if (ch.messages.length === 0) { feed.innerHTML = '<div class="empty-state">'+SVG.chat+t('empty_no_messages')+'</div>'; return; }
   let lastAuthor = null, lastTime = 0;
   ch.messages.forEach(m => {
-    const row = document.createElement('div');
-    row.dataset.id = m.id; row.dataset.t = String(m.t*1000);
-    const d = new Date(m.t*1000);
-    const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-    const grouped = (lastAuthor === m.from) && ((m.t*1000) - lastTime < GROUP_WINDOW_MS);
-    row.className = 'msg-row';
-    row.innerHTML = '<span class="msg-author'+(grouped?' hidden':'')+'" style="color:'+(m.from===currentUser?'#005a87':'#8a4a00')+'">'+
-      escapeHtml(m.from)+':</span><span class="msg-text" data-ct="'+escapeHtml(m.ct)+'">…</span>'+
-      '<span class="msg-time">'+timeStr+'</span>';
-    feed.appendChild(row);
+    const row = buildMsgRow(m, lastAuthor, lastTime);
+    feed.appendChild(row.el);
     lastAuthor = m.from; lastTime = m.t*1000;
   });
   const chId = activeId;
-  feed.querySelectorAll('.msg-row').forEach(row => {
+  feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
     const span = row.querySelector('.msg-text');
-    const ct = span.dataset.ct;
+    const ct = row.getAttribute('data-ct');
     decryptText(chId, ct).then(pt => { span.textContent = pt; });
   });
   feed.scrollTop = feed.scrollHeight;
+}
+
+function buildMsgRow(m, prevAuthor, prevTime) {
+  const row = document.createElement('div');
+  row.className = 'msg-row';
+  row.dataset.id = m.id;
+  row.dataset.t = String(m.t*1000);
+  const d = new Date(m.t*1000);
+  const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const grouped = (prevAuthor === m.from) && ((m.t*1000) - prevTime < GROUP_WINDOW_MS);
+
+  const authorEl = document.createElement('span');
+  authorEl.className = 'msg-author';
+  authorEl.textContent = m.from + ':';
+  authorEl.style.color = (m.from === currentUser) ? '#005a87' : '#8a4a00';
+  if (grouped) authorEl.style.visibility = 'hidden';
+
+  const contentEl = document.createElement('span');
+  contentEl.className = 'msg-content';
+  const textEl = document.createElement('span');
+  textEl.className = 'msg-text';
+  textEl.textContent = '…';
+  const timeEl = document.createElement('span');
+  timeEl.className = 'msg-time';
+  timeEl.textContent = timeStr;
+  contentEl.appendChild(textEl);
+  contentEl.appendChild(timeEl);
+
+  row.appendChild(authorEl);
+  row.appendChild(contentEl);
+  row.setAttribute('data-ct', m.ct);
+  return { el: row, textEl };
 }
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -1346,20 +1690,17 @@ function appendMessageUI(msg, channelId) {
   const feed = $('chatFeed');
   const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
   const ch = channels.find(c => c.id === channelId);
-  if (ch) ch.messages.push(msg);
+  if (ch) {
+    ch.messages.push(msg);
+    if (ch.messages.length > 300) ch.messages = ch.messages.slice(-300);
+  }
   if (activeId !== channelId) return;
   const lastRow = feed.querySelector('.msg-row:last-child');
-  const lastAuthor = lastRow ? lastRow.querySelector('.msg-author').textContent.replace(':','') : null;
-  const lastTime = lastRow ? parseInt(lastRow.dataset.t || '0', 10) : 0;
-  const grouped = lastAuthor === msg.from && (msg.t*1000 - lastTime < GROUP_WINDOW_MS);
-  const row = document.createElement('div');
-  row.className = 'msg-row'; row.dataset.id = msg.id; row.dataset.t = String(msg.t*1000);
-  const d = new Date(msg.t*1000);
-  const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-  row.innerHTML = '<span class="msg-author'+(grouped?' hidden':'')+'" style="color:'+(msg.from===currentUser?'#005a87':'#8a4a00')+'">'+
-    escapeHtml(msg.from)+':</span><span class="msg-text">…</span><span class="msg-time">'+timeStr+'</span>';
-  feed.appendChild(row);
-  decryptText(channelId, msg.ct).then(pt => { const s = row.querySelector('.msg-text'); if (s) s.textContent = pt; });
+  const prevAuthor = lastRow ? (lastRow.querySelector('.msg-author').textContent || '').replace(/:$/,'') : null;
+  const prevTime = lastRow ? parseInt(lastRow.dataset.t || '0', 10) : 0;
+  const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
+  feed.appendChild(el);
+  decryptText(channelId, msg.ct).then(pt => { textEl.textContent = pt; });
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -1568,7 +1909,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') { switchChannel(1); e.preventDefault(); }
 });
 
-// Swipe on tabs-scroll area changes channel on mobile
+// Swipe nav on feed
 let touchStartX = 0, touchStartY = 0, touchActive = false;
 const feedEl = $('chatFeed');
 feedEl.addEventListener('touchstart', e => {
@@ -1594,7 +1935,11 @@ applyLanguage();
 renderUptime();
 (async () => {
   const restored = await tryRestoreSession();
-  if (!restored) setTimeout(() => $('loginName').focus(), 100);
+  if (!restored) {
+    setTimeout(() => $('loginName').focus(), 100);
+    // Wait for turnstile to load and render
+    setTimeout(() => { if (turnstileReady) renderTurnstile(); }, 500);
+  }
 })();
 </script>
 </body>
