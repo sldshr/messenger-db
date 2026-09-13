@@ -33,12 +33,13 @@ RATE_LIMIT_WINDOW = 10.0
 RATE_LIMIT_MAX = 20
 MUTE_SECONDS = 30
 TOKEN_TTL = 60 * 60 * 24 * 7
+MAX_USER_CHANNELS = 500   # per-account channel membership cap
 
 # ---------------- In-memory storage ----------------
 USERS: Dict[str, dict] = {}
 TOKENS: Dict[str, dict] = {}
 CHANNELS: Dict[str, dict] = {}
-CHANNEL_MEMBERS: Dict[str, Set[str]] = {}
+USER_CHANNELS: Dict[str, Set[str]] = {}   # username -> set of channel_ids (PERSISTENT)
 MSG_TIMES: Dict[str, List[float]] = {}
 
 # ---------------- Security helpers ----------------
@@ -71,6 +72,13 @@ async def auth(request: Request) -> str:
     if not user:
         raise HTTPException(status_code=401, detail="unauthorized")
     return user
+
+def user_channel_set(username: str) -> Set[str]:
+    s = USER_CHANNELS.get(username)
+    if s is None:
+        s = set()
+        USER_CHANNELS[username] = s
+    return s
 
 # ---------------- App ----------------
 app = FastAPI(title="Messenger", docs_url=None, redoc_url=None)
@@ -105,7 +113,7 @@ class ConnectChannelReq(BaseModel):
 class LeaveChannelReq(BaseModel):
     channel_id: str
 
-# ---------------- Default public channels (seed) ----------------
+# ---------------- Default public channels (seed, no members) ----------------
 def init_defaults() -> None:
     seeds = [
         ("general", "Общий", False),
@@ -118,14 +126,13 @@ def init_defaults() -> None:
             "id": cid, "name": name, "private": private,
             "owner": None, "created": time.time(), "messages": [],
         }
-        CHANNEL_MEMBERS[cid] = set()
 
 init_defaults()
 
 # ---------------- REST ----------------
 @app.post("/api/auth")
 async def auth_endpoint(req: AuthReq):
-    """Combined login+register: if user exists — verify password; else — create account."""
+    """Login + register combined."""
     username = req.username.strip()
     if not (MIN_USERNAME_LEN <= len(username) <= MAX_USERNAME_LEN):
         raise HTTPException(400, "bad_username")
@@ -146,6 +153,7 @@ async def auth_endpoint(req: AuthReq):
             "salt": salt.hex(),
             "created": time.time(),
         }
+        USER_CHANNELS[username] = set()   # init empty channel list
         is_new = True
 
     token = new_token()
@@ -175,17 +183,21 @@ async def me(request: Request):
 
 @app.get("/api/channels")
 async def list_channels(request: Request):
+    """Return channels the current user is a member of."""
     username = await auth(request)
+    cids = USER_CHANNELS.get(username, set())
     out = []
-    for cid, ch in CHANNELS.items():
-        if username in CHANNEL_MEMBERS.get(cid, set()):
-            out.append({
-                "id": cid,
-                "name": ch["name"],
-                "private": ch["private"],
-                "owner": ch["owner"],
-                "messages": ch["messages"][-MAX_MESSAGES_PER_CHANNEL:],
-            })
+    for cid in cids:
+        ch = CHANNELS.get(cid)
+        if not ch:
+            continue
+        out.append({
+            "id": cid,
+            "name": ch["name"],
+            "private": ch["private"],
+            "owner": ch["owner"],
+            "messages": ch["messages"][-MAX_MESSAGES_PER_CHANNEL:],
+        })
     out.sort(key=lambda c: c["name"].lower())
     return {"channels": out}
 
@@ -200,12 +212,15 @@ async def create_channel(req: CreateChannelReq, request: Request):
             raise HTTPException(409, "name_taken")
     if len(CHANNELS) >= MAX_CHANNELS:
         raise HTTPException(503, "server_full")
+    my_ch = user_channel_set(username)
+    if len(my_ch) >= MAX_USER_CHANNELS:
+        raise HTTPException(503, "user_channel_limit")
     cid = secrets.token_hex(6)
     CHANNELS[cid] = {
         "id": cid, "name": name, "private": bool(req.private),
         "owner": username, "created": time.time(), "messages": [],
     }
-    CHANNEL_MEMBERS[cid] = {username}
+    my_ch.add(cid)   # persist membership
     return {"id": cid, "name": name, "private": bool(req.private), "messages": []}
 
 @app.post("/api/channels/connect")
@@ -216,7 +231,10 @@ async def connect_channel(req: ConnectChannelReq, request: Request):
         raise HTTPException(400, "bad_name")
     for cid, ch in CHANNELS.items():
         if ch["name"].lower() == name.lower():
-            CHANNEL_MEMBERS.setdefault(cid, set()).add(username)
+            my_ch = user_channel_set(username)
+            if len(my_ch) >= MAX_USER_CHANNELS and cid not in my_ch:
+                raise HTTPException(503, "user_channel_limit")
+            my_ch.add(cid)   # persist membership
             return {
                 "id": cid, "name": ch["name"], "private": ch["private"],
                 "owner": ch["owner"],
@@ -228,12 +246,14 @@ async def connect_channel(req: ConnectChannelReq, request: Request):
 async def leave_channel(req: LeaveChannelReq, request: Request):
     username = await auth(request)
     cid = req.channel_id
-    if cid in CHANNEL_MEMBERS:
-        CHANNEL_MEMBERS[cid].discard(username)
+    s = USER_CHANNELS.get(username)
+    if s is not None:
+        s.discard(cid)
     return {"ok": True}
 
 # ---------------- WebSocket ----------------
 class WSManager:
+    """Tracks live WebSocket connections only. Does NOT store membership."""
     def __init__(self):
         self.rooms: Dict[str, Set[WebSocket]] = {}
         self.info: Dict[WebSocket, tuple] = {}
@@ -245,8 +265,11 @@ class WSManager:
     def leave(self, ws: WebSocket):
         entry = self.info.pop(ws, None)
         if entry:
-            _, ch = entry
-            self.rooms.get(ch, set()).discard(ws)
+            _, cid = entry
+            self.rooms.get(cid, set()).discard(ws)
+
+    def online_users(self, channel_id: str) -> List[str]:
+        return sorted(set(u for (u, c) in self.info.values() if c == channel_id))
 
     async def broadcast(self, channel_id: str, payload: dict):
         dead = []
@@ -259,9 +282,6 @@ class WSManager:
             self.leave(ws)
 
 manager = WSManager()
-
-def online_users(channel_id: str) -> List[str]:
-    return sorted(CHANNEL_MEMBERS.get(channel_id, set()))
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -276,12 +296,17 @@ async def ws_endpoint(ws: WebSocket):
         token = init.get("token", "")
         channel_id = init.get("channel_id", "")
         username = user_from_token(token)
-        if not username or channel_id not in CHANNELS or username not in CHANNEL_MEMBERS.get(channel_id, set()):
+
+        # auth: user must be an actual member (persisted)
+        if (not username
+                or channel_id not in CHANNELS
+                or channel_id not in USER_CHANNELS.get(username, set())):
             await ws.send_json({"type": "error", "error": "auth"})
             await ws.close()
             return
+
         await manager.join(channel_id, ws, username)
-        await manager.broadcast(channel_id, {"type": "presence", "users": online_users(channel_id)})
+        await manager.broadcast(channel_id, {"type": "presence", "users": manager.online_users(channel_id)})
 
         while True:
             data = await ws.receive_json()
@@ -315,10 +340,9 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         manager.leave(ws)
-        if channel_id and username:
-            CHANNEL_MEMBERS.get(channel_id, set()).discard(username)
+        if channel_id:
             try:
-                await manager.broadcast(channel_id, {"type": "presence", "users": online_users(channel_id)})
+                await manager.broadcast(channel_id, {"type": "presence", "users": manager.online_users(channel_id)})
             except Exception:
                 pass
 
@@ -328,33 +352,25 @@ async def ws_endpoint(ws: WebSocket):
 I18N = {
  "en": {"login_title":"Messenger","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Create a channel with «+» or connect to an existing one","header_msgs":"{n} messages","header_private_tag":"· private","empty_no_channels":"You have no channels yet.<br>Create a new one («+») or connect to an existing one.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create channel","modal_name":"Name","modal_name_ph":"E.g. Work","modal_private":"Private channel","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_ph":"Search channels and messages...","search_close":"Close","search_empty":"Nothing found","search_no_channels":"You have no channels yet","tag_channel":"channel","tag_msg":"msg.","in_channel":"in «{name}»","title_search":"Search (Ctrl+K)","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_network":"Network error","err_generic":"Error","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","welcome_new":"Welcome! Account created.","welcome_back":"Welcome back!"},
  "ru": {"login_title":"Мессенджер","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Создайте канал кнопкой «+» или подключитесь к существующему","header_msgs":"{n} сообщений","header_private_tag":"· приватный","empty_no_channels":"У вас пока нет каналов.<br>Создайте новый («+») или подключитесь к существующему.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать канал","modal_name":"Название","modal_name_ph":"Например, Работа","modal_private":"Приватный канал","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_ph":"Поиск по каналам и сообщениям...","search_close":"Закрыть","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","tag_channel":"канал","tag_msg":"сообщ.","in_channel":"в «{name}»","title_search":"Поиск (Ctrl+K)","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_network":"Ошибка сети","err_generic":"Ошибка","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","welcome_new":"Добро пожаловать! Аккаунт создан.","welcome_back":"С возвращением!"},
+ "es": {"login_title":"Mensajero","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","ph_nick":"Tu apodo","ph_password":"Tu contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_no_channels":"Sin canales","header_no_channels_sub":"Crea un canal con «+» o conéctate a uno existente","header_msgs":"{n} mensajes","empty_no_channels":"Aún no tienes canales.<br>Crea uno nuevo («+») o conéctate a uno existente.","empty_no_messages":"No hay mensajes. ¡Sé el primero en escribir!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","composer_muted":"Silenciado: {n}s","modal_create_title":"Crear canal","modal_name":"Nombre","modal_name_ph":"Ej.: Trabajo","modal_private":"Canal privado","btn_cancel":"Cancelar","btn_create":"Crear","modal_connect_title":"Conectar al canal","modal_connect_name":"Nombre del canal","modal_connect_ph":"Introduce el nombre exacto del canal","btn_connect":"Conectar","connect_not_found":"Canal «{name}» no encontrado","search_ph":"Buscar canales y mensajes...","search_close":"Cerrar","search_empty":"Nada encontrado","search_no_channels":"Aún no tienes canales","tag_channel":"canal","tag_msg":"msg.","in_channel":"en «{name}»","title_search":"Buscar (Ctrl+K)","title_add":"Crear canal","title_connect":"Conectar al canal","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","online_label":"en línea","err_bad_credentials":"Contraseña incorrecta","err_bad_username":"Apodo 2–32 caracteres","err_bad_password":"Contraseña mín. 4 caracteres","err_generic":"Error","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar"},
+ "de": {"login_title":"Messenger","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","ph_nick":"Dein Spitzname","ph_password":"Dein Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_no_channels":"Keine Kanäle","header_no_channels_sub":"Erstelle einen Kanal mit «+» oder verbinde dich mit einem bestehenden","header_msgs":"{n} Nachrichten","empty_no_channels":"Du hast noch keine Kanäle.<br>Erstelle einen neuen («+») oder verbinde dich mit einem bestehenden.","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","composer_muted":"Stumm: {n}s","modal_create_title":"Kanal erstellen","modal_name":"Name","modal_name_ph":"Z.B. Arbeit","modal_private":"Privater Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","modal_connect_title":"Mit Kanal verbinden","modal_connect_name":"Kanalname","modal_connect_ph":"Exakten Kanalnamen eingeben","btn_connect":"Verbinden","connect_not_found":"Kanal «{name}» nicht gefunden","search_ph":"Kanäle und Nachrichten durchsuchen...","search_close":"Schließen","search_empty":"Nichts gefunden","search_no_channels":"Du hast noch keine Kanäle","tag_channel":"Kanal","tag_msg":"Nachr.","in_channel":"in «{name}»","title_search":"Suchen (Strg+K)","title_add":"Kanal erstellen","title_connect":"Mit Kanal verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","online_label":"online","err_bad_credentials":"Falsches Passwort","err_bad_username":"Spitzname 2–32 Zeichen","err_bad_password":"Passwort mind. 4 Zeichen","err_generic":"Fehler","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen"},
+ "fr": {"login_title":"Messagerie","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","ph_nick":"Votre pseudo","ph_password":"Votre mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_no_channels":"Aucun canal","header_no_channels_sub":"Créez un canal avec «+» ou connectez-vous à un existant","header_msgs":"{n} messages","empty_no_channels":"Vous n'avez pas encore de canaux.<br>Créez-en un («+») ou connectez-vous à un existant.","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","composer_muted":"Muet : {n}s","modal_create_title":"Créer un canal","modal_name":"Nom","modal_name_ph":"Ex : Travail","modal_private":"Canal privé","btn_cancel":"Annuler","btn_create":"Créer","modal_connect_title":"Se connecter à un canal","modal_connect_name":"Nom du canal","modal_connect_ph":"Entrez le nom exact du canal","btn_connect":"Se connecter","connect_not_found":"Canal «{name}» introuvable","search_ph":"Rechercher canaux et messages...","search_close":"Fermer","search_empty":"Rien trouvé","search_no_channels":"Pas encore de canaux","tag_channel":"canal","tag_msg":"msg.","in_channel":"dans «{name}»","title_search":"Rechercher (Ctrl+K)","title_add":"Créer un canal","title_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","online_label":"en ligne","err_bad_credentials":"Mot de passe incorrect","err_bad_username":"Pseudo 2 à 32 caractères","err_bad_password":"Mot de passe min. 4 caractères","err_generic":"Erreur","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer"},
+ "it": {"login_title":"Messaggero","login_subtitle":"Accedi o crea un account","field_nick":"Nickname","field_password":"Password","btn_login":"Continua","remember_me":"Ricordami","logged_as":"Connesso come","header_no_channels":"Nessun canale","header_msgs":"{n} messaggi","empty_no_messages":"Nessun messaggio. Scrivi per primo!","composer_ph":"Scrivi un messaggio...","composer_no_channel":"Nessun canale attivo","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","search_ph":"Cerca canali e messaggi...","search_close":"Chiudi","search_empty":"Nessun risultato","title_search":"Cerca (Ctrl+K)","title_add":"Crea canale","title_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","uptime_label":"Attività","err_bad_credentials":"Password errata","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi"},
+ "pt": {"login_title":"Mensageiro","login_subtitle":"Entre ou crie uma conta","field_nick":"Apelido","field_password":"Senha","btn_login":"Continuar","remember_me":"Lembrar-me","logged_as":"Conectado como","header_no_channels":"Sem canais","header_msgs":"{n} mensagens","empty_no_messages":"Sem mensagens. Seja o primeiro!","composer_ph":"Escrever mensagem...","composer_no_channel":"Nenhum canal ativo","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","search_ph":"Pesquisar canais e mensagens...","search_close":"Fechar","search_empty":"Nada encontrado","title_search":"Pesquisar (Ctrl+K)","title_add":"Criar canal","title_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","uptime_label":"Tempo ativo","err_bad_credentials":"Senha incorreta","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar"},
+ "nl": {"login_title":"Messenger","login_subtitle":"Meld aan of maak een account","field_nick":"Bijnaam","field_password":"Wachtwoord","btn_login":"Doorgaan","remember_me":"Onthoud mij","logged_as":"Ingelogd als","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","search_close":"Sluiten","title_settings":"Instellingen","title_search":"Zoeken (Ctrl+K)","title_add":"Kanaal aanmaken","title_connect":"Verbinden","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","uptime_label":"Uptime","err_bad_credentials":"Onjuist wachtwoord","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten"},
+ "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","search_close":"Zamknij","btn_cancel":"Anuluj","btn_create":"Utwórz","btn_connect":"Połącz"},
+ "uk": {"login_title":"Месенджер","login_subtitle":"Увійдіть або створіть акаунт","field_nick":"Нік","field_password":"Пароль","btn_login":"Продовжити","remember_me":"Запам'ятати мене","logged_as":"Ви увійшли як","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","search_close":"Закрити","title_settings":"Налаштування","title_search":"Пошук (Ctrl+K)","title_add":"Створити канал","title_connect":"Підключитися","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","uptime_label":"Аптайм","err_bad_credentials":"Невірний пароль","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити"},
+ "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení"},
+ "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar"},
+ "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις"},
+ "tr": {"login_title":"Anlık Mesajlaşma","login_subtitle":"Giriş yap veya hesap oluştur","field_nick":"Takma ad","field_password":"Şifre","btn_login":"Devam et","remember_me":"Beni hatırla","logged_as":"Giriş yapan:","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","search_close":"Kapat","title_settings":"Ayarlar","title_search":"Ara (Ctrl+K)","title_add":"Kanal oluştur","title_connect":"Bağlan","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","uptime_label":"Çalışma süresi","err_bad_credentials":"Yanlış şifre","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat"},
+ "ja": {"login_title":"メッセンジャー","login_subtitle":"サインインまたはアカウント作成","field_nick":"ニックネーム","field_password":"パスワード","btn_login":"続行","remember_me":"ログイン状態を保持","logged_as":"ログイン中:","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","search_close":"閉じる","title_settings":"設定","title_search":"検索 (Ctrl+K)","title_add":"チャンネル作成","title_connect":"接続","theme_toggle":"テーマ切替","lang_toggle":"言語変更","uptime_label":"稼働時間","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる"},
+ "ko": {"login_title":"메신저","login_subtitle":"로그인 또는 계정 만들기","field_nick":"닉네임","field_password":"비밀번호","btn_login":"계속","remember_me":"로그인 상태 유지","logged_as":"로그인:","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","search_close":"닫기","title_settings":"설정","title_search":"검색 (Ctrl+K)","title_add":"채널 만들기","title_connect":"연결","theme_toggle":"테마 전환","lang_toggle":"언어 변경","uptime_label":"가동 시간","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기"},
+ "zh": {"login_title":"即时通讯","login_subtitle":"登录或创建账号","field_nick":"昵称","field_password":"密码","btn_login":"继续","remember_me":"记住我","logged_as":"登录为","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","search_close":"关闭","title_settings":"设置","title_search":"搜索 (Ctrl+K)","title_add":"创建频道","title_connect":"连接","theme_toggle":"切换主题","lang_toggle":"切换语言","uptime_label":"运行时间","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭"},
+ "ar": {"login_title":"ماسنجر","login_subtitle":"سجّل الدخول أو أنشئ حسابًا","field_nick":"الاسم","field_password":"كلمة المرور","btn_login":"متابعة","remember_me":"تذكرني","logged_as":"مسجل باسم","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","search_close":"إغلاق","title_settings":"الإعدادات","title_search":"بحث (Ctrl+K)","title_add":"إنشاء قناة","title_connect":"اتصال","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","uptime_label":"مدة التشغيل","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق"},
+ "he": {"login_title":"מסנג'ר","login_subtitle":"התחבר או צור חשבון","field_nick":"כינוי","field_password":"סיסמה","btn_login":"המשך","remember_me":"זכור אותי","logged_as":"מחובר בתור","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","search_close":"סגור","title_settings":"הגדרות","title_search":"חפש (Ctrl+K)","title_add":"צור ערוץ","title_connect":"התחבר","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","uptime_label":"זמן פעילות","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור"},
+ "hi": {"login_title":"मैसेंजर","login_subtitle":"साइन इन करें या खाता बनाएं","field_nick":"उपनाम","field_password":"पासवर्ड","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","logged_as":"इस रूप में साइन इन:","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","search_close":"बंद करें","title_settings":"सेटिंग्स","title_search":"खोजें (Ctrl+K)","title_add":"चैनल बनाएं","title_connect":"जुड़ें","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","uptime_label":"अपटाइम","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_user":"इस रूप में साइन इन:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें"},
 }
-
-# Fallback: for languages not listed in detail, use English keys via t() fallback.
-_other_langs = ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]
-for _code in _other_langs:
-    if _code not in I18N:
-        I18N[_code] = {}
-
-# Some extra translations worth keeping for major languages
-I18N["es"].update({"login_title":"Mensajero","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","ph_nick":"Tu apodo","ph_password":"Tu contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_no_channels":"Sin canales","header_no_channels_sub":"Crea un canal con «+» o conéctate a uno existente","header_msgs":"{n} mensajes","empty_no_messages":"No hay mensajes. ¡Sé el primero en escribir!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","btn_cancel":"Cancelar","btn_create":"Crear","btn_connect":"Conectar","search_ph":"Buscar canales y mensajes...","search_close":"Cerrar","title_search":"Buscar (Ctrl+K)","title_add":"Crear canal","title_connect":"Conectar","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar","err_bad_credentials":"Contraseña incorrecta","err_generic":"Error"})
-I18N["de"].update({"login_title":"Messenger","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","ph_nick":"Dein Spitzname","ph_password":"Dein Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_no_channels":"Keine Kanäle","header_msgs":"{n} Nachrichten","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","btn_connect":"Verbinden","search_ph":"Kanäle und Nachrichten durchsuchen...","search_close":"Schließen","title_search":"Suchen (Strg+K)","title_add":"Kanal erstellen","title_connect":"Verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen","err_bad_credentials":"Falsches Passwort","err_generic":"Fehler"})
-I18N["fr"].update({"login_title":"Messagerie","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","ph_nick":"Votre pseudo","ph_password":"Votre mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_no_channels":"Aucun canal","header_msgs":"{n} messages","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","btn_cancel":"Annuler","btn_create":"Créer","btn_connect":"Se connecter","search_ph":"Rechercher canaux et messages...","search_close":"Fermer","title_search":"Rechercher (Ctrl+K)","title_add":"Créer un canal","title_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer","err_bad_credentials":"Mot de passe incorrect","err_generic":"Erreur"})
-I18N["ja"].update({"login_title":"メッセンジャー","login_subtitle":"サインインまたはアカウント作成","field_nick":"ニックネーム","field_password":"パスワード","btn_login":"続行","remember_me":"ログイン状態を保持","logged_as":"ログイン中:","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","search_close":"閉じる","title_search":"検索 (Ctrl+K)","title_add":"チャンネル作成","title_connect":"接続","title_settings":"設定","theme_toggle":"テーマ切替","lang_toggle":"言語変更","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる","err_generic":"エラー"})
-I18N["zh"].update({"login_title":"即时通讯","login_subtitle":"登录或创建账号","field_nick":"昵称","field_password":"密码","btn_login":"继续","remember_me":"记住我","logged_as":"登录为","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","search_close":"关闭","title_search":"搜索 (Ctrl+K)","title_add":"创建频道","title_connect":"连接","title_settings":"设置","theme_toggle":"切换主题","lang_toggle":"切换语言","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭","err_generic":"错误"})
-I18N["tr"].update({"login_title":"Anlık Mesajlaşma","login_subtitle":"Giriş yap veya hesap oluştur","field_nick":"Takma ad","field_password":"Şifre","btn_login":"Devam et","remember_me":"Beni hatırla","logged_as":"Giriş yapan:","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","search_close":"Kapat","title_search":"Ara (Ctrl+K)","title_add":"Kanal oluştur","title_connect":"Bağlan","title_settings":"Ayarlar","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat","err_generic":"Hata"})
-I18N["pt"].update({"login_title":"Mensageiro","login_subtitle":"Entre ou crie uma conta","field_nick":"Apelido","field_password":"Senha","btn_login":"Continuar","remember_me":"Lembrar-me","logged_as":"Conectado como","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","search_close":"Fechar","title_search":"Pesquisar (Ctrl+K)","title_add":"Criar canal","title_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar","err_generic":"Erro"})
-I18N["it"].update({"login_title":"Messaggero","login_subtitle":"Accedi o crea un account","field_nick":"Nickname","field_password":"Password","btn_login":"Continua","remember_me":"Ricordami","logged_as":"Connesso come","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","search_close":"Chiudi","title_search":"Cerca (Ctrl+K)","title_add":"Crea canale","title_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi","err_generic":"Errore"})
-I18N["nl"].update({"login_title":"Messenger","login_subtitle":"Meld aan of maak een account","field_nick":"Bijnaam","field_password":"Wachtwoord","btn_login":"Doorgaan","remember_me":"Onthoud mij","logged_as":"Ingelogd als","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","search_close":"Sluiten","title_search":"Zoeken (Ctrl+K)","title_add":"Kanaal aanmaken","title_connect":"Verbinden","title_settings":"Instellingen","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten","err_generic":"Fout"})
-I18N["uk"].update({"login_title":"Месенджер","login_subtitle":"Увійдіть або створіть акаунт","field_nick":"Нік","field_password":"Пароль","btn_login":"Продовжити","remember_me":"Запам'ятати мене","logged_as":"Ви увійшли як","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","search_close":"Закрити","title_search":"Пошук (Ctrl+K)","title_add":"Створити канал","title_connect":"Підключитися","title_settings":"Налаштування","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити","err_generic":"Помилка"})
-I18N["ko"].update({"login_title":"메신저","login_subtitle":"로그인 또는 계정 만들기","field_nick":"닉네임","field_password":"비밀번호","btn_login":"계속","remember_me":"로그인 상태 유지","logged_as":"로그인:","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","search_close":"닫기","title_search":"검색 (Ctrl+K)","title_add":"채널 만들기","title_connect":"연결","title_settings":"설정","theme_toggle":"테마 전환","lang_toggle":"언어 변경","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기","err_generic":"오류"})
-I18N["ar"].update({"login_title":"ماسنجر","login_subtitle":"سجّل الدخول أو أنشئ حسابًا","field_nick":"الاسم","field_password":"كلمة المرور","btn_login":"متابعة","remember_me":"تذكرني","logged_as":"مسجل باسم","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","search_close":"إغلاق","title_search":"بحث (Ctrl+K)","title_add":"إنشاء قناة","title_connect":"اتصال","title_settings":"الإعدادات","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق","err_generic":"خطأ"})
-I18N["pl"].update({"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia"})
-I18N["cs"].update({"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení"})
-I18N["sv"].update({"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar"})
-I18N["el"].update({"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις"})
-I18N["he"].update({"btn_login":"המשך","remember_me":"זכור אותי","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_lang":"שפה","settings_close":"סגור","title_settings":"הגדרות"})
-I18N["hi"].update({"btn_login":"जारी रखें","remember_me":"मुझे याद रखें","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_logout":"साइन आउट","settings_theme":"थीम","settings_lang":"भाषा","settings_close":"बंद करें","title_settings":"सेटिंग्स"})
 
 # ---------------- SVG flags ----------------
 _F = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="20" height="{hh}" style="border:1px solid rgba(0,0,0,.25)">{body}</svg>'
@@ -391,31 +407,48 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0088cc">
 <title>Messenger</title>
 <link rel="stylesheet" href="https://getbootstrap.com/1.4.0/assets/css/bootstrap.min.css">
 <style>
-* { scrollbar-width: none; -ms-overflow-style: none; }
+* { scrollbar-width: none; -ms-overflow-style: none; -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
 *::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
-html, body { height: 100%; margin: 0; }
+
+html { height: 100%; }
 body {
+  margin: 0;
   background: #f5f5f5;
   font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
   font-size: 13px;
   color: #333;
   overflow: hidden;
+  height: var(--app-vh, 100vh);
   -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none;
 }
-input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; }
+input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
 
-/* Login */
-.login-screen { position: fixed; inset: 0; background: #e9eef3; background-image: linear-gradient(#f5f8fb, #dfe6ee); display: flex; align-items: center; justify-content: center; z-index: 500; }
-.login-box { width: 320px; background: #fff; border: 1px solid #b8c4d0; box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 20px 20px 14px; text-align: center; }
+/* Tap-friendly interactive elements */
+button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn, .settings-tab, .search-result {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ---- Login ---- */
+.login-screen {
+  position: fixed; top: 0; left: 0; right: 0;
+  height: var(--app-vh, 100vh);
+  background: #e9eef3; background-image: linear-gradient(#f5f8fb, #dfe6ee);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 500; padding: 16px; box-sizing: border-box;
+  overflow-y: auto;
+}
+.login-box { width: 320px; max-width: 100%; background: #fff; border: 1px solid #b8c4d0; box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 20px 20px 14px; text-align: center; margin: auto; }
 .login-box h2 { margin: 0 0 4px; font-size: 18px; color: #2b3d51; }
 .login-box p { margin: 0 0 16px; color: #7b8a99; font-size: 12px; }
 .my-label { display: block !important; text-align: left !important; font-size: 11px !important; font-weight: bold !important; color: #667788 !important; margin: 0 0 4px 0 !important; padding: 0 !important; line-height: 1.4 !important; text-transform: uppercase !important; letter-spacing: .3px; }
 .field-group { margin-bottom: 12px; text-align: left; }
-.my-input { display: block !important; width: 100% !important; box-sizing: border-box !important; padding: 7px 10px !important; border: 1px solid #b8c4d0 !important; font-size: 13px !important; background: #fff !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.08) !important; font-family: inherit !important; color: #333 !important; outline: none !important; height: auto !important; line-height: 1.4 !important; margin: 0 !important; }
+.my-input { display: block !important; width: 100% !important; box-sizing: border-box !important; padding: 7px 10px !important; border: 1px solid #b8c4d0 !important; font-size: 13px !important; background: #fff !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.08) !important; color: #333 !important; outline: none !important; height: auto !important; line-height: 1.4 !important; margin: 0 !important; border-radius: 0 !important; }
 .my-input:focus { border-color: #0088cc !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.08), 0 0 4px rgba(0,136,204,.5) !important; }
 .login-box .btn { width: 100%; margin-top: 6px; }
 .remember-row { display: flex !important; align-items: center !important; font-size: 12px !important; color: #4a5a6a !important; margin: 8px 0 4px 0 !important; cursor: pointer; user-select: none; }
@@ -425,38 +458,45 @@ svg { display: inline-block; vertical-align: middle; }
 .uptime-line { margin-top: 12px; padding-top: 10px; border-top: 1px solid #e0e5eb; font-size: 11px; color: #7b8a99; display: flex; justify-content: space-between; }
 .uptime-line .u-val { font-weight: bold; color: #4a5a6a; font-family: "Courier New", monospace; }
 
-/* Lang picker (login screen) */
+/* ---- Lang picker ---- */
 .login-settings { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e0e5eb; display: flex; gap: 6px; }
-.settings-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; height: 26px; padding: 0 8px; border: 1px solid #b8c4d0; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #333; cursor: pointer; font-size: 12px; font-family: inherit; text-shadow: 0 1px 0 rgba(255,255,255,.6); }
+.settings-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; height: 26px; padding: 0 8px; border: 1px solid #b8c4d0; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #333; cursor: pointer; font-size: 12px; font-family: inherit; text-shadow: 0 1px 0 rgba(255,255,255,.6); border-radius: 0; }
 .settings-btn:hover { background: #d9d9d9; background-image: linear-gradient(#f5f5f5, #d9d9d9); color: #000; }
 .settings-btn .lang-code { margin-left: 6px; font-size: 11px; font-weight: bold; letter-spacing: .5px; }
 .lang-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 9998; display: none; }
 .lang-backdrop.open { display: block; }
-.lang-menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; border: 1px solid #666; box-shadow: 0 5px 20px rgba(0,0,0,.4); padding: 8px; z-index: 9999; display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; max-width: calc(100vw - 20px); max-height: calc(100vh - 20px); overflow-y: auto; box-sizing: border-box; width: 560px; }
+.lang-menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; border: 1px solid #666; box-shadow: 0 5px 20px rgba(0,0,0,.4); padding: 8px; z-index: 9999; display: none; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; max-width: calc(100vw - 20px); max-height: calc(100vh - 20px); overflow-y: auto; box-sizing: border-box; width: 560px; border-radius: 0; }
 .lang-menu.open { display: grid; }
-.lang-menu-item { display: flex; align-items: center; padding: 6px 8px; cursor: pointer; font-size: 12px; color: #333; gap: 7px; border: 1px solid #ddd; background: #fafafa; min-width: 0; box-sizing: border-box; }
+.lang-menu-item { display: flex; align-items: center; padding: 6px 8px; cursor: pointer; font-size: 12px; color: #333; gap: 7px; border: 1px solid #ddd; background: #fafafa; min-width: 0; box-sizing: border-box; border-radius: 0; }
 .lang-menu-item:hover { background: #eaf4fb; border-color: #8ab4dc; }
 .lang-menu-item.active { background: #d6e8f7; color: #004a80; font-weight: bold; border-color: #4a90c2; }
 .lang-menu-item .flag-wrap { flex-shrink: 0; display: inline-flex; align-items: center; }
 .lang-menu-item .lang-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lang-menu-item .check { flex-shrink: 0; color: #0088cc; font-weight: bold; visibility: hidden; }
 .lang-menu-item.active .check { visibility: visible; }
-@media (max-width: 600px) { .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
-/* App — fullscreen */
-.app { width: 100vw; height: 100vh; background: #fff; display: flex; flex-direction: column; position: relative; }
+/* ---- App ---- */
+.app {
+  width: 100%;
+  height: var(--app-vh, 100vh);
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
 .tabs-bar { display: flex; align-items: center; padding: 6px 8px; background: #f5f5f5; background-image: linear-gradient(#ffffff, #ececec); border-bottom: 1px solid #ccc; flex-shrink: 0; gap: 4px; }
-.tabs-scroll { display: flex; align-items: center; flex: 1 1 0; min-width: 0; overflow-x: auto; overflow-y: hidden; padding-bottom: 1px; scroll-behavior: smooth; }
-.scroll-arrow { width: 18px; height: 26px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #555; cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.tabs-scroll { display: flex; align-items: center; flex: 1 1 0; min-width: 0; overflow-x: auto; overflow-y: hidden; padding-bottom: 1px; scroll-behavior: smooth; -webkit-overflow-scrolling: touch; }
+.scroll-arrow { width: 18px; height: 26px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #555; cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 0; }
 .scroll-arrow:hover { background: #d9d9d9; color: #000; }
-.channel-tab { display: inline-flex; align-items: center; padding: 4px 10px; margin-right: 4px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #444; font-size: 12px; white-space: nowrap; cursor: pointer; text-shadow: 0 1px 0 rgba(255,255,255,.6); flex-shrink: 0; font-family: "Courier New", Courier, monospace; }
+.channel-tab { display: inline-flex; align-items: center; padding: 4px 10px; margin-right: 4px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #444; font-size: 12px; white-space: nowrap; cursor: pointer; text-shadow: 0 1px 0 rgba(255,255,255,.6); flex-shrink: 0; font-family: "Courier New", Courier, monospace; border-radius: 0; }
 .channel-tab:last-child { margin-right: 0; }
 .channel-tab:hover { background: #d9d9d9; color: #000; }
 .channel-tab.active { background: #006dcc; background-image: linear-gradient(#0088cc, #0044cc); color: #fff; border-color: #003f81; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
 .channel-tab .lock-ico { margin-right: 4px; opacity: .8; display: inline-flex; align-items: center; }
-.channel-tab .close-x { margin-left: 6px; cursor: pointer; opacity: .55; display: inline-flex; align-items: center; color: inherit; }
+.channel-tab .close-x { margin-left: 6px; cursor: pointer; opacity: .55; display: inline-flex; align-items: center; color: inherit; padding: 2px; }
 .channel-tab .close-x:hover { opacity: 1; color: #c00; }
-.icon-btn-tab { width: 26px; height: 26px; line-height: 1; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #555; cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.icon-btn-tab { width: 26px; height: 26px; line-height: 1; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); color: #555; cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border-radius: 0; }
 .icon-btn-tab:hover { background: #d9d9d9; color: #000; }
 .top-sep { width: 1px; height: 20px; background: #ccc; margin: 0 4px; flex-shrink: 0; }
 
@@ -469,9 +509,9 @@ svg { display: inline-block; vertical-align: middle; }
 .search-panel { position: absolute; top: 0; left: 0; right: 0; background: #fff; border-bottom: 1px solid #ccc; box-shadow: 0 2px 6px rgba(0,0,0,.2); z-index: 30; transform: translateY(-110%); transition: transform .18s ease-out; max-height: 70vh; display: flex; flex-direction: column; }
 .search-panel.open { transform: translateY(0); }
 .search-panel .search-head { padding: 8px 10px; display: flex; align-items: center; border-bottom: 1px solid #e5e5e5; background: #f5f5f5; background-image: linear-gradient(#ffffff, #efefef); gap: 8px; }
-.search-panel .search-head input { flex: 1; padding: 5px 8px !important; border: 1px solid #bbb !important; font-size: 12px !important; outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important; background: #fff !important; color: #333 !important; box-sizing: border-box !important; margin: 0 !important; }
-.search-panel .close-search { padding: 4px 10px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); cursor: pointer; font-size: 12px; color: #333; flex-shrink: 0; }
-.search-results { overflow-y: auto; }
+.search-panel .search-head input { flex: 1; padding: 5px 8px !important; border: 1px solid #bbb !important; font-size: 12px !important; outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important; background: #fff !important; color: #333 !important; box-sizing: border-box !important; margin: 0 !important; border-radius: 0 !important; }
+.search-panel .close-search { padding: 4px 10px; border: 1px solid #bbb; background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6); cursor: pointer; font-size: 12px; color: #333; flex-shrink: 0; border-radius: 0; }
+.search-results { overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .search-results .empty { padding: 20px; text-align: center; color: #999; font-size: 12px; }
 .search-result { display: flex; align-items: center; padding: 8px 12px; border-bottom: 1px solid #eee; cursor: pointer; gap: 8px; }
 .search-result:hover { background: #eaf4fb; }
@@ -480,7 +520,7 @@ svg { display: inline-block; vertical-align: middle; }
 .search-result mark { background: #fff3a8; padding: 0 1px; }
 .search-result .type-tag { font-size: 10px; text-transform: uppercase; color: #888; border: 1px solid #ccc; padding: 1px 5px; background: #f5f5f5; flex-shrink: 0; }
 
-.chat-feed { flex: 1; overflow-y: auto; padding: 8px 12px; background: #fdfdfd; }
+.chat-feed { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 8px 12px; background: #fdfdfd; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 .msg-row { padding: 2px 4px; line-height: 1.55; font-size: 12.5px; word-wrap: break-word; transition: background .3s; }
@@ -495,7 +535,7 @@ svg { display: inline-block; vertical-align: middle; }
 .msg-system.info { color: #31708f; background: #eaf4fb; border-color: #bce0f0; }
 
 .composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px 10px; background: #f5f5f5; background-image: linear-gradient(#f0f0f0, #ffffff); border-top: 1px solid #ccc; flex-shrink: 0; }
-.composer textarea { flex: 1; resize: none; padding: 6px 8px !important; border: 1px solid #bbb !important; font-size: 12px !important; max-height: 140px; outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important; font-family: inherit !important; background: #fff !important; color: #333 !important; box-sizing: border-box !important; margin: 0 !important; overflow: hidden; }
+.composer textarea { flex: 1; resize: none; padding: 6px 8px !important; border: 1px solid #bbb !important; font-size: 12px !important; max-height: 140px; outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important; background: #fff !important; color: #333 !important; box-sizing: border-box !important; margin: 0 !important; overflow: hidden; border-radius: 0 !important; }
 .composer textarea:focus { border-color: #0088cc !important; }
 .composer textarea[disabled] { background: #f7e6e6 !important; border-color: #d6a0a0 !important; color: #a94442 !important; }
 .composer .icon-btn { width: 32px; height: 32px; padding: 0; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -503,9 +543,9 @@ svg { display: inline-block; vertical-align: middle; }
 /* Modals */
 .my-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 1000; display: none; justify-content: center; align-items: center; padding: 20px; box-sizing: border-box; }
 .my-modal-backdrop.open { display: flex; }
-.my-modal { width: 400px; max-width: 100%; background: #fff; border: 1px solid #666; box-shadow: 0 5px 20px rgba(0,0,0,.4); position: relative; box-sizing: border-box; }
+.my-modal { width: 400px; max-width: 100%; background: #fff; border: 1px solid #666; box-shadow: 0 5px 20px rgba(0,0,0,.4); position: relative; box-sizing: border-box; border-radius: 0; }
 .modal-head { padding: 8px 12px; background: #f5f5f5; background-image: linear-gradient(#ffffff, #efefef); border-bottom: 1px solid #ccc; font-weight: bold; font-size: 13px; display: flex; align-items: center; cursor: move; user-select: none; }
-.modal-head .close-m { margin-left: auto; cursor: pointer; color: #666; padding: 0 4px; line-height: 1; display: inline-flex; align-items: center; }
+.modal-head .close-m { margin-left: auto; cursor: pointer; color: #666; padding: 4px; line-height: 1; display: inline-flex; align-items: center; }
 .modal-head .close-m:hover { color: #c00; background: #e6e6e6; }
 .modal-body { padding: 14px; text-align: left; }
 .modal-foot { padding: 10px 12px; background: #f7f7f7; border-top: 1px solid #e5e5e5; text-align: right; }
@@ -520,7 +560,7 @@ svg { display: inline-block; vertical-align: middle; }
 #settingsModal { width: 520px; }
 .settings-body { display: flex; min-height: 260px; }
 .settings-tabs { width: 140px; background: #f5f5f5; border-right: 1px solid #ddd; padding: 8px 0; }
-.settings-tab { display: block; width: 100%; text-align: left; padding: 8px 14px; background: transparent; border: 0; border-left: 3px solid transparent; cursor: pointer; font-size: 12px; color: #444; font-family: inherit; }
+.settings-tab { display: block; width: 100%; text-align: left; padding: 8px 14px; background: transparent; border: 0; border-left: 3px solid transparent; cursor: pointer; font-size: 12px; color: #444; font-family: inherit; border-radius: 0; }
 .settings-tab:hover { background: #e9ecef; }
 .settings-tab.active { background: #fff; border-left-color: #0088cc; color: #006dcc; font-weight: bold; }
 .settings-content { flex: 1; padding: 16px; overflow-y: auto; max-height: 60vh; }
@@ -587,6 +627,117 @@ body.dark .settings-tab.active { background: #252526; border-left-color: #0e639c
 body.dark .settings-label { color: #777; }
 body.dark .settings-value { color: #eaeaea; }
 body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c; }
+
+/* ============================================================
+   MOBILE / TABLET
+   ============================================================ */
+
+/* Active feedback on touch devices */
+@media (hover: none) {
+  .channel-tab:active { background: #c9c9c9; background-image: none; }
+  .icon-btn-tab:active { background: #c9c9c9; background-image: none; }
+  .scroll-arrow:active { background: #c9c9c9; background-image: none; }
+  .settings-btn:active { background: #c9c9c9; background-image: none; }
+  .lang-menu-item:active { background: #d6e8f7; }
+  .search-result:active { background: #eaf4fb; }
+  .msg-row:hover { background: transparent; }
+}
+
+/* Phones & small tablets */
+@media (max-width: 768px) {
+  /* Login */
+  .login-screen { padding: 16px; align-items: flex-start; padding-top: 40px; padding-bottom: 40px; }
+  .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
+  .login-box h2 { font-size: 20px; }
+  .login-box p { font-size: 13px; }
+  .login-box .btn { padding: 12px; font-size: 15px; }
+  .my-label { font-size: 11px !important; }
+  .my-input, .login-box .my-input, .my-modal .my-input { font-size: 16px !important; padding: 11px 12px !important; }
+  .remember-row { font-size: 14px; }
+  .remember-row input { width: 18px; height: 18px; }
+  .settings-btn { height: 40px; font-size: 14px; }
+  .settings-btn .lang-code { font-size: 12px; }
+  .uptime-line { font-size: 12px; }
+
+  /* App layout */
+  .tabs-bar { padding: 8px 6px; gap: 6px; }
+  .tabs-scroll { gap: 4px; }
+  .channel-tab { padding: 8px 12px; font-size: 13px; margin-right: 4px; min-height: 36px; }
+  .channel-tab .close-x { padding: 4px 6px; margin-left: 4px; }
+  .icon-btn-tab { width: 38px; height: 38px; }
+  .icon-btn-tab svg { width: 18px !important; height: 18px !important; }
+  .scroll-arrow { width: 28px; height: 38px; }
+  .scroll-arrow svg { width: 12px !important; height: 12px !important; }
+  .top-sep { height: 26px; margin: 0 2px; }
+
+  .chat-header { padding: 10px 12px; }
+  .chat-header .title { font-size: 15px; }
+  .chat-header .subtitle { font-size: 12px; }
+  .chat-header .user-info { display: none; }
+
+  .chat-feed { padding: 10px; }
+  .msg-row { font-size: 14px; padding: 4px 6px; line-height: 1.5; }
+  .msg-author { font-size: 14px; }
+  .msg-time { font-size: 11px; }
+  .msg-system { font-size: 12.5px; padding: 6px 10px; }
+
+  .composer { padding: 8px; gap: 6px; }
+  .composer textarea { font-size: 16px !important; padding: 10px 12px !important; max-height: 120px; }
+  .composer .icon-btn { width: 42px; height: 42px; }
+  .composer .icon-btn svg { width: 18px !important; height: 18px !important; }
+
+  /* Search */
+  .search-panel .search-head { padding: 8px; gap: 6px; }
+  .search-panel .search-head input { font-size: 16px !important; padding: 9px 11px !important; }
+  .search-panel .close-search { padding: 8px 12px; font-size: 13px; }
+  .search-result { padding: 10px 12px; }
+  .search-result .title-line { font-size: 13px; }
+  .search-result .sub-line { font-size: 12px; }
+
+  /* Modals */
+  .my-modal-backdrop { padding: 10px; align-items: flex-start; padding-top: 20px; padding-bottom: 20px; overflow-y: auto; }
+  .my-modal { width: 100%; max-width: 500px; margin: auto; }
+  #settingsModal { width: 100%; max-width: 500px; }
+  .modal-head { padding: 12px 14px; font-size: 15px; }
+  .modal-head .close-m { padding: 6px; }
+  .modal-body { padding: 16px; }
+  .modal-foot { padding: 12px; }
+  .modal-foot .btn { padding: 10px 18px; font-size: 14px; }
+  .checkbox-row { font-size: 13px; padding: 4px 0; }
+  .checkbox-row input { width: 18px; height: 18px; }
+
+  /* Settings on mobile — tabs on top */
+  .settings-body { flex-direction: column; min-height: 0; }
+  .settings-tabs { width: 100%; border-right: 0; border-bottom: 1px solid #ddd; padding: 0; display: flex; }
+  .settings-tab { flex: 1; text-align: center; padding: 12px 8px; border-left: 0; border-bottom: 3px solid transparent; font-size: 13px; }
+  .settings-tab.active { border-left-color: transparent; border-bottom-color: #0088cc; }
+  body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
+  .settings-content { padding: 14px; max-height: 55vh; }
+  .settings-lang-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-lang-grid .lang-menu-item { padding: 8px; font-size: 12px; }
+
+  /* Lang menu — 2 columns on phones */
+  .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 6px; gap: 4px; }
+  .lang-menu-item { padding: 8px; font-size: 12px; }
+}
+
+/* Small phones */
+@media (max-width: 400px) {
+  .channel-tab { padding: 7px 10px; font-size: 12px; min-height: 34px; }
+  .icon-btn-tab { width: 34px; height: 34px; }
+  .icon-btn-tab svg { width: 16px !important; height: 16px !important; }
+  .scroll-arrow { width: 24px; height: 34px; }
+  .composer .icon-btn { width: 38px; height: 38px; }
+  .lang-menu { grid-template-columns: 1fr; }
+  .settings-lang-grid { grid-template-columns: 1fr; }
+}
+
+/* Tablets */
+@media (min-width: 769px) and (max-width: 1024px) {
+  .lang-menu { width: 620px; }
+  .my-modal { max-width: 500px; }
+  #settingsModal { width: 540px; }
+}
 </style>
 </head>
 <body>
@@ -598,7 +749,7 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
 
     <div class="field-group">
       <label class="my-label" id="lblNick" for="loginName"></label>
-      <input type="text" id="loginName" class="my-input" maxlength="32" autocomplete="username">
+      <input type="text" id="loginName" class="my-input" maxlength="32" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false">
     </div>
 
     <div class="field-group">
@@ -694,7 +845,6 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   </div>
 </div>
 
-<!-- Create channel -->
 <div class="my-modal-backdrop" id="createBackdrop">
   <div class="my-modal" id="newChannelModal">
     <div class="modal-head" id="createModalHead">
@@ -705,7 +855,7 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
     </div>
     <div class="modal-body">
       <label class="my-label" id="lblCreateName" for="newChannelName"></label>
-      <input type="text" id="newChannelName" class="my-input" maxlength="40">
+      <input type="text" id="newChannelName" class="my-input" maxlength="40" autocapitalize="sentences" spellcheck="false">
       <label class="checkbox-row">
         <input type="checkbox" id="newChannelPrivate">
         <span id="lblPrivate"></span>
@@ -718,7 +868,6 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   </div>
 </div>
 
-<!-- Connect -->
 <div class="my-modal-backdrop" id="connectBackdrop">
   <div class="my-modal" id="connectModal">
     <div class="modal-head" id="connectModalHead">
@@ -729,7 +878,7 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
     </div>
     <div class="modal-body">
       <label class="my-label" id="lblConnectName" for="connectChannelName"></label>
-      <input type="text" id="connectChannelName" class="my-input" maxlength="40">
+      <input type="text" id="connectChannelName" class="my-input" maxlength="40" autocapitalize="none" autocorrect="off" spellcheck="false">
       <div class="error-msg" id="connectError"><span class="sys-icon">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/></svg>
       </span><span id="connectErrorText"></span></div>
@@ -741,7 +890,6 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
   </div>
 </div>
 
-<!-- Settings -->
 <div class="my-modal-backdrop" id="settingsBackdrop">
   <div class="my-modal" id="settingsModal">
     <div class="modal-head" id="settingsModalHead">
@@ -801,6 +949,19 @@ const SVG = {
   moon:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
 };
 
+// ---------- Mobile viewport fix (keyboard-aware) ----------
+function updateAppVH() {
+  const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
+  document.documentElement.style.setProperty('--app-vh', h + 'px');
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', updateAppVH);
+  window.visualViewport.addEventListener('scroll', updateAppVH);
+}
+window.addEventListener('resize', updateAppVH);
+window.addEventListener('orientationchange', () => setTimeout(updateAppVH, 100));
+updateAppVH();
+
 let currentLang = localStorage.getItem('lang') || 'en';
 let currentTheme = localStorage.getItem('theme') || 'light';
 let authToken = null;
@@ -824,7 +985,7 @@ const t = (key, vars) => {
   return s;
 };
 
-// ---------------- Crypto ----------------
+// ---------- Crypto ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 async function deriveChannelKey(channelId) {
@@ -855,7 +1016,7 @@ async function decryptText(chId, payload) {
   } catch(e) { return '[decrypt error]'; }
 }
 
-// ---------------- HTTP ----------------
+// ---------- HTTP ----------
 async function api(path, method='GET', body=null, withAuth=true) {
   const headers = { 'Content-Type': 'application/json' };
   if (withAuth && authToken) headers['x-auth-token'] = authToken;
@@ -866,7 +1027,7 @@ async function api(path, method='GET', body=null, withAuth=true) {
   return data;
 }
 
-// ---------------- Uptime ----------------
+// ---------- Uptime ----------
 function fmtUptime(sec) {
   sec = Math.max(0, Math.floor(sec));
   const d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600), m = Math.floor((sec%3600)/60), s = sec%60;
@@ -883,7 +1044,7 @@ function renderUptime() {
 }
 setInterval(renderUptime, 1000); refreshUptime(); setInterval(refreshUptime, 30000);
 
-// ---------------- Theme ----------------
+// ---------- Theme ----------
 function applyTheme() {
   document.body.classList.toggle('dark', currentTheme === 'dark');
   $('themeIcon').innerHTML = currentTheme === 'dark' ? SVG.sun : SVG.moon;
@@ -893,7 +1054,7 @@ function applyTheme() {
 }
 function toggleTheme() { currentTheme = currentTheme === 'dark' ? 'light' : 'dark'; applyTheme(); }
 
-// ---------------- Language ----------------
+// ---------- Language ----------
 function applyLanguage() {
   localStorage.setItem('lang', currentLang);
 
@@ -931,7 +1092,6 @@ function applyLanguage() {
   $('btnCancelConnect').textContent = t('btn_cancel');
   $('connectChannelBtn').textContent = t('btn_connect');
 
-  // Settings modal
   $('settingsTitle').textContent = t('settings_title');
   $('tabAccount').textContent = t('settings_account');
   $('tabAppearance').textContent = t('settings_appearance');
@@ -976,7 +1136,7 @@ function buildSettingsLangGrid() {
 function openLangMenu() { $('langBackdrop').classList.add('open'); $('langMenu').classList.add('open'); }
 function closeLangMenu() { $('langBackdrop').classList.remove('open'); $('langMenu').classList.remove('open'); }
 
-// ---------------- Login error ----------------
+// ---------- Login error ----------
 let loginErrTimer = null;
 function showLoginError(msg) {
   const box = $('loginError');
@@ -987,7 +1147,7 @@ function showLoginError(msg) {
   loginErrTimer = setTimeout(() => box.classList.remove('show'), 3500);
 }
 
-// ---------------- Auth ----------------
+// ---------- Auth ----------
 async function doAuth() {
   const username = $('loginName').value.trim();
   const password = $('loginPass').value;
@@ -1021,6 +1181,7 @@ function enterApp() {
   $('app').style.display = 'flex';
   $('headerUser').textContent = currentUser;
   $('settingsUser').textContent = currentUser;
+  updateAppVH();
   loadChannels();
 }
 
@@ -1041,12 +1202,12 @@ async function tryRestoreSession() {
   }
 }
 
-// ---------------- Theme/lang buttons (login) ----------------
+// ---------- Theme/lang buttons (login) ----------
 $('themeBtn').addEventListener('click', e => { e.stopPropagation(); toggleTheme(); });
 $('langBtn').addEventListener('click', e => { e.stopPropagation(); $('langMenu').classList.contains('open') ? closeLangMenu() : openLangMenu(); });
 $('langBackdrop').addEventListener('click', closeLangMenu);
 
-// ---------------- Settings modal ----------------
+// ---------- Settings modal ----------
 $('settingsBtn').addEventListener('click', () => {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
@@ -1070,9 +1231,10 @@ $('settingsLogoutBtn').addEventListener('click', async () => {
   $('app').style.display = 'none';
   $('loginScreen').style.display = 'flex';
   closeLangMenu();
+  updateAppVH();
 });
 
-// ---------------- Channels ----------------
+// ---------- Channels ----------
 async function loadChannels() {
   try {
     const res = await api('/api/channels');
@@ -1146,7 +1308,7 @@ function renderHeader() {
   $('headerSubtitle').textContent = t('header_msgs', {n: ch.messages.length}) + extra;
 }
 
-// ---------------- Messages ----------------
+// ---------- Messages ----------
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 let mutes = {};
 
@@ -1171,11 +1333,9 @@ function renderMessages() {
   });
   const chId = activeId;
   feed.querySelectorAll('.msg-row').forEach(row => {
-    const ct = row.querySelector('.msg-text').dataset.ct;
-    decryptText(chId, ct).then(pt => {
-      const span = row.querySelector('.msg-text');
-      if (span) span.textContent = pt;
-    });
+    const span = row.querySelector('.msg-text');
+    const ct = span.dataset.ct;
+    decryptText(chId, ct).then(pt => { span.textContent = pt; });
   });
   feed.scrollTop = feed.scrollHeight;
 }
@@ -1203,11 +1363,11 @@ function appendMessageUI(msg, channelId) {
   feed.scrollTop = feed.scrollHeight;
 }
 
-function addSystem(text, info) {
+function addSystem(text) {
   const feed = $('chatFeed');
   const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
   const row = document.createElement('div');
-  row.className = 'msg-row msg-system' + (info ? ' info' : '');
+  row.className = 'msg-row msg-system';
   row.innerHTML = '<span class="sys-icon">'+SVG.ban+'</span><span>'+escapeHtml(text)+'</span>';
   feed.appendChild(row); feed.scrollTop = feed.scrollHeight;
 }
@@ -1222,7 +1382,7 @@ function updateMuteUI() {
 }
 setInterval(updateMuteUI, 1000);
 
-// ---------------- WebSocket ----------------
+// ---------- WebSocket ----------
 function openChannelWS(channelId) {
   if (ws && wsChannelId === channelId && ws.readyState === WebSocket.OPEN) return;
   if (ws) { try { ws.close(); } catch(e){} ws = null; }
@@ -1234,7 +1394,7 @@ function openChannelWS(channelId) {
     let data; try { data = JSON.parse(ev.data); } catch(e){ return; }
     if (data.type === 'message' && data.msg) { appendMessageUI(data.msg, channelId); renderHeader(); }
     else if (data.type === 'presence') { onlineUsers = data.users || []; renderHeader(); }
-    else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's (rate limit)', false); }
+    else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's (rate limit)'); }
     else if (data.type === 'error' && data.error === 'auth') { $('settingsLogoutBtn').click(); }
   };
   ws.onclose = () => { if (wsChannelId === channelId) ws = null; };
@@ -1254,10 +1414,10 @@ function sendMessage() {
 }
 $('sendBtn').addEventListener('click', sendMessage);
 $('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-function autoResize() { const el = $('msgInput'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 140) + 'px'; }
+function autoResize() { const el = $('msgInput'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
 $('msgInput').addEventListener('input', autoResize);
 
-// ---------------- Modals (generic) ----------------
+// ---------- Modals (generic) ----------
 document.addEventListener('click', e => {
   const el = e.target.closest && e.target.closest('[data-close-modal]');
   if (!el) return;
@@ -1321,7 +1481,7 @@ $('connectChannelBtn').addEventListener('click', async () => {
 $('connectChannelName').addEventListener('keydown', e => { if (e.key === 'Enter') $('connectChannelBtn').click(); });
 $('connectChannelName').addEventListener('input', () => $('connectError').classList.remove('show'));
 
-// ---------------- Search ----------------
+// ---------- Search ----------
 $('searchBtn').addEventListener('click', () => {
   $('searchPanel').classList.add('open');
   $('searchInput').value = '';
@@ -1387,7 +1547,7 @@ function hl(text, q) {
   return escapeHtml(text).replace(re, '<mark>$1</mark>');
 }
 
-// ---------------- Keyboard nav ----------------
+// ---------- Keyboard nav ----------
 function switchChannel(delta) {
   if (!channels.length) return;
   const idx = channels.findIndex(c => c.id === activeId);
@@ -1408,9 +1568,28 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') { switchChannel(1); e.preventDefault(); }
 });
 
+// Swipe on tabs-scroll area changes channel on mobile
+let touchStartX = 0, touchStartY = 0, touchActive = false;
+const feedEl = $('chatFeed');
+feedEl.addEventListener('touchstart', e => {
+  if (e.touches.length !== 1) return;
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+  touchActive = true;
+}, {passive: true});
+feedEl.addEventListener('touchend', e => {
+  if (!touchActive) return;
+  touchActive = false;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    switchChannel(dx < 0 ? 1 : -1);
+  }
+}, {passive: true});
+
 function renderAll() { renderTabs(); renderHeader(); renderMessages(); updateMuteUI(); scrollActiveTabIntoView(); }
 
-// ---------------- Init ----------------
+// ---------- Init ----------
 applyLanguage();
 renderUptime();
 (async () => {
