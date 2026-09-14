@@ -35,12 +35,17 @@ RATE_LIMIT_MAX = 20
 MUTE_SECONDS = 30
 TOKEN_TTL = 60 * 60 * 24 * 7
 MAX_USER_CHANNELS = 500
-MAX_BODY_SIZE = 64 * 1024
+MAX_BODY_SIZE = 96 * 1024                # 96 KB (stickers)
 GLOBAL_RATE_WINDOW = 60.0
 GLOBAL_RATE_MAX = 300
 AUTH_RATE_WINDOW = 60.0
 AUTH_RATE_MAX = 8
 WS_PER_IP_MAX = 5
+
+# Stickers
+MAX_STICKERS = 2000
+MAX_STICKERS_PER_USER = 200
+MAX_STICKER_DATAURL = 64 * 1024          # 64 KB
 
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
@@ -55,6 +60,8 @@ USER_CHANNELS: Dict[str, Set[str]] = {}
 MSG_TIMES: Dict[str, List[float]] = {}
 IP_RATE: Dict[str, List[float]] = {}
 WS_PER_IP: Dict[str, int] = {}
+STICKERS: Dict[str, dict] = {}
+STICKER_BY_NAME: Dict[str, str] = {}
 
 def log(msg: str) -> None:
     try: print(f"[SldClient {time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -174,6 +181,9 @@ class LeaveChannelReq(BaseModel):
     channel_id: str
 class PrefsReq(BaseModel):
     show_in_list: bool
+class CreateStickerReq(BaseModel):
+    name: str
+    image: str
 
 def init_defaults():
     for cid, name, private in [
@@ -184,7 +194,7 @@ def init_defaults():
                          "owner":None,"created":time.time(),"messages":[]}
 init_defaults()
 
-# ---------------- REST ----------------
+# ---------------- REST: auth/users/channels ----------------
 @app.post("/api/auth")
 async def auth_endpoint(req: AuthReq, request: Request):
     ip = get_client_ip(request)
@@ -224,7 +234,8 @@ async def logout(request: Request):
 @app.get("/api/uptime")
 async def uptime():
     return {"uptime": time.time()-START_TIME, "users":len(USERS),
-            "channels":len(CHANNELS), "online":len(TOKENS), "name":"SldClient"}
+            "channels":len(CHANNELS), "online":len(TOKENS),
+            "stickers":len(STICKERS), "name":"SldClient"}
 
 @app.get("/api/me")
 async def me(request: Request):
@@ -299,6 +310,53 @@ async def leave_channel(req: LeaveChannelReq, request: Request):
     s = USER_CHANNELS.get(username)
     if s is not None: s.discard(req.channel_id)
     return {"ok": True}
+
+# ---------------- REST: stickers ----------------
+@app.post("/api/stickers")
+async def create_sticker(req: CreateStickerReq, request: Request):
+    username = await auth(request)
+    name = req.name.strip()[:40]
+    if not name: raise HTTPException(400, "bad_name")
+    # Only allow PNG data URL (client resizes to 64x64 PNG)
+    if not req.image.startswith("data:image/png;base64,"):
+        raise HTTPException(400, "bad_image")
+    if len(req.image) > MAX_STICKER_DATAURL:
+        raise HTTPException(413, "image_too_large")
+    if name.lower() in STICKER_BY_NAME:
+        raise HTTPException(409, "name_taken")
+    if len(STICKERS) >= MAX_STICKERS:
+        raise HTTPException(503, "server_full")
+    user_count = sum(1 for s in STICKERS.values() if s["author"] == username)
+    if user_count >= MAX_STICKERS_PER_USER:
+        raise HTTPException(503, "user_sticker_limit")
+    sid = secrets.token_hex(6)
+    STICKERS[sid] = {
+        "id": sid, "name": name, "author": username,
+        "image": req.image, "created": time.time(),
+    }
+    STICKER_BY_NAME[name.lower()] = sid
+    return {"id": sid, "name": name, "author": username,
+            "image": req.image, "created": STICKERS[sid]["created"]}
+
+@app.get("/api/stickers")
+async def list_stickers(request: Request, q: str = "", limit: int = 200):
+    await auth(request)
+    ql = q.strip().lower()
+    lim = max(1, min(500, limit))
+    out = []
+    for s in STICKERS.values():
+        if not ql or ql in s["name"].lower() or ql in s["author"].lower():
+            out.append({"id":s["id"],"name":s["name"],"author":s["author"],
+                        "created":s["created"],"image":s["image"]})
+    out.sort(key=lambda s: s["created"], reverse=True)
+    return {"stickers": out[:lim]}
+
+@app.get("/api/stickers/{sid}")
+async def get_sticker(sid: str, request: Request):
+    await auth(request)
+    s = STICKERS.get(sid)
+    if not s: raise HTTPException(404, "not_found")
+    return s
 
 # ---------------- WebSocket ----------------
 class WSManager:
@@ -381,26 +439,26 @@ async def ws_endpoint(ws: WebSocket):
 #  i18n
 # ============================================================
 I18N = {
- "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open the Channels panel to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.<br>Open the Channels panel to create or join one.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create channel","modal_name":"Name","modal_name_ph":"E.g. Work","modal_private":"Private channel","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_ph":"Search channels...","search_close":"Close","search_empty":"Nothing found","search_no_channels":"You have no channels yet","tag_channel":"channel","tag_msg":"msg.","in_channel":"in «{name}»","title_search":"Search (Ctrl+K)","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","mobile_my_channels":"My channels"},
- "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте панель «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.<br>Откройте панель «Каналы», чтобы создать или вступить.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать канал","modal_name":"Название","modal_name_ph":"Например, Работа","modal_private":"Приватный канал","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_ph":"Поиск по каналам...","search_close":"Закрыть","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","tag_channel":"канал","tag_msg":"сообщ.","in_channel":"в «{name}»","title_search":"Поиск (Ctrl+K)","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","mobile_my_channels":"Мои каналы"},
- "es": {"login_title":"SldClient","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_msgs":"{n} mensajes","empty_no_messages":"No hay mensajes. ¡Sé el primero!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","btn_cancel":"Cancelar","btn_create":"Crear","btn_connect":"Conectar","search_ph":"Buscar canales...","search_close":"Cerrar","title_search":"Buscar (Ctrl+K)","title_add":"Crear canal","title_connect":"Conectar","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","err_generic":"Error","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_users":"Lista de usuarios","settings_show_in_list":"Mostrarme en la lista","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar","users_list_empty":"Sin usuarios","users_you":"(tú)","users_online":"en línea","mobile_channels":"Canales","mobile_my_channels":"Mis canales"},
- "de": {"login_title":"SldClient","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_msgs":"{n} Nachrichten","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","btn_connect":"Verbinden","search_ph":"Kanäle suchen...","search_close":"Schließen","title_search":"Suchen (Strg+K)","title_add":"Kanal erstellen","title_connect":"Verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","err_generic":"Fehler","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_users":"Benutzerliste","settings_show_in_list":"Mich in der Liste anzeigen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen","users_list_empty":"Keine Benutzer","users_you":"(du)","users_online":"online","mobile_channels":"Kanäle","mobile_my_channels":"Meine Kanäle"},
- "fr": {"login_title":"SldClient","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_msgs":"{n} messages","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","btn_cancel":"Annuler","btn_create":"Créer","btn_connect":"Se connecter","search_ph":"Rechercher canaux...","search_close":"Fermer","title_search":"Rechercher (Ctrl+K)","title_add":"Créer un canal","title_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","err_generic":"Erreur","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_users":"Liste des utilisateurs","settings_show_in_list":"Me montrer dans la liste","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer","users_list_empty":"Aucun utilisateur","users_you":"(vous)","users_online":"en ligne","mobile_channels":"Canaux","mobile_my_channels":"Mes canaux"},
- "it": {"login_title":"SldClient","login_subtitle":"Accedi o crea un account","btn_login":"Continua","remember_me":"Ricordami","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","search_close":"Chiudi","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_users":"Lista utenti","settings_show_in_list":"Mostrami nella lista","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi","users_list_empty":"Nessun utente","users_you":"(tu)","users_online":"online","mobile_channels":"Canali","mobile_my_channels":"I miei canali"},
- "pt": {"login_title":"SldClient","login_subtitle":"Entre ou crie uma conta","btn_login":"Continuar","remember_me":"Lembrar-me","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","search_close":"Fechar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_users":"Lista de usuários","settings_show_in_list":"Mostrar-me na lista","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar","users_list_empty":"Nenhum usuário","users_you":"(você)","users_online":"online","mobile_channels":"Canais","mobile_my_channels":"Meus canais"},
- "nl": {"login_title":"SldClient","btn_login":"Doorgaan","remember_me":"Onthoud mij","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","search_close":"Sluiten","title_settings":"Instellingen","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_users":"Gebruikerslijst","settings_show_in_list":"Toon mij in de lijst","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten","users_list_empty":"Geen gebruikers","users_you":"(jij)","users_online":"online","mobile_channels":"Kanalen","mobile_my_channels":"Mijn kanalen"},
- "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","btn_cancel":"Anuluj","btn_create":"Utwórz","btn_connect":"Połącz","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_users":"Lista użytkowników","settings_show_in_list":"Pokaż mnie na liście","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","users_you":"(ty)","users_online":"online","users_list_empty":"Brak użytkowników","mobile_channels":"Kanały","mobile_my_channels":"Moje kanały"},
- "uk": {"login_title":"SldClient","btn_login":"Продовжити","remember_me":"Запам'ятати мене","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","search_close":"Закрити","title_settings":"Налаштування","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_users":"Список користувачів","settings_show_in_list":"Показувати мене в списку","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити","users_you":"(ви)","users_online":"онлайн","users_list_empty":"Немає користувачів","mobile_channels":"Канали","mobile_my_channels":"Мої канали"},
- "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_users":"Seznam uživatelů","settings_show_in_list":"Zobrazit mě v seznamu","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení","users_you":"(vy)","users_online":"online","mobile_channels":"Kanály","mobile_my_channels":"Moje kanály"},
- "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_users":"Användarlista","settings_show_in_list":"Visa mig i listan","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar","users_you":"(du)","users_online":"online","mobile_channels":"Kanaler","mobile_my_channels":"Mina kanaler"},
- "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_users":"Λίστα χρηστών","settings_show_in_list":"Να εμφανίζομαι στη λίστα","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις","users_you":"(εσύ)","users_online":"συνδεδεμένοι","mobile_channels":"Κανάλια","mobile_my_channels":"Τα κανάλια μου"},
- "tr": {"login_title":"SldClient","btn_login":"Devam et","remember_me":"Beni hatırla","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","search_close":"Kapat","title_settings":"Ayarlar","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_users":"Kullanıcı listesi","settings_show_in_list":"Listede göster","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat","users_you":"(sen)","users_online":"çevrimiçi","users_list_empty":"Kullanıcı yok","mobile_channels":"Kanallar","mobile_my_channels":"Kanallarım"},
- "ja": {"login_title":"SldClient","btn_login":"続行","remember_me":"ログイン状態を保持","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","search_close":"閉じる","title_settings":"設定","theme_toggle":"テーマ切替","lang_toggle":"言語変更","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_users":"ユーザー一覧","settings_show_in_list":"一覧に自分を表示","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる","users_you":"(あなた)","users_online":"オンライン","users_list_empty":"ユーザーがいません","mobile_channels":"チャンネル","mobile_my_channels":"マイチャンネル"},
- "ko": {"login_title":"SldClient","btn_login":"계속","remember_me":"로그인 상태 유지","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","search_close":"닫기","title_settings":"설정","theme_toggle":"테마 전환","lang_toggle":"언어 변경","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_users":"사용자 목록","settings_show_in_list":"목록에 나를 표시","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기","users_you":"(나)","users_online":"온라인","users_list_empty":"사용자 없음","mobile_channels":"채널","mobile_my_channels":"내 채널"},
- "zh": {"login_title":"SldClient","btn_login":"继续","remember_me":"记住我","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","search_close":"关闭","title_settings":"设置","theme_toggle":"切换主题","lang_toggle":"切换语言","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_users":"用户列表","settings_show_in_list":"在列表中显示我","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭","users_you":"(你)","users_online":"在线","users_list_empty":"没有用户","mobile_channels":"频道","mobile_my_channels":"我的频道"},
- "ar": {"login_title":"SldClient","btn_login":"متابعة","remember_me":"تذكرني","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","search_close":"إغلاق","title_settings":"الإعدادات","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_users":"قائمة المستخدمين","settings_show_in_list":"إظهاري في القائمة","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق","users_you":"(أنت)","users_online":"متصل","users_list_empty":"لا مستخدمين","mobile_channels":"القنوات","mobile_my_channels":"قنواتي"},
- "he": {"login_title":"SldClient","btn_login":"המשך","remember_me":"זכור אותי","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","search_close":"סגור","title_settings":"הגדרות","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_users":"רשימת משתמשים","settings_show_in_list":"הצג אותי ברשימה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור","users_you":"(אתה)","users_online":"מחובר","users_list_empty":"אין משתמשים","mobile_channels":"ערוצים","mobile_my_channels":"הערוצים שלי"},
- "hi": {"login_title":"SldClient","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","search_close":"बंद करें","title_settings":"सेटिंग्स","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_users":"उपयोगकर्ता सूची","settings_show_in_list":"सूची में मुझे दिखाएं","settings_user":"इस रूप में:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें","users_you":"(आप)","users_online":"ऑनलाइन","users_list_empty":"कोई उपयोगकर्ता नहीं","mobile_channels":"चैनल","mobile_my_channels":"मेरे चैनल"},
+ "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open the Channels panel to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.<br>Open the Channels panel to create or join one.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create channel","modal_name":"Name","modal_name_ph":"E.g. Work","modal_private":"Private channel","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_ph":"Search messages...","search_close":"Close","search_empty":"Nothing found","search_no_channels":"You have no channels yet","tag_channel":"channel","tag_msg":"msg.","in_channel":"in «{name}»","title_search":"Search (Ctrl+K)","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_custom":"Custom","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","sticker_choose":"Choose image (will be resized to 64×64)","sticker_name_ph":"Sticker name","sticker_save":"Save sticker","sticker_search_ph":"Search stickers...","sticker_empty":"No stickers yet. Upload the first one!","sticker_bad_image":"Failed to load image","sticker_no_image":"Choose an image first","sticker_no_name":"Enter a name","sticker_name_taken":"This name is already used","sticker_added":"Sticker added","sticker_hint":"Click a sticker to insert into the message"},
+ "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте панель «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.<br>Откройте панель «Каналы», чтобы создать или вступить.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать канал","modal_name":"Название","modal_name_ph":"Например, Работа","modal_private":"Приватный канал","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_ph":"Поиск по сообщениям...","search_close":"Закрыть","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","tag_channel":"канал","tag_msg":"сообщ.","in_channel":"в «{name}»","title_search":"Поиск (Ctrl+K)","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_custom":"Кастом","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","sticker_choose":"Выбрать изображение (сожмётся до 64×64)","sticker_name_ph":"Название стикера","sticker_save":"Сохранить стикер","sticker_search_ph":"Поиск стикеров...","sticker_empty":"Стикеров пока нет. Загрузите первый!","sticker_bad_image":"Не удалось загрузить изображение","sticker_no_image":"Сначала выберите изображение","sticker_no_name":"Введите название","sticker_name_taken":"Это имя уже занято","sticker_added":"Стикер добавлен","sticker_hint":"Кликните по стикеру, чтобы вставить в сообщение"},
+ "es": {"login_title":"SldClient","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","btn_cancel":"Cancelar","btn_create":"Crear","btn_connect":"Conectar","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","err_generic":"Error","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_users":"Lista de usuarios","settings_custom":"Custom","settings_show_in_list":"Mostrarme en la lista","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar","users_you":"(tú)","users_online":"en línea","mobile_channels":"Canales"},
+ "de": {"login_title":"SldClient","btn_login":"Weiter","remember_me":"Angemeldet bleiben","btn_cancel":"Abbrechen","btn_create":"Erstellen","btn_connect":"Verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","err_generic":"Fehler","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_users":"Benutzerliste","settings_custom":"Custom","settings_show_in_list":"Mich in der Liste anzeigen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen","users_you":"(du)","users_online":"online","mobile_channels":"Kanäle"},
+ "fr": {"login_title":"SldClient","btn_login":"Continuer","remember_me":"Se souvenir de moi","btn_cancel":"Annuler","btn_create":"Créer","btn_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","err_generic":"Erreur","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_users":"Liste des utilisateurs","settings_custom":"Custom","settings_show_in_list":"Me montrer dans la liste","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer","users_you":"(vous)","users_online":"en ligne","mobile_channels":"Canaux"},
+ "it": {"login_title":"SldClient","btn_login":"Continua","remember_me":"Ricordami","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_users":"Lista utenti","settings_custom":"Custom","settings_show_in_list":"Mostrami nella lista","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi","users_you":"(tu)","users_online":"online","mobile_channels":"Canali"},
+ "pt": {"login_title":"SldClient","btn_login":"Continuar","remember_me":"Lembrar-me","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_users":"Lista de usuários","settings_custom":"Custom","settings_show_in_list":"Mostrar-me na lista","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar","users_you":"(você)","users_online":"online","mobile_channels":"Canais"},
+ "nl": {"login_title":"SldClient","btn_login":"Doorgaan","remember_me":"Onthoud mij","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","title_settings":"Instellingen","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_users":"Gebruikerslijst","settings_custom":"Custom","settings_show_in_list":"Toon mij in de lijst","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten","users_you":"(jij)","users_online":"online","mobile_channels":"Kanalen"},
+ "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","btn_cancel":"Anuluj","btn_create":"Utwórz","btn_connect":"Połącz","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_users":"Lista użytkowników","settings_custom":"Custom","settings_show_in_list":"Pokaż mnie na liście","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","users_you":"(ty)","users_online":"online","mobile_channels":"Kanały"},
+ "uk": {"login_title":"SldClient","btn_login":"Продовжити","remember_me":"Запам'ятати мене","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","title_settings":"Налаштування","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_users":"Список користувачів","settings_custom":"Кастом","settings_show_in_list":"Показувати мене в списку","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити","users_you":"(ви)","users_online":"онлайн","mobile_channels":"Канали"},
+ "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_users":"Seznam uživatelů","settings_custom":"Custom","settings_show_in_list":"Zobrazit mě v seznamu","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení","users_you":"(vy)","users_online":"online","mobile_channels":"Kanály"},
+ "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_users":"Användarlista","settings_custom":"Custom","settings_show_in_list":"Visa mig i listan","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar","users_you":"(du)","users_online":"online","mobile_channels":"Kanaler"},
+ "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_users":"Λίστα χρηστών","settings_custom":"Custom","settings_show_in_list":"Να εμφανίζομαι στη λίστα","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις","users_you":"(εσύ)","users_online":"συνδεδεμένοι","mobile_channels":"Κανάλια"},
+ "tr": {"login_title":"SldClient","btn_login":"Devam et","remember_me":"Beni hatırla","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","title_settings":"Ayarlar","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_users":"Kullanıcı listesi","settings_custom":"Custom","settings_show_in_list":"Listede göster","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat","users_you":"(sen)","users_online":"çevrimiçi","mobile_channels":"Kanallar"},
+ "ja": {"login_title":"SldClient","btn_login":"続行","remember_me":"ログイン状態を保持","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","title_settings":"設定","theme_toggle":"テーマ切替","lang_toggle":"言語変更","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_users":"ユーザー一覧","settings_custom":"Custom","settings_show_in_list":"一覧に自分を表示","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる","users_you":"(あなた)","users_online":"オンライン","mobile_channels":"チャンネル"},
+ "ko": {"login_title":"SldClient","btn_login":"계속","remember_me":"로그인 상태 유지","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","title_settings":"설정","theme_toggle":"테마 전환","lang_toggle":"언어 변경","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_users":"사용자 목록","settings_custom":"Custom","settings_show_in_list":"목록에 나를 표시","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기","users_you":"(나)","users_online":"온라인","mobile_channels":"채널"},
+ "zh": {"login_title":"SldClient","btn_login":"继续","remember_me":"记住我","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","title_settings":"设置","theme_toggle":"切换主题","lang_toggle":"切换语言","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_users":"用户列表","settings_custom":"自定义","settings_show_in_list":"在列表中显示我","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭","users_you":"(你)","users_online":"在线","mobile_channels":"频道"},
+ "ar": {"login_title":"SldClient","btn_login":"متابعة","remember_me":"تذكرني","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","title_settings":"الإعدادات","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_users":"قائمة المستخدمين","settings_custom":"Custom","settings_show_in_list":"إظهاري في القائمة","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق","users_you":"(أنت)","users_online":"متصل","mobile_channels":"القنوات"},
+ "he": {"login_title":"SldClient","btn_login":"המשך","remember_me":"זכור אותי","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","title_settings":"הגדרות","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_users":"רשימת משתמשים","settings_custom":"Custom","settings_show_in_list":"הצג אותי ברשימה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור","users_you":"(אתה)","users_online":"מחובר","mobile_channels":"ערוצים"},
+ "hi": {"login_title":"SldClient","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","title_settings":"सेटिंग्स","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_users":"उपयोगकर्ता सूची","settings_custom":"Custom","settings_show_in_list":"सूची में मुझे दिखाएं","settings_user":"इस रूप में:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें","users_you":"(आप)","users_online":"ऑनलाइन","mobile_channels":"चैनल"},
 }
 
 # ---------------- SVG flags ----------------
@@ -454,7 +512,7 @@ body {
 }
 input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
-button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn, .settings-tab, .search-result, .user-list-item, .mcp-item {
+button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn, .settings-tab, .search-result, .user-list-item, .mcp-item, .sticker-card {
   touch-action: manipulation; -webkit-tap-highlight-color: transparent;
 }
 
@@ -528,7 +586,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .app { width: 100%; height: var(--app-vh, 100vh); background: #fff;
   display: flex; flex-direction: column; position: relative; overflow: hidden; }
 
-/* Desktop tabs bar */
 .tabs-bar { display: flex; align-items: center; padding: 6px 8px;
   background: #f5f5f5; background-image: linear-gradient(#ffffff, #ececec);
   border-bottom: 1px solid #ccc; flex-shrink: 0; gap: 4px; }
@@ -558,8 +615,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   align-items: center; justify-content: center; flex-shrink: 0; border-radius: 0; }
 .icon-btn-tab:hover { background: #d9d9d9; color: #000; }
 .top-sep { width: 1px; height: 20px; background: #ccc; margin: 0 4px; flex-shrink: 0; }
-
-/* Mobile topbar (hidden on desktop) */
 .mobile-topbar { display: none; }
 .mobile-channels-backdrop, .mobile-channels-panel { display: none; }
 
@@ -603,7 +658,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-/* Message grid: author | content */
 .msg-row { display: grid; grid-template-columns: 100px 1fr; gap: 6px;
   padding: 2px 4px; align-items: start; font-size: 12.5px; line-height: 1.55;
   border-radius: 3px; transition: background .3s; word-wrap: break-word; }
@@ -619,6 +673,13 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   align-items: center; border-radius: 3px; }
 .msg-system .sys-icon { margin-right: 6px; display: inline-flex; align-items: center; }
 
+/* Message sticker inline */
+.msg-sticker { display: inline-block; width: 64px; height: 64px;
+  vertical-align: middle; margin: 1px 2px; border: 1px solid rgba(0,0,0,.08);
+  background: #fff; object-fit: contain; }
+.msg-sticker-missing { display: inline-block; padding: 2px 6px;
+  background: #f0f0f0; color: #999; font-size: 11px; border: 1px solid #ddd; }
+
 .composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px 10px;
   background: #f5f5f5; background-image: linear-gradient(#f0f0f0, #ffffff);
   border-top: 1px solid #ccc; flex-shrink: 0; }
@@ -633,7 +694,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .composer .icon-btn { width: 32px; height: 32px; padding: 0; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center; }
 
-/* Modals */
 .my-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
   z-index: 1000; display: none; justify-content: center; align-items: center;
   padding: 20px; box-sizing: border-box; }
@@ -659,12 +719,11 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .checkbox-row > span { flex: 1 1 auto; min-width: 0; line-height: 1.35; overflow-wrap: break-word; }
 .error-msg { margin-top: 8px; font-size: 11.5px; color: #a94442; background: #fcebeb;
   border: 1px solid #f5c6c6; padding: 5px 8px; display: none; }
-.error-msg.show { display: flex; align-items: center; }
+.error-msg.show { display: block; }
 
-/* Settings modal */
-#settingsModal { width: 560px; }
-.settings-body { display: flex; min-height: 280px; }
-.settings-tabs { width: 160px; background: #f5f5f5; border-right: 1px solid #ddd;
+#settingsModal { width: 600px; }
+.settings-body { display: flex; min-height: 300px; }
+.settings-tabs { width: 170px; background: #f5f5f5; border-right: 1px solid #ddd;
   padding: 8px 0; flex-shrink: 0; }
 .settings-tab { display: block; width: 100%; text-align: left; padding: 9px 14px;
   background: transparent; border: 0; border-left: 3px solid transparent;
@@ -692,7 +751,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .settings-toggle-row input { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0 0; padding: 0; }
 .settings-toggle-row > span { flex: 1 1 auto; min-width: 0; line-height: 1.4; overflow-wrap: break-word; }
 
-/* Users list */
 .users-list { display: flex; flex-direction: column; }
 .user-list-item { display: flex; align-items: center; gap: 10px; padding: 8px 4px;
   border-bottom: 1px solid #f0f0f0; font-size: 13px; }
@@ -701,10 +759,38 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   flex-shrink: 0; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
 .user-dot.online { background: #4caf50; box-shadow: 0 0 0 2px rgba(76,175,80,.25); }
 .user-list-item .user-name { flex: 1; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; font-weight: bold; color: #222; }
+  text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
 .user-list-item.self .user-name { color: #006dcc; }
 .user-list-item .user-you { font-size: 11px; color: #999; margin-left: 4px; font-weight: normal; }
 .users-empty { padding: 30px 10px; text-align: center; color: #999; font-size: 12px; }
+
+/* Sticker (Custom) tab */
+.sticker-hint { font-size: 11.5px; color: #7b8a99; margin-bottom: 10px; }
+.sticker-upload-box { display: flex; flex-direction: column; gap: 8px;
+  padding: 10px; border: 1px solid #ddd; background: #fafafa; margin-bottom: 12px; }
+.sticker-preview { display: flex; align-items: center; justify-content: center;
+  min-height: 74px; border: 1px dashed #ccc; background: #fff; padding: 4px; }
+.sticker-preview img { width: 64px; height: 64px; object-fit: contain; image-rendering: auto; }
+.sticker-preview .ph { font-size: 11px; color: #aaa; }
+.sticker-upload-row { display: flex; gap: 6px; }
+.sticker-upload-row .btn { flex: 1; padding: 8px 10px; font-size: 12px; border-radius: 0; }
+.sticker-search-row { margin-bottom: 8px; }
+.sticker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px; max-height: 320px; overflow-y: auto; padding: 6px;
+  border: 1px solid #eee; background: #fdfdfd; }
+.sticker-card { display: flex; flex-direction: column; align-items: center;
+  padding: 6px 4px; border: 1px solid #ddd; background: #fff;
+  cursor: pointer; text-align: center; user-select: none; box-sizing: border-box; }
+.sticker-card:hover { background: #eaf4fb; border-color: #8ab4dc; }
+.sticker-card:active { background: #d6e8f7; }
+.sticker-card img { width: 64px; height: 64px; object-fit: contain; image-rendering: auto; }
+.sticker-card .st-name { font-size: 11px; font-weight: bold; color: #333;
+  margin-top: 4px; word-break: break-all; line-height: 1.2;
+  width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.sticker-card .st-meta { font-size: 10px; color: #888; margin-top: 2px;
+  line-height: 1.2; word-break: break-all; width: 100%; }
+.sticker-empty { padding: 30px 10px; text-align: center; color: #999; font-size: 12px;
+  grid-column: 1 / -1; }
 
 /* Dark */
 body.dark { background: #1a1a1a; color: #ccc; }
@@ -778,16 +864,22 @@ body.dark .user-list-item .user-name { color: #eaeaea; }
 body.dark .user-list-item.self .user-name { color: #6cb6ff; }
 body.dark .mobile-channels-panel { background: #252526; border-color: #3c3c3c; }
 body.dark .mcp-head { background: #2d2d30; border-color: #3c3c3c; color: #eaeaea; }
-body.dark .mcp-search { border-color: #3c3c3c; }
-body.dark .mcp-search input { background: #1e1e1e !important; color: #ddd !important;
-  border-color: #4a4a4c !important; }
 body.dark .mcp-item { border-color: #3c3c3c; color: #ccc; }
 body.dark .mcp-item:active { background: #2a3a4a; }
 body.dark .mcp-item.active { background: #0e639c; color: #fff; }
 body.dark .mcp-actions { background: #2a2a2c; border-color: #3c3c3c; }
 body.dark .mcp-empty { color: #666; }
+body.dark .sticker-hint { color: #888; }
+body.dark .sticker-upload-box { background: #2d2d30; border-color: #3c3c3c; }
+body.dark .sticker-preview { background: #1e1e1e; border-color: #4a4a4c; }
+body.dark .sticker-grid { background: #1e1e1e; border-color: #3c3c3c; }
+body.dark .sticker-card { background: #2d2d30; border-color: #3c3c3c; color: #ccc; }
+body.dark .sticker-card:hover { background: #37373d; border-color: #4a4a4c; }
+body.dark .sticker-card .st-name { color: #eaeaea; }
+body.dark .sticker-card .st-meta { color: #888; }
+body.dark .msg-sticker { background: #1e1e1e; border-color: #4a4a4c; }
+body.dark .msg-sticker-missing { background: #2d2d30; color: #888; border-color: #4a4a4c; }
 
-/* Touch active states */
 @media (hover: none) {
   .channel-tab:active { background: #c9c9c9; background-image: none; }
   .icon-btn-tab:active, .scroll-arrow:active, .settings-btn:active { background: #c9c9c9; background-image: none; }
@@ -796,11 +888,7 @@ body.dark .mcp-empty { color: #666; }
   .msg-row:hover { background: transparent; }
 }
 
-/* ============================================================
-   MOBILE: switch to "Channels" drawer layout
-   ============================================================ */
 @media (max-width: 768px) {
-  /* Login */
   .login-screen { padding: 16px; align-items: flex-start; padding-top: 40px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
   .login-box h2 { font-size: 20px; }
@@ -812,40 +900,30 @@ body.dark .mcp-empty { color: #666; }
   .settings-btn { height: 40px; font-size: 14px; }
   .uptime-line { font-size: 12px; }
 
-  /* Hide desktop tabs and its actions */
   .tabs-bar { display: none !important; }
 
-  /* Mobile top bar */
-  .mobile-topbar {
-    display: flex; align-items: center; gap: 8px;
+  .mobile-topbar { display: flex; align-items: center; gap: 8px;
     padding: 8px 10px; background: #f5f5f5;
     background-image: linear-gradient(#ffffff, #ececec);
-    border-bottom: 1px solid #ccc; flex-shrink: 0;
-  }
-  .mobile-channels-btn {
-    flex: 1; display: inline-flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid #ccc; flex-shrink: 0; }
+  .mobile-channels-btn { flex: 1; display: inline-flex; align-items: center; gap: 10px;
     padding: 11px 14px; border: 1px solid #bbb;
     background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6);
     color: #333; cursor: pointer;
     font-family: "Courier New", Courier, monospace;
     font-size: 14px; font-weight: bold; text-align: left;
-    border-radius: 0; min-height: 44px;
-  }
+    border-radius: 0; min-height: 44px; }
   .mobile-channels-btn:active { background: #d0d0d0; background-image: none; }
   .mobile-channels-btn svg { width: 20px !important; height: 20px !important; flex-shrink: 0; }
-  .mobile-settings-btn {
-    width: 44px; height: 44px; padding: 0; flex-shrink: 0;
-    display: inline-flex; align-items: center; justify-content: center;
-  }
+  .mobile-settings-btn { width: 44px; height: 44px; padding: 0; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center; }
   .mobile-settings-btn svg { width: 20px !important; height: 20px !important; }
 
-  /* Header in mobile: no user info, bigger title */
   .chat-header { padding: 10px 12px; }
   .chat-header .title { font-size: 15px; }
   .chat-header .subtitle { font-size: 12px; }
   .chat-header .user-info { display: none; }
 
-  /* Feed */
   .chat-feed { padding: 10px; }
   .msg-row { grid-template-columns: 84px 1fr; gap: 5px; font-size: 14px;
     padding: 3px 4px; line-height: 1.5; }
@@ -853,13 +931,11 @@ body.dark .mcp-empty { color: #666; }
   .msg-time { font-size: 11px; }
   .msg-system { font-size: 12.5px; padding: 6px 10px; }
 
-  /* Composer */
   .composer { padding: 8px; gap: 6px; }
   .composer textarea { font-size: 16px !important; padding: 10px 12px !important; max-height: 120px; }
   .composer .icon-btn { width: 42px; height: 42px; }
   .composer .icon-btn svg { width: 18px !important; height: 18px !important; }
 
-  /* Modals */
   .my-modal-backdrop { padding: 10px; align-items: flex-start;
     padding-top: 20px; padding-bottom: 20px; overflow-y: auto; }
   .my-modal { width: 100%; max-width: 500px; margin: auto; }
@@ -871,12 +947,12 @@ body.dark .mcp-empty { color: #666; }
   .checkbox-row { font-size: 13px; padding: 4px 0; }
   .checkbox-row input { width: 18px; height: 18px; margin-top: 2px; }
 
-  /* Settings on mobile: tabs on top */
   .settings-body { flex-direction: column; min-height: 0; }
   .settings-tabs { width: 100%; border-right: 0; border-bottom: 1px solid #ddd;
-    padding: 0; display: flex; }
-  .settings-tab { flex: 1; text-align: center; padding: 12px 4px;
-    border-left: 0; border-bottom: 3px solid transparent; font-size: 12px; }
+    padding: 0; display: flex; overflow-x: auto; }
+  .settings-tab { flex: 1 0 auto; text-align: center; padding: 12px 6px;
+    border-left: 0; border-bottom: 3px solid transparent;
+    font-size: 12px; white-space: nowrap; min-width: 60px; }
   .settings-tab.active { border-left-color: transparent; border-bottom-color: #0088cc; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
@@ -884,20 +960,15 @@ body.dark .mcp-empty { color: #666; }
   .settings-toggle-row { font-size: 14px; }
   .settings-toggle-row input { width: 18px; height: 18px; }
 
-  /* Lang menu */
   .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 6px; gap: 4px; }
   .lang-menu-item { padding: 8px; font-size: 12px; }
 
-  /* ============================================================
-     MOBILE CHANNELS DRAWER
-     ============================================================ */
   .mobile-channels-backdrop {
     display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 900;
     opacity: 0; pointer-events: none;
-    transition: opacity .2s ease-out;
-  }
+    transition: opacity .2s ease-out; }
   .mobile-channels-backdrop.open { opacity: 1; pointer-events: auto; }
 
   .mobile-channels-panel {
@@ -909,43 +980,24 @@ body.dark .mcp-empty { color: #666; }
     transform: translateX(-100%);
     transition: transform .2s ease-out;
     pointer-events: none;
-    border-right: 1px solid #b8c4d0;
-  }
-  .mobile-channels-panel.open {
-    transform: translateX(0);
-    pointer-events: auto;
-  }
-  .mcp-head {
-    padding: 12px 14px; flex-shrink: 0;
-    border-bottom: 1px solid #ccc;
+    border-right: 1px solid #b8c4d0; }
+  .mobile-channels-panel.open { transform: translateX(0); pointer-events: auto; }
+  .mcp-head { padding: 12px 14px; flex-shrink: 0; border-bottom: 1px solid #ccc;
     background: #f5f5f5; background-image: linear-gradient(#ffffff, #efefef);
     display: flex; align-items: center;
     font-family: "Courier New", Courier, monospace;
-    font-weight: bold; font-size: 15px; color: #222;
-  }
-  .mcp-close {
-    margin-left: auto; background: transparent; border: 0;
+    font-weight: bold; font-size: 15px; color: #222; }
+  .mcp-close { margin-left: auto; background: transparent; border: 0;
     cursor: pointer; padding: 6px; color: #666;
-    display: inline-flex; align-items: center; border-radius: 0;
-  }
+    display: inline-flex; align-items: center; border-radius: 0; }
   .mcp-close:active { color: #c00; }
-  .mcp-search { padding: 10px; border-bottom: 1px solid #e5e5e5; flex-shrink: 0; }
-  .mcp-search input {
-    width: 100%; padding: 11px 12px;
-    border: 1px solid #bbb; font-size: 16px;
-    box-sizing: border-box; outline: none; border-radius: 0;
-    background: #fff; color: #333; font-family: inherit;
-  }
-  .mcp-search input:focus { border-color: #0088cc; }
   .mcp-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
-  .mcp-item {
-    display: flex; align-items: center; gap: 10px;
+  .mcp-item { display: flex; align-items: center; gap: 10px;
     padding: 14px 16px; border-bottom: 1px solid #f0f0f0;
     cursor: pointer;
     font-family: "Courier New", Courier, monospace;
     font-size: 14px; color: #333;
-    min-height: 52px; box-sizing: border-box;
-  }
+    min-height: 52px; box-sizing: border-box; }
   .mcp-item:active { background: #eaf4fb; }
   .mcp-item.active { background: #d6e8f7; color: #004a80; font-weight: bold; }
   .mcp-item .lock-ico { display: inline-flex; align-items: center; flex-shrink: 0; }
@@ -953,15 +1005,15 @@ body.dark .mcp-empty { color: #666; }
     text-overflow: ellipsis; white-space: nowrap; }
   .mcp-empty { padding: 40px 16px; text-align: center;
     color: #999; font-size: 13px; }
-  .mcp-actions {
-    padding: 12px; border-top: 1px solid #ccc;
+  .mcp-actions { padding: 12px; border-top: 1px solid #ccc;
     background: #f7f7f7; flex-shrink: 0;
-    display: flex; gap: 8px;
-  }
-  .mcp-actions .btn {
-    flex: 1; padding: 13px 10px; font-size: 14px; border-radius: 0;
-    min-height: 46px;
-  }
+    display: flex; gap: 8px; }
+  .mcp-actions .btn { flex: 1; padding: 13px 10px; font-size: 14px;
+    border-radius: 0; min-height: 46px; }
+
+  .sticker-grid { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
+  .sticker-card img { width: 56px; height: 56px; }
+  .msg-sticker { width: 56px; height: 56px; }
 }
 
 @media (max-width: 400px) {
@@ -975,7 +1027,7 @@ body.dark .mcp-empty { color: #666; }
 @media (min-width: 769px) and (max-width: 1024px) {
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
-  #settingsModal { width: 600px; }
+  #settingsModal { width: 620px; }
 }
 </style>
 </head>
@@ -1027,7 +1079,6 @@ body.dark .mcp-empty { color: #666; }
 
 <div class="app" id="app" style="display:none">
 
-  <!-- Mobile-only top bar: Channels + Settings -->
   <div class="mobile-topbar" id="mobileTopbar">
     <button class="mobile-channels-btn" id="mobileChannelsBtn" type="button">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1048,7 +1099,6 @@ body.dark .mcp-empty { color: #666; }
     </button>
   </div>
 
-  <!-- Desktop tabs bar -->
   <div class="tabs-bar">
     <button class="scroll-arrow" id="tabScrollLeft" type="button">
       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
@@ -1109,7 +1159,6 @@ body.dark .mcp-empty { color: #666; }
   </div>
 </div>
 
-<!-- Mobile channels drawer -->
 <div class="mobile-channels-backdrop" id="mobileChannelsBackdrop"></div>
 <div class="mobile-channels-panel" id="mobileChannelsPanel">
   <div class="mcp-head">
@@ -1118,9 +1167,6 @@ body.dark .mcp-empty { color: #666; }
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
   </div>
-  <div class="mcp-search">
-    <input type="text" id="mcpSearch" autocomplete="off" autocorrect="off" spellcheck="false">
-  </div>
   <div class="mcp-list" id="mcpList"></div>
   <div class="mcp-actions">
     <button class="btn primary" id="mcpCreateBtn" type="button"></button>
@@ -1128,7 +1174,6 @@ body.dark .mcp-empty { color: #666; }
   </div>
 </div>
 
-<!-- Modals -->
 <div class="my-modal-backdrop" id="createBackdrop">
   <div class="my-modal" id="newChannelModal">
     <div class="modal-head" id="createModalHead">
@@ -1163,9 +1208,7 @@ body.dark .mcp-empty { color: #666; }
     <div class="modal-body">
       <label class="my-label" id="lblConnectName" for="connectChannelName"></label>
       <input type="text" id="connectChannelName" class="my-input" maxlength="40" autocapitalize="none" autocorrect="off" spellcheck="false">
-      <div class="error-msg" id="connectError"><span class="sys-icon">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/></svg>
-      </span><span id="connectErrorText"></span></div>
+      <div class="error-msg" id="connectError"><span class="sys-icon"></span><span id="connectErrorText"></span></div>
     </div>
     <div class="modal-foot">
       <button class="btn" type="button" data-close-modal="connect" id="btnCancelConnect"></button>
@@ -1187,6 +1230,7 @@ body.dark .mcp-empty { color: #666; }
         <button class="settings-tab active" data-tab="account" id="tabAccount"></button>
         <button class="settings-tab" data-tab="appearance" id="tabAppearance"></button>
         <button class="settings-tab" data-tab="users" id="tabUsers"></button>
+        <button class="settings-tab" data-tab="custom" id="tabCustom"></button>
       </div>
       <div class="settings-content">
         <div class="settings-pane active" data-pane="account">
@@ -1221,6 +1265,24 @@ body.dark .mcp-empty { color: #666; }
           <div class="settings-section-title" id="settingsUsersHead">Users List</div>
           <div class="users-list" id="usersList"></div>
         </div>
+        <div class="settings-pane" data-pane="custom">
+          <div class="settings-section-title" id="settingsCustomHead"></div>
+          <div class="sticker-hint" id="stickerHint"></div>
+          <div class="sticker-upload-box">
+            <input type="file" id="stickerFile" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
+            <button class="btn" id="stickerChooseBtn" type="button"></button>
+            <div class="sticker-preview" id="stickerPreview">
+              <span class="ph">64×64</span>
+            </div>
+            <input type="text" id="stickerName" class="my-input" maxlength="40">
+            <button class="btn primary" id="stickerSaveBtn" type="button"></button>
+            <div class="error-msg" id="stickerError"><span id="stickerErrorText"></span></div>
+          </div>
+          <div class="sticker-search-row">
+            <input type="text" id="stickerSearch" class="my-input" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="sticker-grid" id="stickerGrid"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1254,7 +1316,6 @@ if (window.visualViewport) {
 window.addEventListener('resize', updateAppVH);
 window.addEventListener('orientationchange', () => setTimeout(updateAppVH, 100));
 updateAppVH();
-
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 let currentLang = localStorage.getItem('lang') || 'en';
@@ -1272,6 +1333,13 @@ let uptimeFetchAt = 0;
 let showInListPref = true;
 let turnstileReady = false;
 let turnstileWidgetId = null;
+let forcedLogoutInProgress = false;
+
+// sticker caches
+const stickerImageCache = {};   // id -> dataURL
+const stickerMetaCache = {};    // id -> {id,name,author,created}
+let stickerListCache = [];
+let stickerPreviewData = null;
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => {
@@ -1282,6 +1350,28 @@ const t = (key, vars) => {
   if (vars) for (const k in vars) s = s.replace(new RegExp('\\{'+k+'\\}','g'), vars[k]);
   return s;
 };
+
+// ---------- Per-user color (deterministic) ----------
+function userHue(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) {
+    h = (h * 31 + name.charCodeAt(i)) | 0;
+  }
+  return ((h % 360) + 360) % 360;
+}
+function userColor(name) {
+  const hue = userHue(name);
+  const dark = document.body.classList.contains('dark');
+  return dark ? `hsl(${hue}, 70%, 68%)` : `hsl(${hue}, 65%, 38%)`;
+}
+function recolorAllAuthors() {
+  document.querySelectorAll('.msg-row .msg-author').forEach(el => {
+    const raw = (el.textContent || '').trim();
+    if (!raw) return;
+    const name = raw.replace(/:$/, '');
+    if (name) el.style.color = userColor(name);
+  });
+}
 
 // ---------- Turnstile ----------
 function onTurnstileLoaded() { turnstileReady = true; renderTurnstile(); }
@@ -1341,13 +1431,35 @@ async function decryptText(chId, payload) {
   } catch(e) { return '[decrypt error]'; }
 }
 
-// ---------- HTTP ----------
+// ---------- HTTP with global 401 handler ----------
+function forceLogout() {
+  if (forcedLogoutInProgress) return;
+  forcedLogoutInProgress = true;
+  authToken = null; currentUser = null;
+  channels = []; activeId = null; channelKeyCache = {};
+  if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
+  localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
+  $('settingsBackdrop').classList.remove('open');
+  closeMobileChannels();
+  $('app').style.display = 'none';
+  $('loginScreen').style.display = 'flex';
+  closeLangMenu(); updateAppVH(); resetTurnstile();
+  setTimeout(() => { forcedLogoutInProgress = false; }, 500);
+}
+
 async function api(path, method='GET', body=null, withAuth=true) {
+  if (withAuth && !authToken) {
+    // No token — throw without hitting server
+    throw { status: 401, detail: 'no_token' };
+  }
   const headers = { 'Content-Type': 'application/json' };
   if (withAuth && authToken) headers['x-auth-token'] = authToken;
   const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : null});
   let data = null; try { data = await res.json(); } catch(e){}
-  if (!res.ok) throw { status: res.status, detail: (data && data.detail) || 'error' };
+  if (!res.ok) {
+    if (res.status === 401 && withAuth) forceLogout();
+    throw { status: res.status, detail: (data && data.detail) || 'error' };
+  }
   return data;
 }
 
@@ -1377,7 +1489,11 @@ function applyTheme() {
   const tv = $('settingsThemeVal'); if (tv) tv.textContent = currentTheme === 'dark' ? t('settings_theme_dark') : t('settings_theme_light');
   const tt = $('settingsThemeToggle'); if (tt) tt.textContent = currentTheme === 'dark' ? t('settings_theme_light') : t('settings_theme_dark');
 }
-function toggleTheme() { currentTheme = currentTheme === 'dark' ? 'light' : 'dark'; applyTheme(); }
+function toggleTheme() {
+  currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+  applyTheme();
+  recolorAllAuthors();
+}
 
 // ---------- Language ----------
 function applyLanguage() {
@@ -1416,6 +1532,7 @@ function applyLanguage() {
   $('tabAccount').textContent = t('settings_account');
   $('tabAppearance').textContent = t('settings_appearance');
   $('tabUsers').textContent = t('settings_users');
+  $('tabCustom').textContent = t('settings_custom');
   $('settingsAccountHead').textContent = t('settings_account');
   $('settingsUserLabel').textContent = t('settings_user');
   $('settingsLogoutBtn').textContent = t('settings_logout');
@@ -1424,10 +1541,14 @@ function applyLanguage() {
   $('settingsLangLabel').textContent = t('settings_lang');
   $('showInListLabel').textContent = t('settings_show_in_list');
   $('settingsUsersHead').textContent = t('settings_users');
-  // Mobile-only strings
+  $('settingsCustomHead').textContent = t('settings_custom');
+  $('stickerHint').textContent = t('sticker_hint');
+  $('stickerChooseBtn').textContent = t('sticker_choose');
+  $('stickerName').placeholder = t('sticker_name_ph');
+  $('stickerSaveBtn').textContent = t('sticker_save');
+  $('stickerSearch').placeholder = t('sticker_search_ph');
   $('mobileChannelsLbl').textContent = t('mobile_channels');
   $('mcpTitle').textContent = t('mobile_channels');
-  $('mcpSearch').placeholder = t('search_ph');
   $('mcpCreateBtn').textContent = t('modal_create_title');
   $('mcpConnectBtn').textContent = t('modal_connect_title');
   $('langFlag').innerHTML = FLAGS[currentLang] || '';
@@ -1437,7 +1558,7 @@ function applyLanguage() {
   renderTabs(); renderHeader(); renderMessages(); updateMuteUI();
   renderSearchResults($('searchInput').value);
   renderUsersList();
-  renderMobileChannelList($('mcpSearch').value);
+  renderMobileChannelList();
 }
 
 function buildLangMenu() {
@@ -1556,7 +1677,10 @@ function openSettingsModal() {
   $('settingsUser').textContent = currentUser || '—';
   $('showInListToggle').checked = showInListPref;
   const activeTab = document.querySelector('.settings-tab.active');
-  if (activeTab && activeTab.dataset.tab === 'users') loadUsersList();
+  if (activeTab) {
+    if (activeTab.dataset.tab === 'users') loadUsersList();
+    if (activeTab.dataset.tab === 'custom') loadStickers($('stickerSearch').value);
+  }
 }
 $('settingsBtn').addEventListener('click', openSettingsModal);
 $('mobileSettingsBtn').addEventListener('click', openSettingsModal);
@@ -1566,6 +1690,7 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
     document.querySelectorAll('.settings-tab').forEach(x => x.classList.toggle('active', x === tab));
     document.querySelectorAll('.settings-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === target));
     if (target === 'users') loadUsersList();
+    if (target === 'custom') loadStickers($('stickerSearch').value);
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
@@ -1576,24 +1701,20 @@ $('showInListToggle').addEventListener('change', async (e) => {
 });
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
-  authToken = null; currentUser = null;
-  channels = []; activeId = null; channelKeyCache = {};
-  if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
-  localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
-  $('settingsBackdrop').classList.remove('open');
-  closeMobileChannels();
-  $('app').style.display = 'none';
-  $('loginScreen').style.display = 'flex';
-  closeLangMenu(); updateAppVH(); resetTurnstile();
+  forceLogout();
 });
 
 // ---------- Users list ----------
 let usersListCache = [];
 async function loadUsersList() {
   const box = $('usersList'); if (!box) return;
+  if (!authToken) { box.innerHTML = '<div class="users-empty">'+t('users_list_empty')+'</div>'; return; }
   box.innerHTML = '<div class="users-empty">…</div>';
   try { const res = await api('/api/users'); usersListCache = res.users || []; renderUsersList(); }
-  catch (e) { box.innerHTML = '<div class="users-empty">'+t('err_generic')+'</div>'; }
+  catch (e) {
+    if (e.status === 401) return;
+    box.innerHTML = '<div class="users-empty">'+t('err_generic')+'</div>';
+  }
 }
 function renderUsersList() {
   const box = $('usersList'); if (!box) return;
@@ -1602,17 +1723,16 @@ function renderUsersList() {
   usersListCache.forEach(u => {
     const row = document.createElement('div');
     row.className = 'user-list-item' + (u.self ? ' self' : '');
-    row.innerHTML = '<span class="user-dot'+(u.online?' online':'')+'"></span>' +
-      '<span class="user-name">'+escapeHtml(u.username)+
+    const nameEl = '<span class="user-name" style="color:'+userColor(u.username)+'">'+escapeHtml(u.username)+
       (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '')+'</span>';
+    row.innerHTML = '<span class="user-dot'+(u.online?' online':'')+'"></span>' + nameEl;
     box.appendChild(row);
   });
 }
 
-// ---------- Mobile channels drawer ----------
+// ---------- Mobile channels drawer (NO search) ----------
 function openMobileChannels() {
-  $('mcpSearch').value = '';
-  renderMobileChannelList('');
+  renderMobileChannelList();
   $('mobileChannelsBackdrop').classList.add('open');
   $('mobileChannelsPanel').classList.add('open');
 }
@@ -1620,17 +1740,14 @@ function closeMobileChannels() {
   $('mobileChannelsBackdrop').classList.remove('open');
   $('mobileChannelsPanel').classList.remove('open');
 }
-function renderMobileChannelList(filter) {
+function renderMobileChannelList() {
   const box = $('mcpList'); if (!box) return;
-  const q = (filter || '').trim().toLowerCase();
   box.innerHTML = '';
-  const list = channels.filter(ch => !q || ch.name.toLowerCase().includes(q));
-  if (!list.length) {
-    const msg = channels.length ? t('search_empty') : t('search_no_channels');
-    box.innerHTML = '<div class="mcp-empty">'+msg+'</div>';
+  if (!channels.length) {
+    box.innerHTML = '<div class="mcp-empty">'+t('search_no_channels')+'</div>';
     return;
   }
-  list.forEach(ch => {
+  channels.forEach(ch => {
     const item = document.createElement('div');
     item.className = 'mcp-item' + (ch.id === activeId ? ' active' : '');
     if (ch.private) {
@@ -1653,7 +1770,6 @@ function renderMobileChannelList(filter) {
 $('mobileChannelsBtn').addEventListener('click', openMobileChannels);
 $('mcpClose').addEventListener('click', closeMobileChannels);
 $('mobileChannelsBackdrop').addEventListener('click', closeMobileChannels);
-$('mcpSearch').addEventListener('input', () => renderMobileChannelList($('mcpSearch').value));
 $('mcpCreateBtn').addEventListener('click', () => {
   closeMobileChannels();
   setTimeout(() => $('addTabBtn').click(), 60);
@@ -1663,8 +1779,184 @@ $('mcpConnectBtn').addEventListener('click', () => {
   setTimeout(() => $('connectBtn').click(), 60);
 });
 
+// ---------- Stickers ----------
+function showStickerError(msg) {
+  $('stickerErrorText').textContent = msg;
+  $('stickerError').classList.add('show');
+  setTimeout(() => $('stickerError').classList.remove('show'), 3500);
+}
+function resizeImageTo64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = 64; canvas.height = 64;
+          const ctx = canvas.getContext('2d');
+          const scale = Math.min(64 / img.width, 64 / img.height);
+          const w = img.width * scale, h = img.height * scale;
+          const x = (64 - w) / 2, y = (64 - h) / 2;
+          ctx.clearRect(0, 0, 64, 64);
+          ctx.drawImage(img, x, y, w, h);
+          resolve(canvas.toDataURL('image/png'));
+        } catch (err) { reject(err); }
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+$('stickerChooseBtn').addEventListener('click', () => $('stickerFile').click());
+$('stickerFile').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    stickerPreviewData = await resizeImageTo64(file);
+    const prev = $('stickerPreview');
+    prev.innerHTML = '<img src="' + stickerPreviewData + '" alt="">';
+    if (!$('stickerName').value) {
+      $('stickerName').value = file.name.replace(/\.[^.]+$/, '').slice(0, 40);
+    }
+  } catch (err) {
+    showStickerError(t('sticker_bad_image'));
+    stickerPreviewData = null;
+    $('stickerPreview').innerHTML = '<span class="ph">64×64</span>';
+  }
+});
+
+$('stickerSaveBtn').addEventListener('click', async () => {
+  if (!stickerPreviewData) { showStickerError(t('sticker_no_image')); return; }
+  const name = $('stickerName').value.trim();
+  if (!name) { showStickerError(t('sticker_no_name')); return; }
+  try {
+    await api('/api/stickers', 'POST', { name, image: stickerPreviewData });
+    stickerPreviewData = null;
+    $('stickerPreview').innerHTML = '<span class="ph">64×64</span>';
+    $('stickerName').value = '';
+    $('stickerFile').value = '';
+    $('stickerError').classList.remove('show');
+    loadStickers($('stickerSearch').value);
+  } catch (e) {
+    if (e.status === 409) showStickerError(t('sticker_name_taken'));
+    else if (e.status === 413) showStickerError(t('sticker_bad_image'));
+    else showStickerError(t('err_generic'));
+  }
+});
+
+let stickerSearchTimer = null;
+$('stickerSearch').addEventListener('input', () => {
+  clearTimeout(stickerSearchTimer);
+  stickerSearchTimer = setTimeout(() => loadStickers($('stickerSearch').value), 250);
+});
+
+async function loadStickers(q = '') {
+  const grid = $('stickerGrid'); if (!grid) return;
+  if (!authToken) { grid.innerHTML = '<div class="sticker-empty">'+t('sticker_empty')+'</div>'; return; }
+  grid.innerHTML = '<div class="sticker-empty">…</div>';
+  try {
+    const res = await api('/api/stickers?q=' + encodeURIComponent(q) + '&limit=200');
+    stickerListCache = res.stickers || [];
+    stickerListCache.forEach(s => {
+      stickerImageCache[s.id] = s.image;
+      stickerMetaCache[s.id] = {id:s.id, name:s.name, author:s.author, created:s.created};
+    });
+    renderStickerGrid();
+  } catch (e) {
+    if (e.status === 401) return;
+    grid.innerHTML = '<div class="sticker-empty">' + t('err_generic') + '</div>';
+  }
+}
+
+function renderStickerGrid() {
+  const grid = $('stickerGrid'); if (!grid) return;
+  if (!stickerListCache.length) {
+    grid.innerHTML = '<div class="sticker-empty">' + t('sticker_empty') + '</div>';
+    return;
+  }
+  grid.innerHTML = '';
+  stickerListCache.forEach(s => {
+    const card = document.createElement('div');
+    card.className = 'sticker-card';
+    const d = new Date(s.created * 1000);
+    const dateStr = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    card.innerHTML =
+      '<img src="' + s.image + '" alt="">' +
+      '<div class="st-name" title="' + escapeHtml(s.name) + '">' + escapeHtml(s.name) + '</div>' +
+      '<div class="st-meta" title="' + escapeHtml(s.author + ' · ' + dateStr) + '">' +
+        escapeHtml(s.author) + '<br>' + escapeHtml(dateStr) + '</div>';
+    card.addEventListener('click', () => insertStickerIntoComposer(s.id));
+    grid.appendChild(card);
+  });
+}
+
+function insertStickerIntoComposer(id) {
+  const input = $('msgInput');
+  const token = ':sticker:' + id + ':';
+  const cur = input.value;
+  input.value = cur + (cur && !cur.endsWith(' ') ? ' ' : '') + token + ' ';
+  autoResize();
+  // Close settings and focus composer
+  $('settingsBackdrop').classList.remove('open');
+  input.focus();
+}
+
+async function ensureSticker(id) {
+  if (stickerImageCache[id] && stickerMetaCache[id]) return stickerMetaCache[id];
+  try {
+    const res = await api('/api/stickers/' + id);
+    stickerImageCache[id] = res.image;
+    stickerMetaCache[id] = {id:res.id, name:res.name, author:res.author, created:res.created};
+    return res;
+  } catch (e) { return null; }
+}
+
+const STICKER_RE = /:sticker:([a-f0-9]{4,64}):/g;
+
+async function renderMessageContent(text) {
+  // Find all sticker tokens
+  const parts = [];
+  let last = 0, match;
+  STICKER_RE.lastIndex = 0;
+  while ((match = STICKER_RE.exec(text)) !== null) {
+    if (match.index > last) parts.push({type:'text', text: text.slice(last, match.index)});
+    parts.push({type:'sticker', id: match[1]});
+    last = STICKER_RE.lastIndex;
+  }
+  if (last < text.length) parts.push({type:'text', text: text.slice(last)});
+
+  const hasSticker = parts.some(p => p.type === 'sticker');
+  if (!hasSticker) return escapeHtml(text);
+
+  let html = '';
+  for (const p of parts) {
+    if (p.type === 'text') {
+      html += escapeHtml(p.text);
+    } else {
+      let img = stickerImageCache[p.id];
+      let meta = stickerMetaCache[p.id];
+      if (!img) {
+        const s = await ensureSticker(p.id);
+        if (s) { img = s.image; meta = s; }
+      }
+      if (img) {
+        const title = meta ? (meta.name + ' — ' + meta.author) : '';
+        html += '<img class="msg-sticker" src="' + img + '" alt="" title="' + escapeHtml(title) + '">';
+      } else {
+        html += '<span class="msg-sticker-missing">[sticker]</span>';
+      }
+    }
+  }
+  return html;
+}
+
 // ---------- Channels ----------
 async function loadChannels() {
+  if (!authToken) return;
   try {
     const res = await api('/api/channels');
     channels = res.channels || [];
@@ -1672,7 +1964,9 @@ async function loadChannels() {
     if (!activeId && channels.length) activeId = channels[0].id;
     renderAll();
     if (activeId) openChannelWS(activeId);
-  } catch(e) { if (e.status === 401) $('settingsLogoutBtn').click(); }
+  } catch(e) {
+    if (e.status === 401) return;
+  }
 }
 
 function renderTabs() {
@@ -1697,8 +1991,7 @@ function renderTabs() {
     wrap.appendChild(tab);
   });
   scrollActiveTabIntoView();
-  // Also refresh mobile list to keep the active state in sync
-  renderMobileChannelList($('mcpSearch').value);
+  renderMobileChannelList();
 }
 $('tabsScroll').addEventListener('click', async e => {
   const closeEl = e.target.closest && e.target.closest('[data-close]');
@@ -1752,7 +2045,7 @@ function buildMsgRow(m, prevAuthor, prevTime) {
   const authorEl = document.createElement('span');
   authorEl.className = 'msg-author';
   authorEl.textContent = m.from + ':';
-  authorEl.style.color = (m.from === currentUser) ? '#005a87' : '#8a4a00';
+  authorEl.style.color = userColor(m.from);
   if (grouped) authorEl.style.visibility = 'hidden';
 
   const contentEl = document.createElement('span');
@@ -1781,7 +2074,9 @@ function renderMessages() {
   feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
     const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
-    decryptText(chId, ct).then(pt => { span.textContent = pt; });
+    decryptText(chId, ct).then(pt => {
+      renderMessageContent(pt).then(html => { span.innerHTML = html; });
+    });
   });
   feed.scrollTop = feed.scrollHeight;
 }
@@ -1802,7 +2097,9 @@ function appendMessageUI(msg, channelId) {
   const prevTime = lastRow ? parseInt(lastRow.dataset.t || '0', 10) : 0;
   const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
   feed.appendChild(el);
-  decryptText(channelId, msg.ct).then(pt => { textEl.textContent = pt; });
+  decryptText(channelId, msg.ct).then(pt => {
+    renderMessageContent(pt).then(html => { textEl.innerHTML = html; });
+  });
   feed.scrollTop = feed.scrollHeight;
 }
 function addSystem(text) {
@@ -1825,6 +2122,7 @@ setInterval(updateMuteUI, 1000);
 
 // ---------- WebSocket ----------
 function openChannelWS(channelId) {
+  if (!authToken) return;
   if (ws && wsChannelId === channelId && ws.readyState === WebSocket.OPEN) return;
   if (ws) { try { ws.close(); } catch(e){} ws = null; }
   wsChannelId = channelId; onlineUsers = [];
@@ -1836,7 +2134,7 @@ function openChannelWS(channelId) {
     if (data.type === 'message' && data.msg) { appendMessageUI(data.msg, channelId); renderHeader(); }
     else if (data.type === 'presence') { onlineUsers = data.users || []; renderHeader(); }
     else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's (rate limit)'); }
-    else if (data.type === 'error' && data.error === 'auth') { $('settingsLogoutBtn').click(); }
+    else if (data.type === 'error' && data.error === 'auth') { forceLogout(); }
   };
   ws.onclose = () => { if (wsChannelId === channelId) ws = null; };
 }
@@ -1919,7 +2217,7 @@ $('connectChannelBtn').addEventListener('click', async () => {
 $('connectChannelName').addEventListener('keydown', e => { if (e.key === 'Enter') $('connectChannelBtn').click(); });
 $('connectChannelName').addEventListener('input', () => $('connectError').classList.remove('show'));
 
-// ---------- Search (desktop) ----------
+// ---------- Search (desktop, messages-only) ----------
 $('searchBtn').addEventListener('click', () => {
   $('searchPanel').classList.add('open');
   $('searchInput').value = '';
@@ -1936,15 +2234,9 @@ function renderSearchResults(q) {
   const query = q.trim(); const ql = query.toLowerCase();
   const res = $('searchResults');
   if (!query) {
-    res.innerHTML = '';
-    if (!channels.length) { res.innerHTML = '<div class="empty">'+t('search_no_channels')+'</div>'; return; }
-    channels.forEach(ch => res.appendChild(makeChannelRow(ch, '')));
+    res.innerHTML = '<div class="empty">'+t('search_ph')+'</div>';
     return;
   }
-  const items = [];
-  channels.forEach(ch => {
-    if (!ch.private && ch.name.toLowerCase().includes(ql)) items.push({type:'channel', ch});
-  });
   res.innerHTML = '<div class="empty">…</div>';
   (async () => {
     const found = [];
@@ -1955,22 +2247,14 @@ function renderSearchResults(q) {
       }
     }
     res.innerHTML = '';
-    if (!items.length && !found.length) { res.innerHTML = '<div class="empty">'+t('search_empty')+'</div>'; return; }
-    items.forEach(it => res.appendChild(makeChannelRow(it.ch, query)));
-    found.slice(0,50).forEach(it => res.appendChild(makeMessageRow(it.ch, it.m, it.pt, query)));
+    if (!found.length) { res.innerHTML = '<div class="empty">'+t('search_empty')+'</div>'; return; }
+    found.slice(0,80).forEach(it => res.appendChild(makeMessageRow(it.ch, it.m, it.pt, query)));
   })();
-}
-function makeChannelRow(ch, query) {
-  const row = document.createElement('div'); row.className = 'search-result';
-  row.innerHTML = '<div class="text-block"><div class="title-line">'+(query ? hl(ch.name, query) : escapeHtml(ch.name))+'</div>'+
-    '<div class="sub-line">'+t('header_msgs', {n:(ch.messages||[]).length})+'</div></div>'+
-    '<span class="type-tag">'+t('tag_channel')+'</span>';
-  row.addEventListener('click', () => { activeId = ch.id; renderAll(); openChannelWS(activeId); $('searchPanel').classList.remove('open'); });
-  return row;
 }
 function makeMessageRow(ch, m, pt, query) {
   const row = document.createElement('div'); row.className = 'search-result';
-  row.innerHTML = '<div class="text-block"><div class="title-line">'+escapeHtml(m.from)+
+  const authorHtml = '<span style="color:'+userColor(m.from)+';font-weight:bold;">'+escapeHtml(m.from)+'</span>';
+  row.innerHTML = '<div class="text-block"><div class="title-line">'+authorHtml+
     ' <span style="color:#999;font-weight:normal;">'+t('in_channel',{name:ch.name})+'</span></div>'+
     '<div class="sub-line">'+(query ? hl(pt, query) : escapeHtml(pt))+'</div></div>'+
     '<span class="type-tag">'+t('tag_msg')+'</span>';
