@@ -1,17 +1,19 @@
 # ============================================================
-#  SldClient — FastAPI Messenger, full stack in one file
-#  Run: python main.py  →  http://0.0.0.0:8000
+#  SldClient — FastAPI + Supabase, single file
+#  Run:
+#    SUPABASE_URL=... SUPABASE_SERVICE_KEY=... python main.py
 # ============================================================
 import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
-import urllib.parse
-import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,10 +22,8 @@ import uvicorn
 
 START_TIME = time.time()
 
-MAX_USERS = 1000
-MAX_CHANNELS = 2000
-MAX_MESSAGES_PER_CHANNEL = 300
-MAX_MESSAGE_LEN = 4000
+# ---------------- Limits / security ----------------
+MAX_MESSAGE_LEN = 8000
 MAX_USERNAME_LEN = 32
 MIN_USERNAME_LEN = 2
 MIN_PASSWORD_LEN = 4
@@ -32,25 +32,25 @@ PBKDF2_ITERATIONS = 200_000
 RATE_LIMIT_WINDOW = 10.0
 RATE_LIMIT_MAX = 20
 MUTE_SECONDS = 30
-TOKEN_TTL = 60 * 60 * 24 * 7
-MAX_USER_CHANNELS = 500
+TOKEN_TTL_DAYS = 7
 MAX_BODY_SIZE = 64 * 1024
 GLOBAL_RATE_WINDOW = 60.0
-GLOBAL_RATE_MAX = 300
+GLOBAL_RATE_MAX = 600
 AUTH_RATE_WINDOW = 60.0
-AUTH_RATE_MAX = 8
-WS_PER_IP_MAX = 5
+AUTH_RATE_MAX = 10
+WS_PER_IP_MAX = 6
+MESSAGE_FETCH_LIMIT = 300
+USERNAME_RE = re.compile(r"^[^\s@:<>\"'&]{2,32}$")
 
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
 TURNSTILE_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 SKIP_TURNSTILE = os.environ.get("SKIP_TURNSTILE", "").lower() in ("1", "true", "yes")
 
-USERS: Dict[str, dict] = {}
-TOKENS: Dict[str, dict] = {}
-CHANNELS: Dict[str, dict] = {}
-USER_CHANNELS: Dict[str, Set[str]] = {}
-MSG_TIMES: Dict[str, List[float]] = {}
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or ""
+
+# Per-process ephemeral state (not persisted — OK)
 IP_RATE: Dict[str, List[float]] = {}
 WS_PER_IP: Dict[str, int] = {}
 
@@ -58,6 +58,7 @@ def log(msg: str) -> None:
     try: print(f"[SldClient {time.strftime('%H:%M:%S')}] {msg}", flush=True)
     except Exception: pass
 
+# ---------------- Password / tokens ----------------
 def hash_password(password: str, salt: bytes) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS).hex()
 
@@ -68,24 +69,88 @@ def verify_password(password: str, salt_hex: str, expected: str) -> bool:
 
 def new_token() -> str: return secrets.token_urlsafe(32)
 
-def user_from_token(token: Optional[str]) -> Optional[str]:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def parse_ts(s: str) -> float:
+    if not s: return 0.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+# ---------------- Supabase REST client ----------------
+def _sb_headers(prefer: Optional[str] = None) -> dict:
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if prefer: h["Prefer"] = prefer
+    return h
+
+async def sb_get(path: str, params: Optional[dict] = None) -> list:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase not configured")
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params or {})
+        if r.status_code >= 400:
+            raise RuntimeError(f"sb_get {path} → {r.status_code} {r.text[:200]}")
+        return r.json()
+
+async def sb_post(path: str, data, prefer: str = "return=representation") -> list:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.post(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(prefer), json=data)
+        if r.status_code >= 400:
+            raise RuntimeError(f"sb_post {path} → {r.status_code} {r.text[:200]}")
+        if r.status_code == 201 and r.text:
+            try: return r.json()
+            except Exception: return []
+        return []
+
+async def sb_patch(path: str, params: dict, data) -> list:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers("return=representation"),
+                          params=params, json=data)
+        if r.status_code >= 400:
+            raise RuntimeError(f"sb_patch {path} → {r.status_code} {r.text[:200]}")
+        try: return r.json()
+        except Exception: return []
+
+async def sb_delete(path: str, params: dict) -> bool:
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params)
+        return r.status_code < 400
+
+async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
     if not token: return None
-    entry = TOKENS.get(token)
-    if not entry: return None
-    if entry["exp"] < time.time():
-        TOKENS.pop(token, None); return None
-    return entry["user"]
+    try:
+        rows = await sb_get("tokens", {
+            "select": "expires_at,users(id,username,avatar,show_in_list)",
+            "token": f"eq.{token}",
+            "limit": "1",
+        })
+    except Exception:
+        return None
+    if not rows: return None
+    row = rows[0]
+    exp = parse_ts(row.get("expires_at", ""))
+    if exp and exp < time.time():
+        try: await sb_delete("tokens", {"token": f"eq.{token}"})
+        except Exception: pass
+        return None
+    u = row.get("users")
+    if not u: return None
+    return {"id": u["id"], "username": u["username"], "avatar": u.get("avatar", "?"),
+            "show_in_list": u.get("show_in_list", True)}
 
-async def auth(request: Request) -> str:
-    user = user_from_token(request.headers.get("x-auth-token"))
-    if not user: raise HTTPException(status_code=401, detail="unauthorized")
-    return user
+async def auth(request: Request) -> dict:
+    u = await get_user_by_token(request.headers.get("x-auth-token"))
+    if not u: raise HTTPException(status_code=401, detail="unauthorized")
+    return u
 
-def user_channel_set(username: str) -> Set[str]:
-    s = USER_CHANNELS.get(username)
-    if s is None: s = set(); USER_CHANNELS[username] = s
-    return s
-
+# ---------------- IP helpers / rate limit ----------------
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     if fwd: return fwd.split(",")[0].strip()
@@ -114,17 +179,25 @@ def rate_check(key: str, window: float, limit: int) -> bool:
     if len(lst) >= limit: return False
     lst.append(now); return True
 
+# ---------------- Turnstile ----------------
 def _verify_turnstile_sync(token: str, remote_ip: str) -> dict:
     try:
-        body = urllib.parse.urlencode({
-            "secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip,
-        }).encode("utf-8")
-        req = urllib.request.Request(TURNSTILE_URL, data=body, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        body = urllib_encode({"secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip})
+        req = build_request(TURNSTILE_URL, body)
+        with __import__("urllib.request", fromlist=["urlopen"]).urlopen(req, timeout=6) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         return {"success": False, "error-codes": [f"exception: {e}"]}
+
+def urllib_encode(d: dict) -> bytes:
+    import urllib.parse
+    return urllib.parse.urlencode(d).encode("utf-8")
+
+def build_request(url: str, body: bytes):
+    import urllib.request
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    return req
 
 async def verify_turnstile(token: str, remote_ip: str) -> tuple[bool, str]:
     if SKIP_TURNSTILE: return True, "skipped"
@@ -133,10 +206,10 @@ async def verify_turnstile(token: str, remote_ip: str) -> tuple[bool, str]:
     if result.get("success"): return True, "ok"
     return False, ",".join(str(c) for c in result.get("error-codes", ["unknown"]))
 
+# ---------------- App ----------------
 app = FastAPI(title="SldClient", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
 
-# Content-Security-Policy — allows inline (we escape everything) + CF Turnstile + Bootstrap CDN
 CSP = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; "
@@ -145,10 +218,7 @@ CSP = (
     "font-src 'self' data:; "
     "connect-src 'self' https://challenges.cloudflare.com; "
     "frame-src https://challenges.cloudflare.com; "
-    "frame-ancestors 'none'; "
-    "base-uri 'self'; "
-    "form-action 'self'; "
-    "object-src 'none'; "
+    "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; "
     "upgrade-insecure-requests"
 )
 
@@ -166,7 +236,6 @@ async def security_middleware(request: Request, call_next):
     if not rate_check(f"req:{ip}", GLOBAL_RATE_WINDOW, GLOBAL_RATE_MAX):
         return JSONResponse({"detail": "rate_limited"}, status_code=429)
     response = await call_next(request)
-    # Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -182,158 +251,290 @@ async def security_middleware(request: Request, call_next):
     response.headers["Server"] = "SldClient"
     return response
 
+# ---------------- Models ----------------
 class AuthReq(BaseModel):
-    username: str; password: str; turnstile_token: str = ""
+    username: str
+    password: str
+    avatar: str = "?"
+    turnstile_token: str = ""
+
 class CreateChannelReq(BaseModel):
     name: str
+
 class ConnectChannelReq(BaseModel):
     name: str
+
 class LeaveChannelReq(BaseModel):
     channel_id: str
+
 class PrefsReq(BaseModel):
     show_in_list: bool
 
-def init_defaults():
-    for cid, name, private in [
-        ("general","Общий",False),("work","Работа",False),
-        ("friends","Друзья",False),("secret-room","secret-room",True),
-    ]:
-        CHANNELS[cid] = {"id":cid,"name":name,"private":private,
-                         "owner":None,"created":time.time(),"messages":[]}
-init_defaults()
-
+# ---------------- REST ----------------
 @app.post("/api/auth")
 async def auth_endpoint(req: AuthReq, request: Request):
     ip = get_client_ip(request)
     if not rate_check(f"auth:{ip}", AUTH_RATE_WINDOW, AUTH_RATE_MAX):
-        log(f"AUTH rate-limited ip={ip}"); raise HTTPException(429, "too_many_attempts")
+        raise HTTPException(429, "too_many_attempts")
     ok, reason = await verify_turnstile(req.turnstile_token, ip)
     if not ok:
         log(f"AUTH turnstile failed ip={ip} reason={reason}")
         raise HTTPException(400, "turnstile_failed")
+
     username = req.username.strip()
-    if not (MIN_USERNAME_LEN <= len(username) <= MAX_USERNAME_LEN):
+    if not USERNAME_RE.match(username):
         raise HTTPException(400, "bad_username")
     if not (MIN_PASSWORD_LEN <= len(req.password) <= MAX_PASSWORD_LEN):
         raise HTTPException(400, "bad_password")
-    existing = USERS.get(username)
-    if existing:
-        if not verify_password(req.password, existing["salt"], existing["pwd"]):
-            log(f"AUTH bad password user={username}"); raise HTTPException(401, "bad_credentials")
-        is_new = False; log(f"AUTH login user={username}")
+
+    try:
+        rows = await sb_get("users", {
+            "select": "id,username,password_hash,salt,avatar,show_in_list",
+            "username": f"ilike.{username}",
+            "limit": "1",
+        })
+    except Exception as e:
+        log(f"sb_get users error: {e}")
+        raise HTTPException(503, "db_error")
+
+    if rows:
+        u = rows[0]
+        if not verify_password(req.password, u["salt"], u["password_hash"]):
+            raise HTTPException(401, "bad_credentials")
+        user = {"id": u["id"], "username": u["username"], "avatar": u.get("avatar", "?"),
+                "show_in_list": u.get("show_in_list", True)}
+        is_new = False
+        log(f"AUTH login user={user['username']}")
     else:
-        if len(USERS) >= MAX_USERS: raise HTTPException(503, "server_full")
+        avatar = (req.avatar or "?").strip()[:2] or "?"
         salt = os.urandom(16)
-        USERS[username] = {"pwd":hash_password(req.password,salt),"salt":salt.hex(),
-                           "created":time.time(),"show_in_list":True}
-        USER_CHANNELS[username] = set(); is_new = True
-        log(f"AUTH register user={username}")
+        try:
+            created = await sb_post("users", {
+                "username": username,
+                "password_hash": hash_password(req.password, salt),
+                "salt": salt.hex(),
+                "avatar": avatar,
+                "show_in_list": True,
+            })
+        except Exception as e:
+            log(f"register insert error: {e}")
+            raise HTTPException(409, "user_exists")
+        if not created:
+            raise HTTPException(503, "db_error")
+        row = created[0]
+        user = {"id": row["id"], "username": row["username"],
+                "avatar": row.get("avatar", avatar), "show_in_list": True}
+        is_new = True
+        log(f"AUTH register user={user['username']}")
+
     token = new_token()
-    TOKENS[token] = {"user": username, "exp": time.time() + TOKEN_TTL}
-    return {"token": token, "username": username, "is_new": is_new}
+    exp_iso = (datetime.now(timezone.utc) + timedelta(days=TOKEN_TTL_DAYS)).isoformat()
+    try:
+        await sb_post("tokens", {"token": token, "user_id": user["id"], "expires_at": exp_iso},
+                      prefer="return=minimal")
+    except Exception as e:
+        log(f"token insert error: {e}")
+        raise HTTPException(503, "db_error")
+
+    return {"token": token, "username": user["username"], "avatar": user["avatar"], "is_new": is_new}
 
 @app.post("/api/logout")
 async def logout(request: Request):
     token = request.headers.get("x-auth-token")
-    if token: TOKENS.pop(token, None)
+    if token:
+        try: await sb_delete("tokens", {"token": f"eq.{token}"})
+        except Exception: pass
     return {"ok": True}
 
 @app.get("/api/uptime")
 async def uptime():
-    return {"uptime": time.time()-START_TIME, "users":len(USERS),
-            "channels":len(CHANNELS), "online":len(TOKENS), "name":"SldClient"}
+    return {"uptime": time.time()-START_TIME, "name": "SldClient"}
 
 @app.get("/api/me")
 async def me(request: Request):
-    username = await auth(request)
-    return {"username": username, "show_in_list": USERS[username].get("show_in_list", True)}
+    u = await auth(request)
+    return {"username": u["username"], "avatar": u["avatar"], "show_in_list": u["show_in_list"]}
 
 @app.post("/api/me/preferences")
 async def update_prefs(req: PrefsReq, request: Request):
-    username = await auth(request)
-    USERS[username]["show_in_list"] = bool(req.show_in_list)
-    return {"ok": True, "show_in_list": USERS[username]["show_in_list"]}
+    u = await auth(request)
+    await sb_patch("users", {"id": f"eq.{u['id']}"}, {"show_in_list": bool(req.show_in_list)})
+    return {"ok": True, "show_in_list": bool(req.show_in_list)}
 
 @app.get("/api/users")
 async def list_users(request: Request):
     me = await auth(request)
-    online = manager.get_online_users()
+    online = manager.get_online_usernames()
+    try:
+        rows = await sb_get("users", {
+            "select": "id,username,avatar,show_in_list",
+            "order": "username.asc",
+            "limit": "500",
+        })
+    except Exception:
+        raise HTTPException(503, "db_error")
     out = []
-    for u, data in USERS.items():
-        if u == me: out.append({"username":u,"online":u in online,"self":True})
-        elif data.get("show_in_list", True): out.append({"username":u,"online":u in online,"self":False})
-    out.sort(key=lambda x: x["username"].lower())
+    for r in rows:
+        if r["id"] == me["id"]:
+            out.append({"username": r["username"], "avatar": r.get("avatar", "?"),
+                        "online": r["username"] in online, "self": True})
+        elif r.get("show_in_list", True):
+            out.append({"username": r["username"], "avatar": r.get("avatar", "?"),
+                        "online": r["username"] in online, "self": False})
     return {"users": out, "online": len(online)}
+
+def _channel_from_row(ch: dict, msgs: list) -> dict:
+    out_msgs = []
+    for m in msgs:
+        u = m.get("users") or {}
+        out_msgs.append({
+            "id": m["id"],
+            "from": u.get("username", "?"),
+            "avatar": u.get("avatar", "?"),
+            "ct": m["ciphertext"],
+            "t": parse_ts(m["created_at"]),
+        })
+    return {"id": ch["id"], "name": ch["name"], "private": bool(ch.get("private", True)),
+            "owner_id": ch.get("owner_id"), "messages": out_msgs}
+
+async def _fetch_channel_messages(channel_id: str) -> list:
+    rows = await sb_get("messages", {
+        "select": "id,ciphertext,created_at,users(username,avatar)",
+        "channel_id": f"eq.{channel_id}",
+        "order": "created_at.desc",
+        "limit": str(MESSAGE_FETCH_LIMIT),
+    })
+    rows.reverse()
+    return rows
 
 @app.get("/api/channels")
 async def list_channels(request: Request):
-    username = await auth(request)
-    cids = USER_CHANNELS.get(username, set())
+    me = await auth(request)
+    try:
+        rows = await sb_get("channel_members", {
+            "select": "channel_id,channels(id,name,private,owner_id,created_at)",
+            "user_id": f"eq.{me['id']}",
+        })
+    except Exception:
+        raise HTTPException(503, "db_error")
     out = []
-    for cid in cids:
-        ch = CHANNELS.get(cid)
+    for r in rows:
+        ch = r.get("channels")
         if not ch: continue
-        out.append({"id":cid,"name":ch["name"],"private":ch["private"],
-                    "owner":ch["owner"],
-                    "messages":ch["messages"][-MAX_MESSAGES_PER_CHANNEL:]})
+        try:
+            msgs = await _fetch_channel_messages(ch["id"])
+        except Exception:
+            msgs = []
+        out.append(_channel_from_row(ch, msgs))
     out.sort(key=lambda c: c["name"].lower())
     return {"channels": out}
 
 @app.post("/api/channels")
 async def create_channel(req: CreateChannelReq, request: Request):
-    """Channels are ALWAYS private by default."""
-    username = await auth(request)
+    me = await auth(request)
     name = req.name.strip()[:40]
     if not name: raise HTTPException(400, "bad_name")
-    for ch in CHANNELS.values():
-        if ch["name"].lower() == name.lower(): raise HTTPException(409, "name_taken")
-    if len(CHANNELS) >= MAX_CHANNELS: raise HTTPException(503, "server_full")
-    my_ch = user_channel_set(username)
-    if len(my_ch) >= MAX_USER_CHANNELS: raise HTTPException(503, "user_channel_limit")
-    cid = secrets.token_hex(6)
-    CHANNELS[cid] = {"id":cid,"name":name,"private":True,  # always private
-                     "owner":username,"created":time.time(),"messages":[]}
-    my_ch.add(cid)
-    return {"id":cid,"name":name,"private":True,"messages":[]}
+    try:
+        existing = await sb_get("channels", {"select": "id", "name": f"ilike.{name}", "limit": "1"})
+    except Exception:
+        raise HTTPException(503, "db_error")
+    if existing: raise HTTPException(409, "name_taken")
+    try:
+        created = await sb_post("channels", {"name": name, "private": True, "owner_id": me["id"]})
+        if not created: raise HTTPException(503, "db_error")
+        ch = created[0]
+        await sb_post("channel_members", {"channel_id": ch["id"], "user_id": me["id"]},
+                      prefer="return=minimal")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log(f"create_channel error: {e}")
+        raise HTTPException(409, "name_taken")
+    return {"id": ch["id"], "name": ch["name"], "private": True, "messages": []}
 
 @app.post("/api/channels/connect")
 async def connect_channel(req: ConnectChannelReq, request: Request):
-    username = await auth(request)
+    me = await auth(request)
     name = req.name.strip()
     if not name: raise HTTPException(400, "bad_name")
-    for cid, ch in CHANNELS.items():
-        if ch["name"].lower() == name.lower():
-            my_ch = user_channel_set(username)
-            if len(my_ch) >= MAX_USER_CHANNELS and cid not in my_ch:
-                raise HTTPException(503, "user_channel_limit")
-            my_ch.add(cid)
-            return {"id":cid,"name":ch["name"],"private":ch["private"],"owner":ch["owner"],
-                    "messages":ch["messages"][-MAX_MESSAGES_PER_CHANNEL:]}
-    raise HTTPException(404, "not_found")
+    try:
+        rows = await sb_get("channels", {
+            "select": "id,name,private,owner_id",
+            "name": f"ilike.{name}",
+            "limit": "1",
+        })
+    except Exception:
+        raise HTTPException(503, "db_error")
+    if not rows: raise HTTPException(404, "not_found")
+    ch = rows[0]
+    try:
+        await sb_post("channel_members", {"channel_id": ch["id"], "user_id": me["id"]},
+                      prefer="resolution=ignore-duplicates,return=minimal")
+    except Exception:
+        pass
+    try:
+        msgs = await _fetch_channel_messages(ch["id"])
+    except Exception:
+        msgs = []
+    return _channel_from_row(ch, msgs)
 
 @app.post("/api/channels/leave")
 async def leave_channel(req: LeaveChannelReq, request: Request):
-    username = await auth(request)
-    s = USER_CHANNELS.get(username)
-    if s is not None: s.discard(req.channel_id)
+    me = await auth(request)
+    await sb_delete("channel_members",
+                    {"channel_id": f"eq.{req.channel_id}", "user_id": f"eq.{me['id']}"})
     return {"ok": True}
 
+@app.get("/api/channels/{channel_id}/members")
+async def channel_members(channel_id: str, request: Request):
+    me = await auth(request)
+    try:
+        mine = await sb_get("channel_members", {
+            "select": "user_id",
+            "channel_id": f"eq.{channel_id}",
+            "user_id": f"eq.{me['id']}",
+            "limit": "1",
+        })
+    except Exception:
+        raise HTTPException(503, "db_error")
+    if not mine: raise HTTPException(403, "not_member")
+    try:
+        rows = await sb_get("channel_members", {
+            "select": "users(username,avatar)",
+            "channel_id": f"eq.{channel_id}",
+            "order": "joined_at.asc",
+            "limit": "500",
+        })
+    except Exception:
+        raise HTTPException(503, "db_error")
+    out = []
+    for r in rows:
+        u = r.get("users")
+        if u: out.append({"username": u["username"], "avatar": u.get("avatar", "?")})
+    return {"members": out}
+
+# ---------------- WebSocket ----------------
 class WSManager:
     def __init__(self):
         self.rooms: Dict[str, Set[WebSocket]] = {}
         self.info: Dict[WebSocket, tuple] = {}
+
     async def join(self, cid, ws, user):
         self.rooms.setdefault(cid, set()).add(ws)
         self.info[ws] = (user, cid)
+
     def leave(self, ws):
         e = self.info.pop(ws, None)
         if e:
             _, cid = e
             self.rooms.get(cid, set()).discard(ws)
-    def get_online_users(self):
-        return set(u for (u, c) in self.info.values())
-    def online_users(self, cid):
-        return sorted(set(u for (u, c) in self.info.values() if c == cid))
+
+    def get_online_usernames(self) -> Set[str]:
+        return set(u["username"] for (u, _) in self.info.values())
+
+    def online_users(self, cid) -> List[str]:
+        return sorted(set(u["username"] for (u, c) in self.info.values() if c == cid))
+
     async def broadcast(self, cid, payload):
         sockets = list(self.rooms.get(cid, set()))
         if not sockets: return
@@ -343,6 +544,14 @@ class WSManager:
             if isinstance(res, Exception): self.leave(ws)
 
 manager = WSManager()
+
+async def persist_message(mid: str, channel_id: str, user_id: str, ct: str):
+    try:
+        await sb_post("messages", {
+            "id": mid, "channel_id": channel_id, "user_id": user_id, "ciphertext": ct,
+        }, prefer="resolution=ignore-duplicates,return=minimal")
+    except Exception as e:
+        log(f"persist_message failed: {e}")
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -354,23 +563,45 @@ async def ws_endpoint(ws: WebSocket):
         except Exception: pass
         return
     WS_PER_IP[ip] = current + 1
-    username = None; channel_id = None
+
+    user = None
+    channel_id = None
     try:
         init = await ws.receive_json()
-        if init.get("type") != "auth": await ws.close(); return
-        token = init.get("token",""); channel_id = init.get("channel_id","")
-        username = user_from_token(token)
-        if (not username or channel_id not in CHANNELS
-                or channel_id not in USER_CHANNELS.get(username, set())):
+        if init.get("type") != "auth":
+            await ws.close(); return
+        token = init.get("token","")
+        channel_id = init.get("channel_id","")
+        user = await get_user_by_token(token)
+        if not user or not channel_id:
             await ws.send_json({"type":"error","error":"auth"}); await ws.close(); return
-        await manager.join(channel_id, ws, username)
-        await manager.broadcast(channel_id, {"type":"presence","users":manager.online_users(channel_id)})
+        try:
+            mine = await sb_get("channel_members", {
+                "select": "user_id",
+                "channel_id": f"eq.{channel_id}",
+                "user_id": f"eq.{user['id']}",
+                "limit": "1",
+            })
+        except Exception:
+            mine = []
+        if not mine:
+            await ws.send_json({"type":"error","error":"auth"}); await ws.close(); return
+
+        await manager.join(channel_id, ws, user)
+        await manager.broadcast(channel_id,
+            {"type":"presence","users":manager.online_users(channel_id)})
+
         while True:
             data = await ws.receive_json()
-            if data.get("type") == "message":
+            t = data.get("type")
+            if t == "message":
                 ct = str(data.get("ciphertext",""))[:MAX_MESSAGE_LEN]
                 if not ct: continue
-                key = f"{username}|{channel_id}"; now = time.time()
+                mid = str(data.get("id","")).strip()
+                if not re.match(r"^[0-9a-fA-F-]{8,64}$", mid):
+                    mid = secrets.token_hex(16)
+                key = f"{user['id']}|{channel_id}"
+                now = time.time()
                 times = MSG_TIMES.setdefault(key, [])
                 cutoff = now - RATE_LIMIT_WINDOW; i = 0
                 for tt in times:
@@ -378,44 +609,50 @@ async def ws_endpoint(ws: WebSocket):
                     i += 1
                 if i: del times[:i]
                 if len(times) >= RATE_LIMIT_MAX:
-                    await ws.send_json({"type":"muted","seconds":MUTE_SECONDS}); continue
+                    await ws.send_json({"type":"muted","seconds":MUTE_SECONDS})
+                    continue
                 times.append(now)
-                msg = {"id":secrets.token_hex(8),"from":username,"ct":ct,"t":now}
-                ch = CHANNELS[channel_id]; ch["messages"].append(msg)
-                if len(ch["messages"]) > MAX_MESSAGES_PER_CHANNEL:
-                    del ch["messages"][:-MAX_MESSAGES_PER_CHANNEL]
+
+                # Broadcast IMMEDIATELY with client-generated id, persist in background
+                msg = {
+                    "id": mid,
+                    "from": user["username"],
+                    "avatar": user["avatar"],
+                    "ct": ct,
+                    "t": now,
+                }
                 await manager.broadcast(channel_id, {"type":"message","msg":msg})
-    except WebSocketDisconnect: pass
-    except Exception: pass
+                asyncio.create_task(persist_message(mid, channel_id, user["id"], ct))
+
+            elif t == "ping":
+                try: await ws.send_json({"type":"pong"})
+                except Exception: pass
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
     finally:
         manager.leave(ws)
         WS_PER_IP[ip] = max(0, WS_PER_IP.get(ip, 1) - 1)
         if channel_id:
-            try: await manager.broadcast(channel_id, {"type":"presence","users":manager.online_users(channel_id)})
-            except Exception: pass
+            try:
+                await manager.broadcast(channel_id,
+                    {"type":"presence","users":manager.online_users(channel_id)})
+            except Exception:
+                pass
 
+# MSG_TIMES kept in-memory (rate-limit only)
+MSG_TIMES: Dict[str, List[float]] = {}
+
+# ---------------- i18n ----------------
 I18N = {
- "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open the Channels panel to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","search_empty":"Nothing found","search_no_channels":"You have no channels yet","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","title_scroll_left":"Scroll left","title_scroll_right":"Scroll right","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels"},
- "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте панель «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","search_empty":"Ничего не найдено","search_no_channels":"У вас ещё нет каналов","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","title_scroll_left":"Прокрутить влево","title_scroll_right":"Прокрутить вправо","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник должен быть 2–32 символа","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы"},
- "es": {"login_title":"SldClient","login_subtitle":"Inicia sesión o crea una cuenta","field_nick":"Apodo","field_password":"Contraseña","btn_login":"Continuar","remember_me":"Recuérdame","logged_as":"Sesión como","header_msgs":"{n} mensajes","empty_no_messages":"No hay mensajes. ¡Sé el primero!","composer_ph":"Escribe un mensaje...","composer_no_channel":"Sin canal activo","btn_cancel":"Cancelar","btn_create":"Crear","btn_connect":"Conectar","title_settings":"Ajustes","theme_toggle":"Cambiar tema","lang_toggle":"Cambiar idioma","uptime_label":"Tiempo activo","err_generic":"Error","settings_title":"Ajustes","settings_account":"Cuenta","settings_appearance":"Apariencia","settings_users":"Lista de usuarios","settings_show_in_list":"Mostrarme en la lista","settings_user":"Sesión como","settings_logout":"Cerrar sesión","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Oscuro","settings_lang":"Idioma","settings_close":"Cerrar","users_list_empty":"Sin usuarios","users_you":"(tú)","users_online":"en línea","mobile_channels":"Canales"},
- "de": {"login_title":"SldClient","login_subtitle":"Anmelden oder Konto erstellen","field_nick":"Spitzname","field_password":"Passwort","btn_login":"Weiter","remember_me":"Angemeldet bleiben","logged_as":"Angemeldet als","header_msgs":"{n} Nachrichten","empty_no_messages":"Keine Nachrichten. Schreib als Erster!","composer_ph":"Nachricht schreiben...","composer_no_channel":"Kein aktiver Kanal","btn_cancel":"Abbrechen","btn_create":"Erstellen","btn_connect":"Verbinden","title_settings":"Einstellungen","theme_toggle":"Design wechseln","lang_toggle":"Sprache ändern","uptime_label":"Laufzeit","err_generic":"Fehler","settings_title":"Einstellungen","settings_account":"Konto","settings_appearance":"Aussehen","settings_users":"Benutzerliste","settings_show_in_list":"Mich in der Liste anzeigen","settings_user":"Angemeldet als","settings_logout":"Abmelden","settings_theme":"Design","settings_theme_light":"Hell","settings_theme_dark":"Dunkel","settings_lang":"Sprache","settings_close":"Schließen","users_list_empty":"Keine Benutzer","users_you":"(du)","users_online":"online","mobile_channels":"Kanäle"},
- "fr": {"login_title":"SldClient","login_subtitle":"Connectez-vous ou créez un compte","field_nick":"Pseudo","field_password":"Mot de passe","btn_login":"Continuer","remember_me":"Se souvenir de moi","logged_as":"Connecté en tant que","header_msgs":"{n} messages","empty_no_messages":"Aucun message. Soyez le premier !","composer_ph":"Écrire un message...","composer_no_channel":"Aucun canal actif","btn_cancel":"Annuler","btn_create":"Créer","btn_connect":"Se connecter","title_settings":"Paramètres","theme_toggle":"Changer de thème","lang_toggle":"Changer de langue","uptime_label":"Durée","err_generic":"Erreur","settings_title":"Paramètres","settings_account":"Compte","settings_appearance":"Apparence","settings_users":"Liste des utilisateurs","settings_show_in_list":"Me montrer dans la liste","settings_user":"Connecté en tant que","settings_logout":"Se déconnecter","settings_theme":"Thème","settings_theme_light":"Clair","settings_theme_dark":"Sombre","settings_lang":"Langue","settings_close":"Fermer","users_list_empty":"Aucun utilisateur","users_you":"(vous)","users_online":"en ligne","mobile_channels":"Canaux"},
- "it": {"login_title":"SldClient","login_subtitle":"Accedi o crea un account","btn_login":"Continua","remember_me":"Ricordami","btn_cancel":"Annulla","btn_create":"Crea","btn_connect":"Connetti","title_settings":"Impostazioni","theme_toggle":"Cambia tema","lang_toggle":"Cambia lingua","err_generic":"Errore","settings_title":"Impostazioni","settings_account":"Account","settings_appearance":"Aspetto","settings_users":"Lista utenti","settings_show_in_list":"Mostrami nella lista","settings_user":"Connesso come","settings_logout":"Esci","settings_theme":"Tema","settings_theme_light":"Chiaro","settings_theme_dark":"Scuro","settings_lang":"Lingua","settings_close":"Chiudi","users_list_empty":"Nessun utente","users_you":"(tu)","users_online":"online","mobile_channels":"Canali"},
- "pt": {"login_title":"SldClient","login_subtitle":"Entre ou crie uma conta","btn_login":"Continuar","remember_me":"Lembrar-me","btn_cancel":"Cancelar","btn_create":"Criar","btn_connect":"Conectar","title_settings":"Configurações","theme_toggle":"Alternar tema","lang_toggle":"Alterar idioma","err_generic":"Erro","settings_title":"Configurações","settings_account":"Conta","settings_appearance":"Aparência","settings_users":"Lista de usuários","settings_show_in_list":"Mostrar-me na lista","settings_user":"Conectado como","settings_logout":"Sair","settings_theme":"Tema","settings_theme_light":"Claro","settings_theme_dark":"Escuro","settings_lang":"Idioma","settings_close":"Fechar","users_list_empty":"Nenhum usuário","users_you":"(você)","users_online":"online","mobile_channels":"Canais"},
- "nl": {"login_title":"SldClient","btn_login":"Doorgaan","remember_me":"Onthoud mij","btn_cancel":"Annuleren","btn_create":"Aanmaken","btn_connect":"Verbinden","title_settings":"Instellingen","theme_toggle":"Thema wisselen","lang_toggle":"Taal wijzigen","err_generic":"Fout","settings_title":"Instellingen","settings_account":"Account","settings_appearance":"Weergave","settings_users":"Gebruikerslijst","settings_show_in_list":"Toon mij in de lijst","settings_user":"Ingelogd als","settings_logout":"Afmelden","settings_theme":"Thema","settings_theme_light":"Licht","settings_theme_dark":"Donker","settings_lang":"Taal","settings_close":"Sluiten","users_list_empty":"Geen gebruikers","users_you":"(jij)","users_online":"online","mobile_channels":"Kanalen"},
- "pl": {"btn_login":"Kontynuuj","remember_me":"Zapamiętaj mnie","btn_cancel":"Anuluj","btn_create":"Utwórz","btn_connect":"Połącz","settings_title":"Ustawienia","settings_account":"Konto","settings_appearance":"Wygląd","settings_users":"Lista użytkowników","settings_show_in_list":"Pokaż mnie na liście","settings_logout":"Wyloguj","settings_theme":"Motyw","settings_lang":"Język","settings_close":"Zamknij","title_settings":"Ustawienia","users_you":"(ty)","users_online":"online","users_list_empty":"Brak użytkowników","mobile_channels":"Kanały"},
- "uk": {"login_title":"SldClient","btn_login":"Продовжити","remember_me":"Запам'ятати мене","btn_cancel":"Скасувати","btn_create":"Створити","btn_connect":"Підключитися","title_settings":"Налаштування","theme_toggle":"Змінити тему","lang_toggle":"Змінити мову","err_generic":"Помилка","settings_title":"Налаштування","settings_account":"Акаунт","settings_appearance":"Оформлення","settings_users":"Список користувачів","settings_show_in_list":"Показувати мене в списку","settings_user":"Ви увійшли як","settings_logout":"Вийти з акаунта","settings_theme":"Тема","settings_theme_light":"Світла","settings_theme_dark":"Темна","settings_lang":"Мова","settings_close":"Закрити","users_you":"(ви)","users_online":"онлайн","users_list_empty":"Немає користувачів","mobile_channels":"Канали"},
- "cs": {"btn_login":"Pokračovat","remember_me":"Zapamatovat si mě","settings_title":"Nastavení","settings_account":"Účet","settings_appearance":"Vzhled","settings_users":"Seznam uživatelů","settings_show_in_list":"Zobrazit mě v seznamu","settings_logout":"Odhlásit","settings_theme":"Motiv","settings_lang":"Jazyk","settings_close":"Zavřít","title_settings":"Nastavení","users_you":"(vy)","users_online":"online","mobile_channels":"Kanály"},
- "sv": {"btn_login":"Fortsätt","remember_me":"Kom ihåg mig","settings_title":"Inställningar","settings_account":"Konto","settings_appearance":"Utseende","settings_users":"Användarlista","settings_show_in_list":"Visa mig i listan","settings_logout":"Logga ut","settings_theme":"Tema","settings_lang":"Språk","settings_close":"Stäng","title_settings":"Inställningar","users_you":"(du)","users_online":"online","mobile_channels":"Kanaler"},
- "el": {"btn_login":"Συνέχεια","remember_me":"Να με θυμάσαι","settings_title":"Ρυθμίσεις","settings_account":"Λογαριασμός","settings_appearance":"Εμφάνιση","settings_users":"Λίστα χρηστών","settings_show_in_list":"Να εμφανίζομαι στη λίστα","settings_logout":"Αποσύνδεση","settings_theme":"Θέμα","settings_lang":"Γλώσσα","settings_close":"Κλείσιμο","title_settings":"Ρυθμίσεις","users_you":"(εσύ)","users_online":"συνδεδεμένοι","mobile_channels":"Κανάλια"},
- "tr": {"login_title":"SldClient","btn_login":"Devam et","remember_me":"Beni hatırla","btn_cancel":"İptal","btn_create":"Oluştur","btn_connect":"Bağlan","title_settings":"Ayarlar","theme_toggle":"Temayı değiştir","lang_toggle":"Dili değiştir","err_generic":"Hata","settings_title":"Ayarlar","settings_account":"Hesap","settings_appearance":"Görünüm","settings_users":"Kullanıcı listesi","settings_show_in_list":"Listede göster","settings_user":"Giriş yapan:","settings_logout":"Çıkış yap","settings_theme":"Tema","settings_theme_light":"Açık","settings_theme_dark":"Koyu","settings_lang":"Dil","settings_close":"Kapat","users_you":"(sen)","users_online":"çevrimiçi","users_list_empty":"Kullanıcı yok","mobile_channels":"Kanallar"},
- "ja": {"login_title":"SldClient","btn_login":"続行","remember_me":"ログイン状態を保持","btn_cancel":"キャンセル","btn_create":"作成","btn_connect":"接続","title_settings":"設定","theme_toggle":"テーマ切替","lang_toggle":"言語変更","err_generic":"エラー","settings_title":"設定","settings_account":"アカウント","settings_appearance":"外観","settings_users":"ユーザー一覧","settings_show_in_list":"一覧に自分を表示","settings_user":"ログイン中:","settings_logout":"サインアウト","settings_theme":"テーマ","settings_theme_light":"ライト","settings_theme_dark":"ダーク","settings_lang":"言語","settings_close":"閉じる","users_you":"(あなた)","users_online":"オンライン","users_list_empty":"ユーザーがいません","mobile_channels":"チャンネル"},
- "ko": {"login_title":"SldClient","btn_login":"계속","remember_me":"로그인 상태 유지","btn_cancel":"취소","btn_create":"만들기","btn_connect":"연결","title_settings":"설정","theme_toggle":"테마 전환","lang_toggle":"언어 변경","err_generic":"오류","settings_title":"설정","settings_account":"계정","settings_appearance":"모양","settings_users":"사용자 목록","settings_show_in_list":"목록에 나를 표시","settings_user":"로그인:","settings_logout":"로그아웃","settings_theme":"테마","settings_theme_light":"라이트","settings_theme_dark":"다크","settings_lang":"언어","settings_close":"닫기","users_you":"(나)","users_online":"온라인","users_list_empty":"사용자 없음","mobile_channels":"채널"},
- "zh": {"login_title":"SldClient","btn_login":"继续","remember_me":"记住我","btn_cancel":"取消","btn_create":"创建","btn_connect":"连接","title_settings":"设置","theme_toggle":"切换主题","lang_toggle":"切换语言","err_generic":"错误","settings_title":"设置","settings_account":"账号","settings_appearance":"外观","settings_users":"用户列表","settings_show_in_list":"在列表中显示我","settings_user":"登录为","settings_logout":"退出登录","settings_theme":"主题","settings_theme_light":"浅色","settings_theme_dark":"深色","settings_lang":"语言","settings_close":"关闭","users_you":"(你)","users_online":"在线","users_list_empty":"没有用户","mobile_channels":"频道"},
- "ar": {"login_title":"SldClient","btn_login":"متابعة","remember_me":"تذكرني","btn_cancel":"إلغاء","btn_create":"إنشاء","btn_connect":"اتصال","title_settings":"الإعدادات","theme_toggle":"تغيير المظهر","lang_toggle":"تغيير اللغة","err_generic":"خطأ","settings_title":"الإعدادات","settings_account":"الحساب","settings_appearance":"المظهر","settings_users":"قائمة المستخدمين","settings_show_in_list":"إظهاري في القائمة","settings_user":"مسجل باسم","settings_logout":"تسجيل الخروج","settings_theme":"المظهر","settings_theme_light":"فاتح","settings_theme_dark":"داكن","settings_lang":"اللغة","settings_close":"إغلاق","users_you":"(أنت)","users_online":"متصل","users_list_empty":"لا مستخدمين","mobile_channels":"القنوات"},
- "he": {"login_title":"SldClient","btn_login":"המשך","remember_me":"זכור אותי","btn_cancel":"ביטול","btn_create":"צור","btn_connect":"התחבר","title_settings":"הגדרות","theme_toggle":"החלף ערכת נושא","lang_toggle":"החלף שפה","err_generic":"שגיאה","settings_title":"הגדרות","settings_account":"חשבון","settings_appearance":"מראה","settings_users":"רשימת משתמשים","settings_show_in_list":"הצג אותי ברשימה","settings_user":"מחובר בתור","settings_logout":"התנתק","settings_theme":"ערכת נושא","settings_theme_light":"בהיר","settings_theme_dark":"כהה","settings_lang":"שפה","settings_close":"סגור","users_you":"(אתה)","users_online":"מחובר","users_list_empty":"אין משתמשים","mobile_channels":"ערוצים"},
- "hi": {"login_title":"SldClient","btn_login":"जारी रखें","remember_me":"मुझे याद रखें","btn_cancel":"रद्द करें","btn_create":"बनाएं","btn_connect":"जुड़ें","title_settings":"सेटिंग्स","theme_toggle":"थीम बदलें","lang_toggle":"भाषा बदलें","err_generic":"त्रुटि","settings_title":"सेटिंग्स","settings_account":"खाता","settings_appearance":"रूप","settings_users":"उपयोगकर्ता सूची","settings_show_in_list":"सूची में मुझे दिखाएं","settings_user":"इस रूप में:","settings_logout":"साइन आउट","settings_theme":"थीम","settings_theme_light":"लाइट","settings_theme_dark":"डार्क","settings_lang":"भाषा","settings_close":"बंद करें","users_you":"(आप)","users_online":"ऑनलाइन","users_list_empty":"कोई उपयोगकर्ता नहीं","mobile_channels":"चैनल"},
+ "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","field_avatar":"Avatar (1 char)","ph_nick":"Your nickname","ph_password":"Your password","ph_avatar":"A","avatar_hint":"Used for new accounts","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","mention_hint":"Type @ to mention"},
+ "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","field_avatar":"Аватар (1 символ)","ph_nick":"Ваш ник","ph_password":"Ваш пароль","ph_avatar":"А","avatar_hint":"Используется только для новых аккаунтов","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов и @","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","mention_hint":"Введите @ чтобы упомянуть"},
 }
+# Fallbacks for other languages (fall back to EN via t())
+for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
+    I18N.setdefault(_c, {})
 
 _F = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="20" height="{hh}" style="border:1px solid rgba(0,0,0,.25)">{body}</svg>'
 FLAGS = {
@@ -442,6 +679,9 @@ FLAGS = {
 }
 LANG_ORDER = ["en","ru","es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]
 
+# ============================================================
+#  HTML
+# ============================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -449,11 +689,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0088cc">
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
 <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, notranslate">
 <meta name="referrer" content="no-referrer">
-<meta name="format-detection" content="telephone=no">
 <title>SldClient</title>
 <link rel="stylesheet" href="https://getbootstrap.com/1.4.0/assets/css/bootstrap.min.css">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoaded&render=explicit" async defer></script>
@@ -467,12 +704,9 @@ body { margin: 0; background: #f5f5f5; font-family: "Helvetica Neue", Helvetica,
   -webkit-touch-callout: none; }
 input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
-img, svg { -webkit-user-drag: none; user-drag: none; pointer-events: auto; }
 button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn,
 .settings-tab, .user-list-item, .mcp-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
-
-/* Print protection — nothing prints */
-@media print { body { display: none !important; visibility: hidden !important; } * { display: none !important; } }
+@media print { body { display: none !important; } }
 
 /* Login */
 .login-screen { position: fixed; top: 0; left: 0; right: 0; height: var(--app-vh, 100vh);
@@ -506,11 +740,20 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   user-select: none; width: 100%; box-sizing: border-box; gap: 7px; }
 .remember-row input { flex: 0 0 auto; width: 15px; height: 15px; margin: 1px 0 0 0; padding: 0; }
 .remember-row > span { flex: 1 1 auto; min-width: 0; text-align: left; line-height: 1.35; overflow-wrap: break-word; }
+.avatar-row { display: flex; gap: 10px; align-items: flex-start; }
+.avatar-row .avatar-input {
+  flex: 0 0 auto; width: 52px; height: 52px; text-align: center; font-size: 22px;
+  font-weight: bold; color: #fff; border: 1px solid #b8c4d0;
+  background: #0088cc; padding: 0; box-sizing: border-box;
+  outline: none; font-family: inherit; border-radius: 0;
+}
+.avatar-row .avatar-input:focus { border-color: #0088cc; box-shadow: 0 0 4px rgba(0,136,204,.5); }
+.avatar-row .nick-wrap { flex: 1 1 auto; min-width: 0; }
+.avatar-hint { font-size: 11px; color: #7b8a99; margin-top: 4px; }
 #turnstileWidget { margin: 12px auto 6px; width: 100%; max-width: 320px; min-height: 72px;
   display: flex; align-items: center; justify-content: center; overflow: visible;
   position: relative; box-sizing: border-box; }
 #turnstileWidget > div, #turnstileWidget iframe { margin: 0 auto !important; }
-
 .login-settings { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e0e5eb;
   display: flex; gap: 6px; }
 .settings-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center;
@@ -577,7 +820,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 
 .chat-header { display: flex; align-items: center; padding: 8px 12px;
   background: #f5f5f5; background-image: linear-gradient(#ffffff, #f0f0f0);
-  border-bottom: 1px solid #ccc; flex-shrink: 0; }
+  border-bottom: 1px solid #ccc; flex-shrink: 0; gap: 8px; }
 .chat-header .title { font-weight: bold; font-size: 14px; line-height: 1.1; color: #222; }
 .chat-header .subtitle { font-size: 11px; color: #777; }
 .chat-header .user-info { margin-left: auto; display: flex; align-items: center;
@@ -585,29 +828,54 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .chat-header .user-info .nick { font-weight: bold; color: #2b3d51; }
 
 .chat-feed { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
-  padding: 8px 12px; background: #fdfdfd; }
+  padding: 8px 12px; background: #fdfdfd; position: relative; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-.msg-row { display: grid; grid-template-columns: 100px 1fr; gap: 6px;
-  padding: 2px 4px; align-items: start; font-size: 12.5px; line-height: 1.55;
-  border-radius: 3px; transition: background .3s; word-wrap: break-word;
-  -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none; user-select: none; }
+/* 3-column message grid: avatar | nickname | content */
+.msg-row { display: grid;
+  grid-template-columns: 28px minmax(60px, 100px) 1fr;
+  column-gap: 8px; row-gap: 0;
+  padding: 3px 4px; align-items: start; font-size: 13px;
+  line-height: 1.5; border-radius: 3px; transition: background .2s;
+  word-wrap: break-word; }
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
+.msg-row.grouped { padding-top: 0; }
+.msg-avatar { width: 24px; height: 24px; border-radius: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: bold; font-size: 13px; line-height: 1;
+  flex-shrink: 0; user-select: none; margin-top: 1px; }
+.msg-avatar.hidden { visibility: hidden; }
 .msg-author { font-weight: bold; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; margin-top: 1px; }
+.msg-author.hidden { visibility: hidden; }
 .msg-content { min-width: 0; word-break: break-word; overflow-wrap: anywhere; }
 .msg-text { color: #222; }
 .msg-time { color: #b0b8c0; font-size: 10.5px; margin-left: 6px; white-space: nowrap; }
+.mention { background: #e1eefb; color: #005a9e; font-weight: bold;
+  padding: 0 3px; border-radius: 3px; }
+body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .msg-system { color: #a94442; background: #fcebeb; border: 1px solid #f5c6c6;
   font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex;
   align-items: center; border-radius: 3px; }
-.msg-system .sys-icon { margin-right: 6px; display: inline-flex; align-items: center; }
+
+/* Mention autocomplete */
+.mention-pop { position: absolute; z-index: 40;
+  background: #fff; border: 1px solid #bbb; box-shadow: 0 4px 12px rgba(0,0,0,.2);
+  max-height: 220px; overflow-y: auto; min-width: 180px; display: none; }
+.mention-pop.open { display: block; }
+.mention-pop-item { display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; cursor: pointer; font-size: 13px; color: #333; }
+.mention-pop-item:hover, .mention-pop-item.active { background: #eaf4fb; }
+.mention-pop-item .mp-avatar { width: 22px; height: 22px; border-radius: 3px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: bold; font-size: 11px; flex-shrink: 0; }
+.mention-pop-item .mp-name { font-weight: bold; }
 
 .composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px 10px;
   background: #f5f5f5; background-image: linear-gradient(#f0f0f0, #ffffff);
-  border-top: 1px solid #ccc; flex-shrink: 0; }
+  border-top: 1px solid #ccc; flex-shrink: 0; position: relative; }
 .composer textarea { flex: 1; resize: none; padding: 6px 8px !important;
   border: 1px solid #bbb !important; font-size: 12px !important; max-height: 140px;
   outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important;
@@ -678,6 +946,9 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .user-dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb;
   flex-shrink: 0; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
 .user-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.35); }
+.user-list-item .user-avatar { width: 24px; height: 24px; border-radius: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: bold; font-size: 12px; flex-shrink: 0; }
 .user-list-item .user-name { flex: 1; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
 .user-list-item .user-you { font-size: 11px; color: #999; margin-left: 4px; font-weight: normal; }
@@ -690,6 +961,8 @@ body.dark .login-box h2 { color: #eaeaea; }
 body.dark .login-box p { color: #888; }
 body.dark .my-label { color: #888 !important; }
 body.dark .my-input { background: #1e1e1e !important; color: #ddd !important; border-color: #4a4a4c !important; }
+body.dark .avatar-input { border-color: #4a4a4c; }
+body.dark .avatar-hint { color: #777; }
 body.dark .login-error { background: #3a1f1f; border-color: #5a2a2a; color: #e0a0a0; }
 body.dark .login-settings, body.dark .uptime-line { border-top-color: #3c3c3c; }
 body.dark .settings-btn { background: #37373d; background-image: none; color: #ccc;
@@ -704,8 +977,7 @@ body.dark .lang-menu-item .check { color: #6cb6ff; }
 body.dark .app { background: #252526; }
 body.dark .tabs-bar, body.dark .chat-header, body.dark .composer, body.dark .mobile-topbar {
   background: #2d2d30; background-image: none; border-color: #3c3c3c; }
-body.dark .channel-tab, body.dark .icon-btn-tab, body.dark .scroll-arrow,
-body.dark .mobile-channels-btn {
+body.dark .channel-tab, body.dark .icon-btn-tab, body.dark .scroll-arrow, body.dark .mobile-channels-btn {
   background: #37373d; background-image: none; color: #ccc;
   border-color: #4a4a4c; text-shadow: none; }
 body.dark .channel-tab.active { background: #0e639c; border-color: #0e639c; color: #fff; }
@@ -737,6 +1009,9 @@ body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c
 body.dark .settings-toggle-row { color: #ccc; }
 body.dark .user-list-item { border-bottom-color: #3c3c3c; }
 body.dark .user-list-item .user-name { color: #eaeaea; }
+body.dark .mention-pop { background: #252526; border-color: #3c3c3c; color: #ddd; }
+body.dark .mention-pop-item { color: #ddd; }
+body.dark .mention-pop-item:hover, body.dark .mention-pop-item.active { background: #37373d; }
 body.dark .mobile-channels-panel { background: #252526; border-color: #3c3c3c; }
 body.dark .mcp-head { background: #2d2d30; border-color: #3c3c3c; color: #eaeaea; }
 body.dark .mcp-item { border-color: #3c3c3c; color: #ccc; }
@@ -751,13 +1026,17 @@ body.dark .mcp-empty { color: #666; }
   .msg-row:hover { background: transparent; }
 }
 
+/* ============================================================
+   MOBILE
+   ============================================================ */
 @media (max-width: 768px) {
-  .login-screen { padding: 16px; align-items: flex-start; padding-top: 40px; padding-bottom: 40px; }
+  .login-screen { padding: 16px; align-items: flex-start; padding-top: 30px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
   .login-box h2 { font-size: 20px; }
   .login-box p { font-size: 13px; }
-  .login-box .btn { padding: 12px; font-size: 15px; }
-  .my-input, .login-box .my-input, .my-modal .my-input { font-size: 16px !important; padding: 11px 12px !important; }
+  .login-box .btn { padding: 14px; font-size: 15px; }
+  .my-input, .login-box .my-input, .my-modal .my-input { font-size: 16px !important; padding: 12px 12px !important; }
+  .avatar-row .avatar-input { width: 58px; height: 58px; font-size: 26px; }
   .remember-row { font-size: 14px; }
   .remember-row input { width: 18px; height: 18px; margin-top: 2px; }
   .settings-btn { height: 40px; font-size: 14px; }
@@ -770,15 +1049,15 @@ body.dark .mcp-empty { color: #666; }
     background-image: linear-gradient(#ffffff, #ececec);
     border-bottom: 1px solid #ccc; flex-shrink: 0; }
   .mobile-channels-btn { flex: 1; display: inline-flex; align-items: center; gap: 10px;
-    padding: 11px 14px; border: 1px solid #bbb;
+    padding: 12px 14px; border: 1px solid #bbb;
     background: #e6e6e6; background-image: linear-gradient(#ffffff, #e6e6e6);
     color: #333; cursor: pointer;
     font-family: "Courier New", Courier, monospace;
     font-size: 14px; font-weight: bold; text-align: left;
-    border-radius: 0; min-height: 44px; }
+    border-radius: 0; min-height: 46px; }
   .mobile-channels-btn:active { background: #d0d0d0; background-image: none; }
   .mobile-channels-btn svg { width: 20px !important; height: 20px !important; flex-shrink: 0; }
-  .mobile-settings-btn { width: 44px; height: 44px; padding: 0; flex-shrink: 0;
+  .mobile-settings-btn { width: 46px; height: 46px; padding: 0; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center; }
   .mobile-settings-btn svg { width: 20px !important; height: 20px !important; }
 
@@ -787,17 +1066,20 @@ body.dark .mcp-empty { color: #666; }
   .chat-header .subtitle { font-size: 12px; }
   .chat-header .user-info { display: none; }
 
-  .chat-feed { padding: 10px; }
-  .msg-row { grid-template-columns: 84px 1fr; gap: 5px; font-size: 14px;
-    padding: 3px 4px; line-height: 1.5; }
-  .msg-author { font-size: 13px; }
+  .chat-feed { padding: 8px; }
+  .msg-row { grid-template-columns: 24px minmax(52px, 72px) 1fr;
+    column-gap: 6px; padding: 3px 3px; font-size: 14.5px; }
+  .msg-avatar { width: 22px; height: 22px; font-size: 12px; }
+  .msg-author { font-size: 13.5px; }
   .msg-time { font-size: 11px; }
-  .msg-system { font-size: 12.5px; padding: 6px 10px; }
 
-  .composer { padding: 8px; gap: 6px; }
-  .composer textarea { font-size: 16px !important; padding: 10px 12px !important; max-height: 120px; }
-  .composer .icon-btn { width: 42px; height: 42px; }
-  .composer .icon-btn svg { width: 18px !important; height: 18px !important; }
+  .composer { padding: 8px 8px; gap: 6px; }
+  .composer textarea { font-size: 16px !important; padding: 12px 12px !important;
+    max-height: 120px; }
+  .composer .icon-btn { width: 46px; height: 46px; }
+  .composer .icon-btn svg { width: 20px !important; height: 20px !important; }
+
+  .mention-pop { min-width: 200px; }
 
   .my-modal-backdrop { padding: 10px; align-items: flex-start;
     padding-top: 20px; padding-bottom: 20px; overflow-y: auto; }
@@ -806,23 +1088,23 @@ body.dark .mcp-empty { color: #666; }
   .modal-head { padding: 12px 14px; font-size: 15px; }
   .modal-body { padding: 16px; }
   .modal-foot { padding: 12px; }
-  .modal-foot .btn { padding: 10px 18px; font-size: 14px; }
+  .modal-foot .btn { padding: 12px 20px; font-size: 14px; min-height: 44px; }
 
   .settings-body { flex-direction: column; min-height: 0; }
   .settings-tabs { width: 100%; border-right: 0; border-bottom: 1px solid #ddd;
     padding: 0; display: flex; }
-  .settings-tab { flex: 1; text-align: center; padding: 12px 4px;
+  .settings-tab { flex: 1; text-align: center; padding: 14px 4px;
     border-left: 0; border-bottom: 3px solid transparent; font-size: 12px; }
   .settings-tab.active { border-left-color: transparent; border-bottom-color: #0088cc; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
   .settings-lang-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .settings-toggle-row { font-size: 14px; }
-  .settings-toggle-row input { width: 18px; height: 18px; }
+  .settings-toggle-row { font-size: 14px; padding: 12px 0; }
+  .settings-toggle-row input { width: 20px; height: 20px; }
 
   .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 6px; gap: 4px; }
-  .lang-menu-item { padding: 8px; font-size: 12px; }
+  .lang-menu-item { padding: 10px; font-size: 12.5px; }
 
   .mobile-channels-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 900;
@@ -830,28 +1112,29 @@ body.dark .mcp-empty { color: #666; }
   .mobile-channels-backdrop.open { opacity: 1; pointer-events: auto; }
   .mobile-channels-panel { display: flex; flex-direction: column;
     position: fixed; top: 0; left: 0; bottom: 0;
-    width: 90%; max-width: 380px;
+    width: 88%; max-width: 340px;
     background: #fff; z-index: 901;
     box-shadow: 4px 0 20px rgba(0,0,0,.35);
     transform: translateX(-100%); transition: transform .2s ease-out;
     pointer-events: none; border-right: 1px solid #b8c4d0; }
   .mobile-channels-panel.open { transform: translateX(0); pointer-events: auto; }
-  .mcp-head { padding: 12px 14px; flex-shrink: 0;
+  .mcp-head { padding: 14px 16px; flex-shrink: 0;
     border-bottom: 1px solid #ccc;
     background: #f5f5f5; background-image: linear-gradient(#ffffff, #efefef);
     display: flex; align-items: center;
     font-family: "Courier New", Courier, monospace;
     font-weight: bold; font-size: 15px; color: #222; }
   .mcp-close { margin-left: auto; background: transparent; border: 0;
-    cursor: pointer; padding: 6px; color: #666;
+    cursor: pointer; padding: 8px; color: #666;
     display: inline-flex; align-items: center; border-radius: 0; }
+  .mcp-close:active { color: #c00; }
   .mcp-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
   .mcp-item { display: flex; align-items: center; gap: 10px;
-    padding: 14px 16px; border-bottom: 1px solid #f0f0f0;
+    padding: 16px 16px; border-bottom: 1px solid #f0f0f0;
     cursor: pointer;
     font-family: "Courier New", Courier, monospace;
-    font-size: 14px; color: #333;
-    min-height: 52px; box-sizing: border-box; }
+    font-size: 14.5px; color: #333;
+    min-height: 54px; box-sizing: border-box; }
   .mcp-item:active { background: #eaf4fb; }
   .mcp-item.active { background: #d6e8f7; color: #004a80; font-weight: bold; }
   .mcp-item .lock-ico { display: inline-flex; align-items: center; flex-shrink: 0; }
@@ -861,22 +1144,22 @@ body.dark .mcp-empty { color: #666; }
     color: #999; font-size: 13px; }
   .mcp-actions { padding: 12px; border-top: 1px solid #ccc;
     background: #f7f7f7; flex-shrink: 0; display: flex; gap: 8px; }
-  .mcp-actions .btn { flex: 1; padding: 13px 10px; font-size: 14px;
-    border-radius: 0; min-height: 46px; }
+  .mcp-actions .btn { flex: 1; padding: 14px 10px; font-size: 13px;
+    border-radius: 0; min-height: 48px; }
 }
 
 @media (max-width: 400px) {
-  .msg-row { grid-template-columns: 70px 1fr; gap: 4px; }
-  .msg-author { font-size: 12px; }
+  .msg-row { grid-template-columns: 22px minmax(46px, 64px) 1fr; column-gap: 5px; }
+  .msg-author { font-size: 12.5px; }
   .lang-menu { grid-template-columns: 1fr; }
   .settings-lang-grid { grid-template-columns: 1fr; }
-  .composer .icon-btn { width: 38px; height: 38px; }
 }
 
 @media (min-width: 769px) and (max-width: 1024px) {
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
   #settingsModal { width: 600px; }
+  .msg-row { grid-template-columns: 28px minmax(60px, 110px) 1fr; }
 }
 </style>
 </head>
@@ -888,16 +1171,20 @@ body.dark .mcp-empty { color: #666; }
     <p id="loginSubtitle"></p>
 
     <div class="field-group">
-      <label class="my-label" id="lblNick" for="loginName"></label>
-      <input type="text" id="loginName" class="my-input" maxlength="32"
-             autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"
-             data-lpignore="true" data-form-type="other">
+      <div class="avatar-row">
+        <input type="text" id="loginAvatar" class="avatar-input" maxlength="1" value="" autocomplete="off" spellcheck="false">
+        <div class="nick-wrap">
+          <label class="my-label" id="lblNick" for="loginName"></label>
+          <input type="text" id="loginName" class="my-input" maxlength="32"
+                 autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+          <div class="avatar-hint" id="avatarHint"></div>
+        </div>
+      </div>
     </div>
 
     <div class="field-group">
       <label class="my-label" id="lblPass" for="loginPass"></label>
-      <input type="password" id="loginPass" class="my-input" maxlength="128"
-             autocomplete="new-password" data-lpignore="true" data-form-type="other">
+      <input type="password" id="loginPass" class="my-input" maxlength="128" autocomplete="new-password">
     </div>
 
     <label class="remember-row">
@@ -930,7 +1217,6 @@ body.dark .mcp-empty { color: #666; }
 <div class="lang-menu" id="langMenu"></div>
 
 <div class="app" id="app" style="display:none">
-
   <div class="mobile-topbar" id="mobileTopbar">
     <button class="mobile-channels-btn" id="mobileChannelsBtn" type="button">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -996,6 +1282,7 @@ body.dark .mcp-empty { color: #666; }
     <button class="btn primary icon-btn" id="sendBtn" type="button">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
     </button>
+    <div class="mention-pop" id="mentionPop"></div>
   </div>
 </div>
 
@@ -1024,7 +1311,7 @@ body.dark .mcp-empty { color: #666; }
     </div>
     <div class="modal-body">
       <label class="my-label" id="lblCreateName" for="newChannelName"></label>
-      <input type="text" id="newChannelName" class="my-input" maxlength="40" autocomplete="off" autocapitalize="sentences" spellcheck="false">
+      <input type="text" id="newChannelName" class="my-input" maxlength="40" autocomplete="off">
     </div>
     <div class="modal-foot">
       <button class="btn" type="button" data-close-modal="create" id="btnCancelCreate"></button>
@@ -1043,7 +1330,7 @@ body.dark .mcp-empty { color: #666; }
     </div>
     <div class="modal-body">
       <label class="my-label" id="lblConnectName" for="connectChannelName"></label>
-      <input type="text" id="connectChannelName" class="my-input" maxlength="40" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+      <input type="text" id="connectChannelName" class="my-input" maxlength="40" autocomplete="off">
       <div class="error-msg" id="connectError"><span class="sys-icon">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/></svg>
       </span><span id="connectErrorText"></span></div>
@@ -1073,9 +1360,12 @@ body.dark .mcp-empty { color: #666; }
         <div class="settings-pane active" data-pane="account">
           <div class="settings-section-title" id="settingsAccountHead"></div>
           <div class="settings-row">
-            <div>
-              <div class="settings-label" id="settingsUserLabel"></div>
-              <div class="settings-value" id="settingsUser">—</div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <div class="user-avatar" id="settingsUserAvatar">?</div>
+              <div>
+                <div class="settings-label" id="settingsUserLabel"></div>
+                <div class="settings-value" id="settingsUser">—</div>
+              </div>
             </div>
           </div>
           <label class="settings-toggle-row">
@@ -1109,58 +1399,33 @@ body.dark .mcp-empty { color: #666; }
 
 <script>
 "use strict";
-/* ============================================================
-   CLIENT-SIDE PROTECTION LAYER
-   Runs before anything else. Blocks:
-   - right-click context menu (already), copy/cut outside inputs, drag & drop
-   - F12 / Ctrl+Shift+I/J/C/K (devtools)
-   - Ctrl+U (view source), Ctrl+S (save), Ctrl+P (print), Ctrl+A (select all)
-   - window.print()
-   - text drag from anywhere
-   Silences console snooping (log/info/warn/debug) and clears console periodically.
-   ============================================================ */
+/* CLIENT PROTECTION */
 (function() {
-  const isEditable = (el) => {
-    if (!el) return false;
-    const tag = el.tagName;
-    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
-  };
-
-  // Block selection/copy/cut/drag outside inputs
+  const isEditable = (el) => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
   document.addEventListener('selectstart', e => { if (!isEditable(e.target)) e.preventDefault(); }, true);
   document.addEventListener('copy', e => { if (!isEditable(e.target)) e.preventDefault(); }, true);
   document.addEventListener('cut', e => { if (!isEditable(e.target)) e.preventDefault(); }, true);
   document.addEventListener('dragstart', e => e.preventDefault(), true);
   document.addEventListener('dragover', e => e.preventDefault(), true);
   document.addEventListener('drop', e => e.preventDefault(), true);
-
-  // Block devtools / dangerous shortcuts
   document.addEventListener('keydown', e => {
     const k = (e.key || '').toLowerCase();
-    if (e.key === 'F12') { e.preventDefault(); e.stopPropagation(); return false; }
-    if (e.ctrlKey && e.shiftKey && ['i','j','c','k'].includes(k)) {
-      e.preventDefault(); e.stopPropagation(); return false;
-    }
+    if (e.key === 'F12') { e.preventDefault(); return false; }
+    if (e.ctrlKey && e.shiftKey && ['i','j','c','k'].includes(k)) { e.preventDefault(); return false; }
     if (e.ctrlKey && !e.shiftKey && !e.altKey) {
-      if (k === 'u' || k === 's' || k === 'p') { e.preventDefault(); e.stopPropagation(); return false; }
-      if (k === 'a' && !isEditable(e.target)) { e.preventDefault(); e.stopPropagation(); return false; }
+      if (k === 'u' || k === 's' || k === 'p') { e.preventDefault(); return false; }
+      if (k === 'a' && !isEditable(e.target)) { e.preventDefault(); return false; }
     }
   }, true);
-
-  // Block print entirely
-  try { window.print = () => {}; } catch (e) {}
+  try { window.print = () => {}; } catch(e){}
   document.addEventListener('beforeprint', e => e.preventDefault());
-
-  // Silence console (keep private errors via window.__err)
   const noop = () => {};
   window.__err = (...a) => { try { (console.__errOrig || console.error).apply(console, a); } catch(e){} };
-  try { console.__errOrig = console.error.bind(console); } catch(e) {}
+  try { console.__errOrig = console.error.bind(console); } catch(e){}
   try {
     console.log = noop; console.info = noop; console.warn = noop; console.debug = noop;
     console.error = noop; console.trace = noop; console.dir = noop; console.table = noop;
-  } catch (e) {}
-
-  // Periodic console clear — prevents "paste in console" snooping
+  } catch(e){}
   setInterval(() => { try { console.clear && console.clear(); } catch(e){} }, 4000);
 })();
 </script>
@@ -1189,11 +1454,19 @@ const USER_COLORS = [
 ];
 function colorForUser(name) {
   if (!name) return '#888';
-  let h = 0;
-  const s = String(name);
+  let h = 0; const s = String(name);
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return USER_COLORS[Math.abs(h) % USER_COLORS.length];
 }
+function uuid() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random()*16|0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function updateAppVH() {
   const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
@@ -1206,24 +1479,25 @@ if (window.visualViewport) {
 window.addEventListener('resize', updateAppVH);
 window.addEventListener('orientationchange', () => setTimeout(updateAppVH, 100));
 updateAppVH();
-
-document.addEventListener('contextmenu', (e) => e.preventDefault());
+document.addEventListener('contextmenu', e => e.preventDefault());
 
 let currentLang = localStorage.getItem('lang') || 'en';
 let currentTheme = localStorage.getItem('theme') || 'light';
 let authToken = null;
 let currentUser = null;
+let currentAvatar = '?';
 let channels = [];
 let activeId = null;
 let ws = null;
 let wsChannelId = null;
 let channelKeyCache = {};
 let onlineUsers = [];
-let uptimeBase = 0;
-let uptimeFetchAt = 0;
+let uptimeBase = 0, uptimeFetchAt = 0;
 let showInListPref = true;
-let turnstileReady = false;
 let turnstileWidgetId = null;
+let channelMembers = {};          // channelId -> [{username, avatar}]
+let memberSetByChannel = {};      // channelId -> Set(lower(username))
+let mentionState = { open:false, items:[], selected:0, startIdx:-1 };
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => {
@@ -1236,7 +1510,7 @@ const t = (key, vars) => {
 };
 
 // Turnstile
-function onTurnstileLoaded() { turnstileReady = true; renderTurnstile(); }
+function onTurnstileLoaded() { renderTurnstile(); }
 window.onTurnstileLoaded = onTurnstileLoaded;
 function renderTurnstile() {
   if (!window.turnstile) return;
@@ -1266,28 +1540,28 @@ function resetTurnstile() {
 // Crypto
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-async function deriveChannelKey(channelId) {
-  if (channelKeyCache[channelId]) return channelKeyCache[channelId];
-  const baseKey = await crypto.subtle.importKey('raw', enc.encode('e2ee-v1:' + channelId), 'PBKDF2', false, ['deriveKey']);
+async function deriveChannelKey(id) {
+  if (channelKeyCache[id]) return channelKeyCache[id];
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode('e2ee-v1:' + id), 'PBKDF2', false, ['deriveKey']);
   const key = await crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt: enc.encode('messenger-fixed-salt-v1'), iterations: 120000, hash: 'SHA-256' },
     baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
   );
-  channelKeyCache[channelId] = key; return key;
+  channelKeyCache[id] = key; return key;
 }
 function b64(buf){let s='';const bytes=new Uint8Array(buf);for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]);return btoa(s);}
 function ub64(str){const bin=atob(str);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return bytes;}
-async function encryptText(chId, text) {
-  const key = await deriveChannelKey(chId);
+async function encryptText(id, text) {
+  const key = await deriveChannelKey(id);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, enc.encode(text));
   return b64(iv) + '.' + b64(ct);
 }
-async function decryptText(chId, payload) {
+async function decryptText(id, payload) {
   try {
     const [ivB64, ctB64] = payload.split('.');
     if (!ivB64 || !ctB64) return payload;
-    const key = await deriveChannelKey(chId);
+    const key = await deriveChannelKey(id);
     const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv: ub64(ivB64)}, key, ub64(ctB64));
     return dec.decode(pt);
   } catch(e) { return '[decrypt error]'; }
@@ -1296,13 +1570,12 @@ async function decryptText(chId, payload) {
 async function api(path, method='GET', body=null, withAuth=true) {
   const headers = { 'Content-Type': 'application/json' };
   if (withAuth && authToken) headers['x-auth-token'] = authToken;
-  const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : null, credentials: 'same-origin'});
+  const res = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : null});
   let data = null; try { data = await res.json(); } catch(e){}
   if (!res.ok) throw { status: res.status, detail: (data && data.detail) || 'error' };
   return data;
 }
 
-// Uptime
 function fmtUptime(sec) {
   sec = Math.max(0, Math.floor(sec));
   const d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600), m = Math.floor((sec%3600)/60), s = sec%60;
@@ -1320,7 +1593,6 @@ function renderUptime() {
 }
 setInterval(renderUptime, 1000); refreshUptime(); setInterval(refreshUptime, 30000);
 
-// Theme
 function applyTheme() {
   document.body.classList.toggle('dark', currentTheme === 'dark');
   $('themeIcon').innerHTML = currentTheme === 'dark' ? SVG.sun : SVG.moon;
@@ -1330,7 +1602,6 @@ function applyTheme() {
 }
 function toggleTheme() { currentTheme = currentTheme === 'dark' ? 'light' : 'dark'; applyTheme(); }
 
-// Language
 function applyLanguage() {
   localStorage.setItem('lang', currentLang);
   $('loginTitle').textContent = t('login_title');
@@ -1339,6 +1610,9 @@ function applyLanguage() {
   $('lblPass').textContent = t('field_password');
   $('loginName').placeholder = t('ph_nick');
   $('loginPass').placeholder = t('ph_password');
+  $('loginAvatar').placeholder = t('ph_avatar');
+  $('loginAvatar').title = t('field_avatar');
+  $('avatarHint').textContent = t('avatar_hint');
   $('rememberLbl').textContent = t('remember_me');
   $('loginBtn').textContent = t('btn_login');
   $('uptimeLbl').textContent = t('uptime_label');
@@ -1347,8 +1621,6 @@ function applyLanguage() {
   $('connectBtn').title = t('title_connect');
   $('settingsBtn').title = t('title_settings');
   $('mobileSettingsBtn').title = t('title_settings');
-  $('tabScrollLeft').title = t('title_scroll_left');
-  $('tabScrollRight').title = t('title_scroll_right');
   $('createModalTitle').textContent = t('modal_create_title');
   $('lblCreateName').textContent = t('modal_name');
   $('newChannelName').placeholder = t('modal_name_ph');
@@ -1380,8 +1652,7 @@ function applyLanguage() {
   applyTheme();
   buildLangMenu(); buildSettingsLangGrid();
   renderTabs(); renderHeader(); renderMessages(); updateMuteUI();
-  renderUsersList();
-  renderMobileChannelList();
+  renderUsersList(); renderMobileChannelList();
 }
 
 function buildLangMenu() {
@@ -1418,18 +1689,20 @@ function showLoginError(msg) {
   loginErrTimer = setTimeout(() => box.classList.remove('show'), 5000);
 }
 
-// Auth
 async function doAuth() {
   const username = $('loginName').value.trim();
   const password = $('loginPass').value;
+  const avatar = ($('loginAvatar').value.trim() || '?').slice(0, 1);
   if (!username || !password) { showLoginError(t('err_bad_credentials')); return; }
   if (username.length < 2) { showLoginError(t('err_bad_username')); return; }
+  if (/[\s@:<>"'&]/.test(username)) { showLoginError(t('err_bad_username')); return; }
   if (password.length < 4) { showLoginError(t('err_bad_password')); return; }
   const tsToken = getTurnstileToken();
   if (!tsToken) { showLoginError(t('err_turnstile')); return; }
   try {
-    const res = await api('/api/auth', 'POST', { username, password, turnstile_token: tsToken }, false);
-    authToken = res.token; currentUser = res.username;
+    const res = await api('/api/auth', 'POST',
+      { username, password, avatar, turnstile_token: tsToken }, false);
+    authToken = res.token; currentUser = res.username; currentAvatar = res.avatar || '?';
     if ($('rememberMe').checked) {
       localStorage.setItem('auth_token', res.token);
       sessionStorage.removeItem('auth_token');
@@ -1437,7 +1710,7 @@ async function doAuth() {
       sessionStorage.setItem('auth_token', res.token);
       localStorage.removeItem('auth_token');
     }
-    $('loginName').value = ''; $('loginPass').value = '';
+    $('loginName').value = ''; $('loginPass').value = ''; $('loginAvatar').value = '';
     resetTurnstile(); enterApp();
   } catch (e) {
     let msg;
@@ -1453,22 +1726,36 @@ async function doAuth() {
 $('loginBtn').addEventListener('click', doAuth);
 $('loginName').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginPass').focus(); });
 $('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
+$('loginAvatar').addEventListener('input', e => {
+  const v = e.target.value.replace(/[\s@:<>"'&]/g, '');
+  e.target.value = v.slice(0, 1);
+});
+
+function updateAvatarDisplays() {
+  const av = $('settingsUserAvatar');
+  if (av) {
+    av.textContent = currentAvatar || '?';
+    av.style.background = colorForUser(currentUser || '?');
+  }
+}
 
 function enterApp() {
   $('loginScreen').style.display = 'none';
   $('app').style.display = 'flex';
   $('headerUser').textContent = currentUser;
   $('settingsUser').textContent = currentUser;
+  updateAvatarDisplays();
   updateAppVH();
-  loadChannels();
-  loadMyPrefs();
+  loadChannels(); loadMyPrefs();
 }
 
 async function loadMyPrefs() {
   try {
     const res = await api('/api/me');
     showInListPref = !!res.show_in_list;
+    currentAvatar = res.avatar || '?';
     $('showInListToggle').checked = showInListPref;
+    updateAvatarDisplays();
   } catch (e) {}
 }
 
@@ -1478,7 +1765,8 @@ async function tryRestoreSession() {
   authToken = saved;
   try {
     const res = await api('/api/me');
-    currentUser = res.username; enterApp(); return true;
+    currentUser = res.username; currentAvatar = res.avatar || '?';
+    enterApp(); return true;
   } catch(e) {
     localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
     authToken = null; return false;
@@ -1494,6 +1782,7 @@ function openSettingsModal() {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
   $('showInListToggle').checked = showInListPref;
+  updateAvatarDisplays();
   const activeTab = document.querySelector('.settings-tab.active');
   if (activeTab && activeTab.dataset.tab === 'users') loadUsersList();
 }
@@ -1508,15 +1797,16 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
-$('showInListToggle').addEventListener('change', async (e) => {
+$('showInListToggle').addEventListener('change', async e => {
   const val = e.target.checked;
   try { await api('/api/me/preferences', 'POST', { show_in_list: val }); showInListPref = val; }
   catch (err) { e.target.checked = !val; }
 });
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
-  authToken = null; currentUser = null;
+  authToken = null; currentUser = null; currentAvatar = '?';
   channels = []; activeId = null; channelKeyCache = {};
+  channelMembers = {}; memberSetByChannel = {};
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
   $('settingsBackdrop').classList.remove('open');
@@ -1548,11 +1838,12 @@ function renderUsersList() {
     const color = colorForUser(u.username);
     const row = document.createElement('div');
     row.className = 'user-list-item' + (u.self ? ' self' : '');
-    row.innerHTML = '<span class="user-dot'+(u.online?' online':'')+'"></span>' +
+    row.innerHTML =
+      '<span class="user-dot'+(u.online?' online':'')+'" style="background:'+(u.online?'#4caf50':color)+';"></span>' +
+      '<span class="user-avatar" style="background:'+color+';">'+escapeHtml((u.avatar||'?').slice(0,1))+'</span>' +
       '<span class="user-name" style="color:'+color+';">'+escapeHtml(u.username)+
-      (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '')+'</span>';
-    const dot = row.querySelector('.user-dot');
-    if (dot) dot.style.background = u.online ? '#4caf50' : color;
+        (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '')+
+      '</span>';
     box.appendChild(row);
   });
 }
@@ -1589,6 +1880,7 @@ function renderMobileChannelList() {
       closeMobileChannels();
       renderAll();
       openChannelWS(activeId);
+      loadChannelMembers(activeId);
     });
     box.appendChild(item);
   });
@@ -1597,12 +1889,10 @@ $('mobileChannelsBtn').addEventListener('click', openMobileChannels);
 $('mcpClose').addEventListener('click', closeMobileChannels);
 $('mobileChannelsBackdrop').addEventListener('click', closeMobileChannels);
 $('mcpCreateBtn').addEventListener('click', () => {
-  closeMobileChannels();
-  setTimeout(() => $('addTabBtn').click(), 60);
+  closeMobileChannels(); setTimeout(() => $('addTabBtn').click(), 60);
 });
 $('mcpConnectBtn').addEventListener('click', () => {
-  closeMobileChannels();
-  setTimeout(() => $('connectBtn').click(), 60);
+  closeMobileChannels(); setTimeout(() => $('connectBtn').click(), 60);
 });
 
 async function loadChannels() {
@@ -1612,8 +1902,25 @@ async function loadChannels() {
     if (activeId && !channels.find(c => c.id === activeId)) activeId = null;
     if (!activeId && channels.length) activeId = channels[0].id;
     renderAll();
-    if (activeId) openChannelWS(activeId);
+    if (activeId) {
+      openChannelWS(activeId);
+      loadChannelMembers(activeId);
+    }
   } catch(e) { if (e.status === 401) $('settingsLogoutBtn').click(); }
+}
+
+async function loadChannelMembers(channelId) {
+  try {
+    const res = await api('/api/channels/' + encodeURIComponent(channelId) + '/members');
+    channelMembers[channelId] = res.members || [];
+    const s = new Set();
+    (res.members || []).forEach(m => s.add(String(m.username).toLowerCase()));
+    memberSetByChannel[channelId] = s;
+    renderMessages();
+  } catch (e) {
+    channelMembers[channelId] = [];
+    memberSetByChannel[channelId] = new Set();
+  }
 }
 
 function renderTabs() {
@@ -1633,7 +1940,7 @@ function renderTabs() {
     tab.addEventListener('click', e => {
       if (e.target.closest && e.target.closest('[data-close]')) return;
       if (activeId === ch.id) return;
-      activeId = ch.id; renderAll(); openChannelWS(activeId);
+      activeId = ch.id; renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
     });
     wrap.appendChild(tab);
   });
@@ -1647,10 +1954,11 @@ $('tabsScroll').addEventListener('click', async e => {
   const id = closeEl.getAttribute('data-close');
   try { await api('/api/channels/leave', 'POST', { channel_id: id }); } catch(e){}
   channels = channels.filter(c => c.id !== id);
+  delete channelMembers[id]; delete memberSetByChannel[id];
   if (activeId === id) {
     activeId = channels[0] ? channels[0].id : null;
     if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
-    if (activeId) openChannelWS(activeId);
+    if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
   }
   renderAll();
 });
@@ -1680,19 +1988,38 @@ function renderHeader() {
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 let mutes = {};
 
-function buildMsgRow(m, prevAuthor, prevTime) {
+function renderMentions(text, channelId) {
+  const members = memberSetByChannel[channelId];
+  const esc = escapeHtml(text);
+  if (!members || !members.size) return esc;
+  return esc.replace(/@([^\s@:<>"'&]{2,32})/gu, (full, name) => {
+    if (members.has(name.toLowerCase())) {
+      return '<span class="mention">@'+name+'</span>';
+    }
+    return full;
+  });
+}
+
+function buildMsgRow(m, prevAuthor, prevTime, channelId) {
   const row = document.createElement('div');
   row.className = 'msg-row';
   row.dataset.id = m.id; row.dataset.t = String(m.t*1000);
   const d = new Date(m.t*1000);
   const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   const grouped = (prevAuthor === m.from) && ((m.t*1000) - prevTime < GROUP_WINDOW_MS);
+  if (grouped) row.classList.add('grouped');
 
-  const authorEl = document.createElement('span');
-  authorEl.className = 'msg-author';
-  authorEl.textContent = m.from + ':';
-  authorEl.style.color = colorForUser(m.from);
-  if (grouped) authorEl.style.visibility = 'hidden';
+  const color = colorForUser(m.from);
+
+  const avEl = document.createElement('span');
+  avEl.className = 'msg-avatar' + (grouped ? ' hidden' : '');
+  avEl.style.background = color;
+  avEl.textContent = (m.avatar || (m.from[0] || '?')).slice(0,1);
+
+  const authEl = document.createElement('span');
+  authEl.className = 'msg-author' + (grouped ? ' hidden' : '');
+  authEl.textContent = m.from;
+  authEl.style.color = color;
 
   const contentEl = document.createElement('span');
   contentEl.className = 'msg-content';
@@ -1700,7 +2027,7 @@ function buildMsgRow(m, prevAuthor, prevTime) {
   const timeEl = document.createElement('span'); timeEl.className = 'msg-time'; timeEl.textContent = timeStr;
   contentEl.appendChild(textEl); contentEl.appendChild(timeEl);
 
-  row.appendChild(authorEl); row.appendChild(contentEl);
+  row.appendChild(avEl); row.appendChild(authEl); row.appendChild(contentEl);
   row.setAttribute('data-ct', m.ct);
   return { el: row, textEl };
 }
@@ -1712,7 +2039,7 @@ function renderMessages() {
   if (ch.messages.length === 0) { feed.innerHTML = '<div class="empty-state">'+SVG.chat+t('empty_no_messages')+'</div>'; return; }
   let lastAuthor = null, lastTime = 0;
   ch.messages.forEach(m => {
-    const { el } = buildMsgRow(m, lastAuthor, lastTime);
+    const { el } = buildMsgRow(m, lastAuthor, lastTime, activeId);
     feed.appendChild(el);
     lastAuthor = m.from; lastTime = m.t*1000;
   });
@@ -1720,30 +2047,33 @@ function renderMessages() {
   feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
     const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
-    decryptText(chId, ct).then(pt => { span.textContent = pt; });
+    decryptText(chId, ct).then(pt => { span.innerHTML = renderMentions(pt, chId); });
   });
   feed.scrollTop = feed.scrollHeight;
 }
 
-function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-function appendMessageUI(msg, channelId) {
+function appendMessageUI(msg, channelId, own) {
   const feed = $('chatFeed');
-  const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
+  const existing = feed.querySelector('.msg-row[data-id="'+CSS.escape(msg.id)+'"]');
   const ch = channels.find(c => c.id === channelId);
   if (ch) {
-    ch.messages.push(msg);
-    if (ch.messages.length > 300) ch.messages = ch.messages.slice(-300);
+    if (!ch.messages.find(mm => mm.id === msg.id)) {
+      ch.messages.push(msg);
+      if (ch.messages.length > 300) ch.messages = ch.messages.slice(-300);
+    }
   }
+  if (existing) return;
   if (activeId !== channelId) return;
+  const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
   const lastRow = feed.querySelector('.msg-row:last-child');
-  const prevAuthor = lastRow ? (lastRow.querySelector('.msg-author').textContent || '').replace(/:$/,'') : null;
+  const prevAuthor = lastRow ? (lastRow.querySelector('.msg-author').textContent || '') : null;
   const prevTime = lastRow ? parseInt(lastRow.dataset.t || '0', 10) : 0;
-  const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
+  const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime, channelId);
   feed.appendChild(el);
-  decryptText(channelId, msg.ct).then(pt => { textEl.textContent = pt; });
+  decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderMentions(pt, channelId); });
   feed.scrollTop = feed.scrollHeight;
 }
+
 function addSystem(text) {
   const feed = $('chatFeed');
   const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
@@ -1773,7 +2103,7 @@ function openChannelWS(channelId) {
     let data; try { data = JSON.parse(ev.data); } catch(e){ return; }
     if (data.type === 'message' && data.msg) { appendMessageUI(data.msg, channelId); renderHeader(); }
     else if (data.type === 'presence') { onlineUsers = data.users || []; renderHeader(); }
-    else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's (rate limit)'); }
+    else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's'); }
     else if (data.type === 'error' && data.error === 'auth') { $('settingsLogoutBtn').click(); }
   };
   ws.onclose = () => { if (wsChannelId === channelId) ws = null; };
@@ -1785,15 +2115,102 @@ function sendMessage() {
   const chId = activeId;
   if (!chId || !ws || ws.readyState !== WebSocket.OPEN) return;
   if ((mutes[chId]||0) > Date.now()) { updateMuteUI(); return; }
+  const mid = uuid();
+  const tNow = Date.now()/1000;
+  // optimistic local append (own flag not needed — server echo will dedupe)
+  const optimistic = { id: mid, from: currentUser, avatar: currentAvatar, ct: '', t: tNow };
   encryptText(chId, text).then(ct => {
-    ws.send(JSON.stringify({ type:'message', ciphertext: ct }));
-    input.value = ''; autoResize();
+    optimistic.ct = ct;
+    appendMessageUI(optimistic, chId);
+    ws.send(JSON.stringify({ type:'message', id: mid, ciphertext: ct }));
+    input.value = ''; autoResize(); hideMentionPop();
   });
 }
 $('sendBtn').addEventListener('click', sendMessage);
-$('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+$('msgInput').addEventListener('keydown', e => {
+  if (mentionState.open) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); mentionState.selected = Math.min(mentionState.items.length-1, mentionState.selected+1); renderMentionPop(); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); mentionState.selected = Math.max(0, mentionState.selected-1); renderMentionPop(); return; }
+    if (e.key === 'Tab' || e.key === 'Enter') { e.preventDefault(); pickMention(mentionState.selected); return; }
+    if (e.key === 'Escape') { e.preventDefault(); hideMentionPop(); return; }
+  }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
 function autoResize() { const el = $('msgInput'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
-$('msgInput').addEventListener('input', autoResize);
+$('msgInput').addEventListener('input', () => { autoResize(); updateMentionState(); });
+
+// ---------- Mentions autocomplete ----------
+function currentMention() {
+  const ta = $('msgInput');
+  const v = ta.value;
+  const pos = ta.selectionStart;
+  let i = pos - 1;
+  while (i >= 0) {
+    const c = v[i];
+    if (c === '@') {
+      const prev = i > 0 ? v[i-1] : ' ';
+      if (/\s|^/.test(prev)) {
+        const word = v.slice(i+1, pos);
+        if (/^[^\s@:<>"'&]{0,32}$/.test(word)) return { start: i, end: pos, word };
+      }
+      return null;
+    }
+    if (/\s/.test(c)) return null;
+    if (pos - i > 33) return null;
+    i--;
+  }
+  return null;
+}
+function updateMentionState() {
+  const cur = currentMention();
+  if (!cur || !activeId) { hideMentionPop(); return; }
+  const members = channelMembers[activeId] || [];
+  const q = cur.word.toLowerCase();
+  const items = members
+    .filter(m => m.username.toLowerCase() !== (currentUser||'').toLowerCase())
+    .filter(m => !q || m.username.toLowerCase().startsWith(q))
+    .slice(0, 8);
+  if (!items.length) { hideMentionPop(); return; }
+  mentionState.open = true;
+  mentionState.items = items;
+  mentionState.startIdx = cur.start;
+  mentionState.selected = 0;
+  renderMentionPop();
+}
+function renderMentionPop() {
+  const pop = $('mentionPop'); if (!pop) return;
+  pop.innerHTML = '';
+  if (!mentionState.open) { pop.classList.remove('open'); return; }
+  mentionState.items.forEach((m, idx) => {
+    const item = document.createElement('div');
+    item.className = 'mention-pop-item' + (idx === mentionState.selected ? ' active' : '');
+    item.innerHTML = '<span class="mp-avatar" style="background:'+colorForUser(m.username)+';">'+
+      escapeHtml((m.avatar||'?').slice(0,1)) + '</span>' +
+      '<span class="mp-name" style="color:'+colorForUser(m.username)+';">@'+escapeHtml(m.username)+'</span>';
+    item.addEventListener('mousedown', e => { e.preventDefault(); pickMention(idx); });
+    pop.appendChild(item);
+  });
+  pop.classList.add('open');
+}
+function hideMentionPop() {
+  mentionState.open = false;
+  const pop = $('mentionPop'); if (pop) { pop.classList.remove('open'); pop.innerHTML = ''; }
+}
+function pickMention(idx) {
+  if (!mentionState.open) return;
+  const m = mentionState.items[idx]; if (!m) return;
+  const ta = $('msgInput');
+  const v = ta.value;
+  const before = v.slice(0, mentionState.startIdx);
+  const after = v.slice(mentionState.startIdx).replace(/^@[^\s@:<>"'&]{0,32}/, '');
+  const insertion = '@' + m.username + ' ';
+  ta.value = before + insertion + after;
+  const newPos = (before + insertion).length;
+  ta.setSelectionRange(newPos, newPos);
+  hideMentionPop();
+  autoResize();
+  ta.focus();
+}
 
 // Modals
 document.addEventListener('click', e => {
@@ -1809,6 +2226,7 @@ document.addEventListener('keydown', e => {
   ['createBackdrop','connectBackdrop','settingsBackdrop'].forEach(id => $(id).classList.remove('open'));
   if ($('langMenu').classList.contains('open')) closeLangMenu();
   if ($('mobileChannelsPanel').classList.contains('open')) closeMobileChannels();
+  hideMentionPop();
 });
 
 $('addTabBtn').addEventListener('click', () => {
@@ -1816,7 +2234,6 @@ $('addTabBtn').addEventListener('click', () => {
   $('createBackdrop').classList.add('open');
   setTimeout(() => $('newChannelName').focus(), 60);
 });
-// Channel creation — ALWAYS private (server enforces it too)
 $('createChannelBtn').addEventListener('click', async () => {
   const name = $('newChannelName').value.trim();
   if (!name) { $('newChannelName').focus(); return; }
@@ -1825,7 +2242,7 @@ $('createChannelBtn').addEventListener('click', async () => {
     channels.push({ id: res.id, name: res.name, private: true, messages: [] });
     activeId = res.id;
     $('createBackdrop').classList.remove('open');
-    renderAll(); openChannelWS(activeId);
+    renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
   } catch(e) { showLoginError(e.status === 409 ? 'name_taken' : t('err_generic')); }
 });
 $('newChannelName').addEventListener('keydown', e => { if (e.key === 'Enter') $('createChannelBtn').click(); });
@@ -1848,7 +2265,7 @@ $('connectChannelBtn').addEventListener('click', async () => {
     }
     activeId = res.id;
     $('connectBackdrop').classList.remove('open');
-    renderAll(); openChannelWS(activeId);
+    renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
   } catch(e) {
     $('connectErrorText').textContent = e.status === 404 ? t('connect_not_found', {name}) : t('err_generic');
     $('connectError').classList.add('show');
@@ -1864,13 +2281,14 @@ function switchChannel(delta) {
   const n = Math.max(0, Math.min(channels.length - 1, idx + delta));
   if (n === idx) return;
   activeId = channels[n].id;
-  renderAll(); openChannelWS(activeId);
+  renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
 }
 document.addEventListener('keydown', e => {
   if (document.querySelector('.my-modal-backdrop.open')) return;
   if ($('langMenu').classList.contains('open')) return;
   if ($('mobileChannelsPanel').classList.contains('open')) return;
   if ($('loginScreen').style.display !== 'none') return;
+  if (mentionState.open) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
   if (e.key === 'ArrowLeft') { switchChannel(-1); e.preventDefault(); }
@@ -1896,8 +2314,8 @@ function renderAll() { renderTabs(); renderHeader(); renderMessages(); updateMut
 applyLanguage();
 renderUptime();
 (async () => {
-  const restored = await tryRestoreSession();
-  if (!restored) {
+  const ok = await tryRestoreSession();
+  if (!ok) {
     setTimeout(() => $('loginName').focus(), 100);
     let tries = 0;
     const iv = setInterval(() => {
@@ -1914,6 +2332,12 @@ renderUptime();
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return HTMLResponse(
+            "<h1 style='font-family:sans-serif'>SldClient</h1>"
+            "<p>Missing env: <code>SUPABASE_URL</code> and <code>SUPABASE_SERVICE_KEY</code> must be set.</p>",
+            status_code=500,
+        )
     html = HTML_TEMPLATE
     html = html.replace("%%I18N%%", json.dumps(I18N, ensure_ascii=False))
     html = html.replace("%%FLAGS%%", json.dumps(FLAGS, ensure_ascii=False))
@@ -1922,6 +2346,8 @@ async def index():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log("ERROR: set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables")
     log(f"Starting SldClient on port {port}")
     log(f"Turnstile {'DISABLED' if SKIP_TURNSTILE else 'enabled'}")
     uvicorn.run(app, host="0.0.0.0", port=port, workers=1,
