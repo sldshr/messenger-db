@@ -1,4 +1,4 @@
-fastapi>=0.110
+fastapi[standard]
 uvicorn[standard]>=0.29
 websockets 
 httpx
