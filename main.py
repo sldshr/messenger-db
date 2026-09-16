@@ -1,5 +1,5 @@
 # ============================================================
-#  SldClient — FastAPI + Supabase, single file
+#  sldchat — FastAPI + Supabase
 #  Run:
 #    SUPABASE_URL=... SUPABASE_SERVICE_KEY=... python main.py
 # ============================================================
@@ -10,6 +10,8 @@ import os
 import re
 import secrets
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
@@ -22,7 +24,6 @@ import uvicorn
 
 START_TIME = time.time()
 
-# ---------------- Limits / security ----------------
 MAX_MESSAGE_LEN = 8000
 MAX_USERNAME_LEN = 32
 MIN_USERNAME_LEN = 2
@@ -30,17 +31,18 @@ MIN_PASSWORD_LEN = 4
 MAX_PASSWORD_LEN = 128
 PBKDF2_ITERATIONS = 200_000
 RATE_LIMIT_WINDOW = 10.0
-RATE_LIMIT_MAX = 20
+RATE_LIMIT_MAX = 25
 MUTE_SECONDS = 30
 TOKEN_TTL_DAYS = 7
 MAX_BODY_SIZE = 64 * 1024
 GLOBAL_RATE_WINDOW = 60.0
-GLOBAL_RATE_MAX = 600
+GLOBAL_RATE_MAX = 800
 AUTH_RATE_WINDOW = 60.0
-AUTH_RATE_MAX = 10
+AUTH_RATE_MAX = 12
 WS_PER_IP_MAX = 6
-MESSAGE_FETCH_LIMIT = 300
+MESSAGE_FETCH_LIMIT = 200
 USERNAME_RE = re.compile(r"^[^\s@:<>\"'&]{2,32}$")
+MSG_ID_RE = re.compile(r"^[0-9a-fA-F\-]{8,64}$")
 
 TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r"
 TURNSTILE_SECRET = "0x4AAAAAAEt2kX9fNPZNVSsCEur4myw93h4"
@@ -50,15 +52,14 @@ SKIP_TURNSTILE = os.environ.get("SKIP_TURNSTILE", "").lower() in ("1", "true", "
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or ""
 
-# Per-process ephemeral state (not persisted — OK)
 IP_RATE: Dict[str, List[float]] = {}
 WS_PER_IP: Dict[str, int] = {}
+MSG_TIMES: Dict[str, List[float]] = {}
 
 def log(msg: str) -> None:
-    try: print(f"[SldClient {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    try: print(f"[sldchat {time.strftime('%H:%M:%S')}] {msg}", flush=True)
     except Exception: pass
 
-# ---------------- Password / tokens ----------------
 def hash_password(password: str, salt: bytes) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS).hex()
 
@@ -68,18 +69,15 @@ def verify_password(password: str, salt_hex: str, expected: str) -> bool:
     return secrets.compare_digest(hash_password(password, salt), expected)
 
 def new_token() -> str: return secrets.token_urlsafe(32)
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def new_enc_key() -> str: return secrets.token_hex(32)  # 256-bit random
+def now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 
 def parse_ts(s: str) -> float:
     if not s: return 0.0
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0.0
+    try: return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception: return 0.0
 
-# ---------------- Supabase REST client ----------------
+# ---------------- Supabase ----------------
 def _sb_headers(prefer: Optional[str] = None) -> dict:
     h = {
         "apikey": SUPABASE_KEY,
@@ -90,46 +88,50 @@ def _sb_headers(prefer: Optional[str] = None) -> dict:
     if prefer: h["Prefer"] = prefer
     return h
 
+_http_client: Optional[httpx.AsyncClient] = None
+async def _client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10, limits=httpx.Limits(max_keepalive_connections=40, max_connections=80))
+    return _http_client
+
 async def sb_get(path: str, params: Optional[dict] = None) -> list:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Supabase not configured")
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params or {})
-        if r.status_code >= 400:
-            raise RuntimeError(f"sb_get {path} → {r.status_code} {r.text[:200]}")
-        return r.json()
+    c = await _client()
+    r = await c.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params or {})
+    if r.status_code >= 400:
+        raise RuntimeError(f"sb_get {path} → {r.status_code} {r.text[:200]}")
+    return r.json()
 
 async def sb_post(path: str, data, prefer: str = "return=representation") -> list:
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.post(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(prefer), json=data)
-        if r.status_code >= 400:
-            raise RuntimeError(f"sb_post {path} → {r.status_code} {r.text[:200]}")
-        if r.status_code == 201 and r.text:
-            try: return r.json()
-            except Exception: return []
-        return []
-
-async def sb_patch(path: str, params: dict, data) -> list:
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers("return=representation"),
-                          params=params, json=data)
-        if r.status_code >= 400:
-            raise RuntimeError(f"sb_patch {path} → {r.status_code} {r.text[:200]}")
+    c = await _client()
+    r = await c.post(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(prefer), json=data)
+    if r.status_code >= 400:
+        raise RuntimeError(f"sb_post {path} → {r.status_code} {r.text[:200]}")
+    if r.status_code in (200, 201) and r.text:
         try: return r.json()
         except Exception: return []
+    return []
+
+async def sb_patch(path: str, params: dict, data) -> list:
+    c = await _client()
+    r = await c.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers("return=representation"),
+                      params=params, json=data)
+    if r.status_code >= 400:
+        raise RuntimeError(f"sb_patch {path} → {r.status_code} {r.text[:200]}")
+    try: return r.json()
+    except Exception: return []
 
 async def sb_delete(path: str, params: dict) -> bool:
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.delete(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params)
-        return r.status_code < 400
+    c = await _client()
+    r = await c.delete(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers(), params=params)
+    return r.status_code < 400
 
 async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
     if not token: return None
     try:
         rows = await sb_get("tokens", {
-            "select": "expires_at,users(id,username,avatar,show_in_list)",
-            "token": f"eq.{token}",
-            "limit": "1",
+            "select": "expires_at,users(id,username,show_in_list)",
+            "token": f"eq.{token}", "limit": "1",
         })
     except Exception:
         return None
@@ -142,15 +144,14 @@ async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
         return None
     u = row.get("users")
     if not u: return None
-    return {"id": u["id"], "username": u["username"], "avatar": u.get("avatar", "?"),
-            "show_in_list": u.get("show_in_list", True)}
+    return {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
 
 async def auth(request: Request) -> dict:
     u = await get_user_by_token(request.headers.get("x-auth-token"))
     if not u: raise HTTPException(status_code=401, detail="unauthorized")
     return u
 
-# ---------------- IP helpers / rate limit ----------------
+# ---------------- IP / rate limit ----------------
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     if fwd: return fwd.split(",")[0].strip()
@@ -182,22 +183,15 @@ def rate_check(key: str, window: float, limit: int) -> bool:
 # ---------------- Turnstile ----------------
 def _verify_turnstile_sync(token: str, remote_ip: str) -> dict:
     try:
-        body = urllib_encode({"secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip})
-        req = build_request(TURNSTILE_URL, body)
-        with __import__("urllib.request", fromlist=["urlopen"]).urlopen(req, timeout=6) as resp:
+        body = urllib.parse.urlencode({
+            "secret": TURNSTILE_SECRET, "response": token, "remoteip": remote_ip,
+        }).encode("utf-8")
+        req = urllib.request.Request(TURNSTILE_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=6) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         return {"success": False, "error-codes": [f"exception: {e}"]}
-
-def urllib_encode(d: dict) -> bytes:
-    import urllib.parse
-    return urllib.parse.urlencode(d).encode("utf-8")
-
-def build_request(url: str, body: bytes):
-    import urllib.request
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    return req
 
 async def verify_turnstile(token: str, remote_ip: str) -> tuple[bool, str]:
     if SKIP_TURNSTILE: return True, "skipped"
@@ -207,7 +201,7 @@ async def verify_turnstile(token: str, remote_ip: str) -> tuple[bool, str]:
     return False, ",".join(str(c) for c in result.get("error-codes", ["unknown"]))
 
 # ---------------- App ----------------
-app = FastAPI(title="SldClient", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="sldchat", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET","POST"], allow_headers=["*"])
 
 CSP = (
@@ -248,14 +242,13 @@ async def security_middleware(request: Request, call_next):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
-    response.headers["Server"] = "SldClient"
+    response.headers["Server"] = "sldchat"
     return response
 
 # ---------------- Models ----------------
 class AuthReq(BaseModel):
     username: str
     password: str
-    avatar: str = "?"
     turnstile_token: str = ""
 
 class CreateChannelReq(BaseModel):
@@ -278,7 +271,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         raise HTTPException(429, "too_many_attempts")
     ok, reason = await verify_turnstile(req.turnstile_token, ip)
     if not ok:
-        log(f"AUTH turnstile failed ip={ip} reason={reason}")
+        log(f"AUTH turnstile fail ip={ip} reason={reason}")
         raise HTTPException(400, "turnstile_failed")
 
     username = req.username.strip()
@@ -289,9 +282,8 @@ async def auth_endpoint(req: AuthReq, request: Request):
 
     try:
         rows = await sb_get("users", {
-            "select": "id,username,password_hash,salt,avatar,show_in_list",
-            "username": f"ilike.{username}",
-            "limit": "1",
+            "select": "id,username,password_hash,salt,show_in_list",
+            "username": f"ilike.{username}", "limit": "1",
         })
     except Exception as e:
         log(f"sb_get users error: {e}")
@@ -301,19 +293,17 @@ async def auth_endpoint(req: AuthReq, request: Request):
         u = rows[0]
         if not verify_password(req.password, u["salt"], u["password_hash"]):
             raise HTTPException(401, "bad_credentials")
-        user = {"id": u["id"], "username": u["username"], "avatar": u.get("avatar", "?"),
-                "show_in_list": u.get("show_in_list", True)}
+        user = {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
         is_new = False
-        log(f"AUTH login user={user['username']}")
+        log(f"AUTH login {user['username']}")
     else:
-        avatar = (req.avatar or "?").strip()[:2] or "?"
         salt = os.urandom(16)
         try:
             created = await sb_post("users", {
                 "username": username,
                 "password_hash": hash_password(req.password, salt),
                 "salt": salt.hex(),
-                "avatar": avatar,
+                "avatar": "?",
                 "show_in_list": True,
             })
         except Exception as e:
@@ -322,10 +312,9 @@ async def auth_endpoint(req: AuthReq, request: Request):
         if not created:
             raise HTTPException(503, "db_error")
         row = created[0]
-        user = {"id": row["id"], "username": row["username"],
-                "avatar": row.get("avatar", avatar), "show_in_list": True}
+        user = {"id": row["id"], "username": row["username"], "show_in_list": True}
         is_new = True
-        log(f"AUTH register user={user['username']}")
+        log(f"AUTH register {user['username']}")
 
     token = new_token()
     exp_iso = (datetime.now(timezone.utc) + timedelta(days=TOKEN_TTL_DAYS)).isoformat()
@@ -336,7 +325,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         log(f"token insert error: {e}")
         raise HTTPException(503, "db_error")
 
-    return {"token": token, "username": user["username"], "avatar": user["avatar"], "is_new": is_new}
+    return {"token": token, "username": user["username"], "is_new": is_new}
 
 @app.post("/api/logout")
 async def logout(request: Request):
@@ -348,12 +337,12 @@ async def logout(request: Request):
 
 @app.get("/api/uptime")
 async def uptime():
-    return {"uptime": time.time()-START_TIME, "name": "SldClient"}
+    return {"uptime": time.time()-START_TIME, "name": "sldchat"}
 
 @app.get("/api/me")
 async def me(request: Request):
     u = await auth(request)
-    return {"username": u["username"], "avatar": u["avatar"], "show_in_list": u["show_in_list"]}
+    return {"username": u["username"], "show_in_list": u["show_in_list"]}
 
 @app.post("/api/me/preferences")
 async def update_prefs(req: PrefsReq, request: Request):
@@ -367,20 +356,17 @@ async def list_users(request: Request):
     online = manager.get_online_usernames()
     try:
         rows = await sb_get("users", {
-            "select": "id,username,avatar,show_in_list",
-            "order": "username.asc",
-            "limit": "500",
+            "select": "id,username,show_in_list",
+            "order": "username.asc", "limit": "500",
         })
     except Exception:
         raise HTTPException(503, "db_error")
     out = []
     for r in rows:
         if r["id"] == me["id"]:
-            out.append({"username": r["username"], "avatar": r.get("avatar", "?"),
-                        "online": r["username"] in online, "self": True})
+            out.append({"username": r["username"], "online": r["username"] in online, "self": True})
         elif r.get("show_in_list", True):
-            out.append({"username": r["username"], "avatar": r.get("avatar", "?"),
-                        "online": r["username"] in online, "self": False})
+            out.append({"username": r["username"], "online": r["username"] in online, "self": False})
     return {"users": out, "online": len(online)}
 
 def _channel_from_row(ch: dict, msgs: list) -> dict:
@@ -390,19 +376,17 @@ def _channel_from_row(ch: dict, msgs: list) -> dict:
         out_msgs.append({
             "id": m["id"],
             "from": u.get("username", "?"),
-            "avatar": u.get("avatar", "?"),
             "ct": m["ciphertext"],
             "t": parse_ts(m["created_at"]),
         })
     return {"id": ch["id"], "name": ch["name"], "private": bool(ch.get("private", True)),
-            "owner_id": ch.get("owner_id"), "messages": out_msgs}
+            "enc_key": ch.get("enc_key"), "messages": out_msgs}
 
 async def _fetch_channel_messages(channel_id: str) -> list:
     rows = await sb_get("messages", {
-        "select": "id,ciphertext,created_at,users(username,avatar)",
+        "select": "id,ciphertext,created_at,users(username)",
         "channel_id": f"eq.{channel_id}",
-        "order": "created_at.desc",
-        "limit": str(MESSAGE_FETCH_LIMIT),
+        "order": "created_at.desc", "limit": str(MESSAGE_FETCH_LIMIT),
     })
     rows.reverse()
     return rows
@@ -412,20 +396,22 @@ async def list_channels(request: Request):
     me = await auth(request)
     try:
         rows = await sb_get("channel_members", {
-            "select": "channel_id,channels(id,name,private,owner_id,created_at)",
+            "select": "channel_id,channels(id,name,private,enc_key,created_at)",
             "user_id": f"eq.{me['id']}",
         })
     except Exception:
         raise HTTPException(503, "db_error")
-    out = []
-    for r in rows:
+
+    # Fire all message fetches in parallel
+    async def load_one(r):
         ch = r.get("channels")
-        if not ch: continue
-        try:
-            msgs = await _fetch_channel_messages(ch["id"])
-        except Exception:
-            msgs = []
-        out.append(_channel_from_row(ch, msgs))
+        if not ch: return None
+        try: msgs = await _fetch_channel_messages(ch["id"])
+        except Exception: msgs = []
+        return _channel_from_row(ch, msgs)
+
+    results = await asyncio.gather(*(load_one(r) for r in rows))
+    out = [c for c in results if c]
     out.sort(key=lambda c: c["name"].lower())
     return {"channels": out}
 
@@ -439,8 +425,11 @@ async def create_channel(req: CreateChannelReq, request: Request):
     except Exception:
         raise HTTPException(503, "db_error")
     if existing: raise HTTPException(409, "name_taken")
+    enc_key = new_enc_key()
     try:
-        created = await sb_post("channels", {"name": name, "private": True, "owner_id": me["id"]})
+        created = await sb_post("channels", {
+            "name": name, "private": True, "owner_id": me["id"], "enc_key": enc_key,
+        })
         if not created: raise HTTPException(503, "db_error")
         ch = created[0]
         await sb_post("channel_members", {"channel_id": ch["id"], "user_id": me["id"]},
@@ -450,7 +439,7 @@ async def create_channel(req: CreateChannelReq, request: Request):
     except Exception as e:
         log(f"create_channel error: {e}")
         raise HTTPException(409, "name_taken")
-    return {"id": ch["id"], "name": ch["name"], "private": True, "messages": []}
+    return {"id": ch["id"], "name": ch["name"], "private": True, "enc_key": enc_key, "messages": []}
 
 @app.post("/api/channels/connect")
 async def connect_channel(req: ConnectChannelReq, request: Request):
@@ -459,9 +448,8 @@ async def connect_channel(req: ConnectChannelReq, request: Request):
     if not name: raise HTTPException(400, "bad_name")
     try:
         rows = await sb_get("channels", {
-            "select": "id,name,private,owner_id",
-            "name": f"ilike.{name}",
-            "limit": "1",
+            "select": "id,name,private,enc_key",
+            "name": f"ilike.{name}", "limit": "1",
         })
     except Exception:
         raise HTTPException(503, "db_error")
@@ -491,26 +479,22 @@ async def channel_members(channel_id: str, request: Request):
     try:
         mine = await sb_get("channel_members", {
             "select": "user_id",
-            "channel_id": f"eq.{channel_id}",
-            "user_id": f"eq.{me['id']}",
-            "limit": "1",
+            "channel_id": f"eq.{channel_id}", "user_id": f"eq.{me['id']}", "limit": "1",
         })
     except Exception:
         raise HTTPException(503, "db_error")
     if not mine: raise HTTPException(403, "not_member")
     try:
         rows = await sb_get("channel_members", {
-            "select": "users(username,avatar)",
-            "channel_id": f"eq.{channel_id}",
-            "order": "joined_at.asc",
-            "limit": "500",
+            "select": "users(username)",
+            "channel_id": f"eq.{channel_id}", "order": "joined_at.asc", "limit": "500",
         })
     except Exception:
         raise HTTPException(503, "db_error")
     out = []
     for r in rows:
         u = r.get("users")
-        if u: out.append({"username": u["username"], "avatar": u.get("avatar", "?")})
+        if u: out.append({"username": u["username"]})
     return {"members": out}
 
 # ---------------- WebSocket ----------------
@@ -578,9 +562,7 @@ async def ws_endpoint(ws: WebSocket):
         try:
             mine = await sb_get("channel_members", {
                 "select": "user_id",
-                "channel_id": f"eq.{channel_id}",
-                "user_id": f"eq.{user['id']}",
-                "limit": "1",
+                "channel_id": f"eq.{channel_id}", "user_id": f"eq.{user['id']}", "limit": "1",
             })
         except Exception:
             mine = []
@@ -588,8 +570,7 @@ async def ws_endpoint(ws: WebSocket):
             await ws.send_json({"type":"error","error":"auth"}); await ws.close(); return
 
         await manager.join(channel_id, ws, user)
-        await manager.broadcast(channel_id,
-            {"type":"presence","users":manager.online_users(channel_id)})
+        await manager.broadcast(channel_id, {"type":"presence","users":manager.online_users(channel_id)})
 
         while True:
             data = await ws.receive_json()
@@ -598,7 +579,7 @@ async def ws_endpoint(ws: WebSocket):
                 ct = str(data.get("ciphertext",""))[:MAX_MESSAGE_LEN]
                 if not ct: continue
                 mid = str(data.get("id","")).strip()
-                if not re.match(r"^[0-9a-fA-F-]{8,64}$", mid):
+                if not MSG_ID_RE.match(mid):
                     mid = secrets.token_hex(16)
                 key = f"{user['id']}|{channel_id}"
                 now = time.time()
@@ -609,19 +590,18 @@ async def ws_endpoint(ws: WebSocket):
                     i += 1
                 if i: del times[:i]
                 if len(times) >= RATE_LIMIT_MAX:
-                    await ws.send_json({"type":"muted","seconds":MUTE_SECONDS})
-                    continue
+                    await ws.send_json({"type":"muted","seconds":MUTE_SECONDS}); continue
                 times.append(now)
 
-                # Broadcast IMMEDIATELY with client-generated id, persist in background
+                # --- CRITICAL PATH: broadcast first (in-memory), persist after ---
                 msg = {
                     "id": mid,
                     "from": user["username"],
-                    "avatar": user["avatar"],
                     "ct": ct,
                     "t": now,
                 }
                 await manager.broadcast(channel_id, {"type":"message","msg":msg})
+                # fire-and-forget persistence
                 asyncio.create_task(persist_message(mid, channel_id, user["id"], ct))
 
             elif t == "ping":
@@ -637,20 +617,14 @@ async def ws_endpoint(ws: WebSocket):
         WS_PER_IP[ip] = max(0, WS_PER_IP.get(ip, 1) - 1)
         if channel_id:
             try:
-                await manager.broadcast(channel_id,
-                    {"type":"presence","users":manager.online_users(channel_id)})
-            except Exception:
-                pass
-
-# MSG_TIMES kept in-memory (rate-limit only)
-MSG_TIMES: Dict[str, List[float]] = {}
+                await manager.broadcast(channel_id, {"type":"presence","users":manager.online_users(channel_id)})
+            except Exception: pass
 
 # ---------------- i18n ----------------
 I18N = {
- "en": {"login_title":"SldClient","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","field_avatar":"Avatar (1 char)","ph_nick":"Your nickname","ph_password":"Your password","ph_avatar":"A","avatar_hint":"Used for new accounts","btn_login":"Continue","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","mention_hint":"Type @ to mention"},
- "ru": {"login_title":"SldClient","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","field_avatar":"Аватар (1 символ)","ph_nick":"Ваш ник","ph_password":"Ваш пароль","ph_avatar":"А","avatar_hint":"Используется только для новых аккаунтов","btn_login":"Продолжить","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов и @","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","mention_hint":"Введите @ чтобы упомянуть"},
+ "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","leave_channel":"Leave channel"},
+ "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов и @","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","leave_channel":"Покинуть канал"},
 }
-# Fallbacks for other languages (fall back to EN via t())
 for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
     I18N.setdefault(_c, {})
 
@@ -679,19 +653,16 @@ FLAGS = {
 }
 LANG_ORDER = ["en","ru","es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]
 
-# ============================================================
-#  HTML
-# ============================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0088cc">
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
-<meta name="robots" content="noindex, nofollow, noarchive, nosnippet, notranslate">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
 <meta name="referrer" content="no-referrer">
-<title>SldClient</title>
+<title>sldchat</title>
 <link rel="stylesheet" href="https://getbootstrap.com/1.4.0/assets/css/bootstrap.min.css">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoaded&render=explicit" async defer></script>
 <style>
@@ -708,12 +679,21 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .settings-tab, .user-list-item, .mcp-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media print { body { display: none !important; } }
 
+/* Spinner */
+.spinner { display: inline-block; width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+  border-radius: 50%; animation: spin .7s linear infinite;
+  vertical-align: -2px; margin-right: 6px; }
+.spinner.dark { border-color: rgba(0,0,0,.2); border-top-color: #0088cc; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.btn[disabled] { opacity: .7; cursor: not-allowed; }
+
 /* Login */
 .login-screen { position: fixed; top: 0; left: 0; right: 0; height: var(--app-vh, 100vh);
   background: #e9eef3; background-image: linear-gradient(#f5f8fb, #dfe6ee);
   display: flex; align-items: center; justify-content: center;
   z-index: 500; padding: 16px; box-sizing: border-box; overflow-y: auto; }
-.login-box { width: 360px; max-width: 100%; background: #fff; border: 1px solid #b8c4d0;
+.login-box { width: 340px; max-width: 100%; background: #fff; border: 1px solid #b8c4d0;
   box-shadow: 0 4px 16px rgba(0,0,0,.15); padding: 20px 20px 14px; text-align: center;
   margin: auto; box-sizing: border-box; }
 .login-box h2 { margin: 0 0 4px; font-size: 18px; color: #2b3d51; }
@@ -728,7 +708,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   color: #333 !important; outline: none !important; height: auto !important;
   line-height: 1.4 !important; margin: 0 !important; border-radius: 0 !important; }
 .my-input:focus { border-color: #0088cc !important; }
-.login-box .btn { width: 100%; margin-top: 6px; }
+.login-box .btn { width: 100%; margin-top: 6px; min-height: 38px; }
 .login-error { margin-top: 10px; font-size: 11.5px; color: #a94442; background: #fcebeb;
   border: 1px solid #f5c6c6; padding: 5px 8px; display: none; text-align: left; }
 .login-error.show { display: block; }
@@ -740,16 +720,6 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   user-select: none; width: 100%; box-sizing: border-box; gap: 7px; }
 .remember-row input { flex: 0 0 auto; width: 15px; height: 15px; margin: 1px 0 0 0; padding: 0; }
 .remember-row > span { flex: 1 1 auto; min-width: 0; text-align: left; line-height: 1.35; overflow-wrap: break-word; }
-.avatar-row { display: flex; gap: 10px; align-items: flex-start; }
-.avatar-row .avatar-input {
-  flex: 0 0 auto; width: 52px; height: 52px; text-align: center; font-size: 22px;
-  font-weight: bold; color: #fff; border: 1px solid #b8c4d0;
-  background: #0088cc; padding: 0; box-sizing: border-box;
-  outline: none; font-family: inherit; border-radius: 0;
-}
-.avatar-row .avatar-input:focus { border-color: #0088cc; box-shadow: 0 0 4px rgba(0,136,204,.5); }
-.avatar-row .nick-wrap { flex: 1 1 auto; min-width: 0; }
-.avatar-hint { font-size: 11px; color: #7b8a99; margin-top: 4px; }
 #turnstileWidget { margin: 12px auto 6px; width: 100%; max-width: 320px; min-height: 72px;
   display: flex; align-items: center; justify-content: center; overflow: visible;
   position: relative; box-sizing: border-box; }
@@ -832,21 +802,16 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-/* 3-column message grid: avatar | nickname | content */
+/* 2-column: nickname | content. No avatars. */
 .msg-row { display: grid;
-  grid-template-columns: 28px minmax(60px, 100px) 1fr;
-  column-gap: 8px; row-gap: 0;
-  padding: 3px 4px; align-items: start; font-size: 13px;
-  line-height: 1.5; border-radius: 3px; transition: background .2s;
-  word-wrap: break-word; }
+  grid-template-columns: minmax(70px, 110px) 1fr;
+  column-gap: 10px;
+  padding: 3px 4px; align-items: start;
+  font-size: 13px; line-height: 1.5;
+  border-radius: 3px; transition: background .15s; word-wrap: break-word; }
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
 .msg-row.grouped { padding-top: 0; }
-.msg-avatar { width: 24px; height: 24px; border-radius: 4px;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-weight: bold; font-size: 13px; line-height: 1;
-  flex-shrink: 0; user-select: none; margin-top: 1px; }
-.msg-avatar.hidden { visibility: hidden; }
 .msg-author { font-weight: bold; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; margin-top: 1px; }
 .msg-author.hidden { visibility: hidden; }
@@ -860,7 +825,6 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
   font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex;
   align-items: center; border-radius: 3px; }
 
-/* Mention autocomplete */
 .mention-pop { position: absolute; z-index: 40;
   background: #fff; border: 1px solid #bbb; box-shadow: 0 4px 12px rgba(0,0,0,.2);
   max-height: 220px; overflow-y: auto; min-width: 180px; display: none; }
@@ -868,14 +832,12 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .mention-pop-item { display: flex; align-items: center; gap: 8px;
   padding: 8px 12px; cursor: pointer; font-size: 13px; color: #333; }
 .mention-pop-item:hover, .mention-pop-item.active { background: #eaf4fb; }
-.mention-pop-item .mp-avatar { width: 22px; height: 22px; border-radius: 3px;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-weight: bold; font-size: 11px; flex-shrink: 0; }
 .mention-pop-item .mp-name { font-weight: bold; }
 
 .composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px 10px;
   background: #f5f5f5; background-image: linear-gradient(#f0f0f0, #ffffff);
-  border-top: 1px solid #ccc; flex-shrink: 0; position: relative; }
+  border-top: 1px solid #ccc; flex-shrink: 0; position: relative;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
 .composer textarea { flex: 1; resize: none; padding: 6px 8px !important;
   border: 1px solid #bbb !important; font-size: 12px !important; max-height: 140px;
   outline: none !important; box-shadow: inset 0 1px 2px rgba(0,0,0,.1) !important;
@@ -946,9 +908,6 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .user-dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb;
   flex-shrink: 0; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
 .user-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.35); }
-.user-list-item .user-avatar { width: 24px; height: 24px; border-radius: 4px;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-weight: bold; font-size: 12px; flex-shrink: 0; }
 .user-list-item .user-name { flex: 1; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
 .user-list-item .user-you { font-size: 11px; color: #999; margin-left: 4px; font-weight: normal; }
@@ -961,8 +920,6 @@ body.dark .login-box h2 { color: #eaeaea; }
 body.dark .login-box p { color: #888; }
 body.dark .my-label { color: #888 !important; }
 body.dark .my-input { background: #1e1e1e !important; color: #ddd !important; border-color: #4a4a4c !important; }
-body.dark .avatar-input { border-color: #4a4a4c; }
-body.dark .avatar-hint { color: #777; }
 body.dark .login-error { background: #3a1f1f; border-color: #5a2a2a; color: #e0a0a0; }
 body.dark .login-settings, body.dark .uptime-line { border-top-color: #3c3c3c; }
 body.dark .settings-btn { background: #37373d; background-image: none; color: #ccc;
@@ -1030,16 +987,15 @@ body.dark .mcp-empty { color: #666; }
    MOBILE
    ============================================================ */
 @media (max-width: 768px) {
-  .login-screen { padding: 16px; align-items: flex-start; padding-top: 30px; padding-bottom: 40px; }
+  .login-screen { padding: 16px; align-items: flex-start; padding-top: 32px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
   .login-box h2 { font-size: 20px; }
   .login-box p { font-size: 13px; }
-  .login-box .btn { padding: 14px; font-size: 15px; }
+  .login-box .btn { padding: 14px; font-size: 15px; min-height: 48px; }
   .my-input, .login-box .my-input, .my-modal .my-input { font-size: 16px !important; padding: 12px 12px !important; }
-  .avatar-row .avatar-input { width: 58px; height: 58px; font-size: 26px; }
   .remember-row { font-size: 14px; }
   .remember-row input { width: 18px; height: 18px; margin-top: 2px; }
-  .settings-btn { height: 40px; font-size: 14px; }
+  .settings-btn { height: 44px; font-size: 14px; }
   .uptime-line { font-size: 12px; }
 
   .tabs-bar { display: none !important; }
@@ -1054,29 +1010,28 @@ body.dark .mcp-empty { color: #666; }
     color: #333; cursor: pointer;
     font-family: "Courier New", Courier, monospace;
     font-size: 14px; font-weight: bold; text-align: left;
-    border-radius: 0; min-height: 46px; }
+    border-radius: 0; min-height: 48px; }
   .mobile-channels-btn:active { background: #d0d0d0; background-image: none; }
   .mobile-channels-btn svg { width: 20px !important; height: 20px !important; flex-shrink: 0; }
-  .mobile-settings-btn { width: 46px; height: 46px; padding: 0; flex-shrink: 0;
+  .mobile-settings-btn { width: 48px; height: 48px; padding: 0; flex-shrink: 0;
     display: inline-flex; align-items: center; justify-content: center; }
-  .mobile-settings-btn svg { width: 20px !important; height: 20px !important; }
+  .mobile-settings-btn svg { width: 22px !important; height: 22px !important; }
 
   .chat-header { padding: 10px 12px; }
   .chat-header .title { font-size: 15px; }
   .chat-header .subtitle { font-size: 12px; }
   .chat-header .user-info { display: none; }
 
-  .chat-feed { padding: 8px; }
-  .msg-row { grid-template-columns: 24px minmax(52px, 72px) 1fr;
-    column-gap: 6px; padding: 3px 3px; font-size: 14.5px; }
-  .msg-avatar { width: 22px; height: 22px; font-size: 12px; }
-  .msg-author { font-size: 13.5px; }
+  .chat-feed { padding: 8px 10px; }
+  .msg-row { grid-template-columns: minmax(58px, 84px) 1fr;
+    column-gap: 8px; padding: 4px 4px; font-size: 14.5px; }
+  .msg-author { font-size: 14px; }
   .msg-time { font-size: 11px; }
 
-  .composer { padding: 8px 8px; gap: 6px; }
+  .composer { padding: 8px 10px; gap: 8px; }
   .composer textarea { font-size: 16px !important; padding: 12px 12px !important;
     max-height: 120px; }
-  .composer .icon-btn { width: 46px; height: 46px; }
+  .composer .icon-btn { width: 48px; height: 48px; }
   .composer .icon-btn svg { width: 20px !important; height: 20px !important; }
 
   .mention-pop { min-width: 200px; }
@@ -1094,7 +1049,7 @@ body.dark .mcp-empty { color: #666; }
   .settings-tabs { width: 100%; border-right: 0; border-bottom: 1px solid #ddd;
     padding: 0; display: flex; }
   .settings-tab { flex: 1; text-align: center; padding: 14px 4px;
-    border-left: 0; border-bottom: 3px solid transparent; font-size: 12px; }
+    border-left: 0; border-bottom: 3px solid transparent; font-size: 13px; }
   .settings-tab.active { border-left-color: transparent; border-bottom-color: #0088cc; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
@@ -1130,7 +1085,7 @@ body.dark .mcp-empty { color: #666; }
   .mcp-close:active { color: #c00; }
   .mcp-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
   .mcp-item { display: flex; align-items: center; gap: 10px;
-    padding: 16px 16px; border-bottom: 1px solid #f0f0f0;
+    padding: 8px 8px 8px 16px; border-bottom: 1px solid #f0f0f0;
     cursor: pointer;
     font-family: "Courier New", Courier, monospace;
     font-size: 14.5px; color: #333;
@@ -1140,17 +1095,25 @@ body.dark .mcp-empty { color: #666; }
   .mcp-item .lock-ico { display: inline-flex; align-items: center; flex-shrink: 0; }
   .mcp-item .mcp-name { flex: 1; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-item .mcp-close-btn {
+    flex-shrink: 0; width: 40px; height: 40px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #888; cursor: pointer; border-radius: 0;
+    transition: color .15s, background .15s;
+  }
+  .mcp-item .mcp-close-btn:active { color: #c00; background: rgba(192,0,0,.1); }
   .mcp-empty { padding: 40px 16px; text-align: center;
     color: #999; font-size: 13px; }
   .mcp-actions { padding: 12px; border-top: 1px solid #ccc;
-    background: #f7f7f7; flex-shrink: 0; display: flex; gap: 8px; }
+    background: #f7f7f7; flex-shrink: 0; display: flex; gap: 8px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
   .mcp-actions .btn { flex: 1; padding: 14px 10px; font-size: 13px;
     border-radius: 0; min-height: 48px; }
 }
 
 @media (max-width: 400px) {
-  .msg-row { grid-template-columns: 22px minmax(46px, 64px) 1fr; column-gap: 5px; }
-  .msg-author { font-size: 12.5px; }
+  .msg-row { grid-template-columns: minmax(52px, 72px) 1fr; column-gap: 6px; }
+  .msg-author { font-size: 13.5px; }
   .lang-menu { grid-template-columns: 1fr; }
   .settings-lang-grid { grid-template-columns: 1fr; }
 }
@@ -1159,7 +1122,7 @@ body.dark .mcp-empty { color: #666; }
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
   #settingsModal { width: 600px; }
-  .msg-row { grid-template-columns: 28px minmax(60px, 110px) 1fr; }
+  .msg-row { grid-template-columns: minmax(80px, 120px) 1fr; }
 }
 </style>
 </head>
@@ -1167,19 +1130,13 @@ body.dark .mcp-empty { color: #666; }
 
 <div class="login-screen" id="loginScreen">
   <div class="login-box">
-    <h2 id="loginTitle">SldClient</h2>
+    <h2 id="loginTitle">sldchat</h2>
     <p id="loginSubtitle"></p>
 
     <div class="field-group">
-      <div class="avatar-row">
-        <input type="text" id="loginAvatar" class="avatar-input" maxlength="1" value="" autocomplete="off" spellcheck="false">
-        <div class="nick-wrap">
-          <label class="my-label" id="lblNick" for="loginName"></label>
-          <input type="text" id="loginName" class="my-input" maxlength="32"
-                 autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
-          <div class="avatar-hint" id="avatarHint"></div>
-        </div>
-      </div>
+      <label class="my-label" id="lblNick" for="loginName"></label>
+      <input type="text" id="loginName" class="my-input" maxlength="32"
+             autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
     </div>
 
     <div class="field-group">
@@ -1229,7 +1186,7 @@ body.dark .mcp-empty { color: #666; }
       </svg>
       <span id="mobileChannelsLbl">Channels</span>
     </button>
-    <button class="icon-btn-tab mobile-settings-btn" id="mobileSettingsBtn" type="button" title="Settings">
+    <button class="icon-btn-tab mobile-settings-btn" id="mobileSettingsBtn" type="button">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -1360,12 +1317,9 @@ body.dark .mcp-empty { color: #666; }
         <div class="settings-pane active" data-pane="account">
           <div class="settings-section-title" id="settingsAccountHead"></div>
           <div class="settings-row">
-            <div style="display:flex; align-items:center; gap:10px;">
-              <div class="user-avatar" id="settingsUserAvatar">?</div>
-              <div>
-                <div class="settings-label" id="settingsUserLabel"></div>
-                <div class="settings-value" id="settingsUser">—</div>
-              </div>
+            <div>
+              <div class="settings-label" id="settingsUserLabel"></div>
+              <div class="settings-value" id="settingsUser">—</div>
             </div>
           </div>
           <label class="settings-toggle-row">
@@ -1485,18 +1439,18 @@ let currentLang = localStorage.getItem('lang') || 'en';
 let currentTheme = localStorage.getItem('theme') || 'light';
 let authToken = null;
 let currentUser = null;
-let currentAvatar = '?';
 let channels = [];
 let activeId = null;
 let ws = null;
 let wsChannelId = null;
-let channelKeyCache = {};
+let channelKeys = {};          // channelId -> CryptoKey
 let onlineUsers = [];
 let uptimeBase = 0, uptimeFetchAt = 0;
 let showInListPref = true;
 let turnstileWidgetId = null;
-let channelMembers = {};          // channelId -> [{username, avatar}]
-let memberSetByChannel = {};      // channelId -> Set(lower(username))
+let authInFlight = false;
+let channelMembers = {};
+let memberSetByChannel = {};
 let mentionState = { open:false, items:[], selected:0, startIdx:-1 };
 
 const $ = (id) => document.getElementById(id);
@@ -1537,22 +1491,27 @@ function resetTurnstile() {
   try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
 }
 
-// Crypto
+// ---------- Real E2EE: server-side 256-bit random key per channel ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-async function deriveChannelKey(id) {
-  if (channelKeyCache[id]) return channelKeyCache[id];
-  const baseKey = await crypto.subtle.importKey('raw', enc.encode('e2ee-v1:' + id), 'PBKDF2', false, ['deriveKey']);
-  const key = await crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: enc.encode('messenger-fixed-salt-v1'), iterations: 120000, hash: 'SHA-256' },
-    baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
-  );
-  channelKeyCache[id] = key; return key;
+function hexToBytes(hex) {
+  const arr = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < arr.length; i++) arr[i] = parseInt(hex.substr(i*2, 2), 16);
+  return arr;
 }
 function b64(buf){let s='';const bytes=new Uint8Array(buf);for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]);return btoa(s);}
 function ub64(str){const bin=atob(str);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return bytes;}
+
+async function importChannelKey(channelId, hexKey) {
+  if (channelKeys[channelId]) return channelKeys[channelId];
+  const kb = hexToBytes(hexKey);
+  const key = await crypto.subtle.importKey('raw', kb, { name: 'AES-GCM', length: 256 }, false, ['encrypt','decrypt']);
+  channelKeys[channelId] = key;
+  return key;
+}
 async function encryptText(id, text) {
-  const key = await deriveChannelKey(id);
+  const key = channelKeys[id];
+  if (!key) throw new Error('no key');
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, enc.encode(text));
   return b64(iv) + '.' + b64(ct);
@@ -1561,7 +1520,8 @@ async function decryptText(id, payload) {
   try {
     const [ivB64, ctB64] = payload.split('.');
     if (!ivB64 || !ctB64) return payload;
-    const key = await deriveChannelKey(id);
+    const key = channelKeys[id];
+    if (!key) return '[no key]';
     const pt = await crypto.subtle.decrypt({name:'AES-GCM', iv: ub64(ivB64)}, key, ub64(ctB64));
     return dec.decode(pt);
   } catch(e) { return '[decrypt error]'; }
@@ -1610,11 +1570,8 @@ function applyLanguage() {
   $('lblPass').textContent = t('field_password');
   $('loginName').placeholder = t('ph_nick');
   $('loginPass').placeholder = t('ph_password');
-  $('loginAvatar').placeholder = t('ph_avatar');
-  $('loginAvatar').title = t('field_avatar');
-  $('avatarHint').textContent = t('avatar_hint');
   $('rememberLbl').textContent = t('remember_me');
-  $('loginBtn').textContent = t('btn_login');
+  if (!authInFlight) $('loginBtn').textContent = t('btn_login');
   $('uptimeLbl').textContent = t('uptime_label');
   $('lblLoggedAs').textContent = t('logged_as');
   $('addTabBtn').title = t('title_add');
@@ -1689,20 +1646,37 @@ function showLoginError(msg) {
   loginErrTimer = setTimeout(() => box.classList.remove('show'), 5000);
 }
 
+function setAuthBtnLoading(loading) {
+  const btn = $('loginBtn');
+  if (loading) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>' + t('btn_wait');
+  } else {
+    btn.disabled = false;
+    btn.textContent = t('btn_login');
+  }
+}
+
 async function doAuth() {
+  if (authInFlight) return;
   const username = $('loginName').value.trim();
   const password = $('loginPass').value;
-  const avatar = ($('loginAvatar').value.trim() || '?').slice(0, 1);
   if (!username || !password) { showLoginError(t('err_bad_credentials')); return; }
   if (username.length < 2) { showLoginError(t('err_bad_username')); return; }
   if (/[\s@:<>"'&]/.test(username)) { showLoginError(t('err_bad_username')); return; }
   if (password.length < 4) { showLoginError(t('err_bad_password')); return; }
   const tsToken = getTurnstileToken();
   if (!tsToken) { showLoginError(t('err_turnstile')); return; }
+
+  authInFlight = true;
+  setAuthBtnLoading(true);
+  $('loginName').disabled = true;
+  $('loginPass').disabled = true;
+
   try {
     const res = await api('/api/auth', 'POST',
-      { username, password, avatar, turnstile_token: tsToken }, false);
-    authToken = res.token; currentUser = res.username; currentAvatar = res.avatar || '?';
+      { username, password, turnstile_token: tsToken }, false);
+    authToken = res.token; currentUser = res.username;
     if ($('rememberMe').checked) {
       localStorage.setItem('auth_token', res.token);
       sessionStorage.removeItem('auth_token');
@@ -1710,7 +1684,7 @@ async function doAuth() {
       sessionStorage.setItem('auth_token', res.token);
       localStorage.removeItem('auth_token');
     }
-    $('loginName').value = ''; $('loginPass').value = ''; $('loginAvatar').value = '';
+    $('loginName').value = ''; $('loginPass').value = '';
     resetTurnstile(); enterApp();
   } catch (e) {
     let msg;
@@ -1721,30 +1695,22 @@ async function doAuth() {
     else if (e.status === 401) msg = t('err_bad_credentials');
     else msg = t('err_generic');
     showLoginError(msg); resetTurnstile();
+  } finally {
+    authInFlight = false;
+    setAuthBtnLoading(false);
+    $('loginName').disabled = false;
+    $('loginPass').disabled = false;
   }
 }
 $('loginBtn').addEventListener('click', doAuth);
 $('loginName').addEventListener('keydown', e => { if (e.key === 'Enter') $('loginPass').focus(); });
 $('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
-$('loginAvatar').addEventListener('input', e => {
-  const v = e.target.value.replace(/[\s@:<>"'&]/g, '');
-  e.target.value = v.slice(0, 1);
-});
-
-function updateAvatarDisplays() {
-  const av = $('settingsUserAvatar');
-  if (av) {
-    av.textContent = currentAvatar || '?';
-    av.style.background = colorForUser(currentUser || '?');
-  }
-}
 
 function enterApp() {
   $('loginScreen').style.display = 'none';
   $('app').style.display = 'flex';
   $('headerUser').textContent = currentUser;
   $('settingsUser').textContent = currentUser;
-  updateAvatarDisplays();
   updateAppVH();
   loadChannels(); loadMyPrefs();
 }
@@ -1753,9 +1719,7 @@ async function loadMyPrefs() {
   try {
     const res = await api('/api/me');
     showInListPref = !!res.show_in_list;
-    currentAvatar = res.avatar || '?';
     $('showInListToggle').checked = showInListPref;
-    updateAvatarDisplays();
   } catch (e) {}
 }
 
@@ -1765,7 +1729,7 @@ async function tryRestoreSession() {
   authToken = saved;
   try {
     const res = await api('/api/me');
-    currentUser = res.username; currentAvatar = res.avatar || '?';
+    currentUser = res.username;
     enterApp(); return true;
   } catch(e) {
     localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
@@ -1782,7 +1746,6 @@ function openSettingsModal() {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
   $('showInListToggle').checked = showInListPref;
-  updateAvatarDisplays();
   const activeTab = document.querySelector('.settings-tab.active');
   if (activeTab && activeTab.dataset.tab === 'users') loadUsersList();
 }
@@ -1804,8 +1767,8 @@ $('showInListToggle').addEventListener('change', async e => {
 });
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
-  authToken = null; currentUser = null; currentAvatar = '?';
-  channels = []; activeId = null; channelKeyCache = {};
+  authToken = null; currentUser = null;
+  channels = []; activeId = null; channelKeys = {};
   channelMembers = {}; memberSetByChannel = {};
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
@@ -1840,7 +1803,6 @@ function renderUsersList() {
     row.className = 'user-list-item' + (u.self ? ' self' : '');
     row.innerHTML =
       '<span class="user-dot'+(u.online?' online':'')+'" style="background:'+(u.online?'#4caf50':color)+';"></span>' +
-      '<span class="user-avatar" style="background:'+color+';">'+escapeHtml((u.avatar||'?').slice(0,1))+'</span>' +
       '<span class="user-name" style="color:'+color+';">'+escapeHtml(u.username)+
         (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '')+
       '</span>';
@@ -1875,7 +1837,18 @@ function renderMobileChannelList() {
     const n = document.createElement('span');
     n.className = 'mcp-name'; n.textContent = ch.name;
     item.appendChild(n);
-    item.addEventListener('click', () => {
+    // Leave button
+    const cl = document.createElement('span');
+    cl.className = 'mcp-close-btn';
+    cl.title = t('leave_channel');
+    cl.innerHTML = SVG.x;
+    cl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      leaveChannel(ch.id);
+    });
+    item.appendChild(cl);
+    item.addEventListener('click', (e) => {
+      if (e.target.closest && e.target.closest('.mcp-close-btn')) return;
       activeId = ch.id;
       closeMobileChannels();
       renderAll();
@@ -1885,6 +1858,20 @@ function renderMobileChannelList() {
     box.appendChild(item);
   });
 }
+
+async function leaveChannel(id) {
+  try { await api('/api/channels/leave', 'POST', { channel_id: id }); } catch(e){}
+  channels = channels.filter(c => c.id !== id);
+  delete channelMembers[id]; delete memberSetByChannel[id]; delete channelKeys[id];
+  if (activeId === id) {
+    activeId = channels[0] ? channels[0].id : null;
+    if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
+    if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
+  }
+  renderAll();
+  renderMobileChannelList();
+}
+
 $('mobileChannelsBtn').addEventListener('click', openMobileChannels);
 $('mcpClose').addEventListener('click', closeMobileChannels);
 $('mobileChannelsBackdrop').addEventListener('click', closeMobileChannels);
@@ -1899,13 +1886,16 @@ async function loadChannels() {
   try {
     const res = await api('/api/channels');
     channels = res.channels || [];
+    // import keys
+    for (const ch of channels) {
+      if (ch.enc_key) {
+        try { await importChannelKey(ch.id, ch.enc_key); } catch (e) {}
+      }
+    }
     if (activeId && !channels.find(c => c.id === activeId)) activeId = null;
     if (!activeId && channels.length) activeId = channels[0].id;
     renderAll();
-    if (activeId) {
-      openChannelWS(activeId);
-      loadChannelMembers(activeId);
-    }
+    if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
   } catch(e) { if (e.status === 401) $('settingsLogoutBtn').click(); }
 }
 
@@ -1951,16 +1941,7 @@ $('tabsScroll').addEventListener('click', async e => {
   const closeEl = e.target.closest && e.target.closest('[data-close]');
   if (!closeEl) return;
   e.stopPropagation();
-  const id = closeEl.getAttribute('data-close');
-  try { await api('/api/channels/leave', 'POST', { channel_id: id }); } catch(e){}
-  channels = channels.filter(c => c.id !== id);
-  delete channelMembers[id]; delete memberSetByChannel[id];
-  if (activeId === id) {
-    activeId = channels[0] ? channels[0].id : null;
-    if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
-    if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
-  }
-  renderAll();
+  leaveChannel(closeEl.getAttribute('data-close'));
 });
 function scrollActiveTabIntoView() {
   const wrap = $('tabsScroll');
@@ -2000,7 +1981,7 @@ function renderMentions(text, channelId) {
   });
 }
 
-function buildMsgRow(m, prevAuthor, prevTime, channelId) {
+function buildMsgRow(m, prevAuthor, prevTime) {
   const row = document.createElement('div');
   row.className = 'msg-row';
   row.dataset.id = m.id; row.dataset.t = String(m.t*1000);
@@ -2010,11 +1991,6 @@ function buildMsgRow(m, prevAuthor, prevTime, channelId) {
   if (grouped) row.classList.add('grouped');
 
   const color = colorForUser(m.from);
-
-  const avEl = document.createElement('span');
-  avEl.className = 'msg-avatar' + (grouped ? ' hidden' : '');
-  avEl.style.background = color;
-  avEl.textContent = (m.avatar || (m.from[0] || '?')).slice(0,1);
 
   const authEl = document.createElement('span');
   authEl.className = 'msg-author' + (grouped ? ' hidden' : '');
@@ -2027,7 +2003,7 @@ function buildMsgRow(m, prevAuthor, prevTime, channelId) {
   const timeEl = document.createElement('span'); timeEl.className = 'msg-time'; timeEl.textContent = timeStr;
   contentEl.appendChild(textEl); contentEl.appendChild(timeEl);
 
-  row.appendChild(avEl); row.appendChild(authEl); row.appendChild(contentEl);
+  row.appendChild(authEl); row.appendChild(contentEl);
   row.setAttribute('data-ct', m.ct);
   return { el: row, textEl };
 }
@@ -2039,7 +2015,7 @@ function renderMessages() {
   if (ch.messages.length === 0) { feed.innerHTML = '<div class="empty-state">'+SVG.chat+t('empty_no_messages')+'</div>'; return; }
   let lastAuthor = null, lastTime = 0;
   ch.messages.forEach(m => {
-    const { el } = buildMsgRow(m, lastAuthor, lastTime, activeId);
+    const { el } = buildMsgRow(m, lastAuthor, lastTime);
     feed.appendChild(el);
     lastAuthor = m.from; lastTime = m.t*1000;
   });
@@ -2047,12 +2023,13 @@ function renderMessages() {
   feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
     const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
+    if (!ct) return;
     decryptText(chId, ct).then(pt => { span.innerHTML = renderMentions(pt, chId); });
   });
   feed.scrollTop = feed.scrollHeight;
 }
 
-function appendMessageUI(msg, channelId, own) {
+function appendMessageUI(msg, channelId) {
   const feed = $('chatFeed');
   const existing = feed.querySelector('.msg-row[data-id="'+CSS.escape(msg.id)+'"]');
   const ch = channels.find(c => c.id === channelId);
@@ -2062,15 +2039,27 @@ function appendMessageUI(msg, channelId, own) {
       if (ch.messages.length > 300) ch.messages = ch.messages.slice(-300);
     }
   }
-  if (existing) return;
+  if (existing) {
+    // Update content (optimistic already showed this)
+    const span = existing.querySelector('.msg-text');
+    if (span && msg.ct) {
+      decryptText(channelId, msg.ct).then(pt => { span.innerHTML = renderMentions(pt, channelId); });
+      existing.setAttribute('data-ct', msg.ct);
+    }
+    return;
+  }
   if (activeId !== channelId) return;
   const empty = feed.querySelector('.empty-state'); if (empty) empty.remove();
   const lastRow = feed.querySelector('.msg-row:last-child');
   const prevAuthor = lastRow ? (lastRow.querySelector('.msg-author').textContent || '') : null;
   const prevTime = lastRow ? parseInt(lastRow.dataset.t || '0', 10) : 0;
-  const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime, channelId);
+  const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
   feed.appendChild(el);
-  decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderMentions(pt, channelId); });
+  if (msg.ct) {
+    decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderMentions(pt, channelId); });
+  } else {
+    textEl.textContent = '[sending...]';
+  }
   feed.scrollTop = feed.scrollHeight;
 }
 
@@ -2115,12 +2104,11 @@ function sendMessage() {
   const chId = activeId;
   if (!chId || !ws || ws.readyState !== WebSocket.OPEN) return;
   if ((mutes[chId]||0) > Date.now()) { updateMuteUI(); return; }
+  if (!channelKeys[chId]) { addSystem('No encryption key'); return; }
   const mid = uuid();
   const tNow = Date.now()/1000;
-  // optimistic local append (own flag not needed — server echo will dedupe)
-  const optimistic = { id: mid, from: currentUser, avatar: currentAvatar, ct: '', t: tNow };
   encryptText(chId, text).then(ct => {
-    optimistic.ct = ct;
+    const optimistic = { id: mid, from: currentUser, ct: ct, t: tNow };
     appendMessageUI(optimistic, chId);
     ws.send(JSON.stringify({ type:'message', id: mid, ciphertext: ct }));
     input.value = ''; autoResize(); hideMentionPop();
@@ -2139,7 +2127,7 @@ $('msgInput').addEventListener('keydown', e => {
 function autoResize() { const el = $('msgInput'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
 $('msgInput').addEventListener('input', () => { autoResize(); updateMentionState(); });
 
-// ---------- Mentions autocomplete ----------
+// Mentions autocomplete
 function currentMention() {
   const ta = $('msgInput');
   const v = ta.value;
@@ -2184,9 +2172,7 @@ function renderMentionPop() {
   mentionState.items.forEach((m, idx) => {
     const item = document.createElement('div');
     item.className = 'mention-pop-item' + (idx === mentionState.selected ? ' active' : '');
-    item.innerHTML = '<span class="mp-avatar" style="background:'+colorForUser(m.username)+';">'+
-      escapeHtml((m.avatar||'?').slice(0,1)) + '</span>' +
-      '<span class="mp-name" style="color:'+colorForUser(m.username)+';">@'+escapeHtml(m.username)+'</span>';
+    item.innerHTML = '<span class="mp-name" style="color:'+colorForUser(m.username)+';">@'+escapeHtml(m.username)+'</span>';
     item.addEventListener('mousedown', e => { e.preventDefault(); pickMention(idx); });
     pop.appendChild(item);
   });
@@ -2239,6 +2225,7 @@ $('createChannelBtn').addEventListener('click', async () => {
   if (!name) { $('newChannelName').focus(); return; }
   try {
     const res = await api('/api/channels', 'POST', { name });
+    if (res.enc_key) await importChannelKey(res.id, res.enc_key);
     channels.push({ id: res.id, name: res.name, private: true, messages: [] });
     activeId = res.id;
     $('createBackdrop').classList.remove('open');
@@ -2258,6 +2245,7 @@ $('connectChannelBtn').addEventListener('click', async () => {
   if (!name) { $('connectChannelName').focus(); return; }
   try {
     const res = await api('/api/channels/connect', 'POST', { name });
+    if (res.enc_key) await importChannelKey(res.id, res.enc_key);
     if (!channels.find(c => c.id === res.id)) {
       channels.push({ id: res.id, name: res.name, private: res.private, messages: res.messages || [] });
     } else {
@@ -2334,7 +2322,7 @@ renderUptime();
 async def index():
     if not SUPABASE_URL or not SUPABASE_KEY:
         return HTMLResponse(
-            "<h1 style='font-family:sans-serif'>SldClient</h1>"
+            "<h1 style='font-family:sans-serif'>sldchat</h1>"
             "<p>Missing env: <code>SUPABASE_URL</code> and <code>SUPABASE_SERVICE_KEY</code> must be set.</p>",
             status_code=500,
         )
@@ -2347,8 +2335,8 @@ async def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     if not SUPABASE_URL or not SUPABASE_KEY:
-        log("ERROR: set SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables")
-    log(f"Starting SldClient on port {port}")
+        log("ERROR: set SUPABASE_URL and SUPABASE_SERVICE_KEY env vars")
+    log(f"Starting sldchat on port {port}")
     log(f"Turnstile {'DISABLED' if SKIP_TURNSTILE else 'enabled'}")
     uvicorn.run(app, host="0.0.0.0", port=port, workers=1,
                 log_level="info", access_log=False,
