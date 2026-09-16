@@ -70,7 +70,6 @@ def verify_password(password: str, salt_hex: str, expected: str) -> bool:
 
 def new_token() -> str: return secrets.token_urlsafe(32)
 def new_enc_key() -> str: return secrets.token_hex(32)
-def now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 
 def parse_ts(s: str) -> float:
     if not s: return 0.0
@@ -124,7 +123,7 @@ async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
     if not token: return None
     try:
         rows = await sb_get("tokens", {
-            "select": "expires_at,users(id,username,show_in_list)",
+            "select": "expires_at,users(id,username)",
             "token": f"eq.{token}", "limit": "1",
         })
     except Exception:
@@ -138,14 +137,14 @@ async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
         return None
     u = row.get("users")
     if not u: return None
-    return {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
+    return {"id": u["id"], "username": u["username"]}
 
 async def auth(request: Request) -> dict:
     u = await get_user_by_token(request.headers.get("x-auth-token"))
     if not u: raise HTTPException(status_code=401, detail="unauthorized")
     return u
 
-# ---------------- IP / rate limit ----------------
+# ---------------- IP ----------------
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for")
     if fwd: return fwd.split(",")[0].strip()
@@ -238,7 +237,6 @@ async def security_middleware(request: Request, call_next):
     response.headers["Server"] = "sldchat"
     return response
 
-# ---------------- Models ----------------
 class AuthReq(BaseModel):
     username: str
     password: str
@@ -252,9 +250,6 @@ class ConnectChannelReq(BaseModel):
 
 class LeaveChannelReq(BaseModel):
     channel_id: str
-
-class PrefsReq(BaseModel):
-    show_in_list: bool
 
 # ---------------- REST ----------------
 @app.post("/api/auth")
@@ -275,7 +270,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
 
     try:
         rows = await sb_get("users", {
-            "select": "id,username,password_hash,salt,show_in_list",
+            "select": "id,username,password_hash,salt",
             "username": f"ilike.{username}", "limit": "1",
         })
     except Exception as e:
@@ -286,7 +281,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         u = rows[0]
         if not verify_password(req.password, u["salt"], u["password_hash"]):
             raise HTTPException(401, "bad_credentials")
-        user = {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
+        user = {"id": u["id"], "username": u["username"]}
         is_new = False
         log(f"AUTH login {user['username']}")
     else:
@@ -296,7 +291,6 @@ async def auth_endpoint(req: AuthReq, request: Request):
                 "username": username,
                 "password_hash": hash_password(req.password, salt),
                 "salt": salt.hex(),
-                "show_in_list": True,
             })
         except Exception as e:
             log(f"register insert error: {e}")
@@ -304,7 +298,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         if not created:
             raise HTTPException(503, "db_error")
         row = created[0]
-        user = {"id": row["id"], "username": row["username"], "show_in_list": True}
+        user = {"id": row["id"], "username": row["username"]}
         is_new = True
         log(f"AUTH register {user['username']}")
 
@@ -334,15 +328,7 @@ async def uptime():
 @app.get("/api/me")
 async def me(request: Request):
     u = await auth(request)
-    return {"username": u["username"], "show_in_list": u["show_in_list"]}
-
-@app.post("/api/me/preferences")
-async def update_prefs(req: PrefsReq, request: Request):
-    u = await auth(request)
-    c = await _client()
-    await c.patch(f"{SUPABASE_URL}/rest/v1/users", headers=_sb_headers("return=minimal"),
-                  params={"id": f"eq.{u['id']}"}, json={"show_in_list": bool(req.show_in_list)})
-    return {"ok": True, "show_in_list": bool(req.show_in_list)}
+    return {"username": u["username"]}
 
 def _channel_from_row(ch: dict, msgs: list) -> dict:
     out_msgs = []
@@ -590,8 +576,8 @@ async def ws_endpoint(ws: WebSocket):
 
 # ---------------- i18n ----------------
 I18N = {
- "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","booting":"Loading...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, try later","err_turnstile":"Security check failed. Complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_show_in_list":"Show me in users list","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_you":"(you)","mobile_channels":"Channels","leave_channel":"Leave channel","members_title":"Members","members_online":"online"},
- "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","booting":"Загрузка...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_show_in_list":"Показывать в списке пользователей","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_you":"(вы)","mobile_channels":"Каналы","leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн"},
+ "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","booting":"Loading...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, try later","err_turnstile":"Security check failed. Complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_you":"(you)","mobile_channels":"Channels","leave_channel":"Leave channel","members_title":"Members","members_online":"online","msg_menu_mention":"Mention author","msg_menu_copy":"Copy message","copied":"Copied","link_title":"External link","link_warn":"The selected link is not related to us.","btn_continue":"Continue","btn_return":"Return to app","mention_you":"You were mentioned"},
+ "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","booting":"Загрузка...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_you":"(вы)","mobile_channels":"Каналы","leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн","msg_menu_mention":"Упомянуть автора","msg_menu_copy":"Скопировать текст","copied":"Скопировано","link_title":"Внешняя ссылка","link_warn":"Выбранная ссылка никак не связана с нами.","btn_continue":"Продолжить","btn_return":"Вернуться в приложение","mention_you":"Вас упомянули"},
 }
 for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
     I18N.setdefault(_c, {})
@@ -635,11 +621,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 (function() {
   try {
     var tok = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
-    if (tok) {
-      document.documentElement.setAttribute('data-state', 'boot');
-    } else {
-      document.documentElement.setAttribute('data-state', 'login');
-    }
+    document.documentElement.setAttribute('data-state', tok ? 'boot' : 'login');
   } catch (e) {
     document.documentElement.setAttribute('data-state', 'login');
   }
@@ -658,10 +640,10 @@ body { margin: 0; background: #f5f5f5; font-family: "Helvetica Neue", Helvetica,
 input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
 button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn,
-.settings-tab, .mcp-item, .member-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.settings-tab, .mcp-item, .member-item, .msg-menu-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media print { body { display: none !important; } }
 
-/* ============ STATE MACHINE — no login flicker ============ */
+/* State machine */
 .boot-screen { position: fixed; inset: 0; background: #e9eef3;
   background-image: linear-gradient(#f5f8fb, #dfe6ee);
   display: none; align-items: center; justify-content: center;
@@ -808,7 +790,6 @@ html[data-state="app"]   .app          { display: flex !important; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-/* Members sidebar */
 .chat-members {
   width: 220px; flex-shrink: 0;
   background: #f7f8fa;
@@ -836,8 +817,7 @@ html[data-state="app"]   .app          { display: flex !important; }
   cursor: default; transition: background .15s; }
 .member-item:hover { background: #eef3f8; }
 .member-item.self { background: #eaf4fb; }
-.member-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-  background: #bbb; }
+.member-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: #bbb; }
 .member-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.25); }
 .member-name {
   flex: 1; min-width: 0; overflow: hidden;
@@ -845,16 +825,22 @@ html[data-state="app"]   .app          { display: flex !important; }
   font-weight: bold;
 }
 .member-you { font-size: 10.5px; color: #999; font-weight: normal; margin-left: 3px; }
-.members-empty { padding: 30px 14px; text-align: center;
-  color: #aaa; font-size: 12px; }
+.members-empty { padding: 30px 14px; text-align: center; color: #aaa; font-size: 12px; }
 
 /* Message grid */
 .msg-row { display: grid; grid-template-columns: minmax(70px, 110px) 1fr;
   column-gap: 10px; padding: 3px 4px; align-items: start;
   font-size: 13px; line-height: 1.5; border-radius: 3px;
-  transition: background .15s; word-wrap: break-word; }
+  transition: background .15s; word-wrap: break-word;
+  position: relative; }
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
+.msg-row.mentioned-me {
+  background: #fff8d6;
+  border-left: 3px solid #f7b500;
+  padding-left: 6px;
+}
+.msg-row.mentioned-me:hover { background: #fff2c2; }
 .msg-row.grouped { padding-top: 0; }
 .msg-author { font-weight: bold; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; margin-top: 1px; }
@@ -865,10 +851,31 @@ html[data-state="app"]   .app          { display: flex !important; }
   padding: 1px 5px; border-radius: 3px;
   font-family: "Courier New", monospace; font-size: 12.5px; }
 body.dark .msg-text code { background: #2d2d33; color: #ff9db2; }
+.msg-text a.ext-link { color: #0088cc; text-decoration: underline;
+  cursor: pointer; word-break: break-all; }
+.msg-text a.ext-link:hover { color: #0069a3; }
+body.dark .msg-text a.ext-link { color: #6cb6ff; }
+body.dark .msg-text a.ext-link:hover { color: #8ac0ff; }
 .msg-time { color: #b0b8c0; font-size: 10.5px; margin-left: 6px; white-space: nowrap; }
 .mention { background: #e1eefb; color: #005a9e; font-weight: bold;
   padding: 0 3px; border-radius: 3px; }
+.mention.mention-me {
+  background: #ffd84d; color: #6b3a00;
+  box-shadow: 0 0 0 1px #f7b500 inset;
+  animation: mentionPulse .9s ease-out;
+}
+@keyframes mentionPulse {
+  0% { background: #ffec9a; transform: scale(1.06); }
+  100% { background: #ffd84d; transform: scale(1); }
+}
 body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
+body.dark .mention.mention-me { background: #6b4a00; color: #ffe08a;
+  box-shadow: 0 0 0 1px #ffb400 inset; }
+body.dark .msg-row.mentioned-me {
+  background: #3a2f14; border-left-color: #ffb400;
+}
+body.dark .msg-row.mentioned-me:hover { background: #46391a; }
+
 .msg-system { color: #a94442; background: #fcebeb; border: 1px solid #f5c6c6;
   font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex;
   align-items: center; border-radius: 3px; }
@@ -881,6 +888,87 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
   padding: 8px 12px; cursor: pointer; font-size: 13px; color: #333; }
 .mention-pop-item:hover, .mention-pop-item.active { background: #eaf4fb; }
 .mention-pop-item .mp-name { font-weight: bold; }
+
+/* Context menu */
+.msg-menu {
+  position: fixed; z-index: 1200;
+  background: #fff; border: 1px solid #b8c4d0;
+  box-shadow: 0 6px 22px rgba(0,0,0,.25);
+  min-width: 190px; padding: 4px 0;
+  display: none; border-radius: 0;
+}
+.msg-menu.open { display: block; }
+.msg-menu-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; font-size: 13px;
+  cursor: pointer; color: #333; user-select: none;
+  white-space: nowrap;
+}
+.msg-menu-item:hover { background: #eaf4fb; }
+.msg-menu-item:active { background: #d6e8f7; }
+.msg-menu-item svg { flex-shrink: 0; opacity: .75; }
+body.dark .msg-menu { background: #252526; border-color: #3c3c3c; }
+body.dark .msg-menu-item { color: #ddd; }
+body.dark .msg-menu-item:hover { background: #37373d; }
+
+/* Toasts */
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: rgba(30,40,50,.94); color: #fff;
+  font-size: 12.5px; padding: 9px 16px; border-radius: 4px;
+  z-index: 2000; opacity: 0; pointer-events: none;
+  transition: opacity .2s, transform .2s;
+  max-width: 90vw; text-align: center;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(-2px); }
+
+/* Link modal */
+.link-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.5);
+  z-index: 1300; display: none;
+  align-items: center; justify-content: center;
+  padding: 16px; box-sizing: border-box;
+}
+.link-backdrop.open { display: flex; }
+.link-modal {
+  width: 400px; max-width: 100%;
+  background: #fff; border: 1px solid #666;
+  box-shadow: 0 8px 30px rgba(0,0,0,.45);
+  box-sizing: border-box; border-radius: 0;
+}
+.link-modal-head {
+  padding: 10px 14px; font-weight: bold; font-size: 13px;
+  background: #f5f5f5; background-image: linear-gradient(#ffffff, #efefef);
+  border-bottom: 1px solid #ccc;
+  display: flex; align-items: center; gap: 8px;
+  color: #2b3d51;
+}
+.link-modal-head svg { flex-shrink: 0; color: #d97706; }
+.link-modal-body { padding: 16px; }
+.link-modal-warn {
+  font-size: 13px; color: #333; line-height: 1.5; margin-bottom: 10px;
+}
+.link-modal-url {
+  background: #f5f7fa; border: 1px solid #e5e5e5;
+  padding: 8px 10px; font-size: 12px; color: #4a5a6a;
+  font-family: "Courier New", monospace;
+  word-break: break-all; border-radius: 3px;
+  max-height: 100px; overflow-y: auto;
+}
+.link-modal-foot {
+  padding: 10px 14px; background: #f7f7f7;
+  border-top: 1px solid #e5e5e5; text-align: right;
+}
+.link-modal-foot .btn { margin-left: 6px; }
+
+body.dark .link-modal { background: #252526; border-color: #3c3c3c; }
+body.dark .link-modal-head {
+  background: #2d2d30; background-image: none;
+  border-color: #3c3c3c; color: #eaeaea;
+}
+body.dark .link-modal-warn { color: #ddd; }
+body.dark .link-modal-url { background: #1e1e1e; border-color: #3c3c3c; color: #aaa; }
+body.dark .link-modal-foot { background: #2a2a2c; border-color: #3c3c3c; }
 
 .composer { display: flex; align-items: flex-end; gap: 6px; padding: 8px 10px;
   background: #f5f5f5; background-image: linear-gradient(#f0f0f0, #ffffff);
@@ -919,8 +1007,8 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
   border: 1px solid #f5c6c6; padding: 5px 8px; display: none; }
 .error-msg.show { display: flex; align-items: center; }
 
-#settingsModal { width: 560px; }
-.settings-body { display: flex; min-height: 240px; }
+#settingsModal { width: 500px; }
+.settings-body { display: flex; min-height: 220px; }
 .settings-tabs { width: 160px; background: #f5f5f5; border-right: 1px solid #ddd;
   padding: 8px 0; flex-shrink: 0; }
 .settings-tab { display: block; width: 100%; text-align: left; padding: 9px 14px;
@@ -943,11 +1031,6 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .settings-lang-grid .lang-menu-item { padding: 5px 7px; }
 .settings-section-title { font-size: 13px; font-weight: bold; color: #222;
   padding-bottom: 8px; border-bottom: 1px solid #eee; margin-bottom: 12px; }
-.settings-toggle-row { display: flex; align-items: flex-start; gap: 8px;
-  padding: 8px 0; margin-top: 8px; font-size: 13px; color: #333;
-  cursor: pointer; user-select: none; width: 100%; box-sizing: border-box; }
-.settings-toggle-row input { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0 0; padding: 0; }
-.settings-toggle-row > span { flex: 1 1 auto; min-width: 0; line-height: 1.4; overflow-wrap: break-word; }
 
 body.dark { background: #1a1a1a; color: #ccc; }
 body.dark .boot-screen { background: #1a1a1a; background-image: none; }
@@ -1002,7 +1085,6 @@ body.dark .settings-tab.active { background: #252526; border-left-color: #0e639c
 body.dark .settings-label { color: #777; }
 body.dark .settings-value { color: #eaeaea; }
 body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c; }
-body.dark .settings-toggle-row { color: #ccc; }
 body.dark .mention-pop { background: #252526; border-color: #3c3c3c; color: #ddd; }
 body.dark .mention-pop-item { color: #ddd; }
 body.dark .mention-pop-item:hover, body.dark .mention-pop-item.active { background: #37373d; }
@@ -1019,16 +1101,17 @@ body.dark .mcp-item { border-color: #3c3c3c; color: #ccc; }
 body.dark .mcp-item.active { background: #0e639c; color: #fff; }
 body.dark .mcp-actions { background: #2a2a2c; border-color: #3c3c3c; }
 body.dark .mcp-empty { color: #666; }
+body.dark .toast { background: rgba(220,225,230,.94); color: #1a1a1a; }
 
 @media (hover: none) {
   .channel-tab:active { background: #c9c9c9; background-image: none; }
   .icon-btn-tab:active, .scroll-arrow:active, .settings-btn:active { background: #c9c9c9; background-image: none; }
   .lang-menu-item:active { background: #d6e8f7; }
   .msg-row:hover { background: transparent; }
+  .msg-row.mentioned-me:hover { background: #fff2c2; }
   .member-item:hover { background: transparent; }
 }
 
-/* ============ MOBILE ============ */
 @media (max-width: 768px) {
   .login-screen { padding: 16px; align-items: flex-start; padding-top: 32px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
@@ -1070,7 +1153,8 @@ body.dark .mcp-empty { color: #666; }
 
   .chat-feed { padding: 8px 10px; }
   .msg-row { grid-template-columns: minmax(58px, 84px) 1fr;
-    column-gap: 8px; padding: 4px 4px; font-size: 14.5px; }
+    column-gap: 8px; padding: 5px 4px; font-size: 14.5px; }
+  .msg-row.mentioned-me { padding-left: 6px; }
   .msg-author { font-size: 14px; }
   .msg-time { font-size: 11px; }
 
@@ -1100,14 +1184,22 @@ body.dark .mcp-empty { color: #666; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
   .settings-lang-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .settings-toggle-row { font-size: 14px; padding: 12px 0; }
-  .settings-toggle-row input { width: 20px; height: 20px; }
 
   .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 6px; gap: 4px; }
   .lang-menu-item { padding: 10px; font-size: 12.5px; }
 
-  /* Mobile channels drawer */
+  .msg-menu { min-width: 220px; }
+  .msg-menu-item { padding: 14px 18px; font-size: 15px; }
+
+  .link-modal { width: 100%; max-width: 440px; }
+  .link-modal-head { padding: 12px 16px; font-size: 15px; }
+  .link-modal-body { padding: 18px; }
+  .link-modal-warn { font-size: 14.5px; }
+  .link-modal-url { font-size: 12.5px; padding: 10px 12px; }
+  .link-modal-foot { padding: 14px; }
+  .link-modal-foot .btn { padding: 12px 18px; font-size: 14px; min-height: 46px; }
+
   .mobile-channels-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 900;
     opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
@@ -1155,7 +1247,6 @@ body.dark .mcp-empty { color: #666; }
   .mcp-actions .btn { flex: 1; padding: 14px 10px; font-size: 13px;
     border-radius: 0; min-height: 48px; }
 
-  /* Mobile members drawer */
   .members-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 901;
     opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
@@ -1185,7 +1276,7 @@ body.dark .mcp-empty { color: #666; }
 @media (min-width: 769px) and (max-width: 1024px) {
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
-  #settingsModal { width: 600px; }
+  #settingsModal { width: 520px; }
   .msg-row { grid-template-columns: minmax(80px, 120px) 1fr; }
   .chat-members { width: 200px; }
 }
@@ -1410,10 +1501,6 @@ body.dark .mcp-empty { color: #666; }
               <div class="settings-value" id="settingsUser">—</div>
             </div>
           </div>
-          <label class="settings-toggle-row">
-            <input type="checkbox" id="showInListToggle">
-            <span id="showInListLabel"></span>
-          </label>
           <button class="btn" id="settingsLogoutBtn" type="button" style="width:100%; margin-top:14px;"></button>
         </div>
         <div class="settings-pane" data-pane="appearance">
@@ -1435,9 +1522,41 @@ body.dark .mcp-empty { color: #666; }
   </div>
 </div>
 
+<!-- Message context menu -->
+<div class="msg-menu" id="msgMenu">
+  <div class="msg-menu-item" data-action="mention">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/></svg>
+    <span id="msgMenuMention">Mention</span>
+  </div>
+  <div class="msg-menu-item" data-action="copy">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+    <span id="msgMenuCopy">Copy</span>
+  </div>
+</div>
+
+<!-- Link warning modal -->
+<div class="link-backdrop" id="linkBackdrop">
+  <div class="link-modal">
+    <div class="link-modal-head">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span id="linkModalTitle">External link</span>
+    </div>
+    <div class="link-modal-body">
+      <div class="link-modal-warn" id="linkModalWarn"></div>
+      <div class="link-modal-url" id="linkModalUrl"></div>
+    </div>
+    <div class="link-modal-foot">
+      <button class="btn" type="button" id="linkReturnBtn"></button>
+      <button class="btn primary" type="button" id="linkContinueBtn"></button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
 <script>
 "use strict";
-/* CLIENT PROTECTION */
 (function() {
   const isEditable = (el) => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
   document.addEventListener('selectstart', e => { if (!isEditable(e.target)) e.preventDefault(); }, true);
@@ -1506,12 +1625,13 @@ function uuid() {
   });
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// ============ EMOJI + RICH TEXT ============
+// ============ EMOJI ============
 const EMOJI_MAP = {
   like:'👍','+1':'👍',thumbsup:'👍',good:'👍',
   dislike:'👎','-1':'👎',thumbsdown:'👎',bad:'👎',
-  heart:'❤️',love:'❤️',love_you:'❤️',
+  heart:'❤️',love:'❤️',
   smile:'😊',happy:'😊',blush:'😊',
   laugh:'😂',lol:'😂',joy:'😂',haha:'😂',
   cry:'😢',sad:'😢',
@@ -1541,7 +1661,7 @@ const EMOJI_MAP = {
   cake:'🎂',
   gift:'🎁',
   check:'✅',done:'✅',yes:'✅',
-  x:'❌',cross:'❌',no:'❌',
+  cross:'❌',no:'❌',
   warn:'⚠️',warning:'⚠️',
   info:'ℹ️',
   question:'❓',
@@ -1568,8 +1688,6 @@ const EMOJI_MAP = {
   zap:'⚡',
   boom:'💥',
   bomb:'💣',
-  gun:'🔫',
-  knife:'🔪',
   skull:'💀',
   poop:'💩',
   rainbow:'🌈',
@@ -1592,7 +1710,6 @@ const EMOJI_MAP = {
   medal:'🏅',
   trophy:'🏆',
   diamond:'💎',
-  needle:'💉',
   pill:'💊',
   balloon:'🎈',
   confetti:'🎊',
@@ -1618,18 +1735,13 @@ const EMOJI_MAP = {
   trash:'🗑️',
   recycle:'♻️',
   arrow_up:'⬆️',arrow_down:'⬇️',arrow_left:'⬅️',arrow_right:'➡️',
-  wave_hand:'👋',
-  thumbs_up:'👍',
-  thumbs_down:'👎',
   muscle:'💪',
   point_up:'☝️',
-  pray_hands:'🙏',
   raised_hands:'🙌',
   handshake:'🤝',
   fist:'✊',
   punch:'👊',
-  victory:'✌️',
-  peace:'✌️',
+  victory:'✌️',peace:'✌️',
   metal:'🤘',
   call_me:'🤙',
   cross_fingers:'🤞',
@@ -1642,17 +1754,29 @@ function applyEmojis(escaped) {
   });
 }
 function applyFormatting(s) {
-  // Code — protect content from other rules
   s = s.replace(/`([^`\n]+)`/g, (m, c) => '<code>'+c+'</code>');
-  // Bold **text**
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
-  // Italic *text* (not inside **)
   s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
-  // Underline __text__
   s = s.replace(/__([^_\n]+)__/g, '<u>$1</u>');
-  // Strikethrough ~~text~~
   s = s.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
   return s;
+}
+function linkify(escaped) {
+  // Match http(s):// or www. URLs (stop on whitespace or < from other tags)
+  return escaped.replace(
+    /\b(https?:\/\/[^\s<]+|www\.[^\s<]+)/gi,
+    (full) => {
+      const url = full;
+      const href = url.replace(/&amp;/g, '&');
+      return '<a href="#" class="ext-link" data-url="' + href.replace(/"/g, '&quot;') + '" rel="noopener noreferrer nofollow">' + url + '</a>';
+    }
+  );
+}
+
+function isMeMentioned(plainText) {
+  if (!currentUser || !plainText) return false;
+  const re = new RegExp('(^|[\\s\\(\\[\\{])@' + escapeRegex(currentUser) + '(?=$|[\\s\\)\\]\\}\\,.!?:;])', 'i');
+  return re.test(plainText);
 }
 function renderRichText(text, channelId) {
   let s = escapeHtml(text);
@@ -1662,11 +1786,13 @@ function renderRichText(text, channelId) {
   if (members && members.size) {
     s = s.replace(/@([^\s@:<>"'&]{2,32})/gu, (full, name) => {
       if (members.has(name.toLowerCase())) {
-        return '<span class="mention">@'+name+'</span>';
+        const isMe = currentUser && name.toLowerCase() === currentUser.toLowerCase();
+        return '<span class="mention' + (isMe ? ' mention-me' : '') + '">@' + name + '</span>';
       }
       return full;
     });
   }
+  s = linkify(s);
   return s;
 }
 
@@ -1694,12 +1820,12 @@ let wsChannelId = null;
 let channelKeys = {};
 let onlineUsers = [];
 let uptimeBase = 0, uptimeFetchAt = 0;
-let showInListPref = true;
 let turnstileWidgetId = null;
 let authInFlight = false;
 let channelMembers = {};
 let memberSetByChannel = {};
 let mentionState = { open:false, items:[], selected:0, startIdx:-1 };
+const decryptedCache = new Map();  // msgId -> plainText
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => {
@@ -1715,16 +1841,21 @@ function setState(st) {
   document.documentElement.setAttribute('data-state', st);
   if (st === 'login') updateAppVH();
 }
+function showToast(text) {
+  const el = $('toast');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => el.classList.remove('show'), 1600);
+}
 
-// ---------- Cache ----------
 function saveCache() {
   try {
     const data = {
       ts: Date.now(),
       username: currentUser,
-      channels: channels.map(c => ({
-        id: c.id, name: c.name, private: c.private, enc_key: c.enc_key,
-      })),
+      channels: channels.map(c => ({ id: c.id, name: c.name, private: c.private, enc_key: c.enc_key })),
     };
     localStorage.setItem(CACHE_KEY, JSON.stringify(data));
   } catch(e) {}
@@ -1771,7 +1902,7 @@ function resetTurnstile() {
   try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
 }
 
-// ---------- Real E2EE ----------
+// ---------- Crypto ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 function hexToBytes(hex) {
@@ -1878,12 +2009,17 @@ function applyLanguage() {
   $('settingsAppearanceHead').textContent = t('settings_appearance');
   $('settingsThemeLabel').textContent = t('settings_theme');
   $('settingsLangLabel').textContent = t('settings_lang');
-  $('showInListLabel').textContent = t('settings_show_in_list');
   $('mobileChannelsLbl').textContent = t('mobile_channels');
   $('mcpTitle').textContent = t('mobile_channels');
   $('mcpCreateBtn').textContent = t('modal_create_title');
   $('mcpConnectBtn').textContent = t('modal_connect_title');
   $('membersTitle').textContent = t('members_title');
+  $('msgMenuMention').textContent = t('msg_menu_mention');
+  $('msgMenuCopy').textContent = t('msg_menu_copy');
+  $('linkModalTitle').textContent = t('link_title');
+  $('linkModalWarn').textContent = t('link_warn');
+  $('linkReturnBtn').textContent = t('btn_return');
+  $('linkContinueBtn').textContent = t('btn_continue');
   $('langFlag').innerHTML = FLAGS[currentLang] || '';
   $('langCode').textContent = currentLang.toUpperCase();
   applyTheme();
@@ -1992,20 +2128,7 @@ function enterApp() {
   $('settingsUser').textContent = currentUser;
   setState('app');
   updateAppVH();
-  // Load channels fast
   loadChannels();
-  loadMyPrefs();
-}
-
-async function loadMyPrefs() {
-  try {
-    const res = await api('/api/me');
-    showInListPref = !!res.show_in_list;
-    currentUser = res.username;
-    $('headerUser').textContent = currentUser;
-    $('settingsUser').textContent = currentUser;
-    $('showInListToggle').checked = showInListPref;
-  } catch (e) {}
 }
 
 async function tryRestoreSession() {
@@ -2013,7 +2136,6 @@ async function tryRestoreSession() {
   if (!saved) { setState('login'); return false; }
   authToken = saved;
 
-  // Fast-path: render cached UI immediately
   const cached = loadCache();
   if (cached && cached.username && cached.channels.length) {
     currentUser = cached.username;
@@ -2027,18 +2149,14 @@ async function tryRestoreSession() {
     setState('app');
     updateAppVH();
     renderAll();
-    // Then verify in background
     try {
       const me = await api('/api/me');
       currentUser = me.username;
-      showInListPref = !!me.show_in_list;
       $('headerUser').textContent = currentUser;
       $('settingsUser').textContent = currentUser;
-      $('showInListToggle').checked = showInListPref;
-      loadChannels();  // fresh fetch, will replace
+      loadChannels();
       return true;
     } catch(e) {
-      // Token invalid
       localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
       clearCache(); authToken = null; currentUser = null; channels = [];
       setState('login');
@@ -2046,12 +2164,9 @@ async function tryRestoreSession() {
     }
   }
 
-  // No cache — verify first
   try {
     const me = await api('/api/me');
     currentUser = me.username;
-    showInListPref = !!me.show_in_list;
-    $('showInListToggle').checked = showInListPref;
     enterApp();
     return true;
   } catch(e) {
@@ -2070,7 +2185,6 @@ $('langBackdrop').addEventListener('click', closeLangMenu);
 function openSettingsModal() {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
-  $('showInListToggle').checked = showInListPref;
 }
 $('settingsBtn').addEventListener('click', openSettingsModal);
 $('mobileSettingsBtn').addEventListener('click', openSettingsModal);
@@ -2082,16 +2196,11 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
-$('showInListToggle').addEventListener('change', async e => {
-  const val = e.target.checked;
-  try { await api('/api/me/preferences', 'POST', { show_in_list: val }); showInListPref = val; }
-  catch (err) { e.target.checked = !val; }
-});
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
   authToken = null; currentUser = null;
   channels = []; activeId = null; channelKeys = {};
-  channelMembers = {}; memberSetByChannel = {};
+  channelMembers = {}; memberSetByChannel = {}; decryptedCache.clear();
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
   clearCache();
@@ -2120,7 +2229,6 @@ function renderMembersSidebar() {
   const members = channelMembers[activeId] || [];
   const onlineSet = new Set((onlineUsers||[]).map(u => String(u).toLowerCase()));
   $('membersCount').textContent = String(members.length);
-
   if (!members.length) {
     box.innerHTML = '<div class="members-empty">—</div>';
     return;
@@ -2147,7 +2255,6 @@ function renderMembersSidebar() {
   });
 }
 
-// ---------- Mobile channels ----------
 function openMobileChannels() {
   renderMobileChannelList();
   $('mobileChannelsBackdrop').classList.add('open');
@@ -2217,7 +2324,6 @@ async function loadChannels() {
   try {
     const res = await api('/api/channels');
     const fresh = res.channels || [];
-    // Import keys
     for (const ch of fresh) {
       if (ch.enc_key) { try { await importChannelKey(ch.id, ch.enc_key); } catch(e){} }
     }
@@ -2229,7 +2335,6 @@ async function loadChannels() {
     saveCache();
   } catch(e) {
     if (e.status === 401) {
-      // Token invalid — logout
       authToken = null; currentUser = null; channels = [];
       clearCache();
       localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
@@ -2335,7 +2440,19 @@ function buildMsgRow(m, prevAuthor, prevTime) {
 
   row.appendChild(authEl); row.appendChild(contentEl);
   row.setAttribute('data-ct', m.ct || '');
+  row.setAttribute('data-author', m.from || '');
   return { el: row, textEl };
+}
+
+function applyDecryptedToRow(row, channelId, plainText) {
+  const span = row.querySelector('.msg-text');
+  if (!span) return;
+  span.innerHTML = renderRichText(plainText, channelId);
+  if (isMeMentioned(plainText)) {
+    row.classList.add('mentioned-me');
+  } else {
+    row.classList.remove('mentioned-me');
+  }
 }
 
 function renderMessages() {
@@ -2351,10 +2468,13 @@ function renderMessages() {
   });
   const chId = activeId;
   feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
-    const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
     if (!ct) return;
-    decryptText(chId, ct).then(pt => { span.innerHTML = renderRichText(pt, chId); });
+    const id = row.dataset.id;
+    decryptText(chId, ct).then(pt => {
+      decryptedCache.set(id, pt);
+      applyDecryptedToRow(row, chId, pt);
+    });
   });
   feed.scrollTop = feed.scrollHeight;
 }
@@ -2370,10 +2490,12 @@ function appendMessageUI(msg, channelId) {
     }
   }
   if (existing) {
-    const span = existing.querySelector('.msg-text');
-    if (span && msg.ct) {
-      decryptText(channelId, msg.ct).then(pt => { span.innerHTML = renderRichText(pt, channelId); });
+    if (msg.ct) {
       existing.setAttribute('data-ct', msg.ct);
+      decryptText(channelId, msg.ct).then(pt => {
+        decryptedCache.set(msg.id, pt);
+        applyDecryptedToRow(existing, channelId, pt);
+      });
     }
     return;
   }
@@ -2385,7 +2507,10 @@ function appendMessageUI(msg, channelId) {
   const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
   feed.appendChild(el);
   if (msg.ct) {
-    decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderRichText(pt, channelId); });
+    decryptText(channelId, msg.ct).then(pt => {
+      decryptedCache.set(msg.id, pt);
+      applyDecryptedToRow(el, channelId, pt);
+    });
   } else {
     textEl.textContent = '[sending...]';
   }
@@ -2430,6 +2555,7 @@ function openChannelWS(channelId) {
   };
   ws.onclose = () => { if (wsChannelId === channelId) ws = null; };
 }
+
 function sendMessage() {
   const input = $('msgInput');
   const text = input.value.trim();
@@ -2445,9 +2571,13 @@ function sendMessage() {
     appendMessageUI(optimistic, chId);
     ws.send(JSON.stringify({ type:'message', id: mid, ciphertext: ct }));
     input.value = ''; autoResize(); hideMentionPop();
+    // Keep focus so user can keep typing
+    input.focus();
   });
 }
 $('sendBtn').addEventListener('click', sendMessage);
+// Prevent focus steal from the button on mouse-down (desktop)
+$('sendBtn').addEventListener('mousedown', e => e.preventDefault());
 $('msgInput').addEventListener('keydown', e => {
   if (mentionState.open) {
     if (e.key === 'ArrowDown') { e.preventDefault(); mentionState.selected = Math.min(mentionState.items.length-1, mentionState.selected+1); renderMentionPop(); return; }
@@ -2531,7 +2661,163 @@ function pickMention(idx) {
   ta.focus();
 }
 
-// Modals
+// ============ CONTEXT MENU ON MESSAGES ============
+const msgMenuState = { row: null, author: '', msgId: '' };
+let lpTimer = null, lpStartX = 0, lpStartY = 0;
+
+function openMsgMenu(row, x, y) {
+  if (!row) return;
+  const id = row.dataset.id || '';
+  const author = row.dataset.author || '';
+  msgMenuState.row = row;
+  msgMenuState.author = author;
+  msgMenuState.msgId = id;
+  const menu = $('msgMenu');
+  menu.style.left = '0px'; menu.style.top = '0px';
+  menu.classList.add('open');
+  const rect = menu.getBoundingClientRect();
+  const pad = 8;
+  let left = Math.min(Math.max(pad, x), window.innerWidth - rect.width - pad);
+  let top = Math.min(Math.max(pad, y), window.innerHeight - rect.height - pad);
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+}
+function closeMsgMenu() {
+  $('msgMenu').classList.remove('open');
+  msgMenuState.row = null; msgMenuState.author = ''; msgMenuState.msgId = '';
+}
+
+async function copyMessageById(msgId) {
+  let txt = decryptedCache.get(msgId);
+  if (!txt) {
+    const row = msgMenuState.row;
+    const ct = row ? row.getAttribute('data-ct') : '';
+    if (ct && activeId) {
+      txt = await decryptText(activeId, ct);
+      if (txt) decryptedCache.set(msgId, txt);
+    }
+  }
+  if (!txt) return false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(txt);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function insertMention(name) {
+  if (!name) return;
+  const input = $('msgInput');
+  let v = input.value;
+  if (v.length && !/\s$/.test(v)) v += ' ';
+  v += '@' + name + ' ';
+  input.value = v;
+  autoResize();
+  input.focus();
+  const pos = input.value.length;
+  try { input.setSelectionRange(pos, pos); } catch(e){}
+}
+
+$('msgMenu').addEventListener('click', async (e) => {
+  const item = e.target.closest && e.target.closest('.msg-menu-item');
+  if (!item) return;
+  const action = item.dataset.action;
+  const author = msgMenuState.author;
+  const msgId = msgMenuState.msgId;
+  if (action === 'mention') {
+    if (author && author !== currentUser) insertMention(author);
+    else if (author) insertMention(author);
+  } else if (action === 'copy') {
+    const ok = await copyMessageById(msgId);
+    showToast(ok ? t('copied') : t('err_generic'));
+  }
+  closeMsgMenu();
+});
+
+// Desktop contextmenu
+$('chatFeed').addEventListener('contextmenu', e => {
+  const row = e.target.closest && e.target.closest('.msg-row:not(.msg-system)');
+  if (!row) return;
+  e.preventDefault();
+  openMsgMenu(row, e.clientX, e.clientY);
+});
+
+// Mobile long-press
+$('chatFeed').addEventListener('touchstart', e => {
+  if (e.touches.length !== 1) return;
+  const row = e.target.closest && e.target.closest('.msg-row:not(.msg-system)');
+  if (!row) return;
+  lpStartX = e.touches[0].clientX;
+  lpStartY = e.touches[0].clientY;
+  lpTimer = setTimeout(() => {
+    lpTimer = null;
+    try { if (navigator.vibrate) navigator.vibrate(12); } catch(_) {}
+    openMsgMenu(row, lpStartX, lpStartY);
+  }, 500);
+}, {passive: true});
+$('chatFeed').addEventListener('touchmove', e => {
+  if (!lpTimer) return;
+  const t0 = e.touches[0]; if (!t0) return;
+  if (Math.abs(t0.clientX - lpStartX) > 8 || Math.abs(t0.clientY - lpStartY) > 8) {
+    clearTimeout(lpTimer); lpTimer = null;
+  }
+}, {passive: true});
+['touchend','touchcancel'].forEach(ev => {
+  $('chatFeed').addEventListener(ev, () => {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+  }, {passive: true});
+});
+
+document.addEventListener('click', e => {
+  if ($('msgMenu').classList.contains('open') && !e.target.closest('#msgMenu')) {
+    closeMsgMenu();
+  }
+});
+window.addEventListener('scroll', () => closeMsgMenu(), {passive: true, capture: true});
+
+// ============ LINK WARNING MODAL ============
+let pendingLinkUrl = '';
+function openLinkModal(url) {
+  pendingLinkUrl = url || '';
+  $('linkModalUrl').textContent = url || '';
+  $('linkBackdrop').classList.add('open');
+}
+function closeLinkModal() {
+  $('linkBackdrop').classList.remove('open');
+  pendingLinkUrl = '';
+}
+$('linkReturnBtn').addEventListener('click', closeLinkModal);
+$('linkContinueBtn').addEventListener('click', () => {
+  const url = pendingLinkUrl;
+  closeLinkModal();
+  if (url) {
+    try { window.open(url, '_blank', 'noopener,noreferrer'); } catch(e){}
+  }
+});
+$('linkBackdrop').addEventListener('click', e => {
+  if (e.target === $('linkBackdrop')) closeLinkModal();
+});
+
+// Click delegation for ext links
+$('chatFeed').addEventListener('click', e => {
+  const a = e.target.closest && e.target.closest('a.ext-link');
+  if (!a) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const url = a.getAttribute('data-url') || a.textContent || '';
+  openLinkModal(url);
+});
+
+// ---------- Modals ----------
 document.addEventListener('click', e => {
   const el = e.target.closest && e.target.closest('[data-close-modal]');
   if (!el) return;
@@ -2546,6 +2832,8 @@ document.addEventListener('keydown', e => {
   if ($('langMenu').classList.contains('open')) closeLangMenu();
   if ($('mobileChannelsPanel').classList.contains('open')) closeMobileChannels();
   if ($('chatMembers').classList.contains('open')) closeMembersSidebar();
+  if ($('msgMenu').classList.contains('open')) closeMsgMenu();
+  if ($('linkBackdrop').classList.contains('open')) closeLinkModal();
   hideMentionPop();
 });
 
@@ -2612,6 +2900,8 @@ document.addEventListener('keydown', e => {
   if ($('langMenu').classList.contains('open')) return;
   if ($('mobileChannelsPanel').classList.contains('open')) return;
   if ($('chatMembers').classList.contains('open')) return;
+  if ($('msgMenu').classList.contains('open')) return;
+  if ($('linkBackdrop').classList.contains('open')) return;
   if (document.documentElement.getAttribute('data-state') !== 'app') return;
   if (mentionState.open) return;
   const ae = document.activeElement;
@@ -2620,17 +2910,17 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'ArrowRight') { switchChannel(1); e.preventDefault(); }
 });
 
-let touchStartX = 0, touchStartY = 0, touchActive = false;
+let swipeStartX = 0, swipeStartY = 0, swipeActive = false;
 const feedEl = $('chatFeed');
 feedEl.addEventListener('touchstart', e => {
   if (e.touches.length !== 1) return;
-  touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY; touchActive = true;
+  swipeStartX = e.touches[0].clientX; swipeStartY = e.touches[0].clientY; swipeActive = true;
 }, {passive: true});
 feedEl.addEventListener('touchend', e => {
-  if (!touchActive) return;
-  touchActive = false;
-  const dx = e.changedTouches[0].clientX - touchStartX;
-  const dy = e.changedTouches[0].clientY - touchStartY;
+  if (!swipeActive) return;
+  swipeActive = false;
+  const dx = e.changedTouches[0].clientX - swipeStartX;
+  const dy = e.changedTouches[0].clientY - swipeStartY;
   if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) switchChannel(dx < 0 ? 1 : -1);
 }, {passive: true});
 
@@ -2641,6 +2931,7 @@ function renderAll() {
   updateMuteUI();
   scrollActiveTabIntoView();
   renderMembersSidebar();
+  closeMsgMenu();
 }
 
 applyLanguage();
