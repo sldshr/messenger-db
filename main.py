@@ -36,7 +36,7 @@ MUTE_SECONDS = 30
 TOKEN_TTL_DAYS = 7
 MAX_BODY_SIZE = 64 * 1024
 GLOBAL_RATE_WINDOW = 60.0
-GLOBAL_RATE_MAX = 800
+GLOBAL_RATE_MAX = 900
 AUTH_RATE_WINDOW = 60.0
 AUTH_RATE_MAX = 12
 WS_PER_IP_MAX = 6
@@ -69,7 +69,7 @@ def verify_password(password: str, salt_hex: str, expected: str) -> bool:
     return secrets.compare_digest(hash_password(password, salt), expected)
 
 def new_token() -> str: return secrets.token_urlsafe(32)
-def new_enc_key() -> str: return secrets.token_hex(32)  # 256-bit random
+def new_enc_key() -> str: return secrets.token_hex(32)
 def now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 
 def parse_ts(s: str) -> float:
@@ -92,7 +92,10 @@ _http_client: Optional[httpx.AsyncClient] = None
 async def _client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=10, limits=httpx.Limits(max_keepalive_connections=40, max_connections=80))
+        _http_client = httpx.AsyncClient(
+            timeout=10,
+            limits=httpx.Limits(max_keepalive_connections=60, max_connections=120),
+        )
     return _http_client
 
 async def sb_get(path: str, params: Optional[dict] = None) -> list:
@@ -111,15 +114,6 @@ async def sb_post(path: str, data, prefer: str = "return=representation") -> lis
         try: return r.json()
         except Exception: return []
     return []
-
-async def sb_patch(path: str, params: dict, data) -> list:
-    c = await _client()
-    r = await c.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=_sb_headers("return=representation"),
-                      params=params, json=data)
-    if r.status_code >= 400:
-        raise RuntimeError(f"sb_patch {path} → {r.status_code} {r.text[:200]}")
-    try: return r.json()
-    except Exception: return []
 
 async def sb_delete(path: str, params: dict) -> bool:
     c = await _client()
@@ -208,8 +202,7 @@ CSP = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; "
     "style-src 'self' 'unsafe-inline' https://getbootstrap.com; "
-    "img-src 'self' data:; "
-    "font-src 'self' data:; "
+    "img-src 'self' data:; font-src 'self' data:; "
     "connect-src 'self' https://challenges.cloudflare.com; "
     "frame-src https://challenges.cloudflare.com; "
     "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; "
@@ -303,7 +296,6 @@ async def auth_endpoint(req: AuthReq, request: Request):
                 "username": username,
                 "password_hash": hash_password(req.password, salt),
                 "salt": salt.hex(),
-                "avatar": "?",
                 "show_in_list": True,
             })
         except Exception as e:
@@ -347,27 +339,10 @@ async def me(request: Request):
 @app.post("/api/me/preferences")
 async def update_prefs(req: PrefsReq, request: Request):
     u = await auth(request)
-    await sb_patch("users", {"id": f"eq.{u['id']}"}, {"show_in_list": bool(req.show_in_list)})
+    c = await _client()
+    await c.patch(f"{SUPABASE_URL}/rest/v1/users", headers=_sb_headers("return=minimal"),
+                  params={"id": f"eq.{u['id']}"}, json={"show_in_list": bool(req.show_in_list)})
     return {"ok": True, "show_in_list": bool(req.show_in_list)}
-
-@app.get("/api/users")
-async def list_users(request: Request):
-    me = await auth(request)
-    online = manager.get_online_usernames()
-    try:
-        rows = await sb_get("users", {
-            "select": "id,username,show_in_list",
-            "order": "username.asc", "limit": "500",
-        })
-    except Exception:
-        raise HTTPException(503, "db_error")
-    out = []
-    for r in rows:
-        if r["id"] == me["id"]:
-            out.append({"username": r["username"], "online": r["username"] in online, "self": True})
-        elif r.get("show_in_list", True):
-            out.append({"username": r["username"], "online": r["username"] in online, "self": False})
-    return {"users": out, "online": len(online)}
 
 def _channel_from_row(ch: dict, msgs: list) -> dict:
     out_msgs = []
@@ -402,7 +377,6 @@ async def list_channels(request: Request):
     except Exception:
         raise HTTPException(503, "db_error")
 
-    # Fire all message fetches in parallel
     async def load_one(r):
         ch = r.get("channels")
         if not ch: return None
@@ -513,9 +487,6 @@ class WSManager:
             _, cid = e
             self.rooms.get(cid, set()).discard(ws)
 
-    def get_online_usernames(self) -> Set[str]:
-        return set(u["username"] for (u, _) in self.info.values())
-
     def online_users(self, cid) -> List[str]:
         return sorted(set(u["username"] for (u, c) in self.info.values() if c == cid))
 
@@ -593,7 +564,6 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_json({"type":"muted","seconds":MUTE_SECONDS}); continue
                 times.append(now)
 
-                # --- CRITICAL PATH: broadcast first (in-memory), persist after ---
                 msg = {
                     "id": mid,
                     "from": user["username"],
@@ -601,9 +571,7 @@ async def ws_endpoint(ws: WebSocket):
                     "t": now,
                 }
                 await manager.broadcast(channel_id, {"type":"message","msg":msg})
-                # fire-and-forget persistence
                 asyncio.create_task(persist_message(mid, channel_id, user["id"], ct))
-
             elif t == "ping":
                 try: await ws.send_json({"type":"pong"})
                 except Exception: pass
@@ -622,8 +590,8 @@ async def ws_endpoint(ws: WebSocket):
 
 # ---------------- i18n ----------------
 I18N = {
- "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join a channel","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, please try again later","err_turnstile":"Security check failed. Please complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_users":"Users List","settings_show_in_list":"Show me in Users List","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_list_empty":"No users to show","users_you":"(you)","users_online":"online","mobile_channels":"Channels","leave_channel":"Leave channel"},
- "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов и @","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов, попробуйте позже","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку выше.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_users":"Список пользователей","settings_show_in_list":"Показывать меня в списке","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_list_empty":"Нет пользователей","users_you":"(вы)","users_online":"онлайн","mobile_channels":"Каналы","leave_channel":"Покинуть канал"},
+ "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","booting":"Loading...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, try later","err_turnstile":"Security check failed. Complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_show_in_list":"Show me in users list","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_you":"(you)","mobile_channels":"Channels","leave_channel":"Leave channel","members_title":"Members","members_online":"online"},
+ "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","booting":"Загрузка...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_show_in_list":"Показывать в списке пользователей","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_you":"(вы)","mobile_channels":"Каналы","leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн"},
 }
 for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
     I18N.setdefault(_c, {})
@@ -654,7 +622,7 @@ FLAGS = {
 LANG_ORDER = ["en","ru","es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-state="login">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -663,6 +631,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
 <meta name="referrer" content="no-referrer">
 <title>sldchat</title>
+<script>
+(function() {
+  try {
+    var tok = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
+    if (tok) {
+      document.documentElement.setAttribute('data-state', 'boot');
+    } else {
+      document.documentElement.setAttribute('data-state', 'login');
+    }
+  } catch (e) {
+    document.documentElement.setAttribute('data-state', 'login');
+  }
+})();
+</script>
 <link rel="stylesheet" href="https://getbootstrap.com/1.4.0/assets/css/bootstrap.min.css">
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoaded&render=explicit" async defer></script>
 <style>
@@ -676,16 +658,35 @@ body { margin: 0; background: #f5f5f5; font-family: "Helvetica Neue", Helvetica,
 input, textarea { -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text; font-family: inherit; }
 svg { display: inline-block; vertical-align: middle; }
 button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-btn,
-.settings-tab, .user-list-item, .mcp-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.settings-tab, .mcp-item, .member-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media print { body { display: none !important; } }
 
-/* Spinner */
+/* ============ STATE MACHINE — no login flicker ============ */
+.boot-screen { position: fixed; inset: 0; background: #e9eef3;
+  background-image: linear-gradient(#f5f8fb, #dfe6ee);
+  display: none; align-items: center; justify-content: center;
+  flex-direction: column; gap: 18px; z-index: 550; }
+.boot-screen .boot-spinner {
+  width: 34px; height: 34px;
+  border: 3px solid #b8c4d0; border-top-color: #0088cc;
+  border-radius: 50%; animation: spin .8s linear infinite;
+}
+.boot-screen .boot-text { font-size: 13px; color: #4a5a6a; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+html[data-state="boot"]  .login-screen { display: none !important; }
+html[data-state="boot"]  .app          { display: none !important; }
+html[data-state="boot"]  .boot-screen  { display: flex !important; }
+html[data-state="login"] .boot-screen  { display: none !important; }
+html[data-state="login"] .app          { display: none !important; }
+html[data-state="app"]   .login-screen { display: none !important; }
+html[data-state="app"]   .boot-screen  { display: none !important; }
+html[data-state="app"]   .app          { display: flex !important; }
+
 .spinner { display: inline-block; width: 14px; height: 14px;
   border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
   border-radius: 50%; animation: spin .7s linear infinite;
   vertical-align: -2px; margin-right: 6px; }
-.spinner.dark { border-color: rgba(0,0,0,.2); border-top-color: #0088cc; }
-@keyframes spin { to { transform: rotate(360deg); } }
 .btn[disabled] { opacity: .7; cursor: not-allowed; }
 
 /* Login */
@@ -733,6 +734,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
   text-shadow: 0 1px 0 rgba(255,255,255,.6); border-radius: 0; }
 .settings-btn:hover { background: #d9d9d9; color: #000; }
 .settings-btn .lang-code { margin-left: 6px; font-size: 11px; font-weight: bold; letter-spacing: .5px; }
+
 .lang-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 9998; display: none; }
 .lang-backdrop.open { display: block; }
 .lang-menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
@@ -752,8 +754,9 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .lang-menu-item .check { flex-shrink: 0; color: #0088cc; font-weight: bold; visibility: hidden; }
 .lang-menu-item.active .check { visibility: visible; }
 
+/* App */
 .app { width: 100%; height: var(--app-vh, 100vh); background: #fff;
-  display: flex; flex-direction: column; position: relative; overflow: hidden; }
+  flex-direction: column; position: relative; overflow: hidden; }
 
 .tabs-bar { display: flex; align-items: center; padding: 6px 8px;
   background: #f5f5f5; background-image: linear-gradient(#ffffff, #ececec);
@@ -787,6 +790,7 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 
 .mobile-topbar { display: none; }
 .mobile-channels-backdrop, .mobile-channels-panel { display: none; }
+.members-backdrop { display: none; }
 
 .chat-header { display: flex; align-items: center; padding: 8px 12px;
   background: #f5f5f5; background-image: linear-gradient(#ffffff, #f0f0f0);
@@ -796,19 +800,59 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .chat-header .user-info { margin-left: auto; display: flex; align-items: center;
   gap: 8px; font-size: 11px; color: #666; }
 .chat-header .user-info .nick { font-weight: bold; color: #2b3d51; }
+.members-toggle { display: none; }
 
+.chat-body { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 .chat-feed { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
-  padding: 8px 12px; background: #fdfdfd; position: relative; }
+  padding: 8px 12px; background: #fdfdfd; position: relative; min-width: 0; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-/* 2-column: nickname | content. No avatars. */
-.msg-row { display: grid;
-  grid-template-columns: minmax(70px, 110px) 1fr;
-  column-gap: 10px;
-  padding: 3px 4px; align-items: start;
-  font-size: 13px; line-height: 1.5;
-  border-radius: 3px; transition: background .15s; word-wrap: break-word; }
+/* Members sidebar */
+.chat-members {
+  width: 220px; flex-shrink: 0;
+  background: #f7f8fa;
+  border-left: 1px solid #e0e0e0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.members-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid #e0e0e0;
+  font-family: "Courier New", Courier, monospace;
+  font-size: 12px; font-weight: bold; color: #2b3d51;
+  display: flex; align-items: center; gap: 6px;
+  flex-shrink: 0;
+}
+.members-count {
+  background: #e9eef3; color: #4a5a6a;
+  font-size: 11px; font-weight: bold;
+  padding: 1px 6px; border-radius: 8px;
+  margin-left: auto;
+}
+.members-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
+.member-item { display: flex; align-items: center; gap: 8px;
+  padding: 6px 14px; font-size: 12.5px; color: #333;
+  cursor: default; transition: background .15s; }
+.member-item:hover { background: #eef3f8; }
+.member-item.self { background: #eaf4fb; }
+.member-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: #bbb; }
+.member-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.25); }
+.member-name {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-weight: bold;
+}
+.member-you { font-size: 10.5px; color: #999; font-weight: normal; margin-left: 3px; }
+.members-empty { padding: 30px 14px; text-align: center;
+  color: #aaa; font-size: 12px; }
+
+/* Message grid */
+.msg-row { display: grid; grid-template-columns: minmax(70px, 110px) 1fr;
+  column-gap: 10px; padding: 3px 4px; align-items: start;
+  font-size: 13px; line-height: 1.5; border-radius: 3px;
+  transition: background .15s; word-wrap: break-word; }
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
 .msg-row.grouped { padding-top: 0; }
@@ -817,6 +861,10 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .msg-author.hidden { visibility: hidden; }
 .msg-content { min-width: 0; word-break: break-word; overflow-wrap: anywhere; }
 .msg-text { color: #222; }
+.msg-text code { background: #eef1f5; color: #c7254e;
+  padding: 1px 5px; border-radius: 3px;
+  font-family: "Courier New", monospace; font-size: 12.5px; }
+body.dark .msg-text code { background: #2d2d33; color: #ff9db2; }
 .msg-time { color: #b0b8c0; font-size: 10.5px; margin-left: 6px; white-space: nowrap; }
 .mention { background: #e1eefb; color: #005a9e; font-weight: bold;
   padding: 0 3px; border-radius: 3px; }
@@ -872,7 +920,7 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .error-msg.show { display: flex; align-items: center; }
 
 #settingsModal { width: 560px; }
-.settings-body { display: flex; min-height: 280px; }
+.settings-body { display: flex; min-height: 240px; }
 .settings-tabs { width: 160px; background: #f5f5f5; border-right: 1px solid #ddd;
   padding: 8px 0; flex-shrink: 0; }
 .settings-tab { display: block; width: 100%; text-align: left; padding: 9px 14px;
@@ -901,19 +949,10 @@ body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .settings-toggle-row input { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0 0; padding: 0; }
 .settings-toggle-row > span { flex: 1 1 auto; min-width: 0; line-height: 1.4; overflow-wrap: break-word; }
 
-.users-list { display: flex; flex-direction: column; }
-.user-list-item { display: flex; align-items: center; gap: 10px; padding: 8px 4px;
-  border-bottom: 1px solid #f0f0f0; font-size: 13px; }
-.user-list-item:last-child { border-bottom: 0; }
-.user-dot { width: 10px; height: 10px; border-radius: 50%; background: #bbb;
-  flex-shrink: 0; box-shadow: 0 0 0 2px rgba(0,0,0,.05); }
-.user-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.35); }
-.user-list-item .user-name { flex: 1; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
-.user-list-item .user-you { font-size: 11px; color: #999; margin-left: 4px; font-weight: normal; }
-.users-empty { padding: 30px 10px; text-align: center; color: #999; font-size: 12px; }
-
 body.dark { background: #1a1a1a; color: #ccc; }
+body.dark .boot-screen { background: #1a1a1a; background-image: none; }
+body.dark .boot-screen .boot-text { color: #888; }
+body.dark .boot-screen .boot-spinner { border-color: #3c3c3c; border-top-color: #0e639c; }
 body.dark .login-screen { background: #1a1a1a; background-image: none; }
 body.dark .login-box { background: #252526; border-color: #3c3c3c; }
 body.dark .login-box h2 { color: #eaeaea; }
@@ -964,11 +1003,16 @@ body.dark .settings-label { color: #777; }
 body.dark .settings-value { color: #eaeaea; }
 body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c; }
 body.dark .settings-toggle-row { color: #ccc; }
-body.dark .user-list-item { border-bottom-color: #3c3c3c; }
-body.dark .user-list-item .user-name { color: #eaeaea; }
 body.dark .mention-pop { background: #252526; border-color: #3c3c3c; color: #ddd; }
 body.dark .mention-pop-item { color: #ddd; }
 body.dark .mention-pop-item:hover, body.dark .mention-pop-item.active { background: #37373d; }
+body.dark .chat-members { background: #232326; border-left-color: #3c3c3c; }
+body.dark .members-head { background: #232326; border-bottom-color: #3c3c3c; color: #eaeaea; }
+body.dark .members-count { background: #37373d; color: #aaa; }
+body.dark .member-item { color: #ccc; }
+body.dark .member-item:hover { background: #2a2d33; }
+body.dark .member-item.self { background: #1c3a5a; }
+body.dark .member-you { color: #777; }
 body.dark .mobile-channels-panel { background: #252526; border-color: #3c3c3c; }
 body.dark .mcp-head { background: #2d2d30; border-color: #3c3c3c; color: #eaeaea; }
 body.dark .mcp-item { border-color: #3c3c3c; color: #ccc; }
@@ -981,11 +1025,10 @@ body.dark .mcp-empty { color: #666; }
   .icon-btn-tab:active, .scroll-arrow:active, .settings-btn:active { background: #c9c9c9; background-image: none; }
   .lang-menu-item:active { background: #d6e8f7; }
   .msg-row:hover { background: transparent; }
+  .member-item:hover { background: transparent; }
 }
 
-/* ============================================================
-   MOBILE
-   ============================================================ */
+/* ============ MOBILE ============ */
 @media (max-width: 768px) {
   .login-screen { padding: 16px; align-items: flex-start; padding-top: 32px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
@@ -1021,6 +1064,9 @@ body.dark .mcp-empty { color: #666; }
   .chat-header .title { font-size: 15px; }
   .chat-header .subtitle { font-size: 12px; }
   .chat-header .user-info { display: none; }
+  .members-toggle { display: inline-flex; margin-left: auto;
+    width: 42px; height: 42px; }
+  .members-toggle svg { width: 20px !important; height: 20px !important; }
 
   .chat-feed { padding: 8px 10px; }
   .msg-row { grid-template-columns: minmax(58px, 84px) 1fr;
@@ -1061,6 +1107,7 @@ body.dark .mcp-empty { color: #666; }
     padding: 6px; gap: 4px; }
   .lang-menu-item { padding: 10px; font-size: 12.5px; }
 
+  /* Mobile channels drawer */
   .mobile-channels-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 900;
     opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
@@ -1082,7 +1129,6 @@ body.dark .mcp-empty { color: #666; }
   .mcp-close { margin-left: auto; background: transparent; border: 0;
     cursor: pointer; padding: 8px; color: #666;
     display: inline-flex; align-items: center; border-radius: 0; }
-  .mcp-close:active { color: #c00; }
   .mcp-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
   .mcp-item { display: flex; align-items: center; gap: 10px;
     padding: 8px 8px 8px 16px; border-bottom: 1px solid #f0f0f0;
@@ -1099,7 +1145,6 @@ body.dark .mcp-empty { color: #666; }
     flex-shrink: 0; width: 40px; height: 40px;
     display: inline-flex; align-items: center; justify-content: center;
     color: #888; cursor: pointer; border-radius: 0;
-    transition: color .15s, background .15s;
   }
   .mcp-item .mcp-close-btn:active { color: #c00; background: rgba(192,0,0,.1); }
   .mcp-empty { padding: 40px 16px; text-align: center;
@@ -1109,6 +1154,25 @@ body.dark .mcp-empty { color: #666; }
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
   .mcp-actions .btn { flex: 1; padding: 14px 10px; font-size: 13px;
     border-radius: 0; min-height: 48px; }
+
+  /* Mobile members drawer */
+  .members-backdrop { display: block; position: fixed; inset: 0;
+    background: rgba(0,0,0,.45); z-index: 901;
+    opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
+  .members-backdrop.open { opacity: 1; pointer-events: auto; }
+  .chat-members {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: 84%; max-width: 320px;
+    z-index: 902;
+    transform: translateX(100%);
+    transition: transform .2s ease-out;
+    box-shadow: -4px 0 20px rgba(0,0,0,.35);
+    border-left: 0;
+  }
+  .chat-members.open { transform: translateX(0); }
+  .members-head { padding: 14px 16px; font-size: 14px; }
+  .member-item { padding: 12px 16px; font-size: 14px; min-height: 48px; }
+  .member-dot { width: 10px; height: 10px; }
 }
 
 @media (max-width: 400px) {
@@ -1123,10 +1187,16 @@ body.dark .mcp-empty { color: #666; }
   .my-modal { max-width: 500px; }
   #settingsModal { width: 600px; }
   .msg-row { grid-template-columns: minmax(80px, 120px) 1fr; }
+  .chat-members { width: 200px; }
 }
 </style>
 </head>
 <body>
+
+<div class="boot-screen" id="bootScreen">
+  <div class="boot-spinner"></div>
+  <div class="boot-text" id="bootText">Loading...</div>
+</div>
 
 <div class="login-screen" id="loginScreen">
   <div class="login-box">
@@ -1173,7 +1243,7 @@ body.dark .mcp-empty { color: #666; }
 <div class="lang-backdrop" id="langBackdrop"></div>
 <div class="lang-menu" id="langMenu"></div>
 
-<div class="app" id="app" style="display:none">
+<div class="app" id="app">
   <div class="mobile-topbar" id="mobileTopbar">
     <button class="mobile-channels-btn" id="mobileChannelsBtn" type="button">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1230,9 +1300,26 @@ body.dark .mcp-empty { color: #666; }
       <span id="lblLoggedAs"></span>
       <span class="nick" id="headerUser">—</span>
     </div>
+    <button class="icon-btn-tab members-toggle" id="membersToggleBtn" type="button">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+        <circle cx="9" cy="7" r="4"/>
+        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+      </svg>
+    </button>
   </div>
 
-  <div class="chat-feed" id="chatFeed"></div>
+  <div class="chat-body">
+    <div class="chat-feed" id="chatFeed"></div>
+    <aside class="chat-members" id="chatMembers">
+      <div class="members-head">
+        <span id="membersTitle">Members</span>
+        <span class="members-count" id="membersCount">0</span>
+      </div>
+      <div class="members-list" id="membersList"></div>
+    </aside>
+  </div>
 
   <div class="composer">
     <textarea id="msgInput" rows="1" autocomplete="off" autocapitalize="sentences" spellcheck="false"></textarea>
@@ -1242,6 +1329,8 @@ body.dark .mcp-empty { color: #666; }
     <div class="mention-pop" id="mentionPop"></div>
   </div>
 </div>
+
+<div class="members-backdrop" id="membersBackdrop"></div>
 
 <div class="mobile-channels-backdrop" id="mobileChannelsBackdrop"></div>
 <div class="mobile-channels-panel" id="mobileChannelsPanel">
@@ -1311,7 +1400,6 @@ body.dark .mcp-empty { color: #666; }
       <div class="settings-tabs">
         <button class="settings-tab active" data-tab="account" id="tabAccount"></button>
         <button class="settings-tab" data-tab="appearance" id="tabAppearance"></button>
-        <button class="settings-tab" data-tab="users" id="tabUsers"></button>
       </div>
       <div class="settings-content">
         <div class="settings-pane active" data-pane="account">
@@ -1341,10 +1429,6 @@ body.dark .mcp-empty { color: #666; }
             <div class="settings-label" id="settingsLangLabel"></div>
             <div class="settings-lang-grid" id="settingsLangGrid"></div>
           </div>
-        </div>
-        <div class="settings-pane" data-pane="users">
-          <div class="settings-section-title" id="settingsUsersHead">Users List</div>
-          <div class="users-list" id="usersList"></div>
         </div>
       </div>
     </div>
@@ -1391,6 +1475,7 @@ const FLAGS = %%FLAGS%%;
 const LANG_ORDER = %%LANG_ORDER%%;
 const LANG_NAMES = {en:"English",ru:"Русский",es:"Español",de:"Deutsch",fr:"Français",it:"Italiano",pt:"Português",nl:"Nederlands",pl:"Polski",uk:"Українська",cs:"Čeština",sv:"Svenska",el:"Ελληνικά",tr:"Türkçe",ja:"日本語",ko:"한국어",zh:"中文",ar:"العربية",he:"עברית",hi:"हिन्दी"};
 const TURNSTILE_SITEKEY = "0x4AAAAAAEt2kcFzE58AuS_r";
+const CACHE_KEY = "sldchat_cache_v1";
 
 const SVG = {
   x:'<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
@@ -1422,6 +1507,169 @@ function uuid() {
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
+// ============ EMOJI + RICH TEXT ============
+const EMOJI_MAP = {
+  like:'👍','+1':'👍',thumbsup:'👍',good:'👍',
+  dislike:'👎','-1':'👎',thumbsdown:'👎',bad:'👎',
+  heart:'❤️',love:'❤️',love_you:'❤️',
+  smile:'😊',happy:'😊',blush:'😊',
+  laugh:'😂',lol:'😂',joy:'😂',haha:'😂',
+  cry:'😢',sad:'😢',
+  angry:'😠',mad:'😠',rage:'😡',
+  wink:'😉',
+  think:'🤔',thinking:'🤔',
+  ok:'👌',ok_hand:'👌',
+  fire:'🔥',hot:'🔥',lit:'🔥',
+  star:'⭐',star2:'🌟',
+  '100':'💯',
+  rocket:'🚀',
+  party:'🎉',tada:'🎉',celebrate:'🎉',
+  clap:'👏',
+  pray:'🙏',
+  wave:'👋',hi:'👋',hello:'👋',
+  eyes:'👀',
+  sweat:'😅',
+  cool:'😎',sunglasses:'😎',
+  wow:'😮',surprised:'😮',
+  kiss:'😘',
+  sleepy:'😴',tired:'😴',
+  nerd:'🤓',
+  dog:'🐶',cat:'🐱',
+  pizza:'🍕',
+  beer:'🍺',
+  coffee:'☕',
+  cake:'🎂',
+  gift:'🎁',
+  check:'✅',done:'✅',yes:'✅',
+  x:'❌',cross:'❌',no:'❌',
+  warn:'⚠️',warning:'⚠️',
+  info:'ℹ️',
+  question:'❓',
+  excl:'❗',
+  clown:'🤡',
+  ghost:'👻',
+  alien:'👽',
+  robot:'🤖',
+  money:'💰',
+  crown:'👑',
+  flag:'🏁',
+  soccer:'⚽',
+  basketball:'🏀',
+  game:'🎮',
+  music:'🎵',
+  book:'📚',
+  bulb:'💡',
+  lock:'🔒',
+  key:'🔑',
+  phone:'📱',
+  computer:'💻',
+  mail:'✉️',
+  bell:'🔔',
+  zap:'⚡',
+  boom:'💥',
+  bomb:'💣',
+  gun:'🔫',
+  knife:'🔪',
+  skull:'💀',
+  poop:'💩',
+  rainbow:'🌈',
+  sun:'☀️',
+  moon:'🌙',
+  cloud:'☁️',
+  snow:'❄️',
+  umbrella:'☔',
+  apple:'🍎',
+  banana:'🍌',
+  grape:'🍇',
+  watermelon:'🍉',
+  burger:'🍔',
+  fries:'🍟',
+  sushi:'🍣',
+  ramen:'🍜',
+  icecream:'🍦',
+  candy:'🍬',
+  cookie:'🍪',
+  medal:'🏅',
+  trophy:'🏆',
+  diamond:'💎',
+  needle:'💉',
+  pill:'💊',
+  balloon:'🎈',
+  confetti:'🎊',
+  package:'📦',
+  hourglass:'⏳',
+  clock:'⏰',
+  calendar:'📅',
+  camera:'📷',
+  movie:'🎬',
+  tv:'📺',
+  headphones:'🎧',
+  mic:'🎤',
+  speaker:'🔊',
+  search:'🔍',
+  hammer:'🔨',
+  wrench:'🔧',
+  gear:'⚙️',
+  scissors:'✂️',
+  pen:'✏️',
+  paperclip:'📎',
+  pushpin:'📌',
+  bookmark:'🔖',
+  trash:'🗑️',
+  recycle:'♻️',
+  arrow_up:'⬆️',arrow_down:'⬇️',arrow_left:'⬅️',arrow_right:'➡️',
+  wave_hand:'👋',
+  thumbs_up:'👍',
+  thumbs_down:'👎',
+  muscle:'💪',
+  point_up:'☝️',
+  pray_hands:'🙏',
+  raised_hands:'🙌',
+  handshake:'🤝',
+  fist:'✊',
+  punch:'👊',
+  victory:'✌️',
+  peace:'✌️',
+  metal:'🤘',
+  call_me:'🤙',
+  cross_fingers:'🤞',
+};
+
+function applyEmojis(escaped) {
+  return escaped.replace(/:([a-zA-Z0-9_+\-]{1,32}):/g, (full, name) => {
+    const key = name.toLowerCase();
+    return EMOJI_MAP[key] || full;
+  });
+}
+function applyFormatting(s) {
+  // Code — protect content from other rules
+  s = s.replace(/`([^`\n]+)`/g, (m, c) => '<code>'+c+'</code>');
+  // Bold **text**
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  // Italic *text* (not inside **)
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+  // Underline __text__
+  s = s.replace(/__([^_\n]+)__/g, '<u>$1</u>');
+  // Strikethrough ~~text~~
+  s = s.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
+  return s;
+}
+function renderRichText(text, channelId) {
+  let s = escapeHtml(text);
+  s = applyFormatting(s);
+  s = applyEmojis(s);
+  const members = memberSetByChannel[channelId];
+  if (members && members.size) {
+    s = s.replace(/@([^\s@:<>"'&]{2,32})/gu, (full, name) => {
+      if (members.has(name.toLowerCase())) {
+        return '<span class="mention">@'+name+'</span>';
+      }
+      return full;
+    });
+  }
+  return s;
+}
+
 function updateAppVH() {
   const h = (window.visualViewport && window.visualViewport.height) || window.innerHeight;
   document.documentElement.style.setProperty('--app-vh', h + 'px');
@@ -1443,7 +1691,7 @@ let channels = [];
 let activeId = null;
 let ws = null;
 let wsChannelId = null;
-let channelKeys = {};          // channelId -> CryptoKey
+let channelKeys = {};
 let onlineUsers = [];
 let uptimeBase = 0, uptimeFetchAt = 0;
 let showInListPref = true;
@@ -1463,7 +1711,39 @@ const t = (key, vars) => {
   return s;
 };
 
-// Turnstile
+function setState(st) {
+  document.documentElement.setAttribute('data-state', st);
+  if (st === 'login') updateAppVH();
+}
+
+// ---------- Cache ----------
+function saveCache() {
+  try {
+    const data = {
+      ts: Date.now(),
+      username: currentUser,
+      channels: channels.map(c => ({
+        id: c.id, name: c.name, private: c.private, enc_key: c.enc_key,
+      })),
+    };
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+  } catch(e) {}
+}
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.channels)) return null;
+    if (data.ts && Date.now() - data.ts > 7*24*3600*1000) return null;
+    return data;
+  } catch(e) { return null; }
+}
+function clearCache() {
+  try { localStorage.removeItem(CACHE_KEY); } catch(e){}
+}
+
+// ---------- Turnstile ----------
 function onTurnstileLoaded() { renderTurnstile(); }
 window.onTurnstileLoaded = onTurnstileLoaded;
 function renderTurnstile() {
@@ -1491,7 +1771,7 @@ function resetTurnstile() {
   try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
 }
 
-// ---------- Real E2EE: server-side 256-bit random key per channel ----------
+// ---------- Real E2EE ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 function hexToBytes(hex) {
@@ -1555,7 +1835,7 @@ setInterval(renderUptime, 1000); refreshUptime(); setInterval(refreshUptime, 300
 
 function applyTheme() {
   document.body.classList.toggle('dark', currentTheme === 'dark');
-  $('themeIcon').innerHTML = currentTheme === 'dark' ? SVG.sun : SVG.moon;
+  const ti = $('themeIcon'); if (ti) ti.innerHTML = currentTheme === 'dark' ? SVG.sun : SVG.moon;
   localStorage.setItem('theme', currentTheme);
   const tv = $('settingsThemeVal'); if (tv) tv.textContent = currentTheme === 'dark' ? t('settings_theme_dark') : t('settings_theme_light');
   const tt = $('settingsThemeToggle'); if (tt) tt.textContent = currentTheme === 'dark' ? t('settings_theme_light') : t('settings_theme_dark');
@@ -1564,6 +1844,7 @@ function toggleTheme() { currentTheme = currentTheme === 'dark' ? 'light' : 'dar
 
 function applyLanguage() {
   localStorage.setItem('lang', currentLang);
+  $('bootText').textContent = t('booting');
   $('loginTitle').textContent = t('login_title');
   $('loginSubtitle').textContent = t('login_subtitle');
   $('lblNick').textContent = t('field_nick');
@@ -1591,7 +1872,6 @@ function applyLanguage() {
   $('settingsTitle').textContent = t('settings_title');
   $('tabAccount').textContent = t('settings_account');
   $('tabAppearance').textContent = t('settings_appearance');
-  $('tabUsers').textContent = t('settings_users');
   $('settingsAccountHead').textContent = t('settings_account');
   $('settingsUserLabel').textContent = t('settings_user');
   $('settingsLogoutBtn').textContent = t('settings_logout');
@@ -1599,17 +1879,17 @@ function applyLanguage() {
   $('settingsThemeLabel').textContent = t('settings_theme');
   $('settingsLangLabel').textContent = t('settings_lang');
   $('showInListLabel').textContent = t('settings_show_in_list');
-  $('settingsUsersHead').textContent = t('settings_users');
   $('mobileChannelsLbl').textContent = t('mobile_channels');
   $('mcpTitle').textContent = t('mobile_channels');
   $('mcpCreateBtn').textContent = t('modal_create_title');
   $('mcpConnectBtn').textContent = t('modal_connect_title');
+  $('membersTitle').textContent = t('members_title');
   $('langFlag').innerHTML = FLAGS[currentLang] || '';
   $('langCode').textContent = currentLang.toUpperCase();
   applyTheme();
   buildLangMenu(); buildSettingsLangGrid();
   renderTabs(); renderHeader(); renderMessages(); updateMuteUI();
-  renderUsersList(); renderMobileChannelList();
+  renderMobileChannelList(); renderMembersSidebar();
 }
 
 function buildLangMenu() {
@@ -1685,7 +1965,8 @@ async function doAuth() {
       localStorage.removeItem('auth_token');
     }
     $('loginName').value = ''; $('loginPass').value = '';
-    resetTurnstile(); enterApp();
+    resetTurnstile();
+    enterApp();
   } catch (e) {
     let msg;
     if (e.detail === 'turnstile_failed') msg = t('err_turnstile');
@@ -1707,33 +1988,77 @@ $('loginName').addEventListener('keydown', e => { if (e.key === 'Enter') $('logi
 $('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
 
 function enterApp() {
-  $('loginScreen').style.display = 'none';
-  $('app').style.display = 'flex';
   $('headerUser').textContent = currentUser;
   $('settingsUser').textContent = currentUser;
+  setState('app');
   updateAppVH();
-  loadChannels(); loadMyPrefs();
+  // Load channels fast
+  loadChannels();
+  loadMyPrefs();
 }
 
 async function loadMyPrefs() {
   try {
     const res = await api('/api/me');
     showInListPref = !!res.show_in_list;
+    currentUser = res.username;
+    $('headerUser').textContent = currentUser;
+    $('settingsUser').textContent = currentUser;
     $('showInListToggle').checked = showInListPref;
   } catch (e) {}
 }
 
 async function tryRestoreSession() {
   const saved = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
-  if (!saved) return false;
+  if (!saved) { setState('login'); return false; }
   authToken = saved;
+
+  // Fast-path: render cached UI immediately
+  const cached = loadCache();
+  if (cached && cached.username && cached.channels.length) {
+    currentUser = cached.username;
+    channels = cached.channels.map(c => ({ ...c, messages: [] }));
+    for (const ch of channels) {
+      if (ch.enc_key) { try { await importChannelKey(ch.id, ch.enc_key); } catch(e){} }
+    }
+    activeId = channels[0] ? channels[0].id : null;
+    $('headerUser').textContent = currentUser;
+    $('settingsUser').textContent = currentUser;
+    setState('app');
+    updateAppVH();
+    renderAll();
+    // Then verify in background
+    try {
+      const me = await api('/api/me');
+      currentUser = me.username;
+      showInListPref = !!me.show_in_list;
+      $('headerUser').textContent = currentUser;
+      $('settingsUser').textContent = currentUser;
+      $('showInListToggle').checked = showInListPref;
+      loadChannels();  // fresh fetch, will replace
+      return true;
+    } catch(e) {
+      // Token invalid
+      localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
+      clearCache(); authToken = null; currentUser = null; channels = [];
+      setState('login');
+      return false;
+    }
+  }
+
+  // No cache — verify first
   try {
-    const res = await api('/api/me');
-    currentUser = res.username;
-    enterApp(); return true;
+    const me = await api('/api/me');
+    currentUser = me.username;
+    showInListPref = !!me.show_in_list;
+    $('showInListToggle').checked = showInListPref;
+    enterApp();
+    return true;
   } catch(e) {
     localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
-    authToken = null; return false;
+    authToken = null;
+    setState('login');
+    return false;
   }
 }
 
@@ -1746,8 +2071,6 @@ function openSettingsModal() {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
   $('showInListToggle').checked = showInListPref;
-  const activeTab = document.querySelector('.settings-tab.active');
-  if (activeTab && activeTab.dataset.tab === 'users') loadUsersList();
 }
 $('settingsBtn').addEventListener('click', openSettingsModal);
 $('mobileSettingsBtn').addEventListener('click', openSettingsModal);
@@ -1756,7 +2079,6 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
     const target = tab.dataset.tab;
     document.querySelectorAll('.settings-tab').forEach(x => x.classList.toggle('active', x === tab));
     document.querySelectorAll('.settings-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === target));
-    if (target === 'users') loadUsersList();
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
@@ -1772,44 +2094,60 @@ $('settingsLogoutBtn').addEventListener('click', async () => {
   channelMembers = {}; memberSetByChannel = {};
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
+  clearCache();
   $('settingsBackdrop').classList.remove('open');
-  closeMobileChannels();
-  $('app').style.display = 'none';
-  $('loginScreen').style.display = 'flex';
+  closeMobileChannels(); closeMembersSidebar();
+  setState('login');
   closeLangMenu(); updateAppVH(); resetTurnstile();
 });
 
-let usersListCache = [];
-async function loadUsersList() {
-  const box = $('usersList'); if (!box) return;
-  if (!authToken) { box.innerHTML = '<div class="users-empty">'+t('users_list_empty')+'</div>'; return; }
-  box.innerHTML = '<div class="users-empty">…</div>';
-  try {
-    const res = await api('/api/users');
-    usersListCache = res.users || [];
-    renderUsersList();
-  } catch (e) {
-    if (e.status === 401) { box.innerHTML = '<div class="users-empty">'+t('users_list_empty')+'</div>'; return; }
-    box.innerHTML = '<div class="users-empty">'+t('err_generic')+'</div>';
-  }
+// ---------- Members sidebar ----------
+function openMembersSidebar() {
+  $('chatMembers').classList.add('open');
+  $('membersBackdrop').classList.add('open');
 }
-function renderUsersList() {
-  const box = $('usersList'); if (!box) return;
-  if (!usersListCache.length) { box.innerHTML = '<div class="users-empty">'+t('users_list_empty')+'</div>'; return; }
+function closeMembersSidebar() {
+  $('chatMembers').classList.remove('open');
+  $('membersBackdrop').classList.remove('open');
+}
+$('membersToggleBtn').addEventListener('click', openMembersSidebar);
+$('membersBackdrop').addEventListener('click', closeMembersSidebar);
+
+function renderMembersSidebar() {
+  const box = $('membersList'); if (!box) return;
+  const ch = channels.find(c => c.id === activeId);
+  if (!ch) { box.innerHTML = '<div class="members-empty">—</div>'; $('membersCount').textContent = '0'; return; }
+  const members = channelMembers[activeId] || [];
+  const onlineSet = new Set((onlineUsers||[]).map(u => String(u).toLowerCase()));
+  $('membersCount').textContent = String(members.length);
+
+  if (!members.length) {
+    box.innerHTML = '<div class="members-empty">—</div>';
+    return;
+  }
+  const sorted = [...members].sort((a, b) => {
+    const ao = onlineSet.has(a.username.toLowerCase());
+    const bo = onlineSet.has(b.username.toLowerCase());
+    if (ao !== bo) return ao ? -1 : 1;
+    return a.username.localeCompare(b.username);
+  });
   box.innerHTML = '';
-  usersListCache.forEach(u => {
-    const color = colorForUser(u.username);
+  sorted.forEach(m => {
+    const isOnline = onlineSet.has(m.username.toLowerCase());
+    const color = colorForUser(m.username);
+    const isSelf = m.username === currentUser;
     const row = document.createElement('div');
-    row.className = 'user-list-item' + (u.self ? ' self' : '');
+    row.className = 'member-item' + (isSelf ? ' self' : '');
     row.innerHTML =
-      '<span class="user-dot'+(u.online?' online':'')+'" style="background:'+(u.online?'#4caf50':color)+';"></span>' +
-      '<span class="user-name" style="color:'+color+';">'+escapeHtml(u.username)+
-        (u.self ? '<span class="user-you"> '+t('users_you')+'</span>' : '')+
+      '<span class="member-dot'+(isOnline?' online':'')+'" style="background:'+(isOnline?'#4caf50':'#bbb')+';"></span>' +
+      '<span class="member-name" style="color:'+color+';">'+escapeHtml(m.username)+
+        (isSelf ? '<span class="member-you"> '+t('users_you')+'</span>' : '')+
       '</span>';
     box.appendChild(row);
   });
 }
 
+// ---------- Mobile channels ----------
 function openMobileChannels() {
   renderMobileChannelList();
   $('mobileChannelsBackdrop').classList.add('open');
@@ -1837,15 +2175,11 @@ function renderMobileChannelList() {
     const n = document.createElement('span');
     n.className = 'mcp-name'; n.textContent = ch.name;
     item.appendChild(n);
-    // Leave button
     const cl = document.createElement('span');
     cl.className = 'mcp-close-btn';
     cl.title = t('leave_channel');
     cl.innerHTML = SVG.x;
-    cl.addEventListener('click', (e) => {
-      e.stopPropagation();
-      leaveChannel(ch.id);
-    });
+    cl.addEventListener('click', (e) => { e.stopPropagation(); leaveChannel(ch.id); });
     item.appendChild(cl);
     item.addEventListener('click', (e) => {
       if (e.target.closest && e.target.closest('.mcp-close-btn')) return;
@@ -1870,33 +2204,38 @@ async function leaveChannel(id) {
   }
   renderAll();
   renderMobileChannelList();
+  saveCache();
 }
 
 $('mobileChannelsBtn').addEventListener('click', openMobileChannels);
 $('mcpClose').addEventListener('click', closeMobileChannels);
 $('mobileChannelsBackdrop').addEventListener('click', closeMobileChannels);
-$('mcpCreateBtn').addEventListener('click', () => {
-  closeMobileChannels(); setTimeout(() => $('addTabBtn').click(), 60);
-});
-$('mcpConnectBtn').addEventListener('click', () => {
-  closeMobileChannels(); setTimeout(() => $('connectBtn').click(), 60);
-});
+$('mcpCreateBtn').addEventListener('click', () => { closeMobileChannels(); setTimeout(() => $('addTabBtn').click(), 60); });
+$('mcpConnectBtn').addEventListener('click', () => { closeMobileChannels(); setTimeout(() => $('connectBtn').click(), 60); });
 
 async function loadChannels() {
   try {
     const res = await api('/api/channels');
-    channels = res.channels || [];
-    // import keys
-    for (const ch of channels) {
-      if (ch.enc_key) {
-        try { await importChannelKey(ch.id, ch.enc_key); } catch (e) {}
-      }
+    const fresh = res.channels || [];
+    // Import keys
+    for (const ch of fresh) {
+      if (ch.enc_key) { try { await importChannelKey(ch.id, ch.enc_key); } catch(e){} }
     }
+    channels = fresh;
     if (activeId && !channels.find(c => c.id === activeId)) activeId = null;
     if (!activeId && channels.length) activeId = channels[0].id;
     renderAll();
     if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
-  } catch(e) { if (e.status === 401) $('settingsLogoutBtn').click(); }
+    saveCache();
+  } catch(e) {
+    if (e.status === 401) {
+      // Token invalid — logout
+      authToken = null; currentUser = null; channels = [];
+      clearCache();
+      localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
+      setState('login');
+    }
+  }
 }
 
 async function loadChannelMembers(channelId) {
@@ -1906,7 +2245,10 @@ async function loadChannelMembers(channelId) {
     const s = new Set();
     (res.members || []).forEach(m => s.add(String(m.username).toLowerCase()));
     memberSetByChannel[channelId] = s;
-    renderMessages();
+    if (activeId === channelId) {
+      renderMessages();
+      renderMembersSidebar();
+    }
   } catch (e) {
     channelMembers[channelId] = [];
     memberSetByChannel[channelId] = new Set();
@@ -1969,18 +2311,6 @@ function renderHeader() {
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
 let mutes = {};
 
-function renderMentions(text, channelId) {
-  const members = memberSetByChannel[channelId];
-  const esc = escapeHtml(text);
-  if (!members || !members.size) return esc;
-  return esc.replace(/@([^\s@:<>"'&]{2,32})/gu, (full, name) => {
-    if (members.has(name.toLowerCase())) {
-      return '<span class="mention">@'+name+'</span>';
-    }
-    return full;
-  });
-}
-
 function buildMsgRow(m, prevAuthor, prevTime) {
   const row = document.createElement('div');
   row.className = 'msg-row';
@@ -2004,7 +2334,7 @@ function buildMsgRow(m, prevAuthor, prevTime) {
   contentEl.appendChild(textEl); contentEl.appendChild(timeEl);
 
   row.appendChild(authEl); row.appendChild(contentEl);
-  row.setAttribute('data-ct', m.ct);
+  row.setAttribute('data-ct', m.ct || '');
   return { el: row, textEl };
 }
 
@@ -2024,7 +2354,7 @@ function renderMessages() {
     const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
     if (!ct) return;
-    decryptText(chId, ct).then(pt => { span.innerHTML = renderMentions(pt, chId); });
+    decryptText(chId, ct).then(pt => { span.innerHTML = renderRichText(pt, chId); });
   });
   feed.scrollTop = feed.scrollHeight;
 }
@@ -2040,10 +2370,9 @@ function appendMessageUI(msg, channelId) {
     }
   }
   if (existing) {
-    // Update content (optimistic already showed this)
     const span = existing.querySelector('.msg-text');
     if (span && msg.ct) {
-      decryptText(channelId, msg.ct).then(pt => { span.innerHTML = renderMentions(pt, channelId); });
+      decryptText(channelId, msg.ct).then(pt => { span.innerHTML = renderRichText(pt, channelId); });
       existing.setAttribute('data-ct', msg.ct);
     }
     return;
@@ -2056,7 +2385,7 @@ function appendMessageUI(msg, channelId) {
   const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
   feed.appendChild(el);
   if (msg.ct) {
-    decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderMentions(pt, channelId); });
+    decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderRichText(pt, channelId); });
   } else {
     textEl.textContent = '[sending...]';
   }
@@ -2091,7 +2420,11 @@ function openChannelWS(channelId) {
   ws.onmessage = ev => {
     let data; try { data = JSON.parse(ev.data); } catch(e){ return; }
     if (data.type === 'message' && data.msg) { appendMessageUI(data.msg, channelId); renderHeader(); }
-    else if (data.type === 'presence') { onlineUsers = data.users || []; renderHeader(); }
+    else if (data.type === 'presence') {
+      onlineUsers = data.users || [];
+      renderHeader();
+      renderMembersSidebar();
+    }
     else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's'); }
     else if (data.type === 'error' && data.error === 'auth') { $('settingsLogoutBtn').click(); }
   };
@@ -2212,6 +2545,7 @@ document.addEventListener('keydown', e => {
   ['createBackdrop','connectBackdrop','settingsBackdrop'].forEach(id => $(id).classList.remove('open'));
   if ($('langMenu').classList.contains('open')) closeLangMenu();
   if ($('mobileChannelsPanel').classList.contains('open')) closeMobileChannels();
+  if ($('chatMembers').classList.contains('open')) closeMembersSidebar();
   hideMentionPop();
 });
 
@@ -2226,10 +2560,11 @@ $('createChannelBtn').addEventListener('click', async () => {
   try {
     const res = await api('/api/channels', 'POST', { name });
     if (res.enc_key) await importChannelKey(res.id, res.enc_key);
-    channels.push({ id: res.id, name: res.name, private: true, messages: [] });
+    channels.push({ id: res.id, name: res.name, private: true, enc_key: res.enc_key, messages: [] });
     activeId = res.id;
     $('createBackdrop').classList.remove('open');
     renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
+    saveCache();
   } catch(e) { showLoginError(e.status === 409 ? 'name_taken' : t('err_generic')); }
 });
 $('newChannelName').addEventListener('keydown', e => { if (e.key === 'Enter') $('createChannelBtn').click(); });
@@ -2247,13 +2582,14 @@ $('connectChannelBtn').addEventListener('click', async () => {
     const res = await api('/api/channels/connect', 'POST', { name });
     if (res.enc_key) await importChannelKey(res.id, res.enc_key);
     if (!channels.find(c => c.id === res.id)) {
-      channels.push({ id: res.id, name: res.name, private: res.private, messages: res.messages || [] });
+      channels.push({ id: res.id, name: res.name, private: res.private, enc_key: res.enc_key, messages: res.messages || [] });
     } else {
       const c = channels.find(c => c.id === res.id); c.messages = res.messages || [];
     }
     activeId = res.id;
     $('connectBackdrop').classList.remove('open');
     renderAll(); openChannelWS(activeId); loadChannelMembers(activeId);
+    saveCache();
   } catch(e) {
     $('connectErrorText').textContent = e.status === 404 ? t('connect_not_found', {name}) : t('err_generic');
     $('connectError').classList.add('show');
@@ -2275,7 +2611,8 @@ document.addEventListener('keydown', e => {
   if (document.querySelector('.my-modal-backdrop.open')) return;
   if ($('langMenu').classList.contains('open')) return;
   if ($('mobileChannelsPanel').classList.contains('open')) return;
-  if ($('loginScreen').style.display !== 'none') return;
+  if ($('chatMembers').classList.contains('open')) return;
+  if (document.documentElement.getAttribute('data-state') !== 'app') return;
   if (mentionState.open) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
@@ -2297,7 +2634,14 @@ feedEl.addEventListener('touchend', e => {
   if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5) switchChannel(dx < 0 ? 1 : -1);
 }, {passive: true});
 
-function renderAll() { renderTabs(); renderHeader(); renderMessages(); updateMuteUI(); scrollActiveTabIntoView(); }
+function renderAll() {
+  renderTabs();
+  renderHeader();
+  renderMessages();
+  updateMuteUI();
+  scrollActiveTabIntoView();
+  renderMembersSidebar();
+}
 
 applyLanguage();
 renderUptime();
