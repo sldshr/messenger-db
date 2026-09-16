@@ -173,7 +173,7 @@ def rate_check(key: str, window: float, limit: int) -> bool:
     if len(lst) >= limit: return False
     lst.append(now); return True
 
-# ---------------- Turnstile ----------------
+# ---------------- Turnstile (server) ----------------
 def _verify_turnstile_sync(token: str, remote_ip: str) -> dict:
     try:
         body = urllib.parse.urlencode({
@@ -596,7 +596,8 @@ I18N = {
    "leave_channel":"Leave channel","members_title":"Members","members_online":"online",
    "msg_menu_mention":"Mention","msg_menu_copy":"Copy text","msg_copied":"Copied to clipboard","msg_copy_failed":"Copy failed",
    "ext_link_title":"External link","ext_link_warning":"This link is not affiliated with us. Open at your own risk.",
-   "ext_link_continue":"Continue","ext_link_back":"Back to app"
+   "ext_link_continue":"Continue","ext_link_back":"Back to app",
+   "turnstile_error":"Security check error. Please refresh the page and try again."
  },
  "ru": {
    "login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт",
@@ -621,7 +622,8 @@ I18N = {
    "leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн",
    "msg_menu_mention":"Упомянуть","msg_menu_copy":"Скопировать текст","msg_copied":"Скопировано","msg_copy_failed":"Не удалось скопировать",
    "ext_link_title":"Внешняя ссылка","ext_link_warning":"Выбранная ссылка не как не связана с нами. Открывайте на свой страх и риск.",
-   "ext_link_continue":"Продолжить","ext_link_back":"Вернуться в приложение"
+   "ext_link_continue":"Продолжить","ext_link_back":"Вернуться в приложение",
+   "turnstile_error":"Ошибка проверки безопасности. Обновите страницу и попробуйте снова."
  },
 }
 for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
@@ -748,6 +750,8 @@ html[data-state="app"]   .app          { display: flex !important; }
   display: flex; align-items: center; justify-content: center; overflow: visible;
   position: relative; box-sizing: border-box; }
 #turnstileWidget > div, #turnstileWidget iframe { margin: 0 auto !important; }
+.turnstile-error { color: #a94442; font-size: 11px; margin-top: 4px; display: none; }
+.turnstile-error.show { display: block; }
 .login-settings { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e0e5eb;
   display: flex; gap: 6px; }
 .settings-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center;
@@ -1256,6 +1260,7 @@ body.dark .mcp-empty { color: #666; }
       <span id="rememberLbl"></span>
     </label>
     <div id="turnstileWidget"></div>
+    <div class="turnstile-error" id="turnstileError"></div>
     <button class="btn primary" id="loginBtn" type="button"></button>
     <div class="login-error" id="loginError"><span id="loginErrorText"></span></div>
     <div class="login-settings">
@@ -1562,12 +1567,11 @@ function uuid() {
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// ============ EMOJI ============
+// EMOJI
 const EMOJI_MAP = {
   like:'👍','+1':'👍',thumbsup:'👍',good:'👍',
   dislike:'👎','-1':'👎',thumbsdown:'👎',bad:'👎',
-  heart:'❤️',love:'❤️',
-  smile:'😊',happy:'😊',blush:'😊',
+  heart:'❤️',love:'❤️',smile:'😊',happy:'😊',blush:'😊',
   laugh:'😂',lol:'😂',joy:'😂',haha:'😂',
   cry:'😢',sad:'😢',angry:'😠',mad:'😠',rage:'😡',wink:'😉',
   think:'🤔',thinking:'🤔',ok:'👌',ok_hand:'👌',
@@ -1655,7 +1659,6 @@ function renderRichText(text, channelId) {
   return s;
 }
 
-// Decrypted text cache for context menu
 const decryptedCache = {};
 
 function textMentionsMe(text) {
@@ -1691,6 +1694,8 @@ let channelKeys = {};
 let onlineUsers = [];
 let uptimeBase = 0, uptimeFetchAt = 0;
 let turnstileWidgetId = null;
+let turnstileRendered = false;
+let turnstileError = false;
 let authInFlight = false;
 let channelMembers = {};
 let memberSetByChannel = {};
@@ -1734,21 +1739,57 @@ function loadCache() {
 }
 function clearCache() { try { localStorage.removeItem(CACHE_KEY); } catch(e){} }
 
-// Turnstile
-function onTurnstileLoaded() { renderTurnstile(); }
+// Turnstile — robust initialization
+function onTurnstileLoaded() {
+  window.__err && window.__err('Turnstile loaded');
+  tryRenderTurnstile();
+}
 window.onTurnstileLoaded = onTurnstileLoaded;
-function renderTurnstile() {
+
+function tryRenderTurnstile() {
+  if (turnstileRendered) return;
   if (!window.turnstile) return;
-  const el = $('turnstileWidget'); if (!el) return;
-  if (turnstileWidgetId !== null) { try { window.turnstile.remove(turnstileWidgetId); } catch (e) {} turnstileWidgetId = null; }
-  el.innerHTML = '';
+  if (document.readyState === 'loading') return;
+  const el = $('turnstileWidget');
+  if (!el) return;
+  // If login screen is not visible, still allow render but not required
   try {
     turnstileWidgetId = window.turnstile.render(el, {
       sitekey: TURNSTILE_SITEKEY,
       theme: currentTheme === 'dark' ? 'dark' : 'light',
       size: 'normal',
+      callback: function(token) {
+        window.__err && window.__err('Turnstile callback OK');
+        hideTurnstileError();
+      },
+      'error-callback': function(code) {
+        window.__err && window.__err('Turnstile error callback', code);
+        if (code === '600010' || code === 600010) {
+          showTurnstileError();
+        }
+      },
+      'expired-callback': function() {
+        window.__err && window.__err('Turnstile expired');
+      }
     });
-  } catch (e) { window.__err && window.__err('Turnstile render error', e); }
+    turnstileRendered = true;
+    window.__err && window.__err('Turnstile rendered, id=' + turnstileWidgetId);
+  } catch (e) {
+    window.__err && window.__err('Turnstile render error', e);
+  }
+}
+
+function showTurnstileError() {
+  turnstileError = true;
+  const el = $('turnstileError');
+  if (!el) return;
+  el.textContent = t('turnstile_error');
+  el.classList.add('show');
+}
+function hideTurnstileError() {
+  turnstileError = false;
+  const el = $('turnstileError');
+  if (el) el.classList.remove('show');
 }
 function getTurnstileToken() {
   if (!window.turnstile || turnstileWidgetId === null) return '';
@@ -1758,6 +1799,21 @@ function resetTurnstile() {
   if (!window.turnstile || turnstileWidgetId === null) return;
   try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
 }
+
+// DOM ready — attempt render
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', tryRenderTurnstile);
+} else {
+  tryRenderTurnstile();
+}
+// Also retry periodically in case script loads slowly
+let __tstRetries = 0;
+setInterval(() => {
+  if (turnstileRendered) return;
+  __tstRetries++;
+  if (__tstRetries > 40) return;
+  tryRenderTurnstile();
+}, 500);
 
 // Crypto
 const enc = new TextEncoder();
@@ -1870,7 +1926,6 @@ function applyLanguage() {
   $('mcpCreateBtn').textContent = t('modal_create_title');
   $('mcpConnectBtn').textContent = t('modal_connect_title');
   $('membersTitle').textContent = t('members_title');
-  // Ext link modal
   $('extLinkTitle').textContent = t('ext_link_title');
   $('extLinkWarning').textContent = t('ext_link_warning');
   $('extLinkBack').textContent = t('ext_link_back');
@@ -1936,8 +1991,18 @@ async function doAuth() {
   if (username.length < 2) { showLoginError(t('err_bad_username')); return; }
   if (/[\s@:<>"'&]/.test(username)) { showLoginError(t('err_bad_username')); return; }
   if (password.length < 4) { showLoginError(t('err_bad_password')); return; }
+
   const tsToken = getTurnstileToken();
-  if (!tsToken) { showLoginError(t('err_turnstile')); return; }
+  if (!tsToken) {
+    if (turnstileError) {
+      showLoginError(t('turnstile_error'));
+      // Attempt a reset
+      resetTurnstile();
+    } else {
+      showLoginError(t('err_turnstile'));
+    }
+    return;
+  }
 
   authInFlight = true;
   setAuthBtnLoading(true);
@@ -1964,7 +2029,10 @@ async function doAuth() {
     else if (e.detail === 'too_many_attempts' || e.status === 429) msg = t('err_rate_limited');
     else if (e.status === 401) msg = t('err_bad_credentials');
     else msg = t('err_generic');
-    showLoginError(msg); resetTurnstile();
+    showLoginError(msg);
+    resetTurnstile();
+    // try to re-render turnstile if it errored
+    if (turnstileError) tryRenderTurnstile();
   } finally {
     authInFlight = false;
     setAuthBtnLoading(false);
@@ -2053,7 +2121,7 @@ $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
   authToken = null; currentUser = null;
   channels = []; activeId = null; channelKeys = {};
-  channelMembers = {}; memberSetByChannel = {}; decryptedCache && Object.keys(decryptedCache).forEach(k => delete decryptedCache[k]);
+  channelMembers = {}; memberSetByChannel = {}; Object.keys(decryptedCache).forEach(k => delete decryptedCache[k]);
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
   clearCache();
@@ -2392,14 +2460,12 @@ function sendMessage() {
     appendMessageUI(optimistic, chId);
     ws.send(JSON.stringify({ type:'message', id: mid, ciphertext: ct }));
     input.value = ''; autoResize(); hideMentionPop();
-    // Keep focus on input
     try { input.focus(); } catch(e) {}
   });
 }
 $('sendBtn').addEventListener('click', sendMessage);
-// Prevent send button from stealing focus from textarea
 $('sendBtn').addEventListener('mousedown', e => e.preventDefault());
-$('sendBtn').addEventListener('touchstart', e => { /* keep focus */ }, {passive: true});
+$('sendBtn').addEventListener('touchstart', e => {}, {passive: true});
 
 $('msgInput').addEventListener('keydown', e => {
   if (mentionState.open) {
@@ -2481,14 +2547,13 @@ function pickMention(idx) {
   hideMentionPop(); autoResize(); ta.focus();
 }
 
-// ============ Message context menu ============
+// Message context menu
 function showMsgMenu(rowEl, x, y) {
   hideMsgMenu();
   const msgId = rowEl.dataset.id;
   const author = rowEl.dataset.author || (rowEl.querySelector('.msg-author') ? rowEl.querySelector('.msg-author').textContent.trim() : '');
   const text = decryptedCache[msgId] || '';
 
-  // Backdrop
   const back = document.createElement('div');
   back.className = 'msg-menu-backdrop';
   back.addEventListener('mousedown', hideMsgMenu);
@@ -2499,7 +2564,6 @@ function showMsgMenu(rowEl, x, y) {
   const menu = document.createElement('div');
   menu.className = 'msg-menu';
 
-  // Clamp position
   const mw = 220, mh = 110;
   let mx = Math.min(x, window.innerWidth - mw - 8);
   let my = Math.min(y, window.innerHeight - mh - 8);
@@ -2507,7 +2571,6 @@ function showMsgMenu(rowEl, x, y) {
   menu.style.left = mx + 'px';
   menu.style.top = my + 'px';
 
-  // Mention item
   const mentionItem = document.createElement('div');
   mentionItem.className = 'msg-menu-item';
   mentionItem.innerHTML = SVG.at + '<span>' + escapeHtml(t('msg_menu_mention') + ' @' + author) + '</span>';
@@ -2521,7 +2584,6 @@ function showMsgMenu(rowEl, x, y) {
   });
   menu.appendChild(mentionItem);
 
-  // Copy item
   const copyItem = document.createElement('div');
   copyItem.className = 'msg-menu-item';
   copyItem.innerHTML = SVG.copy + '<span>' + escapeHtml(t('msg_menu_copy')) + '</span>';
@@ -2554,7 +2616,6 @@ function hideMsgMenu() {
   }
 }
 
-// Right-click
 document.addEventListener('contextmenu', e => {
   const row = e.target.closest && e.target.closest('.msg-row[data-id]');
   if (row && !row.classList.contains('msg-system')) {
@@ -2565,7 +2626,6 @@ document.addEventListener('contextmenu', e => {
   e.preventDefault();
 });
 
-// Long-press
 (function() {
   let timer = null, sx = 0, sy = 0, fired = false;
   document.addEventListener('touchstart', e => {
@@ -2589,17 +2649,14 @@ document.addEventListener('contextmenu', e => {
   }, {passive: true});
   document.addEventListener('touchend', e => {
     if (timer) { clearTimeout(timer); timer = null; }
-    if (fired) {
-      e.preventDefault();
-      fired = false;
-    }
+    if (fired) { e.preventDefault(); fired = false; }
   }, {passive: false});
   document.addEventListener('touchcancel', () => {
     if (timer) { clearTimeout(timer); timer = null; }
   }, {passive: true});
 })();
 
-// ============ External link modal ============
+// External link modal
 let pendingExtUrl = null;
 function showExtLinkModal(url) {
   pendingExtUrl = url;
@@ -2614,9 +2671,7 @@ $('extLinkBack').addEventListener('click', closeExtLinkModal);
 $('extLinkGo').addEventListener('click', () => {
   const url = pendingExtUrl;
   closeExtLinkModal();
-  if (url) {
-    try { window.open(url, '_blank', 'noopener,noreferrer'); } catch(e) {}
-  }
+  if (url) { try { window.open(url, '_blank', 'noopener,noreferrer'); } catch(e) {} }
 });
 
 document.addEventListener('click', e => {
@@ -2627,7 +2682,6 @@ document.addEventListener('click', e => {
   if (url) showExtLinkModal(url);
 });
 
-// Modals generic
 document.addEventListener('click', e => {
   const el = e.target.closest && e.target.closest('[data-close-modal]');
   if (!el) return;
@@ -2743,12 +2797,6 @@ renderUptime();
   const ok = await tryRestoreSession();
   if (!ok) {
     setTimeout(() => $('loginName').focus(), 100);
-    let tries = 0;
-    const iv = setInterval(() => {
-      tries++;
-      if (window.turnstile && $('turnstileWidget').children.length === 0) renderTurnstile();
-      if ((window.turnstile && turnstileWidgetId !== null) || tries > 20) clearInterval(iv);
-    }, 300);
   }
 })();
 </script>
