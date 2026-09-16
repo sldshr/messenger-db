@@ -70,6 +70,7 @@ def verify_password(password: str, salt_hex: str, expected: str) -> bool:
 
 def new_token() -> str: return secrets.token_urlsafe(32)
 def new_enc_key() -> str: return secrets.token_hex(32)
+def now_iso() -> str: return datetime.now(timezone.utc).isoformat()
 
 def parse_ts(s: str) -> float:
     if not s: return 0.0
@@ -123,7 +124,7 @@ async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
     if not token: return None
     try:
         rows = await sb_get("tokens", {
-            "select": "expires_at,users(id,username)",
+            "select": "expires_at,users(id,username,show_in_list)",
             "token": f"eq.{token}", "limit": "1",
         })
     except Exception:
@@ -137,7 +138,7 @@ async def get_user_by_token(token: Optional[str]) -> Optional[dict]:
         return None
     u = row.get("users")
     if not u: return None
-    return {"id": u["id"], "username": u["username"]}
+    return {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
 
 async def auth(request: Request) -> dict:
     u = await get_user_by_token(request.headers.get("x-auth-token"))
@@ -173,7 +174,7 @@ def rate_check(key: str, window: float, limit: int) -> bool:
     if len(lst) >= limit: return False
     lst.append(now); return True
 
-# ---------------- Turnstile (server) ----------------
+# ---------------- Turnstile ----------------
 def _verify_turnstile_sync(token: str, remote_ip: str) -> dict:
     try:
         body = urllib.parse.urlencode({
@@ -252,6 +253,9 @@ class ConnectChannelReq(BaseModel):
 class LeaveChannelReq(BaseModel):
     channel_id: str
 
+class PrefsReq(BaseModel):
+    show_in_list: bool
+
 # ---------------- REST ----------------
 @app.post("/api/auth")
 async def auth_endpoint(req: AuthReq, request: Request):
@@ -271,7 +275,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
 
     try:
         rows = await sb_get("users", {
-            "select": "id,username,password_hash,salt",
+            "select": "id,username,password_hash,salt,show_in_list",
             "username": f"ilike.{username}", "limit": "1",
         })
     except Exception as e:
@@ -282,7 +286,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         u = rows[0]
         if not verify_password(req.password, u["salt"], u["password_hash"]):
             raise HTTPException(401, "bad_credentials")
-        user = {"id": u["id"], "username": u["username"]}
+        user = {"id": u["id"], "username": u["username"], "show_in_list": u.get("show_in_list", True)}
         is_new = False
         log(f"AUTH login {user['username']}")
     else:
@@ -300,7 +304,7 @@ async def auth_endpoint(req: AuthReq, request: Request):
         if not created:
             raise HTTPException(503, "db_error")
         row = created[0]
-        user = {"id": row["id"], "username": row["username"]}
+        user = {"id": row["id"], "username": row["username"], "show_in_list": True}
         is_new = True
         log(f"AUTH register {user['username']}")
 
@@ -330,7 +334,15 @@ async def uptime():
 @app.get("/api/me")
 async def me(request: Request):
     u = await auth(request)
-    return {"username": u["username"]}
+    return {"username": u["username"], "show_in_list": u["show_in_list"]}
+
+@app.post("/api/me/preferences")
+async def update_prefs(req: PrefsReq, request: Request):
+    u = await auth(request)
+    c = await _client()
+    await c.patch(f"{SUPABASE_URL}/rest/v1/users", headers=_sb_headers("return=minimal"),
+                  params={"id": f"eq.{u['id']}"}, json={"show_in_list": bool(req.show_in_list)})
+    return {"ok": True, "show_in_list": bool(req.show_in_list)}
 
 def _channel_from_row(ch: dict, msgs: list) -> dict:
     out_msgs = []
@@ -552,7 +564,12 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_json({"type":"muted","seconds":MUTE_SECONDS}); continue
                 times.append(now)
 
-                msg = {"id": mid, "from": user["username"], "ct": ct, "t": now}
+                msg = {
+                    "id": mid,
+                    "from": user["username"],
+                    "ct": ct,
+                    "t": now,
+                }
                 await manager.broadcast(channel_id, {"type":"message","msg":msg})
                 asyncio.create_task(persist_message(mid, channel_id, user["id"], ct))
             elif t == "ping":
@@ -573,58 +590,8 @@ async def ws_endpoint(ws: WebSocket):
 
 # ---------------- i18n ----------------
 I18N = {
- "en": {
-   "login_title":"sldchat","login_subtitle":"Sign in or create an account",
-   "field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password",
-   "btn_login":"Continue","btn_wait":"Please wait...","booting":"Loading...","remember_me":"Remember me",
-   "logged_as":"Signed in as","header_no_channels":"No channels",
-   "header_no_channels_sub":"Open Channels to create or join","header_msgs":"{n} messages",
-   "empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!",
-   "composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s",
-   "modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work",
-   "btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel",
-   "modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect",
-   "connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel",
-   "title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime",
-   "online_label":"online","err_bad_credentials":"Wrong password for this nickname",
-   "err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters",
-   "err_generic":"Error","err_rate_limited":"Too many requests, try later",
-   "err_turnstile":"Security check failed. Complete the checkbox above.","settings_title":"Settings",
-   "settings_account":"Account","settings_appearance":"Appearance","settings_user":"Signed in as",
-   "settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark",
-   "settings_lang":"Language","settings_close":"Close","users_you":"(you)","mobile_channels":"Channels",
-   "leave_channel":"Leave channel","members_title":"Members","members_online":"online",
-   "msg_menu_mention":"Mention","msg_menu_copy":"Copy text","msg_copied":"Copied to clipboard","msg_copy_failed":"Copy failed",
-   "ext_link_title":"External link","ext_link_warning":"This link is not affiliated with us. Open at your own risk.",
-   "ext_link_continue":"Continue","ext_link_back":"Back to app",
-   "turnstile_error":"Security check error. Please refresh the page and try again."
- },
- "ru": {
-   "login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт",
-   "field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль",
-   "btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","booting":"Загрузка...","remember_me":"Запомнить меня",
-   "logged_as":"Вы вошли как","header_no_channels":"Нет каналов",
-   "header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений",
-   "empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!",
-   "composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с",
-   "modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа",
-   "btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу",
-   "modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться",
-   "connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу",
-   "title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм",
-   "online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника",
-   "err_bad_username":"Ник 2–32 символа, без пробелов","err_bad_password":"Пароль минимум 4 символа",
-   "err_generic":"Ошибка","err_rate_limited":"Слишком много запросов",
-   "err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку.","settings_title":"Настройки",
-   "settings_account":"Аккаунт","settings_appearance":"Оформление","settings_user":"Вы вошли как",
-   "settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная",
-   "settings_lang":"Язык","settings_close":"Закрыть","users_you":"(вы)","mobile_channels":"Каналы",
-   "leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн",
-   "msg_menu_mention":"Упомянуть","msg_menu_copy":"Скопировать текст","msg_copied":"Скопировано","msg_copy_failed":"Не удалось скопировать",
-   "ext_link_title":"Внешняя ссылка","ext_link_warning":"Выбранная ссылка не как не связана с нами. Открывайте на свой страх и риск.",
-   "ext_link_continue":"Продолжить","ext_link_back":"Вернуться в приложение",
-   "turnstile_error":"Ошибка проверки безопасности. Обновите страницу и попробуйте снова."
- },
+ "en": {"login_title":"sldchat","login_subtitle":"Sign in or create an account","field_nick":"Nickname","field_password":"Password","ph_nick":"Your nickname","ph_password":"Your password","btn_login":"Continue","btn_wait":"Please wait...","booting":"Loading...","remember_me":"Remember me","logged_as":"Signed in as","header_no_channels":"No channels","header_no_channels_sub":"Open Channels to create or join","header_msgs":"{n} messages","empty_no_channels":"You have no channels yet.","empty_no_messages":"No messages. Be the first to write!","composer_ph":"Write a message...","composer_no_channel":"No active channel","composer_muted":"Muted: {n}s","modal_create_title":"Create private channel","modal_name":"Name","modal_name_ph":"E.g. Work","btn_cancel":"Cancel","btn_create":"Create","modal_connect_title":"Connect to channel","modal_connect_name":"Channel name","modal_connect_ph":"Enter the exact channel name","btn_connect":"Connect","connect_not_found":"Channel «{name}» not found","title_add":"Create channel","title_connect":"Connect to channel","title_settings":"Settings","theme_toggle":"Toggle theme","lang_toggle":"Change language","uptime_label":"Uptime","online_label":"online","err_bad_credentials":"Wrong password for this nickname","err_bad_username":"Nickname must be 2–32 characters, no spaces","err_bad_password":"Password must be at least 4 characters","err_generic":"Error","err_rate_limited":"Too many requests, try later","err_turnstile":"Security check failed. Complete the checkbox above.","settings_title":"Settings","settings_account":"Account","settings_appearance":"Appearance","settings_show_in_list":"Show me in users list","settings_user":"Signed in as","settings_logout":"Sign out","settings_theme":"Theme","settings_theme_light":"Light","settings_theme_dark":"Dark","settings_lang":"Language","settings_close":"Close","users_you":"(you)","mobile_channels":"Channels","leave_channel":"Leave channel","members_title":"Members","members_online":"online"},
+ "ru": {"login_title":"sldchat","login_subtitle":"Войдите или создайте аккаунт","field_nick":"Ник","field_password":"Пароль","ph_nick":"Ваш ник","ph_password":"Ваш пароль","btn_login":"Продолжить","btn_wait":"Пожалуйста подождите...","booting":"Загрузка...","remember_me":"Запомнить меня","logged_as":"Вы вошли как","header_no_channels":"Нет каналов","header_no_channels_sub":"Откройте «Каналы», чтобы создать или вступить","header_msgs":"{n} сообщений","empty_no_channels":"У вас пока нет каналов.","empty_no_messages":"Нет сообщений. Напишите первым!","composer_ph":"Написать сообщение...","composer_no_channel":"Нет активного канала","composer_muted":"Мут: {n} с","modal_create_title":"Создать приватный канал","modal_name":"Название","modal_name_ph":"Например, Работа","btn_cancel":"Отмена","btn_create":"Создать","modal_connect_title":"Подключиться к каналу","modal_connect_name":"Название канала","modal_connect_ph":"Введите точное название канала","btn_connect":"Подключиться","connect_not_found":"Канал «{name}» не найден","title_add":"Создать канал","title_connect":"Подключиться к каналу","title_settings":"Настройки","theme_toggle":"Сменить тему","lang_toggle":"Сменить язык","uptime_label":"Аптайм","online_label":"онлайн","err_bad_credentials":"Неверный пароль для этого ника","err_bad_username":"Ник 2–32 символа, без пробелов","err_bad_password":"Пароль минимум 4 символа","err_generic":"Ошибка","err_rate_limited":"Слишком много запросов","err_turnstile":"Проверка безопасности не пройдена. Отметьте галочку.","settings_title":"Настройки","settings_account":"Аккаунт","settings_appearance":"Оформление","settings_show_in_list":"Показывать в списке пользователей","settings_user":"Вы вошли как","settings_logout":"Выйти из аккаунта","settings_theme":"Тема","settings_theme_light":"Светлая","settings_theme_dark":"Тёмная","settings_lang":"Язык","settings_close":"Закрыть","users_you":"(вы)","mobile_channels":"Каналы","leave_channel":"Покинуть канал","members_title":"Участники","members_online":"онлайн"},
 }
 for _c in ["es","de","fr","it","pt","nl","pl","uk","cs","sv","el","tr","ja","ko","zh","ar","he","hi"]:
     I18N.setdefault(_c, {})
@@ -668,7 +635,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 (function() {
   try {
     var tok = localStorage.getItem('auth_token') || sessionStorage.getItem('auth_token');
-    document.documentElement.setAttribute('data-state', tok ? 'boot' : 'login');
+    if (tok) {
+      document.documentElement.setAttribute('data-state', 'boot');
+    } else {
+      document.documentElement.setAttribute('data-state', 'login');
+    }
   } catch (e) {
     document.documentElement.setAttribute('data-state', 'login');
   }
@@ -690,16 +661,19 @@ button, .channel-tab, .icon-btn-tab, .scroll-arrow, .lang-menu-item, .settings-b
 .settings-tab, .mcp-item, .member-item { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 @media print { body { display: none !important; } }
 
-/* State machine */
+/* ============ STATE MACHINE — no login flicker ============ */
 .boot-screen { position: fixed; inset: 0; background: #e9eef3;
   background-image: linear-gradient(#f5f8fb, #dfe6ee);
   display: none; align-items: center; justify-content: center;
   flex-direction: column; gap: 18px; z-index: 550; }
-.boot-screen .boot-spinner { width: 34px; height: 34px;
+.boot-screen .boot-spinner {
+  width: 34px; height: 34px;
   border: 3px solid #b8c4d0; border-top-color: #0088cc;
-  border-radius: 50%; animation: spin .8s linear infinite; }
+  border-radius: 50%; animation: spin .8s linear infinite;
+}
 .boot-screen .boot-text { font-size: 13px; color: #4a5a6a; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
 html[data-state="boot"]  .login-screen { display: none !important; }
 html[data-state="boot"]  .app          { display: none !important; }
 html[data-state="boot"]  .boot-screen  { display: flex !important; }
@@ -708,6 +682,7 @@ html[data-state="login"] .app          { display: none !important; }
 html[data-state="app"]   .login-screen { display: none !important; }
 html[data-state="app"]   .boot-screen  { display: none !important; }
 html[data-state="app"]   .app          { display: flex !important; }
+
 .spinner { display: inline-block; width: 14px; height: 14px;
   border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
   border-radius: 50%; animation: spin .7s linear infinite;
@@ -750,8 +725,6 @@ html[data-state="app"]   .app          { display: flex !important; }
   display: flex; align-items: center; justify-content: center; overflow: visible;
   position: relative; box-sizing: border-box; }
 #turnstileWidget > div, #turnstileWidget iframe { margin: 0 auto !important; }
-.turnstile-error { color: #a94442; font-size: 11px; margin-top: 4px; display: none; }
-.turnstile-error.show { display: block; }
 .login-settings { margin-top: 10px; padding-top: 10px; border-top: 1px solid #e0e5eb;
   display: flex; gap: 6px; }
 .settings-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center;
@@ -761,6 +734,7 @@ html[data-state="app"]   .app          { display: flex !important; }
   text-shadow: 0 1px 0 rgba(255,255,255,.6); border-radius: 0; }
 .settings-btn:hover { background: #d9d9d9; color: #000; }
 .settings-btn .lang-code { margin-left: 6px; font-size: 11px; font-weight: bold; letter-spacing: .5px; }
+
 .lang-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 9998; display: none; }
 .lang-backdrop.open { display: block; }
 .lang-menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
@@ -783,6 +757,7 @@ html[data-state="app"]   .app          { display: flex !important; }
 /* App */
 .app { width: 100%; height: var(--app-vh, 100vh); background: #fff;
   flex-direction: column; position: relative; overflow: hidden; }
+
 .tabs-bar { display: flex; align-items: center; padding: 6px 8px;
   background: #f5f5f5; background-image: linear-gradient(#ffffff, #ececec);
   border-bottom: 1px solid #ccc; flex-shrink: 0; gap: 4px; }
@@ -812,6 +787,7 @@ html[data-state="app"]   .app          { display: flex !important; }
   align-items: center; justify-content: center; flex-shrink: 0; border-radius: 0; }
 .icon-btn-tab:hover { background: #d9d9d9; color: #000; }
 .top-sep { width: 1px; height: 20px; background: #ccc; margin: 0 4px; flex-shrink: 0; }
+
 .mobile-topbar { display: none; }
 .mobile-channels-backdrop, .mobile-channels-panel { display: none; }
 .members-backdrop { display: none; }
@@ -832,27 +808,47 @@ html[data-state="app"]   .app          { display: flex !important; }
 .empty-state { margin: auto; text-align: center; color: #aaa; font-size: 12px; padding-top: 60px; }
 .empty-state svg { display: block; margin: 0 auto 10px; color: #ccc; }
 
-.chat-members { width: 220px; flex-shrink: 0; background: #f7f8fa;
-  border-left: 1px solid #e0e0e0; display: flex; flex-direction: column; overflow: hidden; }
-.members-head { padding: 10px 14px; border-bottom: 1px solid #e0e0e0;
+/* Members sidebar */
+.chat-members {
+  width: 220px; flex-shrink: 0;
+  background: #f7f8fa;
+  border-left: 1px solid #e0e0e0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.members-head {
+  padding: 10px 14px;
+  border-bottom: 1px solid #e0e0e0;
   font-family: "Courier New", Courier, monospace;
   font-size: 12px; font-weight: bold; color: #2b3d51;
-  display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-.members-count { background: #e9eef3; color: #4a5a6a;
-  font-size: 11px; font-weight: bold; padding: 1px 6px; border-radius: 8px; margin-left: auto; }
+  display: flex; align-items: center; gap: 6px;
+  flex-shrink: 0;
+}
+.members-count {
+  background: #e9eef3; color: #4a5a6a;
+  font-size: 11px; font-weight: bold;
+  padding: 1px 6px; border-radius: 8px;
+  margin-left: auto;
+}
 .members-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 0; }
 .member-item { display: flex; align-items: center; gap: 8px;
-  padding: 6px 14px; font-size: 12.5px; color: #333; cursor: default;
-  transition: background .15s; }
+  padding: 6px 14px; font-size: 12.5px; color: #333;
+  cursor: default; transition: background .15s; }
 .member-item:hover { background: #eef3f8; }
 .member-item.self { background: #eaf4fb; }
-.member-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: #bbb; }
+.member-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: #bbb; }
 .member-dot.online { box-shadow: 0 0 0 2px rgba(76,175,80,.25); }
-.member-name { flex: 1; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
+.member-name {
+  flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+  font-weight: bold;
+}
 .member-you { font-size: 10.5px; color: #999; font-weight: normal; margin-left: 3px; }
-.members-empty { padding: 30px 14px; text-align: center; color: #aaa; font-size: 12px; }
+.members-empty { padding: 30px 14px; text-align: center;
+  color: #aaa; font-size: 12px; }
 
+/* Message grid */
 .msg-row { display: grid; grid-template-columns: minmax(70px, 110px) 1fr;
   column-gap: 10px; padding: 3px 4px; align-items: start;
   font-size: 13px; line-height: 1.5; border-radius: 3px;
@@ -860,21 +856,6 @@ html[data-state="app"]   .app          { display: flex !important; }
 .msg-row:hover { background: #f2f6fa; }
 .msg-row.highlight { background: #fff3a8; }
 .msg-row.grouped { padding-top: 0; }
-.msg-row.mentioned-me {
-  background: #fff3a8;
-  border-left: 3px solid #f5b800;
-  padding-left: 7px;
-  animation: mentionPop 1.6s ease-out;
-}
-@keyframes mentionPop {
-  0%   { background: #ffe49c; box-shadow: 0 0 0 4px rgba(245,184,0,.25); }
-  60%  { background: #fff3a8; box-shadow: 0 0 0 0 rgba(245,184,0,0); }
-  100% { background: #fff3a8; box-shadow: none; }
-}
-body.dark .msg-row.mentioned-me {
-  background: #4d4218; border-left-color: #d4a017;
-}
-body.dark .msg-row.mentioned-me:hover { background: #554a1d; }
 .msg-author { font-weight: bold; white-space: nowrap; overflow: hidden;
   text-overflow: ellipsis; margin-top: 1px; }
 .msg-author.hidden { visibility: hidden; }
@@ -885,14 +866,9 @@ body.dark .msg-row.mentioned-me:hover { background: #554a1d; }
   font-family: "Courier New", monospace; font-size: 12.5px; }
 body.dark .msg-text code { background: #2d2d33; color: #ff9db2; }
 .msg-time { color: #b0b8c0; font-size: 10.5px; margin-left: 6px; white-space: nowrap; }
-.mention { background: #ffe066; color: #7a4a00; font-weight: bold;
-  padding: 0 4px; border-radius: 3px; }
-body.dark .mention { background: #5a4a00; color: #ffe680; }
-a.ext-link { color: #006dcc; text-decoration: underline; cursor: pointer;
-  word-break: break-all; }
-a.ext-link:hover { color: #005a9e; }
-body.dark a.ext-link { color: #6cb6ff; }
-body.dark a.ext-link:hover { color: #8ac9ff; }
+.mention { background: #e1eefb; color: #005a9e; font-weight: bold;
+  padding: 0 3px; border-radius: 3px; }
+body.dark .mention { background: #1c3a5a; color: #8ac0ff; }
 .msg-system { color: #a94442; background: #fcebeb; border: 1px solid #f5c6c6;
   font-size: 11.5px; padding: 4px 8px; margin: 4px 0; display: flex;
   align-items: center; border-radius: 3px; }
@@ -921,26 +897,6 @@ body.dark a.ext-link:hover { color: #8ac9ff; }
 .composer .icon-btn { width: 32px; height: 32px; padding: 0; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center; }
 
-/* Message context menu */
-.msg-menu-backdrop { position: fixed; inset: 0; z-index: 999; }
-.msg-menu { position: fixed; z-index: 1000;
-  background: #fff; border: 1px solid #b8c4d0;
-  box-shadow: 0 4px 16px rgba(0,0,0,.25);
-  min-width: 200px; padding: 4px 0; border-radius: 0; }
-.msg-menu-item { padding: 11px 16px; cursor: pointer;
-  font-size: 13px; color: #333;
-  display: flex; align-items: center; gap: 10px; user-select: none; }
-.msg-menu-item svg { flex-shrink: 0; color: #6c757d; }
-.msg-menu-item:hover { background: #eaf4fb; }
-.msg-menu-item:active { background: #d6e8f7; }
-.msg-menu-item + .msg-menu-item { border-top: 1px solid #eee; }
-body.dark .msg-menu { background: #2d2d30; border-color: #3c3c3c; box-shadow: 0 4px 16px rgba(0,0,0,.6); }
-body.dark .msg-menu-item { color: #ddd; }
-body.dark .msg-menu-item svg { color: #888; }
-body.dark .msg-menu-item:hover { background: #37373d; }
-body.dark .msg-menu-item + .msg-menu-item { border-top-color: #3c3c3c; }
-
-/* My modals */
 .my-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45);
   z-index: 1000; display: none; justify-content: center; align-items: center;
   padding: 20px; box-sizing: border-box; }
@@ -963,22 +919,8 @@ body.dark .msg-menu-item + .msg-menu-item { border-top-color: #3c3c3c; }
   border: 1px solid #f5c6c6; padding: 5px 8px; display: none; }
 .error-msg.show { display: flex; align-items: center; }
 
-/* External link modal */
-.ext-link-warning { display: flex; gap: 10px; align-items: flex-start;
-  padding: 12px; background: #fff7e0; border: 1px solid #f0dc98;
-  border-radius: 4px; margin-bottom: 12px; font-size: 12.5px; color: #7a5a00;
-  line-height: 1.45; }
-.ext-link-warning svg { flex-shrink: 0; margin-top: 1px; color: #b8860b; }
-body.dark .ext-link-warning { background: #3a3118; border-color: #5a4a18; color: #e0c890; }
-body.dark .ext-link-warning svg { color: #d4a017; }
-.ext-link-url { font-family: "Courier New", monospace;
-  font-size: 12px; color: #006dcc; word-break: break-all;
-  padding: 8px 10px; background: #f5f7fa;
-  border: 1px solid #e0e5eb; border-radius: 3px; margin-top: 4px; }
-body.dark .ext-link-url { background: #1e1e1e; border-color: #3c3c3c; color: #6cb6ff; }
-
-#settingsModal { width: 520px; }
-.settings-body { display: flex; min-height: 220px; }
+#settingsModal { width: 560px; }
+.settings-body { display: flex; min-height: 240px; }
 .settings-tabs { width: 160px; background: #f5f5f5; border-right: 1px solid #ddd;
   padding: 8px 0; flex-shrink: 0; }
 .settings-tab { display: block; width: 100%; text-align: left; padding: 9px 14px;
@@ -1001,6 +943,11 @@ body.dark .ext-link-url { background: #1e1e1e; border-color: #3c3c3c; color: #6c
 .settings-lang-grid .lang-menu-item { padding: 5px 7px; }
 .settings-section-title { font-size: 13px; font-weight: bold; color: #222;
   padding-bottom: 8px; border-bottom: 1px solid #eee; margin-bottom: 12px; }
+.settings-toggle-row { display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 0; margin-top: 8px; font-size: 13px; color: #333;
+  cursor: pointer; user-select: none; width: 100%; box-sizing: border-box; }
+.settings-toggle-row input { flex: 0 0 auto; width: 16px; height: 16px; margin: 2px 0 0 0; padding: 0; }
+.settings-toggle-row > span { flex: 1 1 auto; min-width: 0; line-height: 1.4; overflow-wrap: break-word; }
 
 body.dark { background: #1a1a1a; color: #ccc; }
 body.dark .boot-screen { background: #1a1a1a; background-image: none; }
@@ -1055,6 +1002,7 @@ body.dark .settings-tab.active { background: #252526; border-left-color: #0e639c
 body.dark .settings-label { color: #777; }
 body.dark .settings-value { color: #eaeaea; }
 body.dark .settings-section-title { color: #eaeaea; border-bottom-color: #3c3c3c; }
+body.dark .settings-toggle-row { color: #ccc; }
 body.dark .mention-pop { background: #252526; border-color: #3c3c3c; color: #ddd; }
 body.dark .mention-pop-item { color: #ddd; }
 body.dark .mention-pop-item:hover, body.dark .mention-pop-item.active { background: #37373d; }
@@ -1080,7 +1028,7 @@ body.dark .mcp-empty { color: #666; }
   .member-item:hover { background: transparent; }
 }
 
-/* MOBILE */
+/* ============ MOBILE ============ */
 @media (max-width: 768px) {
   .login-screen { padding: 16px; align-items: flex-start; padding-top: 32px; padding-bottom: 40px; }
   .login-box { width: 100%; max-width: 420px; padding: 22px 18px 16px; }
@@ -1125,7 +1073,6 @@ body.dark .mcp-empty { color: #666; }
     column-gap: 8px; padding: 4px 4px; font-size: 14.5px; }
   .msg-author { font-size: 14px; }
   .msg-time { font-size: 11px; }
-  .msg-row.mentioned-me { padding-left: 6px; }
 
   .composer { padding: 8px 10px; gap: 8px; }
   .composer textarea { font-size: 16px !important; padding: 12px 12px !important;
@@ -1153,11 +1100,14 @@ body.dark .mcp-empty { color: #666; }
   body.dark .settings-tab.active { border-left-color: transparent; border-bottom-color: #0e639c; }
   .settings-content { padding: 14px; max-height: 55vh; }
   .settings-lang-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-toggle-row { font-size: 14px; padding: 12px 0; }
+  .settings-toggle-row input { width: 20px; height: 20px; }
 
   .lang-menu { width: calc(100vw - 20px); grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 6px; gap: 4px; }
   .lang-menu-item { padding: 10px; font-size: 12.5px; }
 
+  /* Mobile channels drawer */
   .mobile-channels-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 900;
     opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
@@ -1191,32 +1141,38 @@ body.dark .mcp-empty { color: #666; }
   .mcp-item .lock-ico { display: inline-flex; align-items: center; flex-shrink: 0; }
   .mcp-item .mcp-name { flex: 1; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  .mcp-item .mcp-close-btn { flex-shrink: 0; width: 40px; height: 40px;
+  .mcp-item .mcp-close-btn {
+    flex-shrink: 0; width: 40px; height: 40px;
     display: inline-flex; align-items: center; justify-content: center;
-    color: #888; cursor: pointer; border-radius: 0; }
+    color: #888; cursor: pointer; border-radius: 0;
+  }
   .mcp-item .mcp-close-btn:active { color: #c00; background: rgba(192,0,0,.1); }
-  .mcp-empty { padding: 40px 16px; text-align: center; color: #999; font-size: 13px; }
+  .mcp-empty { padding: 40px 16px; text-align: center;
+    color: #999; font-size: 13px; }
   .mcp-actions { padding: 12px; border-top: 1px solid #ccc;
     background: #f7f7f7; flex-shrink: 0; display: flex; gap: 8px;
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
   .mcp-actions .btn { flex: 1; padding: 14px 10px; font-size: 13px;
     border-radius: 0; min-height: 48px; }
 
+  /* Mobile members drawer */
   .members-backdrop { display: block; position: fixed; inset: 0;
     background: rgba(0,0,0,.45); z-index: 901;
     opacity: 0; pointer-events: none; transition: opacity .2s ease-out; }
   .members-backdrop.open { opacity: 1; pointer-events: auto; }
-  .chat-members { position: fixed; top: 0; right: 0; bottom: 0;
-    width: 84%; max-width: 320px; z-index: 902;
-    transform: translateX(100%); transition: transform .2s ease-out;
-    box-shadow: -4px 0 20px rgba(0,0,0,.35); border-left: 0; }
+  .chat-members {
+    position: fixed; top: 0; right: 0; bottom: 0;
+    width: 84%; max-width: 320px;
+    z-index: 902;
+    transform: translateX(100%);
+    transition: transform .2s ease-out;
+    box-shadow: -4px 0 20px rgba(0,0,0,.35);
+    border-left: 0;
+  }
   .chat-members.open { transform: translateX(0); }
   .members-head { padding: 14px 16px; font-size: 14px; }
   .member-item { padding: 12px 16px; font-size: 14px; min-height: 48px; }
   .member-dot { width: 10px; height: 10px; }
-
-  .msg-menu { min-width: 220px; }
-  .msg-menu-item { padding: 14px 18px; font-size: 15px; min-height: 48px; }
 }
 
 @media (max-width: 400px) {
@@ -1229,7 +1185,7 @@ body.dark .mcp-empty { color: #666; }
 @media (min-width: 769px) and (max-width: 1024px) {
   .lang-menu { width: 620px; }
   .my-modal { max-width: 500px; }
-  #settingsModal { width: 560px; }
+  #settingsModal { width: 600px; }
   .msg-row { grid-template-columns: minmax(80px, 120px) 1fr; }
   .chat-members { width: 200px; }
 }
@@ -1246,23 +1202,29 @@ body.dark .mcp-empty { color: #666; }
   <div class="login-box">
     <h2 id="loginTitle">sldchat</h2>
     <p id="loginSubtitle"></p>
+
     <div class="field-group">
       <label class="my-label" id="lblNick" for="loginName"></label>
       <input type="text" id="loginName" class="my-input" maxlength="32"
              autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
     </div>
+
     <div class="field-group">
       <label class="my-label" id="lblPass" for="loginPass"></label>
       <input type="password" id="loginPass" class="my-input" maxlength="128" autocomplete="new-password">
     </div>
+
     <label class="remember-row">
       <input type="checkbox" id="rememberMe" checked>
       <span id="rememberLbl"></span>
     </label>
+
     <div id="turnstileWidget"></div>
-    <div class="turnstile-error" id="turnstileError"></div>
+
     <button class="btn primary" id="loginBtn" type="button"></button>
+
     <div class="login-error" id="loginError"><span id="loginErrorText"></span></div>
+
     <div class="login-settings">
       <button class="settings-btn" id="themeBtn" type="button"><span id="themeIcon"></span></button>
       <button class="settings-btn" id="langBtn" type="button">
@@ -1270,6 +1232,7 @@ body.dark .mcp-empty { color: #666; }
         <span class="lang-code" id="langCode"></span>
       </button>
     </div>
+
     <div class="uptime-line">
       <span id="uptimeLbl">Uptime</span>
       <span class="u-val" id="uptimeVal">—</span>
@@ -1284,9 +1247,11 @@ body.dark .mcp-empty { color: #666; }
   <div class="mobile-topbar" id="mobileTopbar">
     <button class="mobile-channels-btn" id="mobileChannelsBtn" type="button">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+        <line x1="8" y1="6" x2="21" y2="6"/>
+        <line x1="8" y1="12" x2="21" y2="12"/>
         <line x1="8" y1="18" x2="21" y2="18"/>
-        <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/>
+        <line x1="3" y1="6" x2="3.01" y2="6"/>
+        <line x1="3" y1="12" x2="3.01" y2="12"/>
         <line x1="3" y1="18" x2="3.01" y2="18"/>
       </svg>
       <span id="mobileChannelsLbl">Channels</span>
@@ -1308,17 +1273,17 @@ body.dark .mcp-empty { color: #666; }
       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
     </button>
     <div class="top-sep"></div>
-    <button class="icon-btn-tab" id="addTabBtn">
+    <button class="icon-btn-tab" id="addTabBtn" title="">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
     </button>
-    <button class="icon-btn-tab" id="connectBtn">
+    <button class="icon-btn-tab" id="connectBtn" title="">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
         <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
       </svg>
     </button>
     <div class="top-sep"></div>
-    <button class="icon-btn-tab" id="settingsBtn">
+    <button class="icon-btn-tab" id="settingsBtn" title="">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -1445,6 +1410,10 @@ body.dark .mcp-empty { color: #666; }
               <div class="settings-value" id="settingsUser">—</div>
             </div>
           </div>
+          <label class="settings-toggle-row">
+            <input type="checkbox" id="showInListToggle">
+            <span id="showInListLabel"></span>
+          </label>
           <button class="btn" id="settingsLogoutBtn" type="button" style="width:100%; margin-top:14px;"></button>
         </div>
         <div class="settings-pane" data-pane="appearance">
@@ -1462,32 +1431,6 @@ body.dark .mcp-empty { color: #666; }
           </div>
         </div>
       </div>
-    </div>
-  </div>
-</div>
-
-<div class="my-modal-backdrop" id="extLinkBackdrop">
-  <div class="my-modal" id="extLinkModal">
-    <div class="modal-head" id="extLinkModalHead">
-      <span id="extLinkTitle"></span>
-      <span class="close-m" data-close-modal="extLink">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </span>
-    </div>
-    <div class="modal-body">
-      <div class="ext-link-warning">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-          <line x1="12" y1="9" x2="12" y2="13"/>
-          <line x1="12" y1="17" x2="12.01" y2="17"/>
-        </svg>
-        <div id="extLinkWarning"></div>
-      </div>
-      <div class="ext-link-url" id="extLinkUrl"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" id="extLinkBack" type="button"></button>
-      <button class="btn primary" id="extLinkGo" type="button"></button>
     </div>
   </div>
 </div>
@@ -1540,9 +1483,7 @@ const SVG = {
   ban:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>',
   chat:'<svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
   sun:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>',
-  moon:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
-  at:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/></svg>',
-  copy:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+  moon:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
 };
 
 const USER_COLORS = [
@@ -1565,44 +1506,134 @@ function uuid() {
   });
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// EMOJI
+// ============ EMOJI + RICH TEXT ============
 const EMOJI_MAP = {
   like:'👍','+1':'👍',thumbsup:'👍',good:'👍',
   dislike:'👎','-1':'👎',thumbsdown:'👎',bad:'👎',
-  heart:'❤️',love:'❤️',smile:'😊',happy:'😊',blush:'😊',
+  heart:'❤️',love:'❤️',love_you:'❤️',
+  smile:'😊',happy:'😊',blush:'😊',
   laugh:'😂',lol:'😂',joy:'😂',haha:'😂',
-  cry:'😢',sad:'😢',angry:'😠',mad:'😠',rage:'😡',wink:'😉',
-  think:'🤔',thinking:'🤔',ok:'👌',ok_hand:'👌',
-  fire:'🔥',hot:'🔥',lit:'🔥',star:'⭐',star2:'🌟','100':'💯',
-  rocket:'🚀',party:'🎉',tada:'🎉',celebrate:'🎉',clap:'👏',
-  pray:'🙏',wave:'👋',hi:'👋',hello:'👋',eyes:'👀',sweat:'😅',
-  cool:'😎',sunglasses:'😎',wow:'😮',surprised:'😮',kiss:'😘',
-  sleepy:'😴',tired:'😴',nerd:'🤓',
-  dog:'🐶',cat:'🐱',pizza:'🍕',beer:'🍺',coffee:'☕',cake:'🎂',gift:'🎁',
-  check:'✅',done:'✅',yes:'✅',x:'❌',cross:'❌',no:'❌',warn:'⚠️',warning:'⚠️',
-  info:'ℹ️',question:'❓',excl:'❗',
-  clown:'🤡',ghost:'👻',alien:'👽',robot:'🤖',money:'💰',crown:'👑',flag:'🏁',
-  soccer:'⚽',basketball:'🏀',game:'🎮',music:'🎵',book:'📚',bulb:'💡',
-  lock:'🔒',key:'🔑',phone:'📱',computer:'💻',mail:'✉️',bell:'🔔',zap:'⚡',
-  boom:'💥',bomb:'💣',gun:'🔫',knife:'🔪',skull:'💀',poop:'💩',
-  rainbow:'🌈',sun:'☀️',moon:'🌙',cloud:'☁️',snow:'❄️',umbrella:'☔',
-  apple:'🍎',banana:'🍌',grape:'🍇',watermelon:'🍉',burger:'🍔',fries:'🍟',
-  sushi:'🍣',ramen:'🍜',icecream:'🍦',candy:'🍬',cookie:'🍪',
-  medal:'🏅',trophy:'🏆',diamond:'💎',needle:'💉',pill:'💊',balloon:'🎈',
-  confetti:'🎊',package:'📦',hourglass:'⏳',clock:'⏰',calendar:'📅',
-  camera:'📷',movie:'🎬',tv:'📺',headphones:'🎧',mic:'🎤',speaker:'🔊',
-  search:'🔍',hammer:'🔨',wrench:'🔧',gear:'⚙️',scissors:'✂️',
-  pen:'✏️',paperclip:'📎',pushpin:'📌',bookmark:'🔖',trash:'🗑️',recycle:'♻️',
+  cry:'😢',sad:'😢',
+  angry:'😠',mad:'😠',rage:'😡',
+  wink:'😉',
+  think:'🤔',thinking:'🤔',
+  ok:'👌',ok_hand:'👌',
+  fire:'🔥',hot:'🔥',lit:'🔥',
+  star:'⭐',star2:'🌟',
+  '100':'💯',
+  rocket:'🚀',
+  party:'🎉',tada:'🎉',celebrate:'🎉',
+  clap:'👏',
+  pray:'🙏',
+  wave:'👋',hi:'👋',hello:'👋',
+  eyes:'👀',
+  sweat:'😅',
+  cool:'😎',sunglasses:'😎',
+  wow:'😮',surprised:'😮',
+  kiss:'😘',
+  sleepy:'😴',tired:'😴',
+  nerd:'🤓',
+  dog:'🐶',cat:'🐱',
+  pizza:'🍕',
+  beer:'🍺',
+  coffee:'☕',
+  cake:'🎂',
+  gift:'🎁',
+  check:'✅',done:'✅',yes:'✅',
+  x:'❌',cross:'❌',no:'❌',
+  warn:'⚠️',warning:'⚠️',
+  info:'ℹ️',
+  question:'❓',
+  excl:'❗',
+  clown:'🤡',
+  ghost:'👻',
+  alien:'👽',
+  robot:'🤖',
+  money:'💰',
+  crown:'👑',
+  flag:'🏁',
+  soccer:'⚽',
+  basketball:'🏀',
+  game:'🎮',
+  music:'🎵',
+  book:'📚',
+  bulb:'💡',
+  lock:'🔒',
+  key:'🔑',
+  phone:'📱',
+  computer:'💻',
+  mail:'✉️',
+  bell:'🔔',
+  zap:'⚡',
+  boom:'💥',
+  bomb:'💣',
+  gun:'🔫',
+  knife:'🔪',
+  skull:'💀',
+  poop:'💩',
+  rainbow:'🌈',
+  sun:'☀️',
+  moon:'🌙',
+  cloud:'☁️',
+  snow:'❄️',
+  umbrella:'☔',
+  apple:'🍎',
+  banana:'🍌',
+  grape:'🍇',
+  watermelon:'🍉',
+  burger:'🍔',
+  fries:'🍟',
+  sushi:'🍣',
+  ramen:'🍜',
+  icecream:'🍦',
+  candy:'🍬',
+  cookie:'🍪',
+  medal:'🏅',
+  trophy:'🏆',
+  diamond:'💎',
+  needle:'💉',
+  pill:'💊',
+  balloon:'🎈',
+  confetti:'🎊',
+  package:'📦',
+  hourglass:'⏳',
+  clock:'⏰',
+  calendar:'📅',
+  camera:'📷',
+  movie:'🎬',
+  tv:'📺',
+  headphones:'🎧',
+  mic:'🎤',
+  speaker:'🔊',
+  search:'🔍',
+  hammer:'🔨',
+  wrench:'🔧',
+  gear:'⚙️',
+  scissors:'✂️',
+  pen:'✏️',
+  paperclip:'📎',
+  pushpin:'📌',
+  bookmark:'🔖',
+  trash:'🗑️',
+  recycle:'♻️',
   arrow_up:'⬆️',arrow_down:'⬇️',arrow_left:'⬅️',arrow_right:'➡️',
-  muscle:'💪',point_up:'☝️',raised_hands:'🙌',handshake:'🤝',fist:'✊',
-  punch:'👊',victory:'✌️',peace:'✌️',metal:'🤘',call_me:'🤙',cross_fingers:'🤞'
+  wave_hand:'👋',
+  thumbs_up:'👍',
+  thumbs_down:'👎',
+  muscle:'💪',
+  point_up:'☝️',
+  pray_hands:'🙏',
+  raised_hands:'🙌',
+  handshake:'🤝',
+  fist:'✊',
+  punch:'👊',
+  victory:'✌️',
+  peace:'✌️',
+  metal:'🤘',
+  call_me:'🤙',
+  cross_fingers:'🤞',
 };
-
-const URL_MARK = '\uE000';
-const URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
-const WWW_RE = /\bwww\.[^\s<>"'`]+/gi;
 
 function applyEmojis(escaped) {
   return escaped.replace(/:([a-zA-Z0-9_+\-]{1,32}):/g, (full, name) => {
@@ -1611,62 +1642,32 @@ function applyEmojis(escaped) {
   });
 }
 function applyFormatting(s) {
+  // Code — protect content from other rules
   s = s.replace(/`([^`\n]+)`/g, (m, c) => '<code>'+c+'</code>');
+  // Bold **text**
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  // Italic *text* (not inside **)
   s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+  // Underline __text__
   s = s.replace(/__([^_\n]+)__/g, '<u>$1</u>');
+  // Strikethrough ~~text~~
   s = s.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
   return s;
 }
 function renderRichText(text, channelId) {
   let s = escapeHtml(text);
-  const urls = [];
-  const tailRe = /[.,;:!?)\]}>]+$/;
-
-  s = s.replace(URL_RE, m => {
-    let tail = '';
-    const match = m.match(tailRe);
-    if (match) { tail = match[0]; m = m.slice(0, -tail.length); }
-    urls.push(m);
-    return URL_MARK + 'U' + (urls.length - 1) + URL_MARK + tail;
-  });
-  s = s.replace(WWW_RE, m => {
-    let tail = '';
-    const match = m.match(tailRe);
-    if (match) { tail = match[0]; m = m.slice(0, -tail.length); }
-    urls.push('http://' + m);
-    return URL_MARK + 'U' + (urls.length - 1) + URL_MARK + tail;
-  });
-
   s = applyFormatting(s);
   s = applyEmojis(s);
-
   const members = memberSetByChannel[channelId];
   if (members && members.size) {
     s = s.replace(/@([^\s@:<>"'&]{2,32})/gu, (full, name) => {
-      if (members.has(name.toLowerCase())) return '<span class="mention">@'+name+'</span>';
+      if (members.has(name.toLowerCase())) {
+        return '<span class="mention">@'+name+'</span>';
+      }
       return full;
     });
   }
-
-  s = s.replace(new RegExp(URL_MARK + 'U(\\d+)' + URL_MARK, 'g'), (full, idx) => {
-    const url = urls[parseInt(idx, 10)];
-    const display = url.replace(/^https?:\/\//, '');
-    const shown = display.length > 60 ? display.slice(0, 60) + '…' : display;
-    return '<a class="ext-link" href="#" data-url="' + escapeHtml(url) + '" rel="noopener noreferrer">' + escapeHtml(shown) + '</a>';
-  });
-
   return s;
-}
-
-const decryptedCache = {};
-
-function textMentionsMe(text) {
-  if (!currentUser) return false;
-  try {
-    const re = new RegExp('@' + escapeRegExp(currentUser) + '(?![\\w])', 'i');
-    return re.test(text);
-  } catch(e) { return false; }
 }
 
 function updateAppVH() {
@@ -1693,14 +1694,12 @@ let wsChannelId = null;
 let channelKeys = {};
 let onlineUsers = [];
 let uptimeBase = 0, uptimeFetchAt = 0;
+let showInListPref = true;
 let turnstileWidgetId = null;
-let turnstileRendered = false;
-let turnstileError = false;
 let authInFlight = false;
 let channelMembers = {};
 let memberSetByChannel = {};
 let mentionState = { open:false, items:[], selected:0, startIdx:-1 };
-let msgMenuEl = null;
 
 const $ = (id) => document.getElementById(id);
 const t = (key, vars) => {
@@ -1717,79 +1716,51 @@ function setState(st) {
   if (st === 'login') updateAppVH();
 }
 
-// Cache
+// ---------- Cache ----------
 function saveCache() {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({
+    const data = {
       ts: Date.now(),
       username: currentUser,
-      channels: channels.map(c => ({ id: c.id, name: c.name, private: c.private, enc_key: c.enc_key }))
-    }));
+      channels: channels.map(c => ({
+        id: c.id, name: c.name, private: c.private, enc_key: c.enc_key,
+      })),
+    };
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
   } catch(e) {}
 }
 function loadCache() {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
-    const d = JSON.parse(raw);
-    if (!d || !Array.isArray(d.channels)) return null;
-    if (d.ts && Date.now() - d.ts > 7*24*3600*1000) return null;
-    return d;
+    const data = JSON.parse(raw);
+    if (!data || !Array.isArray(data.channels)) return null;
+    if (data.ts && Date.now() - data.ts > 7*24*3600*1000) return null;
+    return data;
   } catch(e) { return null; }
 }
-function clearCache() { try { localStorage.removeItem(CACHE_KEY); } catch(e){} }
-
-// Turnstile — robust initialization
-function onTurnstileLoaded() {
-  window.__err && window.__err('Turnstile loaded');
-  tryRenderTurnstile();
+function clearCache() {
+  try { localStorage.removeItem(CACHE_KEY); } catch(e){}
 }
-window.onTurnstileLoaded = onTurnstileLoaded;
 
-function tryRenderTurnstile() {
-  if (turnstileRendered) return;
+// ---------- Turnstile ----------
+function onTurnstileLoaded() { renderTurnstile(); }
+window.onTurnstileLoaded = onTurnstileLoaded;
+function renderTurnstile() {
   if (!window.turnstile) return;
-  if (document.readyState === 'loading') return;
-  const el = $('turnstileWidget');
-  if (!el) return;
-  // If login screen is not visible, still allow render but not required
+  const el = $('turnstileWidget'); if (!el) return;
+  if (turnstileWidgetId !== null) {
+    try { window.turnstile.remove(turnstileWidgetId); } catch (e) {}
+    turnstileWidgetId = null;
+  }
+  el.innerHTML = '';
   try {
     turnstileWidgetId = window.turnstile.render(el, {
       sitekey: TURNSTILE_SITEKEY,
       theme: currentTheme === 'dark' ? 'dark' : 'light',
       size: 'normal',
-      callback: function(token) {
-        window.__err && window.__err('Turnstile callback OK');
-        hideTurnstileError();
-      },
-      'error-callback': function(code) {
-        window.__err && window.__err('Turnstile error callback', code);
-        if (code === '600010' || code === 600010) {
-          showTurnstileError();
-        }
-      },
-      'expired-callback': function() {
-        window.__err && window.__err('Turnstile expired');
-      }
     });
-    turnstileRendered = true;
-    window.__err && window.__err('Turnstile rendered, id=' + turnstileWidgetId);
-  } catch (e) {
-    window.__err && window.__err('Turnstile render error', e);
-  }
-}
-
-function showTurnstileError() {
-  turnstileError = true;
-  const el = $('turnstileError');
-  if (!el) return;
-  el.textContent = t('turnstile_error');
-  el.classList.add('show');
-}
-function hideTurnstileError() {
-  turnstileError = false;
-  const el = $('turnstileError');
-  if (el) el.classList.remove('show');
+  } catch (e) { window.__err && window.__err('Turnstile render error', e); }
 }
 function getTurnstileToken() {
   if (!window.turnstile || turnstileWidgetId === null) return '';
@@ -1800,22 +1771,7 @@ function resetTurnstile() {
   try { window.turnstile.reset(turnstileWidgetId); } catch (e) {}
 }
 
-// DOM ready — attempt render
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', tryRenderTurnstile);
-} else {
-  tryRenderTurnstile();
-}
-// Also retry periodically in case script loads slowly
-let __tstRetries = 0;
-setInterval(() => {
-  if (turnstileRendered) return;
-  __tstRetries++;
-  if (__tstRetries > 40) return;
-  tryRenderTurnstile();
-}, 500);
-
-// Crypto
+// ---------- Real E2EE ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 function hexToBytes(hex) {
@@ -1825,6 +1781,7 @@ function hexToBytes(hex) {
 }
 function b64(buf){let s='';const bytes=new Uint8Array(buf);for(let i=0;i<bytes.length;i++)s+=String.fromCharCode(bytes[i]);return btoa(s);}
 function ub64(str){const bin=atob(str);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return bytes;}
+
 async function importChannelKey(channelId, hexKey) {
   if (channelKeys[channelId]) return channelKeys[channelId];
   const kb = hexToBytes(hexKey);
@@ -1921,15 +1878,12 @@ function applyLanguage() {
   $('settingsAppearanceHead').textContent = t('settings_appearance');
   $('settingsThemeLabel').textContent = t('settings_theme');
   $('settingsLangLabel').textContent = t('settings_lang');
+  $('showInListLabel').textContent = t('settings_show_in_list');
   $('mobileChannelsLbl').textContent = t('mobile_channels');
   $('mcpTitle').textContent = t('mobile_channels');
   $('mcpCreateBtn').textContent = t('modal_create_title');
   $('mcpConnectBtn').textContent = t('modal_connect_title');
   $('membersTitle').textContent = t('members_title');
-  $('extLinkTitle').textContent = t('ext_link_title');
-  $('extLinkWarning').textContent = t('ext_link_warning');
-  $('extLinkBack').textContent = t('ext_link_back');
-  $('extLinkGo').textContent = t('ext_link_continue');
   $('langFlag').innerHTML = FLAGS[currentLang] || '';
   $('langCode').textContent = currentLang.toUpperCase();
   applyTheme();
@@ -1991,18 +1945,8 @@ async function doAuth() {
   if (username.length < 2) { showLoginError(t('err_bad_username')); return; }
   if (/[\s@:<>"'&]/.test(username)) { showLoginError(t('err_bad_username')); return; }
   if (password.length < 4) { showLoginError(t('err_bad_password')); return; }
-
   const tsToken = getTurnstileToken();
-  if (!tsToken) {
-    if (turnstileError) {
-      showLoginError(t('turnstile_error'));
-      // Attempt a reset
-      resetTurnstile();
-    } else {
-      showLoginError(t('err_turnstile'));
-    }
-    return;
-  }
+  if (!tsToken) { showLoginError(t('err_turnstile')); return; }
 
   authInFlight = true;
   setAuthBtnLoading(true);
@@ -2010,7 +1954,8 @@ async function doAuth() {
   $('loginPass').disabled = true;
 
   try {
-    const res = await api('/api/auth', 'POST', { username, password, turnstile_token: tsToken }, false);
+    const res = await api('/api/auth', 'POST',
+      { username, password, turnstile_token: tsToken }, false);
     authToken = res.token; currentUser = res.username;
     if ($('rememberMe').checked) {
       localStorage.setItem('auth_token', res.token);
@@ -2020,7 +1965,8 @@ async function doAuth() {
       localStorage.removeItem('auth_token');
     }
     $('loginName').value = ''; $('loginPass').value = '';
-    resetTurnstile(); enterApp();
+    resetTurnstile();
+    enterApp();
   } catch (e) {
     let msg;
     if (e.detail === 'turnstile_failed') msg = t('err_turnstile');
@@ -2029,10 +1975,7 @@ async function doAuth() {
     else if (e.detail === 'too_many_attempts' || e.status === 429) msg = t('err_rate_limited');
     else if (e.status === 401) msg = t('err_bad_credentials');
     else msg = t('err_generic');
-    showLoginError(msg);
-    resetTurnstile();
-    // try to re-render turnstile if it errored
-    if (turnstileError) tryRenderTurnstile();
+    showLoginError(msg); resetTurnstile();
   } finally {
     authInFlight = false;
     setAuthBtnLoading(false);
@@ -2049,7 +1992,20 @@ function enterApp() {
   $('settingsUser').textContent = currentUser;
   setState('app');
   updateAppVH();
+  // Load channels fast
   loadChannels();
+  loadMyPrefs();
+}
+
+async function loadMyPrefs() {
+  try {
+    const res = await api('/api/me');
+    showInListPref = !!res.show_in_list;
+    currentUser = res.username;
+    $('headerUser').textContent = currentUser;
+    $('settingsUser').textContent = currentUser;
+    $('showInListToggle').checked = showInListPref;
+  } catch (e) {}
 }
 
 async function tryRestoreSession() {
@@ -2057,6 +2013,7 @@ async function tryRestoreSession() {
   if (!saved) { setState('login'); return false; }
   authToken = saved;
 
+  // Fast-path: render cached UI immediately
   const cached = loadCache();
   if (cached && cached.username && cached.channels.length) {
     currentUser = cached.username;
@@ -2070,14 +2027,18 @@ async function tryRestoreSession() {
     setState('app');
     updateAppVH();
     renderAll();
+    // Then verify in background
     try {
       const me = await api('/api/me');
       currentUser = me.username;
+      showInListPref = !!me.show_in_list;
       $('headerUser').textContent = currentUser;
       $('settingsUser').textContent = currentUser;
-      loadChannels();
+      $('showInListToggle').checked = showInListPref;
+      loadChannels();  // fresh fetch, will replace
       return true;
     } catch(e) {
+      // Token invalid
       localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
       clearCache(); authToken = null; currentUser = null; channels = [];
       setState('login');
@@ -2085,9 +2046,12 @@ async function tryRestoreSession() {
     }
   }
 
+  // No cache — verify first
   try {
     const me = await api('/api/me');
     currentUser = me.username;
+    showInListPref = !!me.show_in_list;
+    $('showInListToggle').checked = showInListPref;
     enterApp();
     return true;
   } catch(e) {
@@ -2106,6 +2070,7 @@ $('langBackdrop').addEventListener('click', closeLangMenu);
 function openSettingsModal() {
   $('settingsBackdrop').classList.add('open');
   $('settingsUser').textContent = currentUser || '—';
+  $('showInListToggle').checked = showInListPref;
 }
 $('settingsBtn').addEventListener('click', openSettingsModal);
 $('mobileSettingsBtn').addEventListener('click', openSettingsModal);
@@ -2117,21 +2082,26 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
   });
 });
 $('settingsThemeToggle').addEventListener('click', toggleTheme);
+$('showInListToggle').addEventListener('change', async e => {
+  const val = e.target.checked;
+  try { await api('/api/me/preferences', 'POST', { show_in_list: val }); showInListPref = val; }
+  catch (err) { e.target.checked = !val; }
+});
 $('settingsLogoutBtn').addEventListener('click', async () => {
   try { await api('/api/logout', 'POST'); } catch(e){}
   authToken = null; currentUser = null;
   channels = []; activeId = null; channelKeys = {};
-  channelMembers = {}; memberSetByChannel = {}; Object.keys(decryptedCache).forEach(k => delete decryptedCache[k]);
+  channelMembers = {}; memberSetByChannel = {};
   if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
   localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
   clearCache();
   $('settingsBackdrop').classList.remove('open');
-  closeMobileChannels(); closeMembersSidebar(); hideMsgMenu();
+  closeMobileChannels(); closeMembersSidebar();
   setState('login');
   closeLangMenu(); updateAppVH(); resetTurnstile();
 });
 
-// Members sidebar
+// ---------- Members sidebar ----------
 function openMembersSidebar() {
   $('chatMembers').classList.add('open');
   $('membersBackdrop').classList.add('open');
@@ -2150,7 +2120,11 @@ function renderMembersSidebar() {
   const members = channelMembers[activeId] || [];
   const onlineSet = new Set((onlineUsers||[]).map(u => String(u).toLowerCase()));
   $('membersCount').textContent = String(members.length);
-  if (!members.length) { box.innerHTML = '<div class="members-empty">—</div>'; return; }
+
+  if (!members.length) {
+    box.innerHTML = '<div class="members-empty">—</div>';
+    return;
+  }
   const sorted = [...members].sort((a, b) => {
     const ao = onlineSet.has(a.username.toLowerCase());
     const bo = onlineSet.has(b.username.toLowerCase());
@@ -2173,7 +2147,7 @@ function renderMembersSidebar() {
   });
 }
 
-// Mobile channels
+// ---------- Mobile channels ----------
 function openMobileChannels() {
   renderMobileChannelList();
   $('mobileChannelsBackdrop').classList.add('open');
@@ -2186,17 +2160,24 @@ function closeMobileChannels() {
 function renderMobileChannelList() {
   const box = $('mcpList'); if (!box) return;
   box.innerHTML = '';
-  if (!channels.length) { box.innerHTML = '<div class="mcp-empty">'+t('empty_no_channels')+'</div>'; return; }
+  if (!channels.length) {
+    box.innerHTML = '<div class="mcp-empty">'+t('empty_no_channels')+'</div>';
+    return;
+  }
   channels.forEach(ch => {
     const item = document.createElement('div');
     item.className = 'mcp-item' + (ch.id === activeId ? ' active' : '');
     if (ch.private) {
-      const l = document.createElement('span'); l.className = 'lock-ico'; l.innerHTML = SVG.lock;
+      const l = document.createElement('span');
+      l.className = 'lock-ico'; l.innerHTML = SVG.lock;
       item.appendChild(l);
     }
-    const n = document.createElement('span'); n.className = 'mcp-name'; n.textContent = ch.name;
+    const n = document.createElement('span');
+    n.className = 'mcp-name'; n.textContent = ch.name;
     item.appendChild(n);
-    const cl = document.createElement('span'); cl.className = 'mcp-close-btn'; cl.title = t('leave_channel');
+    const cl = document.createElement('span');
+    cl.className = 'mcp-close-btn';
+    cl.title = t('leave_channel');
     cl.innerHTML = SVG.x;
     cl.addEventListener('click', (e) => { e.stopPropagation(); leaveChannel(ch.id); });
     item.appendChild(cl);
@@ -2221,7 +2202,9 @@ async function leaveChannel(id) {
     if (ws) { try { ws.close(); } catch(e){} ws = null; wsChannelId = null; }
     if (activeId) { openChannelWS(activeId); loadChannelMembers(activeId); }
   }
-  renderAll(); renderMobileChannelList(); saveCache();
+  renderAll();
+  renderMobileChannelList();
+  saveCache();
 }
 
 $('mobileChannelsBtn').addEventListener('click', openMobileChannels);
@@ -2234,6 +2217,7 @@ async function loadChannels() {
   try {
     const res = await api('/api/channels');
     const fresh = res.channels || [];
+    // Import keys
     for (const ch of fresh) {
       if (ch.enc_key) { try { await importChannelKey(ch.id, ch.enc_key); } catch(e){} }
     }
@@ -2245,7 +2229,9 @@ async function loadChannels() {
     saveCache();
   } catch(e) {
     if (e.status === 401) {
-      authToken = null; currentUser = null; channels = []; clearCache();
+      // Token invalid — logout
+      authToken = null; currentUser = null; channels = [];
+      clearCache();
       localStorage.removeItem('auth_token'); sessionStorage.removeItem('auth_token');
       setState('login');
     }
@@ -2259,7 +2245,10 @@ async function loadChannelMembers(channelId) {
     const s = new Set();
     (res.members || []).forEach(m => s.add(String(m.username).toLowerCase()));
     memberSetByChannel[channelId] = s;
-    if (activeId === channelId) { renderMessages(); renderMembersSidebar(); }
+    if (activeId === channelId) {
+      renderMessages();
+      renderMembersSidebar();
+    }
   } catch (e) {
     channelMembers[channelId] = [];
     memberSetByChannel[channelId] = new Set();
@@ -2273,7 +2262,8 @@ function renderTabs() {
     tab.className = 'channel-tab' + (ch.id === activeId ? ' active' : '');
     tab.dataset.id = ch.id;
     if (ch.private) {
-      const l = document.createElement('span'); l.className = 'lock-ico'; l.innerHTML = SVG.lock;
+      const l = document.createElement('span');
+      l.className = 'lock-ico'; l.innerHTML = SVG.lock;
       tab.appendChild(l);
     }
     const n = document.createElement('span'); n.textContent = ch.name; tab.appendChild(n);
@@ -2325,7 +2315,6 @@ function buildMsgRow(m, prevAuthor, prevTime) {
   const row = document.createElement('div');
   row.className = 'msg-row';
   row.dataset.id = m.id; row.dataset.t = String(m.t*1000);
-  row.dataset.author = m.from;
   const d = new Date(m.t*1000);
   const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   const grouped = (prevAuthor === m.from) && ((m.t*1000) - prevTime < GROUP_WINDOW_MS);
@@ -2349,15 +2338,6 @@ function buildMsgRow(m, prevAuthor, prevTime) {
   return { el: row, textEl };
 }
 
-function applyDecryption(row, channelId, ct) {
-  const span = row.querySelector('.msg-text');
-  decryptText(channelId, ct).then(pt => {
-    decryptedCache[row.dataset.id] = pt;
-    span.innerHTML = renderRichText(pt, channelId);
-    if (textMentionsMe(pt)) row.classList.add('mentioned-me');
-  });
-}
-
 function renderMessages() {
   const feed = $('chatFeed'); feed.innerHTML = '';
   const ch = channels.find(c => c.id === activeId);
@@ -2371,9 +2351,10 @@ function renderMessages() {
   });
   const chId = activeId;
   feed.querySelectorAll('.msg-row[data-ct]').forEach(row => {
+    const span = row.querySelector('.msg-text');
     const ct = row.getAttribute('data-ct');
     if (!ct) return;
-    applyDecryption(row, chId, ct);
+    decryptText(chId, ct).then(pt => { span.innerHTML = renderRichText(pt, chId); });
   });
   feed.scrollTop = feed.scrollHeight;
 }
@@ -2389,9 +2370,10 @@ function appendMessageUI(msg, channelId) {
     }
   }
   if (existing) {
-    if (msg.ct) {
+    const span = existing.querySelector('.msg-text');
+    if (span && msg.ct) {
+      decryptText(channelId, msg.ct).then(pt => { span.innerHTML = renderRichText(pt, channelId); });
       existing.setAttribute('data-ct', msg.ct);
-      applyDecryption(existing, channelId, msg.ct);
     }
     return;
   }
@@ -2403,7 +2385,7 @@ function appendMessageUI(msg, channelId) {
   const { el, textEl } = buildMsgRow(msg, prevAuthor, prevTime);
   feed.appendChild(el);
   if (msg.ct) {
-    applyDecryption(el, channelId, msg.ct);
+    decryptText(channelId, msg.ct).then(pt => { textEl.innerHTML = renderRichText(pt, channelId); });
   } else {
     textEl.textContent = '[sending...]';
   }
@@ -2438,13 +2420,16 @@ function openChannelWS(channelId) {
   ws.onmessage = ev => {
     let data; try { data = JSON.parse(ev.data); } catch(e){ return; }
     if (data.type === 'message' && data.msg) { appendMessageUI(data.msg, channelId); renderHeader(); }
-    else if (data.type === 'presence') { onlineUsers = data.users || []; renderHeader(); renderMembersSidebar(); }
+    else if (data.type === 'presence') {
+      onlineUsers = data.users || [];
+      renderHeader();
+      renderMembersSidebar();
+    }
     else if (data.type === 'muted') { mutes[channelId] = Date.now() + data.seconds*1000; updateMuteUI(); addSystem('Muted for ' + data.seconds + 's'); }
     else if (data.type === 'error' && data.error === 'auth') { $('settingsLogoutBtn').click(); }
   };
   ws.onclose = () => { if (wsChannelId === channelId) ws = null; };
 }
-
 function sendMessage() {
   const input = $('msgInput');
   const text = input.value.trim();
@@ -2460,13 +2445,9 @@ function sendMessage() {
     appendMessageUI(optimistic, chId);
     ws.send(JSON.stringify({ type:'message', id: mid, ciphertext: ct }));
     input.value = ''; autoResize(); hideMentionPop();
-    try { input.focus(); } catch(e) {}
   });
 }
 $('sendBtn').addEventListener('click', sendMessage);
-$('sendBtn').addEventListener('mousedown', e => e.preventDefault());
-$('sendBtn').addEventListener('touchstart', e => {}, {passive: true});
-
 $('msgInput').addEventListener('keydown', e => {
   if (mentionState.open) {
     if (e.key === 'ArrowDown') { e.preventDefault(); mentionState.selected = Math.min(mentionState.items.length-1, mentionState.selected+1); renderMentionPop(); return; }
@@ -2479,10 +2460,11 @@ $('msgInput').addEventListener('keydown', e => {
 function autoResize() { const el = $('msgInput'); el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
 $('msgInput').addEventListener('input', () => { autoResize(); updateMentionState(); });
 
-// Mentions
+// Mentions autocomplete
 function currentMention() {
   const ta = $('msgInput');
-  const v = ta.value, pos = ta.selectionStart;
+  const v = ta.value;
+  const pos = ta.selectionStart;
   let i = pos - 1;
   while (i >= 0) {
     const c = v[i];
@@ -2544,144 +2526,12 @@ function pickMention(idx) {
   ta.value = before + insertion + after;
   const newPos = (before + insertion).length;
   ta.setSelectionRange(newPos, newPos);
-  hideMentionPop(); autoResize(); ta.focus();
+  hideMentionPop();
+  autoResize();
+  ta.focus();
 }
 
-// Message context menu
-function showMsgMenu(rowEl, x, y) {
-  hideMsgMenu();
-  const msgId = rowEl.dataset.id;
-  const author = rowEl.dataset.author || (rowEl.querySelector('.msg-author') ? rowEl.querySelector('.msg-author').textContent.trim() : '');
-  const text = decryptedCache[msgId] || '';
-
-  const back = document.createElement('div');
-  back.className = 'msg-menu-backdrop';
-  back.addEventListener('mousedown', hideMsgMenu);
-  back.addEventListener('touchstart', hideMsgMenu, {passive: true});
-  back.addEventListener('contextmenu', e => { e.preventDefault(); hideMsgMenu(); });
-  document.body.appendChild(back);
-
-  const menu = document.createElement('div');
-  menu.className = 'msg-menu';
-
-  const mw = 220, mh = 110;
-  let mx = Math.min(x, window.innerWidth - mw - 8);
-  let my = Math.min(y, window.innerHeight - mh - 8);
-  mx = Math.max(8, mx); my = Math.max(8, my);
-  menu.style.left = mx + 'px';
-  menu.style.top = my + 'px';
-
-  const mentionItem = document.createElement('div');
-  mentionItem.className = 'msg-menu-item';
-  mentionItem.innerHTML = SVG.at + '<span>' + escapeHtml(t('msg_menu_mention') + ' @' + author) + '</span>';
-  mentionItem.addEventListener('click', e => {
-    e.stopPropagation();
-    const ta = $('msgInput');
-    const prefix = ta.value && !/\s$/.test(ta.value) ? ' ' : '';
-    ta.value = ta.value + prefix + '@' + author + ' ';
-    ta.focus();
-    hideMsgMenu();
-  });
-  menu.appendChild(mentionItem);
-
-  const copyItem = document.createElement('div');
-  copyItem.className = 'msg-menu-item';
-  copyItem.innerHTML = SVG.copy + '<span>' + escapeHtml(t('msg_menu_copy')) + '</span>';
-  copyItem.addEventListener('click', async e => {
-    e.stopPropagation();
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const ta = document.createElement('textarea');
-        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-        document.body.appendChild(ta); ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-      }
-      addSystem(t('msg_copied'));
-    } catch(err) { addSystem(t('msg_copy_failed')); }
-    hideMsgMenu();
-  });
-  menu.appendChild(copyItem);
-
-  document.body.appendChild(menu);
-  msgMenuEl = { menu, back };
-}
-function hideMsgMenu() {
-  if (msgMenuEl) {
-    try { msgMenuEl.menu.remove(); } catch(e){}
-    try { msgMenuEl.back.remove(); } catch(e){}
-    msgMenuEl = null;
-  }
-}
-
-document.addEventListener('contextmenu', e => {
-  const row = e.target.closest && e.target.closest('.msg-row[data-id]');
-  if (row && !row.classList.contains('msg-system')) {
-    e.preventDefault();
-    showMsgMenu(row, e.clientX, e.clientY);
-    return;
-  }
-  e.preventDefault();
-});
-
-(function() {
-  let timer = null, sx = 0, sy = 0, fired = false;
-  document.addEventListener('touchstart', e => {
-    if (e.touches.length !== 1) return;
-    const row = e.target.closest && e.target.closest('.msg-row[data-id]');
-    if (!row || row.classList.contains('msg-system')) return;
-    sx = e.touches[0].clientX; sy = e.touches[0].clientY;
-    fired = false;
-    timer = setTimeout(() => {
-      fired = true;
-      if (navigator.vibrate) try { navigator.vibrate(15); } catch(_) {}
-      showMsgMenu(row, sx, sy);
-    }, 500);
-  }, {passive: true});
-  document.addEventListener('touchmove', e => {
-    if (!timer) return;
-    const t = e.touches[0];
-    if (Math.abs(t.clientX - sx) > 10 || Math.abs(t.clientY - sy) > 10) {
-      clearTimeout(timer); timer = null;
-    }
-  }, {passive: true});
-  document.addEventListener('touchend', e => {
-    if (timer) { clearTimeout(timer); timer = null; }
-    if (fired) { e.preventDefault(); fired = false; }
-  }, {passive: false});
-  document.addEventListener('touchcancel', () => {
-    if (timer) { clearTimeout(timer); timer = null; }
-  }, {passive: true});
-})();
-
-// External link modal
-let pendingExtUrl = null;
-function showExtLinkModal(url) {
-  pendingExtUrl = url;
-  $('extLinkUrl').textContent = url;
-  $('extLinkBackdrop').classList.add('open');
-}
-function closeExtLinkModal() {
-  pendingExtUrl = null;
-  $('extLinkBackdrop').classList.remove('open');
-}
-$('extLinkBack').addEventListener('click', closeExtLinkModal);
-$('extLinkGo').addEventListener('click', () => {
-  const url = pendingExtUrl;
-  closeExtLinkModal();
-  if (url) { try { window.open(url, '_blank', 'noopener,noreferrer'); } catch(e) {} }
-});
-
-document.addEventListener('click', e => {
-  const a = e.target.closest && e.target.closest('a.ext-link');
-  if (!a) return;
-  e.preventDefault();
-  const url = a.getAttribute('data-url');
-  if (url) showExtLinkModal(url);
-});
-
+// Modals
 document.addEventListener('click', e => {
   const el = e.target.closest && e.target.closest('[data-close-modal]');
   if (!el) return;
@@ -2689,15 +2539,14 @@ document.addEventListener('click', e => {
   if (w === 'create') $('createBackdrop').classList.remove('open');
   if (w === 'connect') $('connectBackdrop').classList.remove('open');
   if (w === 'settings') $('settingsBackdrop').classList.remove('open');
-  if (w === 'extLink') closeExtLinkModal();
 });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
-  ['createBackdrop','connectBackdrop','settingsBackdrop','extLinkBackdrop'].forEach(id => $(id).classList.remove('open'));
+  ['createBackdrop','connectBackdrop','settingsBackdrop'].forEach(id => $(id).classList.remove('open'));
   if ($('langMenu').classList.contains('open')) closeLangMenu();
   if ($('mobileChannelsPanel').classList.contains('open')) closeMobileChannels();
   if ($('chatMembers').classList.contains('open')) closeMembersSidebar();
-  hideMentionPop(); hideMsgMenu();
+  hideMentionPop();
 });
 
 $('addTabBtn').addEventListener('click', () => {
@@ -2765,7 +2614,6 @@ document.addEventListener('keydown', e => {
   if ($('chatMembers').classList.contains('open')) return;
   if (document.documentElement.getAttribute('data-state') !== 'app') return;
   if (mentionState.open) return;
-  if (msgMenuEl) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
   if (e.key === 'ArrowLeft') { switchChannel(-1); e.preventDefault(); }
@@ -2787,8 +2635,12 @@ feedEl.addEventListener('touchend', e => {
 }, {passive: true});
 
 function renderAll() {
-  renderTabs(); renderHeader(); renderMessages(); updateMuteUI();
-  scrollActiveTabIntoView(); renderMembersSidebar();
+  renderTabs();
+  renderHeader();
+  renderMessages();
+  updateMuteUI();
+  scrollActiveTabIntoView();
+  renderMembersSidebar();
 }
 
 applyLanguage();
@@ -2797,6 +2649,12 @@ renderUptime();
   const ok = await tryRestoreSession();
   if (!ok) {
     setTimeout(() => $('loginName').focus(), 100);
+    let tries = 0;
+    const iv = setInterval(() => {
+      tries++;
+      if (window.turnstile && $('turnstileWidget').children.length === 0) renderTurnstile();
+      if ((window.turnstile && turnstileWidgetId !== null) || tries > 20) clearInterval(iv);
+    }, 300);
   }
 })();
 </script>
