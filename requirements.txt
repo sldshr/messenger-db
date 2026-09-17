@@ -7,3 +7,4 @@ aiosmtpd
 dnspython 
 pydantic
 itsdangerous
+uvloop 
