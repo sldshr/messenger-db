@@ -1,12 +1,19 @@
 """
-Nexus DM — E2EE мессенджер 1-на-1 (как SMS).
-- Логин/пароль (scrypt + salt) — сервер хранит только хеш.
-- Только личные сообщения 1-на-1. Групповых нет.
-- E2EE: ECDH P-256 + AES-GCM 256. Приватный ключ НИКОГДА не покидает браузер.
-- Сервер видит только шифротекст (ct/iv) + метаданные.
-- Всё в оперативке. Ничего не пишется на диск.
+Federated E2EE Messenger — 1-на-1 чаты, федерация между серверами.
+- Логин/пароль (scrypt). E2EE: ECDH P-256 + AES-GCM-256.
+- Приватный ключ ТОЛЬКО в браузере (localStorage). Сервер видит лишь шифротекст.
+- Федерация: alice@server1.com ↔ bob@server2.com. Между серверами — HTTP.
+- Контакты добавляются вручную по uid (bob или bob@server.com).
+- Всё в оперативке.
 
-Запуск:  python main.py   →   http://localhost:8000
+Установка:  pip install fastapi uvicorn httpx
+Запуск:     python main.py
+
+Продакшн:
+   DOMAIN=chat.example.com SCHEME=https python main.py
+Локальный тест федерации (2 сервера):
+   DOMAIN=localhost:8000 SCHEME=http python main.py   # порт 8000
+   DOMAIN=localhost:8001 SCHEME=http PORT=8001 python main.py
 """
 
 import asyncio
@@ -20,12 +27,30 @@ import uuid
 from collections import deque
 from typing import Any, Optional
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 
-# ============================ ПРОТОКОЛ ============================
-T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_USERS, T_PING, T_PONG, T_ERROR = range(1, 9)
+# ============================ CONFIG ============================
+PUBLIC_DOMAIN = os.getenv("DOMAIN", "").strip().lower().rstrip("/")
+FED_SCHEME_ENV = os.getenv("SCHEME", "").strip().lower()
+FED_TIMEOUT = 6.0
+PORT = int(os.getenv("PORT", "8000"))
+
+
+def fed_scheme_for(domain: str) -> str:
+    if FED_SCHEME_ENV:
+        return FED_SCHEME_ENV
+    if domain.startswith("localhost") or domain.startswith("127."):
+        return "http"
+    return "https"
+
+
+# ============================ PROTOCOL ============================
+# [type:uint8][length:uint32 BE][JSON UTF-8]
+(T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
+ T_HELLO, T_USER_STATUS, T_SYNC, T_USERS) = range(1, 12)
 _HDR = struct.Struct(">BI")
 
 
@@ -39,22 +64,49 @@ def unpack(data: bytes):
     return t, json.loads(data[5:5 + ln].decode("utf-8"))
 
 
-# ============================ СОСТОЯНИЕ (RAM) ============================
-users: dict[str, dict] = {}      # login -> {salt, pw, pub}
+# ============================ STATE (RAM) ============================
+users: dict[str, dict] = {}         # login -> {salt, pw, pub}
+online: dict[str, "Client"] = {}    # login -> Client
 messages: deque = deque(maxlen=5000)
-online: dict[str, "Client"] = {}
+
+_canonical_domain: Optional[str] = PUBLIC_DOMAIN or None
 
 
-def _scrypt(pw: str, salt: bytes) -> bytes:
+def self_domain(scope) -> str:
+    """Публичный домен этого сервера. Если DOMAIN не задан — берём Host первого запроса."""
+    global _canonical_domain
+    if _canonical_domain:
+        return _canonical_domain
+    host = (scope.headers.get("host") or "localhost").lower()
+    _canonical_domain = host
+    return host
+
+
+def scrypt_hash(pw: str, salt: bytes) -> bytes:
     return hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
 
 
-class Client:
-    __slots__ = ("ws", "login", "lock")
+def parse_uid(uid: str) -> tuple[str, str]:
+    """'bob@server.com' -> ('bob', 'server.com'); 'bob' -> ('bob', '')"""
+    uid = (uid or "").strip().lower()
+    if "@" in uid:
+        login, d = uid.split("@", 1)
+        return login, d.strip()
+    return uid, ""
 
-    def __init__(self, ws: WebSocket):
+
+def make_uid(login: str, domain: str) -> str:
+    return f"{login}@{domain}"
+
+
+# ============================ CLIENT ============================
+class Client:
+    __slots__ = ("ws", "login", "domain", "lock")
+
+    def __init__(self, ws: WebSocket, domain: str):
         self.ws = ws
         self.login: Optional[str] = None
+        self.domain = domain
         self.lock = asyncio.Lock()
 
     async def send(self, t: int, o: Any):
@@ -65,17 +117,10 @@ class Client:
                 pass
 
 
-def public_users() -> list[dict]:
-    return [
-        {"login": l, "pub": u["pub"], "online": l in online}
-        for l, u in users.items()
-    ]
-
-
-async def broadcast_users():
+async def broadcast_status(uid: str, is_online: bool):
     if not online:
         return
-    frame = pack(T_USERS, {"users": public_users()})
+    frame = pack(T_USER_STATUS, {"uid": uid, "online": is_online})
     for c in list(online.values()):
         async with c.lock:
             try:
@@ -84,24 +129,23 @@ async def broadcast_users():
                 pass
 
 
+# ============================ HANDLERS ============================
 async def handle_register(c: Client, obj: dict):
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
     pub = obj.get("pub") or ""
-
     if not login or not pw or not pub:
         return await c.send(T_ERROR, {"msg": "Заполните все поля"})
     if not (3 <= len(login) <= 24):
         return await c.send(T_ERROR, {"msg": "Логин: 3–24 символа"})
     if not all(ch.isalnum() or ch in "_-." for ch in login):
-        return await c.send(T_ERROR, {"msg": "Логин: только буквы, цифры, _ - ."})
+        return await c.send(T_ERROR, {"msg": "Логин: только a-z 0-9 _ - ."})
     if len(pw) < 6:
         return await c.send(T_ERROR, {"msg": "Пароль минимум 6 символов"})
     if login in users:
         return await c.send(T_ERROR, {"msg": "Логин уже занят"})
-
     salt = os.urandom(16)
-    users[login] = {"salt": salt, "pw": _scrypt(pw, salt), "pub": pub}
+    users[login] = {"salt": salt, "pw": scrypt_hash(pw, salt), "pub": pub}
     await _finish_auth(c, login)
 
 
@@ -109,7 +153,7 @@ async def handle_auth(c: Client, obj: dict):
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
     u = users.get(login)
-    if not u or not secrets.compare_digest(u["pw"], _scrypt(pw, u["salt"])):
+    if not u or not secrets.compare_digest(u["pw"], scrypt_hash(pw, u["salt"])):
         return await c.send(T_ERROR, {"msg": "Неверный логин или пароль"})
     if login in online:
         return await c.send(T_ERROR, {"msg": "Вы уже вошли с другого устройства"})
@@ -119,34 +163,70 @@ async def handle_auth(c: Client, obj: dict):
 async def _finish_auth(c: Client, login: str):
     c.login = login
     online[login] = c
-    hist = [m for m in messages if m["from"] == login or m["to"] == login]
-    await c.send(T_AUTH_OK, {"login": login, "users": public_users(), "history": hist})
-    await broadcast_users()
+    my_uid = make_uid(login, c.domain)
+    hist = [m for m in messages if m["from"] == my_uid or m["to"] == my_uid]
+    await c.send(T_AUTH_OK, {
+        "login": login, "uid": my_uid,
+        "domain": c.domain, "history": hist,
+    })
+    await broadcast_status(my_uid, True)
+
+
+async def handle_sync(c: Client, obj: dict):
+    """Клиент присылает свои контакты — сервер отвечает статусами (только для локальных)."""
+    uids = obj.get("uids") or []
+    result = []
+    for uid in uids:
+        uid = (uid or "").strip().lower()
+        login, domain = parse_uid(uid)
+        if not domain or domain == c.domain:
+            result.append({"uid": uid, "online": login in online})
+        else:
+            result.append({"uid": uid, "online": None})
+    await c.send(T_USERS, {"users": result})
 
 
 async def handle_msg(c: Client, obj: dict):
-    to = (obj.get("to") or "").strip().lower()
+    to_uid = (obj.get("to") or "").strip().lower()
+    to_login, to_domain = parse_uid(to_uid)
+    if not to_login:
+        return
+    if to_login == c.login and (not to_domain or to_domain == c.domain):
+        return await c.send(T_ERROR, {"msg": "Нельзя писать самому себе"})
     ct = obj.get("ct") or ""
     iv = obj.get("iv") or ""
-    mid = obj.get("id") or uuid.uuid4().hex
-
-    if not to or not ct or not iv:
+    if not ct or not iv:
         return
-    if to not in users:
-        return await c.send(T_ERROR, {"msg": "Получатель не найден"})
-    if to == c.login:
-        return await c.send(T_ERROR, {"msg": "Нельзя писать самому себе"})
-
-    msg = {"id": mid, "from": c.login, "to": to, "ct": ct, "iv": iv,
-           "ts": int(time.time() * 1000)}
+    mid = obj.get("id") or uuid.uuid4().hex
+    from_uid = make_uid(c.login, c.domain)
+    msg = {
+        "id": mid, "from": from_uid, "to": to_uid,
+        "ct": ct, "iv": iv,
+        "from_pub": obj.get("from_pub", ""),
+        "ts": int(time.time() * 1000),
+    }
     messages.append(msg)
+    await c.send(T_MSG, msg)                        # эхо отправителю
+    if not to_domain or to_domain == c.domain:
+        target = online.get(to_login)
+        if target:
+            await target.send(T_MSG, msg)
+    else:
+        asyncio.create_task(fed_send(to_domain, msg))
 
-    target = online.get(to)
-    if target is not None:
-        await target.send(T_MSG, msg)
-    await c.send(T_MSG, msg)
+
+async def fed_send(domain: str, msg: dict):
+    url = f"{fed_scheme_for(domain)}://{domain}/fed/msg"
+    try:
+        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
+            r = await cx.post(url, json=msg)
+            if r.status_code != 200:
+                print(f"[fed] {domain} -> {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[fed] send to {domain} failed: {e}")
 
 
+# ============================ HTTP / WS ============================
 app = FastAPI()
 
 
@@ -155,10 +235,77 @@ async def index():
     return HTMLResponse(HTML_PAGE)
 
 
+@app.get("/api/pubkey")
+async def api_pubkey(uid: str, request: Request):
+    """Клиент узнаёт публичный ключ контакта (локального или удалённого)."""
+    uid = (uid or "").strip().lower()
+    login, domain = parse_uid(uid)
+    my_domain = self_domain(request)
+    if not login:
+        return JSONResponse({"error": "Пустой uid"}, status_code=400)
+    if not domain or domain == my_domain:
+        u = users.get(login)
+        if not u:
+            return JSONResponse({"error": "Пользователь не найден"}, status_code=404)
+        return {"uid": make_uid(login, my_domain), "pub": u["pub"],
+                "online": login in online}
+    url = f"{fed_scheme_for(domain)}://{domain}/fed/pub/{login}"
+    try:
+        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
+            r = await cx.get(url)
+            if r.status_code != 200:
+                return JSONResponse({"error": "Пользователь не найден на удалённом сервере"},
+                                    status_code=404)
+            data = r.json()
+            return {"uid": make_uid(login, domain), "pub": data["pub"], "online": None}
+    except Exception as e:
+        return JSONResponse({"error": f"Сервер недоступен: {e}"}, status_code=502)
+
+
+@app.get("/fed/pub/{login}")
+async def fed_pub(login: str):
+    u = users.get(login.lower())
+    if not u:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"login": login.lower(), "pub": u["pub"]}
+
+
+@app.post("/fed/msg")
+async def fed_msg(payload: dict, request: Request):
+    try:
+        to_uid = (payload.get("to") or "").strip().lower()
+        from_uid = (payload.get("from") or "").strip().lower()
+        to_login, to_domain = parse_uid(to_uid)
+        from_login, from_domain = parse_uid(from_uid)
+        my_domain = self_domain(request)
+        if to_domain != my_domain:
+            return JSONResponse({"error": "wrong domain"}, status_code=400)
+        if not from_domain or from_domain == my_domain:
+            return JSONResponse({"error": "invalid source"}, status_code=400)
+        if to_login not in users:
+            return JSONResponse({"error": "no such user"}, status_code=404)
+        msg = {
+            "id": payload.get("id") or uuid.uuid4().hex,
+            "from": from_uid, "to": to_uid,
+            "ct": payload["ct"], "iv": payload["iv"],
+            "from_pub": payload.get("from_pub", ""),
+            "ts": payload.get("ts") or int(time.time() * 1000),
+        }
+        messages.append(msg)
+        target = online.get(to_login)
+        if target:
+            await target.send(T_MSG, msg)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
-    c = Client(ws)
+    my_domain = self_domain(ws)
+    c = Client(ws, my_domain)
+    await c.send(T_HELLO, {"domain": my_domain})
     try:
         while True:
             raw = await ws.receive_bytes()
@@ -172,6 +319,8 @@ async def ws_handler(ws: WebSocket):
                 await handle_auth(c, obj)
             elif t == T_MSG and c.login:
                 await handle_msg(c, obj)
+            elif t == T_SYNC and c.login:
+                await handle_sync(c, obj)
             elif t == T_PING:
                 await c.send(T_PONG, {"t": obj.get("t", 0)})
     except WebSocketDisconnect:
@@ -181,10 +330,10 @@ async def ws_handler(ws: WebSocket):
     finally:
         if c.login and online.get(c.login) is c:
             online.pop(c.login, None)
-            await broadcast_users()
+            await broadcast_status(make_uid(c.login, c.domain), False)
 
 
-# ============================ HTML (Discord-white, SVG) ============================
+# ============================ HTML ============================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -209,14 +358,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden;overscroll-behavior:none}
-body{
-  background:var(--bg-primary);color:var(--text-normal);
-  font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-}
+body{background:var(--bg-primary);color:var(--text-normal);
+  font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 button{font:inherit;cursor:pointer;color:inherit}
 input{font:inherit}
 
-/* ================= LOGIN ================= */
+/* ---- spinner ---- */
+@keyframes spin{to{transform:rotate(360deg)}}
+button.busy{position:relative;color:transparent !important}
+button.busy::after{
+  content:"";position:absolute;top:50%;left:50%;
+  width:18px;height:18px;margin:-9px 0 0 -9px;
+  border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
+  border-radius:50%;animation:spin .7s linear infinite;
+}
+button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:var(--accent)}
+.spinner{display:inline-block;width:20px;height:20px;
+  border:2px solid var(--bg-tertiary);border-top-color:var(--accent);
+  border-radius:50%;animation:spin .7s linear infinite}
+
+/* ---- login ---- */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   padding:20px;background:var(--bg-secondary);z-index:100}
 .card{width:100%;max-width:400px;background:var(--bg-primary);border-radius:14px;
@@ -230,41 +391,42 @@ input{font:inherit}
   color:var(--text-normal);padding:12px 14px;border-radius:8px;outline:none;
   font-size:16px;margin-bottom:10px;transition:border .12s}
 .card input:focus{border-color:var(--accent)}
-.card input::placeholder{color:var(--text-muted)}
 #submitBtn{width:100%;background:var(--accent);color:#fff;border:none;padding:12px;
-  border-radius:8px;font-weight:600;margin-top:4px;transition:background .12s}
-#submitBtn:hover{background:var(--accent-hover)}
-#submitBtn:disabled{opacity:.55;cursor:default}
+  border-radius:8px;font-weight:600;margin-top:4px}
+#submitBtn:hover:not(:disabled){background:var(--accent-hover)}
+#submitBtn:disabled{cursor:default}
 #authErr{color:var(--red);font-size:13px;margin-top:10px;min-height:17px;text-align:center}
 #authNote{color:var(--text-muted);font-size:12px;margin-top:4px;text-align:center;line-height:1.35}
 
-/* ================= APP ================= */
+/* ---- app ---- */
 #app{display:none;height:100dvh}
 #app.on{display:flex}
 
-/* ---------- SIDEBAR (chat list) ---------- */
 #sidebar{width:320px;flex-shrink:0;background:var(--bg-secondary);
   display:flex;flex-direction:column;border-right:1px solid var(--border)}
-.sidebar-header{display:flex;align-items:center;gap:10px;padding:12px 14px;
-  padding-top:calc(12px + env(safe-area-inset-top));
+.sidebar-header{display:flex;align-items:center;gap:8px;padding:10px 12px;
+  padding-top:calc(10px + env(safe-area-inset-top));
   border-bottom:1px solid var(--border);background:var(--bg-primary)}
-.avatar{width:40px;height:40px;border-radius:50%;color:#fff;font-weight:600;
+.avatar{width:38px;height:38px;border-radius:50%;color:#fff;font-weight:600;
   display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  font-size:16px;text-transform:uppercase;user-select:none}
+  font-size:15px;text-transform:uppercase;user-select:none}
 .my-info{flex:1;min-width:0}
-.my-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.my-sub{font-size:12px;color:var(--text-muted);margin-top:1px}
-.icon-btn{background:none;border:none;color:var(--text-muted);padding:6px;
-  border-radius:6px;display:flex;align-items:center;justify-content:center;
-  transition:background .12s,color .12s}
+.my-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
+.my-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+.icon-btn{background:none;border:none;color:var(--text-muted);padding:7px;
+  border-radius:8px;display:flex;align-items:center;justify-content:center;
+  transition:background .12s,color .12s;flex-shrink:0}
 .icon-btn:hover{background:var(--bg-hover);color:var(--text-normal)}
 
 .sidebar-title{padding:14px 16px 6px;font-size:11px;font-weight:700;
   color:var(--text-muted);text-transform:uppercase;letter-spacing:.02em}
 
-#contacts{flex:1;overflow-y:auto;padding:0 8px 8px}
-.empty-list{padding:32px 20px;text-align:center;color:var(--text-muted);
-  font-size:13px;line-height:1.5}
+#contacts{flex:1;overflow-y:auto;padding:0 8px 8px;position:relative}
+.loading-wrap{display:flex;flex-direction:column;align-items:center;
+  justify-content:center;padding:40px 20px;gap:12px;color:var(--text-muted);font-size:13px}
+.empty-list{padding:32px 22px;text-align:center;color:var(--text-muted);
+  font-size:13px;line-height:1.55}
 
 .contact{display:flex;align-items:center;gap:11px;padding:8px 10px;
   border-radius:8px;cursor:pointer;transition:background .1s;user-select:none}
@@ -274,10 +436,12 @@ input{font:inherit}
 .status-dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
   border-radius:50%;background:#b9bbbe;border:3px solid var(--bg-secondary)}
 .status-dot.online{background:var(--green)}
+.status-dot.unknown{background:#c7ccd1}
 .contact.active .status-dot{border-color:var(--bg-active)}
 .contact-info{flex:1;min-width:0}
 .contact-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;color:var(--text-normal)}
+  white-space:nowrap;color:var(--text-normal);display:flex;align-items:baseline;gap:4px}
+.contact-name .dom{color:var(--text-muted);font-weight:400;font-size:12px}
 .contact-preview{font-size:13px;color:var(--text-muted);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
 .contact.unread .contact-name{color:#000}
@@ -286,33 +450,30 @@ input{font:inherit}
   min-width:20px;height:20px;padding:0 7px;border-radius:10px;
   display:flex;align-items:center;justify-content:center;flex-shrink:0;line-height:1}
 
-/* ---------- CHAT PANE ---------- */
-#chatPane{flex:1;display:flex;flex-direction:column;min-width:0;
-  background:var(--bg-primary)}
+/* ---- chat pane ---- */
+#chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-primary)}
 #emptyState{flex:1;display:flex;flex-direction:column;align-items:center;
   justify-content:center;color:var(--text-muted);gap:14px;padding:24px;text-align:center}
 #emptyState svg{opacity:.28}
 #emptyState p{font-size:14px}
-
 #conversation{display:none;flex-direction:column;flex:1;min-height:0}
 #chatPane.has-chat #conversation{display:flex}
 #chatPane.has-chat #emptyState{display:none}
-
 .conv-header{display:flex;align-items:center;gap:8px;padding:10px 14px;
   padding-top:calc(10px + env(safe-area-inset-top));
   border-bottom:1px solid var(--border);background:var(--bg-primary)}
 #backBtn{display:none}
 .conv-peer{display:flex;flex-direction:column;min-width:0;flex:1}
 .peer-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.peer-status{font-size:12px;color:var(--text-muted)}
-.peer-status.online{color:var(--green)}
+.peer-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
+.peer-sub.online{color:var(--green)}
 
 #msgs{flex:1;overflow-y:auto;padding:16px 16px 6px;display:flex;
   flex-direction:column;gap:4px;scroll-behavior:smooth}
-.m{max-width:70%;padding:8px 13px;border-radius:16px;
-  background:var(--bg-secondary);align-self:flex-start;
-  word-wrap:break-word;overflow-wrap:anywhere;
-  animation:pop .13s ease-out;color:var(--text-normal);font-size:15px;line-height:1.4}
+.m{max-width:70%;padding:8px 13px;border-radius:16px;background:var(--bg-secondary);
+  align-self:flex-start;word-wrap:break-word;overflow-wrap:anywhere;
+  animation:pop .13s ease-out;font-size:15px;line-height:1.4}
 @keyframes pop{from{opacity:.4;transform:translateY(3px)}to{opacity:1;transform:none}}
 .m.me{align-self:flex-end;background:var(--accent);color:#fff}
 .m .ts{font-size:11px;opacity:.65;margin-top:2px;display:block;text-align:right}
@@ -326,17 +487,37 @@ input{font:inherit}
   padding-bottom:calc(10px + env(safe-area-inset-bottom));
   border-top:1px solid var(--border);background:var(--bg-primary)}
 #inp{flex:1;background:var(--bg-secondary);border:1px solid transparent;
-  color:var(--text-normal);padding:11px 16px;border-radius:20px;
-  outline:none;font-size:16px;min-width:0;transition:border .12s}
+  color:var(--text-normal);padding:11px 16px;border-radius:20px;outline:none;
+  font-size:16px;min-width:0;transition:border .12s}
 #inp:focus{border-color:var(--accent)}
-#inp::placeholder{color:var(--text-muted)}
 #sendBtn{width:42px;height:42px;border-radius:50%;background:var(--accent);
   color:#fff;border:none;display:flex;align-items:center;justify-content:center;
   flex-shrink:0;transition:background .12s,transform .06s}
 #sendBtn:hover{background:var(--accent-hover)}
 #sendBtn:active{transform:scale(.94)}
 
-/* ================= MOBILE ================= */
+/* ---- modal ---- */
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);
+  display:none;align-items:center;justify-content:center;padding:20px;z-index:200}
+.modal-backdrop.open{display:flex}
+.modal{background:#fff;border-radius:14px;padding:22px;width:100%;max-width:420px;
+  box-shadow:0 20px 60px rgba(0,0,0,.25)}
+.modal h3{font-size:18px;margin-bottom:6px;font-weight:700}
+.modal .hint{color:var(--text-muted);font-size:13px;margin-bottom:14px;line-height:1.5}
+.modal input{width:100%;padding:12px 14px;border-radius:8px;
+  border:1px solid var(--border);background:var(--bg-secondary);
+  font-size:16px;outline:none;margin-bottom:10px;color:var(--text-normal)}
+.modal input:focus{border-color:var(--accent)}
+.modal .err{color:var(--red);font-size:13px;min-height:18px;margin-bottom:6px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+.btn-secondary{background:var(--bg-secondary);border:none;padding:10px 16px;
+  border-radius:8px;font-weight:500;color:var(--text-normal);transition:background .12s}
+.btn-secondary:hover{background:var(--bg-hover)}
+.btn-primary{background:var(--accent);color:#fff;border:none;
+  padding:10px 22px;border-radius:8px;font-weight:600;transition:background .12s}
+.btn-primary:hover:not(:disabled){background:var(--accent-hover)}
+.btn-primary:disabled,.btn-secondary:disabled{cursor:default}
+
 @media (max-width:720px){
   #app{position:relative;overflow:hidden}
   #sidebar{position:absolute;inset:0;width:100%;z-index:2;
@@ -352,7 +533,7 @@ input{font:inherit}
 </head>
 <body>
 
-<!-- ================= ЛОГИН ================= -->
+<!-- ===== LOGIN ===== -->
 <div id="login">
   <form class="card" id="authForm" autocomplete="on">
     <div class="tabs">
@@ -361,42 +542,43 @@ input{font:inherit}
     </div>
     <input id="loginIn" placeholder="Логин" autocapitalize="off"
            spellcheck="false" maxlength="24" autocomplete="username">
-    <input id="pwIn" type="password" placeholder="Пароль"
-           autocomplete="current-password">
+    <input id="pwIn" type="password" placeholder="Пароль" autocomplete="current-password">
     <button type="submit" id="submitBtn">Войти</button>
     <div id="authErr"></div>
     <div id="authNote"></div>
   </form>
 </div>
 
-<!-- ================= ПРИЛОЖЕНИЕ ================= -->
+<!-- ===== APP ===== -->
 <div id="app">
-  <!-- Список чатов + мой ник сверху -->
   <aside id="sidebar">
     <div class="sidebar-header">
       <div class="avatar" id="myAvatar">?</div>
       <div class="my-info">
         <div class="my-name" id="myLogin">—</div>
-        <div class="my-sub">в сети</div>
+        <div class="my-sub" id="myDomain"></div>
       </div>
+      <button class="icon-btn" id="addBtn" title="Добавить чат" aria-label="Добавить">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+        </svg>
+      </button>
       <button class="icon-btn" id="logoutBtn" title="Выйти" aria-label="Выйти">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path fill-rule="evenodd" clip-rule="evenodd"
-            d="M5 3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6v-2H5V5h6V3H5zm12.28 4.22 5.5 5.5-5.5 5.5-1.42-1.42 3.09-3.08H9v-2h9.95l-3.09-3.08 1.42-1.42z"/>
+          <path d="M16 13v-2H7V8l-5 4 5 4v-3zM20 3h-8v2h8v14h-8v2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/>
         </svg>
       </button>
     </div>
-    <div class="sidebar-title">Сообщения</div>
+    <div class="sidebar-title">Чаты</div>
     <div id="contacts"></div>
   </aside>
 
-  <!-- Правая панель / диалог -->
   <section id="chatPane">
     <div id="emptyState">
       <svg width="90" height="90" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm6 5H7v-2h6v2zm4-6H7V6h10v2z"/>
       </svg>
-      <p>Выберите чат, чтобы начать общение</p>
+      <p>Выберите чат или добавьте новый</p>
     </div>
 
     <div id="conversation">
@@ -408,7 +590,7 @@ input{font:inherit}
         </button>
         <div class="conv-peer">
           <div class="peer-name" id="peerName">—</div>
-          <div class="peer-status" id="peerStatus"></div>
+          <div class="peer-sub" id="peerSub"></div>
         </div>
       </div>
 
@@ -427,12 +609,31 @@ input{font:inherit}
   </section>
 </div>
 
+<!-- ===== ADD CONTACT MODAL ===== -->
+<div class="modal-backdrop" id="addModal">
+  <div class="modal">
+    <h3>Новый чат</h3>
+    <div class="hint">
+      Введите логин (<b>bob</b>) для пользователя этого сервера
+      или полный адрес (<b>bob@server.com</b>) для пользователя другого сервера.
+    </div>
+    <input id="addInput" placeholder="bob или bob@server.com"
+           autocapitalize="off" spellcheck="false" autocomplete="off">
+    <div class="err" id="addErr"></div>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="addCancel" type="button">Отмена</button>
+      <button class="btn-primary" id="addConfirm" type="button">Добавить</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (() => {
 "use strict";
 
-/* ==================== ПРОТОКОЛ ==================== */
-const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, USERS:5, PING:6, PONG:7, ERROR:8};
+/* ================= PROTOCOL ================= */
+const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
+           HELLO:8, USER_STATUS:9, SYNC:10, USERS:11};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -450,7 +651,7 @@ function unpack(buf){
   return [dv.getUint8(0), JSON.parse(_dec.decode(new Uint8Array(buf, 5, len)))];
 }
 
-/* ==================== CRYPTO ==================== */
+/* ================= CRYPTO ================= */
 function b64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function unb64(s){ const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
 
@@ -460,9 +661,7 @@ async function genKeyPair(){
 async function exportPubRaw(pub){
   return b64(new Uint8Array(await crypto.subtle.exportKey("raw", pub)));
 }
-async function exportPrivJWK(priv){
-  return await crypto.subtle.exportKey("jwk", priv);
-}
+async function exportPrivJWK(priv){ return await crypto.subtle.exportKey("jwk", priv); }
 async function importPrivJWK(jwk){
   return crypto.subtle.importKey("jwk",jwk,{name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]);
 }
@@ -483,15 +682,17 @@ async function aesDecrypt(key, ct, iv){
   return _dec.decode(pt);
 }
 
-/* ==================== СОСТОЯНИЕ КЛИЕНТА ==================== */
+/* ================= STATE ================= */
 let ws = null;
-let me = null;
+let helloDomain = null;
+let me = null;                    // {login, uid}
 let myPrivKey = null;
+let myPubRaw = null;
 let sessionPassword = null;
-let usersList = [];
-const convKeys = {};
-const threads = {};
-const unread = {};
+let contacts = [];                // [{uid, pub, online}]
+const convKeys = {};              // uid -> CryptoKey
+const threads = {};               // uid -> [{id, from, to, text, ts, broken}]
+const unread = {};                // uid -> count
 const seenIds = new Set();
 let activePeer = null;
 let reconnectAttempts = 0;
@@ -500,107 +701,162 @@ let mode = "login";
 let authPayload = null;
 
 const $ = id => document.getElementById(id);
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+                   : Date.now().toString(36) + Math.random().toString(36).slice(2,10));
 
-/* ==================== АВАТАРНЫЕ ЦВЕТА ==================== */
-function avatarColor(login){
+/* ================= UTILS ================= */
+function splitUid(uid){
+  const i = uid.indexOf("@");
+  if (i < 0) return [uid, ""];
+  return [uid.slice(0, i), uid.slice(i+1)];
+}
+function displayUid(uid){
+  const [login, dom] = splitUid(uid);
+  if (!dom || (helloDomain && dom === helloDomain)) return login;
+  return login + "@" + dom;
+}
+function avatarColor(uid){
   const colors = ["#5865f2","#3ba55d","#faa61a","#ed4245","#eb459e","#9b59b6","#1abc9c","#e67e22"];
   let h = 0;
-  for (let i=0;i<login.length;i++) h = (h * 31 + login.charCodeAt(i)) | 0;
+  for (let i=0;i<uid.length;i++) h = (h * 31 + uid.charCodeAt(i)) | 0;
   return colors[Math.abs(h) % colors.length];
 }
-function avatarChar(login){ return (login || "?")[0].toUpperCase(); }
+function avatarChar(uid){ return (uid || "?")[0].toUpperCase(); }
 
-/* ==================== РЕНДЕР СПИСКА ЧАТОВ ==================== */
+/* ================= STORAGE ================= */
+function lsKey(){
+  return "fed_key_" + (me ? me.uid : "unknown");
+}
+function lsContacts(){
+  return "fed_contacts_" + (me ? me.uid : "unknown");
+}
+function saveContacts(){
+  try {
+    localStorage.setItem(lsContacts(),
+      JSON.stringify(contacts.map(c => ({uid: c.uid, pub: c.pub}))));
+  } catch(e){}
+}
+function loadContacts(){
+  try {
+    const raw = localStorage.getItem(lsContacts());
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return arr.map(c => ({uid: c.uid, pub: c.pub, online: null}));
+  } catch(e){ return []; }
+}
+
+/* ================= CONTACT LIST RENDER ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
-  const others = usersList.filter(u => u.login !== me);
-  if (!others.length){
+
+  if (!contacts.length){
     const d = document.createElement("div");
     d.className = "empty-list";
-    d.textContent = "Пока никого нет. Зарегистрируйте второго пользователя в другом браузере.";
+    d.innerHTML = "Пока нет чатов.<br>Нажмите <b>+</b> сверху, чтобы добавить пользователя по логину или адресу.";
     box.appendChild(d);
     return;
   }
-  // Сортировка: сначала те, у кого есть переписка (по времени), потом online, потом по алфавиту
-  others.sort((a,b) => {
-    const la = threads[a.login] || [], lb = threads[b.login] || [];
+
+  // сортировка: сначала с непрочитанными, потом по времени последнего, потом online, потом по имени
+  const sorted = contacts.slice().sort((a,b) => {
+    const ua = unread[a.uid] > 0 ? 1 : 0;
+    const ub = unread[b.uid] > 0 ? 1 : 0;
+    if (ua !== ub) return ub - ua;
+    const la = threads[a.uid] || [], lb = threads[b.uid] || [];
     const ta = la.length ? la[la.length-1].ts : 0;
     const tb = lb.length ? lb[lb.length-1].ts : 0;
     if (ta !== tb) return tb - ta;
-    if (a.online !== b.online) return a.online ? -1 : 1;
-    return a.login.localeCompare(b.login);
+    const oa = a.online === true ? 1 : 0, ob = b.online === true ? 1 : 0;
+    if (oa !== ob) return ob - oa;
+    return a.uid.localeCompare(b.uid);
   });
-  for (const u of others){
-    const isActive = u.login === activePeer;
-    const hasUnread = unread[u.login] > 0;
+
+  for (const c of sorted){
+    const isActive = c.uid === activePeer;
+    const hasUnread = unread[c.uid] > 0;
     const el = document.createElement("div");
     el.className = "contact" + (isActive ? " active" : "") + (hasUnread ? " unread" : "");
-    el.onclick = () => selectPeer(u.login);
+    el.onclick = () => selectPeer(c.uid);
 
     const wrap = document.createElement("div");
     wrap.className = "avatar-wrap";
     const av = document.createElement("div");
     av.className = "avatar";
-    av.style.background = avatarColor(u.login);
-    av.textContent = avatarChar(u.login);
+    av.style.background = avatarColor(c.uid);
+    av.textContent = avatarChar(c.uid);
     const dot = document.createElement("span");
-    dot.className = "status-dot" + (u.online ? " online" : "");
+    const st = c.online === true ? "online" : (c.online === false ? "" : "unknown");
+    dot.className = "status-dot " + st;
     wrap.append(av, dot);
 
     const info = document.createElement("div");
     info.className = "contact-info";
     const nm = document.createElement("div");
     nm.className = "contact-name";
-    nm.textContent = u.login;
+    const [login, dom] = splitUid(c.uid);
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = login;
+    nm.appendChild(nameSpan);
+    if (dom && helloDomain && dom !== helloDomain){
+      const d = document.createElement("span");
+      d.className = "dom";
+      d.textContent = "@" + dom;
+      nm.appendChild(d);
+    }
     const pv = document.createElement("div");
     pv.className = "contact-preview";
-    const t = threads[u.login];
+    const t = threads[c.uid];
     if (t && t.length){
       const last = t[t.length-1];
-      const mine = last.from === me;
-      pv.textContent = (mine ? "Вы: " : "") + (last.broken ? "⚠ зашифровано" : last.text);
+      const mine = last.from === me.uid;
+      pv.textContent = (mine ? "Вы: " : "") +
+        (last.broken ? "⚠ зашифровано" : last.text);
     } else {
-      pv.textContent = u.online ? "в сети" : "не в сети";
+      pv.textContent = c.online === true ? "в сети"
+                    : (c.online === false ? "не в сети" : "статус неизвестен");
     }
     info.append(nm, pv);
-
     el.append(wrap, info);
 
     if (hasUnread){
       const b = document.createElement("span");
       b.className = "badge";
-      b.textContent = unread[u.login] > 99 ? "99+" : unread[u.login];
+      b.textContent = unread[c.uid] > 99 ? "99+" : unread[c.uid];
       el.appendChild(b);
     }
     box.appendChild(el);
   }
 }
 
-/* ==================== ВЫБОР ЧАТА ==================== */
-function selectPeer(login){
-  activePeer = login;
-  unread[login] = 0;
+/* ================= SELECT CHAT ================= */
+function selectPeer(uid){
+  activePeer = uid;
+  unread[uid] = 0;
+  const [login, dom] = splitUid(uid);
   $("peerName").textContent = login;
-  const u = usersList.find(x => x.login === login);
-  const st = $("peerStatus");
-  st.textContent = u && u.online ? "в сети" : "не в сети";
-  st.className = "peer-status" + (u && u.online ? " online" : "");
+  const c = contacts.find(x => x.uid === uid);
+  const sub = $("peerSub");
+  const parts = [];
+  if (dom && helloDomain && dom !== helloDomain) parts.push("@" + dom);
+  if (c){
+    if (c.online === true) parts.push("в сети");
+    else if (c.online === false) parts.push("не в сети");
+    else if (dom && dom !== helloDomain) parts.push("другой сервер");
+  }
+  sub.textContent = parts.join(" · ");
+  sub.className = "peer-sub" + (c && c.online === true ? " online" : "");
+
   $("chatPane").classList.add("has-chat");
-  $("app").classList.add("chat-open");   // для мобильной анимации
+  $("app").classList.add("chat-open");
   renderContacts();
   renderThread();
   setTimeout(() => $("inp").focus(), 60);
 }
+function goBack(){ $("app").classList.remove("chat-open"); }
 
-function goBack(){
-  $("app").classList.remove("chat-open");
-}
-
-/* ==================== РЕНДЕР ДИАЛОГА ==================== */
-function fmtTime(ts){
-  return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
-}
+/* ================= RENDER THREAD ================= */
+function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); }
 function fmtDay(ts){
   const d = new Date(ts), t = new Date();
   if (d.toDateString() === t.toDateString()) return "Сегодня";
@@ -609,7 +865,7 @@ function fmtDay(ts){
   return d.toLocaleDateString();
 }
 function buildMsgEl(m){
-  const mine = m.from === me;
+  const mine = m.from === me.uid;
   const el = document.createElement("div");
   el.className = "m" + (mine ? " me" : "") + (m.broken ? " broken" : "");
   const txt = document.createElement("div");
@@ -626,8 +882,7 @@ function appendMsg(m){
   const seps = box.querySelectorAll(".day-sep");
   if (!seps.length || seps[seps.length-1].textContent !== day){
     const s = document.createElement("div");
-    s.className = "day-sep";
-    s.textContent = day;
+    s.className = "day-sep"; s.textContent = day;
     box.appendChild(s);
   }
   box.appendChild(buildMsgEl(m));
@@ -644,8 +899,7 @@ function renderThread(){
     if (day !== lastDay){
       lastDay = day;
       const s = document.createElement("div");
-      s.className = "day-sep";
-      s.textContent = day;
+      s.className = "day-sep"; s.textContent = day;
       box.appendChild(s);
     }
     box.appendChild(buildMsgEl(m));
@@ -653,20 +907,19 @@ function renderThread(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ==================== КЛЮЧ ДИАЛОГА ==================== */
-async function getConvKey(peer){
-  if (convKeys[peer]) return convKeys[peer];
-  const u = usersList.find(x => x.login === peer);
-  if (!u || !u.pub) return null;
+/* ================= CONV KEY ================= */
+async function getConvKey(contact){
+  if (convKeys[contact.uid]) return convKeys[contact.uid];
+  if (!contact.pub || !myPrivKey) return null;
   try {
-    const pub = await importPubRaw(u.pub);
+    const pub = await importPubRaw(contact.pub);
     const key = await deriveAesKey(myPrivKey, pub);
-    convKeys[peer] = key;
+    convKeys[contact.uid] = key;
     return key;
   } catch(e){ return null; }
 }
 
-/* ==================== WS ==================== */
+/* ================= WS ================= */
 function connect(){
   return new Promise((resolve, reject) => {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -675,11 +928,12 @@ function connect(){
     let settled = false;
     const to = setTimeout(() => {
       if (!settled){ settled = true; try{ws.close();}catch(e){}; reject(new Error("Таймаут")); }
-    }, 8000);
+    }, 10000);
     ws.onopen = () => ws.send(pack(mode === "register" ? T.REGISTER : T.AUTH, authPayload));
     ws.onmessage = async ev => {
       let type, obj;
       try { [type, obj] = unpack(ev.data); } catch(e){ return; }
+      if (type === T.HELLO){ helloDomain = obj.domain; return; }
       if (!settled){
         if (type === T.AUTH_OK){ settled = true; clearTimeout(to); resolve(obj); return; }
         if (type === T.ERROR){ settled = true; clearTimeout(to);
@@ -699,105 +953,184 @@ function connect(){
 
 async function handleFrame(type, obj){
   switch(type){
-    case T.MSG:   await onIncomingMsg(obj); break;
-    case T.USERS: usersList = obj.users || []; renderContacts();
-                  if (activePeer){
-                    const u = usersList.find(x => x.login === activePeer);
-                    const st = $("peerStatus");
-                    if (u){
-                      st.textContent = u.online ? "в сети" : "не в сети";
-                      st.className = "peer-status" + (u.online ? " online" : "");
-                    }
-                  }
-                  break;
-    case T.PING:  if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
-    case T.PONG:  break;
-    case T.ERROR: console.warn("server error:", obj.msg); break;
+    case T.MSG: await onIncomingMsg(obj); break;
+    case T.USER_STATUS: {
+      const c = contacts.find(x => x.uid === obj.uid);
+      if (c){ c.online = obj.online; renderContacts();
+        if (activePeer === obj.uid) selectPeer(obj.uid);
+      }
+      break;
+    }
+    case T.USERS: {
+      for (const u of (obj.users || [])){
+        const c = contacts.find(x => x.uid === u.uid);
+        if (c) c.online = u.online;
+      }
+      renderContacts();
+      break;
+    }
+    case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
+    case T.PONG: break;
+    case T.ERROR: console.warn("server:", obj.msg); break;
   }
 }
 
 async function onIncomingMsg(m){
-  if (!m || seenIds.has(m.id)) return;
+  if (seenIds.has(m.id)) return;
   seenIds.add(m.id);
-  const peer = m.from === me ? m.to : m.from;
-  const key = await getConvKey(peer);
-  let text, broken = false;
-  if (!key){ text = "⚠ нет ключа для расшифровки"; broken = true; }
-  else {
-    try { text = await aesDecrypt(key, m.ct, m.iv); }
-    catch(e){ text = "⚠ не удалось расшифровать"; broken = true; }
+  const peerUid = m.from === me.uid ? m.to : m.from;
+
+  let contact = contacts.find(c => c.uid === peerUid);
+  if (!contact){
+    // авто-добавление: либо из from_pub, либо запросом
+    const pub = (m.from !== me.uid && m.from_pub) ? m.from_pub : "";
+    if (pub){
+      contact = {uid: peerUid, pub, online: null};
+      contacts.push(contact); saveContacts(); renderContacts();
+    } else if (m.from !== me.uid){
+      try {
+        const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(peerUid));
+        if (r.ok){
+          const d = await r.json();
+          contact = {uid: peerUid, pub: d.pub, online: d.online};
+          contacts.push(contact); saveContacts(); renderContacts();
+        }
+      } catch(e){}
+    }
   }
-  const msg = {id:m.id, from:m.from, to:m.to, text, ts:m.ts, broken};
-  if (!threads[peer]) threads[peer] = [];
-  threads[peer].push(msg);
-  if (activePeer === peer){
+
+  let text, broken = false;
+  if (!contact){
+    text = "⚠ неизвестный отправитель"; broken = true;
+  } else {
+    const key = await getConvKey(contact);
+    if (!key){ text = "⚠ нет ключа для расшифровки"; broken = true; }
+    else {
+      try { text = await aesDecrypt(key, m.ct, m.iv); }
+      catch(e){ text = "⚠ не удалось расшифровать"; broken = true; }
+    }
+  }
+
+  const msg = {id: m.id, from: m.from, to: m.to, text, ts: m.ts, broken};
+  (threads[peerUid] = threads[peerUid] || []).push(msg);
+
+  if (activePeer === peerUid){
     appendMsg(msg);
     renderContacts();
   } else {
-    unread[peer] = (unread[peer] || 0) + 1;
+    unread[peerUid] = (unread[peerUid] || 0) + 1;
     renderContacts();
   }
 }
 
-/* ==================== АВТОРИЗАЦИЯ ==================== */
+/* ================= AUTH ================= */
 function setErr(m){ $("authErr").textContent = m || ""; }
 function setNote(m){ $("authNote").textContent = m || ""; }
+function setBusy(btn, busy){ btn.disabled = busy; btn.classList.toggle("busy", busy); }
 
 async function doAuth(login, password){
-  login = login.trim().toLowerCase();
+  login = (login || "").trim().toLowerCase();
   if (!login || !password){ setErr("Заполните все поля"); return; }
   if (!/^[a-z0-9._-]{3,24}$/.test(login)){ setErr("Логин 3–24: a-z 0-9 . _ -"); return; }
   if (mode === "register" && password.length < 6){ setErr("Пароль минимум 6 символов"); return; }
   setErr(""); setNote("");
 
-  const lsKey = "nexus_dm_key_" + login;
-  if (mode === "register"){
-    const kp = await genKeyPair();
-    myPrivKey = kp.privateKey;
-    localStorage.setItem(lsKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
-    const pubRaw = await exportPubRaw(kp.publicKey);
-    authPayload = {login, password, pub: pubRaw};
-  } else {
-    const saved = localStorage.getItem(lsKey);
-    if (!saved){
-      setNote("⚠ Приватный ключ не найден в этом браузере — старые сообщения не расшифруются.");
-    } else {
-      try { myPrivKey = await importPrivJWK(JSON.parse(saved)); }
-      catch(e){ setNote("⚠ Ключ повреждён."); }
-    }
-    authPayload = {login, password};
-  }
+  const storeKey = "fed_key_" + login;
 
-  $("submitBtn").disabled = true;
   try {
+    if (mode === "register"){
+      const kp = await genKeyPair();
+      myPrivKey = kp.privateKey;
+      localStorage.setItem(storeKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
+      myPubRaw = await exportPubRaw(kp.publicKey);
+      authPayload = {login, password, pub: myPubRaw};
+    } else {
+      const saved = localStorage.getItem(storeKey);
+      if (!saved){
+        setNote("⚠ Приватный ключ не найден в этом браузере — старые сообщения не расшифруются.");
+        // Генерируем новый ключ — сможем получать новые сообщения, но не читать старые.
+        const kp = await genKeyPair();
+        myPrivKey = kp.privateKey;
+        localStorage.setItem(storeKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
+        myPubRaw = await exportPubRaw(kp.publicKey);
+      } else {
+        try {
+          myPrivKey = await importPrivJWK(JSON.parse(saved));
+          // Публичный из приватного через ECDH нельзя достать напрямую — но нам нужен только приват для получения.
+          // myPubRaw заполним после AUTH_OK через отдельный запрос.
+        } catch(e){ setNote("⚠ Ключ повреждён."); }
+      }
+      authPayload = {login, password};
+    }
+
+    setBusy($("submitBtn"), true);
     const ok = await connect();
     sessionPassword = password;
-    me = ok.login;
-    usersList = ok.users || [];
-    await loadHistory(ok.history || []);
-    $("myLogin").textContent = "@" + me;
-    $("myAvatar").textContent = avatarChar(me);
-    $("myAvatar").style.background = avatarColor(me);
+    me = {login: ok.login, uid: ok.uid};
+    if (!myPubRaw && myPrivKey){
+      // Восстановили приватный ключ — узнаем публичный через /api/pubkey
+      try {
+        const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(me.uid));
+        if (r.ok){ const d = await r.json(); myPubRaw = d.pub; }
+      } catch(e){}
+    }
+
+    // UI
+    $("myLogin").textContent = me.login;
+    $("myDomain").textContent = "@" + (helloDomain || "");
+    $("myAvatar").textContent = avatarChar(me.login);
+    $("myAvatar").style.background = avatarColor(me.uid);
     $("login").style.display = "none";
     $("app").classList.add("on");
+
+    // Контакты из LS
+    contacts = loadContacts();
     renderContacts();
+
+    // История с сервера
+    await loadHistory(ok.history || []);
+
+    // Запрос статусов
+    if (contacts.length){
+      ws.send(pack(T.SYNC, {uids: contacts.map(c => c.uid)}));
+    }
+
     startHeartbeat();
     reconnectAttempts = 0;
   } catch(e){
     setErr(e.message || "Ошибка");
-    $("submitBtn").disabled = false;
+    setBusy($("submitBtn"), false);
   }
 }
 
 async function loadHistory(history){
   const byPeer = {};
   for (const m of history){
-    const peer = m.from === me ? m.to : m.from;
+    const peer = m.from === me.uid ? m.to : m.from;
     (byPeer[peer] = byPeer[peer] || []).push(m);
     seenIds.add(m.id);
+    // Если увидели from_pub для контакта которого нет — добавим
+    if (m.from !== me.uid && m.from_pub){
+      if (!contacts.find(c => c.uid === m.from)){
+        contacts.push({uid: m.from, pub: m.from_pub, online: null});
+      }
+    }
   }
+  saveContacts();
+
   for (const peer of Object.keys(byPeer)){
-    const key = await getConvKey(peer);
+    let contact = contacts.find(c => c.uid === peer);
+    if (!contact){
+      try {
+        const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(peer));
+        if (r.ok){
+          const d = await r.json();
+          contact = {uid: peer, pub: d.pub, online: d.online};
+          contacts.push(contact);
+        }
+      } catch(e){}
+    }
+    const key = contact ? await getConvKey(contact) : null;
     const list = byPeer[peer].sort((a,b) => a.ts - b.ts);
     const out = [];
     for (const m of list){
@@ -811,22 +1144,25 @@ async function loadHistory(history){
     }
     threads[peer] = out;
   }
+  saveContacts();
+  renderContacts();
 }
 
-/* ==================== ОТПРАВКА ==================== */
+/* ================= SEND ================= */
 async function sendMessage(){
   if (!activePeer || !ws || ws.readyState !== 1) return;
   const inp = $("inp");
   const text = inp.value.trim();
   if (!text) return;
-  const key = await getConvKey(activePeer);
+  const contact = contacts.find(c => c.uid === activePeer);
+  if (!contact){ alert("Контакт не найден"); return; }
+  const key = await getConvKey(contact);
   if (!key){ alert("Нет ключа получателя"); return; }
 
   const {ct, iv} = await aesEncrypt(key, text);
-  const id = (crypto.randomUUID && crypto.randomUUID()) ||
-             (Date.now().toString(36) + Math.random().toString(36).slice(2,8));
+  const id = uuid();
 
-  const localMsg = {id, from: me, to: activePeer, text, ts: Date.now()};
+  const localMsg = {id, from: me.uid, to: activePeer, text, ts: Date.now()};
   seenIds.add(id);
   (threads[activePeer] = threads[activePeer] || []).push(localMsg);
   appendMsg(localMsg);
@@ -835,10 +1171,61 @@ async function sendMessage(){
   inp.value = "";
   inp.focus();
 
-  ws.send(pack(T.MSG, {id, to: activePeer, ct, iv}));
+  ws.send(pack(T.MSG, {id, to: activePeer, ct, iv, from_pub: myPubRaw}));
 }
 
-/* ==================== ПЕРЕПОДКЛЮЧЕНИЕ ==================== */
+/* ================= ADD CONTACT ================= */
+function openAddModal(){
+  $("addInput").value = "";
+  $("addErr").textContent = "";
+  $("addModal").classList.add("open");
+  setTimeout(() => $("addInput").focus(), 40);
+}
+function closeAddModal(){
+  $("addModal").classList.remove("open");
+  setBusy($("addConfirm"), false);
+}
+
+async function addContactFromInput(){
+  const raw = $("addInput").value.trim().toLowerCase();
+  const err = $("addErr");
+  err.textContent = "";
+  if (!raw){ err.textContent = "Введите логин или адрес"; return; }
+
+  let uid = raw;
+  if (!uid.includes("@")){
+    if (!helloDomain){ err.textContent = "Неизвестен домен сервера"; return; }
+    uid = uid + "@" + helloDomain;
+  }
+  const [login, dom] = splitUid(uid);
+  if (!login || !dom){ err.textContent = "Неверный формат"; return; }
+  if (uid === me.uid){ err.textContent = "Это ваш собственный адрес"; return; }
+  if (contacts.find(c => c.uid === uid)){ err.textContent = "Уже добавлен"; return; }
+
+  setBusy($("addConfirm"), true);
+  try {
+    const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(uid));
+    if (!r.ok){
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || "Не удалось получить ключ");
+    }
+    const data = await r.json();
+    contacts.push({uid: data.uid, pub: data.pub, online: data.online});
+    saveContacts();
+    renderContacts();
+    // запрос статуса
+    if (ws && ws.readyState === 1){
+      ws.send(pack(T.SYNC, {uids: [data.uid]}));
+    }
+    closeAddModal();
+    selectPeer(data.uid);
+  } catch(e){
+    err.textContent = e.message || "Ошибка";
+    setBusy($("addConfirm"), false);
+  }
+}
+
+/* ================= HEARTBEAT / RECONNECT ================= */
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
@@ -850,13 +1237,12 @@ async function onDisconnect(){
   if (!sessionPassword) return;
   if (reconnectAttempts >= 5){ alert("Соединение потеряно. Обновите страницу."); return; }
   reconnectAttempts++;
-  const login = me, pw = sessionPassword;
   try {
-    authPayload = {login, password: pw};
+    authPayload = {login: me.login, password: sessionPassword};
     mode = "login";
     const ok = await connect();
-    usersList = ok.users || [];
-    renderContacts();
+    me = {login: ok.login, uid: ok.uid};
+    if (contacts.length) ws.send(pack(T.SYNC, {uids: contacts.map(c => c.uid)}));
     startHeartbeat();
     reconnectAttempts = 0;
   } catch(e){
@@ -864,7 +1250,7 @@ async function onDisconnect(){
   }
 }
 
-/* ==================== UI BIND ==================== */
+/* ================= UI BIND ================= */
 function setMode(m){
   mode = m;
   $("tabLogin").classList.toggle("active", m === "login");
@@ -873,11 +1259,11 @@ function setMode(m){
   $("pwIn").autocomplete = m === "login" ? "current-password" : "new-password";
   setErr(""); setNote("");
 }
-
 $("tabLogin").onclick = () => setMode("login");
 $("tabReg").onclick   = () => setMode("register");
 $("authForm").addEventListener("submit", e => {
   e.preventDefault();
+  if ($("submitBtn").disabled) return;
   doAuth($("loginIn").value, $("pwIn").value);
 });
 
@@ -886,6 +1272,17 @@ $("logoutBtn").onclick = () => {
   try { ws && ws.close(); } catch(e){}
   location.reload();
 };
+
+$("addBtn").onclick = openAddModal;
+$("addCancel").onclick = closeAddModal;
+$("addConfirm").onclick = () => { if (!$("addConfirm").disabled) addContactFromInput(); };
+$("addInput").addEventListener("keydown", e => {
+  if (e.key === "Enter"){ e.preventDefault(); addContactFromInput(); }
+  else if (e.key === "Escape"){ closeAddModal(); }
+});
+$("addModal").addEventListener("click", e => {
+  if (e.target === $("addModal")) closeAddModal();
+});
 
 $("sendBtn").onclick = () => sendMessage();
 $("inp").addEventListener("keydown", e => {
@@ -902,10 +1299,15 @@ setTimeout(() => $("loginIn").focus(), 100);
 """
 
 
-# ============================ ЗАПУСК ============================
+# ============================ RUN ============================
 if __name__ == "__main__":
+    print(f"Server starting on http://0.0.0.0:{PORT}")
+    if PUBLIC_DOMAIN:
+        print(f"Public domain: {PUBLIC_DOMAIN}")
+    else:
+        print("DOMAIN not set — will use Host header from first request")
     try:
         import uvloop  # type: ignore
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning", loop="uvloop")
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning", loop="uvloop")
     except ImportError:
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
