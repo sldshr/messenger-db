@@ -16,7 +16,7 @@ import uvicorn
 #  FastAPI + Uvicorn
 # ============================================================
 
-app = FastAPI(title="SldForum")
+app = FastAPI(title="SldForuM")
 
 # Session data is also kept in signed cookies.
 # No filesystem/database is used.
