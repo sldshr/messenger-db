@@ -2,25 +2,23 @@ import os
 import time
 import secrets
 import hashlib
-import base64
 from typing import Dict, List, Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 SERVER_NAME = os.environ.get("SLDCHAT_DOMAIN", "localhost:8000")
-MAX_TOTAL_ATTACH = int(os.environ.get("SLDCHAT_MAX_TOTAL_ATTACH", 8 * 1024 * 1024))
 
-app = FastAPI(title="SLDCHAT Mail", version="0.3")
+app = FastAPI(title="SLDCHAT Mail", version="0.4")
 
 # ---------------------- RAM STORAGE ----------------------
-USERS: Dict[str, Dict[str, Any]] = {}                       # username -> {salt, pw_hash, token}
-MESSAGES: Dict[str, Dict[str, Any]] = {}                    # msg_id -> message
-USER_STATE: Dict[str, Dict[str, Dict[str, Any]]] = {}       # username -> msg_id -> {read, folder, starred}
-DRAFTS: Dict[str, Dict[str, Dict[str, Any]]] = {}           # username -> draft_id -> draft
-CONTACTS: Dict[str, List[str]] = {}                         # username -> [address, ...]
+USERS: Dict[str, Dict[str, Any]] = {}
+MESSAGES: Dict[str, Dict[str, Any]] = {}
+USER_STATE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+DRAFTS: Dict[str, Dict[str, Dict[str, Any]]] = {}
+CONTACTS: Dict[str, List[str]] = {}
 
 
 # ---------------------- Models ----------------------
@@ -40,7 +38,6 @@ class SendReq(BaseModel):
     bcc: List[str] = []
     subject: str = ""
     body: str = ""
-    attachments: List[Dict[str, Any]] = []
 
 
 class DraftReq(BaseModel):
@@ -57,6 +54,10 @@ class FlagReq(BaseModel):
     folder: Optional[str] = None
 
 
+class ContactReq(BaseModel):
+    address: str
+
+
 class FederationMsg(BaseModel):
     msg_id: str
     from_addr: str
@@ -65,7 +66,6 @@ class FederationMsg(BaseModel):
     subject: str = ""
     body: str = ""
     ts: float
-    attachments: List[Dict[str, Any]] = []
     deliver_to: str
 
 
@@ -124,7 +124,6 @@ async def federation_receive(msg: FederationMsg):
         "subject": msg.subject,
         "body": msg.body,
         "ts": msg.ts,
-        "attachments": msg.attachments,
     }
     st = USER_STATE.setdefault(user, {})
     if msg.msg_id not in st:
@@ -136,10 +135,7 @@ async def federation_receive(msg: FederationMsg):
 
 
 async def federate_http(domain: str, payload: dict) -> tuple[bool, str]:
-    """
-    follow_redirects=False — иначе httpx превращает POST в GET на 301/302,
-    и удалённый /federation/receive отдаёт 405.
-    """
+    """follow_redirects=False, иначе POST становится GET на 301/302 и получаем 405."""
     last_err = ""
     for scheme in ("https", "http"):
         url = f"{scheme}://{domain}/federation/receive"
@@ -179,7 +175,6 @@ def deliver_local(recipient_full: str, msg: dict) -> tuple[bool, str]:
         "subject": msg["subject"],
         "body": msg["body"],
         "ts": msg["ts"],
-        "attachments": msg["attachments"],
     }
     st = USER_STATE.setdefault(user, {})
     if msg["msg_id"] not in st:
@@ -204,11 +199,11 @@ async def deliver(recipient_full: str, msg: dict) -> tuple[bool, str]:
 async def register(req: RegisterReq):
     u = req.username.strip().lower()
     if not u or not req.password:
-        raise HTTPException(400, "укажите логин и пароль")
+        raise HTTPException(400, "Укажите логин и пароль.")
     if not u.replace("_", "").replace("-", "").replace(".", "").isalnum():
-        raise HTTPException(400, "логин: только буквы/цифры/_-. ")
+        raise HTTPException(400, "Логин может содержать только буквы, цифры, _ - .")
     if u in USERS:
-        raise HTTPException(409, "логин занят")
+        raise HTTPException(409, "Такой логин уже занят.")
     salt = secrets.token_hex(8)
     USERS[u] = {"salt": salt, "pw_hash": hash_pw(req.password, salt), "token": ""}
     return {"status": "ok", "address": full(u), "server": SERVER_NAME}
@@ -219,7 +214,7 @@ async def login(req: LoginReq):
     u = req.username.strip().lower()
     d = USERS.get(u)
     if not d or d["pw_hash"] != hash_pw(req.password, d["salt"]):
-        raise HTTPException(401, "неверный логин/пароль")
+        raise HTTPException(401, "Неверный логин или пароль.")
     d["token"] = secrets.token_urlsafe(24)
     return {"status": "ok", "token": d["token"], "username": u, "server": SERVER_NAME}
 
@@ -263,19 +258,22 @@ async def list_messages(
     u = auth(authorization)
     st = USER_STATE.get(u, {})
     q_lower = q.strip().lower()
-    rows = []
 
     if folder == "drafts":
         items = sorted(DRAFTS.get(u, {}).values(), key=lambda x: -x["ts"])
+        total = len(items)
         items = items[(page - 1) * per_page: page * per_page]
         return {"items": [
-            {"msg_id": "draft:" + d["id"], "from": full(u), "to": [t for t in [d.get("to", "")] if t],
-             "subject": d.get("subject", "") or "(черновик)", "ts": d["ts"],
-             "read": True, "starred": False, "has_attach": False,
-             "preview": (d.get("body", "") or "")[:120], "is_draft": True}
+            {"msg_id": "draft:" + d["id"], "from": full(u),
+             "to": [t for t in [d.get("to", "")] if t],
+             "subject": d.get("subject", "") or "(черновик без темы)",
+             "ts": d["ts"], "read": True, "starred": False,
+             "preview": (d.get("body", "") or "").replace("\n", " ")[:120],
+             "is_draft": True}
             for d in items
-        ], "total": len(DRAFTS.get(u, {})), "page": page, "per_page": per_page, "folder": folder}
+        ], "total": total, "page": page, "per_page": per_page, "folder": folder}
 
+    rows = []
     for mid, s in st.items():
         if folder == "starred":
             if not s.get("starred"):
@@ -288,10 +286,8 @@ async def list_messages(
             continue
         if q_lower:
             hay = " ".join([
-                m.get("subject", ""),
-                m.get("body", ""),
-                m.get("from_addr", ""),
-                " ".join(m.get("to", [])),
+                m.get("subject", ""), m.get("body", ""),
+                m.get("from_addr", ""), " ".join(m.get("to", [])),
                 " ".join(m.get("cc", [])),
             ]).lower()
             if q_lower not in hay:
@@ -302,24 +298,17 @@ async def list_messages(
     total = len(rows)
     chunk = rows[(page - 1) * per_page: page * per_page]
     return {
-        "items": [
-            {
-                "msg_id": mid,
-                "from": m["from_addr"],
-                "to": m.get("to", []),
-                "subject": m.get("subject", "") or "(без темы)",
-                "ts": m["ts"],
-                "read": s.get("read", False),
-                "starred": s.get("starred", False),
-                "has_attach": bool(m.get("attachments")),
-                "preview": (m.get("body", "") or "")[:120],
-            }
-            for mid, s, m in chunk
-        ],
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "folder": folder,
+        "items": [{
+            "msg_id": mid,
+            "from": m["from_addr"],
+            "to": m.get("to", []),
+            "subject": m.get("subject", "") or "(без темы)",
+            "ts": m["ts"],
+            "read": s.get("read", False),
+            "starred": s.get("starred", False),
+            "preview": (m.get("body", "") or "").replace("\n", " ")[:120],
+        } for mid, s, m in chunk],
+        "total": total, "page": page, "per_page": per_page, "folder": folder,
     }
 
 
@@ -328,21 +317,12 @@ async def get_message(msg_id: str, mark_read: bool = True, authorization: Option
     u = auth(authorization)
     m = MESSAGES.get(msg_id)
     if not m:
-        raise HTTPException(404, "сообщение не найдено")
+        raise HTTPException(404, "Сообщение не найдено.")
     st = USER_STATE.get(u, {})
     if msg_id not in st:
-        raise HTTPException(403, "нет доступа")
+        raise HTTPException(403, "Нет доступа к этому сообщению.")
     if mark_read:
         st[msg_id]["read"] = True
-    atts = []
-    for i, a in enumerate(m.get("attachments", [])):
-        raw = a.get("data", "") or ""
-        atts.append({
-            "idx": i,
-            "name": a.get("name", "file"),
-            "type": a.get("type", "application/octet-stream"),
-            "size": len(raw) * 3 // 4,
-        })
     return {
         "msg_id": msg_id,
         "from": m["from_addr"],
@@ -351,7 +331,6 @@ async def get_message(msg_id: str, mark_read: bool = True, authorization: Option
         "subject": m.get("subject", ""),
         "body": m.get("body", ""),
         "ts": m["ts"],
-        "attachments": atts,
         "read": st[msg_id].get("read", False),
         "starred": st[msg_id].get("starred", False),
         "folder": st[msg_id].get("folder", "inbox"),
@@ -363,7 +342,7 @@ async def set_flags(msg_id: str, req: FlagReq, authorization: Optional[str] = He
     u = auth(authorization)
     st = USER_STATE.get(u, {})
     if msg_id not in st:
-        raise HTTPException(404, "не найдено")
+        raise HTTPException(404, "Сообщение не найдено.")
     s = st[msg_id]
     if req.read is not None:
         s["read"] = req.read
@@ -371,7 +350,7 @@ async def set_flags(msg_id: str, req: FlagReq, authorization: Optional[str] = He
         s["starred"] = req.starred
     if req.folder is not None:
         if req.folder not in ("inbox", "sent", "trash", "archive"):
-            raise HTTPException(400, "неверная папка")
+            raise HTTPException(400, "Неверная папка.")
         s["folder"] = req.folder
     return {"status": "ok", "state": s}
 
@@ -381,7 +360,7 @@ async def delete_message(msg_id: str, authorization: Optional[str] = Header(None
     u = auth(authorization)
     st = USER_STATE.get(u, {})
     if msg_id not in st:
-        raise HTTPException(404, "не найдено")
+        raise HTTPException(404, "Сообщение не найдено.")
     if st[msg_id].get("folder") == "trash":
         del st[msg_id]
     else:
@@ -389,43 +368,14 @@ async def delete_message(msg_id: str, authorization: Optional[str] = Header(None
     return {"status": "ok"}
 
 
-@app.get("/api/attachment/{msg_id}/{idx}")
-async def get_attachment(msg_id: str, idx: int, authorization: Optional[str] = Header(None)):
-    u = auth(authorization)
-    if msg_id not in USER_STATE.get(u, {}):
-        raise HTTPException(403, "нет доступа")
-    m = MESSAGES.get(msg_id)
-    if not m:
-        raise HTTPException(404, "не найдено")
-    atts = m.get("attachments", [])
-    if idx < 0 or idx >= len(atts):
-        raise HTTPException(404, "нет вложения")
-    a = atts[idx]
-    try:
-        data = base64.b64decode(a.get("data", "") or "")
-    except Exception:
-        raise HTTPException(400, "битые данные вложения")
-    fname = (a.get("name") or "file").replace('"', "")
-    return Response(
-        content=data,
-        media_type=a.get("type", "application/octet-stream"),
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
-
-
 @app.post("/api/send")
 async def send(req: SendReq, authorization: Optional[str] = Header(None)):
     u = auth(authorization)
-
     to_list = [x for x in (parse_addr(a) for a in req.to) if x]
     cc_list = [x for x in (parse_addr(a) for a in req.cc) if x]
     bcc_list = [x for x in (parse_addr(a) for a in req.bcc) if x]
     if not (to_list or cc_list or bcc_list):
-        raise HTTPException(400, "укажите хотя бы одного получателя")
-
-    total_b64 = sum(len((a.get("data") or "")) for a in req.attachments)
-    if total_b64 * 3 // 4 > MAX_TOTAL_ATTACH:
-        raise HTTPException(413, f"суммарный размер вложений превышает {MAX_TOTAL_ATTACH // 1024} КБ")
+        raise HTTPException(400, "Укажите хотя бы одного получателя.")
 
     mid = secrets.token_hex(16)
     msg = {
@@ -436,9 +386,7 @@ async def send(req: SendReq, authorization: Optional[str] = Header(None)):
         "subject": req.subject,
         "body": req.body,
         "ts": time.time(),
-        "attachments": req.attachments,
     }
-
     MESSAGES[mid] = msg
     USER_STATE.setdefault(u, {})[mid] = {"read": True, "folder": "sent", "starred": False}
 
@@ -476,16 +424,26 @@ async def get_contacts(authorization: Optional[str] = Header(None)):
     return {"contacts": sorted(seen), "local_users": sorted(local)}
 
 
+@app.post("/api/contacts")
+async def add_contact(req: ContactReq, authorization: Optional[str] = Header(None)):
+    u = auth(authorization)
+    a = parse_addr(req.address)
+    if not a:
+        raise HTTPException(400, "Формат адреса: user@domain")
+    cl = CONTACTS.setdefault(u, [])
+    if a not in cl:
+        cl.append(a)
+    return {"status": "ok", "contacts": sorted(cl)}
+
+
 # ---------------------- Drafts ----------------------
 @app.post("/api/drafts")
 async def save_draft(req: DraftReq, authorization: Optional[str] = Header(None)):
     u = auth(authorization)
     did = secrets.token_hex(8)
     DRAFTS.setdefault(u, {})[did] = {
-        "id": did,
-        "to": req.to, "cc": req.cc, "bcc": req.bcc,
-        "subject": req.subject, "body": req.body,
-        "ts": time.time(),
+        "id": did, "to": req.to, "cc": req.cc, "bcc": req.bcc,
+        "subject": req.subject, "body": req.body, "ts": time.time(),
     }
     return {"status": "ok", "id": did}
 
@@ -495,7 +453,7 @@ async def get_draft(did: str, authorization: Optional[str] = Header(None)):
     u = auth(authorization)
     d = DRAFTS.get(u, {}).get(did)
     if not d:
-        raise HTTPException(404, "черновик не найден")
+        raise HTTPException(404, "Черновик не найден.")
     return d
 
 
@@ -516,198 +474,305 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <style>
 * { box-sizing: border-box; }
 html, body {
-  margin: 0; padding: 0;
+  margin: 0; padding: 0; min-height: 100%;
   font-family: Arial, Helvetica, Verdana, sans-serif;
-  font-size: 13px; color: #000; background: #dfe6ee;
+  font-size: 14px; color: #000; background: #eef2f7;
 }
-a { color: #003399; text-decoration: underline; cursor: pointer; }
-a:hover { color: #cc3300; }
-input, textarea, button, select {
-  font-family: inherit; font-size: 13px;
-}
-button, .btn {
-  background: #e8eef5; color: #003399;
-  border: 1px solid #7a8fa6; padding: 2px 9px;
-  cursor: pointer; text-decoration: none;
-  display: inline-block;
-}
-button:hover, .btn:hover { background: #cfdbe9; }
-button:disabled { color: #888; cursor: default; }
+a { color: #003399; text-decoration: none; cursor: pointer; }
+a:hover { color: #cc3300; text-decoration: underline; }
+input, textarea, button, select { font-family: inherit; font-size: 14px; }
 
+/* ---------- buttons ---------- */
+button, .btn {
+  display: inline-block;
+  background: #e8eef5; color: #00295f;
+  border: 1px solid #7a8fa6; border-radius: 3px;
+  padding: 6px 12px; cursor: pointer;
+  line-height: 1.2; text-decoration: none; font-size: 13px;
+}
+button:hover, .btn:hover { background: #d3dfee; }
+button.primary {
+  background: #2e6fbf; color: #fff; border-color: #234f8a;
+  font-weight: bold;
+}
+button.primary:hover { background: #245b9e; }
+button.danger { color: #8a2020; border-color: #b08080; }
+button.danger:hover { background: #fbe6e6; }
+button.big {
+  padding: 8px 18px; font-size: 14px;
+}
+
+/* ---------- header ---------- */
 .header {
   background: #1a3e6e; color: #fff;
-  padding: 6px 12px; font-size: 15px; font-weight: bold;
+  padding: 8px 16px;
+  display: flex; justify-content: space-between; align-items: center;
   border-bottom: 3px solid #0a2649;
 }
-.header .right { float: right; font-weight: normal; font-size: 12px; padding-top: 3px; }
-.header .right a { color: #cce0ff; }
-.header .right span { margin-right: 12px; }
+.header .brand { font-size: 16px; font-weight: bold; letter-spacing: .5px; }
+.header .user { font-size: 13px; }
+.header .user a { color: #cce0ff; margin-left: 14px; }
 
-.layout { width: 100%; border-collapse: collapse; }
-.layout > tbody > tr > td { vertical-align: top; }
-.sidebar { width: 172px; background: #d5dfec; border-right: 1px solid #8fa3b8; padding: 8px 0; }
-.side-title { padding: 4px 12px; font-size: 11px; text-transform: uppercase; color: #4a5a6e; letter-spacing: .06em; }
+/* ---------- top nav ---------- */
+.topnav {
+  background: #dbe4ef; border-bottom: 1px solid #a8b8cc;
+  padding: 6px 12px;
+  display: flex; gap: 6px; align-items: center;
+}
+.topnav .sep { flex: 1; }
+.topnav button { padding: 6px 14px; }
+
+/* ---------- layout ---------- */
+.layout {
+  display: grid;
+  grid-template-columns: 190px 1fr;
+  min-height: calc(100vh - 100px);
+}
+.sidebar {
+  background: #d9e2ee; border-right: 1px solid #a8b8cc;
+  padding: 10px 0;
+}
+.side-title {
+  padding: 6px 16px 4px; font-size: 11px;
+  text-transform: uppercase; color: #4a5a6e; letter-spacing: .07em;
+}
 .folder {
-  display: block; padding: 3px 12px; color: #003399;
-  text-decoration: none; border-bottom: 1px solid #c0ccd9; font-size: 12px;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 16px; color: #00295f; font-size: 13px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
 }
-.folder:hover { background: #c3d0e0; color: #003399; }
-.folder.active { background: #fff; font-weight: bold; border-left: 3px solid #1a3e6e; padding-left: 9px; }
-.folder .cnt { float: right; color: #666; font-weight: normal; }
-.folder .unread { color: #b03030; font-weight: bold; }
-.sidebar .sep { height: 12px; border-bottom: 1px solid #b0c0d0; margin: 6px 12px; }
+.folder:hover { background: #c7d3e2; }
+.folder.active {
+  background: #fff; font-weight: bold;
+  border-left-color: #1a3e6e;
+}
+.folder .cnt { color: #777; font-size: 12px; font-weight: normal; }
+.folder .cnt.unread {
+  background: #c33; color: #fff; font-weight: bold;
+  padding: 1px 7px; border-radius: 9px; font-size: 11px;
+}
 
+/* ---------- content ---------- */
 .content { background: #fff; }
-.toolbar {
-  background: #c8d5e3; border-bottom: 1px solid #8899aa;
-  padding: 5px 8px;
+.panel-toolbar {
+  background: #f2f5f9; border-bottom: 1px solid #d5dfec;
+  padding: 8px 12px;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
 }
-.toolbar button, .toolbar .btn { margin-right: 4px; }
-.toolbar .sep { display: inline-block; width: 1px; height: 18px; background: #8899aa;
-                vertical-align: middle; margin: 0 6px; }
-.toolbar .search { float: right; }
-.toolbar .search input { padding: 2px 4px; border: 1px solid #7a8fa6; width: 180px; }
+.panel-toolbar .search {
+  margin-left: auto; display: flex; gap: 6px; align-items: center;
+}
+.panel-toolbar .search input {
+  padding: 5px 8px; border: 1px solid #7a8fa6; border-radius: 3px;
+  width: 220px;
+}
 
+/* ---------- list ---------- */
 table.list { width: 100%; border-collapse: collapse; }
 table.list th {
-  background: #c8d5e3; text-align: left; padding: 4px 6px;
-  border-bottom: 1px solid #8899aa; font-size: 12px;
-  border-right: 1px solid #b0bfd0;
+  background: #e5ebf3; text-align: left;
+  padding: 8px 10px; font-size: 12px; color: #3a4a5e;
+  border-bottom: 1px solid #a8b8cc;
+  border-right: 1px solid #d5dfec; font-weight: bold;
 }
-table.list td { padding: 4px 6px; border-bottom: 1px solid #e0e8f0; font-size: 13px; vertical-align: top; }
-table.list tr.unread td { font-weight: bold; background: #f5f9ff; }
+table.list th:last-child { border-right: 0; }
+table.list td {
+  padding: 9px 10px; font-size: 13px;
+  border-bottom: 1px solid #eef2f7; vertical-align: middle;
+}
+table.list tr { cursor: pointer; }
 table.list tr:hover td { background: #eef4fb; }
-table.list tr.starred-row td.starcell a { color: #cc9900; }
-.starcell { width: 22px; text-align: center; }
-.starcell a { text-decoration: none; font-size: 15px; }
+table.list tr.unread td { font-weight: bold; background: #f7faff; }
+table.list tr.unread:hover td { background: #eef4fb; }
+.col-star { width: 30px; text-align: center; }
 .col-from { width: 22%; }
-.col-date { width: 110px; white-space: nowrap; text-align: right; color: #555; }
-.col-subj { }
-.attach-icon { color: #666; font-size: 12px; margin-left: 4px; }
-.preview { color: #777; font-size: 12px; }
-.unread .preview { color: #333; }
-.empty { padding: 30px; text-align: center; color: #777; }
-.pager { padding: 6px 10px; font-size: 12px; background: #eef4fb; border-top: 1px solid #c8d5e3; }
-.pager a, .pager span { margin-right: 10px; }
-
-.view { padding: 12px 16px; }
-.hdr-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
-.hdr-table td { padding: 2px 0; font-size: 12px; vertical-align: top; }
-.hdr-table .lbl { width: 60px; color: #666; }
-.subject-line { font-size: 16px; font-weight: bold; border-bottom: 1px solid #ccc; padding: 6px 0 8px; margin-bottom: 10px; }
-.msg-body {
-  white-space: pre-wrap; font-size: 13px;
-  border-top: 1px dashed #ccc; border-bottom: 1px dashed #ccc;
-  padding: 12px 0; margin: 8px 0 14px; min-height: 60px;
+.col-date { width: 120px; white-space: nowrap; text-align: right; color: #555; font-size: 12px; }
+.row-subject { display: block; }
+.row-preview {
+  color: #777; font-size: 12px; font-weight: normal;
+  margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.att-list { margin: 8px 0; padding: 8px; background: #f4f7fb; border: 1px solid #d5e0ec; font-size: 12px; }
-.att-list a { margin-right: 12px; }
-.actions { margin-top: 10px; }
-.actions button { margin-right: 6px; }
+tr.unread .row-preview { color: #444; }
+.star-btn {
+  color: #c9c9c9; font-size: 17px; line-height: 1;
+  text-decoration: none; user-select: none;
+}
+.star-btn.on { color: #f0b400; }
+.empty { padding: 40px; text-align: center; color: #777; }
 
-.compose { padding: 8px 10px; }
-.compose table { width: 100%; border-collapse: collapse; }
-.compose td { padding: 3px 4px; vertical-align: top; }
-.compose .lbl { width: 90px; text-align: right; color: #555; font-size: 12px; padding-right: 6px; padding-top: 6px; }
+.pager {
+  padding: 10px 14px; font-size: 12px;
+  background: #f2f5f9; border-top: 1px solid #d5dfec;
+  display: flex; align-items: center; gap: 12px;
+}
+.pager a {
+  padding: 3px 10px; border: 1px solid #7a8fa6; border-radius: 3px;
+  background: #fff;
+}
+.pager a:hover { background: #e8eef5; text-decoration: none; }
+
+/* ---------- read view ---------- */
+.read { padding: 20px 26px; max-width: 900px; }
+.read .subject {
+  font-size: 20px; font-weight: bold; line-height: 1.25;
+  padding-bottom: 12px; border-bottom: 1px solid #e0e6ee; margin-bottom: 14px;
+}
+.read .hdr {
+  background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px;
+  padding: 10px 14px; margin-bottom: 16px;
+}
+.read .hdr-row { padding: 3px 0; font-size: 13px; }
+.read .hdr-row .lbl { color: #667; display: inline-block; width: 70px; }
+.read .body {
+  white-space: pre-wrap; word-wrap: break-word;
+  font-size: 14px; line-height: 1.5;
+  padding: 4px 0 20px;
+  border-bottom: 1px solid #e0e6ee; margin-bottom: 20px;
+  min-height: 80px;
+}
+.read .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* big action buttons at top of read view */
+.read-head-actions {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 12px 14px; background: #f2f5f9;
+  border-bottom: 1px solid #d5dfec;
+}
+
+/* ---------- compose ---------- */
+.compose { padding: 20px 26px; max-width: 900px; }
+.compose h2 {
+  margin: 0 0 16px 0; font-size: 16px; color: #1a3e6e;
+  font-weight: bold;
+}
+.compose .row { display: flex; align-items: flex-start; margin-bottom: 8px; }
+.compose .row label {
+  width: 90px; padding-top: 7px; color: #555; font-size: 13px; flex-shrink: 0;
+}
+.compose .row .val { flex: 1; }
 .compose input[type=text] {
-  width: 100%; border: 1px solid #7a8fa6; padding: 3px 5px;
+  width: 100%; border: 1px solid #7a8fa6; border-radius: 3px;
+  padding: 6px 9px;
 }
 .compose textarea {
-  width: 100%; min-height: 280px; border: 1px solid #7a8fa6;
-  padding: 5px; font-family: "Courier New", monospace; font-size: 13px;
+  width: 100%; min-height: 260px; border: 1px solid #7a8fa6;
+  border-radius: 3px; padding: 8px 10px; resize: vertical;
+  font-family: "Segoe UI", Arial, sans-serif; font-size: 14px;
 }
-.compose .attach-row { font-size: 12px; }
-.compose .att-chip { display: inline-block; background: #eef4fb; border: 1px solid #c8d5e3;
-                     padding: 2px 6px; margin: 2px 4px 2px 0; }
-.compose .att-chip a { color: #b03030; text-decoration: none; margin-left: 6px; }
-.compose-buttons { margin-top: 8px; }
-.compose-buttons button { margin-right: 6px; }
+.compose .hint { color: #777; font-size: 12px; margin-top: 4px; }
+.compose .buttons {
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid #e0e6ee;
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
 
-.contacts table { width: 100%; border-collapse: collapse; }
-.contacts th { background: #c8d5e3; text-align: left; padding: 4px 6px; border-bottom: 1px solid #8899aa; font-size: 12px; }
-.contacts td { padding: 4px 6px; border-bottom: 1px solid #e0e8f0; }
-.contacts .newform { padding: 8px; background: #eef4fb; border-bottom: 1px solid #c8d5e3; }
-.contacts .newform input { padding: 3px 5px; border: 1px solid #7a8fa6; width: 260px; }
+/* ---------- contacts ---------- */
+.contacts { padding: 20px 26px; max-width: 900px; }
+.contacts h2 {
+  margin: 0 0 14px 0; font-size: 16px; color: #1a3e6e;
+}
+.contacts .addbox {
+  background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px;
+  padding: 12px; margin-bottom: 20px;
+  display: flex; gap: 8px; align-items: center;
+}
+.contacts .addbox input {
+  flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px;
+}
+.contacts .section {
+  font-weight: bold; color: #1a3e6e; font-size: 13px;
+  padding: 8px 0 6px; margin-top: 14px;
+  border-bottom: 1px solid #e0e6ee;
+}
+.contacts table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.contacts td { padding: 6px 4px; border-bottom: 1px solid #eef2f7; font-size: 13px; }
+.contacts td.act { text-align: right; width: 130px; }
+.contacts .empty { padding: 20px; color: #888; font-size: 13px; }
 
-/* auth */
+/* ---------- auth ---------- */
 .auth-wrap {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 30px;
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 30px; background: #eef2f7;
 }
-.auth-box {
-  width: 420px; background: #fff; border: 1px solid #7a8fa6;
+.auth-box { width: 420px; background: #fff; border: 1px solid #7a8fa6; border-radius: 4px; overflow: hidden; }
+.auth-box .top { background: #1a3e6e; color: #fff; padding: 12px 16px; font-weight: bold; }
+.auth-box .body { padding: 20px; }
+.auth-tabs { display: flex; border-bottom: 1px solid #d5dfec; margin-bottom: 16px; }
+.auth-tab {
+  padding: 8px 18px; cursor: pointer; color: #003399;
+  border: 1px solid #d5dfec; border-bottom: 0; background: #f2f5f9;
+  margin-right: 4px; margin-bottom: -1px; border-radius: 3px 3px 0 0;
 }
-.auth-box .top {
-  background: #1a3e6e; color: #fff; font-weight: bold; padding: 8px 12px;
+.auth-tab.active { background: #fff; font-weight: bold; color: #1a3e6e; }
+.auth-row { margin-bottom: 10px; display: flex; align-items: center; }
+.auth-row label { width: 90px; color: #555; font-size: 13px; }
+.auth-row input {
+  flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px;
 }
-.auth-box .body { padding: 18px; }
-.auth-box .tabs { border-bottom: 1px solid #c0ccd9; margin-bottom: 14px; }
-.auth-box .tab {
-  display: inline-block; padding: 6px 14px; cursor: pointer;
-  border: 1px solid #c0ccd9; border-bottom: none; background: #eef4fb;
-  color: #003399; margin-right: 4px; position: relative; top: 1px;
-}
-.auth-box .tab.active { background: #fff; font-weight: bold; }
-.auth-box .row { margin-bottom: 8px; }
-.auth-box .row label { display: inline-block; width: 90px; color: #555; }
-.auth-box .row input { padding: 3px 5px; border: 1px solid #7a8fa6; width: 250px; }
-.auth-box .actions { margin-top: 14px; }
-.notice { padding: 6px 10px; font-size: 12px; margin-top: 10px; }
+.auth-actions { margin-top: 16px; }
+.notice { padding: 8px 12px; font-size: 13px; border-radius: 3px; margin-top: 12px; }
 .notice.ok { background: #e8f4e0; border: 1px solid #a8cc88; color: #2a5a10; }
 .notice.err { background: #fbe6e6; border: 1px solid #d09090; color: #802020; }
 
-.footer { padding: 6px 12px; font-size: 11px; color: #667; text-align: center; }
+.footer { padding: 10px; font-size: 11px; color: #667; text-align: center; }
 </style>
 </head>
 <body>
 
-<div class="header">
-  SLDCHAT MAIL
-  <span class="right">
-    <span id="who">не авторизован</span>
-    <a id="logout_link" style="display:none" onclick="doLogout()">Выход</a>
-  </span>
-</div>
-
+<!-- ============ AUTH ============ -->
 <div id="auth_screen" class="auth-wrap">
   <div class="auth-box">
-    <div class="top">Вход в почту</div>
+    <div class="top">SLDCHAT MAIL — вход</div>
     <div class="body">
-      <div class="tabs">
-        <div id="tab_login" class="tab active" onclick="switchTab('login')">Вход</div>
-        <div id="tab_reg" class="tab" onclick="switchTab('reg')">Регистрация</div>
+      <div class="auth-tabs">
+        <div id="tab_login" class="auth-tab active" onclick="switchTab('login')">Вход</div>
+        <div id="tab_reg" class="auth-tab" onclick="switchTab('reg')">Регистрация</div>
       </div>
       <div id="form_login">
-        <div class="row"><label>Логин:</label><input id="log_user" autocomplete="username"></div>
-        <div class="row"><label>Пароль:</label><input id="log_pass" type="password" autocomplete="current-password"></div>
-        <div class="actions"><button onclick="doLogin()">Войти</button></div>
+        <div class="auth-row"><label>Логин:</label><input id="log_user" autocomplete="username"></div>
+        <div class="auth-row"><label>Пароль:</label><input id="log_pass" type="password" autocomplete="current-password"></div>
+        <div class="auth-actions"><button class="primary big" onclick="doLogin()">Войти</button></div>
       </div>
       <div id="form_reg" style="display:none">
-        <div class="row"><label>Логин:</label><input id="reg_user" autocomplete="username"></div>
-        <div class="row"><label>Пароль:</label><input id="reg_pass" type="password" autocomplete="new-password"></div>
-        <div class="row"><label>&nbsp;</label><span style="color:#777;font-size:12px">сервер: __SERVER__</span></div>
-        <div class="actions"><button onclick="doRegister()">Создать ящик</button></div>
+        <div class="auth-row"><label>Логин:</label><input id="reg_user" autocomplete="username"></div>
+        <div class="auth-row"><label>Пароль:</label><input id="reg_pass" type="password" autocomplete="new-password"></div>
+        <div class="auth-row"><label></label><span style="color:#777;font-size:12px">Ваш адрес: логин@__SERVER__</span></div>
+        <div class="auth-actions"><button class="primary big" onclick="doRegister()">Создать ящик</button></div>
       </div>
       <div id="auth_status" class="notice" style="display:none"></div>
     </div>
   </div>
 </div>
 
-<div id="main_screen" style="display:none">
-  <table class="layout"><tbody><tr>
-    <td class="sidebar">
+<!-- ============ APP ============ -->
+<div id="app_screen" style="display:none">
+  <div class="header">
+    <div class="brand">✉ SLDCHAT MAIL</div>
+    <div class="user">
+      <span id="who">—</span>
+      <a onclick="doLogout()">Выход</a>
+    </div>
+  </div>
+
+  <div class="topnav">
+    <button class="primary big" onclick="newCompose()">✎ Написать письмо</button>
+    <button onclick="openFolder('inbox')">📥 Входящие</button>
+    <button onclick="openFolder('sent')">📤 Отправленные</button>
+    <button onclick="openFolder('drafts')">📝 Черновики</button>
+    <span class="sep"></span>
+    <button onclick="showContacts()">☎ Контакты</button>
+  </div>
+
+  <div class="layout">
+    <div class="sidebar">
       <div class="side-title">Папки</div>
       <div id="folders"></div>
-      <div class="sep"></div>
-      <a class="folder" onclick="showContacts()">☎ Контакты</a>
-    </td>
-    <td class="content">
-      <div class="toolbar" id="toolbar"></div>
-      <div id="view"></div>
-    </td>
-  </tr></tbody></table>
-</div>
+    </div>
+    <div class="content" id="content"></div>
+  </div>
 
-<div class="footer" id="footer"></div>
+  <div class="footer" id="footer"></div>
+</div>
 
 <script>
 const SERVER_DOMAIN = "__SERVER__";
@@ -715,6 +780,10 @@ const FOLDERS = [
   ["inbox","Входящие"], ["sent","Отправленные"], ["drafts","Черновики"],
   ["starred","Помеченные"], ["archive","Архив"], ["trash","Удалённые"]
 ];
+const FOLDER_TITLE = {
+  inbox: "Входящие", sent: "Отправленные", drafts: "Черновики",
+  starred: "Помеченные", archive: "Архив", trash: "Удалённые"
+};
 
 const S = {
   token: localStorage.getItem("sldchat_token") || "",
@@ -722,10 +791,9 @@ const S = {
   folder: "inbox",
   q: "",
   page: 1,
-  view: "list",              // list | read | compose | contacts
+  view: "list",       // list | read | compose | contacts
   currentMsg: null,
-  compose: null,             // {to, cc, bcc, subject, body, draft_id}
-  attachments: [],
+  compose: null,
   pollTimer: null,
   folderCounts: {},
 };
@@ -762,13 +830,9 @@ function fmtDate(ts) {
 function fmtFull(ts) {
   const d = new Date(ts * 1000);
   const pad = n => String(n).padStart(2, "0");
-  return pad(d.getDate()) + "." + pad(d.getMonth()+1) + "." + d.getFullYear()
-       + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
-}
-function fmtSize(bytes) {
-  if (bytes < 1024) return bytes + " Б";
-  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + " КБ";
-  return (bytes/(1024*1024)).toFixed(2) + " МБ";
+  const months = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+  return pad(d.getDate()) + " " + months[d.getMonth()] + " " + d.getFullYear()
+       + ", " + pad(d.getHours()) + ":" + pad(d.getMinutes());
 }
 function meAddr() { return S.username + "@" + SERVER_DOMAIN; }
 function shortAddr(a) { return a ? a.replace(/@.*$/, "") : ""; }
@@ -792,7 +856,7 @@ async function doRegister() {
   const st = document.getElementById("auth_status");
   const u = document.getElementById("reg_user").value.trim();
   const p = document.getElementById("reg_pass").value;
-  if (!u || !p) return notice(st, "заполните поля");
+  if (!u || !p) return notice(st, "Заполните оба поля.");
   try {
     const d = await api("/api/register", {method:"POST", body: JSON.stringify({username:u, password:p})});
     notice(st, "Ящик создан: " + d.address + ". Теперь войдите.", "ok");
@@ -805,7 +869,7 @@ async function doLogin() {
   const st = document.getElementById("auth_status");
   const u = document.getElementById("log_user").value.trim();
   const p = document.getElementById("log_pass").value;
-  if (!u || !p) return notice(st, "заполните поля");
+  if (!u || !p) return notice(st, "Введите логин и пароль.");
   try {
     const d = await api("/api/login", {method:"POST", body: JSON.stringify({username:u, password:p})});
     S.token = d.token; S.username = d.username;
@@ -813,7 +877,8 @@ async function doLogin() {
     localStorage.setItem("sldchat_user", S.username);
     S.folder = "inbox"; S.page = 1; S.view = "list";
     renderShell();
-    refreshFolders(); refreshList();
+    refreshFolders();
+    openFolder("inbox");
     startPolling();
   } catch (e) { notice(st, e.message); }
 }
@@ -829,11 +894,10 @@ function doLogout() {
 /* ---------- shell ---------- */
 function renderShell() {
   const logged = !!S.token;
-  document.getElementById("auth_screen").style.display = logged ? "none" : "";
-  document.getElementById("main_screen").style.display = logged ? "" : "none";
-  document.getElementById("who").textContent = logged ? meAddr() : "не авторизован";
-  document.getElementById("logout_link").style.display = logged ? "" : "none";
-  document.getElementById("footer").textContent = "SLDCHAT MAIL 0.3 — сервер " + SERVER_DOMAIN;
+  document.getElementById("auth_screen").style.display = logged ? "none" : "flex";
+  document.getElementById("app_screen").style.display = logged ? "" : "none";
+  document.getElementById("who").textContent = logged ? meAddr() : "";
+  document.getElementById("footer").textContent = "SLDCHAT MAIL — ваш сервер: " + SERVER_DOMAIN;
 }
 
 function renderFolders() {
@@ -841,157 +905,132 @@ function renderFolders() {
   box.innerHTML = FOLDERS.map(([key, label]) => {
     const c = S.folderCounts[key] || {total:0, unread:0};
     let right = "";
-    if (key === "inbox") {
-      right = c.unread > 0
-        ? `<span class="cnt unread">${c.unread}</span>`
-        : (c.total > 0 ? `<span class="cnt">${c.total}</span>` : "");
+    if (key === "inbox" && c.unread > 0) {
+      right = `<span class="cnt unread">${c.unread}</span>`;
     } else if (c.total > 0) {
       right = `<span class="cnt">${c.total}</span>`;
     }
-    const active = (S.view !== "contacts" && S.folder === key) ? " active" : "";
-    return `<a class="folder${active}" onclick="openFolder('${key}')">${label}${right}</a>`;
+    const active = (S.view === "list" && S.folder === key) ? " active" : "";
+    return `<div class="folder${active}" onclick="openFolder('${key}')">
+      <span>${label}</span>${right}
+    </div>`;
   }).join("");
 }
 
-function renderToolbar() {
-  const t = document.getElementById("toolbar");
-  if (S.view === "contacts") {
-    t.innerHTML = `<button onclick="openFolder(S.folder)">← К папкам</button>`;
-    return;
-  }
-  if (S.view === "compose") {
-    t.innerHTML = `<button onclick="cancelCompose()">← Отмена</button>`;
-    return;
-  }
-  if (S.view === "read") {
-    const mid = S.currentMsg ? S.currentMsg.msg_id : "";
-    t.innerHTML = `
-      <button onclick="openFolder(S.folder)">← К списку</button>
-      <span class="sep"></span>
-      <button onclick="replyCurrent(false)">Ответить</button>
-      <button onclick="replyCurrent(true)">Ответить всем</button>
-      <button onclick="forwardCurrent()">Переслать</button>
-      <span class="sep"></span>
-      <button onclick="toggleStarCurrent()">${S.currentMsg && S.currentMsg.starred ? "Снять метку" : "Пометить"}</button>
-      <button onclick="toggleUnreadCurrent()">${S.currentMsg && S.currentMsg.read ? "Пометить непрочитанным" : "Пометить прочитанным"}</button>
-      <span class="sep"></span>
-      <button onclick="archiveCurrent()">В архив</button>
-      <button onclick="deleteCurrent()">Удалить</button>
-    `;
-    return;
-  }
-  // list view
-  const folder = S.folder;
-  let extra = "";
-  if (folder === "trash") extra = `<button onclick="emptyTrash()">Очистить корзину</button>`;
-  t.innerHTML = `
-    <button onclick="newCompose()">Написать</button>
-    <button onclick="refreshList()">Обновить</button>
-    <span class="sep"></span>
-    ${extra}
-    <span class="search">
-      <input id="q_input" placeholder="поиск…" value="${esc(S.q)}"
-             onkeydown="if(event.key==='Enter'){S.q=this.value;S.page=1;refreshList();}">
-      <button onclick="S.q=document.getElementById('q_input').value;S.page=1;refreshList()">Найти</button>
-      ${S.q ? `<button onclick="S.q='';S.page=1;refreshList()">Сброс</button>` : ""}
-    </span>
-  `;
-}
-
-/* ---------- folders ---------- */
-async function refreshFolders() {
-  try {
-    S.folderCounts = await api("/api/folders");
-    renderFolders();
-  } catch (e) { /* ignore */ }
-}
-
+/* ---------- folder ---------- */
 function openFolder(f) {
   S.folder = f;
   S.page = 1;
   S.view = "list";
   S.currentMsg = null;
-  renderShell(); renderFolders(); renderToolbar();
+  renderFolders();
   refreshList();
 }
 
 /* ---------- list ---------- */
 async function refreshList() {
   if (S.view !== "list") return;
-  const v = document.getElementById("view");
+  renderFolders();
+  const v = document.getElementById("content");
+
+  const toolbar = `
+    <div class="panel-toolbar">
+      <button class="primary" onclick="newCompose()">✎ Написать</button>
+      <button onclick="refreshList()">⟳ Обновить</button>
+      ${S.folder === "trash" ? '<button class="danger" onclick="emptyTrash()">🗑 Очистить корзину</button>' : ""}
+      <div class="search">
+        <input id="q_input" placeholder="Поиск по письмам…" value="${esc(S.q)}"
+               onkeydown="if(event.key==='Enter'){doSearch();}">
+        <button onclick="doSearch()">Найти</button>
+        ${S.q ? `<button onclick="clearSearch()">Сброс</button>` : ""}
+      </div>
+    </div>
+  `;
+
   try {
     const params = new URLSearchParams({folder: S.folder, q: S.q, page: S.page, per_page: 30});
     const d = await api("/api/list?" + params.toString());
     const rows = d.items;
-
     const showTo = (S.folder === "sent" || S.folder === "drafts");
-    const headers = `
-      <tr>
-        <th class="starcell"></th>
-        <th class="col-from">${showTo ? "Кому" : "От кого"}</th>
-        <th class="col-subj">Тема</th>
-        <th class="col-date">Дата</th>
-      </tr>`;
+
+    const heading = `<div style="padding:12px 16px;border-bottom:1px solid #e0e6ee;background:#f9fbfd">
+      <b style="color:#1a3e6e;font-size:15px">${FOLDER_TITLE[S.folder] || S.folder}</b>
+      <span style="color:#777;font-size:12px;margin-left:10px">${d.total} писем${S.q ? " (поиск: "+esc(S.q)+")" : ""}</span>
+    </div>`;
 
     let body;
     if (!rows.length) {
-      body = `<tr><td colspan="4" class="empty">Пусто.</td></tr>`;
+      body = `<div class="empty">Здесь пока пусто.</div>`;
     } else {
-      body = rows.map(r => {
-        const cls = (!r.read && S.folder === "inbox") ? "unread" : "";
-        const starCls = r.starred ? "starred-row" : "";
-        const starChar = r.starred ? "★" : "☆";
-        const attach = r.has_attach ? `<span class="attach-icon">📎</span>` : "";
-        const who = showTo ? (r.to.join(", ") || "(нет получателя)") : r.from;
-        const whoShort = who.split(",").map(a => shortAddr(a.trim())).join(", ");
-        const subj = r.is_draft ? "✎ " + r.subject : r.subject;
-        return `
-          <tr class="${cls} ${starCls}">
-            <td class="starcell"><a onclick="event.stopPropagation();toggleStar('${r.msg_id}')">${starChar}</a></td>
-            <td class="col-from" title="${esc(who)}">${esc(whoShort)}</td>
-            <td class="col-subj">
-              <a onclick="openMessage('${r.msg_id}')">${esc(subj)}</a>
-              ${attach}
-              <div class="preview">${esc(r.preview)}</div>
+      body = `<table class="list">
+        <thead>
+          <tr>
+            <th class="col-star"></th>
+            <th class="col-from">${showTo ? "Кому" : "От кого"}</th>
+            <th>Тема</th>
+            <th class="col-date">Дата</th>
+          </tr>
+        </thead>
+        <tbody>
+        ${rows.map(r => {
+          const cls = (!r.read && S.folder === "inbox") ? "unread" : "";
+          const star = r.starred ? "★" : "☆";
+          const starCls = r.starred ? "star-btn on" : "star-btn";
+          const who = showTo
+            ? (r.to.map(a => shortAddr(a)).join(", ") || "(нет получателя)")
+            : shortAddr(r.from);
+          const subj = r.is_draft ? "✎ " + r.subject : r.subject;
+          return `<tr class="${cls}" onclick="openMessage('${r.msg_id}')">
+            <td class="col-star" onclick="event.stopPropagation(); toggleStar('${r.msg_id}')">
+              <span class="${starCls}">${star}</span>
+            </td>
+            <td class="col-from" title="${esc(r.from)}">${esc(who)}</td>
+            <td>
+              <span class="row-subject">${esc(subj)}</span>
+              <div class="row-preview">${esc(r.preview)}</div>
             </td>
             <td class="col-date">${fmtDate(r.ts)}</td>
           </tr>`;
-      }).join("");
+        }).join("")}
+        </tbody>
+      </table>`;
     }
 
-    let pager = "";
     const totalPages = Math.max(1, Math.ceil(d.total / d.per_page));
-    if (totalPages > 1) {
-      pager = `<div class="pager">
-        ${S.page > 1 ? `<a onclick="gotoPage(${S.page-1})">« Пред</a>` : ""}
-        <span>Стр. ${S.page} из ${totalPages} (${d.total})</span>
-        ${S.page < totalPages ? `<a onclick="gotoPage(${S.page+1})">След »</a>` : ""}
-      </div>`;
-    } else {
-      pager = `<div class="pager">Всего: ${d.total}</div>`;
-    }
+    const pager = `<div class="pager">
+      ${S.page > 1 ? `<a onclick="gotoPage(${S.page-1})">← Предыдущие</a>` : ""}
+      <span>Страница ${S.page} из ${totalPages}</span>
+      ${S.page < totalPages ? `<a onclick="gotoPage(${S.page+1})">Следующие →</a>` : ""}
+    </div>`;
 
-    v.innerHTML = `<table class="list">${headers}${body}</table>${pager}`;
+    v.innerHTML = toolbar + heading + body + pager;
     refreshFolders();
   } catch (e) {
-    v.innerHTML = `<div class="empty">Ошибка: ${esc(e.message)}</div>`;
+    v.innerHTML = toolbar + `<div class="empty">Ошибка: ${esc(e.message)}</div>`;
   }
 }
 
+function doSearch() {
+  const el = document.getElementById("q_input");
+  S.q = el.value.trim();
+  S.page = 1;
+  refreshList();
+}
+function clearSearch() { S.q = ""; S.page = 1; refreshList(); }
 function gotoPage(p) { S.page = p; refreshList(); }
 
 async function toggleStar(msgId) {
+  if (msgId.startsWith("draft:")) return;
   try {
-    if (msgId.startsWith("draft:")) return;
-    const cur = S.currentMsg && S.currentMsg.msg_id === msgId ? S.currentMsg.starred : undefined;
-    // Для списка — узнаем по item через /api/message (без mark_read)
     const m = await api("/api/message/" + msgId + "?mark_read=false");
-    await api("/api/message/" + msgId + "/flags", {method:"POST", body: JSON.stringify({starred: !m.starred})});
+    await api("/api/message/" + msgId + "/flags", {
+      method: "POST", body: JSON.stringify({starred: !m.starred})
+    });
     refreshList(); refreshFolders();
   } catch (e) { alert(e.message); }
 }
 
-/* ---------- read view ---------- */
+/* ---------- read ---------- */
 async function openMessage(msgId) {
   if (msgId.startsWith("draft:")) {
     const did = msgId.slice(6);
@@ -999,8 +1038,7 @@ async function openMessage(msgId) {
       const d = await api("/api/drafts/" + did);
       startCompose({
         to: d.to, cc: d.cc, bcc: d.bcc,
-        subject: d.subject, body: d.body,
-        draft_id: did,
+        subject: d.subject, body: d.body, draft_id: did,
       });
     } catch (e) { alert(e.message); }
     return;
@@ -1009,54 +1047,54 @@ async function openMessage(msgId) {
     const m = await api("/api/message/" + msgId);
     S.currentMsg = m;
     S.view = "read";
-    renderToolbar();
     renderRead();
     refreshFolders();
   } catch (e) { alert(e.message); }
 }
 
 function renderRead() {
-  const v = document.getElementById("view");
+  const v = document.getElementById("content");
   const m = S.currentMsg;
   if (!m) { v.innerHTML = ""; return; }
-  const atts = m.attachments.length
-    ? `<div class="att-list"><b>Вложения:</b><br>${m.attachments.map(a =>
-        `<a href="/api/attachment/${m.msg_id}/${a.idx}" target="_blank">📎 ${esc(a.name)}</a>
-         <span style="color:#777">(${fmtSize(a.size)})</span>`).join(" &nbsp; ")}</div>`
+
+  const ccLine = m.cc && m.cc.length
+    ? `<div class="hdr-row"><span class="lbl">Копия:</span> ${esc(m.cc.join(", "))}</div>`
     : "";
-  const ccLine = m.cc && m.cc.length ? `<tr><td class="lbl">Копия:</td><td>${esc(m.cc.join(", "))}</td></tr>` : "";
+
   v.innerHTML = `
-    <div class="view">
-      <div class="subject-line">${esc(m.subject || "(без темы)")}</div>
-      <table class="hdr-table">
-        <tr><td class="lbl">От:</td><td><b>${esc(m.from)}</b></td></tr>
-        <tr><td class="lbl">Кому:</td><td>${esc(m.to.join(", "))}</td></tr>
+    <div class="read-head-actions">
+      <button class="primary big" onclick="replyCurrent(false)">↩ Ответить</button>
+      <button onclick="replyCurrent(true)">↩↩ Ответить всем</button>
+      <button onclick="forwardCurrent()">→ Переслать</button>
+      <button onclick="openFolder(S.folder)">← К списку писем</button>
+      <span style="flex:1"></span>
+      <button onclick="toggleStarCurrent()">${m.starred ? "★ Снять метку" : "☆ Пометить"}</button>
+      <button onclick="archiveCurrent()">В архив</button>
+      <button class="danger" onclick="deleteCurrent()">🗑 Удалить</button>
+    </div>
+    <div class="read">
+      <div class="subject">${esc(m.subject || "(без темы)")}</div>
+      <div class="hdr">
+        <div class="hdr-row"><span class="lbl">От:</span> <b>${esc(m.from)}</b></div>
+        <div class="hdr-row"><span class="lbl">Кому:</span> ${esc(m.to.join(", "))}</div>
         ${ccLine}
-        <tr><td class="lbl">Дата:</td><td>${fmtFull(m.ts)}</td></tr>
-      </table>
-      <div class="msg-body">${esc(m.body)}</div>
-      ${atts}
-      <div class="actions">
-        <button onclick="replyCurrent(false)">Ответить</button>
-        <button onclick="replyCurrent(true)">Ответить всем</button>
-        <button onclick="forwardCurrent()">Переслать</button>
+        <div class="hdr-row"><span class="lbl">Дата:</span> ${fmtFull(m.ts)}</div>
       </div>
-    </div>`;
+      <div class="body">${esc(m.body)}</div>
+      <div class="actions">
+        <button class="primary big" onclick="replyCurrent(false)">↩ Ответить</button>
+        <button onclick="replyCurrent(true)">↩↩ Ответить всем</button>
+        <button onclick="forwardCurrent()">→ Переслать</button>
+      </div>
+    </div>
+  `;
 }
 
 function toggleStarCurrent() {
   const m = S.currentMsg;
   if (!m) return;
   api("/api/message/" + m.msg_id + "/flags", {method:"POST", body: JSON.stringify({starred: !m.starred})})
-    .then(() => { m.starred = !m.starred; renderToolbar(); refreshFolders(); })
-    .catch(e => alert(e.message));
-}
-
-function toggleUnreadCurrent() {
-  const m = S.currentMsg;
-  if (!m) return;
-  api("/api/message/" + m.msg_id + "/flags", {method:"POST", body: JSON.stringify({read: !m.read})})
-    .then(() => { m.read = !m.read; renderToolbar(); refreshFolders(); })
+    .then(() => { m.starred = !m.starred; renderRead(); refreshFolders(); })
     .catch(e => alert(e.message));
 }
 
@@ -1064,21 +1102,21 @@ function archiveCurrent() {
   const m = S.currentMsg;
   if (!m) return;
   api("/api/message/" + m.msg_id + "/flags", {method:"POST", body: JSON.stringify({folder: "archive"})})
-    .then(() => { openFolder(S.folder); })
+    .then(() => openFolder(S.folder))
     .catch(e => alert(e.message));
 }
 
 function deleteCurrent() {
   const m = S.currentMsg;
   if (!m) return;
-  if (!confirm("Удалить сообщение?")) return;
+  if (!confirm("Удалить это сообщение?")) return;
   api("/api/message/" + m.msg_id + "/delete", {method:"POST"})
-    .then(() => { openFolder(S.folder); })
+    .then(() => openFolder(S.folder))
     .catch(e => alert(e.message));
 }
 
 async function emptyTrash() {
-  if (!confirm("Удалить все сообщения из корзины?")) return;
+  if (!confirm("Удалить все письма из корзины безвозвратно?")) return;
   try {
     const d = await api("/api/list?folder=trash&per_page=1000");
     for (const it of d.items) {
@@ -1095,52 +1133,52 @@ function newCompose() {
 
 function startCompose(c) {
   S.compose = Object.assign({to:"", cc:"", bcc:"", subject:"", body:"", draft_id:null}, c);
-  S.attachments = [];
   S.view = "compose";
-  renderToolbar();
+  S.currentMsg = null;
   renderCompose();
 }
 
-function cancelCompose() {
-  if (S.compose && (S.compose.body || S.compose.subject || S.compose.to)) {
-    if (!confirm("Закрыть без сохранения? Нажмите Отмена — черновик сохранится отдельно кнопкой.")) {}
-  }
-  S.view = "list";
-  S.compose = null;
-  renderToolbar();
-  refreshList();
-}
-
 function renderCompose() {
-  const v = document.getElementById("view");
+  const v = document.getElementById("content");
   const c = S.compose;
+  const title = c.draft_id ? "Редактирование черновика" :
+    (c.to ? "Ответ на письмо" : "Новое письмо");
   v.innerHTML = `
     <div class="compose">
-      <table>
-        <tr><td class="lbl">Кому:</td>
-            <td><input type="text" id="c_to" value="${esc(c.to)}" placeholder="user@domain, user2@domain2"></td></tr>
-        <tr><td class="lbl">Копия:</td>
-            <td><input type="text" id="c_cc" value="${esc(c.cc)}"></td></tr>
-        <tr><td class="lbl">Скрытая:</td>
-            <td><input type="text" id="c_bcc" value="${esc(c.bcc)}"></td></tr>
-        <tr><td class="lbl">Тема:</td>
-            <td><input type="text" id="c_subject" value="${esc(c.subject)}"></td></tr>
-        <tr><td class="lbl">Текст:</td>
-            <td><textarea id="c_body">${esc(c.body)}</textarea></td></tr>
-        <tr><td class="lbl">Файлы:</td>
-            <td class="attach-row">
-              <input type="file" id="c_files" multiple onchange="addFiles(this)">
-              <div id="att_chips"></div>
-            </td></tr>
-      </table>
-      <div class="compose-buttons">
-        <button onclick="sendCompose()">Отправить</button>
-        <button onclick="saveDraft()">Сохранить черновик</button>
+      <h2>${esc(title)}</h2>
+      <div class="row">
+        <label>Кому:</label>
+        <div class="val">
+          <input type="text" id="c_to" value="${esc(c.to)}" placeholder="user@domain, user2@domain2">
+          <div class="hint">Через запятую. Можно отправить на другой сервер, например: bob@other.example.com</div>
+        </div>
+      </div>
+      <div class="row">
+        <label>Копия:</label>
+        <div class="val"><input type="text" id="c_cc" value="${esc(c.cc)}" placeholder="(необязательно)"></div>
+      </div>
+      <div class="row">
+        <label>Скрытая:</label>
+        <div class="val"><input type="text" id="c_bcc" value="${esc(c.bcc)}" placeholder="(необязательно)"></div>
+      </div>
+      <div class="row">
+        <label>Тема:</label>
+        <div class="val"><input type="text" id="c_subject" value="${esc(c.subject)}"></div>
+      </div>
+      <div class="row">
+        <label>Текст:</label>
+        <div class="val">
+          <textarea id="c_body" placeholder="Текст письма…">${esc(c.body)}</textarea>
+          <div class="hint">Подсказка: Ctrl+Enter — отправить сразу.</div>
+        </div>
+      </div>
+      <div class="buttons">
+        <button class="primary big" onclick="sendCompose()">✉ Отправить</button>
+        <button onclick="saveDraft()">📝 Сохранить черновик</button>
         <button onclick="cancelCompose()">Отмена</button>
-        <span style="color:#777;font-size:12px;margin-left:10px">Ctrl+Enter — отправить</span>
       </div>
     </div>`;
-  renderAttachments();
+
   const ta = document.getElementById("c_body");
   ta.addEventListener("keydown", e => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -1150,35 +1188,10 @@ function renderCompose() {
   });
 }
 
-function addFiles(input) {
-  const files = Array.from(input.files || []);
-  const maxOne = 2 * 1024 * 1024;
-  const cur = S.attachments.reduce((s, a) => s + (a.data.length * 3 / 4), 0);
-  let total = cur;
-  for (const f of files) {
-    if (f.size > maxOne) { alert("Файл слишком большой: " + f.name); continue; }
-    total += f.size;
-    if (total > 8 * 1024 * 1024) { alert("Сумма вложений превышает 8 МБ"); break; }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const b64 = String(reader.result).split(",")[1] || "";
-      S.attachments.push({name: f.name, type: f.type || "application/octet-stream", data: b64});
-      renderAttachments();
-    };
-    reader.readAsDataURL(f);
-  }
-  input.value = "";
+function cancelCompose() {
+  S.compose = null;
+  openFolder(S.folder || "inbox");
 }
-
-function renderAttachments() {
-  const el = document.getElementById("att_chips");
-  if (!el) return;
-  el.innerHTML = S.attachments.map((a, i) =>
-    `<span class="att-chip">📎 ${esc(a.name)} <a onclick="removeAttach(${i})">✕</a></span>`
-  ).join("");
-}
-
-function removeAttach(i) { S.attachments.splice(i, 1); renderAttachments(); }
 
 function splitAddrs(s) {
   return (s || "").split(/[,;\s]+/).map(x => x.trim()).filter(Boolean);
@@ -1190,26 +1203,31 @@ async function sendCompose() {
   const bcc = document.getElementById("c_bcc").value;
   const subject = document.getElementById("c_subject").value;
   const body = document.getElementById("c_body").value;
-  if (!splitAddrs(to).length && !splitAddrs(cc).length && !splitAddrs(bcc).length) {
-    alert("Укажите получателя."); return;
+  const any = splitAddrs(to).length + splitAddrs(cc).length + splitAddrs(bcc).length;
+  if (!any) {
+    alert("Укажите получателя в поле «Кому».");
+    document.getElementById("c_to").focus();
+    return;
   }
   try {
     const d = await api("/api/send", {
       method: "POST",
       body: JSON.stringify({
         to: splitAddrs(to), cc: splitAddrs(cc), bcc: splitAddrs(bcc),
-        subject, body, attachments: S.attachments,
+        subject, body,
       }),
     });
-    if (S.compose.draft_id) {
+    if (S.compose && S.compose.draft_id) {
       await api("/api/drafts/" + S.compose.draft_id, {method:"DELETE"}).catch(()=>{});
     }
     if (d.status === "partial") {
-      alert("Отправлено частично. Ошибки:\n" + d.errors.join("\n"));
+      alert("Письмо отправлено частично. Не доставлено:\n" + d.errors.join("\n"));
     }
-    S.compose = null; S.attachments = [];
+    S.compose = null;
     openFolder("sent");
-  } catch (e) { alert("Ошибка отправки: " + e.message); }
+  } catch (e) {
+    alert("Ошибка отправки: " + e.message);
+  }
 }
 
 async function saveDraft() {
@@ -1219,7 +1237,7 @@ async function saveDraft() {
   const subject = document.getElementById("c_subject").value;
   const body = document.getElementById("c_body").value;
   try {
-    if (S.compose.draft_id) {
+    if (S.compose && S.compose.draft_id) {
       await api("/api/drafts/" + S.compose.draft_id, {method:"DELETE"}).catch(()=>{});
     }
     const d = await api("/api/drafts", {
@@ -1227,7 +1245,7 @@ async function saveDraft() {
       body: JSON.stringify({to, cc, bcc, subject, body}),
     });
     S.compose.draft_id = d.id;
-    alert("Черновик сохранён.");
+    alert("Черновик сохранён. Найти его можно в папке «Черновики».");
     refreshFolders();
   } catch (e) { alert(e.message); }
 }
@@ -1235,7 +1253,7 @@ async function saveDraft() {
 /* ---------- reply / forward ---------- */
 function quoteBody(m) {
   const quoted = (m.body || "").split("\n").map(l => "> " + l).join("\n");
-  return "\n\n\n--- " + fmtFull(m.ts) + ", " + m.from + " пишет: ---\n" + quoted;
+  return "\n\n--- " + fmtFull(m.ts) + ", " + m.from + " пишет: ---\n" + quoted;
 }
 function replyCurrent(all) {
   const m = S.currentMsg;
@@ -1246,13 +1264,13 @@ function replyCurrent(all) {
     const me = meAddr();
     cc = (m.to.concat(m.cc)).filter(a => a !== me && a !== to).join(", ");
   }
-  const subj = (m.subject || "").match(/^Re:/i) ? m.subject : "Re: " + (m.subject || "");
+  const subj = /^Re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
   startCompose({to, cc, bcc:"", subject: subj, body: quoteBody(m)});
 }
 function forwardCurrent() {
   const m = S.currentMsg;
   if (!m) return;
-  const subj = (m.subject || "").match(/^Fwd:/i) ? m.subject : "Fwd: " + (m.subject || "");
+  const subj = /^Fwd:/i.test(m.subject || "") ? m.subject : "Fwd: " + (m.subject || "");
   const hdr = "---------- Пересылаемое сообщение ----------\n"
             + "От: " + m.from + "\n"
             + "Кому: " + m.to.join(", ") + "\n"
@@ -1265,36 +1283,42 @@ function forwardCurrent() {
 /* ---------- contacts ---------- */
 async function showContacts() {
   S.view = "contacts";
-  renderToolbar();
-  const v = document.getElementById("view");
+  S.currentMsg = null;
+  renderFolders();
+  const v = document.getElementById("content");
   try {
     const d = await api("/api/contacts");
-    const rows = d.contacts.length
-      ? d.contacts.map(a => `
-          <tr>
-            <td><a onclick="composeTo('${esc(a)}')">${esc(a)}</a></td>
-            <td style="width:120px">
-              <button onclick="composeTo('${esc(a)}')">Написать</button>
-            </td>
-          </tr>`).join("")
-      : `<tr><td colspan="2" style="color:#777;padding:20px;text-align:center">Пусто. Начните переписку или добавьте адрес вручную.</td></tr>`;
     const localRows = d.local_users.length
       ? d.local_users.map(a => `
           <tr>
             <td><a onclick="composeTo('${esc(a)}')">${esc(a)}</a></td>
-            <td><button onclick="composeTo('${esc(a)}')">Написать</button></td>
+            <td class="act"><button onclick="composeTo('${esc(a)}')">✎ Написать</button></td>
           </tr>`).join("")
-      : `<tr><td colspan="2" style="color:#777;padding:10px">— нет других пользователей на этом сервере —</td></tr>`;
+      : `<tr><td colspan="2" class="empty">На этом сервере пока нет других пользователей.</td></tr>`;
+    const rows = d.contacts.length
+      ? d.contacts.map(a => `
+          <tr>
+            <td><a onclick="composeTo('${esc(a)}')">${esc(a)}</a></td>
+            <td class="act"><button onclick="composeTo('${esc(a)}')">✎ Написать</button></td>
+          </tr>`).join("")
+      : `<tr><td colspan="2" class="empty">Пока никого нет. Начните переписку или добавьте адрес вручную.</td></tr>`;
+
     v.innerHTML = `
+      <div class="panel-toolbar">
+        <button class="primary" onclick="newCompose()">✎ Написать письмо</button>
+        <button onclick="openFolder(S.folder || 'inbox')">← К письмам</button>
+      </div>
       <div class="contacts">
-        <div class="newform">
-          Добавить адрес:
-          <input id="new_contact" placeholder="user@domain">
+        <h2>Контакты</h2>
+        <div class="addbox">
+          <input id="new_contact" placeholder="user@domain — добавить адрес в контакты">
           <button onclick="addContactForm()">Добавить</button>
         </div>
-        <div style="padding:8px 10px;background:#f4f7fb;border-bottom:1px solid #c8d5e3;font-weight:bold">На этом сервере (${SERVER_DOMAIN})</div>
+
+        <div class="section">Пользователи сервера ${SERVER_DOMAIN}</div>
         <table>${localRows}</table>
-        <div style="padding:8px 10px;background:#f4f7fb;border-bottom:1px solid #c8d5e3;font-weight:bold">Все контакты</div>
+
+        <div class="section">Все контакты</div>
         <table>${rows}</table>
       </div>`;
   } catch (e) {
@@ -1303,7 +1327,6 @@ async function showContacts() {
 }
 
 function composeTo(a) {
-  S.view = "list"; // чтобы toolbar сбросился
   startCompose({to: a, cc:"", bcc:"", subject:"", body:""});
 }
 
@@ -1312,12 +1335,6 @@ async function addContactForm() {
   const v = (el.value || "").trim().toLowerCase();
   if (!v || v.indexOf("@") < 0) return alert("Формат: user@domain");
   try {
-    // сохраняем через невидимый триггер — просто добавим в контакты отправив черновик-заглушку? Нет — используем contacts через message send не нужно.
-    // Простейший способ: использовать /api/contacts POST не реализован — эмулируем через сохранение в localStorage? Не подходит.
-    // Реализовано на сервере через no-op: см. ниже. Если эндпоинт отсутствует — просто добавим в поле "Кому" при следующем compose.
-    // Для простоты и надёжности — локально запомним и обновим позже. Но лучше: эндпоинт не нужен, эта строка необязательна.
-    // Итог: временно отправляем через серверный неявный путь — прикрепим к контактам путём создания черновика НЕ надо.
-    // Просто вызовем /api/contacts POST — реализовано ниже в main.py (см. правку).
     await api("/api/contacts", {method:"POST", body: JSON.stringify({address: v})});
     el.value = "";
     showContacts();
@@ -1337,32 +1354,14 @@ function startPolling() {
 /* ---------- init ---------- */
 renderShell();
 if (S.token) {
-  renderShell();
   refreshFolders();
-  refreshList();
+  openFolder("inbox");
   startPolling();
 }
 </script>
 </body>
 </html>
 """
-
-
-# Эндпоинт добавления контакта (используется UI)
-class ContactReq(BaseModel):
-    address: str
-
-
-@app.post("/api/contacts")
-async def add_contact(req: ContactReq, authorization: Optional[str] = Header(None)):
-    u = auth(authorization)
-    a = parse_addr(req.address)
-    if not a:
-        raise HTTPException(400, "формат: user@domain")
-    cl = CONTACTS.setdefault(u, [])
-    if a not in cl:
-        cl.append(a)
-    return {"status": "ok", "contacts": sorted(cl)}
 
 
 @app.get("/", response_class=HTMLResponse)
