@@ -1,19 +1,17 @@
 """
-Federated E2EE Messenger — 1-на-1 чаты, федерация между серверами.
+Federated E2EE Messenger — 1-на-1 чаты с федерацией серверов.
 - Логин/пароль (scrypt). E2EE: ECDH P-256 + AES-GCM-256.
-- Приватный ключ ТОЛЬКО в браузере (localStorage). Сервер видит лишь шифротекст.
-- Федерация: alice@server1.com ↔ bob@server2.com. Между серверами — HTTP.
-- Контакты добавляются вручную по uid (bob или bob@server.com).
-- Всё в оперативке.
+- Приватный ключ ТОЛЬКО в браузере. Сервер видит лишь шифротекст.
+- Федерация: alice@server1.com <-> bob@server2.com.
+- Взаимное добавление контактов между серверами.
+- "Запомнить меня" — авто-логин.
+- Клик по своему нику — копирует полный uid.
 
 Установка:  pip install fastapi uvicorn httpx
 Запуск:     python main.py
-
-Продакшн:
-   DOMAIN=chat.example.com SCHEME=https python main.py
-Локальный тест федерации (2 сервера):
-   DOMAIN=localhost:8000 SCHEME=http python main.py   # порт 8000
-   DOMAIN=localhost:8001 SCHEME=http PORT=8001 python main.py
+Прод:       DOMAIN=chat.example.com SCHEME=https python main.py
+Тест фед.:  DOMAIN=localhost:8000 SCHEME=http PORT=8000 python main.py
+            DOMAIN=localhost:8001 SCHEME=http PORT=8001 python main.py
 """
 
 import asyncio
@@ -50,7 +48,7 @@ def fed_scheme_for(domain: str) -> str:
 # ============================ PROTOCOL ============================
 # [type:uint8][length:uint32 BE][JSON UTF-8]
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
- T_HELLO, T_USER_STATUS, T_SYNC, T_USERS) = range(1, 12)
+ T_HELLO, T_USER_STATUS, T_SYNC, T_USERS, T_INTRO, T_CONTACT_ADD) = range(1, 14)
 _HDR = struct.Struct(">BI")
 
 
@@ -65,15 +63,15 @@ def unpack(data: bytes):
 
 
 # ============================ STATE (RAM) ============================
-users: dict[str, dict] = {}         # login -> {salt, pw, pub}
-online: dict[str, "Client"] = {}    # login -> Client
+users: dict[str, dict] = {}
+online: dict[str, "Client"] = {}
 messages: deque = deque(maxlen=5000)
+pending_intros: dict[str, list] = {}   # login -> [{uid, pub}]
 
 _canonical_domain: Optional[str] = PUBLIC_DOMAIN or None
 
 
 def self_domain(scope) -> str:
-    """Публичный домен этого сервера. Если DOMAIN не задан — берём Host первого запроса."""
     global _canonical_domain
     if _canonical_domain:
         return _canonical_domain
@@ -87,7 +85,6 @@ def scrypt_hash(pw: str, salt: bytes) -> bytes:
 
 
 def parse_uid(uid: str) -> tuple[str, str]:
-    """'bob@server.com' -> ('bob', 'server.com'); 'bob' -> ('bob', '')"""
     uid = (uid or "").strip().lower()
     if "@" in uid:
         login, d = uid.split("@", 1)
@@ -165,15 +162,16 @@ async def _finish_auth(c: Client, login: str):
     online[login] = c
     my_uid = make_uid(login, c.domain)
     hist = [m for m in messages if m["from"] == my_uid or m["to"] == my_uid]
+    intros = pending_intros.pop(login, [])
     await c.send(T_AUTH_OK, {
         "login": login, "uid": my_uid,
         "domain": c.domain, "history": hist,
+        "pending_intros": intros,
     })
     await broadcast_status(my_uid, True)
 
 
 async def handle_sync(c: Client, obj: dict):
-    """Клиент присылает свои контакты — сервер отвечает статусами (только для локальных)."""
     uids = obj.get("uids") or []
     result = []
     for uid in uids:
@@ -206,13 +204,25 @@ async def handle_msg(c: Client, obj: dict):
         "ts": int(time.time() * 1000),
     }
     messages.append(msg)
-    await c.send(T_MSG, msg)                        # эхо отправителю
+    await c.send(T_MSG, msg)
     if not to_domain or to_domain == c.domain:
         target = online.get(to_login)
         if target:
             await target.send(T_MSG, msg)
     else:
         asyncio.create_task(fed_send(to_domain, msg))
+
+
+async def handle_intro(c: Client, obj: dict):
+    """Клиент сообщает: я добавил удалённого пользователя — расскажи ему обо мне."""
+    to_uid = (obj.get("to") or "").strip().lower()
+    to_login, to_domain = parse_uid(to_uid)
+    if not to_login or not to_domain or to_domain == c.domain:
+        return
+    u = users.get(c.login)
+    from_pub = u["pub"] if u else ""
+    from_uid = make_uid(c.login, c.domain)
+    asyncio.create_task(fed_intro(to_domain, from_uid, from_pub, to_uid))
 
 
 async def fed_send(domain: str, msg: dict):
@@ -226,6 +236,17 @@ async def fed_send(domain: str, msg: dict):
         print(f"[fed] send to {domain} failed: {e}")
 
 
+async def fed_intro(domain: str, from_uid: str, from_pub: str, to_uid: str):
+    url = f"{fed_scheme_for(domain)}://{domain}/fed/intro"
+    try:
+        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
+            await cx.post(url, json={
+                "from_uid": from_uid, "from_pub": from_pub, "to_uid": to_uid,
+            })
+    except Exception as e:
+        print(f"[fed] intro to {domain} failed: {e}")
+
+
 # ============================ HTTP / WS ============================
 app = FastAPI()
 
@@ -237,7 +258,6 @@ async def index():
 
 @app.get("/api/pubkey")
 async def api_pubkey(uid: str, request: Request):
-    """Клиент узнаёт публичный ключ контакта (локального или удалённого)."""
     uid = (uid or "").strip().lower()
     login, domain = parse_uid(uid)
     my_domain = self_domain(request)
@@ -300,6 +320,33 @@ async def fed_msg(payload: dict, request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@app.post("/fed/intro")
+async def fed_intro_ep(payload: dict, request: Request):
+    """Пользователь удалённого сервера добавил нас в контакты — сообщаем об этом."""
+    from_uid = (payload.get("from_uid") or "").strip().lower()
+    from_pub = payload.get("from_pub") or ""
+    to_uid = (payload.get("to_uid") or "").strip().lower()
+    from_login, from_domain = parse_uid(from_uid)
+    to_login, to_domain = parse_uid(to_uid)
+    my_domain = self_domain(request)
+    if not from_login or not from_domain or from_domain == my_domain:
+        return JSONResponse({"error": "invalid from"}, status_code=400)
+    if not to_login or to_domain != my_domain:
+        return JSONResponse({"error": "invalid to"}, status_code=400)
+    if to_login not in users:
+        return JSONResponse({"error": "no such user"}, status_code=404)
+
+    entry = {"uid": from_uid, "pub": from_pub}
+    target = online.get(to_login)
+    if target is not None:
+        await target.send(T_CONTACT_ADD, entry)
+    else:
+        lst = pending_intros.setdefault(to_login, [])
+        if not any(e["uid"] == from_uid for e in lst):
+            lst.append(entry)
+    return {"ok": True}
+
+
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
@@ -321,6 +368,8 @@ async def ws_handler(ws: WebSocket):
                 await handle_msg(c, obj)
             elif t == T_SYNC and c.login:
                 await handle_sync(c, obj)
+            elif t == T_INTRO and c.login:
+                await handle_intro(c, obj)
             elif t == T_PING:
                 await c.send(T_PONG, {"t": obj.get("t", 0)})
     except WebSocketDisconnect:
@@ -373,9 +422,6 @@ button.busy::after{
   border-radius:50%;animation:spin .7s linear infinite;
 }
 button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:var(--accent)}
-.spinner{display:inline-block;width:20px;height:20px;
-  border:2px solid var(--bg-tertiary);border-top-color:var(--accent);
-  border-radius:50%;animation:spin .7s linear infinite}
 
 /* ---- login ---- */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
@@ -387,10 +433,13 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   padding:9px;border-radius:7px;font-weight:500;transition:all .15s}
 .tabs button.active{background:var(--bg-primary);color:var(--text-normal);
   box-shadow:0 1px 2px rgba(0,0,0,.08)}
-.card input{width:100%;background:var(--bg-secondary);border:1px solid transparent;
-  color:var(--text-normal);padding:12px 14px;border-radius:8px;outline:none;
-  font-size:16px;margin-bottom:10px;transition:border .12s}
-.card input:focus{border-color:var(--accent)}
+.card input[type=text],.card input[type=password]{width:100%;background:var(--bg-secondary);
+  border:1px solid transparent;color:var(--text-normal);padding:12px 14px;border-radius:8px;
+  outline:none;font-size:16px;margin-bottom:10px;transition:border .12s}
+.card input[type=text]:focus,.card input[type=password]:focus{border-color:var(--accent)}
+.remember{display:flex;align-items:center;gap:8px;font-size:13px;
+  color:var(--text-muted);margin:0 2px 12px;cursor:pointer;user-select:none}
+.remember input{width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer}
 #submitBtn{width:100%;background:var(--accent);color:#fff;border:none;padding:12px;
   border-radius:8px;font-weight:600;margin-top:4px}
 #submitBtn:hover:not(:disabled){background:var(--accent-hover)}
@@ -401,7 +450,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 /* ---- app ---- */
 #app{display:none;height:100dvh}
 #app.on{display:flex}
-
 #sidebar{width:320px;flex-shrink:0;background:var(--bg-secondary);
   display:flex;flex-direction:column;border-right:1px solid var(--border)}
 .sidebar-header{display:flex;align-items:center;gap:8px;padding:10px 12px;
@@ -410,7 +458,10 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 .avatar{width:38px;height:38px;border-radius:50%;color:#fff;font-weight:600;
   display:flex;align-items:center;justify-content:center;flex-shrink:0;
   font-size:15px;text-transform:uppercase;user-select:none}
-.my-info{flex:1;min-width:0}
+.my-info{flex:1;min-width:0;cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;
+  transition:background .12s}
+.my-info:hover{background:var(--bg-hover)}
+.my-info:active{background:var(--bg-active)}
 .my-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
 .my-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
@@ -421,10 +472,7 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 
 .sidebar-title{padding:14px 16px 6px;font-size:11px;font-weight:700;
   color:var(--text-muted);text-transform:uppercase;letter-spacing:.02em}
-
-#contacts{flex:1;overflow-y:auto;padding:0 8px 8px;position:relative}
-.loading-wrap{display:flex;flex-direction:column;align-items:center;
-  justify-content:center;padding:40px 20px;gap:12px;color:var(--text-muted);font-size:13px}
+#contacts{flex:1;overflow-y:auto;padding:0 8px 8px}
 .empty-list{padding:32px 22px;text-align:center;color:var(--text-muted);
   font-size:13px;line-height:1.55}
 
@@ -518,6 +566,14 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
 .btn-primary:disabled,.btn-secondary:disabled{cursor:default}
 
+/* ---- toast ---- */
+#toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);
+  background:#2e3338;color:#fff;padding:11px 18px;border-radius:8px;font-size:14px;
+  opacity:0;pointer-events:none;transition:opacity .2s, transform .2s;z-index:300;
+  box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:80%;text-align:center;
+  word-break:break-all;line-height:1.4}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
 @media (max-width:720px){
   #app{position:relative;overflow:hidden}
   #sidebar{position:absolute;inset:0;width:100%;z-index:2;
@@ -540,9 +596,13 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
       <button type="button" id="tabLogin" class="active">Вход</button>
       <button type="button" id="tabReg">Регистрация</button>
     </div>
-    <input id="loginIn" placeholder="Логин" autocapitalize="off"
+    <input id="loginIn" type="text" placeholder="Логин" autocapitalize="off"
            spellcheck="false" maxlength="24" autocomplete="username">
     <input id="pwIn" type="password" placeholder="Пароль" autocomplete="current-password">
+    <label class="remember">
+      <input type="checkbox" id="rememberIn">
+      <span>Запомнить меня</span>
+    </label>
     <button type="submit" id="submitBtn">Войти</button>
     <div id="authErr"></div>
     <div id="authNote"></div>
@@ -554,7 +614,7 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   <aside id="sidebar">
     <div class="sidebar-header">
       <div class="avatar" id="myAvatar">?</div>
-      <div class="my-info">
+      <div class="my-info" id="myInfo" title="Нажмите, чтобы скопировать адрес">
         <div class="my-name" id="myLogin">—</div>
         <div class="my-sub" id="myDomain"></div>
       </div>
@@ -593,9 +653,7 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
           <div class="peer-sub" id="peerSub"></div>
         </div>
       </div>
-
       <div id="msgs"></div>
-
       <div id="composer">
         <input id="inp" placeholder="Написать сообщение…" autocomplete="off"
                autocapitalize="sentences">
@@ -627,13 +685,15 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   </div>
 </div>
 
+<div id="toast"></div>
+
 <script>
 (() => {
 "use strict";
 
 /* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
-           HELLO:8, USER_STATUS:9, SYNC:10, USERS:11};
+           HELLO:8, USER_STATUS:9, SYNC:10, USERS:11, INTRO:12, CONTACT_ADD:13};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -685,14 +745,14 @@ async function aesDecrypt(key, ct, iv){
 /* ================= STATE ================= */
 let ws = null;
 let helloDomain = null;
-let me = null;                    // {login, uid}
+let me = null;
 let myPrivKey = null;
 let myPubRaw = null;
 let sessionPassword = null;
-let contacts = [];                // [{uid, pub, online}]
-const convKeys = {};              // uid -> CryptoKey
-const threads = {};               // uid -> [{id, from, to, text, ts, broken}]
-const unread = {};                // uid -> count
+let contacts = [];
+const convKeys = {};
+const threads = {};
+const unread = {};
 const seenIds = new Set();
 let activePeer = null;
 let reconnectAttempts = 0;
@@ -710,11 +770,6 @@ function splitUid(uid){
   if (i < 0) return [uid, ""];
   return [uid.slice(0, i), uid.slice(i+1)];
 }
-function displayUid(uid){
-  const [login, dom] = splitUid(uid);
-  if (!dom || (helloDomain && dom === helloDomain)) return login;
-  return login + "@" + dom;
-}
 function avatarColor(uid){
   const colors = ["#5865f2","#3ba55d","#faa61a","#ed4245","#eb459e","#9b59b6","#1abc9c","#e67e22"];
   let h = 0;
@@ -723,33 +778,39 @@ function avatarColor(uid){
 }
 function avatarChar(uid){ return (uid || "?")[0].toUpperCase(); }
 
+let toastTimer = null;
+function toast(msg){
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
+}
+
 /* ================= STORAGE ================= */
-function lsKey(){
-  return "fed_key_" + (me ? me.uid : "unknown");
-}
-function lsContacts(){
-  return "fed_contacts_" + (me ? me.uid : "unknown");
-}
+function lsContactsKey(){ return "fed_contacts_" + (me ? me.uid : "unknown"); }
+function lsKeyKey(){ return "fed_key_" + (me ? me.login : "unknown"); }
+const LS_REMEMBER = "fed_remember";
+
 function saveContacts(){
   try {
-    localStorage.setItem(lsContacts(),
+    localStorage.setItem(lsContactsKey(),
       JSON.stringify(contacts.map(c => ({uid: c.uid, pub: c.pub}))));
   } catch(e){}
 }
 function loadContacts(){
   try {
-    const raw = localStorage.getItem(lsContacts());
+    const raw = localStorage.getItem(lsContactsKey());
     if (!raw) return [];
     const arr = JSON.parse(raw);
     return arr.map(c => ({uid: c.uid, pub: c.pub, online: null}));
   } catch(e){ return []; }
 }
 
-/* ================= CONTACT LIST RENDER ================= */
+/* ================= CONTACT LIST ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
-
   if (!contacts.length){
     const d = document.createElement("div");
     d.className = "empty-list";
@@ -757,8 +818,6 @@ function renderContacts(){
     box.appendChild(d);
     return;
   }
-
-  // сортировка: сначала с непрочитанными, потом по времени последнего, потом online, потом по имени
   const sorted = contacts.slice().sort((a,b) => {
     const ua = unread[a.uid] > 0 ? 1 : 0;
     const ub = unread[b.uid] > 0 ? 1 : 0;
@@ -771,7 +830,6 @@ function renderContacts(){
     if (oa !== ob) return ob - oa;
     return a.uid.localeCompare(b.uid);
   });
-
   for (const c of sorted){
     const isActive = c.uid === activePeer;
     const hasUnread = unread[c.uid] > 0;
@@ -810,15 +868,13 @@ function renderContacts(){
     if (t && t.length){
       const last = t[t.length-1];
       const mine = last.from === me.uid;
-      pv.textContent = (mine ? "Вы: " : "") +
-        (last.broken ? "⚠ зашифровано" : last.text);
+      pv.textContent = (mine ? "Вы: " : "") + (last.broken ? "⚠ зашифровано" : last.text);
     } else {
       pv.textContent = c.online === true ? "в сети"
                     : (c.online === false ? "не в сети" : "статус неизвестен");
     }
     info.append(nm, pv);
     el.append(wrap, info);
-
     if (hasUnread){
       const b = document.createElement("span");
       b.className = "badge";
@@ -829,7 +885,7 @@ function renderContacts(){
   }
 }
 
-/* ================= SELECT CHAT ================= */
+/* ================= SELECT ================= */
 function selectPeer(uid){
   activePeer = uid;
   unread[uid] = 0;
@@ -846,7 +902,6 @@ function selectPeer(uid){
   }
   sub.textContent = parts.join(" · ");
   sub.className = "peer-sub" + (c && c.online === true ? " online" : "");
-
   $("chatPane").classList.add("has-chat");
   $("app").classList.add("chat-open");
   renderContacts();
@@ -855,7 +910,7 @@ function selectPeer(uid){
 }
 function goBack(){ $("app").classList.remove("chat-open"); }
 
-/* ================= RENDER THREAD ================= */
+/* ================= THREAD ================= */
 function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); }
 function fmtDay(ts){
   const d = new Date(ts), t = new Date();
@@ -954,10 +1009,21 @@ function connect(){
 async function handleFrame(type, obj){
   switch(type){
     case T.MSG: await onIncomingMsg(obj); break;
+    case T.CONTACT_ADD: await onContactAdd(obj); break;
     case T.USER_STATUS: {
       const c = contacts.find(x => x.uid === obj.uid);
-      if (c){ c.online = obj.online; renderContacts();
-        if (activePeer === obj.uid) selectPeer(obj.uid);
+      if (c){
+        c.online = obj.online;
+        renderContacts();
+        if (activePeer === obj.uid){
+          const sub = $("peerSub");
+          const [_, dom] = splitUid(obj.uid);
+          const parts = [];
+          if (dom && helloDomain && dom !== helloDomain) parts.push("@" + dom);
+          parts.push(obj.online ? "в сети" : "не в сети");
+          sub.textContent = parts.join(" · ");
+          sub.className = "peer-sub" + (obj.online ? " online" : "");
+        }
       }
       break;
     }
@@ -975,6 +1041,28 @@ async function handleFrame(type, obj){
   }
 }
 
+async function onContactAdd(obj){
+  // Сервер сообщает: удалённый пользователь добавил нас в контакты
+  const uid = (obj.uid || "").toLowerCase();
+  if (!uid || (me && uid === me.uid)) return;
+  if (contacts.find(c => c.uid === uid)) return;
+  const contact = {uid, pub: obj.pub || "", online: null};
+  if (!contact.pub){
+    try {
+      const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(uid));
+      if (r.ok){ const d = await r.json(); contact.pub = d.pub; }
+    } catch(e){}
+  }
+  contacts.push(contact);
+  saveContacts();
+  renderContacts();
+  if (ws && ws.readyState === 1){
+    ws.send(pack(T.SYNC, {uids: [uid]}));
+  }
+  const [login] = splitUid(uid);
+  toast(login + " добавил(а) вас в контакты");
+}
+
 async function onIncomingMsg(m){
   if (seenIds.has(m.id)) return;
   seenIds.add(m.id);
@@ -982,7 +1070,6 @@ async function onIncomingMsg(m){
 
   let contact = contacts.find(c => c.uid === peerUid);
   if (!contact){
-    // авто-добавление: либо из from_pub, либо запросом
     const pub = (m.from !== me.uid && m.from_pub) ? m.from_pub : "";
     if (pub){
       contact = {uid: peerUid, pub, online: null};
@@ -1000,9 +1087,8 @@ async function onIncomingMsg(m){
   }
 
   let text, broken = false;
-  if (!contact){
-    text = "⚠ неизвестный отправитель"; broken = true;
-  } else {
+  if (!contact){ text = "⚠ неизвестный отправитель"; broken = true; }
+  else {
     const key = await getConvKey(contact);
     if (!key){ text = "⚠ нет ключа для расшифровки"; broken = true; }
     else {
@@ -1028,7 +1114,7 @@ function setErr(m){ $("authErr").textContent = m || ""; }
 function setNote(m){ $("authNote").textContent = m || ""; }
 function setBusy(btn, busy){ btn.disabled = busy; btn.classList.toggle("busy", busy); }
 
-async function doAuth(login, password){
+async function doAuth(login, password, remember){
   login = (login || "").trim().toLowerCase();
   if (!login || !password){ setErr("Заполните все поля"); return; }
   if (!/^[a-z0-9._-]{3,24}$/.test(login)){ setErr("Логин 3–24: a-z 0-9 . _ -"); return; }
@@ -1036,7 +1122,6 @@ async function doAuth(login, password){
   setErr(""); setNote("");
 
   const storeKey = "fed_key_" + login;
-
   try {
     if (mode === "register"){
       const kp = await genKeyPair();
@@ -1048,17 +1133,13 @@ async function doAuth(login, password){
       const saved = localStorage.getItem(storeKey);
       if (!saved){
         setNote("⚠ Приватный ключ не найден в этом браузере — старые сообщения не расшифруются.");
-        // Генерируем новый ключ — сможем получать новые сообщения, но не читать старые.
         const kp = await genKeyPair();
         myPrivKey = kp.privateKey;
         localStorage.setItem(storeKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
         myPubRaw = await exportPubRaw(kp.publicKey);
       } else {
-        try {
-          myPrivKey = await importPrivJWK(JSON.parse(saved));
-          // Публичный из приватного через ECDH нельзя достать напрямую — но нам нужен только приват для получения.
-          // myPubRaw заполним после AUTH_OK через отдельный запрос.
-        } catch(e){ setNote("⚠ Ключ повреждён."); }
+        try { myPrivKey = await importPrivJWK(JSON.parse(saved)); }
+        catch(e){ setNote("⚠ Ключ повреждён."); }
       }
       authPayload = {login, password};
     }
@@ -1068,11 +1149,18 @@ async function doAuth(login, password){
     sessionPassword = password;
     me = {login: ok.login, uid: ok.uid};
     if (!myPubRaw && myPrivKey){
-      // Восстановили приватный ключ — узнаем публичный через /api/pubkey
       try {
         const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(me.uid));
         if (r.ok){ const d = await r.json(); myPubRaw = d.pub; }
       } catch(e){}
+    }
+
+    // remember me
+    if (remember){
+      try { localStorage.setItem(LS_REMEMBER, JSON.stringify({login: me.login, password})); }
+      catch(e){}
+    } else {
+      try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
     }
 
     // UI
@@ -1083,23 +1171,33 @@ async function doAuth(login, password){
     $("login").style.display = "none";
     $("app").classList.add("on");
 
-    // Контакты из LS
     contacts = loadContacts();
     renderContacts();
-
-    // История с сервера
     await loadHistory(ok.history || []);
-
-    // Запрос статусов
+    await applyPendingIntros(ok.pending_intros || []);
     if (contacts.length){
       ws.send(pack(T.SYNC, {uids: contacts.map(c => c.uid)}));
     }
-
     startHeartbeat();
     reconnectAttempts = 0;
   } catch(e){
     setErr(e.message || "Ошибка");
     setBusy($("submitBtn"), false);
+  }
+}
+
+async function applyPendingIntros(intros){
+  let changed = false;
+  for (const intro of intros){
+    const uid = (intro.uid || "").toLowerCase();
+    if (!uid || uid === me.uid) continue;
+    if (contacts.find(c => c.uid === uid)) continue;
+    contacts.push({uid, pub: intro.pub || "", online: null});
+    changed = true;
+  }
+  if (changed){
+    saveContacts();
+    renderContacts();
   }
 }
 
@@ -1109,7 +1207,6 @@ async function loadHistory(history){
     const peer = m.from === me.uid ? m.to : m.from;
     (byPeer[peer] = byPeer[peer] || []).push(m);
     seenIds.add(m.id);
-    // Если увидели from_pub для контакта которого нет — добавим
     if (m.from !== me.uid && m.from_pub){
       if (!contacts.find(c => c.uid === m.from)){
         contacts.push({uid: m.from, pub: m.from_pub, online: null});
@@ -1117,7 +1214,6 @@ async function loadHistory(history){
     }
   }
   saveContacts();
-
   for (const peer of Object.keys(byPeer)){
     let contact = contacts.find(c => c.uid === peer);
     if (!contact){
@@ -1158,19 +1254,15 @@ async function sendMessage(){
   if (!contact){ alert("Контакт не найден"); return; }
   const key = await getConvKey(contact);
   if (!key){ alert("Нет ключа получателя"); return; }
-
   const {ct, iv} = await aesEncrypt(key, text);
   const id = uuid();
-
   const localMsg = {id, from: me.uid, to: activePeer, text, ts: Date.now()};
   seenIds.add(id);
   (threads[activePeer] = threads[activePeer] || []).push(localMsg);
   appendMsg(localMsg);
   renderContacts();
-
   inp.value = "";
   inp.focus();
-
   ws.send(pack(T.MSG, {id, to: activePeer, ct, iv, from_pub: myPubRaw}));
 }
 
@@ -1213,9 +1305,13 @@ async function addContactFromInput(){
     contacts.push({uid: data.uid, pub: data.pub, online: data.online});
     saveContacts();
     renderContacts();
-    // запрос статуса
     if (ws && ws.readyState === 1){
       ws.send(pack(T.SYNC, {uids: [data.uid]}));
+      // если удалённый — уведомляем его сервер, чтобы он тоже увидел нас
+      const [_, d] = splitUid(data.uid);
+      if (d && helloDomain && d !== helloDomain){
+        ws.send(pack(T.INTRO, {to: data.uid}));
+      }
     }
     closeAddModal();
     selectPeer(data.uid);
@@ -1225,7 +1321,7 @@ async function addContactFromInput(){
   }
 }
 
-/* ================= HEARTBEAT / RECONNECT ================= */
+/* ================= RECONNECT ================= */
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
@@ -1250,6 +1346,30 @@ async function onDisconnect(){
   }
 }
 
+/* ================= COPY MY UID ================= */
+async function copyMyUid(){
+  if (!me || !helloDomain) return;
+  const full = me.login + "@" + helloDomain;
+  try {
+    await navigator.clipboard.writeText(full);
+    toast("Скопировано: " + full);
+  } catch(e){
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = full;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      toast("Скопировано: " + full);
+    } catch(e2){
+      toast("Не удалось скопировать: " + full);
+    }
+  }
+}
+
 /* ================= UI BIND ================= */
 function setMode(m){
   mode = m;
@@ -1264,11 +1384,12 @@ $("tabReg").onclick   = () => setMode("register");
 $("authForm").addEventListener("submit", e => {
   e.preventDefault();
   if ($("submitBtn").disabled) return;
-  doAuth($("loginIn").value, $("pwIn").value);
+  doAuth($("loginIn").value, $("pwIn").value, $("rememberIn").checked);
 });
 
 $("logoutBtn").onclick = () => {
   sessionPassword = null;
+  try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
   try { ws && ws.close(); } catch(e){}
   location.reload();
 };
@@ -1289,8 +1410,33 @@ $("inp").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendMessage(); }
 });
 $("backBtn").onclick = goBack;
+$("myInfo").onclick = copyMyUid;
 
-setTimeout(() => $("loginIn").focus(), 100);
+/* ================= AUTOLOGIN ================= */
+(function boot(){
+  setTimeout(() => {
+    let auto = null;
+    try {
+      const raw = localStorage.getItem(LS_REMEMBER);
+      if (raw) auto = JSON.parse(raw);
+    } catch(e){}
+    if (auto && auto.login && auto.password){
+      $("loginIn").value = auto.login;
+      $("pwIn").value = auto.password;
+      $("rememberIn").checked = true;
+      // Даём серверу шанс ответить HELLO, потом логинимся
+      setTimeout(() => {
+        if (!$("submitBtn").disabled){
+          doAuth(auto.login, auto.password, true).catch(() => {
+            try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
+          });
+        }
+      }, 250);
+    } else {
+      $("loginIn").focus();
+    }
+  }, 80);
+})();
 
 })();
 </script>
