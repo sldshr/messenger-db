@@ -3,9 +3,7 @@ Federated E2EE Messenger — 1-на-1 чаты с федерацией серв�
 - Логин/пароль (scrypt). E2EE: ECDH P-256 + AES-GCM-256.
 - Приватный ключ ТОЛЬКО в браузере. Сервер видит лишь шифротекст.
 - Федерация: alice@server1.com <-> bob@server2.com.
-- Взаимное добавление контактов между серверами.
-- "Запомнить меня" — авто-логин.
-- Клик по своему нику — копирует полный uid.
+- Взаимное добавление контактов, "запомнить меня", клик по нику — копирование uid.
 
 Установка:  pip install fastapi uvicorn httpx
 Запуск:     python main.py
@@ -46,7 +44,6 @@ def fed_scheme_for(domain: str) -> str:
 
 
 # ============================ PROTOCOL ============================
-# [type:uint8][length:uint32 BE][JSON UTF-8]
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
  T_HELLO, T_USER_STATUS, T_SYNC, T_USERS, T_INTRO, T_CONTACT_ADD) = range(1, 14)
 _HDR = struct.Struct(">BI")
@@ -63,10 +60,10 @@ def unpack(data: bytes):
 
 
 # ============================ STATE (RAM) ============================
-users: dict[str, dict] = {}
-online: dict[str, "Client"] = {}
+users: dict[str, dict] = {}            # login -> {salt, pw, pub}
+online: dict[str, "Client"] = {}       # login -> Client
 messages: deque = deque(maxlen=5000)
-pending_intros: dict[str, list] = {}   # login -> [{uid, pub}]
+pending_intros: dict[str, list] = {}
 
 _canonical_domain: Optional[str] = PUBLIC_DOMAIN or None
 
@@ -149,11 +146,15 @@ async def handle_register(c: Client, obj: dict):
 async def handle_auth(c: Client, obj: dict):
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
+    pub = (obj.get("pub") or "").strip()   # клиент всегда шлёт актуальный pub
     u = users.get(login)
     if not u or not secrets.compare_digest(u["pw"], scrypt_hash(pw, u["salt"])):
         return await c.send(T_ERROR, {"msg": "Неверный логин или пароль"})
     if login in online:
         return await c.send(T_ERROR, {"msg": "Вы уже вошли с другого устройства"})
+    # обновляем pub если он есть и отличается — иначе останется устаревший
+    if pub and pub != u.get("pub"):
+        u["pub"] = pub
     await _finish_auth(c, login)
 
 
@@ -197,10 +198,12 @@ async def handle_msg(c: Client, obj: dict):
         return
     mid = obj.get("id") or uuid.uuid4().hex
     from_uid = make_uid(c.login, c.domain)
+    # from_pub берём либо из сообщения, либо из регистрационных данных
+    from_pub = obj.get("from_pub") or (users.get(c.login, {}) or {}).get("pub", "")
     msg = {
         "id": mid, "from": from_uid, "to": to_uid,
         "ct": ct, "iv": iv,
-        "from_pub": obj.get("from_pub", ""),
+        "from_pub": from_pub,
         "ts": int(time.time() * 1000),
     }
     messages.append(msg)
@@ -214,7 +217,6 @@ async def handle_msg(c: Client, obj: dict):
 
 
 async def handle_intro(c: Client, obj: dict):
-    """Клиент сообщает: я добавил удалённого пользователя — расскажи ему обо мне."""
     to_uid = (obj.get("to") or "").strip().lower()
     to_login, to_domain = parse_uid(to_uid)
     if not to_login or not to_domain or to_domain == c.domain:
@@ -322,7 +324,6 @@ async def fed_msg(payload: dict, request: Request):
 
 @app.post("/fed/intro")
 async def fed_intro_ep(payload: dict, request: Request):
-    """Пользователь удалённого сервера добавил нас в контакты — сообщаем об этом."""
     from_uid = (payload.get("from_uid") or "").strip().lower()
     from_pub = payload.get("from_pub") or ""
     to_uid = (payload.get("to_uid") or "").strip().lower()
@@ -335,7 +336,6 @@ async def fed_intro_ep(payload: dict, request: Request):
         return JSONResponse({"error": "invalid to"}, status_code=400)
     if to_login not in users:
         return JSONResponse({"error": "no such user"}, status_code=404)
-
     entry = {"uid": from_uid, "pub": from_pub}
     target = online.get(to_login)
     if target is not None:
@@ -392,18 +392,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>Messages</title>
 <style>
 :root{
-  --bg-primary:#ffffff;
-  --bg-secondary:#f2f3f5;
-  --bg-tertiary:#e3e5e8;
-  --bg-hover:#e8eaed;
-  --bg-active:#d7dae0;
-  --text-normal:#2e3338;
-  --text-muted:#747f8d;
-  --border:#e3e5e8;
-  --accent:#5865f2;
-  --accent-hover:#4752c4;
-  --green:#3ba55d;
-  --red:#ed4245;
+  --bg-primary:#ffffff;--bg-secondary:#f2f3f5;--bg-tertiary:#e3e5e8;
+  --bg-hover:#e8eaed;--bg-active:#d7dae0;
+  --text-normal:#2e3338;--text-muted:#747f8d;--border:#e3e5e8;
+  --accent:#5865f2;--accent-hover:#4752c4;--green:#3ba55d;--red:#ed4245;
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden;overscroll-behavior:none}
@@ -411,19 +403,14 @@ body{background:var(--bg-primary);color:var(--text-normal);
   font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 button{font:inherit;cursor:pointer;color:inherit}
 input{font:inherit}
-
-/* ---- spinner ---- */
 @keyframes spin{to{transform:rotate(360deg)}}
 button.busy{position:relative;color:transparent !important}
-button.busy::after{
-  content:"";position:absolute;top:50%;left:50%;
+button.busy::after{content:"";position:absolute;top:50%;left:50%;
   width:18px;height:18px;margin:-9px 0 0 -9px;
   border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
-  border-radius:50%;animation:spin .7s linear infinite;
-}
+  border-radius:50%;animation:spin .7s linear infinite}
 button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:var(--accent)}
 
-/* ---- login ---- */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   padding:20px;background:var(--bg-secondary);z-index:100}
 .card{width:100%;max-width:400px;background:var(--bg-primary);border-radius:14px;
@@ -447,7 +434,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 #authErr{color:var(--red);font-size:13px;margin-top:10px;min-height:17px;text-align:center}
 #authNote{color:var(--text-muted);font-size:12px;margin-top:4px;text-align:center;line-height:1.35}
 
-/* ---- app ---- */
 #app{display:none;height:100dvh}
 #app.on{display:flex}
 #sidebar{width:320px;flex-shrink:0;background:var(--bg-secondary);
@@ -469,13 +455,11 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   border-radius:8px;display:flex;align-items:center;justify-content:center;
   transition:background .12s,color .12s;flex-shrink:0}
 .icon-btn:hover{background:var(--bg-hover);color:var(--text-normal)}
-
 .sidebar-title{padding:14px 16px 6px;font-size:11px;font-weight:700;
   color:var(--text-muted);text-transform:uppercase;letter-spacing:.02em}
 #contacts{flex:1;overflow-y:auto;padding:0 8px 8px}
 .empty-list{padding:32px 22px;text-align:center;color:var(--text-muted);
   font-size:13px;line-height:1.55}
-
 .contact{display:flex;align-items:center;gap:11px;padding:8px 10px;
   border-radius:8px;cursor:pointer;transition:background .1s;user-select:none}
 .contact:hover{background:var(--bg-hover)}
@@ -498,7 +482,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   min-width:20px;height:20px;padding:0 7px;border-radius:10px;
   display:flex;align-items:center;justify-content:center;flex-shrink:0;line-height:1}
 
-/* ---- chat pane ---- */
 #chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-primary)}
 #emptyState{flex:1;display:flex;flex-direction:column;align-items:center;
   justify-content:center;color:var(--text-muted);gap:14px;padding:24px;text-align:center}
@@ -516,7 +499,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 .peer-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
 .peer-sub.online{color:var(--green)}
-
 #msgs{flex:1;overflow-y:auto;padding:16px 16px 6px;display:flex;
   flex-direction:column;gap:4px;scroll-behavior:smooth}
 .m{max-width:70%;padding:8px 13px;border-radius:16px;background:var(--bg-secondary);
@@ -530,7 +512,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   color:var(--text-muted);font-style:italic}
 .day-sep{align-self:center;font-size:11px;color:var(--text-muted);
   padding:6px 12px;background:var(--bg-secondary);border-radius:10px;margin:8px 0 4px}
-
 #composer{display:flex;align-items:center;gap:8px;padding:10px 14px;
   padding-bottom:calc(10px + env(safe-area-inset-bottom));
   border-top:1px solid var(--border);background:var(--bg-primary)}
@@ -544,7 +525,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 #sendBtn:hover{background:var(--accent-hover)}
 #sendBtn:active{transform:scale(.94)}
 
-/* ---- modal ---- */
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);
   display:none;align-items:center;justify-content:center;padding:20px;z-index:200}
 .modal-backdrop.open{display:flex}
@@ -566,7 +546,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
 .btn-primary:disabled,.btn-secondary:disabled{cursor:default}
 
-/* ---- toast ---- */
 #toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);
   background:#2e3338;color:#fff;padding:11px 18px;border-radius:8px;font-size:14px;
   opacity:0;pointer-events:none;transition:opacity .2s, transform .2s;z-index:300;
@@ -589,7 +568,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
 </head>
 <body>
 
-<!-- ===== LOGIN ===== -->
 <div id="login">
   <form class="card" id="authForm" autocomplete="on">
     <div class="tabs">
@@ -609,7 +587,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   </form>
 </div>
 
-<!-- ===== APP ===== -->
 <div id="app">
   <aside id="sidebar">
     <div class="sidebar-header">
@@ -640,7 +617,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
       </svg>
       <p>Выберите чат или добавьте новый</p>
     </div>
-
     <div id="conversation">
       <div class="conv-header">
         <button class="icon-btn" id="backBtn" aria-label="Назад">
@@ -667,7 +643,6 @@ button.btn-secondary.busy::after{border-color:rgba(0,0,0,.15);border-top-color:v
   </section>
 </div>
 
-<!-- ===== ADD CONTACT MODAL ===== -->
 <div class="modal-backdrop" id="addModal">
   <div class="modal">
     <h3>Новый чат</h3>
@@ -714,6 +689,23 @@ function unpack(buf){
 /* ================= CRYPTO ================= */
 function b64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function unb64(s){ const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
+function b64urlToBytes(s){
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return unb64(s);
+}
+// восстанавливаем raw pubkey (0x04 || X || Y) из приватного JWK
+function jwkToRawPub(jwk){
+  if (!jwk || !jwk.x || !jwk.y) return null;
+  const x = b64urlToBytes(jwk.x);
+  const y = b64urlToBytes(jwk.y);
+  if (x.length !== 32 || y.length !== 32) return null;
+  const raw = new Uint8Array(65);
+  raw[0] = 4;
+  raw.set(x, 1);
+  raw.set(y, 33);
+  return b64(raw);
+}
 
 async function genKeyPair(){
   return crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]);
@@ -750,8 +742,8 @@ let myPrivKey = null;
 let myPubRaw = null;
 let sessionPassword = null;
 let contacts = [];
-const convKeys = {};
-const threads = {};
+const convKeys = {};      // uid -> CryptoKey
+const threads = {};       // uid -> [{...}]
 const unread = {};
 const seenIds = new Set();
 let activePeer = null;
@@ -788,8 +780,14 @@ function toast(msg){
 }
 
 /* ================= STORAGE ================= */
+// ключ зависит от домена текущего сервера (location.host)
+function storeKeyFor(login){
+  return "fed_key_" + login + "@" + location.host;
+}
+function storeKeyOld(login){
+  return "fed_key_" + login;
+}
 function lsContactsKey(){ return "fed_contacts_" + (me ? me.uid : "unknown"); }
-function lsKeyKey(){ return "fed_key_" + (me ? me.login : "unknown"); }
 const LS_REMEMBER = "fed_remember";
 
 function saveContacts(){
@@ -962,16 +960,79 @@ function renderThread(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ================= CONV KEY ================= */
-async function getConvKey(contact){
-  if (convKeys[contact.uid]) return convKeys[contact.uid];
-  if (!contact.pub || !myPrivKey) return null;
+/* ================= CONTACT / DECRYPT ================= */
+async function getConvKeyFromPub(uid, pub){
+  const cacheKey = uid + "|" + pub.slice(0, 16);
+  if (convKeys[cacheKey]) return convKeys[cacheKey];
   try {
-    const pub = await importPubRaw(contact.pub);
-    const key = await deriveAesKey(myPrivKey, pub);
-    convKeys[contact.uid] = key;
-    return key;
+    const p = await importPubRaw(pub);
+    const k = await deriveAesKey(myPrivKey, p);
+    convKeys[cacheKey] = k;
+    return k;
   } catch(e){ return null; }
+}
+
+/**
+ * Пытаемся расшифровать сообщение, используя несколько возможных pubkey:
+ * сначала актуальный from_pub (из самого сообщения), потом сохранённый в контакте.
+ * Если расшифровка удалась с from_pub и он отличается от сохранённого —
+ * обновляем контакт (это исправляет устаревшие pubkey).
+ */
+async function tryDecryptIncoming(m, peerUid){
+  const contact = contacts.find(c => c.uid === peerUid);
+  const incomingPub = (m.from !== me.uid && m.from_pub) ? m.from_pub : "";
+  const candidates = [];
+  if (incomingPub) candidates.push(incomingPub);
+  if (contact && contact.pub && contact.pub !== incomingPub) candidates.push(contact.pub);
+
+  for (const pub of candidates){
+    const key = await getConvKeyFromPub(peerUid, pub);
+    if (!key) continue;
+    try {
+      const text = await aesDecrypt(key, m.ct, m.iv);
+      // расшифровка удалась: синхронизируем pub в контакте, если он был неверный
+      if (contact){
+        if (incomingPub && contact.pub !== incomingPub){
+          contact.pub = incomingPub;
+          saveContacts();
+        }
+      } else if (incomingPub){
+        contacts.push({uid: peerUid, pub: incomingPub, online: null});
+        saveContacts();
+        renderContacts();
+      }
+      return {text, broken: false};
+    } catch(e){ /* пробуем следующий pub */ }
+  }
+  return null;
+}
+
+/**
+ * Убедиться, что контакт существует. Возвращает контакт или null.
+ * Если pub из сообщения есть — используем его.
+ */
+async function ensureContact(peerUid, preferredPub){
+  let c = contacts.find(x => x.uid === peerUid);
+  if (preferredPub){
+    if (!c){
+      c = {uid: peerUid, pub: preferredPub, online: null};
+      contacts.push(c); saveContacts(); renderContacts();
+    } else if (c.pub !== preferredPub){
+      c.pub = preferredPub; saveContacts();
+    }
+    return c;
+  }
+  if (c) return c;
+  try {
+    const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(peerUid));
+    if (r.ok){
+      const d = await r.json();
+      c = {uid: peerUid, pub: d.pub, online: d.online};
+      contacts.push(c); saveContacts(); renderContacts();
+      return c;
+    }
+  } catch(e){}
+  return null;
 }
 
 /* ================= WS ================= */
@@ -1042,10 +1103,16 @@ async function handleFrame(type, obj){
 }
 
 async function onContactAdd(obj){
-  // Сервер сообщает: удалённый пользователь добавил нас в контакты
   const uid = (obj.uid || "").toLowerCase();
   if (!uid || (me && uid === me.uid)) return;
-  if (contacts.find(c => c.uid === uid)) return;
+  const existing = contacts.find(c => c.uid === uid);
+  if (existing){
+    if (obj.pub && existing.pub !== obj.pub){
+      existing.pub = obj.pub;
+      saveContacts();
+    }
+    return;
+  }
   const contact = {uid, pub: obj.pub || "", online: null};
   if (!contact.pub){
     try {
@@ -1056,9 +1123,7 @@ async function onContactAdd(obj){
   contacts.push(contact);
   saveContacts();
   renderContacts();
-  if (ws && ws.readyState === 1){
-    ws.send(pack(T.SYNC, {uids: [uid]}));
-  }
+  if (ws && ws.readyState === 1) ws.send(pack(T.SYNC, {uids: [uid]}));
   const [login] = splitUid(uid);
   toast(login + " добавил(а) вас в контакты");
 }
@@ -1068,38 +1133,17 @@ async function onIncomingMsg(m){
   seenIds.add(m.id);
   const peerUid = m.from === me.uid ? m.to : m.from;
 
-  let contact = contacts.find(c => c.uid === peerUid);
-  if (!contact){
-    const pub = (m.from !== me.uid && m.from_pub) ? m.from_pub : "";
-    if (pub){
-      contact = {uid: peerUid, pub, online: null};
-      contacts.push(contact); saveContacts(); renderContacts();
-    } else if (m.from !== me.uid){
-      try {
-        const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(peerUid));
-        if (r.ok){
-          const d = await r.json();
-          contact = {uid: peerUid, pub: d.pub, online: d.online};
-          contacts.push(contact); saveContacts(); renderContacts();
-        }
-      } catch(e){}
-    }
-  }
-
-  let text, broken = false;
-  if (!contact){ text = "⚠ неизвестный отправитель"; broken = true; }
-  else {
-    const key = await getConvKey(contact);
-    if (!key){ text = "⚠ нет ключа для расшифровки"; broken = true; }
-    else {
-      try { text = await aesDecrypt(key, m.ct, m.iv); }
-      catch(e){ text = "⚠ не удалось расшифровать"; broken = true; }
-    }
-  }
-
-  const msg = {id: m.id, from: m.from, to: m.to, text, ts: m.ts, broken};
+  // Гарантируем контакт (для входящих — сразу с from_pub, это авторитетный источник)
+  await ensureContact(peerUid, m.from !== me.uid ? m.from_pub : "");
+  // Пробуем расшифровать (использует from_pub И contact.pub)
+  const result = await tryDecryptIncoming(m, peerUid);
+  const msg = {
+    id: m.id, from: m.from, to: m.to,
+    text: result ? result.text : "⚠ не удалось расшифровать",
+    ts: m.ts,
+    broken: !result,
+  };
   (threads[peerUid] = threads[peerUid] || []).push(msg);
-
   if (activePeer === peerUid){
     appendMsg(msg);
     renderContacts();
@@ -1121,41 +1165,70 @@ async function doAuth(login, password, remember){
   if (mode === "register" && password.length < 6){ setErr("Пароль минимум 6 символов"); return; }
   setErr(""); setNote("");
 
-  const storeKey = "fed_key_" + login;
   try {
     if (mode === "register"){
+      // Новая регистрация — всегда новый ключ, сервер сохранит pub при REGISTER
       const kp = await genKeyPair();
       myPrivKey = kp.privateKey;
-      localStorage.setItem(storeKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
+      const jwk = await exportPrivJWK(kp.privateKey);
       myPubRaw = await exportPubRaw(kp.publicKey);
+      // сохраняем и JWK, и pub (pub понадобится при login)
+      try {
+        localStorage.setItem(storeKeyFor(login), JSON.stringify(jwk));
+        localStorage.setItem(storeKeyFor(login) + ":pub", myPubRaw);
+        localStorage.removeItem(storeKeyOld(login));
+      } catch(e){}
       authPayload = {login, password, pub: myPubRaw};
     } else {
-      const saved = localStorage.getItem(storeKey);
-      if (!saved){
+      // Вход: сначала пробуем достать сохранённый ключ
+      let saved = null, savedPub = null;
+      try {
+        saved = localStorage.getItem(storeKeyFor(login))
+             || localStorage.getItem(storeKeyOld(login));
+        savedPub = localStorage.getItem(storeKeyFor(login) + ":pub");
+      } catch(e){}
+
+      if (saved){
+        try {
+          const jwk = JSON.parse(saved);
+          myPrivKey = await importPrivJWK(jwk);
+          // ВАЖНО: pub восстанавливаем ИЗ САМОГО КЛЮЧА, а не тянем с сервера
+          myPubRaw = jwkToRawPub(jwk) || savedPub;
+        } catch(e){ setNote("⚠ Ключ повреждён."); }
+      }
+
+      if (!myPrivKey){
+        // Нет сохранённого — генерируем новый
         setNote("⚠ Приватный ключ не найден в этом браузере — старые сообщения не расшифруются.");
         const kp = await genKeyPair();
         myPrivKey = kp.privateKey;
-        localStorage.setItem(storeKey, JSON.stringify(await exportPrivJWK(kp.privateKey)));
+        const jwk = await exportPrivJWK(kp.privateKey);
         myPubRaw = await exportPubRaw(kp.publicKey);
-      } else {
-        try { myPrivKey = await importPrivJWK(JSON.parse(saved)); }
-        catch(e){ setNote("⚠ Ключ повреждён."); }
+        try {
+          localStorage.setItem(storeKeyFor(login), JSON.stringify(jwk));
+          localStorage.setItem(storeKeyFor(login) + ":pub", myPubRaw);
+        } catch(e){}
       }
+
+      // Всегда отправляем актуальный pub — сервер обновит у себя, если расходится
       authPayload = {login, password};
+      if (myPubRaw) authPayload.pub = myPubRaw;
     }
 
     setBusy($("submitBtn"), true);
     const ok = await connect();
     sessionPassword = password;
     me = {login: ok.login, uid: ok.uid};
-    if (!myPubRaw && myPrivKey){
+
+    // На login: если сервер вернул свой pub и он совпадает с нашим — ок.
+    // Если у нас нет своего pub (маловероятно) — подсосём с сервера.
+    if (!myPubRaw){
       try {
         const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(me.uid));
         if (r.ok){ const d = await r.json(); myPubRaw = d.pub; }
       } catch(e){}
     }
 
-    // remember me
     if (remember){
       try { localStorage.setItem(LS_REMEMBER, JSON.stringify({login: me.login, password})); }
       catch(e){}
@@ -1163,7 +1236,6 @@ async function doAuth(login, password, remember){
       try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
     }
 
-    // UI
     $("myLogin").textContent = me.login;
     $("myDomain").textContent = "@" + (helloDomain || "");
     $("myAvatar").textContent = avatarChar(me.login);
@@ -1191,14 +1263,15 @@ async function applyPendingIntros(intros){
   for (const intro of intros){
     const uid = (intro.uid || "").toLowerCase();
     if (!uid || uid === me.uid) continue;
-    if (contacts.find(c => c.uid === uid)) continue;
+    const ex = contacts.find(c => c.uid === uid);
+    if (ex){
+      if (intro.pub && ex.pub !== intro.pub){ ex.pub = intro.pub; changed = true; }
+      continue;
+    }
     contacts.push({uid, pub: intro.pub || "", online: null});
     changed = true;
   }
-  if (changed){
-    saveContacts();
-    renderContacts();
-  }
+  if (changed){ saveContacts(); renderContacts(); }
 }
 
 async function loadHistory(history){
@@ -1208,35 +1281,23 @@ async function loadHistory(history){
     (byPeer[peer] = byPeer[peer] || []).push(m);
     seenIds.add(m.id);
     if (m.from !== me.uid && m.from_pub){
-      if (!contacts.find(c => c.uid === m.from)){
-        contacts.push({uid: m.from, pub: m.from_pub, online: null});
-      }
+      const ex = contacts.find(c => c.uid === m.from);
+      if (!ex){ contacts.push({uid: m.from, pub: m.from_pub, online: null}); }
+      else if (ex.pub !== m.from_pub){ ex.pub = m.from_pub; }
     }
   }
   saveContacts();
   for (const peer of Object.keys(byPeer)){
-    let contact = contacts.find(c => c.uid === peer);
-    if (!contact){
-      try {
-        const r = await fetch("/api/pubkey?uid=" + encodeURIComponent(peer));
-        if (r.ok){
-          const d = await r.json();
-          contact = {uid: peer, pub: d.pub, online: d.online};
-          contacts.push(contact);
-        }
-      } catch(e){}
-    }
-    const key = contact ? await getConvKey(contact) : null;
+    await ensureContact(peer, "");
     const list = byPeer[peer].sort((a,b) => a.ts - b.ts);
     const out = [];
     for (const m of list){
-      let text, broken = false;
-      if (!key){ text = "⚠ нет ключа"; broken = true; }
-      else {
-        try { text = await aesDecrypt(key, m.ct, m.iv); }
-        catch(e){ text = "⚠ не удалось расшифровать"; broken = true; }
-      }
-      out.push({id:m.id, from:m.from, to:m.to, text, ts:m.ts, broken});
+      const r = await tryDecryptIncoming(m, peer);
+      out.push({
+        id: m.id, from: m.from, to: m.to,
+        text: r ? r.text : "⚠ не удалось расшифровать",
+        ts: m.ts, broken: !r,
+      });
     }
     threads[peer] = out;
   }
@@ -1252,7 +1313,8 @@ async function sendMessage(){
   if (!text) return;
   const contact = contacts.find(c => c.uid === activePeer);
   if (!contact){ alert("Контакт не найден"); return; }
-  const key = await getConvKey(contact);
+  if (!contact.pub){ alert("Нет ключа получателя"); return; }
+  const key = await getConvKeyFromPub(activePeer, contact.pub);
   if (!key){ alert("Нет ключа получателя"); return; }
   const {ct, iv} = await aesEncrypt(key, text);
   const id = uuid();
@@ -1307,7 +1369,6 @@ async function addContactFromInput(){
     renderContacts();
     if (ws && ws.readyState === 1){
       ws.send(pack(T.SYNC, {uids: [data.uid]}));
-      // если удалённый — уведомляем его сервер, чтобы он тоже увидел нас
       const [_, d] = splitUid(data.uid);
       if (d && helloDomain && d !== helloDomain){
         ws.send(pack(T.INTRO, {to: data.uid}));
@@ -1335,6 +1396,7 @@ async function onDisconnect(){
   reconnectAttempts++;
   try {
     authPayload = {login: me.login, password: sessionPassword};
+    if (myPubRaw) authPayload.pub = myPubRaw;
     mode = "login";
     const ok = await connect();
     me = {login: ok.login, uid: ok.uid};
@@ -1364,9 +1426,7 @@ async function copyMyUid(){
       document.execCommand("copy");
       document.body.removeChild(ta);
       toast("Скопировано: " + full);
-    } catch(e2){
-      toast("Не удалось скопировать: " + full);
-    }
+    } catch(e2){ toast("Не удалось скопировать: " + full); }
   }
 }
 
@@ -1424,7 +1484,6 @@ $("myInfo").onclick = copyMyUid;
       $("loginIn").value = auto.login;
       $("pwIn").value = auto.password;
       $("rememberIn").checked = true;
-      // Даём серверу шанс ответить HELLO, потом логинимся
       setTimeout(() => {
         if (!$("submitBtn").disabled){
           doAuth(auto.login, auto.password, true).catch(() => {
