@@ -21,18 +21,43 @@ W, H = 900, 520  # размеры игрового поля (в пикселях
 #                        ЛОГИКА ИГРЫ
 # ============================================================
 
+def point_hits_obstacle(px, py, o, padding=0.0):
+    """Точная проверка точки относительно скруглённого прямоугольника."""
+    x = o["x"] - padding
+    y = o["y"] - padding
+    w = o["w"] + padding * 2
+    h = o["h"] + padding * 2
+    radius = min(o.get("radius", 14) + padding, w / 2, h / 2)
+
+    cx = max(x + radius, min(px, x + w - radius))
+    cy = max(y + radius, min(py, y + h - radius))
+
+    # Центральные полосы
+    if x + radius <= px <= x + w - radius and y <= py <= y + h:
+        return True
+    if y + radius <= py <= y + h - radius and x <= px <= x + w:
+        return True
+
+    # Четыре круглых угла
+    for qx, qy in (
+        (x + radius, y + radius),
+        (x + w - radius, y + radius),
+        (x + radius, y + h - radius),
+        (x + w - radius, y + h - radius),
+    ):
+        if (px - qx) ** 2 + (py - qy) ** 2 <= radius ** 2:
+            return True
+    return False
+
+
 def has_path(obstacles, start, end, cell=12):
-    """BFS-проверка: есть ли путь от start до end, минуя препятствия."""
+    """BFS-проверка: существует ли маршрут через свободное пространство."""
     cols = W // cell + 1
     rows = H // cell + 1
 
     def blocked(cx, cy):
         x, y = cx * cell, cy * cell
-        for ob in obstacles:
-            if (ob["x"] - 1 <= x <= ob["x"] + ob["w"] + 1 and
-                    ob["y"] - 1 <= y <= ob["y"] + ob["h"] + 1):
-                return True
-        return False
+        return any(point_hits_obstacle(x, y, ob, 2) for ob in obstacles)
 
     sx = max(0, min(cols - 1, int(start[0] / cell)))
     sy = max(0, min(rows - 1, int(start[1] / cell)))
@@ -57,60 +82,139 @@ def has_path(obstacles, start, end, cell=12):
 
 
 class Room:
-    """Комната = уровень. ИИ-генератор создаёт препятствия и позицию врага."""
+    """Процедурный уровень: случайная стартовая точка, цель и набор стен."""
 
     def __init__(self, rid: str, difficulty: int = 1):
         self.id = rid
         self.difficulty = max(1, difficulty)
-        self.player_start = {"x": 60.0, "y": float(H - 60), "angle": 0.0}
+        self.player_start = {"x": 70.0, "y": float(H - 70), "angle": 0.0}
         self.obstacles = []
-        self.enemy = {"x": W - 100, "y": 100, "r": 18}
+        self.enemy = {"x": W - 90, "y": 90, "r": 18}
+        self.seed = random.randrange(1, 2**31 - 1)
         self.generate()
 
-    # ---- ИИ-генерация уровня ----
-    def _random_obstacles(self):
-        n = min(2 + self.difficulty, 8)
-        obs = []
-        for _ in range(n):
-            w = random.randint(30, 80 + self.difficulty * 8)
-            h = random.randint(30, 80 + self.difficulty * 12)
-            x = random.randint(140, max(141, W - 200))
-            y = random.randint(40, max(41, H - 40 - h))
-            obs.append({"x": x, "y": y, "w": w, "h": h})
-        return obs
-
     @staticmethod
-    def _circle_hits_rect(cx, cy, r, o):
-        nx = max(o["x"], min(cx, o["x"] + o["w"]))
-        ny = max(o["y"], min(cy, o["y"] + o["h"]))
-        return (nx - cx) ** 2 + (ny - cy) ** 2 <= r * r
+    def _rect(x, y, w, h, radius=None, kind="wall"):
+        radius = int(radius if radius is not None else min(18, w / 3, h / 3))
+        return {
+            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "radius": max(6, radius), "kind": kind
+        }
+
+    def _random_obstacles(self, rng, start, end):
+        """
+        Генератор делает не просто кучку квадратов, а несколько секций.
+        В каждой секции есть большой барьер с проходом, плюс небольшие блоки.
+        Поэтому один прямой скрипт не подходит ко всем seed-ам.
+        """
+        obs = []
+        d = self.difficulty
+
+        # 2..5 крупных "ворот". Положение прохода случайное.
+        gates = min(2 + (d + 1) // 2, 5)
+        corridor_y = rng.randint(110, H - 110)
+
+        for i in range(gates):
+            x = 155 + i * ((W - 310) / max(1, gates - 1))
+            x += rng.randint(-28, 28)
+            x = int(max(105, min(W - 145, x)))
+
+            if rng.random() < 0.5:
+                gap_y = rng.randint(85, H - 145)
+                gap_h = rng.randint(75, max(80, 115 - d * 2))
+                top_h = gap_y - 12
+                bottom_y = gap_y + gap_h + 12
+                bottom_h = H - bottom_y - 12
+                if top_h >= 28:
+                    obs.append(self._rect(x, 18, rng.randint(24, 38), top_h, 14, "gate"))
+                if bottom_h >= 28:
+                    obs.append(self._rect(x, bottom_y, rng.randint(24, 38), bottom_h, 14, "gate"))
+            else:
+                gap_x = rng.randint(80, 170)
+                gap_w = rng.randint(75, max(80, 125 - d))
+                left_w = gap_x - 12
+                right_x = gap_x + gap_w + 12
+                right_w = W - right_x - 12
+                # horizontal gate
+                if left_w >= 28:
+                    obs.append(self._rect(12, corridor_y, left_w, rng.randint(24, 38), 14, "gate"))
+                if right_w >= 28:
+                    obs.append(self._rect(right_x, corridor_y, right_w, rng.randint(24, 38), 14, "gate"))
+                corridor_y = rng.randint(100, H - 100)
+
+        # Дополнительные скруглённые блоки и "островки".
+        extra = min(3 + d * 2, 15)
+        for _ in range(extra):
+            w = rng.randint(32, 72 + min(d * 5, 35))
+            h = rng.randint(30, 72 + min(d * 5, 35))
+            x = rng.randint(95, W - 95 - w)
+            y = rng.randint(28, H - 28 - h)
+            kind = rng.choice(("block", "block", "small"))
+            obs.append(self._rect(x, y, w, h, rng.randint(10, 20), kind))
+
+        # Убираем объекты, которые перекрывают старт/цель.
+        clean = []
+        for o in obs:
+            if point_hits_obstacle(start["x"], start["y"], o, 26):
+                continue
+            if point_hits_obstacle(end["x"], end["y"], o, end.get("r", 18) + 10):
+                continue
+            clean.append(o)
+
+        return clean
 
     def _overlaps_any(self, obs, cx, cy, r):
-        return any(self._circle_hits_rect(cx, cy, r, o) for o in obs)
+        return any(point_hits_obstacle(cx, cy, o, r) for o in obs)
 
     def generate(self):
-        """Пробуем 120 раз создать валидный уровень (враг достижим, старт свободен)."""
-        for _ in range(120):
-            obs = self._random_obstacles()
-            ex = random.randint(W - 180, W - 70)
-            ey = random.randint(70, H - 70)
-            r = 18
-            if self._overlaps_any(obs, self.player_start["x"], self.player_start["y"], 22):
+        """Генерирует новый seed и принимает только действительно проходимую карту."""
+        rng = random.Random()
+        for _ in range(180):
+            # Старт и цель находятся в разных секторах и тоже рандомизируются.
+            start = {
+                "x": rng.randint(48, 125),
+                "y": rng.randint(48, H - 48),
+                "angle": rng.choice((0, 0, 15, -15, 180)),
+            }
+            end = {
+                "x": rng.randint(W - 135, W - 55),
+                "y": rng.randint(48, H - 48),
+                "r": 18,
+            }
+
+            obs = self._random_obstacles(rng, start, end)
+
+            if self._overlaps_any(obs, start["x"], start["y"], 24):
                 continue
-            if self._overlaps_any(obs, ex, ey, r + 6):
+            if self._overlaps_any(obs, end["x"], end["y"], 26):
                 continue
-            if not has_path(obs, (self.player_start["x"], self.player_start["y"]), (ex, ey)):
+            if not has_path(obs, (start["x"], start["y"]), (end["x"], end["y"])):
                 continue
+
+            # Не принимаем слишком пустые карты.
+            if len(obs) < min(4, 2 + self.difficulty):
+                continue
+
+            self.seed = rng.randrange(1, 2**31 - 1)
+            self.player_start = start
+            self.enemy = end
             self.obstacles = obs
-            self.enemy = {"x": ex, "y": ey, "r": r}
             return
-        self.obstacles = []
-        self.enemy = {"x": W - 100, "y": H // 2, "r": 18}
+
+        # Безопасный fallback.
+        self.player_start = {"x": 60.0, "y": H - 60.0, "angle": 0.0}
+        self.enemy = {"x": W - 80.0, "y": 80.0, "r": 18}
+        self.obstacles = [
+            self._rect(250, 90, 32, 270, 14, "gate"),
+            self._rect(510, 160, 32, 270, 14, "gate"),
+            self._rect(340, 350, 90, 36, 16, "block"),
+        ]
 
     def to_dict(self):
         return {
             "id": self.id,
             "difficulty": self.difficulty,
+            "seed": self.seed,
             "player_start": self.player_start,
             "obstacles": self.obstacles,
             "enemy": self.enemy,
@@ -196,8 +300,7 @@ def simulate(room: Room, text: str):
                     return finish("out_of_bounds")
 
                 for o in room.obstacles:
-                    if (o["x"] <= x <= o["x"] + o["w"] and
-                            o["y"] <= y <= o["y"] + o["h"]):
+                    if point_hits_obstacle(x, y, o, 2):
                         return finish("hit_obstacle")
 
                 dx = x - room.enemy["x"]
@@ -356,7 +459,7 @@ HTML_PAGE = r"""<!doctype html>
   .card {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 16px;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -384,7 +487,7 @@ HTML_PAGE = r"""<!doctype html>
     background:
       radial-gradient(1200px 400px at 50% -10%, rgba(88,166,255,0.05), transparent 70%),
       var(--panel-2);
-    border-radius: 0 0 10px 10px;
+    border-radius: 0 0 16px 16px;
   }
   canvas {
     max-width: 100%;
@@ -866,6 +969,26 @@ const state = {
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 
+// Совместимость: roundRect есть в современных браузерах, но игра не должна
+// ломаться из-за старого Chromium/WebView.
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+    const radius = typeof r === 'number' ? r : 12;
+    const rr = Math.min(radius, Math.abs(w) / 2, Math.abs(h) / 2);
+    this.moveTo(x + rr, y);
+    this.lineTo(x + w - rr, y);
+    this.quadraticCurveTo(x + w, y, x + w, y + rr);
+    this.lineTo(x + w, y + h - rr);
+    this.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    this.lineTo(x + rr, y + h);
+    this.quadraticCurveTo(x, y + h, x, y + h - rr);
+    this.lineTo(x, y + rr);
+    this.quadraticCurveTo(x, y, x + rr, y);
+    this.closePath();
+    return this;
+  };
+}
+
 const codeEl = document.getElementById('code');
 const hlEl = document.getElementById('hl');
 const gutterInner = document.getElementById('gutterInner');
@@ -1012,7 +1135,8 @@ async function loadRoom(id, silent) {
     ['k', `# Комната ${state.roomId}`],
     ['', `Сложность: ${state.room.difficulty}`],
     ['', `Стены: ${state.room.obstacles.length}`],
-    ['', 'Напиши команды — превью покажет путь.'],
+    ['', `Seed: ${state.room.seed}`],
+    ['', 'Карта случайная — придумай новый маршрут.'],
   ]);
   outChip.textContent = '—';
   outChip.className = 'chip';
@@ -1190,11 +1314,24 @@ function draw() {
     const g = ctx.createLinearGradient(o.x, o.y, o.x, o.y + o.h);
     g.addColorStop(0, '#2c3446');
     g.addColorStop(1, '#1e2532');
+    const rr = Math.min(o.radius || 14, o.w / 2, o.h / 2);
+    ctx.beginPath();
+    ctx.roundRect(o.x, o.y, o.w, o.h, rr);
     ctx.fillStyle = g;
-    ctx.fillRect(o.x, o.y, o.w, o.h);
-    ctx.strokeStyle = 'rgba(120,140,180,0.35)';
+    ctx.fill();
+    ctx.strokeStyle = o.kind === 'gate'
+      ? 'rgba(130,155,205,0.46)'
+      : 'rgba(120,140,180,0.34)';
+    ctx.lineWidth = o.kind === 'gate' ? 1.4 : 1;
+    ctx.stroke();
+
+    // Мягкая внутренняя подсветка для "нормальных" объёмных стен.
+    ctx.beginPath();
+    ctx.roundRect(o.x + 2, o.y + 2, Math.max(0, o.w - 4), Math.max(0, o.h - 4),
+                  Math.max(4, rr - 2));
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
     ctx.lineWidth = 1;
-    ctx.strokeRect(o.x + .5, o.y + .5, o.w - 1, o.h - 1);
+    ctx.stroke();
   }
 
   const isRun = !!state.run;
@@ -1388,7 +1525,7 @@ document.getElementById('regen').onclick = async () => {
   state.run = null;
   stopAnim();
   setStatus('info', `Комната ${state.roomId} пересоздана`, `Препятствий: ${state.room.obstacles.length}`);
-  logOut([['k', '# Уровень пересоздан'], ['', `Стен: ${state.room.obstacles.length}`]]);
+  logOut([['k', '# Уровень пересоздан'], ['', `Стен: ${state.room.obstacles.length}`], ['', `Seed: ${state.room.seed}`]]);
   outChip.textContent = '—';
   outChip.className = 'chip';
   draw();
@@ -1415,12 +1552,11 @@ document.querySelectorAll('.hint').forEach(el => {
 /* ============================================================
    Bootstrap
 ============================================================ */
-const DEFAULT_CODE = `# Проведи черепашку к врагу, не задев стены
-forward 200
+const DEFAULT_CODE = `# Уровень генерируется случайно.
+# Построй свой маршрут до красной цели.
+forward 100
 right 90
-forward 150
-left 90
-forward 400`;
+forward 100`;
 
 codeEl.value = DEFAULT_CODE;
 refreshEditor();
