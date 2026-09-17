@@ -1,36 +1,74 @@
 # main.py
-# Запуск:  pip install fastapi uvicorn
-#          uvicorn main:app --reload --host 0.0.0.0 --port 8000
-# Открыть: http://localhost:8000
+# pip install fastapi uvicorn
+# uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
+import secrets
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="CollabBoard", version="1.0.0")
+app = FastAPI(title="CollabBoard", version="2.0.0")
 
 MAX_ELEMENTS = 20000
+MAX_NICK = 24
+
+AVATAR_COLORS = [
+    "#818cf8", "#34d399", "#fbbf24", "#f472b6", "#38bdf8",
+    "#a78bfa", "#fb923c", "#4ade80", "#f87171", "#22d3ee",
+    "#e879f9", "#2dd4bf", "#facc15", "#60a5fa",
+]
+
+
+def color_for(nick: str) -> str:
+    h = 0
+    for ch in nick:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return AVATAR_COLORS[h % len(AVATAR_COLORS)]
+
+
+class Client:
+    __slots__ = ("ws", "nick", "color", "cursor", "cid", "is_owner")
+
+    def __init__(self, ws: WebSocket, nick: str, color: str, cid: str, is_owner: bool):
+        self.ws = ws
+        self.nick = nick
+        self.color = color
+        self.cursor: Optional[List[float]] = None
+        self.cid = cid
+        self.is_owner = is_owner
+
+    def pub(self) -> dict:
+        return {
+            "id": self.cid,
+            "nick": self.nick,
+            "color": self.color,
+            "cursor": self.cursor,
+        }
 
 
 class Room:
     def __init__(self) -> None:
-        self.clients: Dict[WebSocket, str] = {}
+        self.owner_token: str = secrets.token_urlsafe(20)
+        self.clients: Dict[WebSocket, Client] = {}
         self.elements: List[dict] = []
 
-    def snapshot(self) -> dict:
-        return {
-            "type": "init",
-            "elements": self.elements,
-            "users": list(self.clients.values()),
-        }
+    def users(self) -> List[dict]:
+        return [c.pub() for c in self.clients.values()]
 
 
 rooms: Dict[str, Room] = {}
 
 
+async def send_json(ws: WebSocket, payload: dict) -> None:
+    try:
+        await ws.send_json(payload)
+    except Exception:
+        pass
+
+
 async def broadcast(room: Room, payload: dict, exclude: Optional[WebSocket] = None) -> None:
-    dead = []
+    dead: List[WebSocket] = []
     for ws in list(room.clients.keys()):
         if ws is exclude:
             continue
@@ -48,24 +86,85 @@ async def index() -> HTMLResponse:
 
 
 @app.websocket("/ws/{room_id}")
-async def ws_endpoint(websocket: WebSocket, room_id: str, nick: str = Query("Гость")):
+async def ws_endpoint(
+    websocket: WebSocket,
+    room_id: str,
+    nick: str = Query("Гость"),
+    token: str = Query(""),
+    cid: str = Query(""),
+):
     await websocket.accept()
-    room = rooms.setdefault(room_id, Room())
-    room.clients[websocket] = nick[:24] or "Гость"
+    nick = (nick or "Гость")[:MAX_NICK].strip() or "Гость"
+    if not cid:
+        cid = secrets.token_hex(6)
 
-    await websocket.send_json(room.snapshot())
-    await broadcast(room, {"type": "presence", "users": list(room.clients.values())}, exclude=websocket)
+    room = rooms.get(room_id)
+    created = False
+    if room is None:
+        room = Room()
+        rooms[room_id] = room
+        created = True
+
+    # Ownership:
+    #  - создатель комнаты получает токен
+    #  - при повторном входе с тем же токеном — владелец
+    #  - если комната пуста и токен не подошёл — новый владелец забирает её
+    is_owner = created or (bool(token) and token == room.owner_token)
+    if not is_owner and not room.clients:
+        room.owner_token = secrets.token_urlsafe(20)
+        is_owner = True
+
+    client = Client(websocket, nick, color_for(nick), cid, is_owner)
+    room.clients[websocket] = client
+
+    await send_json(websocket, {
+        "type": "init",
+        "elements": room.elements,
+        "users": room.users(),
+        "is_owner": is_owner,
+        "owner_token": room.owner_token if is_owner else None,
+        "you": client.pub(),
+        "room": room_id,
+    })
+    await broadcast(room, {"type": "presence", "users": room.users()}, exclude=websocket)
 
     try:
         while True:
             msg = await websocket.receive_json()
             t = msg.get("type")
 
+            # --- не требует прав владельца ---
+            if t == "cursor":
+                x = msg.get("x")
+                y = msg.get("y")
+                client.cursor = [float(x), float(y)] if (x is not None and y is not None) else None
+                await broadcast(room, {
+                    "type": "cursor",
+                    "id": cid,
+                    "nick": nick,
+                    "color": client.color,
+                    "x": x,
+                    "y": y,
+                }, exclude=websocket)
+                continue
+
+            if t == "laser":
+                await broadcast(room, msg, exclude=websocket)
+                continue
+
+            if t == "ping":
+                await send_json(websocket, {"type": "pong"})
+                continue
+
+            # --- дальше — только владелец ---
+            if not is_owner:
+                continue
+
             if t == "add":
                 el = msg.get("element")
                 if el and len(room.elements) < MAX_ELEMENTS:
                     room.elements.append(el)
-                await broadcast(room, {"type": "add", "element": el, "from": nick}, exclude=websocket)
+                await broadcast(room, {"type": "add", "element": el}, exclude=websocket)
 
             elif t == "batch":
                 els = msg.get("elements") or []
@@ -76,8 +175,9 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, nick: str = Query("Г�
 
             elif t == "update":
                 el = msg.get("element") or {}
+                eid = el.get("id")
                 for i, cur in enumerate(room.elements):
-                    if cur.get("id") == el.get("id"):
+                    if cur.get("id") == eid:
                         room.elements[i] = el
                         break
                 await broadcast(room, {"type": "update", "element": el}, exclude=websocket)
@@ -91,8 +191,11 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, nick: str = Query("Г�
                 room.elements.clear()
                 await broadcast(room, {"type": "clear"}, exclude=websocket)
 
-            elif t == "laser":
-                await broadcast(room, msg, exclude=websocket)
+            elif t == "sync":
+                els = msg.get("elements")
+                if isinstance(els, list):
+                    room.elements = els[:MAX_ELEMENTS]
+                    await broadcast(room, {"type": "sync", "elements": room.elements}, exclude=websocket)
 
     except WebSocketDisconnect:
         pass
@@ -100,7 +203,8 @@ async def ws_endpoint(websocket: WebSocket, room_id: str, nick: str = Query("Г�
         pass
     finally:
         room.clients.pop(websocket, None)
-        await broadcast(room, {"type": "presence", "users": list(room.clients.values())})
+        await broadcast(room, {"type": "presence", "users": room.users()})
+        await broadcast(room, {"type": "user_leave", "id": cid})
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -129,9 +233,8 @@ input,select,textarea{font-family:inherit}
 ::-webkit-scrollbar-thumb{background:#22314f;border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#2f4268}
 
-/* ---------- TOPBAR ---------- */
 .topbar{
-  height:54px; display:flex; align-items:center; gap:12px; padding:0 14px;
+  height:54px; display:flex; align-items:center; gap:10px; padding:0 12px;
   background:linear-gradient(180deg,#0e1729,#0b1424);
   border-bottom:1px solid var(--line); position:relative; z-index:20;
 }
@@ -145,20 +248,28 @@ input,select,textarea{font-family:inherit}
 .brand-txt b{font-size:13.5px;letter-spacing:.2px}
 .brand-txt span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px}
 .divider{width:1px;height:26px;background:var(--line)}
+.divider.sm{height:14px}
 .board-pill{
   display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:8px;
   background:#101b30;border:1px solid var(--line);font-weight:600;font-size:12.5px;
 }
 .board-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.role-badge{
+  padding:4px 9px;border-radius:20px;font-size:10.5px;font-weight:700;letter-spacing:.6px;
+  text-transform:uppercase;border:1px solid;
+}
+.role-badge.owner{color:#c7d2fe;background:#312e81aa;border-color:#4338ca}
+.role-badge.viewer{color:#fde68a;background:#78350f66;border-color:#b45309}
 .spacer{flex:1}
 .users{display:flex;align-items:center}
 .avatar{
   width:29px;height:29px;border-radius:50%;display:grid;place-items:center;
   font-size:11px;font-weight:700;color:#08111f;border:2px solid #0e1729;margin-left:-8px;
-  transition:transform .15s;
+  transition:transform .15s;cursor:default;
 }
 .avatar:first-child{margin-left:0}
 .avatar:hover{transform:translateY(-2px)}
+.avatar.me{box-shadow:0 0 0 2px #6366f1}
 .users-count{font-size:11px;color:var(--muted);margin-left:9px}
 .zoom{display:flex;align-items:center;background:#101b30;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .zoom button{background:none;border:0;padding:6px 11px;cursor:pointer;font-size:13px;color:var(--muted);transition:.15s}
@@ -173,12 +284,12 @@ input,select,textarea{font-family:inherit}
 .btn.primary:hover{filter:brightness(1.1)}
 .btn.ghost{background:transparent}
 .btn.danger:hover{background:#3a1622;border-color:#7f2033;color:#ffb4c0}
+.btn.icon{padding:7px 9px}
 .btn svg{width:15px;height:15px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
 
-/* ---------- LAYOUT ---------- */
 .workspace{position:absolute;inset:54px 0 0 0;display:flex}
 
-/* ---------- RAIL ---------- */
 .rail{
   width:56px;background:var(--panel);border-right:1px solid var(--line);
   display:flex;flex-direction:column;align-items:center;gap:3px;padding:9px 0;overflow-y:auto;z-index:10;
@@ -191,6 +302,8 @@ input,select,textarea{font-family:inherit}
 .tool:hover{background:#16233c;color:var(--text)}
 .tool.active{background:linear-gradient(180deg,#243467,#1a2749);color:#c7d2fe;border-color:#3b4f8a;box-shadow:0 4px 14px -6px #6366f1}
 .tool.active::before{content:"";position:absolute;left:-9px;top:9px;bottom:9px;width:3px;border-radius:0 3px 3px 0;background:var(--accent2)}
+.tool:disabled{opacity:.28;cursor:not-allowed}
+.tool:disabled:hover{background:transparent;color:var(--muted)}
 .tool .tt{
   position:absolute;left:52px;top:50%;transform:translateY(-50%) scale(.95);
   background:#0a1322;border:1px solid var(--line2);padding:5px 9px;border-radius:7px;
@@ -201,7 +314,6 @@ input,select,textarea{font-family:inherit}
 .tool:hover .tt{opacity:1;transform:translateY(-50%) scale(1)}
 .rail-sep{width:26px;height:1px;background:var(--line);margin:6px 0}
 
-/* ---------- STAGE ---------- */
 .stage{flex:1;position:relative;overflow:hidden;background:#0a1120}
 #canvas{display:block;position:absolute;inset:0;touch-action:none;cursor:crosshair}
 .stage.hand #canvas{cursor:grab}
@@ -219,7 +331,6 @@ input,select,textarea{font-family:inherit}
 .conn.off .led{background:var(--danger);box-shadow:0 0 8px var(--danger)}
 .conn.warn .led{background:var(--warn);box-shadow:0 0 8px var(--warn)}
 
-/* ---------- PROPS ---------- */
 .props{
   width:296px;background:var(--panel);border-left:1px solid var(--line);
   display:flex;flex-direction:column;z-index:10;
@@ -272,24 +383,19 @@ input,select,textarea{font-family:inherit}
 .val{font-size:10.5px;color:#6f83a6;min-width:32px;text-align:right;font-variant-numeric:tabular-nums}
 .switch{position:relative;display:inline-block;width:34px;height:19px;flex-shrink:0}
 .switch input{opacity:0;width:0;height:0}
-.switch span{
-  position:absolute;inset:0;background:#22314f;border-radius:20px;cursor:pointer;transition:.2s;
-}
-.switch span::before{
-  content:"";position:absolute;width:13px;height:13px;left:3px;top:3px;background:#7c8db0;border-radius:50%;transition:.2s;
-}
+.switch span{position:absolute;inset:0;background:#22314f;border-radius:20px;cursor:pointer;transition:.2s}
+.switch span::before{content:"";position:absolute;width:13px;height:13px;left:3px;top:3px;background:#7c8db0;border-radius:50%;transition:.2s}
 .switch input:checked + span{background:#4f46e5}
 .switch input:checked + span::before{transform:translateX(15px);background:#fff}
 .empty-note{padding:24px 14px;color:var(--muted);font-size:12px;line-height:1.6;text-align:center}
 
-/* ---------- OVERLAY ---------- */
 .overlay{
   position:fixed;inset:0;background:radial-gradient(1000px 600px at 50% 0%,#16224a 0%,#070c16 60%);
   display:grid;place-items:center;z-index:100;
 }
 .overlay.hidden{display:none}
 .card{
-  width:390px;background:#0e1729;border:1px solid #23324f;border-radius:18px;padding:34px 32px 30px;
+  width:400px;background:#0e1729;border:1px solid #23324f;border-radius:18px;padding:34px 32px 30px;
   box-shadow:0 40px 90px -30px #000, 0 0 0 1px #ffffff08 inset;
 }
 .card .logo{width:46px;height:46px;font-size:16px;border-radius:13px;margin-bottom:18px}
@@ -305,18 +411,54 @@ input,select,textarea{font-family:inherit}
 .card .btn{width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:8px;border-radius:10px}
 .hint{margin-top:16px;font-size:11px;color:#5f7192;text-align:center;line-height:1.5}
 
-/* ---------- TEXT EDITOR ---------- */
 #textEditor{
   position:absolute;display:none;z-index:30;background:transparent;border:1px dashed #6366f1;
   outline:none;resize:none;overflow:hidden;padding:0;margin:0;line-height:1.35;
-  white-space:pre;color:#0f172a;
+  white-space:pre-wrap;word-break:break-word;
 }
+
+.ctxmenu{
+  position:fixed;background:#0e1729;border:1px solid var(--line2);border-radius:9px;
+  padding:5px;min-width:220px;box-shadow:0 20px 50px -12px #000;display:none;z-index:300;
+}
+.ctxmenu.show{display:block}
+.ctxmenu button{
+  display:flex;width:100%;align-items:center;gap:10px;background:none;border:0;
+  padding:8px 10px;border-radius:6px;cursor:pointer;font-size:12.5px;text-align:left;
+  color:var(--text);transition:.1s;
+}
+.ctxmenu button:hover:not(:disabled){background:#1a2749}
+.ctxmenu button:disabled{color:#4a5a78;cursor:default}
+.ctxmenu button .kbd{margin-left:auto;color:#6f83a6;font-size:10.5px;font-family:inherit}
+.ctxmenu .sep{height:1px;background:var(--line);margin:4px 2px}
+
 .toast{
   position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);
   background:#132340;border:1px solid #2b3f68;border-radius:10px;padding:10px 18px;font-size:12.5px;
   z-index:200;opacity:0;transition:.28s cubic-bezier(.2,.9,.3,1);box-shadow:0 18px 40px -14px #000;
+  pointer-events:none;
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+.modal{
+  position:fixed;inset:0;background:rgba(3,8,18,.7);backdrop-filter:blur(6px);
+  display:none;place-items:center;z-index:250;
+}
+.modal.show{display:grid}
+.modal-card{
+  width:520px;max-height:80vh;overflow-y:auto;background:#0e1729;border:1px solid #23324f;
+  border-radius:14px;padding:24px;box-shadow:0 40px 90px -30px #000;
+}
+.modal-card h2{margin:0 0 16px;font-size:17px}
+.kbd-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #16223c;font-size:12.5px}
+.kbd-row:last-child{border-bottom:0}
+.kbd-row .keys{display:flex;gap:5px;align-items:center}
+kbd{
+  background:#1b2b47;border:1px solid #2b3f68;border-radius:5px;padding:2px 7px;
+  font-size:11px;font-family:inherit;font-weight:600;color:#c7d2fe;
+}
+.section-h{font-size:10px;text-transform:uppercase;letter-spacing:1.3px;color:#5f7192;font-weight:700;margin:16px 0 8px}
+.section-h:first-child{margin-top:0}
 </style>
 </head>
 <body>
@@ -328,23 +470,22 @@ input,select,textarea{font-family:inherit}
   </div>
   <div class="divider"></div>
   <div class="board-pill"><span class="dot"></span><span id="boardLabel">main</span></div>
+  <span class="role-badge owner" id="roleBadge" style="display:none">Владелец</span>
   <div class="spacer"></div>
   <div class="users" id="users"></div>
   <div class="users-count" id="usersCount"></div>
   <div class="zoom">
-    <button id="zoomOut" title="Уменьшить">−</button>
-    <button class="zval" id="zoomVal" title="Сбросить масштаб">100%</button>
-    <button id="zoomIn" title="Увеличить">+</button>
+    <button id="zoomOut" title="Уменьшить (Ctrl+-)">−</button>
+    <button class="zval" id="zoomVal" title="Сбросить (Ctrl+0)">100%</button>
+    <button id="zoomIn" title="Увеличить (Ctrl+=)">+</button>
   </div>
-  <button class="btn ghost" id="btnUndo" title="Отменить (Ctrl+Z)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
-    Отменить
+  <button class="btn ghost icon" id="btnHelp" title="Горячие клавиши (?)">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.7"/><circle cx="12" cy="17" r=".5" fill="currentColor"/></svg>
   </button>
-  <button class="btn" id="btnExport">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-    Экспорт
-  </button>
-  <button class="btn danger" id="btnClear">Очистить</button>
+  <button class="btn ghost" id="btnUndo" title="Отменить (Ctrl+Z)">Отменить</button>
+  <button class="btn ghost" id="btnRedo" title="Повторить (Ctrl+Y)">Повторить</button>
+  <button class="btn" id="btnExport" title="Экспорт (Ctrl+S)">Экспорт</button>
+  <button class="btn danger" id="btnClear" title="Очистить доску">Очистить</button>
 </header>
 
 <main class="workspace">
@@ -354,9 +495,11 @@ input,select,textarea{font-family:inherit}
     <textarea id="textEditor" spellcheck="false"></textarea>
     <div class="hud">
       <div class="conn" id="conn"><span class="led"></span><span id="connTxt">Подключение…</span></div>
-      <div class="divider" style="height:14px"></div>
+      <div class="divider sm"></div>
       <span>Объектов: <b id="statCount">0</b></span>
-      <div class="divider" style="height:14px"></div>
+      <div class="divider sm"></div>
+      <span>Выбрано: <b id="statSel">0</b></span>
+      <div class="divider sm"></div>
       <span id="statTool">Перо</span>
     </div>
   </section>
@@ -388,10 +531,42 @@ input,select,textarea{font-family:inherit}
       <input id="roomInput" maxlength="32" value="main" autocomplete="off"/>
     </div>
     <button class="btn primary" id="joinBtn">Войти на доску</button>
-    <div class="hint">Все участники комнаты видят изменения мгновенно</div>
+    <div class="hint">
+      Первый, кто создаёт комнату, становится её <b>владельцем</b> и может редактировать доску.<br/>
+      Остальные подключаются как наблюдатели.
+    </div>
   </div>
 </div>
 
+<div class="modal" id="helpModal">
+  <div class="modal-card">
+    <h2>Горячие клавиши</h2>
+    <div class="section-h">Инструменты</div>
+    <div id="helpTools"></div>
+    <div class="section-h">Редактирование</div>
+    <div class="kbd-row"><span>Выделить всё</span><span class="keys"><kbd>Ctrl</kbd><kbd>A</kbd></span></div>
+    <div class="kbd-row"><span>Копировать</span><span class="keys"><kbd>Ctrl</kbd><kbd>C</kbd></span></div>
+    <div class="kbd-row"><span>Вставить</span><span class="keys"><kbd>Ctrl</kbd><kbd>V</kbd></span></div>
+    <div class="kbd-row"><span>Дублировать</span><span class="keys"><kbd>Ctrl</kbd><kbd>D</kbd></span></div>
+    <div class="kbd-row"><span>Удалить</span><span class="keys"><kbd>Del</kbd></span></div>
+    <div class="kbd-row"><span>Отменить / Повторить</span><span class="keys"><kbd>Ctrl</kbd><kbd>Z</kbd> / <kbd>Ctrl</kbd><kbd>Y</kbd></span></div>
+    <div class="kbd-row"><span>Снять выделение</span><span class="keys"><kbd>Esc</kbd></span></div>
+    <div class="kbd-row"><span>Сдвинуть на 1 / 10 px</span><span class="keys"><kbd>←↑→↓</kbd> / <kbd>Shift</kbd>+<kbd>←↑→↓</kbd></span></div>
+    <div class="section-h">Навигация</div>
+    <div class="kbd-row"><span>Панорама</span><span class="keys"><kbd>Space</kbd>+drag / СКМ / <kbd>H</kbd></span></div>
+    <div class="kbd-row"><span>Зум</span><span class="keys"><kbd>Ctrl</kbd>+колесо / <kbd>Ctrl</kbd><kbd>+/−</kbd></span></div>
+    <div class="kbd-row"><span>Показать всё</span><span class="keys"><kbd>Ctrl</kbd><kbd>1</kbd></span></div>
+    <div class="kbd-row"><span>Масштаб 100%</span><span class="keys"><kbd>Ctrl</kbd><kbd>0</kbd></span></div>
+    <div class="kbd-row"><span>Экспорт</span><span class="keys"><kbd>Ctrl</kbd><kbd>S</kbd></span></div>
+    <div class="section-h">Мышь</div>
+    <div class="kbd-row"><span>Мульти-выбор</span><span class="keys"><kbd>Shift</kbd>+клик</span></div>
+    <div class="kbd-row"><span>Дублировать при перетаскивании</span><span class="keys"><kbd>Alt</kbd>+drag</span></div>
+    <div class="kbd-row"><span>Редактировать текст/стикер</span><span class="keys">двойной клик</span></div>
+    <div class="kbd-row"><span>Контекстное меню</span><span class="keys">правый клик</span></div>
+  </div>
+</div>
+
+<div class="ctxmenu" id="ctxmenu"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -421,7 +596,7 @@ const ICONS = {
 };
 
 /* ============================================================
-   TOOLS  (15 инструментов)
+   TOOLS
    ============================================================ */
 const TOOLS = [
   {id:'select',      name:'Выделение',    icon:'select',      key:'v', sub:'Перемещение и удаление объектов'},
@@ -438,169 +613,70 @@ const TOOLS = [
   {id:'star',        name:'Звезда',       icon:'star',        key:'s', sub:'Многолучевая звезда'},
   {id:'text',        name:'Текст',        icon:'type',        key:'x', sub:'Текстовая надпись'},
   {id:'sticky',      name:'Стикер',       icon:'sticky',      key:'n', sub:'Заметка на доске'},
-  {id:'laser',       name:'Лазер',        icon:'zap',         key:'k', sub:'Временная указка'}
+  {id:'laser',       name:'Лазер',        icon:'zap',         key:'k', sub:'Временная указка (для всех)'}
 ];
 const TOOL_BY_ID = Object.fromEntries(TOOLS.map(t=>[t.id,t]));
 
+const VIEWER_TOOLS = new Set(['hand','laser']);
+
 /* ============================================================
-   НАСТРОЙКИ (100+)
+   SETTINGS (100+)
    ============================================================ */
 const S = {
-  /* --- Холст (21) --- */
-  bgColor:'#ffffff',
-  bgPattern:'grid',
-  patternSize:24,
-  patternColor:'#cbd5e1',
-  patternOpacity:0.7,
-  patternWidth:1,
-  patternAngle:0,
-  snapEnabled:false,
-  snapGrid:20,
-  snapObjects:true,
-  snapThreshold:8,
-  showRulers:true,
-  rulerUnit:'px',
-  showOrigin:false,
-  pageMode:'infinite',
-  pageWidth:1920,
-  pageHeight:1080,
-  zoomMin:0.1,
-  zoomMax:8,
-  canvasShadow:true,
-  canvasShadowBlur:30,
-
-  /* --- Обводка (14) --- */
-  stroke:'#0f172a',
-  strokeWidth:3,
-  strokeOpacity:1,
-  lineCap:'round',
-  lineJoin:'round',
-  miterLimit:10,
-  dashPreset:'solid',
-  dashLength:10,
-  dashGap:8,
-  dashOffset:0,
-  strokeGradient:false,
-  strokeGradType:'linear',
-  strokeGradColor2:'#6366f1',
-  strokeGradAngle:0,
-
-  /* --- Заливка (6) --- */
-  fillEnabled:false,
-  fill:'#a5b4fc',
-  fillOpacity:0.45,
-  fillGradient:false,
-  fillGradColor2:'#f472b6',
-  fillGradAngle:0,
-
-  /* --- Перо (12) --- */
-  penSmoothing:0.6,
-  penStabilizer:0.3,
-  penPressure:true,
-  penMinWidth:0.25,
-  penMaxWidth:1.6,
-  penVelocity:0.4,
-  penTaperStart:0.0,
-  penTaperEnd:0.2,
-  penSpacing:2,
-  penTexture:false,
-  penTextureDensity:0.3,
-  penTextureOpacity:0.35,
-
-  /* --- Маркер (5) --- */
-  hlOpacity:0.35,
-  hlBlend:'multiply',
-  hlWidthMul:5,
-  hlRoundTip:true,
-  hlCap:'butt',
-
-  /* --- Ластик (5) --- */
-  eraserSize:24,
-  eraserMode:'object',
-  eraserHardness:0.8,
-  eraserFalloff:0.4,
-  eraserCurrentLayerOnly:false,
-
-  /* --- Фигуры (13) --- */
-  cornerRadius:12,
-  polySides:6,
-  shapeRotation:0,
-  lockAspect:false,
-  starPoints:5,
-  starInner:0.45,
-  closePath:true,
-  shadowEnabled:false,
-  shadowBlur:18,
-  shadowX:0,
-  shadowY:6,
-  shadowColor:'#0f172a',
-  shadowOpacity:0.25,
-
-  /* --- Линия/стрелка (6) --- */
-  arrowHeadSize:14,
-  arrowHeadStyle:'triangle',
-  arrowTailStyle:'none',
-  arrowCurve:0,
-  arrowDouble:false,
-  arrowHeadAngle:28,
-
-  /* --- Текст (11) --- */
-  fontFamily:'Inter, system-ui, sans-serif',
-  fontSize:22,
-  fontWeight:500,
-  fontItalic:false,
-  fontUnderline:false,
-  textAlign:'left',
-  lineHeight:1.35,
-  letterSpacing:0,
-  textColor:'#0f172a',
-  textBgEnabled:false,
-  textBgColor:'#fef9c3',
-
-  /* --- Стикер (7) --- */
-  stickyColor:'#fde68a',
-  stickyFontSize:18,
-  stickyFontFamily:'Inter, system-ui, sans-serif',
-  stickyTextColor:'#1f2937',
-  stickyShadow:true,
-  stickyRadius:10,
-  stickyPadding:14,
-
-  /* --- Лазер (4) --- */
-  laserColor:'#ef4444',
-  laserWidth:4,
-  laserFade:700,
-  laserGlow:true,
-
-  /* --- Выделение (5) --- */
-  showBBox:true,
-  bboxColor:'#6366f1',
-  handleSize:8,
-  handleColor:'#ffffff',
-  snapRotation:false,
-
-  /* --- Экспорт (5) --- */
-  exportFormat:'png',
-  exportScale:2,
-  exportTransparent:false,
-  exportQuality:0.92,
-  exportIncludeGrid:false,
-
-  /* --- Объект / слой (4) --- */
-  elementOpacity:1,
-  blendMode:'source-over',
-  locked:false,
-  visible:true
+  /* canvas 21 */
+  bgColor:'#ffffff', bgPattern:'grid', patternSize:24, patternColor:'#cbd5e1',
+  patternOpacity:0.7, patternWidth:1, patternAngle:0,
+  snapEnabled:false, snapGrid:20, snapObjects:true, snapThreshold:8,
+  showRulers:false, rulerUnit:'px', showOrigin:false,
+  pageMode:'infinite', pageWidth:1920, pageHeight:1080,
+  zoomMin:0.1, zoomMax:8, canvasShadow:true, canvasShadowBlur:30,
+  /* stroke 14 */
+  stroke:'#0f172a', strokeWidth:3, strokeOpacity:1,
+  lineCap:'round', lineJoin:'round', miterLimit:10,
+  dashPreset:'solid', dashLength:10, dashGap:8, dashOffset:0,
+  strokeGradient:false, strokeGradType:'linear', strokeGradColor2:'#6366f1', strokeGradAngle:0,
+  /* fill 6 */
+  fillEnabled:false, fill:'#a5b4fc', fillOpacity:0.45,
+  fillGradient:false, fillGradColor2:'#f472b6', fillGradAngle:0,
+  /* pen 12 */
+  penSmoothing:0.6, penStabilizer:0.3, penPressure:true, penMinWidth:0.25, penMaxWidth:1.6,
+  penVelocity:0.4, penTaperStart:0.0, penTaperEnd:0.2, penSpacing:2,
+  penTexture:false, penTextureDensity:0.3, penTextureOpacity:0.35,
+  /* highlighter 5 */
+  hlOpacity:0.35, hlBlend:'multiply', hlWidthMul:5, hlRoundTip:true, hlCap:'butt',
+  /* eraser 5 */
+  eraserSize:24, eraserMode:'object', eraserHardness:0.8, eraserFalloff:0.4, eraserCurrentLayerOnly:false,
+  /* shapes 13 */
+  cornerRadius:12, polySides:6, shapeRotation:0, lockAspect:false,
+  starPoints:5, starInner:0.45, closePath:true,
+  shadowEnabled:false, shadowBlur:18, shadowX:0, shadowY:6, shadowColor:'#0f172a', shadowOpacity:0.25,
+  /* arrow 6 */
+  arrowHeadSize:14, arrowHeadStyle:'triangle', arrowTailStyle:'none', arrowCurve:0,
+  arrowDouble:false, arrowHeadAngle:28,
+  /* text 11 */
+  fontFamily:'Inter, system-ui, sans-serif', fontSize:22, fontWeight:500,
+  fontItalic:false, fontUnderline:false, textAlign:'left', lineHeight:1.35, letterSpacing:0,
+  textColor:'#0f172a', textBgEnabled:false, textBgColor:'#fef9c3',
+  /* sticky 7 */
+  stickyColor:'#fde68a', stickyFontSize:18, stickyFontFamily:'Inter, system-ui, sans-serif',
+  stickyTextColor:'#1f2937', stickyShadow:true, stickyRadius:10, stickyPadding:14,
+  /* laser 4 */
+  laserColor:'#ef4444', laserWidth:4, laserFade:700, laserGlow:true,
+  /* selection 5 */
+  showBBox:true, bboxColor:'#6366f1', handleSize:8, handleColor:'#ffffff', snapRotation:false,
+  /* export 5 */
+  exportFormat:'png', exportScale:2, exportTransparent:false, exportQuality:0.92, exportIncludeGrid:false,
+  /* misc 4 */
+  elementOpacity:1, blendMode:'source-over', locked:false, visible:true
 };
 
 /* ============================================================
-   СХЕМА ПАНЕЛИ
+   SECTIONS
    ============================================================ */
 const C = (k,l,t,o={}) => Object.assign({k,l,t}, o);
 
 const SECTIONS = [
-  /* ---------- ХОЛСТ ---------- */
-  { id:'canvas', tab:'canvas', title:'Оформление холста', items:[
+  { id:'canvas1', tab:'canvas', title:'Оформление холста', items:[
     C('bgColor','Цвет фона','color'),
     C('bgPattern','Узор','select',{options:[['none','Нет'],['grid','Сетка'],['dots','Точки'],['lines','Линии']]}),
     C('patternSize','Размер ячейки','range',{min:4,max:200,step:1,suf:'px'}),
@@ -628,8 +704,7 @@ const SECTIONS = [
     C('zoomMax','Макс. масштаб','range',{min:1,max:16,step:0.5}),
   ]},
 
-  /* ---------- ОБВОДКА ---------- */
-  { id:'stroke', tools:['pen','highlighter','line','arrow','rect','ellipse','triangle','polygon','star'], title:'Обводка', items:[
+  { id:'stroke', tools:['pen','highlighter','line','arrow','rect','ellipse','triangle','polygon','star','text'], title:'Обводка', items:[
     C('stroke','Цвет','color'),
     C('strokeWidth','Толщина','range',{min:0.5,max:60,step:0.5,suf:'px'}),
     C('strokeOpacity','Непрозрачность','range',{min:0,max:1,step:0.01,pct:true}),
@@ -648,7 +723,6 @@ const SECTIONS = [
     C('strokeGradAngle','Угол','range',{min:0,max:360,step:1,suf:'°'}),
   ]},
 
-  /* ---------- ЗАЛИВКА ---------- */
   { id:'fill', tools:['rect','ellipse','triangle','polygon','star'], title:'Заливка', items:[
     C('fillEnabled','Заливать фигуру','check'),
     C('fill','Цвет заливки','color'),
@@ -658,7 +732,6 @@ const SECTIONS = [
     C('fillGradAngle','Угол градиента','range',{min:0,max:360,step:1,suf:'°'}),
   ]},
 
-  /* ---------- ПЕРО ---------- */
   { id:'pen', tools:['pen'], title:'Параметры пера', items:[
     C('penSmoothing','Сглаживание','range',{min:0,max:1,step:0.01,pct:true}),
     C('penStabilizer','Стабилизатор','range',{min:0,max:1,step:0.01,pct:true}),
@@ -674,7 +747,6 @@ const SECTIONS = [
     C('penTextureOpacity','Сила текстуры','range',{min:0,max:1,step:0.05,pct:true}),
   ]},
 
-  /* ---------- МАРКЕР ---------- */
   { id:'hl', tools:['highlighter'], title:'Параметры маркера', items:[
     C('hlOpacity','Непрозрачность','range',{min:0.05,max:1,step:0.01,pct:true}),
     C('hlBlend','Режим наложения','select',{options:[['multiply','Умножение'],['source-over','Обычный'],['screen','Экран'],['overlay','Перекрытие'],['darken','Затемнение']]}),
@@ -683,7 +755,6 @@ const SECTIONS = [
     C('hlCap','Окончание','select',{options:[['butt','Плоское'],['round','Круглое'],['square','Квадратное']]}),
   ]},
 
-  /* ---------- ЛАСТИК ---------- */
   { id:'eraser', tools:['eraser'], title:'Параметры ластика', items:[
     C('eraserSize','Размер','range',{min:4,max:200,step:2,suf:'px'}),
     C('eraserMode','Режим','select',{options:[['object','Удалять объект'],['partial','Стирать часть']]}),
@@ -692,7 +763,6 @@ const SECTIONS = [
     C('eraserCurrentLayerOnly','Только текущий слой','check'),
   ]},
 
-  /* ---------- ФИГУРЫ ---------- */
   { id:'shape', tools:['rect','ellipse','triangle','polygon','star'], title:'Геометрия фигуры', items:[
     C('cornerRadius','Радиус скругления','range',{min:0,max:120,step:1,suf:'px'}),
     C('polySides','Число сторон','range',{min:3,max:24,step:1}),
@@ -711,7 +781,6 @@ const SECTIONS = [
     C('shadowOpacity','Плотность тени','range',{min:0,max:1,step:0.01,pct:true}),
   ]},
 
-  /* ---------- ЛИНИЯ / СТРЕЛКА ---------- */
   { id:'arrow', tools:['line','arrow'], title:'Линия и стрелка', items:[
     C('arrowHeadSize','Размер наконечника','range',{min:4,max:60,step:1,suf:'px'}),
     C('arrowHeadAngle','Угол наконечника','range',{min:10,max:70,step:1,suf:'°'}),
@@ -721,7 +790,6 @@ const SECTIONS = [
     C('arrowDouble','Двусторонняя','check'),
   ]},
 
-  /* ---------- ТЕКСТ ---------- */
   { id:'text', tools:['text'], title:'Типографика', items:[
     C('fontFamily','Шрифт','select',{options:[
       ['Inter, system-ui, sans-serif','Inter'],
@@ -744,7 +812,6 @@ const SECTIONS = [
     C('textBgColor','Цвет подложки','color'),
   ]},
 
-  /* ---------- СТИКЕР ---------- */
   { id:'sticky', tools:['sticky'], title:'Стикер', items:[
     C('stickyColor','Цвет стикера','color'),
     C('stickyFontSize','Размер шрифта','range',{min:8,max:60,step:1,suf:'px'}),
@@ -760,7 +827,6 @@ const SECTIONS = [
     C('stickyPadding','Внутренний отступ','range',{min:4,max:50,step:1,suf:'px'}),
   ]},
 
-  /* ---------- ЛАЗЕР ---------- */
   { id:'laser', tools:['laser'], title:'Указка', items:[
     C('laserColor','Цвет','color'),
     C('laserWidth','Толщина','range',{min:1,max:20,step:1,suf:'px'}),
@@ -768,7 +834,6 @@ const SECTIONS = [
     C('laserGlow','Свечение','check'),
   ]},
 
-  /* ---------- ВЫДЕЛЕНИЕ ---------- */
   { id:'selection', tools:['select'], title:'Выделение', items:[
     C('showBBox','Показывать рамку','check'),
     C('bboxColor','Цвет рамки','color'),
@@ -777,7 +842,6 @@ const SECTIONS = [
     C('snapRotation','Привязка поворота','check'),
   ]},
 
-  /* ---------- ЭКСПОРТ ---------- */
   { id:'export', tab:'export', title:'Экспорт изображения', items:[
     C('exportFormat','Формат','select',{options:[['png','PNG'],['jpeg','JPEG'],['webp','WebP']]}),
     C('exportScale','Масштаб','range',{min:0.5,max:6,step:0.5,suf:'×'}),
@@ -788,31 +852,43 @@ const SECTIONS = [
 ];
 
 /* ============================================================
-   БАЗОВОЕ СОСТОЯНИЕ
+   STATE
    ============================================================ */
 const state = {
   tool:'pen',
   view:{x:0, y:0, zoom:1},
   elements:[],
-  selected:null,
+  selection:new Set(),
   draft:null,
   lasers:[],
   ws:null,
   nick:'',
   room:'main',
+  isOwner:false,
+  ownerToken:null,
+  myId:null,
+  myColor:'#818cf8',
+  remoteUsers:new Map(),   // id -> {nick,color,cursor,cursorAnim}
   tab:'tool',
-  undo:[],
+  undoStack:[],
+  redoStack:[],
+  clipboard:[],
   panning:false,
-  erasing:false,
-  drawing:false,
   spaceDown:false,
-  pendingPoints:null,
+  drawing:false,
+  erasing:false,
+  laserActive:false,
+  moveStart:null,
+  moveSnapshot:null,
+  altDuplicate:false,
+  lastScreen:null,
+  lastEditorClose:0,
   collapsed:{}
 };
 
 const $  = (s,r=document)=>r.querySelector(s);
 const $$ = (s,r=document)=>[...r.querySelectorAll(s)];
-const uid = ()=> (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Math.random().toString(36).slice(2)+Date.now());
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-'+Math.random().toString(36).slice(2)+Date.now());
 
 const canvas = $('#canvas');
 const ctx = canvas.getContext('2d');
@@ -821,9 +897,11 @@ const editor = $('#textEditor');
 let W=0,H=0,DPR=1;
 let dirty = true;
 const markDirty = ()=>{ dirty = true; };
+const isOwner = ()=> state.isOwner;
+const canEdit = ()=> state.isOwner;
 
 /* ============================================================
-   ИНТЕРФЕЙС: RAIL
+   RAIL
    ============================================================ */
 function buildRail(){
   const rail = $('#rail');
@@ -838,23 +916,36 @@ function buildRail(){
     b.onclick = ()=> setTool(t.id);
     rail.appendChild(b);
   });
+  updateToolAvailability();
+}
+
+function updateToolAvailability(){
+  $$('.tool').forEach(el=>{
+    const id = el.dataset.tool;
+    const allowed = canEdit() || VIEWER_TOOLS.has(id);
+    el.disabled = !allowed;
+  });
 }
 
 function setTool(id){
+  if(!canEdit() && !VIEWER_TOOLS.has(id)){
+    toast('Только владелец комнаты может редактировать');
+    return;
+  }
   if(state.tool===id) return;
   state.tool = id;
   $$('.tool').forEach(el=>el.classList.toggle('active', el.dataset.tool===id));
   const t = TOOL_BY_ID[id];
   $('#statTool').textContent = t.name;
   stage.classList.toggle('hand', id==='hand');
-  stage.classList.toggle('select', id==='select' || id==='text');
-  editor.style.display='none';
+  stage.classList.toggle('select', id==='select');
+  closeEditor(true);
   renderPanel();
   markDirty();
 }
 
 /* ============================================================
-   ИНТЕРФЕЙС: ПАНЕЛЬ НАСТРОЕК
+   PANEL
    ============================================================ */
 function fmt(v,c){
   if(c.pct) return Math.round(v*100)+'%';
@@ -891,7 +982,7 @@ function renderPanel(){
   });
 
   if(!secs.length){
-    body.innerHTML = `<div class="empty-note">У этого инструмента нет дополнительных параметров.<br/>Выберите другой инструмент.</div>`;
+    body.innerHTML = `<div class="empty-note">У этого инструмента нет дополнительных параметров.</div>`;
     return;
   }
 
@@ -923,12 +1014,8 @@ $('#props').addEventListener('input', e=>{
   if(el.type==='checkbox') v = el.checked;
   else if(el.type==='range' || el.type==='number') v = parseFloat(el.value);
   else v = el.value;
-
-  if(el.type==='range' || el.type==='number'){
-    if(isNaN(v)) return;
-  }
+  if((el.type==='range' || el.type==='number') && isNaN(v)) return;
   S[k] = v;
-
   const valEl = $(`[data-val="${k}"]`, $('#props'));
   if(valEl){
     const def = SECTIONS.flatMap(s=>s.items).find(c=>c.k===k);
@@ -946,7 +1033,7 @@ $$('.prop-tab').forEach(tab=>{
 });
 
 /* ============================================================
-   ГЕОМЕТРИЯ / УТИЛИТЫ
+   GEOMETRY
    ============================================================ */
 const w2s = p => [p[0]*state.view.zoom + state.view.x, p[1]*state.view.zoom + state.view.y];
 const s2w = (x,y) => [(x - state.view.x)/state.view.zoom, (y - state.view.y)/state.view.zoom];
@@ -973,19 +1060,27 @@ function elementBounds(el){
       const pad = (el.width||3)/2;
       return {x:minX-pad,y:minY-pad,w:(maxX-minX)+pad*2,h:(maxY-minY)+pad*2};
     }
-    case 'line':
-    case 'arrow': {
+    case 'line': case 'arrow': {
       const x = Math.min(el.x1,el.x2), y = Math.min(el.y1,el.y2);
       return {x, y, w: Math.abs(el.x2-el.x1), h: Math.abs(el.y2-el.y1)};
     }
-    case 'rect':
-    case 'sticky': return {x:el.x, y:el.y, w:el.w, h:el.h};
+    case 'rect': case 'sticky': return {x:el.x, y:el.y, w:el.w, h:el.h};
     case 'ellipse': return {x:el.cx-el.rx, y:el.cy-el.ry, w:el.rx*2, h:el.ry*2};
-    case 'poly':
-    case 'star': return {x:el.cx-el.r, y:el.cy-el.r, w:el.r*2, h:el.r*2};
+    case 'poly': case 'star': return {x:el.cx-el.r, y:el.cy-el.r, w:el.r*2, h:el.r*2};
     case 'text': return {x:el.x, y:el.y, w:el.w||120, h:el.h||30};
     default: return {x:0,y:0,w:0,h:0};
   }
+}
+
+function unionBounds(els){
+  if(!els.length) return null;
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for(const el of els){
+    const b = elementBounds(el);
+    minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
+    maxX = Math.max(maxX, b.x+b.w); maxY = Math.max(maxY, b.y+b.h);
+  }
+  return {x:minX, y:minY, w:maxX-minX, h:maxY-minY};
 }
 
 function moveElement(el, dx, dy){
@@ -997,25 +1092,6 @@ function moveElement(el, dx, dy){
   }
 }
 
-function hitTest(el, p, tol){
-  const b = elementBounds(el);
-  const pad = tol || 6/state.view.zoom;
-  if(el.type==='path'){
-    // расстояние до ломаной
-    const pts = el.points;
-    for(let i=0;i<pts.length-1;i++){
-      const d = segDist(p, pts[i], pts[i+1]);
-      if(d < (el.width/2 + pad)) return true;
-    }
-    if(pts.length===1){
-      const d = Math.hypot(p[0]-pts[0][0], p[1]-pts[0][1]);
-      if(d < el.width/2 + pad) return true;
-    }
-    return false;
-  }
-  return p[0] >= b.x-pad && p[0] <= b.x+b.w+pad && p[1] >= b.y-pad && p[1] <= b.y+b.h+pad;
-}
-
 function segDist(p, a, b){
   const vx = b[0]-a[0], vy = b[1]-a[1];
   const wx = p[0]-a[0], wy = p[1]-a[1];
@@ -1025,44 +1101,33 @@ function segDist(p, a, b){
   return Math.hypot(p[0]-(a[0]+t*vx), p[1]-(a[1]+t*vy));
 }
 
-/* ============================================================
-   СТИЛИ ЭЛЕМЕНТОВ
-   ============================================================ */
-function strokeStyle(){
-  return {
-    stroke:S.stroke,
-    width:S.strokeWidth,
-    opacity:S.strokeOpacity,
-    cap:S.lineCap,
-    join:S.lineJoin,
-    miter:S.miterLimit,
-    dash:S.dashPreset,
-    dashLength:S.dashLength,
-    dashGap:S.dashGap,
-    dashOffset:S.dashOffset,
-    grad:S.strokeGradient,
-    gradType:S.strokeGradType,
-    gradColor2:S.strokeGradColor2,
-    gradAngle:S.strokeGradAngle
-  };
+function hitTest(el, p, tol){
+  if(el.visible === false) return false;
+  if(el.type==='path'){
+    const pad = tol || 6/state.view.zoom;
+    const pts = el.points;
+    if(pts.length===1){
+      return Math.hypot(p[0]-pts[0][0], p[1]-pts[0][1]) < el.width/2 + pad;
+    }
+    for(let i=0;i<pts.length-1;i++){
+      if(segDist(p, pts[i], pts[i+1]) < (el.width/2 + pad)) return true;
+    }
+    return false;
+  }
+  const b = elementBounds(el);
+  const pad = tol || 6/state.view.zoom;
+  return p[0] >= b.x-pad && p[0] <= b.x+b.w+pad && p[1] >= b.y-pad && p[1] <= b.y+b.h+pad;
 }
-function fillStyle(){
-  return {
-    enabled:S.fillEnabled,
-    color:S.fill,
-    opacity:S.fillOpacity,
-    grad:S.fillGradient,
-    gradColor2:S.fillGradColor2,
-    gradAngle:S.fillGradAngle
-  };
-}
-function shadowStyle(){
-  if(!S.shadowEnabled) return null;
-  return {blur:S.shadowBlur, x:S.shadowX, y:S.shadowY, color:S.shadowColor, opacity:S.shadowOpacity};
+
+function topElementAt(p){
+  for(let i=state.elements.length-1;i>=0;i--){
+    if(hitTest(state.elements[i], p)) return state.elements[i];
+  }
+  return null;
 }
 
 /* ============================================================
-   РЕНДЕР
+   RENDER
    ============================================================ */
 function resize(){
   const r = stage.getBoundingClientRect();
@@ -1087,20 +1152,23 @@ function applyDash(c, el){
   c.lineDashOffset = el.dashOffset || 0;
 }
 
-function makeGradient(c, el, bbox, isStroke){
-  const angle = ((isStroke ? el.gradAngle : el.gradAngle) || 0) * Math.PI/180;
-  const cx = bbox.x + bbox.w/2, cy = bbox.y + bbox.h/2;
+function hexA(hex, a){
+  if(!hex) return `rgba(0,0,0,${a===undefined?1:a})`;
+  if(hex.startsWith('rgb')) return hex;
+  let h = hex.replace('#','');
+  if(h.length===3) h = h.split('').map(x=>x+x).join('');
+  const n = parseInt(h,16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a===undefined?1:a})`;
+}
+
+function grad2(c, col1, col2, angleDeg, bbox){
+  const a = (angleDeg||0)*Math.PI/180;
+  const cx = bbox.x+bbox.w/2, cy = bbox.y+bbox.h/2;
   const r = Math.max(bbox.w, bbox.h)/2 || 1;
-  if(el.gradType==='radial'){
-    const g = c.createRadialGradient(cx, cy, 0, cx, cy, r);
-    g.addColorStop(0, el.stroke);
-    g.addColorStop(1, el.gradColor2);
-    return g;
-  }
-  const dx = Math.cos(angle)*r, dy = Math.sin(angle)*r;
+  const dx = Math.cos(a)*r, dy = Math.sin(a)*r;
   const g = c.createLinearGradient(cx-dx, cy-dy, cx+dx, cy+dy);
-  g.addColorStop(0, isStroke ? el.stroke : el.color);
-  g.addColorStop(1, el.gradColor2);
+  g.addColorStop(0, col1);
+  g.addColorStop(1, col2);
   return g;
 }
 
@@ -1127,7 +1195,7 @@ function drawPathPoints(c, pts, smooth){
 
 function drawVariableStroke(c, el){
   const pts = el.points;
-  if(pts.length<2) {
+  if(pts.length<2){
     c.beginPath();
     c.arc(pts[0][0], pts[0][1], el.width/2, 0, Math.PI*2);
     c.fillStyle = el.stroke;
@@ -1148,6 +1216,69 @@ function drawVariableStroke(c, el){
     c.lineTo(pts[i+1][0], pts[i+1][1]);
     c.stroke();
   }
+}
+
+function pathRect(el){
+  const p = new Path2D();
+  const r = Math.min(el.radius||0, Math.abs(el.w)/2, Math.abs(el.h)/2);
+  const x = el.x, y = el.y, w = el.w, h = el.h;
+  if(r>0){
+    p.moveTo(x+r, y);
+    p.lineTo(x+w-r, y); p.quadraticCurveTo(x+w, y, x+w, y+r);
+    p.lineTo(x+w, y+h-r); p.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+    p.lineTo(x+r, y+h); p.quadraticCurveTo(x, y+h, x, y+h-r);
+    p.lineTo(x, y+r); p.quadraticCurveTo(x, y, x+r, y);
+    p.closePath();
+  } else {
+    p.rect(x,y,w,h);
+  }
+  return p;
+}
+
+function drawArrowHead(c, x, y, ang, el, style){
+  const s = el.headSize;
+  const a = (el.headAngle||28) * Math.PI/180;
+  c.save();
+  c.setLineDash([]);
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
+  if(style==='triangle'){
+    c.beginPath();
+    c.moveTo(x,y);
+    c.lineTo(x - s*Math.cos(ang-a), y - s*Math.sin(ang-a));
+    c.lineTo(x - s*Math.cos(ang+a), y - s*Math.sin(ang+a));
+    c.closePath();
+    c.fillStyle = c.strokeStyle;
+    c.fill();
+  } else if(style==='open'){
+    c.beginPath();
+    c.moveTo(x - s*Math.cos(ang-a), y - s*Math.sin(ang-a));
+    c.lineTo(x,y);
+    c.lineTo(x - s*Math.cos(ang+a), y - s*Math.sin(ang+a));
+    c.stroke();
+  } else if(style==='diamond'){
+    const mx = x - s*0.6*Math.cos(ang), my = y - s*0.6*Math.sin(ang);
+    c.beginPath();
+    c.moveTo(x,y);
+    c.lineTo(mx - s*0.4*Math.cos(ang-a), my - s*0.4*Math.sin(ang-a));
+    c.lineTo(x - s*1.2*Math.cos(ang), y - s*1.2*Math.sin(ang));
+    c.lineTo(mx - s*0.4*Math.cos(ang+a), my - s*0.4*Math.sin(ang+a));
+    c.closePath();
+    c.fillStyle = c.strokeStyle;
+    c.fill();
+  } else if(style==='circle'){
+    c.beginPath();
+    c.arc(x - s*0.5*Math.cos(ang), y - s*0.5*Math.sin(ang), s*0.42, 0, Math.PI*2);
+    c.fillStyle = c.strokeStyle;
+    c.fill();
+  } else if(style==='bar'){
+    c.beginPath();
+    const px = -Math.sin(ang)*s*0.6, py = Math.cos(ang)*s*0.6;
+    c.moveTo(x+px, y+py);
+    c.lineTo(x-px, y-py);
+    c.stroke();
+  }
+  c.restore();
 }
 
 function drawElement(c, el){
@@ -1188,10 +1319,33 @@ function drawElement(c, el){
       }
       break;
     }
-    case 'line':
-    case 'arrow': drawLineArrow(c, el); break;
+    case 'line': case 'arrow': {
+      const {x1,y1,x2,y2} = el;
+      c.beginPath();
+      c.moveTo(x1,y1);
+      if(el.curve){
+        const mx = (x1+x2)/2, my = (y1+y2)/2;
+        const dx = x2-x1, dy = y2-y1;
+        const len = Math.hypot(dx,dy) || 1;
+        const nx = -dy/len, ny = dx/len;
+        c.quadraticCurveTo(mx + nx*el.curve, my + ny*el.curve, x2, y2);
+      } else {
+        c.lineTo(x2,y2);
+      }
+      c.stroke();
+
+      if(el.type==='arrow'){
+        const ang = Math.atan2(y2-y1, x2-x1);
+        if(el.headStyle!=='none') drawArrowHead(c, x2, y2, ang, el, el.headStyle);
+        if(el.doubleHead || el.tailStyle!=='none'){
+          const st = el.doubleHead ? (el.headStyle||'triangle') : el.tailStyle;
+          drawArrowHead(c, x1, y1, ang+Math.PI, el, st);
+        }
+      }
+      break;
+    }
     case 'rect': {
-      const p = pathRect(c, el);
+      const p = pathRect(el);
       if(el.fillEnabled){
         c.fillStyle = el.fillGrad ? grad2(c, el.fill, el.fillGradColor2, el.fillGradAngle, bbox) : hexA(el.fill, el.fillOpacity);
         c.fill(p);
@@ -1245,116 +1399,16 @@ function drawElement(c, el){
       c.stroke();
       break;
     }
-    case 'text': drawText(c, el, bbox); break;
+    case 'text': drawText(c, el); break;
     case 'sticky': drawSticky(c, el); break;
   }
   c.restore();
 }
 
-function grad2(c, col1, col2, angleDeg, bbox){
-  const a = (angleDeg||0)*Math.PI/180;
-  const cx = bbox.x+bbox.w/2, cy = bbox.y+bbox.h/2;
-  const r = Math.max(bbox.w, bbox.h)/2 || 1;
-  const dx = Math.cos(a)*r, dy = Math.sin(a)*r;
-  const g = c.createLinearGradient(cx-dx, cy-dy, cx+dx, cy+dy);
-  g.addColorStop(0, col1);
-  g.addColorStop(1, col2);
-  return g;
-}
-
-function pathRect(c, el){
-  const p = new Path2D();
-  const r = Math.min(el.radius||0, Math.abs(el.w)/2, Math.abs(el.h)/2);
-  const x = el.x, y = el.y, w = el.w, h = el.h;
-  if(r>0){
-    p.moveTo(x+r, y);
-    p.lineTo(x+w-r, y); p.quadraticCurveTo(x+w, y, x+w, y+r);
-    p.lineTo(x+w, y+h-r); p.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
-    p.lineTo(x+r, y+h); p.quadraticCurveTo(x, y+h, x, y+h-r);
-    p.lineTo(x, y+r); p.quadraticCurveTo(x, y, x+r, y);
-    p.closePath();
-  } else {
-    p.rect(x,y,w,h);
-  }
-  return p;
-}
-
-function drawLineArrow(c, el){
-  const {x1,y1,x2,y2} = el;
-  c.beginPath();
-  c.moveTo(x1,y1);
-  if(el.curve){
-    const mx = (x1+x2)/2, my = (y1+y2)/2;
-    const dx = x2-x1, dy = y2-y1;
-    const len = Math.hypot(dx,dy) || 1;
-    const nx = -dy/len, ny = dx/len;
-    c.quadraticCurveTo(mx + nx*el.curve, my + ny*el.curve, x2, y2);
-  } else {
-    c.lineTo(x2,y2);
-  }
-  c.stroke();
-
-  const ang = Math.atan2(y2-y1, x2-x1);
-  if(el.type==='arrow'){
-    if(el.headStyle!=='none') head(c, x2, y2, ang, el);
-    if(el.doubleHead || el.tailStyle!=='none'){
-      const st = el.doubleHead ? (el.headStyle||'triangle') : el.tailStyle;
-      head(c, x1, y1, ang+Math.PI, Object.assign({}, el, {headStyle:st}));
-    }
-  }
-}
-
-function head(c, x, y, ang, el){
-  const s = el.headSize;
-  const a = (el.headAngle||28) * Math.PI/180;
-  c.save();
-  c.setLineDash([]);
-  c.lineCap = 'round';
-  c.lineJoin = 'round';
-  const style = el.headStyle;
-  if(style==='triangle'){
-    c.beginPath();
-    c.moveTo(x,y);
-    c.lineTo(x - s*Math.cos(ang-a), y - s*Math.sin(ang-a));
-    c.lineTo(x - s*Math.cos(ang+a), y - s*Math.sin(ang+a));
-    c.closePath();
-    c.fillStyle = c.strokeStyle;
-    c.fill();
-  } else if(style==='open'){
-    c.beginPath();
-    c.moveTo(x - s*Math.cos(ang-a), y - s*Math.sin(ang-a));
-    c.lineTo(x,y);
-    c.lineTo(x - s*Math.cos(ang+a), y - s*Math.sin(ang+a));
-    c.stroke();
-  } else if(style==='diamond'){
-    const mx = x - s*0.6*Math.cos(ang), my = y - s*0.6*Math.sin(ang);
-    c.beginPath();
-    c.moveTo(x,y);
-    c.lineTo(mx - s*0.4*Math.cos(ang-a), my - s*0.4*Math.sin(ang-a));
-    c.lineTo(x - s*1.2*Math.cos(ang), y - s*1.2*Math.sin(ang));
-    c.lineTo(mx - s*0.4*Math.cos(ang+a), my - s*0.4*Math.sin(ang+a));
-    c.closePath();
-    c.fillStyle = c.strokeStyle;
-    c.fill();
-  } else if(style==='circle'){
-    c.beginPath();
-    c.arc(x - s*0.5*Math.cos(ang), y - s*0.5*Math.sin(ang), s*0.42, 0, Math.PI*2);
-    c.fillStyle = c.strokeStyle;
-    c.fill();
-  } else if(style==='bar'){
-    c.beginPath();
-    const px = -Math.sin(ang)*s*0.6, py = Math.cos(ang)*s*0.6;
-    c.moveTo(x+px, y+py);
-    c.lineTo(x-px, y-py);
-    c.stroke();
-  }
-  c.restore();
-}
-
-function drawText(c, el, bbox){
+function drawText(c, el){
   c.font = `${el.italic?'italic ':''}${el.weight} ${el.size}px ${el.family}`;
   c.textBaseline = 'top';
-  c.letterSpacing = (el.spacing||0)+'px';
+  if('letterSpacing' in c) c.letterSpacing = (el.spacing||0)+'px';
   const lines = (el.text||'').split('\n');
   const lh = el.size * el.lineHeight;
 
@@ -1362,7 +1416,7 @@ function drawText(c, el, bbox){
   for(const ln of lines) maxW = Math.max(maxW, c.measureText(ln).width);
   const totalH = lines.length * lh;
 
-  if(el.bgEnabled){
+  if(el.bgEnabled && el.bgEnabled){
     c.save();
     c.shadowBlur = 0;
     c.fillStyle = el.bgColor;
@@ -1370,971 +1424,4 @@ function drawText(c, el, bbox){
     c.restore();
   }
 
-  c.fillStyle = el.color;
-  lines.forEach((ln,i)=>{
-    const w = c.measureText(ln).width;
-    let x = el.x;
-    if(el.align==='center') x = el.x + (maxW - w)/2;
-    else if(el.align==='right') x = el.x + (maxW - w);
-    c.fillText(ln, x, el.y + i*lh);
-    if(el.underline){
-      c.save();
-      c.strokeStyle = el.color;
-      c.lineWidth = Math.max(1, el.size*0.06);
-      c.setLineDash([]);
-      c.beginPath();
-      c.moveTo(x, el.y + i*lh + el.size*1.12);
-      c.lineTo(x + w, el.y + i*lh + el.size*1.12);
-      c.stroke();
-      c.restore();
-    }
-  });
-  el.w = Math.max(40, maxW);
-  el.h = Math.max(el.size, totalH);
-}
-
-function drawSticky(c, el){
-  c.save();
-  if(el.shadow){
-    c.shadowBlur = 22; c.shadowOffsetX = 0; c.shadowOffsetY = 8;
-    c.shadowColor = 'rgba(15,23,42,0.28)';
-  }
-  const r = Math.min(el.radius, el.w/2, el.h/2);
-  const p = new Path2D();
-  p.moveTo(el.x+r, el.y);
-  p.lineTo(el.x+el.w-r, el.y); p.quadraticCurveTo(el.x+el.w, el.y, el.x+el.w, el.y+r);
-  p.lineTo(el.x+el.w, el.y+el.h-r); p.quadraticCurveTo(el.x+el.w, el.y+el.h, el.x+el.w-r, el.y+el.h);
-  p.lineTo(el.x+r, el.y+el.h); p.quadraticCurveTo(el.x, el.y+el.h, el.x, el.y+el.h-r);
-  p.lineTo(el.x, el.y+r); p.quadraticCurveTo(el.x, el.y, el.x+r, el.y);
-  p.closePath();
-  c.fillStyle = el.color;
-  c.fill(p);
-  c.restore();
-
-  c.save();
-  c.font = `${el.fontSize}px ${el.fontFamily}`;
-  c.fillStyle = el.textColor;
-  c.textBaseline = 'top';
-  c.letterSpacing = '0px';
-  const pad = el.padding;
-  const lines = (el.text||'').split('\n');
-  const lh = el.fontSize*1.3;
-  const maxW = el.w - pad*2;
-  let y = el.y + pad;
-  for(const raw of lines){
-    let line = raw;
-    // простая переноска по словам
-    while(c.measureText(line).width > maxW && line.length>1){
-      let cut = line.length;
-      while(cut>1 && c.measureText(line.slice(0,cut)).width > maxW) cut--;
-      c.fillText(line.slice(0,cut), el.x+pad, y);
-      line = line.slice(cut);
-      y += lh;
-      if(y > el.y+el.h-pad) break;
-    }
-    if(y > el.y+el.h-pad) break;
-    c.fillText(line, el.x+pad, y);
-    y += lh;
-  }
-  c.restore();
-}
-
-function hexA(hex, a){
-  if(!hex) return `rgba(0,0,0,${a})`;
-  if(hex.startsWith('rgb')) return hex;
-  let h = hex.replace('#','');
-  if(h.length===3) h = h.split('').map(x=>x+x).join('');
-  const n = parseInt(h,16);
-  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a===undefined?1:a})`;
-}
-
-/* ---------- Сетка ---------- */
-function drawGrid(c){
-  const {x:vx, y:vy, zoom} = state.view;
-  const size = S.patternSize * zoom;
-  if(size < 4 || S.bgPattern==='none') return;
-
-  c.save();
-  c.globalAlpha = S.patternOpacity;
-  c.strokeStyle = S.patternColor;
-  c.fillStyle = S.patternColor;
-  c.lineWidth = S.patternWidth;
-
-  if(S.bgPattern==='grid' || S.bgPattern==='lines'){
-    c.beginPath();
-    let startX = vx % size;
-    for(let x = startX; x < W; x += size){ c.moveTo(x, 0); c.lineTo(x, H); }
-    if(S.bgPattern==='grid'){
-      let startY = vy % size;
-      for(let y = startY; y < H; y += size){ c.moveTo(0, y); c.lineTo(W, y); }
-    }
-    c.stroke();
-  } else if(S.bgPattern==='dots'){
-    const r = Math.max(0.7, S.patternWidth*0.9);
-    let startX = vx % size;
-    let startY = vy % size;
-    for(let x = startX; x < W; x += size){
-      for(let y = startY; y < H; y += size){
-        c.beginPath();
-        c.arc(x, y, r, 0, Math.PI*2);
-        c.fill();
-      }
-    }
-  }
-  c.restore();
-}
-
-function drawRulers(c){
-  if(!S.showRulers) return;
-  const h = 18;
-  c.save();
-  c.fillStyle = '#0b1424';
-  c.fillRect(0,0,W,h);
-  c.fillRect(0,0,h,H);
-  c.strokeStyle = '#1d2a44';
-  c.beginPath(); c.moveTo(0,h); c.lineTo(W,h); c.moveTo(h,0); c.lineTo(h,H); c.stroke();
-
-  const zoom = state.view.zoom;
-  let step = 50;
-  while(step*zoom < 44) step *= 2;
-  while(step*zoom > 200) step /= 2;
-
-  c.fillStyle = '#55688c';
-  c.font = '9px Inter, sans-serif';
-  c.textBaseline = 'middle';
-
-  const startWorldX = Math.floor((-state.view.x/zoom)/step)*step;
-  const endWorldX = (W - state.view.x)/zoom;
-  for(let wx = startWorldX; wx < endWorldX; wx += step){
-    const sx = wx*zoom + state.view.x;
-    if(sx < h) continue;
-    c.beginPath(); c.moveTo(sx, h-6); c.lineTo(sx, h); c.stroke();
-    c.textAlign = 'left';
-    c.fillText(Math.round(wx), sx+3, h/2);
-  }
-
-  const startWorldY = Math.floor((-state.view.y/zoom)/step)*step;
-  const endWorldY = (H - state.view.y)/zoom;
-  for(let wy = startWorldY; wy < endWorldY; wy += step){
-    const sy = wy*zoom + state.view.y;
-    if(sy < h) continue;
-    c.beginPath(); c.moveTo(h-6, sy); c.lineTo(h, sy); c.stroke();
-    c.save();
-    c.translate(h/2, sy+3);
-    c.rotate(-Math.PI/2);
-    c.textAlign = 'right';
-    c.fillText(Math.round(wy), 0, 0);
-    c.restore();
-  }
-  c.restore();
-}
-
-/* ---------- Главный рендер ---------- */
-function render(){
-  ctx.setTransform(DPR,0,0,DPR,0,0);
-  ctx.clearRect(0,0,W,H);
-
-  // фон
-  ctx.fillStyle = '#0a1120';
-  ctx.fillRect(0,0,W,H);
-
-  // страница
-  const vx = state.view.x, vy = state.view.y, z = state.view.zoom;
-  const pageW = S.pageMode==='page' ? S.pageWidth : 4000;
-  const pageH = S.pageMode==='page' ? S.pageHeight : 3000;
-  const px = S.pageMode==='page' ? vx : vx - 2000*z;
-  const py = S.pageMode==='page' ? vy : vy - 1500*z;
-
-  ctx.save();
-  if(S.canvasShadow){
-    ctx.shadowBlur = S.canvasShadowBlur;
-    ctx.shadowColor = 'rgba(0,0,0,0.55)';
-    ctx.shadowOffsetY = 8;
-  }
-  ctx.fillStyle = S.bgColor;
-  ctx.fillRect(px, py, pageW*z, pageH*z);
-  ctx.restore();
-
-  drawGrid(ctx);
-
-  // объекты
-  ctx.save();
-  ctx.translate(vx, vy);
-  ctx.scale(z, z);
-  for(const el of state.elements) drawElement(ctx, el);
-  if(state.draft) drawElement(ctx, state.draft);
-  ctx.restore();
-
-  // лазер
-  const now = performance.now();
-  const fade = S.laserFade;
-  for(const l of state.lasers){
-    const alive = l.pts.filter(p => now - p[2] < fade);
-    if(alive.length < 2) continue;
-    ctx.save();
-    ctx.translate(vx, vy);
-    ctx.scale(z, z);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    if(S.laserGlow){ ctx.shadowBlur = 16; ctx.shadowColor = l.color; }
-    for(let i=0;i<alive.length-1;i++){
-      const a = 1 - (now - alive[i][2])/fade;
-      ctx.globalAlpha = Math.max(0, a);
-      ctx.strokeStyle = l.color;
-      ctx.lineWidth = l.width;
-      ctx.beginPath();
-      ctx.moveTo(alive[i][0], alive[i][1]);
-      ctx.lineTo(alive[i+1][0], alive[i+1][1]);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  // ластик-курсор
-  if(state.tool==='eraser'){
-    const p = state.lastScreen;
-    if(p){
-      ctx.save();
-      ctx.strokeStyle = '#94a3b8';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(p[0], p[1], S.eraserSize*z/2, 0, Math.PI*2);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // выделение
-  if(state.selected && S.showBBox){
-    const el = state.elements.find(e=>e.id===state.selected);
-    if(el){
-      const b = elementBounds(el);
-      const a = w2s([b.x, b.y]);
-      const bb = w2s([b.x+b.w, b.y+b.h]);
-      ctx.save();
-      ctx.strokeStyle = S.bboxColor;
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([5,4]);
-      ctx.strokeRect(a[0]-3, a[1]-3, (bb[0]-a[0])+6, (bb[1]-a[1])+6);
-      ctx.setLineDash([]);
-      const hs = S.handleSize;
-      const pts = [[a[0],a[1]],[bb[0],a[1]],[bb[0],bb[1]],[a[0],bb[1]]];
-      for(const hp of pts){
-        ctx.fillStyle = S.handleColor;
-        ctx.strokeStyle = S.bboxColor;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.rect(hp[0]-hs/2, hp[1]-hs/2, hs, hs);
-        ctx.fill();
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-  }
-
-  drawRulers(ctx);
-}
-
-function loop(){
-  const now = performance.now();
-  state.lasers = state.lasers.filter(l => l.pts.some(p => now - p[2] < S.laserFade));
-  if(dirty || state.lasers.length){
-    render();
-    dirty = false;
-  }
-  requestAnimationFrame(loop);
-}
-
-/* ============================================================
-   ВЗАИМОДЕЙСТВИЕ
-   ============================================================ */
-let panStart = null;
-let drawStart = null;
-let moveStart = null;
-let moveTarget = null;
-
-canvas.addEventListener('pointerdown', e=>{
-  if(e.button===2) return;
-  canvas.setPointerCapture(e.pointerId);
-  const p = pointerWorld(e);
-  state.lastScreen = null;
-
-  // панорамирование
-  if(state.spaceDown || state.tool==='hand' || e.button===1){
-    state.panning = true;
-    stage.classList.add('dragging');
-    panStart = {sx:e.clientX, sy:e.clientY, vx:state.view.x, vy:state.view.y};
-    return;
-  }
-
-  if(state.tool==='laser'){
-    state.lasers.push({pts:[[p[0],p[1],performance.now()]], color:S.laserColor, width:S.laserWidth});
-    state.laserActive = true;
-    return;
-  }
-
-  if(state.tool==='select'){
-    // ищем сверху вниз
-    let hit = null;
-    for(let i=state.elements.length-1;i>=0;i--){
-      if(hitTest(state.elements[i], p)){
-        hit = state.elements[i];
-        break;
-      }
-    }
-    state.selected = hit ? hit.id : null;
-    if(hit){
-      moveStart = p;
-      moveTarget = hit;
-      const before = JSON.parse(JSON.stringify(hit));
-      state._moveSnapshot = before;
-    }
-    markDirty();
-    return;
-  }
-
-  if(state.tool==='eraser'){
-    state.erasing = true;
-    eraseAt(p);
-    return;
-  }
-
-  if(state.tool==='text'){
-    const el = {
-      id:uid(), type:'text',
-      x:p[0], y:p[1], text:'',
-      color:S.textColor, family:S.fontFamily, size:S.fontSize, weight:S.fontWeight,
-      italic:S.fontItalic, underline:S.fontUnderline, align:S.textAlign,
-      lineHeight:S.lineHeight, spacing:S.letterSpacing,
-      bgEnabled:S.textBgEnabled, bgColor:S.textBgColor,
-      stroke:S.stroke, width:S.strokeWidth, opacity:S.strokeOpacity,
-      cap:S.lineCap, join:S.lineJoin, miter:S.miterLimit,
-      dash:S.dashPreset, dashLength:S.dashLength, dashGap:S.dashGap, dashOffset:S.dashOffset,
-      elOpacity:S.elementOpacity, blend:S.blendMode,
-      shadow:shadowStyle(), visible:true, w:120, h:S.fontSize
-    };
-    state.elements.push(el);
-    send({type:'add', element:el});
-    state.undo.push({kind:'add', id:el.id});
-    openEditor(el, true);
-    markDirty();
-    return;
-  }
-
-  if(state.tool==='sticky'){
-    const el = {
-      id:uid(), type:'sticky',
-      x:p[0]-90, y:p[1]-70, w:180, h:140, text:'',
-      color:S.stickyColor, fontSize:S.stickyFontSize, fontFamily:S.stickyFontFamily,
-      textColor:S.stickyTextColor, padding:S.stickyPadding, radius:S.stickyRadius,
-      shadow:S.stickyShadow,
-      stroke:S.stroke, width:S.strokeWidth, opacity:S.strokeOpacity,
-      cap:S.lineCap, join:S.lineJoin, miter:S.miterLimit,
-      dash:S.dashPreset, dashLength:S.dashLength, dashGap:S.dashGap, dashOffset:S.dashOffset,
-      elOpacity:S.elementOpacity, blend:S.blendMode, visible:true
-    };
-    state.elements.push(el);
-    send({type:'add', element:el});
-    state.undo.push({kind:'add', id:el.id});
-    openEditor(el, false);
-    markDirty();
-    return;
-  }
-
-  // рисование
-  state.drawing = true;
-  const sp = snapPoint(p);
-  drawStart = sp;
-
-  const common = Object.assign({ id:uid(), opacity:S.strokeOpacity, elOpacity:S.elementOpacity,
-    blend:S.blendMode, shadow:shadowStyle(), visible:true }, strokeStyle());
-
-  if(state.tool==='pen'){
-    state.draft = Object.assign(common, {
-      type:'path', tool:'pen', points:[[sp[0],sp[1]]],
-      variable: S.penPressure, taperStart:S.penTaperStart, taperEnd:S.penTaperEnd,
-      smoothing:S.penSmoothing, texture:S.penTexture
-    });
-  } else if(state.tool==='highlighter'){
-    state.draft = Object.assign(common, {
-      type:'path', tool:'highlighter', points:[[sp[0],sp[1]]],
-      width: S.strokeWidth * S.hlWidthMul,
-      opacity: S.hlOpacity, hlBlend:S.hlBlend, cap:S.hlCap
-    });
-  } else if(state.tool==='line' || state.tool==='arrow'){
-    state.draft = Object.assign(common, {
-      type: state.tool, x1:sp[0], y1:sp[1], x2:sp[0], y2:sp[1],
-      headSize:S.arrowHeadSize, headStyle:S.arrowHeadStyle, tailStyle:S.arrowTailStyle,
-      curve:S.arrowCurve, doubleHead:S.arrowDouble, headAngle:S.arrowHeadAngle
-    });
-  } else {
-    const fill = fillStyle();
-    const base = Object.assign(common, {
-      fillEnabled:fill.enabled, fill:fill.color, fillOpacity:fill.opacity,
-      fillGrad:fill.grad, fillGradColor2:fill.gradColor2, fillGradAngle:fill.gradAngle
-    });
-    if(state.tool==='rect'){
-      state.draft = Object.assign(base, { type:'rect', x:sp[0], y:sp[1], w:0, h:0, radius:S.cornerRadius });
-    } else if(state.tool==='ellipse'){
-      state.draft = Object.assign(base, { type:'ellipse', cx:sp[0], cy:sp[1], rx:0, ry:0 });
-    } else if(state.tool==='triangle'){
-      state.draft = Object.assign(base, { type:'poly', cx:sp[0], cy:sp[1], r:0, sides:3, rotation:0 });
-    } else if(state.tool==='polygon'){
-      state.draft = Object.assign(base, { type:'poly', cx:sp[0], cy:sp[1], r:0, sides:S.polySides, rotation:S.shapeRotation });
-    } else if(state.tool==='star'){
-      state.draft = Object.assign(base, { type:'star', cx:sp[0], cy:sp[1], r:0,
-        pointsCount:S.starPoints, innerRatio:S.starInner, rotation:S.shapeRotation });
-    }
-  }
-  markDirty();
-});
-
-canvas.addEventListener('pointermove', e=>{
-  const r = canvas.getBoundingClientRect();
-  state.lastScreen = [e.clientX - r.left, e.clientY - r.top];
-  if(state.tool==='eraser') markDirty();
-
-  if(state.panning && panStart){
-    state.view.x = panStart.vx + (e.clientX - panStart.sx);
-    state.view.y = panStart.vy + (e.clientY - panStart.sy);
-    markDirty();
-    return;
-  }
-
-  const p = pointerWorld(e);
-
-  if(state.laserActive){
-    const last = state.lasers[state.lasers.length-1];
-    last.pts.push([p[0], p[1], performance.now()]);
-    throttleLaser(p);
-    markDirty();
-    return;
-  }
-
-  if(state.erasing){
-    eraseAt(p);
-    return;
-  }
-
-  if(moveTarget && moveStart){
-    const dx = p[0]-moveStart[0], dy = p[1]-moveStart[1];
-    const snap = JSON.parse(JSON.stringify(state._moveSnapshot));
-    moveElement(moveTarget, dx, dy);
-    Object.assign(moveTarget, snap);
-    moveElement(moveTarget, dx, dy);
-    markDirty();
-    return;
-  }
-
-  if(!state.drawing || !state.draft) return;
-  const sp = snapPoint(p);
-  const d = state.draft;
-
-  if(d.type==='path'){
-    d.points.push([p[0], p[1]]);
-  } else if(d.type==='line' || d.type==='arrow'){
-    d.x2 = sp[0]; d.y2 = sp[1];
-    if(S.lockAspect){
-      const dx = d.x2-d.x1, dy = d.y2-d.y1;
-      const a = Math.abs(dx) > Math.abs(dy) ? Math.abs(dx) : Math.abs(dy);
-      d.x2 = d.x1 + Math.sign(dx||1)*a;
-      d.y2 = d.y1 + Math.sign(dy||1)*a;
-    }
-  } else if(d.type==='rect'){
-    d.w = sp[0]-d.x; d.h = sp[1]-d.y;
-    if(S.lockAspect){
-      const s = Math.max(Math.abs(d.w), Math.abs(d.h));
-      d.w = Math.sign(d.w||1)*s; d.h = Math.sign(d.h||1)*s;
-    }
-  } else if(d.type==='ellipse'){
-    d.rx = Math.abs(sp[0]-d.cx); d.ry = Math.abs(sp[1]-d.cy);
-    if(S.lockAspect) d.ry = d.rx;
-  } else if(d.type==='poly' || d.type==='star'){
-    d.r = Math.hypot(sp[0]-d.cx, sp[1]-d.cy);
-  }
-  markDirty();
-});
-
-function finishDraw(){
-  const d = state.draft;
-  state.draft = null;
-  state.drawing = false;
-  if(!d) return;
-
-  // отбрасываем пустышки
-  const b = elementBounds(d);
-  if(b.w < 2 && b.h < 2 && d.type!=='path') return;
-  if(d.type==='path' && d.points.length < 2) return;
-
-  state.elements.push(d);
-  send({type:'add', element:d});
-  state.undo.push({kind:'add', id:d.id});
-  updateStats();
-  markDirty();
-}
-
-function endInteraction(){
-  if(state.panning){ state.panning = false; stage.classList.remove('dragging'); panStart = null; }
-  if(state.laserActive){ state.laserActive = false; }
-  if(state.erasing){ state.erasing = false; }
-  if(state.drawing) finishDraw();
-  if(moveTarget){
-    send({type:'update', element: moveTarget});
-    state.undo.push({kind:'move', id:moveTarget.id, before:state._moveSnapshot});
-    moveTarget = null; moveStart = null; state._moveSnapshot = null;
-  }
-}
-
-window.addEventListener('pointerup', endInteraction);
-canvas.addEventListener('pointercancel', endInteraction);
-canvas.addEventListener('contextmenu', e=>e.preventDefault());
-
-/* ---------- ластик ---------- */
-function eraseAt(p){
-  const rad = S.eraserSize/2;
-  const removed = [];
-
-  if(S.eraserMode==='object'){
-    for(let i=state.elements.length-1;i>=0;i--){
-      const el = state.elements[i];
-      if(hitTest(el, p, rad)){ removed.push(el.id); state.elements.splice(i,1); }
-    }
-  } else {
-    for(const el of state.elements){
-      if(el.type!=='path') continue;
-      const pts = el.points;
-      const keep = [];
-      let cur = [];
-      for(const pt of pts){
-        const d = Math.hypot(pt[0]-p[0], pt[1]-p[1]);
-        if(d > rad){ cur.push(pt); }
-        else {
-          if(cur.length>1) keep.push(cur);
-          cur = [];
-        }
-      }
-      if(cur.length>1) keep.push(cur);
-      if(keep.length===0){ removed.push(el.id); }
-      else if(keep.length===1 && keep[0].length===pts.length){ /* не тронут */ }
-      else {
-        removed.push(el.id);
-        for(const seg of keep){
-          const ne = JSON.parse(JSON.stringify(el));
-          ne.id = uid();
-          ne.points = seg;
-          state.elements.push(ne);
-          send({type:'add', element:ne});
-        }
-      }
-    }
-    if(removed.length){
-      state.elements = state.elements.filter(e => !removed.includes(e.id));
-    }
-  }
-
-  if(removed.length){
-    send({type:'delete', ids:removed});
-    state.undo.push({kind:'delete', ids:removed});
-    updateStats();
-  }
-  markDirty();
-}
-
-/* ---------- лазер (троттлинг сети) ---------- */
-let lastLaserSend = 0;
-function throttleLaser(p){
-  const now = performance.now();
-  if(now - lastLaserSend < 40) return;
-  lastLaserSend = now;
-  send({type:'laser', pts:[[p[0],p[1]]], color:S.laserColor, width:S.laserWidth});
-}
-
-/* ============================================================
-   РЕДАКТОР ТЕКСТА
-   ============================================================ */
-let editingEl = null;
-let editorNew = false;
-
-function openEditor(el, isNew){
-  editingEl = el;
-  editorNew = isNew;
-  const b = elementBounds(el);
-  const a = w2s([b.x, b.y]);
-  editor.style.display = 'block';
-  editor.style.left = a[0]+'px';
-  editor.style.top = a[1]+'px';
-  editor.style.width = Math.max(120, b.w*state.view.zoom + 30)+'px';
-  editor.style.height = Math.max(30, b.h*state.view.zoom + 10)+'px';
-
-  if(el.type==='sticky'){
-    editor.style.font = `${el.fontSize*state.view.zoom}px ${el.fontFamily}`;
-    editor.style.color = el.textColor;
-    editor.style.background = el.color;
-    editor.style.borderRadius = (el.radius*state.view.zoom)+'px';
-    editor.style.padding = (el.padding*state.view.zoom)+'px';
-    editor.style.width = (el.w*state.view.zoom)+'px';
-    editor.style.height = (el.h*state.view.zoom)+'px';
-  } else {
-    editor.style.font = `${el.italic?'italic ':''}${el.weight} ${el.size*state.view.zoom}px ${el.family}`;
-    editor.style.color = el.color;
-    editor.style.background = el.bgEnabled ? el.bgColor : 'transparent';
-    editor.style.padding = '0';
-    editor.style.borderRadius = '0';
-  }
-  editor.value = el.text || '';
-  editor.focus();
-  editor.select();
-}
-
-function closeEditor(commit){
-  if(!editingEl) return;
-  const el = editingEl;
-  const val = editor.value;
-  editingEl = null;
-  editor.style.display = 'none';
-
-  if(commit){
-    el.text = val;
-    if(!val.trim() && editorNew){
-      state.elements = state.elements.filter(e=>e.id!==el.id);
-      send({type:'delete', ids:[el.id]});
-      state.undo = state.undo.filter(u=>u.id!==el.id);
-    } else {
-      send({type:'update', element:el});
-    }
-  } else if(editorNew){
-    state.elements = state.elements.filter(e=>e.id!==el.id);
-    send({type:'delete', ids:[el.id]});
-    state.undo = state.undo.filter(u=>u.id!==el.id);
-  }
-  editorNew = false;
-  updateStats();
-  markDirty();
-}
-
-editor.addEventListener('blur', ()=>closeEditor(true));
-editor.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){ e.preventDefault(); closeEditor(true); }
-  if(e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); closeEditor(true); }
-  e.stopPropagation();
-});
-
-/* ============================================================
-   ЗУМ / ПАНОРАМА
-   ============================================================ */
-function setZoom(z, cx, cy){
-  z = Math.max(S.zoomMin, Math.min(S.zoomMax, z));
-  const r = canvas.getBoundingClientRect();
-  if(cx===undefined){ cx = W/2; cy = H/2; }
-  const wx = (cx - state.view.x)/state.view.zoom;
-  const wy = (cy - state.view.y)/state.view.zoom;
-  state.view.zoom = z;
-  state.view.x = cx - wx*z;
-  state.view.y = cy - wy*z;
-  updateZoomLabel();
-  markDirty();
-}
-function updateZoomLabel(){ $('#zoomVal').textContent = Math.round(state.view.zoom*100)+'%'; }
-
-canvas.addEventListener('wheel', e=>{
-  e.preventDefault();
-  const r = canvas.getBoundingClientRect();
-  if(e.ctrlKey || e.metaKey || !e.shiftKey){
-    const factor = Math.exp(-e.deltaY * 0.0016);
-    setZoom(state.view.zoom * factor, e.clientX-r.left, e.clientY-r.top);
-  } else {
-    state.view.x -= e.deltaX;
-    state.view.y -= e.deltaY;
-    markDirty();
-  }
-}, {passive:false});
-
-$('#zoomIn').onclick = ()=>setZoom(state.view.zoom*1.2);
-$('#zoomOut').onclick = ()=>setZoom(state.view.zoom/1.2);
-$('#zoomVal').onclick = ()=>{ state.view.zoom = 1; state.view.x = 0; state.view.y = 0; updateZoomLabel(); markDirty(); };
-
-/* ============================================================
-   КЛАВИАТУРА
-   ============================================================ */
-window.addEventListener('keydown', e=>{
-  if(editingEl) return;
-  const tag = (e.target.tagName||'').toLowerCase();
-  if(tag==='input' || tag==='select' || tag==='textarea') return;
-
-  if(e.code==='Space'){ state.spaceDown = true; e.preventDefault(); return; }
-
-  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z'){ e.preventDefault(); doUndo(); return; }
-
-  if(e.key==='Delete' || e.key==='Backspace'){
-    if(state.selected){
-      e.preventDefault();
-      const id = state.selected;
-      state.elements = state.elements.filter(el=>el.id!==id);
-      send({type:'delete', ids:[id]});
-      state.undo.push({kind:'delete', ids:[id]});
-      state.selected = null;
-      updateStats();
-      markDirty();
-    }
-    return;
-  }
-
-  const k = e.key.toLowerCase();
-  const tool = TOOLS.find(t=>t.key===k);
-  if(tool){ setTool(tool.id); }
-});
-window.addEventListener('keyup', e=>{
-  if(e.code==='Space') state.spaceDown = false;
-});
-
-function doUndo(){
-  const a = state.undo.pop();
-  if(!a) return;
-  if(a.kind==='add'){
-    state.elements = state.elements.filter(e=>e.id!==a.id);
-    send({type:'delete', ids:[a.id]});
-  } else if(a.kind==='delete'){
-    // вернуть нельзя без снапшота — игнорируем
-    toast('Отмена удаления недоступна');
-    return;
-  } else if(a.kind==='move'){
-    const el = state.elements.find(x=>x.id===a.id);
-    if(el){
-      Object.assign(el, a.before);
-      send({type:'update', element:el});
-    }
-  }
-  updateStats();
-  markDirty();
-}
-
-/* ============================================================
-   WEBSOCKET
-   ============================================================ */
-function send(obj){
-  if(state.ws && state.ws.readyState===WebSocket.OPEN){
-    state.ws.send(JSON.stringify(obj));
-  }
-}
-
-function connect(){
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws/${encodeURIComponent(state.room)}?nick=${encodeURIComponent(state.nick)}`;
-  setConn('warn','Подключение…');
-  const ws = new WebSocket(url);
-  state.ws = ws;
-
-  ws.onopen = ()=> setConn('ok','Онлайн');
-  ws.onclose = ()=>{ setConn('off','Нет связи'); setTimeout(connect, 1800); };
-  ws.onerror = ()=> setConn('off','Ошибка');
-
-  ws.onmessage = ev=>{
-    let m;
-    try{ m = JSON.parse(ev.data); }catch(_){ return; }
-    switch(m.type){
-      case 'init':
-        state.elements = m.elements || [];
-        renderUsers(m.users||[]);
-        updateStats();
-        markDirty();
-        break;
-      case 'add':
-        if(m.element && !state.elements.some(e=>e.id===m.element.id)){
-          state.elements.push(m.element);
-          updateStats(); markDirty();
-        }
-        break;
-      case 'batch':
-        for(const el of (m.elements||[])){
-          if(!state.elements.some(e=>e.id===el.id)) state.elements.push(el);
-        }
-        updateStats(); markDirty();
-        break;
-      case 'update': {
-        const i = state.elements.findIndex(e=>e.id===m.element.id);
-        if(i>=0) state.elements[i] = m.element;
-        else state.elements.push(m.element);
-        markDirty();
-        break;
-      }
-      case 'delete': {
-        const ids = new Set(m.ids||[]);
-        state.elements = state.elements.filter(e=>!ids.has(e.id));
-        if(ids.has(state.selected)) state.selected = null;
-        updateStats(); markDirty();
-        break;
-      }
-      case 'clear':
-        state.elements = [];
-        state.selected = null;
-        updateStats(); markDirty();
-        break;
-      case 'presence':
-        renderUsers(m.users||[]);
-        break;
-      case 'laser':
-        state.lasers.push({
-          pts:(m.pts||[]).map(p=>[p[0],p[1],performance.now()]),
-          color:m.color||'#ef4444',
-          width:m.width||4
-        });
-        markDirty();
-        break;
-    }
-  };
-}
-
-function setConn(kind, text){
-  const el = $('#conn');
-  el.className = 'conn' + (kind==='ok'?'':(kind==='warn'?' warn':' off'));
-  $('#connTxt').textContent = text;
-}
-
-/* ============================================================
-   ПОЛЬЗОВАТЕЛИ
-   ============================================================ */
-const AVATAR_COLORS = ['#818cf8','#34d399','#fbbf24','#f472b6','#38bdf8','#a78bfa','#fb923c','#4ade80','#f87171','#22d3ee'];
-function hash(s){ let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))|0; return Math.abs(h); }
-
-function renderUsers(list){
-  const box = $('#users');
-  box.innerHTML = '';
-  list.slice(0,6).forEach(n=>{
-    const d = document.createElement('div');
-    d.className = 'avatar';
-    d.style.background = AVATAR_COLORS[hash(n) % AVATAR_COLORS.length];
-    d.textContent = (n||'?').trim().slice(0,2).toUpperCase();
-    d.title = n;
-    box.appendChild(d);
-  });
-  $('#usersCount').textContent = list.length + ' онлайн';
-  $('#statCount').textContent = state.elements.length;
-}
-function updateStats(){ $('#statCount').textContent = state.elements.length; }
-
-/* ============================================================
-   ЭКСПОРТ
-   ============================================================ */
-function exportImage(){
-  const b = (()=>{
-    if(!state.elements.length) return {x:-400,y:-300,w:800,h:600};
-    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-    for(const el of state.elements){
-      const bb = elementBounds(el);
-      minX = Math.min(minX, bb.x); minY = Math.min(minY, bb.y);
-      maxX = Math.max(maxX, bb.x+bb.w); maxY = Math.max(maxY, bb.y+bb.h);
-    }
-    const pad = 40;
-    return {x:minX-pad, y:minY-pad, w:(maxX-minX)+pad*2, h:(maxY-minY)+pad*2};
-  })();
-
-  const scale = S.exportScale;
-  const off = document.createElement('canvas');
-  off.width = Math.max(1, Math.round(b.w*scale));
-  off.height = Math.max(1, Math.round(b.h*scale));
-  const c = off.getContext('2d');
-
-  if(!S.exportTransparent){
-    c.fillStyle = S.bgColor;
-    c.fillRect(0,0,off.width,off.height);
-  }
-  if(S.exportIncludeGrid && S.bgPattern!=='none'){
-    c.save();
-    c.strokeStyle = S.patternColor;
-    c.globalAlpha = S.patternOpacity;
-    c.lineWidth = S.patternWidth;
-    const sz = S.patternSize*scale;
-    c.beginPath();
-    for(let x=0;x<off.width;x+=sz){ c.moveTo(x,0); c.lineTo(x,off.height); }
-    for(let y=0;y<off.height;y+=sz){ c.moveTo(0,y); c.lineTo(off.width,y); }
-    c.stroke();
-    c.restore();
-  }
-
-  c.translate(-b.x*scale, -b.y*scale);
-  c.scale(scale, scale);
-  for(const el of state.elements) drawElement(c, el);
-
-  const fmt = S.exportFormat;
-  const mime = fmt==='png' ? 'image/png' : fmt==='jpeg' ? 'image/jpeg' : 'image/webp';
-  const quality = (fmt==='png') ? undefined : S.exportQuality;
-
-  off.toBlob(blob=>{
-    if(!blob){ toast('Не удалось экспортировать'); return; }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `collabboard-${state.room}-${Date.now()}.${fmt}`;
-    a.click();
-    setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
-    toast('Файл сохранён');
-  }, mime, quality);
-}
-
-/* ============================================================
-   ТОСТ
-   ============================================================ */
-let toastTimer = null;
-function toast(msg){
-  const t = $('#toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(()=>t.classList.remove('show'), 2200);
-}
-
-/* ============================================================
-   КНОПКИ
-   ============================================================ */
-$('#btnExport').onclick = ()=>{
-  state.tab = 'export';
-  $$('.prop-tab').forEach(x=>x.classList.toggle('active', x.dataset.tab==='export'));
-  renderPanel();
-  exportImage();
-};
-$('#btnUndo').onclick = doUndo;
-$('#btnClear').onclick = ()=>{
-  if(!confirm('Очистить доску для всех участников?')) return;
-  state.elements = [];
-  state.selected = null;
-  state.undo = [];
-  send({type:'clear'});
-  updateStats();
-  markDirty();
-  toast('Доска очищена');
-};
-
-/* ============================================================
-   JOIN
-   ============================================================ */
-$('#joinBtn').onclick = join;
-$('#nickInput').addEventListener('keydown', e=>{ if(e.key==='Enter') join(); });
-$('#roomInput').addEventListener('keydown', e=>{ if(e.key==='Enter') join(); });
-
-function join(){
-  const nick = ($('#nickInput').value || '').trim() || 'Гость';
-  const room = ($('#roomInput').value || '').trim() || 'main';
-  state.nick = nick;
-  state.room = room;
-  $('#boardLabel').textContent = room;
-  $('#overlay').classList.add('hidden');
-  connect();
-  toast(`Добро пожаловать, ${nick}!`);
-}
-
-/* ============================================================
-   СТАРТ
-   ============================================================ */
-function boot(){
-  buildRail();
-  renderPanel();
-  resize();
-  updateZoomLabel();
-  setTool('pen');
-  requestAnimationFrame(loop);
-  $('#nickInput').focus();
-}
-boot();
-</script>
-</body>
-</html>
-"""
+  c.fillStyle = el.color
