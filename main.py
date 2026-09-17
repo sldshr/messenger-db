@@ -6,32 +6,23 @@ import secrets
 import struct
 import time
 import uuid
+from collections import deque
 from typing import Any, Optional
 
-import httpx
 import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 # ============================ CONFIG ============================
-PUBLIC_DOMAIN = os.getenv("DOMAIN", "").strip().lower().rstrip("/")
-FED_SCHEME_ENV = os.getenv("SCHEME", "").strip().lower()
-FED_TIMEOUT = 5.0
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
-
-
-def fed_scheme_for(domain: str) -> str:
-    if FED_SCHEME_ENV:
-        return FED_SCHEME_ENV
-    if domain.startswith("localhost") or domain.startswith("127."):
-        return "http"
-    return "https"
-
+PAIR_HISTORY_MAX = 200      # максимум сообщений на пару
+STATUS_HEARTBEAT = 30.0     # как часто клиент шлёт ping
 
 # ============================ PROTOCOL ============================
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
- T_HELLO, T_USER_STATUS, T_SYNC, T_USERS, T_CONTACT_REQ, T_CONTACT_OK,
- T_CONTACT_ADD, T_CHAT_END) = range(1, 16)
+ T_HELLO, T_STATUS, T_SYNC, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
+ T_CHAT_END) = range(1, 15)
 _HDR = struct.Struct(">BI")
 
 
@@ -46,53 +37,30 @@ def unpack(data: bytes):
 
 
 # ============================ STATE (RAM only) ============================
-# users[login] = {"salt": b, "pw": b, "pub": str, "contacts": {uid: pub}}
+# users[login] = {"salt": b, "pw": b, "pub": str, "contacts": {peer_login: pub}}
 users: dict[str, dict] = {}
 online: dict[str, "Client"] = {}
-messages: list[dict] = []
-_canonical_domain: Optional[str] = PUBLIC_DOMAIN or None
-
-
-def self_domain(scope) -> str:
-    global _canonical_domain
-    if _canonical_domain:
-        return _canonical_domain
-    host = (scope.headers.get("host") or "localhost").lower()
-    _canonical_domain = host
-    return host
+# watchers[login] = {login1, login2, ...} — кто держит login в контактах
+watchers: dict[str, set] = {}
+# messages[(a,b)] = deque[{i,f,t,d,p,s}], a < b
+messages: dict[tuple, deque] = {}
 
 
 def scrypt_hash(pw: str, salt: bytes) -> bytes:
     return hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
 
 
-def parse_uid(uid: str) -> tuple[str, str]:
-    uid = (uid or "").strip().lower()
-    if "@" in uid:
-        login, d = uid.split("@", 1)
-        return login, d.strip()
-    return uid, ""
-
-
-def make_uid(login: str, domain: str) -> str:
-    return f"{login}@{domain}"
-
-
-def _purge_messages_between(a_uid: str, b_uid: str):
-    global messages
-    messages = [m for m in messages
-                if not ((m["f"] == a_uid and m["t"] == b_uid)
-                     or (m["f"] == b_uid and m["t"] == a_uid))]
+def pair_key(a: str, b: str) -> tuple:
+    return (a, b) if a < b else (b, a)
 
 
 # ============================ CLIENT ============================
 class Client:
-    __slots__ = ("ws", "login", "domain", "lock")
+    __slots__ = ("ws", "login", "lock")
 
-    def __init__(self, ws: WebSocket, domain: str):
+    def __init__(self, ws: WebSocket):
         self.ws = ws
         self.login: Optional[str] = None
-        self.domain = domain
         self.lock = asyncio.Lock()
 
     async def send(self, t: int, o: Any):
@@ -103,22 +71,24 @@ class Client:
                 pass
 
 
-async def broadcast_status(uid: str, is_online: bool):
-    """Сообщаем всем локальным online-клиентам, у кого uid в контактах."""
-    if not online:
+async def notify_watchers(login: str, is_online: bool):
+    """Сообщаем только тем, у кого login в контактах и кто сейчас online."""
+    w = watchers.get(login)
+    if not w:
         return
-    frame = pack(T_USER_STATUS, {"u": uid, "o": is_online})
-    for login, c in list(online.items()):
-        contacts = users.get(login, {}).get("contacts", {})
-        if uid in contacts:
-            async with c.lock:
-                try:
-                    await c.ws.send_bytes(frame)
-                except Exception:
-                    pass
+    frame = pack(T_STATUS, {"u": login, "o": is_online})
+    for watcher in list(w):
+        c = online.get(watcher)
+        if c is None:
+            continue
+        async with c.lock:
+            try:
+                await c.ws.send_bytes(frame)
+            except Exception:
+                pass
 
 
-# ============================ WS HANDLERS ============================
+# ============================ HANDLERS ============================
 async def handle_register(c: Client, obj: dict):
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
@@ -135,6 +105,7 @@ async def handle_register(c: Client, obj: dict):
         return await c.send(T_ERROR, {"m": "Логин уже занят"})
     salt = os.urandom(16)
     users[login] = {"salt": salt, "pw": scrypt_hash(pw, salt), "pub": pub, "contacts": {}}
+    watchers.setdefault(login, set())
     await _finish_auth(c, login)
 
 
@@ -155,188 +126,118 @@ async def handle_auth(c: Client, obj: dict):
 async def _finish_auth(c: Client, login: str):
     c.login = login
     online[login] = c
-    my_uid = make_uid(login, c.domain)
-    my_login_domain = c.domain
+    u = users[login]
 
-    # Контакты с их онлайн-статусом (для локальных)
-    contacts_list = []
-    for uid, pub in users[login]["contacts"].items():
-        cl, cd = parse_uid(uid)
-        is_on = (cl in online) if cd == my_login_domain else None
-        contacts_list.append({"u": uid, "p": pub, "o": is_on})
+    # контакты с их статусом
+    contacts_payload = [
+        {"u": peer, "p": pub, "o": peer in online}
+        for peer, pub in u["contacts"].items()
+    ]
 
-    hist = [m for m in messages if m["f"] == my_uid or m["t"] == my_uid]
+    # история: собираем из всех пар с участием login
+    hist = []
+    for (a, b), dq in messages.items():
+        if a == login or b == login:
+            hist.extend(dq)
+    hist.sort(key=lambda m: m["s"])
 
     await c.send(T_AUTH_OK, {
         "login": login,
-        "uid": my_uid,
-        "domain": my_login_domain,
-        "contacts": contacts_list,
+        "contacts": contacts_payload,
         "history": hist,
     })
-    await broadcast_status(my_uid, True)
+
+    # уведомляем тех, кто следит за мной
+    await notify_watchers(login, True)
 
 
 async def handle_msg(c: Client, obj: dict):
-    to_uid = (obj.get("t") or "").strip().lower()
-    to_login, to_domain = parse_uid(to_uid)
+    to_login = (obj.get("t") or "").strip().lower()
     blob = obj.get("d") or ""
     if not to_login or not blob:
         return
-    from_uid = make_uid(c.login, c.domain)
-    if to_uid == from_uid:
+    if to_login == c.login:
         return await c.send(T_ERROR, {"m": "Нельзя писать самому себе"})
+    if to_login not in users:
+        return await c.send(T_ERROR, {"m": "Пользователь не найден"})
 
     from_pub = users[c.login]["pub"]
     mid = obj.get("i") or uuid.uuid4().hex
     msg = {
-        "i": mid, "f": from_uid, "t": to_uid,
+        "i": mid, "f": c.login, "t": to_login,
         "d": blob, "p": from_pub,
         "s": int(time.time() * 1000),
     }
-    messages.append(msg)
+
+    # сохранение в историю пары
+    key = pair_key(c.login, to_login)
+    dq = messages.get(key)
+    if dq is None:
+        dq = deque(maxlen=PAIR_HISTORY_MAX)
+        messages[key] = dq
+    dq.append(msg)
 
     # эхо отправителю
     await c.send(T_MSG, msg)
 
-    if not to_domain or to_domain == c.domain:
-        # обновляем contacts у получателя, если есть
-        if to_login in users:
-            users[to_login]["contacts"][from_uid] = from_pub
-        target = online.get(to_login)
-        if target:
-            await target.send(T_MSG, msg)
-    else:
-        asyncio.create_task(fed_send(to_domain, msg))
-
-
-async def handle_sync(c: Client, obj: dict):
-    """Клиент просит обновить статусы своих контактов."""
-    my_login = c.login
-    my_domain = c.domain
-    results = []
-    fed_queries: dict[str, list[str]] = {}   # domain -> [uid]
-
-    for uid in users[my_login]["contacts"].keys():
-        cl, cd = parse_uid(uid)
-        if not cd or cd == my_domain:
-            results.append({"u": uid, "o": cl in online})
-        else:
-            fed_queries.setdefault(cd, []).append(uid)
-
-    if results:
-        await c.send(T_USERS, {"u": results})
-
-    for dom, uids in fed_queries.items():
-        asyncio.create_task(_fed_status_query(c, dom, uids))
-
-
-async def _fed_status_query(c: Client, domain: str, uids: list[str]):
-    url = f"{fed_scheme_for(domain)}://{domain}/fed/status"
-    try:
-        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
-            r = await cx.post(url, json={"uids": uids})
-            if r.status_code == 200:
-                await c.send(T_USERS, {"u": r.json().get("statuses", [])})
-    except Exception:
-        pass
+    # доставка получателю
+    target = online.get(to_login)
+    if target:
+        await target.send(T_MSG, msg)
 
 
 async def handle_contact_req(c: Client, obj: dict):
-    """Клиент просит добавить контакт (локальный или удалённый)."""
-    uid = (obj.get("u") or "").strip().lower()
-    cl, cd = parse_uid(uid)
-    if not cl:
-        return await c.send(T_ERROR, {"m": "Пустой uid"})
-    if not cd:
-        cd = c.domain
-        uid = make_uid(cl, cd)
-    if uid == make_uid(c.login, c.domain):
-        return await c.send(T_ERROR, {"m": "Это ваш собственный адрес"})
+    """Клиент просит добавить контакт. Только локальные пользователи."""
+    peer = (obj.get("u") or "").strip().lower()
+    if not peer:
+        return await c.send(T_ERROR, {"m": "Пустой логин"})
+    if peer == c.login:
+        return await c.send(T_ERROR, {"m": "Это ваш собственный логин"})
+    u = users.get(peer)
+    if not u:
+        return await c.send(T_ERROR, {"m": "Пользователь не найден"})
 
-    my_uid = make_uid(c.login, c.domain)
+    pub = u["pub"]
     my_pub = users[c.login]["pub"]
 
-    if cd == c.domain:
-        u = users.get(cl)
-        if not u:
-            return await c.send(T_ERROR, {"m": "Пользователь не найден"})
-        pub = u["pub"]
-        online_status = cl in online
-    else:
-        url = f"{fed_scheme_for(cd)}://{cd}/fed/pub/{cl}"
-        try:
-            async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
-                r = await cx.get(url)
-                if r.status_code != 200:
-                    return await c.send(T_ERROR, {"m": "Пользователь не найден на сервере"})
-                pub = r.json()["pub"]
-                online_status = None
-        except Exception as e:
-            return await c.send(T_ERROR, {"m": f"Сервер недоступен: {e}"})
+    # добавляю себе
+    users[c.login]["contacts"][peer] = pub
+    # добавляю себя ему (взаимное добавление)
+    users[peer]["contacts"][c.login] = my_pub
+    # регистрирую watchers
+    watchers.setdefault(peer, set()).add(c.login)
+    watchers.setdefault(c.login, set()).add(peer)
 
-    # добавляем себе
-    users[c.login]["contacts"][uid] = pub
-    # отвечаем
-    await c.send(T_CONTACT_OK, {"u": uid, "p": pub, "o": online_status})
+    online_status = peer in online
+    await c.send(T_CONTACT_OK, {"u": peer, "p": pub, "o": online_status})
 
-    # если удалённый — уведомляем его сервер
-    if cd != c.domain:
-        asyncio.create_task(fed_intro(cd, my_uid, my_pub, uid))
+    # уведомляем собеседника, если он online
+    target = online.get(peer)
+    if target:
+        await target.send(T_CONTACT_ADD, {"u": c.login, "p": my_pub, "o": True})
 
 
 async def handle_chat_end(c: Client, obj: dict):
-    peer_uid = (obj.get("u") or "").strip().lower()
-    pl, pd = parse_uid(peer_uid)
-    if not pl:
+    peer = (obj.get("u") or "").strip().lower()
+    if not peer:
         return
-    my_uid = make_uid(c.login, c.domain)
+    my = c.login
 
-    # локальная чистка
-    users[c.login]["contacts"].pop(peer_uid, None)
-    _purge_messages_between(my_uid, peer_uid)
+    users[my]["contacts"].pop(peer, None)
+    if peer in users:
+        users[peer]["contacts"].pop(my, None)
 
-    if not pd or pd == c.domain:
-        if pl in users:
-            users[pl]["contacts"].pop(my_uid, None)
-        _purge_messages_between(my_uid, peer_uid)
-        target = online.get(pl)
-        if target:
-            await target.send(T_CHAT_END, {"u": my_uid})
-    else:
-        asyncio.create_task(fed_chat_end(pd, my_uid, peer_uid))
+    w_me = watchers.get(my)
+    if w_me: w_me.discard(peer)
+    w_peer = watchers.get(peer)
+    if w_peer: w_peer.discard(my)
 
+    # удаляем всю переписку
+    messages.pop(pair_key(my, peer), None)
 
-# ============================ FEDERATION ============================
-async def fed_send(domain: str, msg: dict):
-    url = f"{fed_scheme_for(domain)}://{domain}/fed/msg"
-    try:
-        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
-            r = await cx.post(url, json=msg)
-            if r.status_code != 200:
-                print(f"[fed] {domain} msg -> {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"[fed] send to {domain} failed: {e}")
-
-
-async def fed_intro(domain: str, from_uid: str, from_pub: str, to_uid: str):
-    url = f"{fed_scheme_for(domain)}://{domain}/fed/intro"
-    try:
-        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
-            await cx.post(url, json={
-                "from_uid": from_uid, "from_pub": from_pub, "to_uid": to_uid,
-            })
-    except Exception as e:
-        print(f"[fed] intro to {domain} failed: {e}")
-
-
-async def fed_chat_end(domain: str, from_uid: str, to_uid: str):
-    url = f"{fed_scheme_for(domain)}://{domain}/fed/chat_end"
-    try:
-        async with httpx.AsyncClient(timeout=FED_TIMEOUT) as cx:
-            await cx.post(url, json={"from_uid": from_uid, "to_uid": to_uid})
-    except Exception as e:
-        print(f"[fed] chat_end to {domain} failed: {e}")
+    target = online.get(peer)
+    if target:
+        await target.send(T_CHAT_END, {"u": my})
 
 
 # ============================ HTTP ============================
@@ -348,118 +249,11 @@ async def index():
     return HTMLResponse(HTML_PAGE)
 
 
-@app.get("/fed/pub/{login}")
-async def fed_pub(login: str):
-    u = users.get(login.lower())
-    if not u:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return {"login": login.lower(), "pub": u["pub"]}
-
-
-@app.post("/fed/status")
-async def fed_status(payload: dict, request: Request):
-    uids = payload.get("uids") or []
-    my_domain = self_domain(request)
-    out = []
-    for uid in uids:
-        uid = (uid or "").strip().lower()
-        cl, cd = parse_uid(uid)
-        if cd == my_domain:
-            out.append({"u": uid, "o": cl in online})
-        else:
-            out.append({"u": uid, "o": None})
-    return {"statuses": out}
-
-
-@app.post("/fed/msg")
-async def fed_msg(payload: dict, request: Request):
-    try:
-        to_uid = (payload.get("t") or "").strip().lower()
-        from_uid = (payload.get("f") or "").strip().lower()
-        to_login, to_domain = parse_uid(to_uid)
-        from_login, from_domain = parse_uid(from_uid)
-        my_domain = self_domain(request)
-        if to_domain != my_domain:
-            return JSONResponse({"error": "wrong domain"}, status_code=400)
-        if not from_domain or from_domain == my_domain:
-            return JSONResponse({"error": "invalid source"}, status_code=400)
-        if to_login not in users:
-            return JSONResponse({"error": "no such user"}, status_code=404)
-
-        from_pub = payload.get("p", "")
-        msg = {
-            "i": payload.get("i") or uuid.uuid4().hex,
-            "f": from_uid, "t": to_uid,
-            "d": payload["d"], "p": from_pub,
-            "s": payload.get("s") or int(time.time() * 1000),
-        }
-        messages.append(msg)
-
-        # авто-обновление contacts у получателя
-        if from_pub:
-            users[to_login]["contacts"][from_uid] = from_pub
-        else:
-            users[to_login]["contacts"].setdefault(from_uid, "")
-
-        target = online.get(to_login)
-        if target:
-            await target.send(T_MSG, msg)
-        return {"ok": True}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/fed/intro")
-async def fed_intro_ep(payload: dict, request: Request):
-    from_uid = (payload.get("from_uid") or "").strip().lower()
-    from_pub = payload.get("from_pub") or ""
-    to_uid = (payload.get("to_uid") or "").strip().lower()
-    from_login, from_domain = parse_uid(from_uid)
-    to_login, to_domain = parse_uid(to_uid)
-    my_domain = self_domain(request)
-    if not from_login or not from_domain or from_domain == my_domain:
-        return JSONResponse({"error": "invalid from"}, status_code=400)
-    if not to_login or to_domain != my_domain:
-        return JSONResponse({"error": "invalid to"}, status_code=400)
-    if to_login not in users:
-        return JSONResponse({"error": "no such user"}, status_code=404)
-
-    users[to_login]["contacts"][from_uid] = from_pub
-    target = online.get(to_login)
-    if target is not None:
-        await target.send(T_CONTACT_ADD, {"u": from_uid, "p": from_pub})
-    return {"ok": True}
-
-
-@app.post("/fed/chat_end")
-async def fed_chat_end_ep(payload: dict, request: Request):
-    from_uid = (payload.get("from_uid") or "").strip().lower()
-    to_uid = (payload.get("to_uid") or "").strip().lower()
-    from_login, from_domain = parse_uid(from_uid)
-    to_login, to_domain = parse_uid(to_uid)
-    my_domain = self_domain(request)
-    if not from_login or not from_domain or from_domain == my_domain:
-        return JSONResponse({"error": "invalid from"}, status_code=400)
-    if not to_login or to_domain != my_domain:
-        return JSONResponse({"error": "invalid to"}, status_code=400)
-
-    if to_login in users:
-        users[to_login]["contacts"].pop(from_uid, None)
-    _purge_messages_between(from_uid, to_uid)
-
-    target = online.get(to_login)
-    if target:
-        await target.send(T_CHAT_END, {"u": from_uid})
-    return {"ok": True}
-
-
-# ============================ WS ============================
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
-    my_domain = self_domain(ws)
-    c = Client(ws, my_domain)
-    await c.send(T_HELLO, {"domain": my_domain})
+    c = Client(ws)
+    await c.send(T_HELLO, {})
     try:
         while True:
             raw = await ws.receive_bytes()
@@ -473,14 +267,20 @@ async def ws_handler(ws: WebSocket):
                 await handle_auth(c, obj)
             elif t == T_MSG and c.login:
                 await handle_msg(c, obj)
-            elif t == T_SYNC and c.login:
-                await handle_sync(c, obj)
             elif t == T_CONTACT_REQ and c.login:
                 await handle_contact_req(c, obj)
             elif t == T_CHAT_END and c.login:
                 await handle_chat_end(c, obj)
             elif t == T_PING:
                 await c.send(T_PONG, {})
+            elif t == T_SYNC and c.login:
+                # лёгкий пинг статусов (клиент может запросить вручную)
+                u = users[c.login]
+                snapshot = [
+                    {"u": peer, "o": peer in online}
+                    for peer in u["contacts"].keys()
+                ]
+                await c.send(T_STATUS, {"snapshot": snapshot})
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -488,7 +288,7 @@ async def ws_handler(ws: WebSocket):
     finally:
         if c.login and online.get(c.login) is c:
             online.pop(c.login, None)
-            await broadcast_status(make_uid(c.login, c.domain), False)
+            await notify_watchers(c.login, False)
 
 
 # ============================ HTML ============================
@@ -603,8 +403,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 .contact.active .status-dot{border-color:var(--bg-active)}
 .contact-info{flex:1;min-width:0}
 .contact-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;color:var(--text-normal);display:flex;align-items:baseline;gap:4px}
-.contact-name .dom{color:var(--text-muted);font-weight:400;font-size:12px}
+  white-space:nowrap;color:var(--text-normal)}
 .contact-preview{font-size:13px;color:var(--text-muted);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
 .contact.unread .contact-preview{color:var(--text-normal);font-weight:500}
@@ -732,9 +531,9 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   <aside id="sidebar">
     <div class="sidebar-header">
       <div class="avatar" id="myAvatar">?</div>
-      <div class="my-info" id="myInfo" title="Нажмите, чтобы скопировать адрес">
+      <div class="my-info" id="myInfo" title="Нажмите, чтобы скопировать логин">
         <div class="my-name" id="myLogin">—</div>
-        <div class="my-sub" id="myDomain"></div>
+        <div class="my-sub" id="myDomain">в сети</div>
       </div>
       <button class="icon-btn" id="themeBtn" title="Тема" aria-label="Тема">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -770,7 +569,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
             <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
           </svg>
         </button>
-        <div class="conv-peer" id="convPeer" title="Нажмите, чтобы скопировать адрес">
+        <div class="conv-peer" id="convPeer" title="Нажмите, чтобы скопировать логин">
           <div class="peer-name" id="peerName">—</div>
           <div class="peer-sub" id="peerSub"></div>
         </div>
@@ -797,12 +596,8 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 <div class="modal-backdrop" id="addModal">
   <div class="modal">
     <h3>Новый чат</h3>
-    <div class="hint">
-      Введите логин (<b>bob</b>) для пользователя этого сервера
-      или полный адрес (<b>bob@server.com</b>) для пользователя другого сервера.
-    </div>
-    <input id="addInput" placeholder="bob или bob@server.com"
-           autocapitalize="off" spellcheck="false" autocomplete="off">
+    <div class="hint">Введите логин пользователя этого сервера (например, <b>bob</b>).</div>
+    <input id="addInput" placeholder="логин" autocapitalize="off" spellcheck="false" autocomplete="off">
     <div class="err" id="addErr"></div>
     <div class="modal-actions">
       <button class="btn-secondary" id="addCancel" type="button">Отмена</button>
@@ -832,8 +627,8 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 
 /* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
-           HELLO:8, USER_STATUS:9, SYNC:10, USERS:11, CONTACT_REQ:12,
-           CONTACT_OK:13, CONTACT_ADD:14, CHAT_END:15};
+           HELLO:8, STATUS:9, SYNC:10, CONTACT_REQ:11, CONTACT_OK:12,
+           CONTACT_ADD:13, CHAT_END:14};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -893,10 +688,9 @@ async function decryptBlob(key, blob){
   return _dec.decode(pt);
 }
 
-/* ================= THEME (system by default) ================= */
+/* ================= THEME ================= */
 const LS_THEME = "fed_theme";
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
-
 function systemTheme(){ return mq.matches ? "dark" : "light"; }
 function applyTheme(t){
   document.documentElement.setAttribute("data-theme", t);
@@ -918,7 +712,6 @@ function toggleTheme(){
 }
 applyTheme(getInitialTheme());
 mq.addEventListener("change", e => {
-  // если пользователь не переопределил вручную — следуем системе
   let saved = null;
   try { saved = localStorage.getItem(LS_THEME); } catch(e){}
   if (saved !== "dark" && saved !== "light"){
@@ -926,7 +719,7 @@ mq.addEventListener("change", e => {
   }
 });
 
-/* ================= ANTI-CTX / ANTI-SELECT ================= */
+/* ================= ANTI-CTX ================= */
 document.addEventListener("contextmenu", e => {
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
@@ -945,29 +738,27 @@ document.addEventListener("dragstart", e => {
 
 /* ================= STATE ================= */
 let ws = null;
-let helloDomain = null;
-let me = null;             // {login, uid}
-let myPrivKey = null;      // CryptoKey, никогда не покидает браузер
+let me = null;
+let myPrivKey = null;
 let myPubRaw = null;
 let sessionPassword = null;
-let contacts = [];         // [{uid, pub, online}] — только в памяти
-const convKeys = {};       // uid|pub16 -> CryptoKey
-const threads = {};        // uid -> [{id, from, to, text, ts, broken}]
-const unread = {};         // uid -> count
+let contacts = [];          // [{uid, pub, online}] — только в памяти
+const convKeys = {};        // uid|pub16 -> CryptoKey
+const threads = {};         // uid -> [{id,from,to,text,ts,broken}]
+const unread = {};          // uid -> count
 const seenIds = new Set();
 let activePeer = null;
 let reconnectAttempts = 0;
 let heartbeatTimer = null;
-let statusSyncTimer = null;
 let mode = "login";
 let authPayload = null;
+let pendingAdd = null;
 
 const $ = id => document.getElementById(id);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
                    : Date.now().toString(36) + Math.random().toString(36).slice(2,10));
 
 /* ================= UTILS ================= */
-function splitUid(uid){ const i = uid.indexOf("@"); return i < 0 ? [uid,""] : [uid.slice(0,i), uid.slice(i+1)]; }
 function avatarColor(uid){
   const colors = ["#5865f2","#3ba55d","#faa61a","#ed4245","#eb459e","#9b59b6","#1abc9c","#e67e22"];
   let h = 0;
@@ -985,19 +776,19 @@ function toast(msg){
   toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-/* ================= LOCAL STORAGE (только ключ + remember) ================= */
+/* ================= STORAGE ================= */
 const LS_REMEMBER = "fed_remember";
 function privStoreKey(login){ return "fed_priv_" + login + "@" + location.host; }
 function privStoreKeyOld(login){ return "fed_priv_" + login; }
 
-/* ================= CONTACT LIST RENDER ================= */
+/* ================= RENDER CONTACTS ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
   if (!contacts.length){
     const d = document.createElement("div");
     d.className = "empty-list";
-    d.innerHTML = "Пока нет чатов.<br>Нажмите <b>+</b> сверху, чтобы добавить пользователя по логину или адресу.";
+    d.innerHTML = "Пока нет чатов.<br>Нажмите <b>+</b> сверху, чтобы добавить пользователя по логину.";
     box.appendChild(d);
     return;
   }
@@ -1027,23 +818,14 @@ function renderContacts(){
     av.style.background = avatarColor(c.uid);
     av.textContent = avatarChar(c.uid);
     const dot = document.createElement("span");
-    const st = c.online === true ? "online" : (c.online === false ? "" : "unknown");
-    dot.className = "status-dot " + st;
+    dot.className = "status-dot " + (c.online === true ? "online" : (c.online === false ? "" : "unknown"));
     wrap.append(av, dot);
 
     const info = document.createElement("div");
     info.className = "contact-info";
     const nm = document.createElement("div");
     nm.className = "contact-name";
-    const [login, dom] = splitUid(c.uid);
-    const nameSpan = document.createElement("span");
-    nameSpan.textContent = login;
-    nm.appendChild(nameSpan);
-    if (dom && helloDomain && dom !== helloDomain){
-      const d = document.createElement("span");
-      d.className = "dom"; d.textContent = "@" + dom;
-      nm.appendChild(d);
-    }
+    nm.textContent = c.uid;
     const pv = document.createElement("div");
     pv.className = "contact-preview";
     const t = threads[c.uid];
@@ -1071,28 +853,27 @@ function renderContacts(){
 function selectPeer(uid){
   activePeer = uid;
   unread[uid] = 0;
-  const [login, dom] = splitUid(uid);
-  $("peerName").textContent = login;
-  const c = contacts.find(x => x.uid === uid);
-  const sub = $("peerSub");
-  const parts = [];
-  if (dom && helloDomain && dom !== helloDomain) parts.push("@" + dom);
-  if (c){
-    if (c.online === true) parts.push("в сети");
-    else if (c.online === false) parts.push("не в сети");
-    else if (dom && dom !== helloDomain) parts.push("другой сервер");
-  }
-  sub.textContent = parts.join(" · ");
-  sub.className = "peer-sub" + (c && c.online === true ? " online" : "");
+  $("peerName").textContent = uid;
   $("chatPane").classList.add("has-chat");
   $("app").classList.add("chat-open");
   renderContacts();
+  refreshPeerSub();
   renderThread();
   setTimeout(() => $("inp").focus(), 60);
 }
 function goBack(){ $("app").classList.remove("chat-open"); }
 
-/* ================= THREAD RENDER ================= */
+function refreshPeerSub(){
+  if (!activePeer) return;
+  const c = contacts.find(x => x.uid === activePeer);
+  const sub = $("peerSub");
+  if (!c){ sub.textContent = ""; return; }
+  if (c.online === true){ sub.textContent = "в сети"; sub.className = "peer-sub online"; }
+  else if (c.online === false){ sub.textContent = "не в сети"; sub.className = "peer-sub"; }
+  else { sub.textContent = "статус неизвестен"; sub.className = "peer-sub"; }
+}
+
+/* ================= THREAD ================= */
 function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); }
 function fmtDay(ts){
   const d = new Date(ts), t = new Date();
@@ -1157,21 +938,17 @@ async function getConvKeyFromPub(uid, pub){
   } catch(e){ return null; }
 }
 
-/**
- * Расшифровка входящего. ВСЕГДА использует pub из самого сообщения (m.p),
- * и только при его отсутствии — pub из контакта. Это ключевой фикс first message.
- */
-async function decryptIncoming(m, peerUid){
+async function decryptIncoming(m, peer){
+  // ВСЕГДА используем pub из сообщения (m.p). Fallback — контакт.
   const pubs = [];
   if (m.p) pubs.push(m.p);
-  const c = contacts.find(x => x.uid === peerUid);
+  const c = contacts.find(x => x.uid === peer);
   if (c && c.pub && c.pub !== m.p) pubs.push(c.pub);
   for (const pub of pubs){
-    const key = await getConvKeyFromPub(peerUid, pub);
+    const key = await getConvKeyFromPub(peer, pub);
     if (!key) continue;
     try {
       const text = await decryptBlob(key, m.d);
-      // синхронизируем pub, если сервер прислал более свежий
       if (c && m.p && c.pub !== m.p) c.pub = m.p;
       return text;
     } catch(e){}
@@ -1193,7 +970,7 @@ function connect(){
     ws.onmessage = async ev => {
       let type, obj;
       try { [type, obj] = unpack(ev.data); } catch(e){ return; }
-      if (type === T.HELLO){ helloDomain = obj.domain; return; }
+      if (type === T.HELLO) return;
       if (!settled){
         if (type === T.AUTH_OK){ settled = true; clearTimeout(to); resolve(obj); return; }
         if (type === T.ERROR){ settled = true; clearTimeout(to);
@@ -1214,117 +991,91 @@ function connect(){
 async function handleFrame(type, obj){
   switch(type){
     case T.MSG: await onIncomingMsg(obj); break;
-    case T.CONTACT_ADD: await onContactAdd(obj); break;
     case T.CONTACT_OK: onContactOk(obj); break;
+    case T.CONTACT_ADD: onContactAdd(obj); break;
     case T.CHAT_END: onChatEnded(obj.u); break;
-    case T.USER_STATUS: {
-      const c = contacts.find(x => x.uid === obj.u);
-      if (c){
-        c.online = obj.o;
+    case T.STATUS:
+      if (obj.snapshot){
+        for (const it of obj.snapshot){
+          const c = contacts.find(x => x.uid === it.u);
+          if (c) c.online = it.o;
+        }
         renderContacts();
-        if (activePeer === obj.u) refreshPeerSub();
+        refreshPeerSub();
+      } else {
+        const c = contacts.find(x => x.uid === obj.u);
+        if (c){ c.online = obj.o; renderContacts(); refreshPeerSub(); }
       }
       break;
-    }
-    case T.USERS: {
-      for (const u of (obj.u || [])){
-        const c = contacts.find(x => x.uid === u.u);
-        if (c) c.online = u.o;
-      }
-      renderContacts();
-      if (activePeer) refreshPeerSub();
-      break;
-    }
     case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
     case T.PONG: break;
-    case T.ERROR: console.warn("server:", obj.m); break;
+    case T.ERROR: {
+      // если ошибка при добавлении — показать
+      if (pendingAdd){ $("addErr").textContent = obj.m || "Ошибка"; setBusy($("addConfirm"), false); }
+      console.warn("server:", obj.m);
+      break;
+    }
   }
 }
 
-function refreshPeerSub(){
-  if (!activePeer) return;
-  const c = contacts.find(x => x.uid === activePeer);
-  const sub = $("peerSub");
-  const [_, dom] = splitUid(activePeer);
-  const parts = [];
-  if (dom && helloDomain && dom !== helloDomain) parts.push("@" + dom);
-  if (c){
-    if (c.online === true) parts.push("в сети");
-    else if (c.online === false) parts.push("не в сети");
-    else if (dom && dom !== helloDomain) parts.push("другой сервер");
-  }
-  sub.textContent = parts.join(" · ");
-  sub.className = "peer-sub" + (c && c.online === true ? " online" : "");
-}
-
-async function onContactOk(obj){
+function onContactOk(obj){
   const uid = obj.u;
-  if (!uid) return;
   const ex = contacts.find(c => c.uid === uid);
-  if (ex){
-    ex.pub = obj.p || ex.pub;
-    ex.online = obj.o;
-  } else {
-    contacts.push({uid, pub: obj.p || "", online: obj.o});
-  }
+  if (ex){ ex.pub = obj.p || ex.pub; ex.online = obj.o; }
+  else contacts.push({uid, pub: obj.p || "", online: obj.o});
   renderContacts();
-  selectPeer(uid);
+  if (pendingAdd === uid){ closeAddModal(); pendingAdd = null; selectPeer(uid); }
 }
 
-async function onContactAdd(obj){
-  const uid = (obj.u || "").toLowerCase();
-  if (!uid || (me && uid === me.uid)) return;
+function onContactAdd(obj){
+  const uid = obj.u;
+  if (!uid || uid === me.uid) return;
   const ex = contacts.find(c => c.uid === uid);
   if (ex){
     if (obj.p && ex.pub !== obj.p) ex.pub = obj.p;
+    if (obj.o !== undefined) ex.online = obj.o;
     return;
   }
-  contacts.push({uid, pub: obj.p || "", online: null});
+  contacts.push({uid, pub: obj.p || "", online: obj.o === undefined ? true : obj.o});
   renderContacts();
-  if (ws && ws.readyState === 1) ws.send(pack(T.SYNC, {}));
-  const [login] = splitUid(uid);
-  toast(login + " добавил(а) вас в контакты");
+  toast(uid + " добавил(а) вас в контакты");
 }
 
 async function onIncomingMsg(m){
   if (seenIds.has(m.i)) return;
   seenIds.add(m.i);
-  const peerUid = m.f === me.uid ? m.t : m.f;
+  const peer = m.f === me.uid ? m.t : m.f;
 
-  // если контакта нет — создаём локально (сервер тоже его добавил)
-  let c = contacts.find(x => x.uid === peerUid);
+  let c = contacts.find(x => x.uid === peer);
   if (!c){
-    c = {uid: peerUid, pub: m.p || "", online: null};
+    c = {uid: peer, pub: m.p || "", online: null};
     contacts.push(c);
     renderContacts();
-    if (ws && ws.readyState === 1) ws.send(pack(T.SYNC, {}));
   } else if (m.f !== me.uid && m.p && c.pub !== m.p){
     c.pub = m.p;
   }
 
-  const text = await decryptIncoming(m, peerUid);
+  const text = await decryptIncoming(m, peer);
   const msg = {
     id: m.i, from: m.f, to: m.t,
     text: text !== null ? text : "⚠ не удалось расшифровать",
     ts: m.s, broken: text === null,
   };
-  (threads[peerUid] = threads[peerUid] || []).push(msg);
-  if (activePeer === peerUid){
+  (threads[peer] = threads[peer] || []).push(msg);
+  if (activePeer === peer){
     appendMsg(msg);
     renderContacts();
   } else {
-    unread[peerUid] = (unread[peerUid] || 0) + 1;
+    unread[peer] = (unread[peer] || 0) + 1;
     renderContacts();
   }
 }
 
-function onChatEnded(peerUid){
-  peerUid = (peerUid || "").toLowerCase();
-  if (!peerUid) return;
-  const [login] = splitUid(peerUid);
-  const wasActive = activePeer === peerUid;
-  removeContact(peerUid);
-  toast(login + " завершил(а) чат");
+function onChatEnded(peer){
+  if (!peer) return;
+  const wasActive = activePeer === peer;
+  removeContact(peer);
+  toast(peer + " завершил(а) чат");
   if (wasActive){
     $("chatPane").classList.remove("has-chat");
     $("app").classList.remove("chat-open");
@@ -1332,11 +1083,11 @@ function onChatEnded(peerUid){
   }
 }
 
-function removeContact(peerUid){
-  const idx = contacts.findIndex(c => c.uid === peerUid);
+function removeContact(peer){
+  const idx = contacts.findIndex(c => c.uid === peer);
   if (idx >= 0) contacts.splice(idx, 1);
-  delete threads[peerUid];
-  delete unread[peerUid];
+  delete threads[peer];
+  delete unread[peer];
   renderContacts();
 }
 
@@ -1391,7 +1142,7 @@ async function doAuth(login, password, remember){
     setBusy($("submitBtn"), true);
     const ok = await connect();
     sessionPassword = password;
-    me = {login: ok.login, uid: ok.uid};
+    me = {login: ok.login, uid: ok.login};
 
     if (remember){
       try { localStorage.setItem(LS_REMEMBER, JSON.stringify({login: me.login, password})); }
@@ -1400,9 +1151,9 @@ async function doAuth(login, password, remember){
       try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
     }
 
-    // контакты и история — с сервера
     contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
-    threads_clear();
+    for (const k of Object.keys(threads)) delete threads[k];
+    // история
     for (const m of (ok.history || [])){
       const peer = m.f === me.uid ? m.t : m.f;
       seenIds.add(m.i);
@@ -1415,7 +1166,7 @@ async function doAuth(login, password, remember){
     }
 
     $("myLogin").textContent = me.login;
-    $("myDomain").textContent = "@" + (helloDomain || "");
+    $("myDomain").textContent = "в сети";
     $("myAvatar").textContent = avatarChar(me.login);
     $("myAvatar").style.background = avatarColor(me.uid);
     $("login").style.display = "none";
@@ -1423,15 +1174,12 @@ async function doAuth(login, password, remember){
 
     renderContacts();
     startHeartbeat();
-    startStatusSync();
     reconnectAttempts = 0;
   } catch(e){
     setErr(e.message || "Ошибка");
     setBusy($("submitBtn"), false);
   }
 }
-
-function threads_clear(){ for (const k of Object.keys(threads)) delete threads[k]; }
 
 /* ================= SEND ================= */
 async function sendMessage(){
@@ -1458,9 +1206,8 @@ async function sendMessage(){
 /* ================= END CHAT ================= */
 function openEndModal(){
   if (!activePeer) return;
-  const [login] = splitUid(activePeer);
   $("endHint").textContent =
-    "Переписка с " + login + " будет удалена у вас и у собеседника. Отменить это действие нельзя.";
+    "Переписка с " + activePeer + " будет удалена у вас и у собеседника. Отменить это действие нельзя.";
   $("endModal").classList.add("open");
 }
 function closeEndModal(){ $("endModal").classList.remove("open"); }
@@ -1483,58 +1230,31 @@ function openAddModal(){
   $("addModal").classList.add("open");
   setTimeout(() => $("addInput").focus(), 40);
 }
-function closeAddModal(){ $("addModal").classList.remove("open"); setBusy($("addConfirm"), false); }
+function closeAddModal(){ $("addModal").classList.remove("open"); setBusy($("addConfirm"), false); pendingAdd = null; }
 
 function addContactFromInput(){
   const raw = $("addInput").value.trim().toLowerCase();
   const err = $("addErr");
   err.textContent = "";
-  if (!raw){ err.textContent = "Введите логин или адрес"; return; }
-  let uid = raw;
-  if (!uid.includes("@")){
-    if (!helloDomain){ err.textContent = "Неизвестен домен сервера"; return; }
-    uid = uid + "@" + helloDomain;
-  }
-  const [login, dom] = splitUid(uid);
-  if (!login || !dom){ err.textContent = "Неверный формат"; return; }
-  if (uid === me.uid){ err.textContent = "Это ваш собственный адрес"; return; }
-  if (contacts.find(c => c.uid === uid)){ err.textContent = "Уже добавлен"; return; }
+  if (!raw){ err.textContent = "Введите логин"; return; }
+  if (!/^[a-z0-9._-]{3,24}$/.test(raw)){ err.textContent = "Неверный формат логина"; return; }
+  if (raw === me.login){ err.textContent = "Это ваш собственный логин"; return; }
+  if (contacts.find(c => c.uid === raw)){ err.textContent = "Уже добавлен"; return; }
   if (!ws || ws.readyState !== 1){ err.textContent = "Нет соединения"; return; }
-
   setBusy($("addConfirm"), true);
-  pendingAddUid = uid;
-  ws.send(pack(T.CONTACT_REQ, {u: uid}));
+  pendingAdd = raw;
+  ws.send(pack(T.CONTACT_REQ, {u: raw}));
 }
 
-let pendingAddUid = null;
-// обрабатываем ответ отдельно
-const _origContactOk = onContactOk;
-onContactOk = async function(obj){
-  await _origContactOk(obj);
-  if (pendingAddUid && obj.u === pendingAddUid){
-    closeAddModal();
-    pendingAddUid = null;
-  }
-};
-
-/* ================= HEARTBEAT / STATUS SYNC ================= */
+/* ================= HEARTBEAT / RECONNECT ================= */
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
     if (ws && ws.readyState === 1) ws.send(pack(T.PING, {}));
-  }, 25000);
-}
-function startStatusSync(){
-  clearInterval(statusSyncTimer);
-  statusSyncTimer = setInterval(() => {
-    if (ws && ws.readyState === 1 && contacts.length){
-      ws.send(pack(T.SYNC, {}));
-    }
-  }, 15000);
+  }, 30000);
 }
 async function onDisconnect(){
   clearInterval(heartbeatTimer);
-  clearInterval(statusSyncTimer);
   if (!sessionPassword) return;
   if (reconnectAttempts >= 5){ alert("Соединение потеряно. Обновите страницу."); return; }
   reconnectAttempts++;
@@ -1543,18 +1263,17 @@ async function onDisconnect(){
     if (myPubRaw) authPayload.pub = myPubRaw;
     mode = "login";
     const ok = await connect();
-    me = {login: ok.login, uid: ok.uid};
+    me = {login: ok.login, uid: ok.login};
     contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
     renderContacts();
     startHeartbeat();
-    startStatusSync();
     reconnectAttempts = 0;
   } catch(e){
     setTimeout(onDisconnect, 800 * reconnectAttempts);
   }
 }
 
-/* ================= COPY UID ================= */
+/* ================= COPY ================= */
 async function copyToClipboard(text){
   try { await navigator.clipboard.writeText(text); return true; }
   catch(e){
@@ -1570,15 +1289,14 @@ async function copyToClipboard(text){
   }
 }
 async function copyMyUid(){
-  if (!me || !helloDomain) return;
-  const full = me.login + "@" + helloDomain;
-  if (await copyToClipboard(full)) toast("Скопировано: " + full);
-  else toast("Не удалось скопировать: " + full);
+  if (!me) return;
+  if (await copyToClipboard(me.login)) toast("Скопировано: " + me.login);
+  else toast("Не удалось скопировать");
 }
 async function copyPeerUid(){
   if (!activePeer) return;
   if (await copyToClipboard(activePeer)) toast("Скопировано: " + activePeer);
-  else toast("Не удалось скопировать: " + activePeer);
+  else toast("Не удалось скопировать");
 }
 
 /* ================= UI BIND ================= */
@@ -1629,7 +1347,8 @@ $("convPeer").onclick = copyPeerUid;
 
 $("endChatBtn").onclick = openEndModal;
 $("endCancel").onclick = closeEndModal;
-$("endConfirm").onclick = confirmEndChat;
+$("endConfirm").onclick = confirmChatEndBridge;
+function confirmChatEndBridge(){ confirmEndChat(); }
 $("endModal").addEventListener("click", e => {
   if (e.target === $("endModal")) closeEndModal();
 });
@@ -1668,13 +1387,9 @@ $("endModal").addEventListener("click", e => {
 
 # ============================ RUN ============================
 if __name__ == "__main__":
-    print(f"Server starting on http://0.0.0.0:{PORT}")
-    if PUBLIC_DOMAIN:
-        print(f"Public domain: {PUBLIC_DOMAIN}")
-    else:
-        print("DOMAIN not set — will use Host header from first request")
+    print(f"Server starting on http://{HOST}:{PORT}")
     try:
         import uvloop  # type: ignore
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning", loop="uvloop")
+        uvicorn.run(app, host=HOST, port=PORT, log_level="warning", loop="uvloop")
     except ImportError:
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
