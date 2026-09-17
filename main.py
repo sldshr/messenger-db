@@ -1,1582 +1,1780 @@
-# main.py
-# 🐢 Turtle Sniper — IDE-стиль мини-игра в духе Graphwar на черепашьих командах.
-# Запуск:  python main.py   →   http://127.0.0.1:8000
+```python
+import asyncio
+import json
+import secrets
+import string
+from datetime import datetime
+from typing import Dict, Set, Optional
 
-import math
-import random
-import re
-from collections import deque
-
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-app = FastAPI(title="Turtle Sniper")
 
-W, H = 900, 520  # размеры игрового поля (в пикселях)
+app = FastAPI(title="SldMeet")
 
-
-# ============================================================
-#                        ЛОГИКА ИГРЫ
-# ============================================================
-
-def point_hits_obstacle(px, py, o, padding=0.0):
-    """Точная проверка точки относительно скруглённого прямоугольника."""
-    x = o["x"] - padding
-    y = o["y"] - padding
-    w = o["w"] + padding * 2
-    h = o["h"] + padding * 2
-    radius = min(o.get("radius", 14) + padding, w / 2, h / 2)
-
-    cx = max(x + radius, min(px, x + w - radius))
-    cy = max(y + radius, min(py, y + h - radius))
-
-    # Центральные полосы
-    if x + radius <= px <= x + w - radius and y <= py <= y + h:
-        return True
-    if y + radius <= py <= y + h - radius and x <= px <= x + w:
-        return True
-
-    # Четыре круглых угла
-    for qx, qy in (
-        (x + radius, y + radius),
-        (x + w - radius, y + radius),
-        (x + radius, y + h - radius),
-        (x + w - radius, y + h - radius),
-    ):
-        if (px - qx) ** 2 + (py - qy) ** 2 <= radius ** 2:
-            return True
-    return False
-
-
-def has_path(obstacles, start, end, cell=12):
-    """BFS-проверка: существует ли маршрут через свободное пространство."""
-    cols = W // cell + 1
-    rows = H // cell + 1
-
-    def blocked(cx, cy):
-        x, y = cx * cell, cy * cell
-        return any(point_hits_obstacle(x, y, ob, 2) for ob in obstacles)
-
-    sx = max(0, min(cols - 1, int(start[0] / cell)))
-    sy = max(0, min(rows - 1, int(start[1] / cell)))
-    ex = max(0, min(cols - 1, int(end[0] / cell)))
-    ey = max(0, min(rows - 1, int(end[1] / cell)))
-
-    if blocked(sx, sy) or blocked(ex, ey):
-        return False
-
-    q = deque([(sx, sy)])
-    seen = {(sx, sy)}
-    while q:
-        x, y = q.popleft()
-        if (x, y) == (ex, ey):
-            return True
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < cols and 0 <= ny < rows and (nx, ny) not in seen and not blocked(nx, ny):
-                seen.add((nx, ny))
-                q.append((nx, ny))
-    return False
-
-
-class Room:
-    """Процедурный уровень: случайная стартовая точка, цель и набор стен."""
-
-    def __init__(self, rid: str, difficulty: int = 1):
-        self.id = rid
-        self.difficulty = max(1, difficulty)
-        self.player_start = {"x": 70.0, "y": float(H - 70), "angle": 0.0}
-        self.obstacles = []
-        self.enemy = {"x": W - 90, "y": 90, "r": 18}
-        self.seed = random.randrange(1, 2**31 - 1)
-        self.generate()
-
-    @staticmethod
-    def _rect(x, y, w, h, radius=None, kind="wall"):
-        radius = int(radius if radius is not None else min(18, w / 3, h / 3))
-        return {
-            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
-            "radius": max(6, radius), "kind": kind
-        }
-
-    def _random_obstacles(self, rng, start, end):
-        """
-        Генератор делает не просто кучку квадратов, а несколько секций.
-        В каждой секции есть большой барьер с проходом, плюс небольшие блоки.
-        Поэтому один прямой скрипт не подходит ко всем seed-ам.
-        """
-        obs = []
-        d = self.difficulty
-
-        # 2..5 крупных "ворот". Положение прохода случайное.
-        gates = min(2 + (d + 1) // 2, 5)
-        corridor_y = rng.randint(110, H - 110)
-
-        for i in range(gates):
-            x = 155 + i * ((W - 310) / max(1, gates - 1))
-            x += rng.randint(-28, 28)
-            x = int(max(105, min(W - 145, x)))
-
-            if rng.random() < 0.5:
-                gap_y = rng.randint(85, H - 145)
-                gap_h = rng.randint(75, max(80, 115 - d * 2))
-                top_h = gap_y - 12
-                bottom_y = gap_y + gap_h + 12
-                bottom_h = H - bottom_y - 12
-                if top_h >= 28:
-                    obs.append(self._rect(x, 18, rng.randint(24, 38), top_h, 14, "gate"))
-                if bottom_h >= 28:
-                    obs.append(self._rect(x, bottom_y, rng.randint(24, 38), bottom_h, 14, "gate"))
-            else:
-                gap_x = rng.randint(80, 170)
-                gap_w = rng.randint(75, max(80, 125 - d))
-                left_w = gap_x - 12
-                right_x = gap_x + gap_w + 12
-                right_w = W - right_x - 12
-                # horizontal gate
-                if left_w >= 28:
-                    obs.append(self._rect(12, corridor_y, left_w, rng.randint(24, 38), 14, "gate"))
-                if right_w >= 28:
-                    obs.append(self._rect(right_x, corridor_y, right_w, rng.randint(24, 38), 14, "gate"))
-                corridor_y = rng.randint(100, H - 100)
-
-        # Дополнительные скруглённые блоки и "островки".
-        extra = min(3 + d * 2, 15)
-        for _ in range(extra):
-            w = rng.randint(32, 72 + min(d * 5, 35))
-            h = rng.randint(30, 72 + min(d * 5, 35))
-            x = rng.randint(95, W - 95 - w)
-            y = rng.randint(28, H - 28 - h)
-            kind = rng.choice(("block", "block", "small"))
-            obs.append(self._rect(x, y, w, h, rng.randint(10, 20), kind))
-
-        # Убираем объекты, которые перекрывают старт/цель.
-        clean = []
-        for o in obs:
-            if point_hits_obstacle(start["x"], start["y"], o, 26):
-                continue
-            if point_hits_obstacle(end["x"], end["y"], o, end.get("r", 18) + 10):
-                continue
-            clean.append(o)
-
-        return clean
-
-    def _overlaps_any(self, obs, cx, cy, r):
-        return any(point_hits_obstacle(cx, cy, o, r) for o in obs)
-
-    def generate(self):
-        """Генерирует новый seed и принимает только действительно проходимую карту."""
-        rng = random.Random()
-        for _ in range(180):
-            # Старт и цель находятся в разных секторах и тоже рандомизируются.
-            start = {
-                "x": rng.randint(48, 125),
-                "y": rng.randint(48, H - 48),
-                "angle": rng.choice((0, 0, 15, -15, 180)),
-            }
-            end = {
-                "x": rng.randint(W - 135, W - 55),
-                "y": rng.randint(48, H - 48),
-                "r": 18,
-            }
-
-            obs = self._random_obstacles(rng, start, end)
-
-            if self._overlaps_any(obs, start["x"], start["y"], 24):
-                continue
-            if self._overlaps_any(obs, end["x"], end["y"], 26):
-                continue
-            if not has_path(obs, (start["x"], start["y"]), (end["x"], end["y"])):
-                continue
-
-            # Не принимаем слишком пустые карты.
-            if len(obs) < min(4, 2 + self.difficulty):
-                continue
-
-            self.seed = rng.randrange(1, 2**31 - 1)
-            self.player_start = start
-            self.enemy = end
-            self.obstacles = obs
-            return
-
-        # Безопасный fallback.
-        self.player_start = {"x": 60.0, "y": H - 60.0, "angle": 0.0}
-        self.enemy = {"x": W - 80.0, "y": 80.0, "r": 18}
-        self.obstacles = [
-            self._rect(250, 90, 32, 270, 14, "gate"),
-            self._rect(510, 160, 32, 270, 14, "gate"),
-            self._rect(340, 350, 90, 36, 16, "block"),
-        ]
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "difficulty": self.difficulty,
-            "seed": self.seed,
-            "player_start": self.player_start,
-            "obstacles": self.obstacles,
-            "enemy": self.enemy,
-        }
-
-
-# ---- Разбор команд черепашки ----
-ALIASES = {
-    "forward": "forward", "fd": "forward", "fwd": "forward", "f": "forward",
-    "backward": "backward", "back": "backward", "bk": "backward", "bwd": "backward", "b": "backward",
-    "right": "right", "rt": "right", "r": "right",
-    "left": "left", "lt": "left", "l": "left",
-    "вперёд": "forward", "вперед": "forward",
-    "назад": "backward",
-    "вправо": "right", "направо": "right",
-    "влево": "left", "налево": "left",
-}
-
-MAX_STEPS = 20000
-
-
-def parse_commands(text: str):
-    steps = []
-    if not text:
-        return steps
-    # убираем комментарии
-    lines = []
-    for ln in text.split("\n"):
-        ln = ln.split("#", 1)[0]
-        lines.append(ln)
-    text = "\n".join(lines)
-
-    for p in re.split(r"[\n,;]+", text):
-        p = p.strip()
-        if not p:
-            continue
-        m = re.match(r"^([A-Za-zА-Яа-яЁё]+)\s*\(?\s*(-?\d+(?:[.,]\d+)?)\s*\)?$", p)
-        if not m:
-            continue
-        name = m.group(1).lower()
-        num = float(m.group(2).replace(",", "."))
-        cmd = ALIASES.get(name, name)
-        if cmd in ("forward", "backward", "right", "left"):
-            steps.append((cmd, num))
-    return steps
-
-
-def simulate(room: Room, text: str):
-    x = room.player_start["x"]
-    y = room.player_start["y"]
-    angle = room.player_start["angle"]
-    path = [(x, y)]
-    steps = parse_commands(text)
-    total_moves = 0
-
-    def finish(status):
-        return {"path": path, "status": status, "steps": len(steps)}
-
-    for cmd, arg in steps:
-        if cmd == "right":
-            angle += arg
-        elif cmd == "left":
-            angle -= arg
-        elif cmd in ("forward", "backward"):
-            dist = arg if cmd == "forward" else -arg
-            if dist == 0:
-                continue
-            sign = 1 if dist > 0 else -1
-            length = abs(dist)
-            n = max(1, int(length / 2.0))
-            step = length / n
-            ux = math.cos(math.radians(angle)) * step * sign
-            uy = math.sin(math.radians(angle)) * step * sign
-            for _ in range(n):
-                total_moves += 1
-                if total_moves > MAX_STEPS:
-                    return finish("too_long")
-                x += ux
-                y += uy
-                path.append((x, y))
-
-                if x < 0 or x > W or y < 0 or y > H:
-                    return finish("out_of_bounds")
-
-                for o in room.obstacles:
-                    if point_hits_obstacle(x, y, o, 2):
-                        return finish("hit_obstacle")
-
-                dx = x - room.enemy["x"]
-                dy = y - room.enemy["y"]
-                if dx * dx + dy * dy <= room.enemy["r"] ** 2:
-                    return finish("success")
-
-    return finish("out_of_commands")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
-#                          API
+# DATA
 # ============================================================
 
-rooms: dict = {}
+rooms: Dict[str, dict] = {}
+connections: Dict[str, Set[WebSocket]] = {}
 
 
-class ShootRequest(BaseModel):
-    commands: str = ""
+def make_room_id(length: int = 8) -> str:
+    chars = string.ascii_letters + string.digits
+    while True:
+        room_id = "".join(secrets.choice(chars) for _ in range(length))
+        if room_id not in rooms:
+            return room_id
 
 
-def get_room(rid: str) -> Room:
-    if rid not in rooms:
-        try:
-            diff = max(1, int(rid))
-        except ValueError:
-            diff = 1
-        rooms[rid] = Room(rid, diff)
-    return rooms[rid]
+def clean_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        return "Гость"
+
+    return name[:32]
 
 
-@app.get("/api/room/{rid}")
-def api_get_room(rid: str):
-    return get_room(rid).to_dict()
-
-
-@app.post("/api/room/{rid}/shoot")
-def api_shoot(rid: str, req: ShootRequest):
-    r = get_room(rid)
-    return simulate(r, req.commands)
-
-
-@app.post("/api/room/{rid}/regen")
-def api_regen(rid: str):
-    r = get_room(rid)
-    r.generate()
-    return r.to_dict()
-
-
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return HTML_PAGE
+def now() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 
 # ============================================================
-#                      HTML / CSS / JS
+# HTML
 # ============================================================
 
-HTML_PAGE = r"""<!doctype html>
+HTML = r"""
+<!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Turtle Sniper</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SldMeet</title>
+
 <style>
-  :root {
-    --bg:        #0d1117;
-    --bg-2:      #010409;
-    --panel:     #161b22;
-    --panel-2:   #0d1117;
-    --panel-3:   #1c2128;
-    --border:    #21262d;
-    --border-2:  #30363d;
-    --text:      #c9d1d9;
-    --text-dim:  #8b949e;
-    --text-faint:#484f58;
-    --accent:    #58a6ff;
-    --accent-2:  #1f6feb;
-    --success:   #3fb950;
-    --success-2: #2ea043;
-    --danger:    #f85149;
-    --warn:      #d29922;
-    --code-cmd:  #ff7b72;
-    --code-num:  #79c0ff;
-    --code-cmt:  #6e7681;
-    --code-err:  #f85149;
-    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0; height: 100%;
-    background: var(--bg-2);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
-    font-size: 14px;
-    overflow: hidden;
-  }
-  button { font-family: inherit; }
+* {
+    box-sizing: border-box;
+}
 
-  .app { display: flex; flex-direction: column; height: 100vh; }
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #d6d6d6;
+    color: #111;
+}
 
-  /* ---------- Header ---------- */
-  .hdr {
-    height: 52px;
-    flex-shrink: 0;
+button,
+input,
+select,
+textarea {
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+button {
+    cursor: pointer;
+}
+
+.topbar {
+    height: 54px;
+    background: linear-gradient(#f7f7f7, #cfcfcf);
+    border-bottom: 1px solid #888;
+    box-shadow: 0 1px 2px #fff inset;
     display: flex;
     align-items: center;
-    gap: 16px;
-    padding: 0 16px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-  }
-  .brand {
-    display: flex; align-items: center; gap: 10px;
-    font-weight: 600; letter-spacing: -0.01em;
+    padding: 0 14px;
+}
+
+.logo {
+    font-size: 23px;
+    font-weight: bold;
+    color: #174c86;
+    text-shadow: 1px 1px white;
+}
+
+.logo span {
+    color: #333;
+}
+
+.top-right {
+    margin-left: auto;
+    font-size: 12px;
+    color: #555;
+}
+
+.page {
+    min-height: calc(100% - 54px);
+    padding: 25px;
+}
+
+.window {
+    max-width: 900px;
+    margin: auto;
+    background: #eee;
+    border: 1px solid #777;
+    box-shadow: 2px 2px 8px #777;
+}
+
+.titlebar {
+    background: linear-gradient(#447bb0, #1f4e7d);
+    color: white;
+    padding: 7px 10px;
+    font-weight: bold;
+    text-shadow: 1px 1px #234;
+}
+
+.content {
+    padding: 18px;
+}
+
+h2 {
+    margin-top: 0;
+    font-size: 20px;
+}
+
+h3 {
     font-size: 15px;
-  }
-  .brand svg { width: 22px; height: 22px; color: var(--accent); }
-  .brand .sub { color: var(--text-faint); font-weight: 400; font-size: 12px; margin-left: 6px; }
+    margin-bottom: 8px;
+}
 
-  .hdr-spacer { flex: 1; }
+.field {
+    margin-bottom: 13px;
+}
 
-  .room-chip {
-    display: flex; align-items: center; gap: 8px;
-    height: 32px; padding: 0 12px;
-    background: var(--panel-3);
-    border: 1px solid var(--border-2);
-    border-radius: 8px;
-    font-size: 13px;
-    color: var(--text-dim);
-  }
-  .room-chip svg { width: 14px; height: 14px; color: var(--text-faint); }
-  .room-chip b { color: var(--text); font-weight: 600; }
-  .room-chip .diff {
-    padding: 1px 7px;
-    border-radius: 999px;
-    background: rgba(88,166,255,0.14);
-    color: var(--accent);
-    font-size: 11px;
-    font-weight: 600;
-  }
+label {
+    display: block;
+    font-size: 12px;
+    font-weight: bold;
+    margin-bottom: 4px;
+}
 
-  /* ---------- Main grid ---------- */
-  .main {
+input[type=text],
+input[type=number],
+select,
+textarea {
+    width: 100%;
+    border: 1px solid #777;
+    background: white;
+    padding: 7px;
+    box-shadow: inset 1px 1px 2px #ccc;
+}
+
+textarea {
+    resize: vertical;
+}
+
+button {
+    border: 1px solid #666;
+    background: linear-gradient(#fff, #c9c9c9);
+    padding: 7px 13px;
+    color: #111;
+}
+
+button:hover {
+    background: linear-gradient(#fff, #ddd);
+}
+
+button:active {
+    background: #bbb;
+}
+
+.primary {
+    background: linear-gradient(#6199d0, #275f94);
+    color: white;
+    border-color: #234b70;
+    font-weight: bold;
+}
+
+.primary:hover {
+    background: linear-gradient(#76a9d9, #316da3);
+}
+
+.row {
+    display: flex;
+    gap: 15px;
+}
+
+.col {
     flex: 1;
-    min-height: 0;
-    display: grid;
-    grid-template-columns: minmax(360px, 1fr) minmax(440px, 620px);
-    gap: 12px;
+}
+
+.box {
+    border: 1px solid #999;
+    background: #ddd;
     padding: 12px;
-  }
+    margin-bottom: 15px;
+}
 
-  /* ---------- Left column: canvas + status ---------- */
-  .left { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; }
+.checkbox {
+    margin: 8px 0;
+    font-size: 13px;
+}
 
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 16px;
+.checkbox input {
+    vertical-align: middle;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.info {
+    background: #ffffd5;
+    border: 1px solid #aaa;
+    padding: 9px;
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+
+.error {
+    color: #a00000;
+    font-size: 12px;
+    margin-top: 8px;
+}
+
+.success {
+    color: #075f14;
+    font-size: 12px;
+    margin-top: 8px;
+}
+
+/* ROOM */
+
+.room {
+    width: 100%;
+    height: calc(100vh - 54px);
     display: flex;
     flex-direction: column;
-    min-height: 0;
-  }
-  .card-head {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-  }
-  .card-head svg { width: 13px; height: 13px; }
-  .card-head .dot { width: 8px; height: 8px; border-radius: 50%; }
+}
 
-  .canvas-card { flex: 1; min-height: 0; }
-  .canvas-body {
-    flex: 1; min-height: 0;
+.roombar {
+    height: 43px;
+    background: linear-gradient(#f5f5f5, #c7c7c7);
+    border-bottom: 1px solid #888;
+    display: flex;
+    align-items: center;
+    padding: 5px 8px;
+}
+
+.room-title {
+    font-weight: bold;
+    color: #174c86;
+}
+
+.room-link {
+    margin-left: 15px;
+    font-size: 11px;
+    color: #555;
+}
+
+.room-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+}
+
+.video-area {
+    flex: 1;
+    background: #242424;
     padding: 10px;
+    overflow: auto;
+}
+
+.videos {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 9px;
+}
+
+.video {
+    position: relative;
+    background: #111;
+    border: 1px solid #555;
+    min-height: 190px;
+    aspect-ratio: 16 / 10;
+}
+
+.video video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.video-name {
+    position: absolute;
+    bottom: 5px;
+    left: 5px;
+    background: rgba(0,0,0,.75);
+    color: white;
+    font-size: 12px;
+    padding: 3px 6px;
+}
+
+.no-video {
+    color: #aaa;
+    display: flex;
+    height: 100%;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+}
+
+.sidebar {
+    width: 280px;
+    background: #eee;
+    border-left: 1px solid #777;
+    display: flex;
+    flex-direction: column;
+}
+
+.tabs {
+    display: flex;
+    border-bottom: 1px solid #888;
+}
+
+.tab {
+    flex: 1;
+    padding: 7px;
+    border: 0;
+    border-right: 1px solid #aaa;
+    background: #ddd;
+    font-size: 12px;
+}
+
+.tab.active {
+    background: #f5f5f5;
+    font-weight: bold;
+}
+
+.tab-content {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+
+.chat {
+    padding: 8px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.messages {
+    flex: 1;
+    overflow-y: auto;
+    background: white;
+    border: 1px solid #999;
+    padding: 7px;
+}
+
+.msg {
+    margin-bottom: 7px;
+    font-size: 12px;
+}
+
+.msg .meta {
+    color: #777;
+    font-size: 10px;
+}
+
+.chat-input {
+    display: flex;
+    margin-top: 7px;
+}
+
+.chat-input input {
+    flex: 1;
+}
+
+.chat-input button {
+    margin-left: 4px;
+}
+
+.people {
+    padding: 10px;
+}
+
+.person {
+    padding: 7px;
+    background: white;
+    border: 1px solid #aaa;
+    margin-bottom: 5px;
+    font-size: 12px;
+}
+
+.controls {
+    height: 54px;
+    background: linear-gradient(#e9e9e9, #bdbdbd);
+    border-top: 1px solid #777;
     display: flex;
     align-items: center;
     justify-content: center;
-    background:
-      radial-gradient(1200px 400px at 50% -10%, rgba(88,166,255,0.05), transparent 70%),
-      var(--panel-2);
-    border-radius: 0 0 16px 16px;
-  }
-  canvas {
-    max-width: 100%;
-    max-height: 100%;
-    width: auto;
-    height: auto;
-    border-radius: 6px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-    display: block;
-  }
+    gap: 7px;
+}
 
-  .status-card { flex-shrink: 0; }
-  .status-body {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 14px;
-    min-height: 56px;
-  }
-  .status-icon {
-    width: 32px; height: 32px;
-    border-radius: 8px;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
-    background: var(--panel-3);
-    color: var(--text-dim);
-  }
-  .status-icon svg { width: 18px; height: 18px; }
-  .status-title { font-weight: 600; font-size: 14px; }
-  .status-sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
-  .status-body.ok   .status-icon { background: rgba(63,185,80,0.15); color: var(--success); }
-  .status-body.bad  .status-icon { background: rgba(248,81,73,0.15); color: var(--danger); }
-  .status-body.warn .status-icon { background: rgba(210,153,34,0.15); color: var(--warn); }
-  .status-body.info .status-icon { background: rgba(88,166,255,0.15); color: var(--accent); }
+.control {
+    min-width: 70px;
+}
 
-  /* ---------- Right column: IDE ---------- */
-  .ide {
-    display: flex;
-    flex-direction: column;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    min-height: 0;
-  }
-  .tabbar {
-    display: flex;
-    align-items: center;
-    background: var(--panel-2);
-    border-bottom: 1px solid var(--border);
-    height: 40px;
-    flex-shrink: 0;
-  }
-  .tabs { display: flex; height: 100%; }
-  .tab {
-    display: flex; align-items: center; gap: 8px;
-    padding: 0 14px;
-    font-size: 13px;
-    color: var(--text-dim);
-    border-right: 1px solid var(--border);
-    background: var(--panel);
-    position: relative;
-  }
-  .tab.active {
-    color: var(--text);
-    background: var(--panel);
-  }
-  .tab.active::after {
-    content: "";
-    position: absolute;
-    left: 0; right: 0; top: 0;
-    height: 2px;
-    background: var(--accent);
-  }
-  .tab svg { width: 14px; height: 14px; color: #ffa657; }
-  .tab .dot { color: var(--text-faint); margin-left: 6px; }
+.danger {
+    background: linear-gradient(#e99a9a, #bb5050);
+    color: white;
+    border-color: #873434;
+}
 
-  .actions {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding-right: 8px;
-  }
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    height: 28px; padding: 0 10px;
-    border-radius: 6px;
-    border: 1px solid var(--border-2);
-    background: var(--panel-3);
-    color: var(--text);
-    font-size: 12.5px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background .12s, border-color .12s, transform .06s;
-  }
-  .btn svg { width: 14px; height: 14px; }
-  .btn:hover { background: #262c36; border-color: #3d444d; }
-  .btn:active { transform: translateY(1px); }
-  .btn.primary {
-    background: var(--success-2);
-    border-color: var(--success-2);
-    color: #fff;
-  }
-  .btn.primary:hover { background: #2cbf51; border-color: #2cbf51; }
-  .btn.ghost { background: transparent; }
-  .btn.ghost:hover { background: var(--panel-3); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+@media(max-width: 750px) {
+    .room-body {
+        flex-direction: column;
+    }
 
-  /* ---------- Editor ---------- */
-  .editor-wrap {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    position: relative;
-    background: var(--panel);
-    overflow: hidden;
-  }
-  .gutter {
-    width: 52px;
-    flex-shrink: 0;
-    padding: 14px 8px 14px 0;
-    text-align: right;
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 21px;
-    color: var(--text-faint);
-    background: var(--panel-2);
-    border-right: 1px solid var(--border);
-    user-select: none;
-    overflow: hidden;
-    position: relative;
-  }
-  .gutter-inner { will-change: transform; }
-  .gutter-inner .ln { display: block; }
-  .gutter-inner .ln.cur { color: var(--text-dim); }
+    .sidebar {
+        width: 100%;
+        height: 230px;
+    }
 
-  .code-area {
-    flex: 1;
-    position: relative;
-    overflow: hidden;
-    min-width: 0;
-  }
-  .code-area pre.highlight,
-  .code-area textarea {
-    margin: 0;
-    border: 0;
-    outline: 0;
-    padding: 14px 16px;
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 21px;
-    tab-size: 4;
-    -moz-tab-size: 4;
-    white-space: pre;
-    word-wrap: normal;
-    overflow-wrap: normal;
-    letter-spacing: 0;
-  }
-  .code-area pre.highlight {
-    position: absolute;
-    inset: 0;
-    overflow: hidden;
-    pointer-events: none;
-    color: var(--text);
-    background: transparent;
-  }
-  .code-area pre.highlight code {
-    font: inherit;
-    display: block;
-    will-change: transform;
-  }
-  .code-area textarea {
-    position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
-    background: transparent;
-    color: transparent;
-    caret-color: var(--accent);
-    resize: none;
-    overflow: auto;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border-2) transparent;
-  }
-  .code-area textarea::selection { background: rgba(88,166,255,0.30); color: transparent; }
-  .code-area textarea::-webkit-scrollbar { width: 10px; height: 10px; }
-  .code-area textarea::-webkit-scrollbar-thumb {
-    background: var(--border-2); border-radius: 6px; border: 2px solid var(--panel);
-  }
-  .code-area textarea::-webkit-scrollbar-thumb:hover { background: #4a5260; }
+    .video-area {
+        min-height: 0;
+    }
 
-  /* Токены */
-  .tk-cmd { color: var(--code-cmd); }
-  .tk-num { color: var(--code-num); }
-  .tk-cmt { color: var(--code-cmt); font-style: italic; }
-  .tk-id  { color: #d2a8ff; }
+    .row {
+        flex-direction: column;
+        gap: 0;
+    }
 
-  /* ---------- Output ---------- */
-  .output {
-    flex-shrink: 0;
-    border-top: 1px solid var(--border);
-    background: var(--panel-2);
-    display: flex;
-    flex-direction: column;
-    height: 148px;
-  }
-  .output-head {
-    display: flex; align-items: center; gap: 8px;
-    height: 32px;
-    padding: 0 12px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    border-bottom: 1px solid var(--border);
-  }
-  .output-head .chip {
-    margin-left: auto;
-    padding: 2px 8px;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    border-radius: 4px;
-    background: var(--panel-3);
-    color: var(--text-dim);
-    text-transform: none;
-  }
-  .output-head .chip.ok { background: rgba(63,185,80,0.15); color: var(--success); }
-  .output-head .chip.bad { background: rgba(248,81,73,0.15); color: var(--danger); }
-  .output-head .chip.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
-  .output-body {
-    flex: 1;
-    min-height: 0;
-    padding: 10px 14px;
-    font-family: var(--mono);
-    font-size: 12.5px;
-    line-height: 1.55;
-    color: var(--text-dim);
-    overflow: auto;
-    white-space: pre-wrap;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border-2) transparent;
-  }
-  .output-body::-webkit-scrollbar { width: 8px; }
-  .output-body::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
-  .output-body b { color: var(--text); }
-  .output-body .k { color: var(--accent); }
-
-  /* Hint chips */
-  .hints {
-    display: flex; flex-wrap: wrap; gap: 6px;
-    padding: 8px 12px;
-    border-top: 1px solid var(--border);
-    background: var(--panel-2);
-  }
-  .hint {
-    font-family: var(--mono);
-    font-size: 11px;
-    padding: 3px 8px;
-    border-radius: 4px;
-    background: var(--panel-3);
-    color: var(--text-dim);
-    border: 1px solid var(--border);
-    cursor: pointer;
-    user-select: none;
-    transition: background .12s;
-  }
-  .hint:hover { background: #262c36; color: var(--text); }
-  .hint .k { color: var(--code-cmd); }
-
-  /* Toast */
-  .toast-wrap {
-    position: fixed;
-    bottom: 20px; right: 20px;
-    display: flex; flex-direction: column; gap: 8px;
-    z-index: 50;
-    pointer-events: none;
-  }
-  .toast {
-    background: var(--panel-3);
-    border: 1px solid var(--border-2);
-    border-radius: 8px;
-    padding: 10px 14px;
-    font-size: 13px;
-    color: var(--text);
-    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-    animation: slideIn .18s ease-out;
-  }
-  .toast.ok { border-color: var(--success-2); }
-  .toast.bad { border-color: var(--danger); }
-  @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
-
-  /* Confetti-less victory flash */
-  .flash {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    border-radius: 10px;
-    box-shadow: inset 0 0 0 2px transparent;
-    animation: flashRing .6s ease-out;
-  }
-  @keyframes flashRing {
-    0% { box-shadow: inset 0 0 0 2px rgba(63,185,80,0.9); }
-    100% { box-shadow: inset 0 0 0 2px rgba(63,185,80,0); }
-  }
-
-  @media (max-width: 980px) {
-    .main { grid-template-columns: 1fr; }
-    .ide { min-height: 520px; }
-  }
+    .page {
+        padding: 8px;
+    }
+}
 </style>
 </head>
+
 <body>
-<div class="app">
 
-  <!-- ============ HEADER ============ -->
-  <header class="hdr">
-    <div class="brand">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
-           stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3 L20 7.5 L20 16.5 L12 21 L4 16.5 L4 7.5 Z"/>
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M12 3 V9 M20 7.5 L15 10 M20 16.5 L15 14 M12 21 V15 M4 16.5 L9 14 M4 7.5 L9 10"/>
-      </svg>
-      <span>Turtle Sniper</span>
-      <span class="sub">Graphwar on turtle commands</span>
-    </div>
-
-    <div class="hdr-spacer"></div>
-
-    <div class="room-chip">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 21V7l9-4 9 4v14"/>
-        <path d="M9 21V12h6v9"/>
-      </svg>
-      <span>Комната <b id="roomNum">1</b></span>
-      <span class="diff" id="roomDiff">ур. 1</span>
-    </div>
-  </header>
-
-  <!-- ============ MAIN ============ -->
-  <div class="main">
-
-    <!-- ----- LEFT ----- -->
-    <section class="left">
-      <div class="card canvas-card">
-        <div class="card-head">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2"/>
-            <path d="M3 9h18 M9 21V9"/>
-          </svg>
-          Поле
-          <span style="margin-left:auto; font-weight:500; letter-spacing:0; text-transform:none; font-size:11px; color:var(--text-faint)">
-            <span style="color:var(--success)">●</span> старт
-            <span style="color:var(--danger); margin-left:8px">●</span> враг
-            <span style="color:#4b5872; margin-left:8px">●</span> стены
-          </span>
-        </div>
-        <div class="canvas-body" id="canvasBody">
-          <canvas id="cv" width="900" height="520"></canvas>
-        </div>
-      </div>
-
-      <div class="card status-card">
-        <div class="status-body info" id="statusBody">
-          <div class="status-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="9"/>
-              <path d="M12 8v4l3 2"/>
-            </svg>
-          </div>
-          <div>
-            <div class="status-title" id="statusTitle">Загрузка…</div>
-            <div class="status-sub" id="statusSub">Готовим комнату</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ----- RIGHT: IDE ----- -->
-    <section class="ide">
-      <div class="tabbar">
-        <div class="tabs">
-          <div class="tab active">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M9.4 2h5.2l.6 2.1 2 .8 1.9-1.1 3.7 3.7-1.1 1.9.8 2 2.1.6v5.2l-2.1.6-.8 2 1.1 1.9-3.7 3.7-1.9-1.1-2 .8-.6 2.1H9.4l-.6-2.1-2-.8-1.9 1.1L1.2 18.6l1.1-1.9-.8-2L-.6 14.1V8.9l2.1-.6.8-2L1.2 4.4 4.9.7l1.9 1.1 2-.8.6-2z"/>
-            </svg>
-            main.py
-            <span class="dot">●</span>
-          </div>
-        </div>
-        <div class="actions">
-          <button class="btn" id="regen" title="Сгенерировать новый уровень в этой комнате">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 4v6h-6"/>
-              <path d="M1 20v-6h6"/>
-              <path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10"/>
-              <path d="M20.5 15a9 9 0 0 1-14.9 3.4L1 14"/>
-            </svg>
-            Заново
-          </button>
-          <button class="btn" id="next" title="Следующая комната">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <path d="M5 12h14"/>
-              <path d="m12 5 7 7-7 7"/>
-            </svg>
-            Дальше
-          </button>
-          <button class="btn primary" id="run" title="Ctrl/Cmd + Enter">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M8 5v14l11-7z"/>
-            </svg>
-            Запустить
-          </button>
-        </div>
-      </div>
-
-      <div class="editor-wrap" id="editorWrap">
-        <div class="gutter"><div class="gutter-inner" id="gutterInner"></div></div>
-        <div class="code-area">
-          <pre class="highlight" aria-hidden="true"><code id="hl"></code></pre>
-          <textarea id="code" wrap="off" spellcheck="false" autocapitalize="off"
-                    autocomplete="off" autocorrect="off"></textarea>
-        </div>
-      </div>
-
-      <div class="hints">
-        <span class="hint" data-cmd="forward 100"><span class="k">forward</span> N</span>
-        <span class="hint" data-cmd="backward 50"><span class="k">backward</span> N</span>
-        <span class="hint" data-cmd="right 90"><span class="k">right</span> N</span>
-        <span class="hint" data-cmd="left 45"><span class="k">left</span> N</span>
-        <span class="hint" data-cmd="# комментарий"># комментарий</span>
-      </div>
-
-      <div class="output">
-        <div class="output-head">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-               stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px">
-            <path d="M4 17l6-6-6-6"/>
-            <path d="M12 19h8"/>
-          </svg>
-          Вывод
-          <span class="chip" id="outChip">—</span>
-        </div>
-        <div class="output-body" id="outBody">
-          Напиши команды в редакторе — превью появится автоматически.
-        </div>
-      </div>
-    </section>
-
-  </div>
+<div class="topbar">
+    <div class="logo">Sld<span>Meet</span></div>
+    <div class="top-right">Video conference system</div>
 </div>
 
-<div class="toast-wrap" id="toasts"></div>
+<div id="home" class="page">
+    <div class="window">
+
+        <div class="titlebar">
+            Новая конференция
+        </div>
+
+        <div class="content">
+
+            <h2>Создать комнату</h2>
+
+            <div class="info">
+                Создайте комнату и отправьте полученную ссылку участникам.
+            </div>
+
+            <div class="box">
+
+                <div class="field">
+                    <label>Название конференции</label>
+                    <input id="roomName" type="text"
+                           value="Новая конференция"
+                           maxlength="80">
+                </div>
+
+                <div class="row">
+
+                    <div class="col">
+                        <div class="field">
+                            <label>Максимум участников</label>
+                            <select id="maxUsers">
+                                <option value="2">2</option>
+                                <option value="5">5</option>
+                                <option value="10" selected>10</option>
+                                <option value="20">20</option>
+                                <option value="50">50</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="col">
+                        <div class="field">
+                            <label>Режим комнаты</label>
+                            <select id="roomMode">
+                                <option value="video" selected>Видео + звук</option>
+                                <option value="audio">Только звук</option>
+                                <option value="presentation">Презентация</option>
+                            </select>
+                        </div>
+                    </div>
+
+                </div>
+
+                <div class="field">
+                    <label>Пароль комнаты</label>
+                    <input id="password" type="text"
+                           placeholder="Оставьте пустым, если пароль не нужен"
+                           maxlength="50">
+                </div>
+
+                <div class="checkbox">
+                    <input id="allowChat" type="checkbox" checked>
+                    Разрешить общий чат
+                </div>
+
+                <div class="checkbox">
+                    <input id="allowGuests" type="checkbox" checked>
+                    Разрешить подключение по ссылке
+                </div>
+
+                <div class="checkbox">
+                    <input id="hostMute" type="checkbox">
+                    Участники входят с выключенным микрофоном
+                </div>
+
+                <div class="checkbox">
+                    <input id="hostVideo" type="checkbox">
+                    Участники входят с выключенной камерой
+                </div>
+
+                <div class="checkbox">
+                    <input id="waitingRoom" type="checkbox">
+                    Использовать комнату ожидания
+                </div>
+
+            </div>
+
+            <button class="primary" onclick="createRoom()">
+                Создать конференцию
+            </button>
+
+            <div id="createError" class="error"></div>
+
+            <hr>
+
+            <h2>Подключиться</h2>
+
+            <div class="field">
+                <label>Ссылка или ID комнаты</label>
+                <input id="joinRoom" type="text"
+                       placeholder="Например: Ab12Cd34">
+            </div>
+
+            <button onclick="showJoin()">Подключиться</button>
+
+        </div>
+    </div>
+</div>
+
+
+<div id="joinPage" class="page hidden">
+    <div class="window">
+
+        <div class="titlebar">
+            Подключение к конференции
+        </div>
+
+        <div class="content">
+
+            <h2>Введите имя</h2>
+
+            <div class="field">
+                <label>Ваш никнейм</label>
+                <input id="nickname" type="text"
+                       maxlength="32"
+                       placeholder="Например: Alex">
+            </div>
+
+            <div id="passwordBox" class="field hidden">
+                <label>Пароль комнаты</label>
+                <input id="joinPassword" type="password">
+            </div>
+
+            <button class="primary" onclick="joinRoom()">
+                Войти в конференцию
+            </button>
+
+            <button onclick="goHome()">
+                Назад
+            </button>
+
+            <div id="joinError" class="error"></div>
+
+        </div>
+    </div>
+</div>
+
+
+<div id="room" class="room hidden">
+
+    <div class="roombar">
+        <div id="roomTitle" class="room-title">
+            Конференция
+        </div>
+
+        <div id="roomLink" class="room-link"></div>
+    </div>
+
+    <div class="room-body">
+
+        <div class="video-area">
+            <div id="videos" class="videos"></div>
+        </div>
+
+        <div class="sidebar">
+
+            <div class="tabs">
+                <button id="chatTab"
+                        class="tab active"
+                        onclick="showTab('chat')">
+                    Чат
+                </button>
+
+                <button id="peopleTab"
+                        class="tab"
+                        onclick="showTab('people')">
+                    Участники
+                </button>
+            </div>
+
+            <div id="chatPanel" class="tab-content">
+                <div class="chat">
+
+                    <div id="messages" class="messages"></div>
+
+                    <div class="chat-input">
+                        <input id="chatInput"
+                               type="text"
+                               maxlength="500"
+                               placeholder="Сообщение...">
+
+                        <button onclick="sendChat()">
+                            Отправить
+                        </button>
+                    </div>
+
+                </div>
+            </div>
+
+            <div id="peoplePanel" class="tab-content hidden">
+                <div id="people" class="people"></div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <div class="controls">
+
+        <button id="micBtn"
+                class="control"
+                onclick="toggleMic()">
+            🎤 Микрофон
+        </button>
+
+        <button id="camBtn"
+                class="control"
+                onclick="toggleCamera()">
+            Камера
+        </button>
+
+        <button class="control"
+                onclick="copyRoomLink()">
+            Ссылка
+        </button>
+
+        <button class="control danger"
+                onclick="leaveRoom()">
+            Покинуть
+        </button>
+
+    </div>
+
+</div>
+
 
 <script>
-/* ============================================================
-   Состояние
-============================================================ */
-const state = {
-  roomId: '1',
-  room: null,
-  preview: null,   // результат последнего предпросмотра
-  run: null,       // { result, idx } — результат запуска + индекс анимации
-  rafId: null,
-  previewReq: 0,
-  previewTimer: null,
-  solvedRooms: new Set(),
-};
+let roomId = null;
+let nickname = null;
+let password = null;
+let ws = null;
 
-/* ============================================================
-   DOM
-============================================================ */
-const cv = document.getElementById('cv');
-const ctx = cv.getContext('2d');
+let localStream = null;
+let peers = {};
 
-// Совместимость: roundRect есть в современных браузерах, но игра не должна
-// ломаться из-за старого Chromium/WebView.
-if (!CanvasRenderingContext2D.prototype.roundRect) {
-  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
-    const radius = typeof r === 'number' ? r : 12;
-    const rr = Math.min(radius, Math.abs(w) / 2, Math.abs(h) / 2);
-    this.moveTo(x + rr, y);
-    this.lineTo(x + w - rr, y);
-    this.quadraticCurveTo(x + w, y, x + w, y + rr);
-    this.lineTo(x + w, y + h - rr);
-    this.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-    this.lineTo(x + rr, y + h);
-    this.quadraticCurveTo(x, y + h, x, y + h - rr);
-    this.lineTo(x, y + rr);
-    this.quadraticCurveTo(x, y, x + rr, y);
-    this.closePath();
-    return this;
-  };
+let micEnabled = true;
+let cameraEnabled = true;
+
+let roomSettings = {};
+let participants = {};
+
+
+function $(id) {
+    return document.getElementById(id);
 }
 
-const codeEl = document.getElementById('code');
-const hlEl = document.getElementById('hl');
-const gutterInner = document.getElementById('gutterInner');
 
-const statusBody = document.getElementById('statusBody');
-const statusTitle = document.getElementById('statusTitle');
-const statusSub = document.getElementById('statusSub');
-const statusIcon = statusBody.querySelector('.status-icon');
-
-const outBody = document.getElementById('outBody');
-const outChip = document.getElementById('outChip');
-const roomNumEl = document.getElementById('roomNum');
-const roomDiffEl = document.getElementById('roomDiff');
-const canvasBody = document.getElementById('canvasBody');
-
-/* ============================================================
-   SVG-иконки для статус-бара
-============================================================ */
-const ICONS = {
-  info: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-           stroke-linecap="round" stroke-linejoin="round">
-           <circle cx="12" cy="12" r="9"/><path d="M12 16v-4 M12 8h.01"/></svg>`,
-  ok:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
-           stroke-linecap="round" stroke-linejoin="round">
-           <path d="M20 6L9 17l-5-5"/></svg>`,
-  bad:  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
-           stroke-linecap="round" stroke-linejoin="round">
-           <circle cx="12" cy="12" r="9"/>
-           <path d="M15 9l-6 6 M9 9l6 6"/></svg>`,
-  warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-           stroke-linecap="round" stroke-linejoin="round">
-           <path d="M10.3 3.6 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/>
-           <path d="M12 9v4 M12 17h.01"/></svg>`,
-};
-
-/* ============================================================
-   Подсветка синтаксиса
-============================================================ */
-const CMD_SET = new Set([
-  'forward','backward','right','left','fd','bk','rt','lt','f','b','r','l','fwd','bwd',
-  'вперёд','вперед','назад','вправо','направо','влево','налево'
-]);
-
-function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function show(id) {
+    $(id).classList.remove("hidden");
 }
 
-function highlightCode(code) {
-  return code.split('\n').map(line => {
-    let out = '';
-    let i = 0;
-    while (i < line.length) {
-      const ch = line[i];
-      if (ch === '#') {
-        out += `<span class="tk-cmt">${escapeHtml(line.slice(i))}</span>`;
-        break;
-      }
-      if (/\s/.test(ch)) {
-        out += escapeHtml(ch); i++; continue;
-      }
-      const wm = line.slice(i).match(/^[A-Za-zА-Яа-яЁё]+/);
-      if (wm) {
-        const w = wm[0];
-        const low = w.toLowerCase();
-        if (CMD_SET.has(low)) out += `<span class="tk-cmd">${w}</span>`;
-        else out += `<span class="tk-id">${w}</span>`;
-        i += w.length; continue;
-      }
-      const nm = line.slice(i).match(/^-?\d+(?:[.,]\d+)?/);
-      if (nm) {
-        out += `<span class="tk-num">${nm[0]}</span>`;
-        i += nm[0].length; continue;
-      }
-      out += escapeHtml(ch); i++;
-    }
-    return out;
-  }).join('\n');
+
+function hide(id) {
+    $(id).classList.add("hidden");
 }
 
-function refreshEditor() {
-  const raw = codeEl.value;
-  hlEl.innerHTML = highlightCode(raw) + '\n';
 
-  // gutter
-  const lines = raw.split('\n').length;
-  const curLine = raw.slice(0, codeEl.selectionStart).split('\n').length;
-  let g = '';
-  for (let i = 1; i <= Math.max(lines, 1); i++) {
-    g += `<span class="ln${i === curLine ? ' cur' : ''}">${i}</span>`;
-  }
-  gutterInner.innerHTML = g;
-  syncScroll();
+function goHome() {
+    hide("joinPage");
+    hide("room");
+    show("home");
 }
 
-function syncScroll() {
-  const st = codeEl.scrollTop, sl = codeEl.scrollLeft;
-  hlEl.style.transform = `translate(${-sl}px, ${-st}px)`;
-  gutterInner.style.transform = `translateY(${-st}px)`;
-}
 
-codeEl.addEventListener('scroll', syncScroll, { passive: true });
-codeEl.addEventListener('input', () => {
-  refreshEditor();
-  schedulePreview();
-});
-codeEl.addEventListener('click', refreshEditor);
-codeEl.addEventListener('keyup', () => {
-  // обновляем "текущую" строку в гуттере
-  const raw = codeEl.value;
-  const curLine = raw.slice(0, codeEl.selectionStart).split('\n').length;
-  [...gutterInner.children].forEach((el, idx) => {
-    el.classList.toggle('cur', idx + 1 === curLine);
-  });
-});
-codeEl.addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-    e.preventDefault(); runShot(); return;
-  }
-  if (e.key === 'Tab') {
-    e.preventDefault();
-    const s = codeEl.selectionStart, en = codeEl.selectionEnd;
-    const v = codeEl.value;
-    codeEl.value = v.slice(0, s) + '    ' + v.slice(en);
-    codeEl.selectionStart = codeEl.selectionEnd = s + 4;
-    refreshEditor();
-    schedulePreview();
-  }
-});
+async function createRoom() {
 
-/* ============================================================
-   Комнаты
-============================================================ */
-async function loadRoom(id, silent) {
-  state.roomId = String(id);
-  const r = await fetch(`/api/room/${state.roomId}`);
-  state.room = await r.json();
-  state.preview = null;
-  stopAnim();
-  state.run = null;
-  roomNumEl.textContent = state.roomId;
-  roomDiffEl.textContent = `ур. ${state.room.difficulty}`;
-  setStatus('info', `Комната ${state.roomId}`, `Препятствий: ${state.room.obstacles.length}`);
-  logOut([
-    ['k', `# Комната ${state.roomId}`],
-    ['', `Сложность: ${state.room.difficulty}`],
-    ['', `Стены: ${state.room.obstacles.length}`],
-    ['', `Seed: ${state.room.seed}`],
-    ['', 'Карта случайная — придумай новый маршрут.'],
-  ]);
-  outChip.textContent = '—';
-  outChip.className = 'chip';
-  draw();
-  if (!silent) schedulePreview(0);
-}
-
-/* ============================================================
-   Запросы
-============================================================ */
-function schedulePreview(delay = 180) {
-  if (state.previewTimer) clearTimeout(state.previewTimer);
-  state.previewTimer = setTimeout(runPreview, delay);
-}
-
-async function runPreview() {
-  if (!state.room) return;
-  const myId = ++state.previewReq;
-  try {
-    const r = await fetch(`/api/room/${state.roomId}/shoot`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ commands: codeEl.value }),
-    });
-    const data = await r.json();
-    if (myId !== state.previewReq) return;
-    state.preview = data;
-    state.run = null;
-    stopAnim();
-    draw();
-  } catch (e) { /* тихо */ }
-}
-
-async function runShot() {
-  if (!state.room) return;
-  if (state.previewTimer) clearTimeout(state.previewTimer);
-  state.previewReq++; // отменяем старые превью
-  const r = await fetch(`/api/room/${state.roomId}/shoot`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ commands: codeEl.value }),
-  });
-  const data = await r.json();
-  state.preview = null;
-  state.run = { result: data, idx: 0 };
-
-  const M = {
-    success:         ['ok',   'Попадание',        'Враг поражён. Жми «Дальше»'],
-    hit_obstacle:    ['bad',  'Столкновение',     'Черепашка врезалась в стену'],
-    out_of_bounds:   ['warn', 'Вне поля',         'Черепашка покинула игровое поле'],
-    out_of_commands: ['info', 'Команды закончились', 'Цель не достигнута'],
-    too_long:        ['warn', 'Слишком долго',    'Слишком много шагов'],
-  };
-  const [cls, title, sub] = M[data.status] || ['info', 'Готово', ''];
-  setStatus(cls, title, sub);
-  updateChip(data.status);
-  logOut([
-    ['k', `$ run  (${data.status})`],
-    ['', `точек траектории: ${data.path.length}`],
-    ['', `команд: ${data.steps}`],
-  ]);
-
-  if (data.status === 'success') {
-    if (!state.solvedRooms.has(state.roomId)) {
-      state.solvedRooms.add(state.roomId);
-      toast(`Комната ${state.roomId} пройдена`, 'ok');
-    }
-    flashVictory();
-  }
-
-  startAnim();
-}
-
-function updateChip(status) {
-  const map = {
-    success: ['OK', 'ok'],
-    hit_obstacle: ['СТЕНА', 'bad'],
-    out_of_bounds: ['ГРАНИЦА', 'warn'],
-    out_of_commands: ['—', ''],
-    too_long: ['—', 'warn'],
-  };
-  const [txt, cls] = map[status] || ['—', ''];
-  outChip.textContent = txt;
-  outChip.className = 'chip ' + cls;
-}
-
-function logOut(rows) {
-  outBody.innerHTML = rows.map(([cls, txt]) =>
-    cls === 'k' ? `<b>${txt}</b>` : txt
-  ).join('\n');
-}
-
-function setStatus(cls, title, sub) {
-  statusBody.className = 'status-body ' + cls;
-  statusIcon.innerHTML = ICONS[cls] || ICONS.info;
-  statusTitle.textContent = title;
-  statusSub.textContent = sub;
-}
-
-/* ============================================================
-   Тост
-============================================================ */
-function toast(text, cls = '') {
-  const el = document.createElement('div');
-  el.className = 'toast ' + cls;
-  el.textContent = text;
-  document.getElementById('toasts').appendChild(el);
-  setTimeout(() => {
-    el.style.transition = 'opacity .3s, transform .3s';
-    el.style.opacity = '0';
-    el.style.transform = 'translateX(20px)';
-    setTimeout(() => el.remove(), 320);
-  }, 2200);
-}
-
-/* ============================================================
-   Анимация
-============================================================ */
-function stopAnim() {
-  if (state.rafId) cancelAnimationFrame(state.rafId);
-  state.rafId = null;
-}
-
-function startAnim() {
-  stopAnim();
-  state.run.idx = 0;
-  const path = state.run.result.path;
-  const total = path.length;
-  if (total <= 1) { draw(); return; }
-  const step = Math.max(1, Math.ceil(total / 130));
-  const tick = () => {
-    state.run.idx += step;
-    if (state.run.idx >= total - 1) {
-      state.run.idx = total - 1;
-      draw();
-      state.rafId = null;
-      return;
-    }
-    draw();
-    state.rafId = requestAnimationFrame(tick);
-  };
-  state.rafId = requestAnimationFrame(tick);
-}
-
-/* ============================================================
-   Отрисовка
-============================================================ */
-function draw() {
-  // фон
-  ctx.fillStyle = '#0b0f16';
-  ctx.fillRect(0, 0, cv.width, cv.height);
-
-  // тонкая сетка
-  ctx.strokeStyle = 'rgba(88,166,255,0.045)';
-  ctx.lineWidth = 1;
-  for (let x = 0; x <= cv.width; x += 30) {
-    ctx.beginPath(); ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, cv.height); ctx.stroke();
-  }
-  for (let y = 0; y <= cv.height; y += 30) {
-    ctx.beginPath(); ctx.moveTo(0, y + .5); ctx.lineTo(cv.width, y + .5); ctx.stroke();
-  }
-  // крупная сетка
-  ctx.strokeStyle = 'rgba(88,166,255,0.10)';
-  for (let x = 0; x <= cv.width; x += 150) {
-    ctx.beginPath(); ctx.moveTo(x + .5, 0); ctx.lineTo(x + .5, cv.height); ctx.stroke();
-  }
-  for (let y = 0; y <= cv.height; y += 150) {
-    ctx.beginPath(); ctx.moveTo(0, y + .5); ctx.lineTo(cv.width, y + .5); ctx.stroke();
-  }
-
-  if (!state.room) return;
-
-  // стены
-  for (const o of state.room.obstacles) {
-    const g = ctx.createLinearGradient(o.x, o.y, o.x, o.y + o.h);
-    g.addColorStop(0, '#2c3446');
-    g.addColorStop(1, '#1e2532');
-    const rr = Math.min(o.radius || 14, o.w / 2, o.h / 2);
-    ctx.beginPath();
-    ctx.roundRect(o.x, o.y, o.w, o.h, rr);
-    ctx.fillStyle = g;
-    ctx.fill();
-    ctx.strokeStyle = o.kind === 'gate'
-      ? 'rgba(130,155,205,0.46)'
-      : 'rgba(120,140,180,0.34)';
-    ctx.lineWidth = o.kind === 'gate' ? 1.4 : 1;
-    ctx.stroke();
-
-    // Мягкая внутренняя подсветка для "нормальных" объёмных стен.
-    ctx.beginPath();
-    ctx.roundRect(o.x + 2, o.y + 2, Math.max(0, o.w - 4), Math.max(0, o.h - 4),
-                  Math.max(4, rr - 2));
-    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-  }
-
-  const isRun = !!state.run;
-  const result = isRun ? state.run.result : state.preview;
-
-  // призрак полного пути при запуске
-  if (isRun) {
-    const path = result.path;
-    ctx.beginPath();
-    ctx.moveTo(path[0][0], path[0][1]);
-    for (let i = 1; i < path.length; i++) ctx.lineTo(path[i][0], path[i][1]);
-    ctx.strokeStyle = 'rgba(88,166,255,0.10)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([]);
-    ctx.stroke();
-  }
-
-  // путь
-  if (result && result.path && result.path.length > 1) {
-    const status = result.status;
-    const palette = {
-      success:         ['rgba(63,185,80,0.95)',   '#3fb950'],
-      hit_obstacle:    ['rgba(248,81,73,0.95)',   '#f85149'],
-      out_of_bounds:   ['rgba(210,153,34,0.95)',  '#d29922'],
-      out_of_commands: ['rgba(88,166,255,0.65)',  '#58a6ff'],
-      too_long:        ['rgba(210,153,34,0.95)',  '#d29922'],
+    const data = {
+        name: $("roomName").value,
+        max_users: Number($("maxUsers").value),
+        mode: $("roomMode").value,
+        password: $("password").value,
+        allow_chat: $("allowChat").checked,
+        allow_guests: $("allowGuests").checked,
+        host_mute: $("hostMute").checked,
+        host_video: $("hostVideo").checked,
+        waiting_room: $("waitingRoom").checked
     };
-    const [lineColor, headColor] = palette[status] || palette.out_of_commands;
-    const path = result.path;
-    const end = isRun ? Math.min(state.run.idx, path.length - 1) : path.length - 1;
 
-    // превью — пунктир, run — сплошная
-    ctx.beginPath();
-    ctx.moveTo(path[0][0], path[0][1]);
-    for (let i = 1; i <= end; i++) ctx.lineTo(path[i][0], path[i][1]);
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = isRun ? 2.6 : 1.8;
-    ctx.setLineDash(isRun ? [] : [6, 6]);
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.stroke();
-    ctx.setLineDash([]);
+    const response = await fetch("/api/create", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(data)
+    });
 
-    // голова
-    if (isRun && end > 0) {
-      const [hx, hy] = path[end];
-      ctx.beginPath();
-      ctx.arc(hx, hy, 7, 0, Math.PI * 2);
-      ctx.fillStyle = headColor;
-      ctx.shadowColor = headColor;
-      ctx.shadowBlur = 14;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+    const result = await response.json();
+
+    if (!response.ok) {
+        $("createError").textContent =
+            result.detail || "Ошибка создания комнаты";
+        return;
     }
-  }
 
-  // враг — мишень
-  drawEnemy(state.room.enemy);
+    roomId = result.room_id;
 
-  // старт (черепашка)
-  drawTurtle(state.room.player_start);
+    $("joinRoom").value =
+        location.origin + "/?room=" + roomId;
+
+    showJoin();
 }
 
-function drawEnemy(e) {
-  // внешнее свечение
-  const grd = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, e.r * 2.2);
-  grd.addColorStop(0, 'rgba(248,81,73,0.35)');
-  grd.addColorStop(1, 'rgba(248,81,73,0)');
-  ctx.fillStyle = grd;
-  ctx.beginPath();
-  ctx.arc(e.x, e.y, e.r * 2.2, 0, Math.PI * 2);
-  ctx.fill();
 
-  // тело
-  ctx.beginPath();
-  ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
-  ctx.fillStyle = '#8a1c26';
-  ctx.fill();
-  ctx.strokeStyle = '#f85149';
-  ctx.lineWidth = 2;
-  ctx.stroke();
+function showJoin() {
 
-  // мишень
-  ctx.beginPath();
-  ctx.arc(e.x, e.y, e.r * 0.68, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(255,180,180,0.65)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
+    const value = $("joinRoom").value.trim();
 
-  ctx.beginPath();
-  ctx.arc(e.x, e.y, e.r * 0.35, 0, Math.PI * 2);
-  ctx.fillStyle = '#ff9aa4';
-  ctx.fill();
+    if (!value) {
+        $("joinError").textContent = "Введите ID или ссылку комнаты";
+        return;
+    }
 
-  ctx.beginPath();
-  ctx.arc(e.x, e.y, 2.4, 0, Math.PI * 2);
-  ctx.fillStyle = '#2b0609';
-  ctx.fill();
+    let id = value;
 
-  // "перекрестие" по краям
-  ctx.strokeStyle = 'rgba(248,81,73,0.5)';
-  ctx.lineWidth = 1.2;
-  const t = e.r + 6, L = 6;
-  ctx.beginPath();
-  ctx.moveTo(e.x, e.y - t); ctx.lineTo(e.x, e.y - t - L);
-  ctx.moveTo(e.x, e.y + t); ctx.lineTo(e.x, e.y + t + L);
-  ctx.moveTo(e.x - t, e.y); ctx.lineTo(e.x - t - L, e.y);
-  ctx.moveTo(e.x + t, e.y); ctx.lineTo(e.x + t + L, e.y);
-  ctx.stroke();
+    try {
+        const url = new URL(value);
+        const fromUrl = url.searchParams.get("room");
+
+        if (fromUrl) {
+            id = fromUrl;
+        }
+    } catch (_) {}
+
+    roomId = id;
+
+    hide("home");
+    show("joinPage");
+
+    $("nickname").focus();
+
+    checkRoom();
 }
 
-function drawTurtle(p) {
-  const r = 12;
-  const ang = p.angle * Math.PI / 180;
-  const ax = Math.cos(ang), ay = Math.sin(ang);
 
-  // свечение
-  const grd = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 2.4);
-  grd.addColorStop(0, 'rgba(63,185,80,0.30)');
-  grd.addColorStop(1, 'rgba(63,185,80,0)');
-  ctx.fillStyle = grd;
-  ctx.beginPath();
-  ctx.arc(p.x, p.y, r * 2.4, 0, Math.PI * 2);
-  ctx.fill();
+async function checkRoom() {
 
-  // направление
-  ctx.beginPath();
-  ctx.moveTo(p.x + ax * (r + 4), p.y + ay * (r + 4));
-  ctx.lineTo(p.x + ax * (r + 26), p.y + ay * (r + 26));
-  ctx.strokeStyle = 'rgba(166,255,185,0.75)';
-  ctx.lineWidth = 2;
-  ctx.lineCap = 'round';
-  ctx.stroke();
+    const response = await fetch(
+        "/api/room/" + encodeURIComponent(roomId)
+    );
 
-  // стрелка на конце
-  const tipX = p.x + ax * (r + 26);
-  const tipY = p.y + ay * (r + 26);
-  const perpX = -ay, perpY = ax;
-  ctx.beginPath();
-  ctx.moveTo(tipX, tipY);
-  ctx.lineTo(tipX - ax * 7 + perpX * 4, tipY - ay * 7 + perpY * 4);
-  ctx.lineTo(tipX - ax * 7 - perpX * 4, tipY - ay * 7 - perpY * 4);
-  ctx.closePath();
-  ctx.fillStyle = 'rgba(166,255,185,0.85)';
-  ctx.fill();
+    const result = await response.json();
 
-  // панцирь (шестиугольник)
-  ctx.beginPath();
-  for (let i = 0; i < 6; i++) {
-    const a = ang + i * Math.PI / 3;
-    const x = p.x + Math.cos(a) * r;
-    const y = p.y + Math.sin(a) * r;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.closePath();
-  const shell = ctx.createLinearGradient(p.x, p.y - r, p.x, p.y + r);
-  shell.addColorStop(0, '#4ddf7c');
-  shell.addColorStop(1, '#1f7c3f');
-  ctx.fillStyle = shell;
-  ctx.fill();
-  ctx.strokeStyle = '#a6ffb9';
-  ctx.lineWidth = 1.8;
-  ctx.stroke();
+    if (!response.ok) {
+        $("joinError").textContent =
+            result.detail || "Комната не найдена";
+        return;
+    }
 
-  // центр
-  ctx.beginPath();
-  ctx.arc(p.x, p.y, 3.2, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(10,30,15,0.75)';
-  ctx.fill();
+    roomSettings = result;
+
+    if (result.password_required) {
+        show("passwordBox");
+    } else {
+        hide("passwordBox");
+    }
 }
 
-/* ============================================================
-   Победа — вспышка на канвасе
-============================================================ */
-function flashVictory() {
-  const el = document.createElement('div');
-  el.className = 'flash';
-  canvasBody.style.position = 'relative';
-  canvasBody.appendChild(el);
-  setTimeout(() => el.remove(), 700);
+
+async function joinRoom() {
+
+    nickname = $("nickname").value.trim();
+
+    if (!nickname) {
+        $("joinError").textContent =
+            "Введите никнейм";
+        return;
+    }
+
+    password = $("joinPassword").value;
+
+    const response = await fetch("/api/join", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            room_id: roomId,
+            nickname: nickname,
+            password: password
+        })
+    });
+
+    const result = await response.json();
+
+    if (!response.ok) {
+        $("joinError").textContent =
+            result.detail || "Не удалось войти";
+        return;
+    }
+
+    roomSettings = result.room;
+
+    startRoom();
 }
 
-/* ============================================================
-   Кнопки
-============================================================ */
-document.getElementById('run').onclick   = runShot;
-document.getElementById('regen').onclick = async () => {
-  const r = await fetch(`/api/room/${state.roomId}/regen`, { method: 'POST' });
-  state.room = await r.json();
-  state.preview = null;
-  state.run = null;
-  stopAnim();
-  setStatus('info', `Комната ${state.roomId} пересоздана`, `Препятствий: ${state.room.obstacles.length}`);
-  logOut([['k', '# Уровень пересоздан'], ['', `Стен: ${state.room.obstacles.length}`], ['', `Seed: ${state.room.seed}`]]);
-  outChip.textContent = '—';
-  outChip.className = 'chip';
-  draw();
-  schedulePreview(0);
-};
-document.getElementById('next').onclick = () => {
-  loadRoom(String(parseInt(state.roomId, 10) + 1));
-};
 
-/* чипы-подсказки вставляют команду */
-document.querySelectorAll('.hint').forEach(el => {
-  el.addEventListener('click', () => {
-    const cmd = el.getAttribute('data-cmd');
-    const v = codeEl.value;
-    const sep = v.endsWith('\n') || v.length === 0 ? '' : '\n';
-    codeEl.value = v + sep + cmd + '\n';
-    codeEl.focus();
-    codeEl.selectionStart = codeEl.selectionEnd = codeEl.value.length;
-    refreshEditor();
-    schedulePreview(0);
-  });
-});
+async function startRoom() {
 
-/* ============================================================
-   Bootstrap
-============================================================ */
-const DEFAULT_CODE = `# Уровень генерируется случайно.
-# Построй свой маршрут до красной цели.
-forward 100
-right 90
-forward 100`;
+    hide("home");
+    hide("joinPage");
+    show("room");
 
-codeEl.value = DEFAULT_CODE;
-refreshEditor();
+    $("roomTitle").textContent =
+        roomSettings.name || "Конференция";
 
-loadRoom('1').then(() => {
-  // первичное превью
-  schedulePreview(50);
-});
+    $("roomLink").textContent =
+        location.origin + "/?room=" + roomId;
 
-// слегка перерисовываем canvas при ресайзе окна (для чёткости)
-window.addEventListener('resize', () => { /* canvas масштабируется через CSS */ });
+    if (!roomSettings.allow_chat) {
+        hide("chatTab");
+        hide("chatPanel");
+        showTab("people");
+    }
+
+    micEnabled = !roomSettings.host_mute;
+    cameraEnabled = !roomSettings.host_video;
+
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: roomSettings.mode !== "audio"
+        });
+
+        localStream.getAudioTracks().forEach(
+            track => track.enabled = micEnabled
+        );
+
+        localStream.getVideoTracks().forEach(
+            track => track.enabled = cameraEnabled
+        );
+
+    } catch (e) {
+        console.log("Media error:", e);
+        localStream = new MediaStream();
+    }
+
+    addLocalVideo();
+
+    connectWebSocket();
+}
+
+
+function addLocalVideo() {
+
+    const div = document.createElement("div");
+    div.className = "video";
+    div.id = "localVideo";
+
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+
+    if (localStream) {
+        video.srcObject = localStream;
+    }
+
+    const name = document.createElement("div");
+    name.className = "video-name";
+    name.textContent = nickname + " (Вы)";
+
+    div.appendChild(video);
+    div.appendChild(name);
+
+    $("videos").appendChild(div);
+}
+
+
+function connectWebSocket() {
+
+    const protocol =
+        location.protocol === "https:" ? "wss:" : "ws:";
+
+    ws = new WebSocket(
+        protocol + "//" +
+        location.host +
+        "/ws/" +
+        encodeURIComponent(roomId)
+    );
+
+    ws.onopen = () => {
+
+        ws.send(JSON.stringify({
+            type: "join",
+            nickname: nickname,
+            password: password
+        }));
+
+    };
+
+    ws.onmessage = async event => {
+
+        const data = JSON.parse(event.data);
+
+        if (data.type === "room_state") {
+
+            participants = data.participants || {};
+            updatePeople();
+
+            for (const id of Object.keys(participants)) {
+
+                if (id !== data.client_id) {
+                    await createOffer(id);
+                }
+            }
+
+        } else if (data.type === "user_joined") {
+
+            participants[data.client_id] =
+                data.nickname;
+
+            updatePeople();
+
+        } else if (data.type === "user_left") {
+
+            delete participants[data.client_id];
+
+            removePeer(data.client_id);
+            updatePeople();
+
+        } else if (data.type === "chat") {
+
+            addMessage(
+                data.nickname,
+                data.message,
+                data.time
+            );
+
+        } else if (data.type === "offer") {
+
+            await receiveOffer(
+                data.client_id,
+                data.offer
+            );
+
+        } else if (data.type === "answer") {
+
+            const peer = peers[data.client_id];
+
+            if (peer) {
+                await peer.setRemoteDescription(
+                    new RTCSessionDescription(data.answer)
+                );
+            }
+
+        } else if (data.type === "candidate") {
+
+            const peer = peers[data.client_id];
+
+            if (peer && data.candidate) {
+
+                try {
+                    await peer.addIceCandidate(
+                        new RTCIceCandidate(data.candidate)
+                    );
+                } catch (e) {
+                    console.log(e);
+                }
+            }
+        }
+    };
+
+    ws.onclose = () => {
+        console.log("WebSocket closed");
+    };
+}
+
+
+function createPeer(clientId) {
+
+    if (peers[clientId]) {
+        return peers[clientId];
+    }
+
+    const peer = new RTCPeerConnection({
+        iceServers: []
+    });
+
+    peers[clientId] = peer;
+
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            peer.addTrack(track, localStream);
+        });
+    }
+
+    peer.onicecandidate = event => {
+
+        if (event.candidate && ws) {
+
+            ws.send(JSON.stringify({
+                type: "candidate",
+                target: clientId,
+                candidate: event.candidate
+            }));
+        }
+    };
+
+    peer.ontrack = event => {
+
+        addRemoteVideo(
+            clientId,
+            event.streams[0]
+        );
+    };
+
+    return peer;
+}
+
+
+async function createOffer(clientId) {
+
+    if (clientId === window.clientId) {
+        return;
+    }
+
+    const peer = createPeer(clientId);
+
+    try {
+
+        const offer = await peer.createOffer();
+
+        await peer.setLocalDescription(offer);
+
+        ws.send(JSON.stringify({
+            type: "offer",
+            target: clientId,
+            offer: offer
+        }));
+
+    } catch (e) {
+        console.log("Offer error:", e);
+    }
+}
+
+
+async function receiveOffer(clientId, offer) {
+
+    const peer = createPeer(clientId);
+
+    try {
+
+        await peer.setRemoteDescription(
+            new RTCSessionDescription(offer)
+        );
+
+        const answer = await peer.createAnswer();
+
+        await peer.setLocalDescription(answer);
+
+        ws.send(JSON.stringify({
+            type: "answer",
+            target: clientId,
+            answer: answer
+        }));
+
+    } catch (e) {
+        console.log("Answer error:", e);
+    }
+}
+
+
+function addRemoteVideo(clientId, stream) {
+
+    let div = $("video-" + clientId);
+
+    if (!div) {
+
+        div = document.createElement("div");
+        div.className = "video";
+        div.id = "video-" + clientId;
+
+        const video = document.createElement("video");
+        video.autoplay = true;
+        video.playsInline = true;
+        video.srcObject = stream;
+
+        const name = document.createElement("div");
+        name.className = "video-name";
+        name.textContent =
+            participants[clientId] || "Участник";
+
+        div.appendChild(video);
+        div.appendChild(name);
+
+        $("videos").appendChild(div);
+
+    } else {
+
+        const video = div.querySelector("video");
+        video.srcObject = stream;
+    }
+}
+
+
+function removePeer(clientId) {
+
+    if (peers[clientId]) {
+
+        peers[clientId].close();
+
+        delete peers[clientId];
+    }
+
+    const video = $("video-" + clientId);
+
+    if (video) {
+        video.remove();
+    }
+}
+
+
+function updatePeople() {
+
+    $("people").innerHTML = "";
+
+    const local = document.createElement("div");
+    local.className = "person";
+    local.textContent = nickname + " (Вы)";
+
+    $("people").appendChild(local);
+
+    for (const id in participants) {
+
+        const div = document.createElement("div");
+        div.className = "person";
+        div.textContent = participants[id];
+
+        $("people").appendChild(div);
+    }
+}
+
+
+function addMessage(name, message, time) {
+
+    const div = document.createElement("div");
+    div.className = "msg";
+
+    div.innerHTML =
+        "<b>" +
+        escapeHtml(name) +
+        "</b> " +
+        "<span class='meta'>" +
+        escapeHtml(time) +
+        "</span><br>" +
+        escapeHtml(message);
+
+    $("messages").appendChild(div);
+
+    $("messages").scrollTop =
+        $("messages").scrollHeight;
+}
+
+
+function escapeHtml(text) {
+
+    return String(text)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+function sendChat() {
+
+    const input = $("chatInput");
+    const message = input.value.trim();
+
+    if (!message || !ws) {
+        return;
+    }
+
+    ws.send(JSON.stringify({
+        type: "chat",
+        message: message
+    }));
+
+    input.value = "";
+}
+
+
+$("chatInput").addEventListener(
+    "keydown",
+    event => {
+
+        if (event.key === "Enter") {
+            sendChat();
+        }
+    }
+);
+
+
+function toggleMic() {
+
+    if (!localStream) {
+        return;
+    }
+
+    micEnabled = !micEnabled;
+
+    localStream.getAudioTracks().forEach(
+        track => track.enabled = micEnabled
+    );
+
+    $("micBtn").textContent =
+        micEnabled ? "🎤 Микрофон" : "🔇 Микрофон";
+}
+
+
+function toggleCamera() {
+
+    if (!localStream) {
+        return;
+    }
+
+    cameraEnabled = !cameraEnabled;
+
+    localStream.getVideoTracks().forEach(
+        track => track.enabled = cameraEnabled
+    );
+
+    $("camBtn").textContent =
+        cameraEnabled ? "Камера" : "Камера выкл.";
+}
+
+
+function copyRoomLink() {
+
+    const link =
+        location.origin + "/?room=" + roomId;
+
+    navigator.clipboard.writeText(link);
+
+    alert("Ссылка скопирована:\n" + link);
+}
+
+
+function leaveRoom() {
+
+    if (ws) {
+        ws.close();
+    }
+
+    for (const id in peers) {
+        peers[id].close();
+    }
+
+    peers = {};
+
+    if (localStream) {
+
+        localStream.getTracks().forEach(
+            track => track.stop()
+        );
+    }
+
+    $("videos").innerHTML = "";
+    $("messages").innerHTML = "";
+
+    goHome();
+}
+
+
+function showTab(tab) {
+
+    if (tab === "chat") {
+
+        show("chatPanel");
+        hide("peoplePanel");
+
+        $("chatTab").classList.add("active");
+        $("peopleTab").classList.remove("active");
+
+    } else {
+
+        hide("chatPanel");
+        show("peoplePanel");
+
+        $("chatTab").classList.remove("active");
+        $("peopleTab").classList.add("active");
+    }
+}
+
+
+async function autoJoinFromUrl() {
+
+    const params =
+        new URLSearchParams(location.search);
+
+    const id = params.get("room");
+
+    if (id) {
+
+        $("joinRoom").value =
+            location.href;
+
+        roomId = id;
+
+        showJoin();
+    }
+}
+
+
+autoJoinFromUrl();
+
 </script>
+
 </body>
 </html>
 """
 
 
 # ============================================================
-#                          ЗАПУСК
+# API
+# ============================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML
+
+
+@app.post("/api/create")
+async def create_room(data: dict):
+
+    name = str(data.get("name", "Новая конференция")).strip()
+
+    if not name:
+        name = "Новая конференция"
+
+    max_users = int(data.get("max_users", 10))
+
+    max_users = max(2, min(max_users, 50))
+
+    room_id = make_room_id()
+
+    rooms[room_id] = {
+        "name": name[:80],
+        "max_users": max_users,
+        "mode": data.get("mode", "video"),
+        "password": data.get("password", ""),
+        "allow_chat": bool(data.get("allow_chat", True)),
+        "allow_guests": bool(data.get("allow_guests", True)),
+        "host_mute": bool(data.get("host_mute", False)),
+        "host_video": bool(data.get("host_video", False)),
+        "waiting_room": bool(data.get("waiting_room", False)),
+        "created": datetime.now().isoformat()
+    }
+
+    connections[room_id] = set()
+
+    return {
+        "room_id": room_id,
+        "url": "/?room=" + room_id
+    }
+
+
+@app.get("/api/room/{room_id}")
+async def room_info(room_id: str):
+
+    room = rooms.get(room_id)
+
+    if not room:
+        raise HTTPException(
+            status_code=404,
+            detail="Комната не найдена"
+        )
+
+    return {
+        "name": room["name"],
+        "max_users": room["max_users"],
+        "mode": room["mode"],
+        "allow_chat": room["allow_chat"],
+        "allow_guests": room["allow_guests"],
+        "password_required": bool(room["password"]),
+        "waiting_room": room["waiting_room"]
+    }
+
+
+@app.post("/api/join")
+async def check_join(data: dict):
+
+    room_id = str(data.get("room_id", ""))
+    password = str(data.get("password", ""))
+
+    room = rooms.get(room_id)
+
+    if not room:
+        raise HTTPException(
+            status_code=404,
+            detail="Комната не найдена"
+        )
+
+    if room["password"] and password != room["password"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Неверный пароль"
+        )
+
+    if len(connections.get(room_id, set())) >= room["max_users"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Комната заполнена"
+        )
+
+    return {
+        "room": {
+            "name": room["name"],
+            "max_users": room["max_users"],
+            "mode": room["mode"],
+            "allow_chat": room["allow_chat"],
+            "allow_guests": room["allow_guests"],
+            "host_mute": room["host_mute"],
+            "host_video": room["host_video"],
+            "waiting_room": room["waiting_room"]
+        }
+    }
+
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
+async def send_to(
+    room_id: str,
+    target: WebSocket,
+    data: dict
+):
+
+    try:
+        await target.send_text(
+            json.dumps(data, ensure_ascii=False)
+        )
+    except Exception:
+        pass
+
+
+async def broadcast(
+    room_id: str,
+    data: dict,
+    exclude: Optional[WebSocket] = None
+):
+
+    dead = []
+
+    for connection in list(connections.get(room_id, set())):
+
+        if connection == exclude:
+            continue
+
+        try:
+
+            await connection.send_text(
+                json.dumps(data, ensure_ascii=False)
+            )
+
+        except Exception:
+
+            dead.append(connection)
+
+    for connection in dead:
+        connections[room_id].discard(connection)
+
+
+@app.websocket("/ws/{room_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    room_id: str
+):
+
+    await websocket.accept()
+
+    if room_id not in rooms:
+        await websocket.close(code=4004)
+        return
+
+    client_id = secrets.token_hex(8)
+
+    nickname = "Гость"
+
+    joined = False
+
+    try:
+
+        first_message = await websocket.receive_text()
+
+        data = json.loads(first_message)
+
+        if data.get("type") != "join":
+            await websocket.close(code=4000)
+            return
+
+        nickname = clean_name(
+            data.get("nickname", "Гость")
+        )
+
+        password = str(data.get("password", ""))
+
+        room = rooms[room_id]
+
+        if room["password"] and password != room["password"]:
+
+            await websocket.send_text(
+                json.dumps({
+                    "type": "error",
+                    "message": "Неверный пароль"
+                }, ensure_ascii=False)
+            )
+
+            await websocket.close(code=4003)
+            return
+
+        if len(connections[room_id]) >= room["max_users"]:
+
+            await websocket.send_text(
+                json.dumps({
+                    "type": "error",
+                    "message": "Комната заполнена"
+                }, ensure_ascii=False)
+            )
+
+            await websocket.close(code=4005)
+            return
+
+        connections[room_id].add(websocket)
+        joined = True
+
+        participants = {}
+
+        for conn in connections[room_id]:
+
+            if conn != websocket:
+
+                # Участники хранятся отдельно в runtime.
+                pass
+
+        # Сохраняем имя прямо на объекте websocket.
+        websocket.client_id = client_id
+        websocket.nickname = nickname
+
+        for conn in connections[room_id]:
+
+            if conn != websocket:
+
+                participants[
+                    getattr(conn, "client_id", "")
+                ] = getattr(
+                    conn,
+                    "nickname",
+                    "Гость"
+                )
+
+        await websocket.send_text(
+            json.dumps({
+                "type": "room_state",
+                "client_id": client_id,
+                "participants": participants
+            }, ensure_ascii=False)
+        )
+
+        await broadcast(
+            room_id,
+            {
+                "type": "user_joined",
+                "client_id": client_id,
+                "nickname": nickname
+            },
+            exclude=websocket
+        )
+
+        while True:
+
+            raw = await websocket.receive_text()
+
+            data = json.loads(raw)
+
+            message_type = data.get("type")
+
+            if message_type == "chat":
+
+                if not room["allow_chat"]:
+                    continue
+
+                message = str(
+                    data.get("message", "")
+                ).strip()
+
+                if not message:
+                    continue
+
+                message = message[:500]
+
+                await broadcast(
+                    room_id,
+                    {
+                        "type": "chat",
+                        "nickname": nickname,
+                        "message": message,
+                        "time": now()
+                    }
+                )
+
+            elif message_type in (
+                "offer",
+                "answer",
+                "candidate"
+            ):
+
+                target_id = data.get("target")
+
+                if not target_id:
+                    continue
+
+                target = None
+
+                for conn in connections[room_id]:
+
+                    if getattr(
+                        conn,
+                        "client_id",
+                        None
+                    ) == target_id:
+
+                        target = conn
+                        break
+
+                if target:
+
+                    packet = dict(data)
+
+                    packet["client_id"] = client_id
+
+                    await send_to(
+                        room_id,
+                        target,
+                        packet
+                    )
+
+    except WebSocketDisconnect:
+        pass
+
+    except Exception as e:
+        print("WebSocket error:", e)
+
+    finally:
+
+        if joined:
+
+            connections[room_id].discard(websocket)
+
+            await broadcast(
+                room_id,
+                {
+                    "type": "user_left",
+                    "client_id": client_id,
+                    "nickname": nickname
+                }
+            )
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+async def cleanup_rooms():
+
+    while True:
+
+        await asyncio.sleep(300)
+
+        # Удаляем пустые комнаты.
+        for room_id in list(rooms.keys()):
+
+            if not connections.get(room_id):
+
+                rooms.pop(room_id, None)
+                connections.pop(room_id, None)
+
+
+@app.on_event("startup")
+async def startup():
+
+    asyncio.create_task(
+        cleanup_rooms()
+    )
+
+
+# ============================================================
+# START
 # ============================================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
+```
