@@ -6,3 +6,4 @@ python-multipart
 aiosmtpd 
 dnspython 
 pydantic
+itsdangerous
