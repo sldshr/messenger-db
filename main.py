@@ -11,9 +11,10 @@ from pydantic import BaseModel
 
 SERVER_NAME = os.environ.get("SLDCHAT_DOMAIN", "localhost:8000")
 
-app = FastAPI(title="SLDCHAT Mail", version="0.4")
+app = FastAPI(title="SLDCHAT Mail", version="0.5")
 
-# ---------------------- RAM STORAGE ----------------------
+
+# ============ RAM STORAGE ============
 USERS: Dict[str, Dict[str, Any]] = {}
 MESSAGES: Dict[str, Dict[str, Any]] = {}
 USER_STATE: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -21,7 +22,7 @@ DRAFTS: Dict[str, Dict[str, Dict[str, Any]]] = {}
 CONTACTS: Dict[str, List[str]] = {}
 
 
-# ---------------------- Models ----------------------
+# ============ Models ============
 class RegisterReq(BaseModel):
     username: str
     password: str
@@ -69,13 +70,13 @@ class FederationMsg(BaseModel):
     deliver_to: str
 
 
-# ---------------------- Utils ----------------------
+# ============ Helpers ============
 def hash_pw(password: str, salt: str) -> str:
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
 def full(username: str) -> str:
-    return f"{username}@{SERVER_NAME}"
+    return username + "@" + SERVER_NAME
 
 
 def parse_addr(a: str) -> Optional[str]:
@@ -87,26 +88,26 @@ def parse_addr(a: str) -> Optional[str]:
     local, _, domain = a.rpartition("@")
     if not local or not domain or "." not in domain:
         return None
-    return f"{local}@{domain}"
+    return local + "@" + domain
 
 
 def auth(authorization: Optional[str]) -> str:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "unauthorized")
+        raise HTTPException(401, "Требуется авторизация.")
     tok = authorization[7:].strip()
     for u, d in USERS.items():
         if d.get("token") and secrets.compare_digest(d["token"], tok):
             return u
-    raise HTTPException(401, "unauthorized")
+    raise HTTPException(401, "Неверный токен.")
 
 
-# ---------------------- Discovery ----------------------
+# ============ Discovery ============
 @app.get("/.well-known/sldchat")
 async def well_known():
     return {"protocol": "sldchat-mail", "version": 1, "server": SERVER_NAME}
 
 
-# ---------------------- Federation ----------------------
+# ============ Federation ============
 @app.post("/federation/receive")
 async def federation_receive(msg: FederationMsg):
     to = msg.deliver_to.strip().lower()
@@ -114,7 +115,7 @@ async def federation_receive(msg: FederationMsg):
     if domain != SERVER_NAME:
         raise HTTPException(400, "not for this server")
     if user not in USERS:
-        raise HTTPException(404, f"no such user {user}")
+        raise HTTPException(404, "no such user")
 
     MESSAGES[msg.msg_id] = {
         "msg_id": msg.msg_id,
@@ -135,10 +136,10 @@ async def federation_receive(msg: FederationMsg):
 
 
 async def federate_http(domain: str, payload: dict) -> tuple[bool, str]:
-    """follow_redirects=False, иначе POST становится GET на 301/302 и получаем 405."""
+    """follow_redirects=False — иначе POST превращается в GET и получаем 405."""
     last_err = ""
     for scheme in ("https", "http"):
-        url = f"{scheme}://{domain}/federation/receive"
+        url = scheme + "://" + domain + "/federation/receive"
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
                 current = url
@@ -157,16 +158,16 @@ async def federate_http(domain: str, payload: dict) -> tuple[bool, str]:
                 continue
             if r.status_code < 400:
                 return True, ""
-            last_err = f"{r.status_code} {r.text[:300]}"
+            last_err = str(r.status_code) + " " + r.text[:300]
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+            last_err = type(e).__name__ + ": " + str(e)
     return False, last_err
 
 
 def deliver_local(recipient_full: str, msg: dict) -> tuple[bool, str]:
     user, _, domain = recipient_full.rpartition("@")
     if user not in USERS:
-        return False, f"нет пользователя {recipient_full}"
+        return False, "нет пользователя " + recipient_full
     MESSAGES[msg["msg_id"]] = {
         "msg_id": msg["msg_id"],
         "from_addr": msg["from_addr"],
@@ -194,14 +195,14 @@ async def deliver(recipient_full: str, msg: dict) -> tuple[bool, str]:
     return await federate_http(domain, payload)
 
 
-# ---------------------- User API ----------------------
+# ============ User API ============
 @app.post("/api/register")
 async def register(req: RegisterReq):
     u = req.username.strip().lower()
     if not u or not req.password:
         raise HTTPException(400, "Укажите логин и пароль.")
     if not u.replace("_", "").replace("-", "").replace(".", "").isalnum():
-        raise HTTPException(400, "Логин может содержать только буквы, цифры, _ - .")
+        raise HTTPException(400, "Логин: только буквы, цифры, _ - .")
     if u in USERS:
         raise HTTPException(409, "Такой логин уже занят.")
     salt = secrets.token_hex(8)
@@ -263,15 +264,20 @@ async def list_messages(
         items = sorted(DRAFTS.get(u, {}).values(), key=lambda x: -x["ts"])
         total = len(items)
         items = items[(page - 1) * per_page: page * per_page]
-        return {"items": [
-            {"msg_id": "draft:" + d["id"], "from": full(u),
-             "to": [t for t in [d.get("to", "")] if t],
-             "subject": d.get("subject", "") or "(черновик без темы)",
-             "ts": d["ts"], "read": True, "starred": False,
-             "preview": (d.get("body", "") or "").replace("\n", " ")[:120],
-             "is_draft": True}
-            for d in items
-        ], "total": total, "page": page, "per_page": per_page, "folder": folder}
+        return {
+            "items": [
+                {
+                    "msg_id": "draft:" + d["id"],
+                    "from": full(u),
+                    "to": [d.get("to", "")] if d.get("to") else [],
+                    "subject": d.get("subject", "") or "(черновик без темы)",
+                    "ts": d["ts"],
+                    "read": True, "starred": False, "is_draft": True,
+                    "preview": (d.get("body", "") or "").replace("\n", " ")[:120],
+                } for d in items
+            ],
+            "total": total, "page": page, "per_page": per_page, "folder": folder,
+        }
 
     rows = []
     for mid, s in st.items():
@@ -287,7 +293,8 @@ async def list_messages(
         if q_lower:
             hay = " ".join([
                 m.get("subject", ""), m.get("body", ""),
-                m.get("from_addr", ""), " ".join(m.get("to", [])),
+                m.get("from_addr", ""),
+                " ".join(m.get("to", [])),
                 " ".join(m.get("cc", [])),
             ]).lower()
             if q_lower not in hay:
@@ -298,16 +305,18 @@ async def list_messages(
     total = len(rows)
     chunk = rows[(page - 1) * per_page: page * per_page]
     return {
-        "items": [{
-            "msg_id": mid,
-            "from": m["from_addr"],
-            "to": m.get("to", []),
-            "subject": m.get("subject", "") or "(без темы)",
-            "ts": m["ts"],
-            "read": s.get("read", False),
-            "starred": s.get("starred", False),
-            "preview": (m.get("body", "") or "").replace("\n", " ")[:120],
-        } for mid, s, m in chunk],
+        "items": [
+            {
+                "msg_id": mid,
+                "from": m["from_addr"],
+                "to": m.get("to", []),
+                "subject": m.get("subject", "") or "(без темы)",
+                "ts": m["ts"],
+                "read": s.get("read", False),
+                "starred": s.get("starred", False),
+                "preview": (m.get("body", "") or "").replace("\n", " ")[:120],
+            } for mid, s, m in chunk
+        ],
         "total": total, "page": page, "per_page": per_page, "folder": folder,
     }
 
@@ -394,7 +403,7 @@ async def send(req: SendReq, authorization: Optional[str] = Header(None)):
     for r in to_list + cc_list + bcc_list:
         ok, err = await deliver(r, msg)
         if not ok:
-            errors.append(f"{r}: {err}")
+            errors.append(r + ": " + err)
 
     cl = CONTACTS.setdefault(u, [])
     for r in to_list + cc_list + bcc_list:
@@ -436,7 +445,7 @@ async def add_contact(req: ContactReq, authorization: Optional[str] = Header(Non
     return {"status": "ok", "contacts": sorted(cl)}
 
 
-# ---------------------- Drafts ----------------------
+# ============ Drafts ============
 @app.post("/api/drafts")
 async def save_draft(req: DraftReq, authorization: Optional[str] = Header(None)):
     u = auth(authorization)
@@ -464,7 +473,7 @@ async def del_draft(did: str, authorization: Optional[str] = Header(None)):
     return {"status": "ok"}
 
 
-# ---------------------- UI ----------------------
+# ============ UI ============
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -473,114 +482,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>SLDCHAT MAIL</title>
 <style>
 * { box-sizing: border-box; }
-html, body {
-  margin: 0; padding: 0; min-height: 100%;
-  font-family: Arial, Helvetica, Verdana, sans-serif;
-  font-size: 14px; color: #000; background: #eef2f7;
-}
+html, body { margin: 0; padding: 0; min-height: 100%; font-family: Arial, Helvetica, Verdana, sans-serif; font-size: 14px; color: #000; background: #eef2f7; }
 a { color: #003399; text-decoration: none; cursor: pointer; }
 a:hover { color: #cc3300; text-decoration: underline; }
 input, textarea, button, select { font-family: inherit; font-size: 14px; }
 
-/* ---------- buttons ---------- */
-button, .btn {
-  display: inline-block;
-  background: #e8eef5; color: #00295f;
-  border: 1px solid #7a8fa6; border-radius: 3px;
-  padding: 6px 12px; cursor: pointer;
-  line-height: 1.2; text-decoration: none; font-size: 13px;
-}
+button, .btn { display: inline-block; background: #e8eef5; color: #00295f; border: 1px solid #7a8fa6; border-radius: 3px; padding: 6px 12px; cursor: pointer; line-height: 1.2; text-decoration: none; font-size: 13px; }
 button:hover, .btn:hover { background: #d3dfee; }
-button.primary {
-  background: #2e6fbf; color: #fff; border-color: #234f8a;
-  font-weight: bold;
-}
+button.primary { background: #2e6fbf; color: #fff; border-color: #234f8a; font-weight: bold; }
 button.primary:hover { background: #245b9e; }
 button.danger { color: #8a2020; border-color: #b08080; }
 button.danger:hover { background: #fbe6e6; }
-button.big {
-  padding: 8px 18px; font-size: 14px;
-}
+button.big { padding: 8px 18px; font-size: 14px; }
 
-/* ---------- header ---------- */
-.header {
-  background: #1a3e6e; color: #fff;
-  padding: 8px 16px;
-  display: flex; justify-content: space-between; align-items: center;
-  border-bottom: 3px solid #0a2649;
-}
+.header { background: #1a3e6e; color: #fff; padding: 8px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 3px solid #0a2649; }
 .header .brand { font-size: 16px; font-weight: bold; letter-spacing: .5px; }
 .header .user { font-size: 13px; }
 .header .user a { color: #cce0ff; margin-left: 14px; }
 
-/* ---------- top nav ---------- */
-.topnav {
-  background: #dbe4ef; border-bottom: 1px solid #a8b8cc;
-  padding: 6px 12px;
-  display: flex; gap: 6px; align-items: center;
-}
+.topnav { background: #dbe4ef; border-bottom: 1px solid #a8b8cc; padding: 6px 12px; display: flex; gap: 6px; align-items: center; }
 .topnav .sep { flex: 1; }
 .topnav button { padding: 6px 14px; }
 
-/* ---------- layout ---------- */
-.layout {
-  display: grid;
-  grid-template-columns: 190px 1fr;
-  min-height: calc(100vh - 100px);
-}
-.sidebar {
-  background: #d9e2ee; border-right: 1px solid #a8b8cc;
-  padding: 10px 0;
-}
-.side-title {
-  padding: 6px 16px 4px; font-size: 11px;
-  text-transform: uppercase; color: #4a5a6e; letter-spacing: .07em;
-}
-.folder {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 6px 16px; color: #00295f; font-size: 13px;
-  border-left: 3px solid transparent;
-  cursor: pointer;
-}
+.layout { display: grid; grid-template-columns: 190px 1fr; min-height: calc(100vh - 100px); }
+.sidebar { background: #d9e2ee; border-right: 1px solid #a8b8cc; padding: 10px 0; }
+.side-title { padding: 6px 16px 4px; font-size: 11px; text-transform: uppercase; color: #4a5a6e; letter-spacing: .07em; }
+.folder { display: flex; justify-content: space-between; align-items: center; padding: 6px 16px; color: #00295f; font-size: 13px; border-left: 3px solid transparent; cursor: pointer; }
 .folder:hover { background: #c7d3e2; }
-.folder.active {
-  background: #fff; font-weight: bold;
-  border-left-color: #1a3e6e;
-}
+.folder.active { background: #fff; font-weight: bold; border-left-color: #1a3e6e; }
 .folder .cnt { color: #777; font-size: 12px; font-weight: normal; }
-.folder .cnt.unread {
-  background: #c33; color: #fff; font-weight: bold;
-  padding: 1px 7px; border-radius: 9px; font-size: 11px;
-}
+.folder .cnt.unread { background: #c33; color: #fff; font-weight: bold; padding: 1px 7px; border-radius: 9px; font-size: 11px; }
 
-/* ---------- content ---------- */
-.content { background: #fff; }
-.panel-toolbar {
-  background: #f2f5f9; border-bottom: 1px solid #d5dfec;
-  padding: 8px 12px;
-  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-}
-.panel-toolbar .search {
-  margin-left: auto; display: flex; gap: 6px; align-items: center;
-}
-.panel-toolbar .search input {
-  padding: 5px 8px; border: 1px solid #7a8fa6; border-radius: 3px;
-  width: 220px;
-}
+.content { background: #fff; min-height: 400px; }
+.panel-toolbar { background: #f2f5f9; border-bottom: 1px solid #d5dfec; padding: 8px 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.panel-toolbar .search { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+.panel-toolbar .search input { padding: 5px 8px; border: 1px solid #7a8fa6; border-radius: 3px; width: 220px; }
 
-/* ---------- list ---------- */
 table.list { width: 100%; border-collapse: collapse; }
-table.list th {
-  background: #e5ebf3; text-align: left;
-  padding: 8px 10px; font-size: 12px; color: #3a4a5e;
-  border-bottom: 1px solid #a8b8cc;
-  border-right: 1px solid #d5dfec; font-weight: bold;
-}
+table.list th { background: #e5ebf3; text-align: left; padding: 8px 10px; font-size: 12px; color: #3a4a5e; border-bottom: 1px solid #a8b8cc; border-right: 1px solid #d5dfec; font-weight: bold; }
 table.list th:last-child { border-right: 0; }
-table.list td {
-  padding: 9px 10px; font-size: 13px;
-  border-bottom: 1px solid #eef2f7; vertical-align: middle;
-}
+table.list td { padding: 9px 10px; font-size: 13px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
 table.list tr { cursor: pointer; }
 table.list tr:hover td { background: #eef4fb; }
 table.list tr.unread td { font-weight: bold; background: #f7faff; }
@@ -589,126 +530,55 @@ table.list tr.unread:hover td { background: #eef4fb; }
 .col-from { width: 22%; }
 .col-date { width: 120px; white-space: nowrap; text-align: right; color: #555; font-size: 12px; }
 .row-subject { display: block; }
-.row-preview {
-  color: #777; font-size: 12px; font-weight: normal;
-  margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
+.row-preview { color: #777; font-size: 12px; font-weight: normal; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 tr.unread .row-preview { color: #444; }
-.star-btn {
-  color: #c9c9c9; font-size: 17px; line-height: 1;
-  text-decoration: none; user-select: none;
-}
+.star-btn { color: #c9c9c9; font-size: 17px; line-height: 1; text-decoration: none; user-select: none; }
 .star-btn.on { color: #f0b400; }
 .empty { padding: 40px; text-align: center; color: #777; }
 
-.pager {
-  padding: 10px 14px; font-size: 12px;
-  background: #f2f5f9; border-top: 1px solid #d5dfec;
-  display: flex; align-items: center; gap: 12px;
-}
-.pager a {
-  padding: 3px 10px; border: 1px solid #7a8fa6; border-radius: 3px;
-  background: #fff;
-}
+.pager { padding: 10px 14px; font-size: 12px; background: #f2f5f9; border-top: 1px solid #d5dfec; display: flex; align-items: center; gap: 12px; }
+.pager a { padding: 3px 10px; border: 1px solid #7a8fa6; border-radius: 3px; background: #fff; }
 .pager a:hover { background: #e8eef5; text-decoration: none; }
 
-/* ---------- read view ---------- */
 .read { padding: 20px 26px; max-width: 900px; }
-.read .subject {
-  font-size: 20px; font-weight: bold; line-height: 1.25;
-  padding-bottom: 12px; border-bottom: 1px solid #e0e6ee; margin-bottom: 14px;
-}
-.read .hdr {
-  background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px;
-  padding: 10px 14px; margin-bottom: 16px;
-}
+.read .subject { font-size: 20px; font-weight: bold; line-height: 1.25; padding-bottom: 12px; border-bottom: 1px solid #e0e6ee; margin-bottom: 14px; }
+.read .hdr { background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px; padding: 10px 14px; margin-bottom: 16px; }
 .read .hdr-row { padding: 3px 0; font-size: 13px; }
 .read .hdr-row .lbl { color: #667; display: inline-block; width: 70px; }
-.read .body {
-  white-space: pre-wrap; word-wrap: break-word;
-  font-size: 14px; line-height: 1.5;
-  padding: 4px 0 20px;
-  border-bottom: 1px solid #e0e6ee; margin-bottom: 20px;
-  min-height: 80px;
-}
+.read .body { white-space: pre-wrap; word-wrap: break-word; font-size: 14px; line-height: 1.5; padding: 4px 0 20px; border-bottom: 1px solid #e0e6ee; margin-bottom: 20px; min-height: 80px; }
 .read .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.read-head-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; background: #f2f5f9; border-bottom: 1px solid #d5dfec; }
 
-/* big action buttons at top of read view */
-.read-head-actions {
-  display: flex; gap: 8px; flex-wrap: wrap;
-  padding: 12px 14px; background: #f2f5f9;
-  border-bottom: 1px solid #d5dfec;
-}
-
-/* ---------- compose ---------- */
 .compose { padding: 20px 26px; max-width: 900px; }
-.compose h2 {
-  margin: 0 0 16px 0; font-size: 16px; color: #1a3e6e;
-  font-weight: bold;
-}
+.compose h2 { margin: 0 0 16px 0; font-size: 16px; color: #1a3e6e; font-weight: bold; }
 .compose .row { display: flex; align-items: flex-start; margin-bottom: 8px; }
-.compose .row label {
-  width: 90px; padding-top: 7px; color: #555; font-size: 13px; flex-shrink: 0;
-}
+.compose .row label { width: 90px; padding-top: 7px; color: #555; font-size: 13px; flex-shrink: 0; }
 .compose .row .val { flex: 1; }
-.compose input[type=text] {
-  width: 100%; border: 1px solid #7a8fa6; border-radius: 3px;
-  padding: 6px 9px;
-}
-.compose textarea {
-  width: 100%; min-height: 260px; border: 1px solid #7a8fa6;
-  border-radius: 3px; padding: 8px 10px; resize: vertical;
-  font-family: "Segoe UI", Arial, sans-serif; font-size: 14px;
-}
+.compose input[type=text] { width: 100%; border: 1px solid #7a8fa6; border-radius: 3px; padding: 6px 9px; }
+.compose textarea { width: 100%; min-height: 260px; border: 1px solid #7a8fa6; border-radius: 3px; padding: 8px 10px; resize: vertical; font-family: Arial, sans-serif; font-size: 14px; }
 .compose .hint { color: #777; font-size: 12px; margin-top: 4px; }
-.compose .buttons {
-  margin-top: 16px; padding-top: 14px; border-top: 1px solid #e0e6ee;
-  display: flex; gap: 8px; flex-wrap: wrap;
-}
+.compose .buttons { margin-top: 16px; padding-top: 14px; border-top: 1px solid #e0e6ee; display: flex; gap: 8px; flex-wrap: wrap; }
 
-/* ---------- contacts ---------- */
 .contacts { padding: 20px 26px; max-width: 900px; }
-.contacts h2 {
-  margin: 0 0 14px 0; font-size: 16px; color: #1a3e6e;
-}
-.contacts .addbox {
-  background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px;
-  padding: 12px; margin-bottom: 20px;
-  display: flex; gap: 8px; align-items: center;
-}
-.contacts .addbox input {
-  flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px;
-}
-.contacts .section {
-  font-weight: bold; color: #1a3e6e; font-size: 13px;
-  padding: 8px 0 6px; margin-top: 14px;
-  border-bottom: 1px solid #e0e6ee;
-}
+.contacts h2 { margin: 0 0 14px 0; font-size: 16px; color: #1a3e6e; }
+.contacts .addbox { background: #f6f9fc; border: 1px solid #e0e6ee; border-radius: 3px; padding: 12px; margin-bottom: 20px; display: flex; gap: 8px; align-items: center; }
+.contacts .addbox input { flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px; }
+.contacts .section { font-weight: bold; color: #1a3e6e; font-size: 13px; padding: 8px 0 6px; margin-top: 14px; border-bottom: 1px solid #e0e6ee; }
 .contacts table { width: 100%; border-collapse: collapse; margin-top: 8px; }
 .contacts td { padding: 6px 4px; border-bottom: 1px solid #eef2f7; font-size: 13px; }
 .contacts td.act { text-align: right; width: 130px; }
 .contacts .empty { padding: 20px; color: #888; font-size: 13px; }
 
-/* ---------- auth ---------- */
-.auth-wrap {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
-  padding: 30px; background: #eef2f7;
-}
+.auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 30px; background: #eef2f7; }
 .auth-box { width: 420px; background: #fff; border: 1px solid #7a8fa6; border-radius: 4px; overflow: hidden; }
 .auth-box .top { background: #1a3e6e; color: #fff; padding: 12px 16px; font-weight: bold; }
 .auth-box .body { padding: 20px; }
 .auth-tabs { display: flex; border-bottom: 1px solid #d5dfec; margin-bottom: 16px; }
-.auth-tab {
-  padding: 8px 18px; cursor: pointer; color: #003399;
-  border: 1px solid #d5dfec; border-bottom: 0; background: #f2f5f9;
-  margin-right: 4px; margin-bottom: -1px; border-radius: 3px 3px 0 0;
-}
+.auth-tab { padding: 8px 18px; cursor: pointer; color: #003399; border: 1px solid #d5dfec; border-bottom: 0; background: #f2f5f9; margin-right: 4px; margin-bottom: -1px; border-radius: 3px 3px 0 0; }
 .auth-tab.active { background: #fff; font-weight: bold; color: #1a3e6e; }
 .auth-row { margin-bottom: 10px; display: flex; align-items: center; }
 .auth-row label { width: 90px; color: #555; font-size: 13px; }
-.auth-row input {
-  flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px;
-}
+.auth-row input { flex: 1; padding: 6px 9px; border: 1px solid #7a8fa6; border-radius: 3px; }
 .auth-actions { margin-top: 16px; }
 .notice { padding: 8px 12px; font-size: 13px; border-radius: 3px; margin-top: 12px; }
 .notice.ok { background: #e8f4e0; border: 1px solid #a8cc88; color: #2a5a10; }
@@ -719,10 +589,9 @@ tr.unread .row-preview { color: #444; }
 </head>
 <body>
 
-<!-- ============ AUTH ============ -->
 <div id="auth_screen" class="auth-wrap">
   <div class="auth-box">
-    <div class="top">SLDCHAT MAIL — вход</div>
+    <div class="top">SLDCHAT MAIL &mdash; вход</div>
     <div class="body">
       <div class="auth-tabs">
         <div id="tab_login" class="auth-tab active" onclick="switchTab('login')">Вход</div>
@@ -744,23 +613,22 @@ tr.unread .row-preview { color: #444; }
   </div>
 </div>
 
-<!-- ============ APP ============ -->
 <div id="app_screen" style="display:none">
   <div class="header">
-    <div class="brand">✉ SLDCHAT MAIL</div>
+    <div class="brand">SLDCHAT MAIL</div>
     <div class="user">
-      <span id="who">—</span>
+      <span id="who">&mdash;</span>
       <a onclick="doLogout()">Выход</a>
     </div>
   </div>
 
   <div class="topnav">
-    <button class="primary big" onclick="newCompose()">✎ Написать письмо</button>
-    <button onclick="openFolder('inbox')">📥 Входящие</button>
-    <button onclick="openFolder('sent')">📤 Отправленные</button>
-    <button onclick="openFolder('drafts')">📝 Черновики</button>
+    <button class="primary big" onclick="newCompose()">Написать письмо</button>
+    <button onclick="openFolder('inbox')">Входящие</button>
+    <button onclick="openFolder('sent')">Отправленные</button>
+    <button onclick="openFolder('drafts')">Черновики</button>
     <span class="sep"></span>
-    <button onclick="showContacts()">☎ Контакты</button>
+    <button onclick="showContacts()">Контакты</button>
   </div>
 
   <div class="layout">
@@ -775,67 +643,85 @@ tr.unread .row-preview { color: #444; }
 </div>
 
 <script>
-const SERVER_DOMAIN = "__SERVER__";
-const FOLDERS = [
-  ["inbox","Входящие"], ["sent","Отправленные"], ["drafts","Черновики"],
-  ["starred","Помеченные"], ["archive","Архив"], ["trash","Удалённые"]
+"use strict";
+
+var SERVER_DOMAIN = "__SERVER__";
+
+var FOLDERS = [
+  ["inbox",   "Входящие"],
+  ["sent",    "Отправленные"],
+  ["drafts",  "Черновики"],
+  ["starred", "Помеченные"],
+  ["archive", "Архив"],
+  ["trash",   "Удалённые"]
 ];
-const FOLDER_TITLE = {
-  inbox: "Входящие", sent: "Отправленные", drafts: "Черновики",
-  starred: "Помеченные", archive: "Архив", trash: "Удалённые"
+
+var FOLDER_TITLE = {
+  inbox: "Входящие",
+  sent: "Отправленные",
+  drafts: "Черновики",
+  starred: "Помеченные",
+  archive: "Архив",
+  trash: "Удалённые"
 };
 
-const S = {
+var S = {
   token: localStorage.getItem("sldchat_token") || "",
   username: localStorage.getItem("sldchat_user") || "",
   folder: "inbox",
   q: "",
   page: 1,
-  view: "list",       // list | read | compose | contacts
+  view: "list",
   currentMsg: null,
   compose: null,
   pollTimer: null,
-  folderCounts: {},
+  folderCounts: {}
 };
 
-/* ---------- http ---------- */
-async function api(path, opts = {}) {
-  opts.headers = Object.assign({"Content-Type":"application/json"}, opts.headers || {});
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  opts.headers["Content-Type"] = "application/json";
   if (S.token) opts.headers["Authorization"] = "Bearer " + S.token;
-  const r = await fetch(path, opts);
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const e = new Error(data.detail || r.statusText);
-    e.status = r.status;
-    if (r.status === 401 && S.token) doLogout();
-    throw e;
-  }
-  return data;
+  return fetch(path, opts).then(function(r) {
+    return r.json().catch(function(){ return {}; }).then(function(data) {
+      if (!r.ok) {
+        var e = new Error(data.detail || r.statusText);
+        e.status = r.status;
+        if (r.status === 401 && S.token) doLogout();
+        throw e;
+      }
+      return data;
+    });
+  });
 }
 
-/* ---------- helpers ---------- */
 function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"']/g, c =>
-    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  return String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, function(c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
 }
+
+function pad2(n) { return n < 10 ? "0" + n : "" + n; }
+
 function fmtDate(ts) {
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const pad = n => String(n).padStart(2, "0");
-  if (d.toDateString() === now.toDateString()) return pad(d.getHours()) + ":" + pad(d.getMinutes());
-  const months = ["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"];
+  var d = new Date(ts * 1000);
+  var now = new Date();
+  if (d.toDateString() === now.toDateString()) return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  var months = ["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"];
   if (d.getFullYear() === now.getFullYear()) return d.getDate() + " " + months[d.getMonth()];
-  return pad(d.getDate()) + "." + pad(d.getMonth()+1) + "." + d.getFullYear();
+  return pad2(d.getDate()) + "." + pad2(d.getMonth() + 1) + "." + d.getFullYear();
 }
+
 function fmtFull(ts) {
-  const d = new Date(ts * 1000);
-  const pad = n => String(n).padStart(2, "0");
-  const months = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
-  return pad(d.getDate()) + " " + months[d.getMonth()] + " " + d.getFullYear()
-       + ", " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  var d = new Date(ts * 1000);
+  var months = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+  return pad2(d.getDate()) + " " + months[d.getMonth()] + " " + d.getFullYear() + ", " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
 }
+
 function meAddr() { return S.username + "@" + SERVER_DOMAIN; }
 function shortAddr(a) { return a ? a.replace(/@.*$/, "") : ""; }
+
 function notice(el, msg, kind) {
   if (!msg) { el.style.display = "none"; return; }
   el.style.display = "block";
@@ -847,44 +733,46 @@ function notice(el, msg, kind) {
 function switchTab(t) {
   document.getElementById("tab_login").classList.toggle("active", t === "login");
   document.getElementById("tab_reg").classList.toggle("active", t === "reg");
-  document.getElementById("form_login").style.display = t === "login" ? "" : "none";
-  document.getElementById("form_reg").style.display = t === "reg" ? "" : "none";
+  document.getElementById("form_login").style.display = (t === "login") ? "" : "none";
+  document.getElementById("form_reg").style.display = (t === "reg") ? "" : "none";
   notice(document.getElementById("auth_status"), "");
 }
 
-async function doRegister() {
-  const st = document.getElementById("auth_status");
-  const u = document.getElementById("reg_user").value.trim();
-  const p = document.getElementById("reg_pass").value;
+function doRegister() {
+  var st = document.getElementById("auth_status");
+  var u = document.getElementById("reg_user").value.trim();
+  var p = document.getElementById("reg_pass").value;
   if (!u || !p) return notice(st, "Заполните оба поля.");
-  try {
-    const d = await api("/api/register", {method:"POST", body: JSON.stringify({username:u, password:p})});
-    notice(st, "Ящик создан: " + d.address + ". Теперь войдите.", "ok");
-    document.getElementById("log_user").value = u;
-    switchTab("login");
-  } catch (e) { notice(st, e.message); }
+  api("/api/register", { method: "POST", body: JSON.stringify({ username: u, password: p }) })
+    .then(function(d) {
+      notice(st, "Ящик создан: " + d.address + ". Теперь войдите.", "ok");
+      document.getElementById("log_user").value = u;
+      switchTab("login");
+    })
+    .catch(function(e) { notice(st, e.message); });
 }
 
-async function doLogin() {
-  const st = document.getElementById("auth_status");
-  const u = document.getElementById("log_user").value.trim();
-  const p = document.getElementById("log_pass").value;
+function doLogin() {
+  var st = document.getElementById("auth_status");
+  var u = document.getElementById("log_user").value.trim();
+  var p = document.getElementById("log_pass").value;
   if (!u || !p) return notice(st, "Введите логин и пароль.");
-  try {
-    const d = await api("/api/login", {method:"POST", body: JSON.stringify({username:u, password:p})});
-    S.token = d.token; S.username = d.username;
-    localStorage.setItem("sldchat_token", S.token);
-    localStorage.setItem("sldchat_user", S.username);
-    S.folder = "inbox"; S.page = 1; S.view = "list";
-    renderShell();
-    refreshFolders();
-    openFolder("inbox");
-    startPolling();
-  } catch (e) { notice(st, e.message); }
+  api("/api/login", { method: "POST", body: JSON.stringify({ username: u, password: p }) })
+    .then(function(d) {
+      S.token = d.token; S.username = d.username;
+      localStorage.setItem("sldchat_token", S.token);
+      localStorage.setItem("sldchat_user", S.username);
+      S.folder = "inbox"; S.page = 1; S.view = "list";
+      renderShell();
+      refreshFolders();
+      openFolder("inbox");
+      startPolling();
+    })
+    .catch(function(e) { notice(st, e.message); });
 }
 
 function doLogout() {
-  S.token = ""; S.username = ""; S.currentMsg = null;
+  S.token = ""; S.username = ""; S.currentMsg = null; S.compose = null;
   localStorage.removeItem("sldchat_token");
   localStorage.removeItem("sldchat_user");
   if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
@@ -893,28 +781,32 @@ function doLogout() {
 
 /* ---------- shell ---------- */
 function renderShell() {
-  const logged = !!S.token;
+  var logged = !!S.token;
   document.getElementById("auth_screen").style.display = logged ? "none" : "flex";
   document.getElementById("app_screen").style.display = logged ? "" : "none";
   document.getElementById("who").textContent = logged ? meAddr() : "";
-  document.getElementById("footer").textContent = "SLDCHAT MAIL — ваш сервер: " + SERVER_DOMAIN;
+  document.getElementById("footer").textContent = "SLDCHAT MAIL \u2014 ваш сервер: " + SERVER_DOMAIN;
 }
 
 function renderFolders() {
-  const box = document.getElementById("folders");
-  box.innerHTML = FOLDERS.map(([key, label]) => {
-    const c = S.folderCounts[key] || {total:0, unread:0};
-    let right = "";
+  var box = document.getElementById("folders");
+  var html = "";
+  for (var i = 0; i < FOLDERS.length; i++) {
+    var key = FOLDERS[i][0];
+    var label = FOLDERS[i][1];
+    var c = S.folderCounts[key] || { total: 0, unread: 0 };
+    var right = "";
     if (key === "inbox" && c.unread > 0) {
-      right = `<span class="cnt unread">${c.unread}</span>`;
+      right = '<span class="cnt unread">' + c.unread + '</span>';
     } else if (c.total > 0) {
-      right = `<span class="cnt">${c.total}</span>`;
+      right = '<span class="cnt">' + c.total + '</span>';
     }
-    const active = (S.view === "list" && S.folder === key) ? " active" : "";
-    return `<div class="folder${active}" onclick="openFolder('${key}')">
-      <span>${label}</span>${right}
-    </div>`;
-  }).join("");
+    var active = (S.view === "list" && S.folder === key) ? " active" : "";
+    html += '<div class="folder' + active + '" onclick="openFolder(\'' + key + '\')">';
+    html += '<span>' + label + '</span>' + right;
+    html += '</div>';
+  }
+  box.innerHTML = html;
 }
 
 /* ---------- folder ---------- */
@@ -928,90 +820,93 @@ function openFolder(f) {
 }
 
 /* ---------- list ---------- */
-async function refreshList() {
+function refreshList() {
   if (S.view !== "list") return;
   renderFolders();
-  const v = document.getElementById("content");
+  var v = document.getElementById("content");
 
-  const toolbar = `
-    <div class="panel-toolbar">
-      <button class="primary" onclick="newCompose()">✎ Написать</button>
-      <button onclick="refreshList()">⟳ Обновить</button>
-      ${S.folder === "trash" ? '<button class="danger" onclick="emptyTrash()">🗑 Очистить корзину</button>' : ""}
-      <div class="search">
-        <input id="q_input" placeholder="Поиск по письмам…" value="${esc(S.q)}"
-               onkeydown="if(event.key==='Enter'){doSearch();}">
-        <button onclick="doSearch()">Найти</button>
-        ${S.q ? `<button onclick="clearSearch()">Сброс</button>` : ""}
-      </div>
-    </div>
-  `;
+  var toolbar = '';
+  toolbar += '<div class="panel-toolbar">';
+  toolbar += '<button class="primary" onclick="newCompose()">Написать</button>';
+  toolbar += '<button onclick="refreshList()">Обновить</button>';
+  if (S.folder === "trash") {
+    toolbar += '<button class="danger" onclick="emptyTrash()">Очистить корзину</button>';
+  }
+  toolbar += '<div class="search">';
+  toolbar += '<input id="q_input" placeholder="Поиск по письмам..." value="' + esc(S.q) + '" onkeydown="if(event.key===\'Enter\'){doSearch();}">';
+  toolbar += '<button onclick="doSearch()">Найти</button>';
+  if (S.q) toolbar += '<button onclick="clearSearch()">Сброс</button>';
+  toolbar += '</div>';
+  toolbar += '</div>';
 
-  try {
-    const params = new URLSearchParams({folder: S.folder, q: S.q, page: S.page, per_page: 30});
-    const d = await api("/api/list?" + params.toString());
-    const rows = d.items;
-    const showTo = (S.folder === "sent" || S.folder === "drafts");
+  var params = "folder=" + encodeURIComponent(S.folder) +
+               "&q=" + encodeURIComponent(S.q) +
+               "&page=" + S.page + "&per_page=30";
 
-    const heading = `<div style="padding:12px 16px;border-bottom:1px solid #e0e6ee;background:#f9fbfd">
-      <b style="color:#1a3e6e;font-size:15px">${FOLDER_TITLE[S.folder] || S.folder}</b>
-      <span style="color:#777;font-size:12px;margin-left:10px">${d.total} писем${S.q ? " (поиск: "+esc(S.q)+")" : ""}</span>
-    </div>`;
+  api("/api/list?" + params).then(function(d) {
+    var rows = d.items;
+    var showTo = (S.folder === "sent" || S.folder === "drafts");
 
-    let body;
+    var heading = '<div style="padding:12px 16px;border-bottom:1px solid #e0e6ee;background:#f9fbfd">';
+    heading += '<b style="color:#1a3e6e;font-size:15px">' + (FOLDER_TITLE[S.folder] || S.folder) + '</b>';
+    heading += '<span style="color:#777;font-size:12px;margin-left:10px">' + d.total + ' писем';
+    if (S.q) heading += ' (поиск: ' + esc(S.q) + ')';
+    heading += '</span></div>';
+
+    var body;
     if (!rows.length) {
-      body = `<div class="empty">Здесь пока пусто.</div>`;
+      body = '<div class="empty">Здесь пока пусто.</div>';
     } else {
-      body = `<table class="list">
-        <thead>
-          <tr>
-            <th class="col-star"></th>
-            <th class="col-from">${showTo ? "Кому" : "От кого"}</th>
-            <th>Тема</th>
-            <th class="col-date">Дата</th>
-          </tr>
-        </thead>
-        <tbody>
-        ${rows.map(r => {
-          const cls = (!r.read && S.folder === "inbox") ? "unread" : "";
-          const star = r.starred ? "★" : "☆";
-          const starCls = r.starred ? "star-btn on" : "star-btn";
-          const who = showTo
-            ? (r.to.map(a => shortAddr(a)).join(", ") || "(нет получателя)")
-            : shortAddr(r.from);
-          const subj = r.is_draft ? "✎ " + r.subject : r.subject;
-          return `<tr class="${cls}" onclick="openMessage('${r.msg_id}')">
-            <td class="col-star" onclick="event.stopPropagation(); toggleStar('${r.msg_id}')">
-              <span class="${starCls}">${star}</span>
-            </td>
-            <td class="col-from" title="${esc(r.from)}">${esc(who)}</td>
-            <td>
-              <span class="row-subject">${esc(subj)}</span>
-              <div class="row-preview">${esc(r.preview)}</div>
-            </td>
-            <td class="col-date">${fmtDate(r.ts)}</td>
-          </tr>`;
-        }).join("")}
-        </tbody>
-      </table>`;
+      body = '<table class="list"><thead><tr>';
+      body += '<th class="col-star"></th>';
+      body += '<th class="col-from">' + (showTo ? 'Кому' : 'От кого') + '</th>';
+      body += '<th>Тема</th>';
+      body += '<th class="col-date">Дата</th>';
+      body += '</tr></thead><tbody>';
+
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        var cls = (!r.read && S.folder === "inbox") ? "unread" : "";
+        var star = r.starred ? "\u2605" : "\u2606";
+        var starCls = r.starred ? "star-btn on" : "star-btn";
+        var who;
+        if (showTo) {
+          var arr = r.to || [];
+          who = arr.length ? arr.map(shortAddr).join(", ") : "(нет получателя)";
+        } else {
+          who = shortAddr(r.from);
+        }
+        var subj = r.is_draft ? "\u270E " + r.subject : r.subject;
+        body += '<tr class="' + cls + '" onclick="openMessage(\'' + r.msg_id + '\')">';
+        body += '<td class="col-star" onclick="event.stopPropagation(); toggleStar(\'' + r.msg_id + '\')">';
+        body += '<span class="' + starCls + '">' + star + '</span>';
+        body += '</td>';
+        body += '<td class="col-from" title="' + esc(r.from) + '">' + esc(who) + '</td>';
+        body += '<td><span class="row-subject">' + esc(subj) + '</span>';
+        body += '<div class="row-preview">' + esc(r.preview) + '</div></td>';
+        body += '<td class="col-date">' + fmtDate(r.ts) + '</td>';
+        body += '</tr>';
+      }
+      body += '</tbody></table>';
     }
 
-    const totalPages = Math.max(1, Math.ceil(d.total / d.per_page));
-    const pager = `<div class="pager">
-      ${S.page > 1 ? `<a onclick="gotoPage(${S.page-1})">← Предыдущие</a>` : ""}
-      <span>Страница ${S.page} из ${totalPages}</span>
-      ${S.page < totalPages ? `<a onclick="gotoPage(${S.page+1})">Следующие →</a>` : ""}
-    </div>`;
+    var totalPages = Math.max(1, Math.ceil(d.total / d.per_page));
+    var pager = '<div class="pager">';
+    if (S.page > 1) pager += '<a onclick="gotoPage(' + (S.page - 1) + ')">&larr; Предыдущие</a>';
+    pager += '<span>Страница ' + S.page + ' из ' + totalPages + '</span>';
+    if (S.page < totalPages) pager += '<a onclick="gotoPage(' + (S.page + 1) + ')">Следующие &rarr;</a>';
+    pager += '</div>';
 
     v.innerHTML = toolbar + heading + body + pager;
     refreshFolders();
-  } catch (e) {
-    v.innerHTML = toolbar + `<div class="empty">Ошибка: ${esc(e.message)}</div>`;
-  }
+  }).catch(function(e) {
+    v.innerHTML = toolbar + '<div class="empty">Ошибка: ' + esc(e.message) + '</div>';
+  });
 }
 
 function doSearch() {
-  const el = document.getElementById("q_input");
+  var el = document.getElementById("q_input");
+  if (!el) return;
   S.q = el.value.trim();
   S.page = 1;
   refreshList();
@@ -1019,168 +914,183 @@ function doSearch() {
 function clearSearch() { S.q = ""; S.page = 1; refreshList(); }
 function gotoPage(p) { S.page = p; refreshList(); }
 
-async function toggleStar(msgId) {
-  if (msgId.startsWith("draft:")) return;
-  try {
-    const m = await api("/api/message/" + msgId + "?mark_read=false");
-    await api("/api/message/" + msgId + "/flags", {
-      method: "POST", body: JSON.stringify({starred: !m.starred})
+function toggleStar(msgId) {
+  if (msgId.indexOf("draft:") === 0) return;
+  api("/api/message/" + msgId + "?mark_read=false").then(function(m) {
+    return api("/api/message/" + msgId + "/flags", {
+      method: "POST",
+      body: JSON.stringify({ starred: !m.starred })
     });
+  }).then(function() {
     refreshList(); refreshFolders();
-  } catch (e) { alert(e.message); }
+  }).catch(function(e) { alert(e.message); });
 }
 
 /* ---------- read ---------- */
-async function openMessage(msgId) {
-  if (msgId.startsWith("draft:")) {
-    const did = msgId.slice(6);
-    try {
-      const d = await api("/api/drafts/" + did);
+function openMessage(msgId) {
+  if (msgId.indexOf("draft:") === 0) {
+    var did = msgId.slice(6);
+    api("/api/drafts/" + did).then(function(d) {
       startCompose({
         to: d.to, cc: d.cc, bcc: d.bcc,
-        subject: d.subject, body: d.body, draft_id: did,
+        subject: d.subject, body: d.body, draft_id: did
       });
-    } catch (e) { alert(e.message); }
+    }).catch(function(e) { alert(e.message); });
     return;
   }
-  try {
-    const m = await api("/api/message/" + msgId);
+  api("/api/message/" + msgId).then(function(m) {
     S.currentMsg = m;
     S.view = "read";
     renderRead();
     refreshFolders();
-  } catch (e) { alert(e.message); }
+  }).catch(function(e) { alert(e.message); });
 }
 
 function renderRead() {
-  const v = document.getElementById("content");
-  const m = S.currentMsg;
+  var v = document.getElementById("content");
+  var m = S.currentMsg;
   if (!m) { v.innerHTML = ""; return; }
 
-  const ccLine = m.cc && m.cc.length
-    ? `<div class="hdr-row"><span class="lbl">Копия:</span> ${esc(m.cc.join(", "))}</div>`
-    : "";
+  var ccLine = "";
+  if (m.cc && m.cc.length) {
+    ccLine = '<div class="hdr-row"><span class="lbl">Копия:</span> ' + esc(m.cc.join(", ")) + '</div>';
+  }
 
-  v.innerHTML = `
-    <div class="read-head-actions">
-      <button class="primary big" onclick="replyCurrent(false)">↩ Ответить</button>
-      <button onclick="replyCurrent(true)">↩↩ Ответить всем</button>
-      <button onclick="forwardCurrent()">→ Переслать</button>
-      <button onclick="openFolder(S.folder)">← К списку писем</button>
-      <span style="flex:1"></span>
-      <button onclick="toggleStarCurrent()">${m.starred ? "★ Снять метку" : "☆ Пометить"}</button>
-      <button onclick="archiveCurrent()">В архив</button>
-      <button class="danger" onclick="deleteCurrent()">🗑 Удалить</button>
-    </div>
-    <div class="read">
-      <div class="subject">${esc(m.subject || "(без темы)")}</div>
-      <div class="hdr">
-        <div class="hdr-row"><span class="lbl">От:</span> <b>${esc(m.from)}</b></div>
-        <div class="hdr-row"><span class="lbl">Кому:</span> ${esc(m.to.join(", "))}</div>
-        ${ccLine}
-        <div class="hdr-row"><span class="lbl">Дата:</span> ${fmtFull(m.ts)}</div>
-      </div>
-      <div class="body">${esc(m.body)}</div>
-      <div class="actions">
-        <button class="primary big" onclick="replyCurrent(false)">↩ Ответить</button>
-        <button onclick="replyCurrent(true)">↩↩ Ответить всем</button>
-        <button onclick="forwardCurrent()">→ Переслать</button>
-      </div>
-    </div>
-  `;
+  var starLabel = m.starred ? "\u2605 Снять метку" : "\u2606 Пометить";
+  var html = '';
+  html += '<div class="read-head-actions">';
+  html += '<button class="primary big" onclick="replyCurrent(false)">&larr; Ответить</button>';
+  html += '<button onclick="replyCurrent(true)">Ответить всем</button>';
+  html += '<button onclick="forwardCurrent()">Переслать</button>';
+  html += '<button onclick="openFolder(S.folder)">К списку писем</button>';
+  html += '<span style="flex:1"></span>';
+  html += '<button onclick="toggleStarCurrent()">' + starLabel + '</button>';
+  html += '<button onclick="archiveCurrent()">В архив</button>';
+  html += '<button class="danger" onclick="deleteCurrent()">Удалить</button>';
+  html += '</div>';
+
+  html += '<div class="read">';
+  html += '<div class="subject">' + esc(m.subject || "(без темы)") + '</div>';
+  html += '<div class="hdr">';
+  html += '<div class="hdr-row"><span class="lbl">От:</span> <b>' + esc(m.from) + '</b></div>';
+  html += '<div class="hdr-row"><span class="lbl">Кому:</span> ' + esc(m.to.join(", ")) + '</div>';
+  html += ccLine;
+  html += '<div class="hdr-row"><span class="lbl">Дата:</span> ' + fmtFull(m.ts) + '</div>';
+  html += '</div>';
+  html += '<div class="body">' + esc(m.body) + '</div>';
+  html += '<div class="actions">';
+  html += '<button class="primary big" onclick="replyCurrent(false)">&larr; Ответить</button>';
+  html += '<button onclick="replyCurrent(true)">Ответить всем</button>';
+  html += '<button onclick="forwardCurrent()">Переслать</button>';
+  html += '</div>';
+  html += '</div>';
+
+  v.innerHTML = html;
 }
 
 function toggleStarCurrent() {
-  const m = S.currentMsg;
+  var m = S.currentMsg;
   if (!m) return;
-  api("/api/message/" + m.msg_id + "/flags", {method:"POST", body: JSON.stringify({starred: !m.starred})})
-    .then(() => { m.starred = !m.starred; renderRead(); refreshFolders(); })
-    .catch(e => alert(e.message));
+  api("/api/message/" + m.msg_id + "/flags", {
+    method: "POST", body: JSON.stringify({ starred: !m.starred })
+  }).then(function() {
+    m.starred = !m.starred;
+    renderRead();
+    refreshFolders();
+  }).catch(function(e) { alert(e.message); });
 }
 
 function archiveCurrent() {
-  const m = S.currentMsg;
+  var m = S.currentMsg;
   if (!m) return;
-  api("/api/message/" + m.msg_id + "/flags", {method:"POST", body: JSON.stringify({folder: "archive"})})
-    .then(() => openFolder(S.folder))
-    .catch(e => alert(e.message));
+  api("/api/message/" + m.msg_id + "/flags", {
+    method: "POST", body: JSON.stringify({ folder: "archive" })
+  }).then(function() { openFolder(S.folder); })
+    .catch(function(e) { alert(e.message); });
 }
 
 function deleteCurrent() {
-  const m = S.currentMsg;
+  var m = S.currentMsg;
   if (!m) return;
   if (!confirm("Удалить это сообщение?")) return;
-  api("/api/message/" + m.msg_id + "/delete", {method:"POST"})
-    .then(() => openFolder(S.folder))
-    .catch(e => alert(e.message));
+  api("/api/message/" + m.msg_id + "/delete", { method: "POST" })
+    .then(function() { openFolder(S.folder); })
+    .catch(function(e) { alert(e.message); });
 }
 
-async function emptyTrash() {
+function emptyTrash() {
   if (!confirm("Удалить все письма из корзины безвозвратно?")) return;
-  try {
-    const d = await api("/api/list?folder=trash&per_page=1000");
-    for (const it of d.items) {
-      await api("/api/message/" + it.msg_id + "/delete", {method:"POST"});
-    }
+  api("/api/list?folder=trash&per_page=1000").then(function(d) {
+    var chain = Promise.resolve();
+    d.items.forEach(function(it) {
+      chain = chain.then(function() {
+        return api("/api/message/" + it.msg_id + "/delete", { method: "POST" });
+      });
+    });
+    return chain;
+  }).then(function() {
     refreshList(); refreshFolders();
-  } catch (e) { alert(e.message); }
+  }).catch(function(e) { alert(e.message); });
 }
 
 /* ---------- compose ---------- */
 function newCompose() {
-  startCompose({to:"", cc:"", bcc:"", subject:"", body:""});
+  startCompose({ to: "", cc: "", bcc: "", subject: "", body: "" });
 }
 
 function startCompose(c) {
-  S.compose = Object.assign({to:"", cc:"", bcc:"", subject:"", body:"", draft_id:null}, c);
+  S.compose = {
+    to: c.to || "", cc: c.cc || "", bcc: c.bcc || "",
+    subject: c.subject || "", body: c.body || "",
+    draft_id: c.draft_id || null
+  };
   S.view = "compose";
   S.currentMsg = null;
   renderCompose();
 }
 
 function renderCompose() {
-  const v = document.getElementById("content");
-  const c = S.compose;
-  const title = c.draft_id ? "Редактирование черновика" :
-    (c.to ? "Ответ на письмо" : "Новое письмо");
-  v.innerHTML = `
-    <div class="compose">
-      <h2>${esc(title)}</h2>
-      <div class="row">
-        <label>Кому:</label>
-        <div class="val">
-          <input type="text" id="c_to" value="${esc(c.to)}" placeholder="user@domain, user2@domain2">
-          <div class="hint">Через запятую. Можно отправить на другой сервер, например: bob@other.example.com</div>
-        </div>
-      </div>
-      <div class="row">
-        <label>Копия:</label>
-        <div class="val"><input type="text" id="c_cc" value="${esc(c.cc)}" placeholder="(необязательно)"></div>
-      </div>
-      <div class="row">
-        <label>Скрытая:</label>
-        <div class="val"><input type="text" id="c_bcc" value="${esc(c.bcc)}" placeholder="(необязательно)"></div>
-      </div>
-      <div class="row">
-        <label>Тема:</label>
-        <div class="val"><input type="text" id="c_subject" value="${esc(c.subject)}"></div>
-      </div>
-      <div class="row">
-        <label>Текст:</label>
-        <div class="val">
-          <textarea id="c_body" placeholder="Текст письма…">${esc(c.body)}</textarea>
-          <div class="hint">Подсказка: Ctrl+Enter — отправить сразу.</div>
-        </div>
-      </div>
-      <div class="buttons">
-        <button class="primary big" onclick="sendCompose()">✉ Отправить</button>
-        <button onclick="saveDraft()">📝 Сохранить черновик</button>
-        <button onclick="cancelCompose()">Отмена</button>
-      </div>
-    </div>`;
+  var v = document.getElementById("content");
+  var c = S.compose;
+  var title = c.draft_id ? "Редактирование черновика" : (c.to ? "Ответ на письмо" : "Новое письмо");
 
-  const ta = document.getElementById("c_body");
-  ta.addEventListener("keydown", e => {
+  var html = '';
+  html += '<div class="compose">';
+  html += '<h2>' + esc(title) + '</h2>';
+
+  html += '<div class="row"><label>Кому:</label><div class="val">';
+  html += '<input type="text" id="c_to" value="' + esc(c.to) + '" placeholder="user@domain, user2@domain2">';
+  html += '<div class="hint">Через запятую. Можно на другой сервер: bob@other.example.com</div>';
+  html += '</div></div>';
+
+  html += '<div class="row"><label>Копия:</label><div class="val">';
+  html += '<input type="text" id="c_cc" value="' + esc(c.cc) + '" placeholder="(необязательно)">';
+  html += '</div></div>';
+
+  html += '<div class="row"><label>Скрытая:</label><div class="val">';
+  html += '<input type="text" id="c_bcc" value="' + esc(c.bcc) + '" placeholder="(необязательно)">';
+  html += '</div></div>';
+
+  html += '<div class="row"><label>Тема:</label><div class="val">';
+  html += '<input type="text" id="c_subject" value="' + esc(c.subject) + '">';
+  html += '</div></div>';
+
+  html += '<div class="row"><label>Текст:</label><div class="val">';
+  html += '<textarea id="c_body" placeholder="Текст письма...">' + esc(c.body) + '</textarea>';
+  html += '<div class="hint">Ctrl+Enter &mdash; отправить сразу.</div>';
+  html += '</div></div>';
+
+  html += '<div class="buttons">';
+  html += '<button class="primary big" onclick="sendCompose()">Отправить</button>';
+  html += '<button onclick="saveDraft()">Сохранить черновик</button>';
+  html += '<button onclick="cancelCompose()">Отмена</button>';
+  html += '</div>';
+
+  html += '</div>';
+  v.innerHTML = html;
+
+  var ta = document.getElementById("c_body");
+  ta.addEventListener("keydown", function(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
       sendCompose();
@@ -1194,157 +1104,165 @@ function cancelCompose() {
 }
 
 function splitAddrs(s) {
-  return (s || "").split(/[,;\s]+/).map(x => x.trim()).filter(Boolean);
+  if (!s) return [];
+  return s.split(/[,;\s]+/).map(function(x) { return x.trim(); }).filter(function(x) { return !!x; });
 }
 
-async function sendCompose() {
-  const to = document.getElementById("c_to").value;
-  const cc = document.getElementById("c_cc").value;
-  const bcc = document.getElementById("c_bcc").value;
-  const subject = document.getElementById("c_subject").value;
-  const body = document.getElementById("c_body").value;
-  const any = splitAddrs(to).length + splitAddrs(cc).length + splitAddrs(bcc).length;
+function sendCompose() {
+  var to = document.getElementById("c_to").value;
+  var cc = document.getElementById("c_cc").value;
+  var bcc = document.getElementById("c_bcc").value;
+  var subject = document.getElementById("c_subject").value;
+  var body = document.getElementById("c_body").value;
+
+  var any = splitAddrs(to).length + splitAddrs(cc).length + splitAddrs(bcc).length;
   if (!any) {
-    alert("Укажите получателя в поле «Кому».");
+    alert("Укажите получателя в поле \"Кому\".");
     document.getElementById("c_to").focus();
     return;
   }
-  try {
-    const d = await api("/api/send", {
-      method: "POST",
-      body: JSON.stringify({
-        to: splitAddrs(to), cc: splitAddrs(cc), bcc: splitAddrs(bcc),
-        subject, body,
-      }),
-    });
+
+  var payload = {
+    to: splitAddrs(to),
+    cc: splitAddrs(cc),
+    bcc: splitAddrs(bcc),
+    subject: subject,
+    body: body
+  };
+
+  api("/api/send", { method: "POST", body: JSON.stringify(payload) }).then(function(d) {
+    var cleanup = Promise.resolve();
     if (S.compose && S.compose.draft_id) {
-      await api("/api/drafts/" + S.compose.draft_id, {method:"DELETE"}).catch(()=>{});
+      cleanup = api("/api/drafts/" + S.compose.draft_id, { method: "DELETE" }).catch(function(){});
     }
+    return cleanup.then(function() { return d; });
+  }).then(function(d) {
     if (d.status === "partial") {
       alert("Письмо отправлено частично. Не доставлено:\n" + d.errors.join("\n"));
     }
     S.compose = null;
     openFolder("sent");
-  } catch (e) {
+  }).catch(function(e) {
     alert("Ошибка отправки: " + e.message);
-  }
+  });
 }
 
-async function saveDraft() {
-  const to = document.getElementById("c_to").value;
-  const cc = document.getElementById("c_cc").value;
-  const bcc = document.getElementById("c_bcc").value;
-  const subject = document.getElementById("c_subject").value;
-  const body = document.getElementById("c_body").value;
-  try {
-    if (S.compose && S.compose.draft_id) {
-      await api("/api/drafts/" + S.compose.draft_id, {method:"DELETE"}).catch(()=>{});
-    }
-    const d = await api("/api/drafts", {
-      method: "POST",
-      body: JSON.stringify({to, cc, bcc, subject, body}),
-    });
+function saveDraft() {
+  var payload = {
+    to: document.getElementById("c_to").value,
+    cc: document.getElementById("c_cc").value,
+    bcc: document.getElementById("c_bcc").value,
+    subject: document.getElementById("c_subject").value,
+    body: document.getElementById("c_body").value
+  };
+  var cleanup = Promise.resolve();
+  if (S.compose && S.compose.draft_id) {
+    cleanup = api("/api/drafts/" + S.compose.draft_id, { method: "DELETE" }).catch(function(){});
+  }
+  cleanup.then(function() {
+    return api("/api/drafts", { method: "POST", body: JSON.stringify(payload) });
+  }).then(function(d) {
     S.compose.draft_id = d.id;
-    alert("Черновик сохранён. Найти его можно в папке «Черновики».");
+    alert("Черновик сохранён. Найти его можно в папке \"Черновики\".");
     refreshFolders();
-  } catch (e) { alert(e.message); }
+  }).catch(function(e) { alert(e.message); });
 }
 
 /* ---------- reply / forward ---------- */
 function quoteBody(m) {
-  const quoted = (m.body || "").split("\n").map(l => "> " + l).join("\n");
+  var quoted = (m.body || "").split("\n").map(function(l) { return "> " + l; }).join("\n");
   return "\n\n--- " + fmtFull(m.ts) + ", " + m.from + " пишет: ---\n" + quoted;
 }
+
 function replyCurrent(all) {
-  const m = S.currentMsg;
+  var m = S.currentMsg;
   if (!m) return;
-  const to = m.from;
-  let cc = "";
+  var to = m.from;
+  var cc = "";
   if (all) {
-    const me = meAddr();
-    cc = (m.to.concat(m.cc)).filter(a => a !== me && a !== to).join(", ");
+    var me = meAddr();
+    cc = (m.to || []).concat(m.cc || []).filter(function(a) { return a !== me && a !== to; }).join(", ");
   }
-  const subj = /^Re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
-  startCompose({to, cc, bcc:"", subject: subj, body: quoteBody(m)});
+  var subj = /^Re:/i.test(m.subject || "") ? m.subject : "Re: " + (m.subject || "");
+  startCompose({ to: to, cc: cc, bcc: "", subject: subj, body: quoteBody(m) });
 }
+
 function forwardCurrent() {
-  const m = S.currentMsg;
+  var m = S.currentMsg;
   if (!m) return;
-  const subj = /^Fwd:/i.test(m.subject || "") ? m.subject : "Fwd: " + (m.subject || "");
-  const hdr = "---------- Пересылаемое сообщение ----------\n"
-            + "От: " + m.from + "\n"
-            + "Кому: " + m.to.join(", ") + "\n"
-            + (m.cc && m.cc.length ? "Копия: " + m.cc.join(", ") + "\n" : "")
-            + "Дата: " + fmtFull(m.ts) + "\n"
-            + "Тема: " + (m.subject || "") + "\n\n";
-  startCompose({to:"", cc:"", bcc:"", subject: subj, body: hdr + (m.body || "")});
+  var subj = /^Fwd:/i.test(m.subject || "") ? m.subject : "Fwd: " + (m.subject || "");
+  var hdr = "---------- Пересылаемое сообщение ----------\n"
+          + "От: " + m.from + "\n"
+          + "Кому: " + (m.to || []).join(", ") + "\n";
+  if (m.cc && m.cc.length) hdr += "Копия: " + m.cc.join(", ") + "\n";
+  hdr += "Дата: " + fmtFull(m.ts) + "\n";
+  hdr += "Тема: " + (m.subject || "") + "\n\n";
+  startCompose({ to: "", cc: "", bcc: "", subject: subj, body: hdr + (m.body || "") });
 }
 
 /* ---------- contacts ---------- */
-async function showContacts() {
+function showContacts() {
   S.view = "contacts";
   S.currentMsg = null;
   renderFolders();
-  const v = document.getElementById("content");
-  try {
-    const d = await api("/api/contacts");
-    const localRows = d.local_users.length
-      ? d.local_users.map(a => `
-          <tr>
-            <td><a onclick="composeTo('${esc(a)}')">${esc(a)}</a></td>
-            <td class="act"><button onclick="composeTo('${esc(a)}')">✎ Написать</button></td>
-          </tr>`).join("")
-      : `<tr><td colspan="2" class="empty">На этом сервере пока нет других пользователей.</td></tr>`;
-    const rows = d.contacts.length
-      ? d.contacts.map(a => `
-          <tr>
-            <td><a onclick="composeTo('${esc(a)}')">${esc(a)}</a></td>
-            <td class="act"><button onclick="composeTo('${esc(a)}')">✎ Написать</button></td>
-          </tr>`).join("")
-      : `<tr><td colspan="2" class="empty">Пока никого нет. Начните переписку или добавьте адрес вручную.</td></tr>`;
+  var v = document.getElementById("content");
+  api("/api/contacts").then(function(d) {
+    var localRows = d.local_users.length
+      ? d.local_users.map(function(a) {
+          return '<tr><td><a onclick="composeTo(\'' + esc(a) + '\')">' + esc(a) + '</a></td>'
+               + '<td class="act"><button onclick="composeTo(\'' + esc(a) + '\')">Написать</button></td></tr>';
+        }).join("")
+      : '<tr><td colspan="2" class="empty">На этом сервере пока нет других пользователей.</td></tr>';
 
-    v.innerHTML = `
-      <div class="panel-toolbar">
-        <button class="primary" onclick="newCompose()">✎ Написать письмо</button>
-        <button onclick="openFolder(S.folder || 'inbox')">← К письмам</button>
-      </div>
-      <div class="contacts">
-        <h2>Контакты</h2>
-        <div class="addbox">
-          <input id="new_contact" placeholder="user@domain — добавить адрес в контакты">
-          <button onclick="addContactForm()">Добавить</button>
-        </div>
+    var rows = d.contacts.length
+      ? d.contacts.map(function(a) {
+          return '<tr><td><a onclick="composeTo(\'' + esc(a) + '\')">' + esc(a) + '</a></td>'
+               + '<td class="act"><button onclick="composeTo(\'' + esc(a) + '\')">Написать</button></td></tr>';
+        }).join("")
+      : '<tr><td colspan="2" class="empty">Пока никого нет. Начните переписку или добавьте адрес вручную.</td></tr>';
 
-        <div class="section">Пользователи сервера ${SERVER_DOMAIN}</div>
-        <table>${localRows}</table>
-
-        <div class="section">Все контакты</div>
-        <table>${rows}</table>
-      </div>`;
-  } catch (e) {
-    v.innerHTML = `<div class="empty">Ошибка: ${esc(e.message)}</div>`;
-  }
+    var html = '';
+    html += '<div class="panel-toolbar">';
+    html += '<button class="primary" onclick="newCompose()">Написать письмо</button>';
+    html += '<button onclick="openFolder(S.folder || \'inbox\')">&larr; К письмам</button>';
+    html += '</div>';
+    html += '<div class="contacts">';
+    html += '<h2>Контакты</h2>';
+    html += '<div class="addbox">';
+    html += '<input id="new_contact" placeholder="user@domain — добавить в контакты">';
+    html += '<button onclick="addContactForm()">Добавить</button>';
+    html += '</div>';
+    html += '<div class="section">Пользователи сервера ' + esc(SERVER_DOMAIN) + '</div>';
+    html += '<table>' + localRows + '</table>';
+    html += '<div class="section">Все контакты</div>';
+    html += '<table>' + rows + '</table>';
+    html += '</div>';
+    v.innerHTML = html;
+  }).catch(function(e) {
+    v.innerHTML = '<div class="empty">Ошибка: ' + esc(e.message) + '</div>';
+  });
 }
 
 function composeTo(a) {
-  startCompose({to: a, cc:"", bcc:"", subject:"", body:""});
+  startCompose({ to: a, cc: "", bcc: "", subject: "", body: "" });
 }
 
-async function addContactForm() {
-  const el = document.getElementById("new_contact");
-  const v = (el.value || "").trim().toLowerCase();
+function addContactForm() {
+  var el = document.getElementById("new_contact");
+  var v = (el.value || "").trim().toLowerCase();
   if (!v || v.indexOf("@") < 0) return alert("Формат: user@domain");
-  try {
-    await api("/api/contacts", {method:"POST", body: JSON.stringify({address: v})});
-    el.value = "";
-    showContacts();
-  } catch (e) { alert(e.message); }
+  api("/api/contacts", { method: "POST", body: JSON.stringify({ address: v }) })
+    .then(function() {
+      el.value = "";
+      showContacts();
+    })
+    .catch(function(e) { alert(e.message); });
 }
 
 /* ---------- polling ---------- */
 function startPolling() {
   if (S.pollTimer) clearInterval(S.pollTimer);
-  S.pollTimer = setInterval(() => {
+  S.pollTimer = setInterval(function() {
     if (!S.token) return;
     if (S.view === "list") { refreshFolders(); refreshList(); }
     else { refreshFolders(); }
@@ -1352,11 +1270,19 @@ function startPolling() {
 }
 
 /* ---------- init ---------- */
-renderShell();
-if (S.token) {
-  refreshFolders();
-  openFolder("inbox");
-  startPolling();
+function boot() {
+  renderShell();
+  if (S.token) {
+    refreshFolders();
+    openFolder("inbox");
+    startPolling();
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
 }
 </script>
 </body>
