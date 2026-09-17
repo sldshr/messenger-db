@@ -1,4 +1,3 @@
-```python
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -2181,4 +2180,3 @@ if __name__ == "__main__":
         port=8000,
         reload=False,
     )
-```
