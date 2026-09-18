@@ -130,10 +130,10 @@ CONN_WINDOW        = 10
 CONN_MAX           = 20
 MAX_WS_FRAME       = MAX_MSG_CHARS * 4 + 4096
 
-SCRYPT_N       = 2 ** 15
-SCRYPT_R       = 8
-SCRYPT_P       = 1
-SCRYPT_MAXMEM  = 256 * 1024 * 1024
+SCRYPT_N        = 2 ** 15
+SCRYPT_R        = 8
+SCRYPT_P        = 1
+SCRYPT_MAXMEM   = 256 * 1024 * 1024
 SCRYPT_PARALLEL = 4
 
 
@@ -146,7 +146,7 @@ def log_err(tag: str, exc: BaseException):
 # [type:uint8][length:uint32 BE][JSON UTF-8]
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
  T_HELLO, T_STATUS, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
- T_CHAT_END, T_LOGOUT, T_READ, T_UNFOCUS, T_UNREAD) = range(1, 18)
+ T_CHAT_END, T_LOGOUT, T_READ) = range(1, 16)
 
 _HDR = struct.Struct(">BI")
 
@@ -242,13 +242,12 @@ def ws_ip(ws: WebSocket) -> str:
 
 # ============================ CLIENT ============================
 class Client:
-    __slots__ = ("ws", "login", "lock", "ip", "active_chat")
+    __slots__ = ("ws", "login", "lock", "ip")
 
     def __init__(self, ws: WebSocket, ip: str):
         self.ws = ws
         self.login: Optional[str] = None
         self.ip = ip
-        self.active_chat: Optional[str] = None
         self.lock = asyncio.Lock()
 
     async def send(self, t: int, o: Any):
@@ -435,16 +434,15 @@ async def handle_msg(c: Client, obj: dict):
             messages[key] = dq
         dq.append(msg)
 
+        # эхо отправителю (без n)
         await c.send(T_MSG, msg)
 
+        # получателю — инкрементим счётчик и включаем абсолютное значение в T_MSG
+        peer["unread"][c.login] = peer["unread"].get(c.login, 0) + 1
+        n = peer["unread"][c.login]
         target = online.get(to_login)
         if target is not None:
-            if target.active_chat != c.login:
-                peer["unread"][c.login] = peer["unread"].get(c.login, 0) + 1
-                await target.send(T_UNREAD, {"u": c.login, "n": peer["unread"][c.login]})
-            await target.send(T_MSG, msg)
-        else:
-            peer["unread"][c.login] = peer["unread"].get(c.login, 0) + 1
+            await target.send(T_MSG, {**msg, "n": n})
     except Exception as e:
         log_err("msg", e)
         await c.send_error("SERVER", "Не удалось доставить сообщение",
@@ -512,23 +510,16 @@ async def handle_chat_end(c: Client, obj: dict):
 
 
 async def handle_read(c: Client, obj: dict):
+    """Пользователь открыл чат — обнуляем серверный счётчик непрочитанных."""
     try:
         peer = (obj.get("u") or "").strip().lower()
         if not valid_login(peer):
             return
-        c.active_chat = peer
         u = users.get(c.login)
         if u:
             u["unread"].pop(peer, None)
     except Exception as e:
         log_err("read", e)
-
-
-async def handle_unfocus(c: Client, obj: dict):
-    try:
-        c.active_chat = None
-    except Exception as e:
-        log_err("unfocus", e)
 
 
 async def handle_logout(c: Client, obj: dict):
@@ -544,25 +535,46 @@ async def handle_logout(c: Client, obj: dict):
 def _self_test() -> list[tuple[str, bool]]:
     checks: list[tuple[str, bool]] = []
 
+    # 1. scrypt
     try:
-        h = hashlib.scrypt(b"x", salt=b"0" * 16, n=2 ** 14, r=8, p=1,
-                           dklen=32, maxmem=128 * 1024 * 1024)
-        checks.append(("scrypt", len(h) == 32))
+        h = hashlib.scrypt(b"x", salt=b"0" * 16, n=2 ** 15, r=8, p=1,
+                           dklen=32, maxmem=256 * 1024 * 1024)
+        checks.append(("scrypt-2^15", len(h) == 32))
     except Exception:
-        checks.append(("scrypt", False))
+        checks.append(("scrypt-2^15", False))
 
+    # 2. protocol round-trip x10000
     try:
         ok = True
-        for i in range(1000):
-            b = pack(T_MSG, {"i": str(i), "x": "привет" * (i % 10), "y": [1, 2, 3]})
+        for i in range(10000):
+            b = pack(T_MSG, {"i": str(i), "x": "hello" * (i % 20), "y": [1, 2, 3]})
             t, o = unpack(b)
             if t != T_MSG or o["i"] != str(i):
                 ok = False
                 break
-        checks.append(("protocol", ok))
+        checks.append(("protocol-10k", ok))
     except Exception:
-        checks.append(("protocol", False))
+        checks.append(("protocol-10k", False))
 
+    # 3. unicode (эмодзи, кириллица, RTL, surrogates)
+    try:
+        s = "привет 🌍 hello مرحبا 世界 \U0001F600"
+        b = pack(T_MSG, {"x": s})
+        _, o = unpack(b)
+        checks.append(("unicode", o["x"] == s))
+    except Exception:
+        checks.append(("unicode", False))
+
+    # 4. big payload
+    try:
+        big = "a" * 4000
+        b = pack(T_MSG, {"x": big})
+        _, o = unpack(b)
+        checks.append(("payload-4k", o["x"] == big and len(b) > 4000))
+    except Exception:
+        checks.append(("payload-4k", False))
+
+    # 5. rate limiter
     try:
         bucket = {}
         a = all(check_rate(bucket, "k", 5, 1.0) for _ in range(5))
@@ -571,19 +583,31 @@ def _self_test() -> list[tuple[str, bool]]:
     except Exception:
         checks.append(("rate_limiter", False))
 
+    # 6. validation
     try:
         ok = (valid_login("alice") and valid_login("bob.42") and
               not valid_login("a") and not valid_login("bad name") and
-              not valid_login("") and not valid_login("a" * 30))
+              not valid_login("") and not valid_login("a" * 30) and
+              valid_pw("pass1234") and not valid_pw("short") and
+              not valid_pw("x" * 200))
         checks.append(("validation", ok))
     except Exception:
         checks.append(("validation", False))
 
+    # 7. pair_key инвариант
     try:
-        ok = (pair_key("a", "b") == pair_key("b", "a") == ("a", "b"))
+        ok = (pair_key("a", "b") == pair_key("b", "a") == ("a", "b") and
+              pair_key("a", "a") == ("a", "a"))
         checks.append(("pair_key", ok))
     except Exception:
         checks.append(("pair_key", False))
+
+    # 8. constant-time сравнение
+    try:
+        ok = secrets.compare_digest(b"abc", b"abc") and not secrets.compare_digest(b"abc", b"abd")
+        checks.append(("ct_compare", ok))
+    except Exception:
+        checks.append(("ct_compare", False))
 
     return checks
 
@@ -674,8 +698,6 @@ async def ws_handler(ws: WebSocket):
                 await handle_chat_end(c, obj)
             elif t == T_READ and c.login:
                 await handle_read(c, obj)
-            elif t == T_UNFOCUS and c.login:
-                await handle_unfocus(c, obj)
             elif t == T_LOGOUT and c.login:
                 await handle_logout(c, obj)
             elif t == T_PING:
@@ -722,7 +744,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   --bg-bubble-me:#2563eb;
   --fg:#111827;
   --fg-muted:#6b7280;
-  --fg-on-accent:#ffffff;
   --border:#e5e7eb;
   --border-strong:#d1d5db;
   --accent:#2563eb;
@@ -743,7 +764,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   --bg-bubble-me:#2563eb;
   --fg:#e5e7eb;
   --fg-muted:#9ca3af;
-  --fg-on-accent:#ffffff;
   --border:#2a2e37;
   --border-strong:#3a3f4b;
   --accent:#2563eb;
@@ -805,7 +825,7 @@ button.btn-secondary.busy::after{
 .theme-btn{position:absolute;top:14px;right:14px}
 .tabs{display:flex;background:var(--bg-input);border-radius:9px;padding:3px;margin-bottom:18px}
 .tabs button{
-  flex:1;color:var(--fg-muted);padding:8px;border-radius:7px;
+  flex:1;color:var(--fg-muted);padding:9px;border-radius:7px;
   font-weight:500;font-size:13px;transition:all .15s;
 }
 .tabs button.active{
@@ -837,7 +857,7 @@ button.btn-secondary.busy::after{
 #app.on{display:flex}
 
 #sidebar{
-  width:300px;flex-shrink:0;background:var(--bg-sidebar);
+  width:320px;flex-shrink:0;background:var(--bg-sidebar);
   display:flex;flex-direction:column;border-right:1px solid var(--border);
 }
 .sidebar-header{
@@ -859,10 +879,10 @@ button.btn-secondary.busy::after{
   display:flex;align-items:center;gap:5px}
 .dot-mini{width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0}
 .icon-btn{
-  color:var(--fg-muted);padding:7px;border-radius:7px;
+  color:var(--fg-muted);padding:8px;border-radius:8px;
   display:flex;align-items:center;justify-content:center;
   transition:background .12s,color .12s;flex-shrink:0;
-  min-width:32px;min-height:32px;
+  min-width:36px;min-height:36px;
 }
 .icon-btn:hover{background:var(--bg-hover);color:var(--fg)}
 .icon-btn.danger{color:var(--red)}
@@ -882,9 +902,9 @@ button.btn-secondary.busy::after{
 }
 
 .contact{
-  display:flex;align-items:center;gap:10px;padding:9px 10px;
+  display:flex;align-items:center;gap:10px;padding:10px;
   border-radius:8px;cursor:pointer;transition:background .1s;
-  position:relative;min-height:52px;
+  position:relative;min-height:56px;
 }
 .contact:hover{background:var(--bg-hover)}
 .contact.active{background:var(--bg-active)}
@@ -906,22 +926,19 @@ button.btn-secondary.busy::after{
 .contact.unread .contact-preview{color:var(--fg);font-weight:500}
 .badge{
   background:var(--red);color:#fff;font-size:11px;font-weight:700;
-  min-width:20px;height:20px;padding:0 6px;border-radius:10px;
-  display:flex;align-items:center;justify-content:center;
+  min-width:22px;height:22px;padding:0 7px;border-radius:11px;
+  display:inline-flex;align-items:center;justify-content:center;
   flex-shrink:0;line-height:1;letter-spacing:-.01em;
 }
 .contact .pin-btn{
   color:var(--fg-muted);padding:5px;border-radius:6px;
   display:none;flex-shrink:0;align-items:center;justify-content:center;
-  transition:all .12s;min-width:26px;min-height:26px;
+  transition:all .12s;min-width:28px;min-height:28px;
 }
-.contact:hover .pin-btn{display:flex}
 .contact.pinned .pin-btn{display:flex;color:var(--accent)}
+.contact:hover .pin-btn{display:flex}
+.contact:hover .badge{display:none}
 .contact .pin-btn:hover{background:var(--bg-active)}
-@media (hover:none){
-  .contact .pin-btn{display:flex;opacity:.35}
-  .contact.pinned .pin-btn{opacity:1;color:var(--accent)}
-}
 
 #chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-app)}
 #emptyState{
@@ -981,12 +998,12 @@ button.btn-secondary.busy::after{
 #inp{
   flex:1;background:var(--bg-input);border:1px solid transparent;
   color:var(--fg);padding:11px 16px;border-radius:10px;outline:none;
-  font-size:15px;min-width:0;transition:border .12s;
+  font-size:16px;min-width:0;transition:border .12s;
 }
 #inp:focus{border-color:var(--accent)}
 #inp::placeholder{color:var(--fg-muted)}
 #sendBtn{
-  width:38px;height:38px;border-radius:9px;background:var(--accent);
+  width:44px;height:44px;border-radius:10px;background:var(--accent);
   color:#fff;display:flex;align-items:center;justify-content:center;
   flex-shrink:0;transition:background .12s,transform .06s;
 }
@@ -1010,24 +1027,24 @@ button.btn-secondary.busy::after{
 .modal input{
   width:100%;padding:12px 14px;border-radius:8px;
   border:1px solid var(--border);background:var(--bg-input);
-  font-size:15px;outline:none;margin-bottom:10px;color:var(--fg);
+  font-size:16px;outline:none;margin-bottom:10px;color:var(--fg);
 }
 .modal input:focus{border-color:var(--accent)}
 .modal .err{color:var(--red);font-size:13px;min-height:18px;margin-bottom:8px}
 .modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:6px}
 .btn-secondary{
-  background:var(--bg-input);padding:10px 16px;border-radius:8px;
+  background:var(--bg-input);padding:11px 18px;border-radius:8px;
   font-weight:500;color:var(--fg);transition:background .12s;font-size:14px;
 }
 .btn-secondary:hover{background:var(--bg-hover)}
 .btn-primary{
-  background:var(--accent);color:#fff;padding:10px 20px;
+  background:var(--accent);color:#fff;padding:11px 22px;
   border-radius:8px;font-weight:600;font-size:14px;
   transition:background .12s;
 }
 .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
 .btn-danger{
-  background:var(--red);color:#fff;padding:10px 20px;
+  background:var(--red);color:#fff;padding:11px 22px;
   border-radius:8px;font-weight:600;font-size:14px;transition:opacity .12s;
 }
 .btn-danger:hover{opacity:.9}
@@ -1067,8 +1084,10 @@ button.btn-secondary.busy::after{
 }
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
+/* ============ MOBILE ============ */
 @media (max-width:720px){
   #app{position:relative;overflow:hidden}
+
   #sidebar{
     position:absolute;inset:0;width:100%;z-index:2;
     border-right:none;transition:transform .24s ease;
@@ -1080,8 +1099,41 @@ button.btn-secondary.busy::after{
   #app.chat-open #sidebar{transform:translateX(-22%)}
   #app.chat-open #chatPane{transform:translateX(0)}
   #backBtn{display:flex}
-  .m{max-width:84%}
-  .contact{padding:11px 12px;min-height:58px}
+
+  /* увеличенные touch-target */
+  .icon-btn{min-width:44px;min-height:44px;padding:10px}
+  .sidebar-header{padding:10px 12px}
+  .my-name{font-size:15px}
+  .my-sub{font-size:12px}
+
+  .contact{padding:14px 12px;min-height:68px;gap:12px}
+  .contact-name{font-size:15px}
+  .contact-preview{font-size:13px;margin-top:3px}
+  .badge{min-width:24px;height:24px;font-size:12px;border-radius:12px}
+
+  /* pin-btn в списке на мобиле не показываем — только через шапку чата */
+  .contact .pin-btn{display:none !important}
+
+  .conv-header{padding:10px 12px}
+  .peer-name{font-size:16px}
+  .peer-sub{font-size:12.5px}
+
+  .m{max-width:84%;font-size:15px;padding:9px 13px}
+
+  .modal{padding:22px 20px;border-radius:16px}
+  .modal h3{font-size:18px}
+  .modal input{padding:14px;font-size:16px}
+  .btn-primary,.btn-secondary,.btn-danger{padding:13px 22px;font-size:15px;min-height:46px}
+
+  #submitBtn{padding:14px;font-size:15px;min-height:48px}
+  .tabs button{padding:11px;font-size:14px}
+  .card{padding:24px 22px}
+  .card input[type=text],.card input[type=password]{padding:14px;font-size:16px}
+
+  #sendBtn{width:46px;height:46px}
+  #inp{padding:12px 16px}
+
+  #toast{bottom:calc(24px + env(safe-area-inset-bottom))}
 }
 </style>
 </head>
@@ -1130,17 +1182,17 @@ button.btn-secondary.busy::after{
         <div class="my-sub"><span class="dot-mini"></span>в сети</div>
       </div>
       <button class="icon-btn" id="themeBtn" title="Тема" aria-label="Тема">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
         </svg>
       </button>
       <button class="icon-btn" id="addBtn" title="Добавить чат" aria-label="Добавить">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
         </svg>
       </button>
       <button class="icon-btn" id="logoutBtn" title="Выйти" aria-label="Выйти">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M16 13v-2H7V8l-5 4 5 4v-3zM20 3h-8v2h8v14h-8v2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/>
         </svg>
       </button>
@@ -1162,7 +1214,7 @@ button.btn-secondary.busy::after{
     <div id="conversation">
       <div class="conv-header">
         <button class="icon-btn" id="backBtn" aria-label="Назад">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
           </svg>
         </button>
@@ -1171,10 +1223,10 @@ button.btn-secondary.busy::after{
           <div class="peer-sub" id="peerSub"></div>
         </div>
         <button class="icon-btn" id="pinActiveBtn" title="Закрепить/открепить" aria-label="Закрепить">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>
         </button>
         <button class="icon-btn danger" id="endChatBtn" title="Завершить чат" aria-label="Завершить чат">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
           </svg>
         </button>
@@ -1184,7 +1236,7 @@ button.btn-secondary.busy::after{
         <input id="inp" placeholder="Написать сообщение…" autocomplete="off"
                autocapitalize="sentences">
         <button id="sendBtn" aria-label="Отправить">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/>
           </svg>
         </button>
@@ -1294,7 +1346,7 @@ window.addEventListener("unhandledrejection", e => {
 /* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
            HELLO:8, STATUS:9, CONTACT_REQ:10, CONTACT_OK:11, CONTACT_ADD:12,
-           CHAT_END:13, LOGOUT:14, READ:15, UNFOCUS:16, UNREAD:17};
+           CHAT_END:13, LOGOUT:14, READ:15};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -1365,9 +1417,9 @@ let ws = null;
 let me = null;
 let sessionToken = null;
 let sessionPassword = null;
-let contacts = [];
-const threads = {};
-const unread = {};
+let contacts = [];       // [{uid, online}]
+const threads = {};      // uid -> [{id, from, to, text, ts}]
+const unread = {};       // uid -> int
 const seenIds = new Set();
 let activePeer = null;
 let reconnectAttempts = 0;
@@ -1470,22 +1522,25 @@ function renderContacts(){
     }
     info.append(nm, pv);
 
-    if (hasUnread && !isActive){
+    const pb = document.createElement("button");
+    pb.className = "pin-btn";
+    pb.title = isPinned ? "Открепить" : "Закрепить";
+    pb.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
+    pb.onclick = (ev) => {
+      ev.stopPropagation(); ev.preventDefault();
+      togglePin(c.uid);
+    };
+
+    el.append(sl, info);
+
+    if (hasUnread){
       const b = document.createElement("span");
       b.className = "badge";
       b.textContent = unread[c.uid] > 99 ? "99+" : unread[c.uid];
-      el.append(sl, info, b);
-    } else {
-      const pb = document.createElement("button");
-      pb.className = "pin-btn";
-      pb.title = isPinned ? "Открепить" : "Закрепить";
-      pb.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
-      pb.onclick = (ev) => {
-        ev.stopPropagation(); ev.preventDefault();
-        togglePin(c.uid);
-      };
-      el.append(sl, info, pb);
+      el.appendChild(b);
     }
+    el.appendChild(pb);
+
     box.appendChild(el);
   }
 }
@@ -1527,9 +1582,6 @@ function selectPeer(uid){
 }
 function goBack(){
   $("app").classList.remove("chat-open");
-  if (ws && ws.readyState === 1){
-    try { ws.send(pack(T.UNFOCUS, {})); } catch(e){}
-  }
 }
 function refreshPeerSub(){
   if (!activePeer) return;
@@ -1694,7 +1746,6 @@ function connect(){
 async function handleFrame(type, obj){
   switch(type){
     case T.MSG: onIncomingMsg(obj); break;
-    case T.UNREAD: onUnread(obj); break;
     case T.CONTACT_OK: onContactOk(obj); break;
     case T.CONTACT_ADD: onContactAdd(obj); break;
     case T.CHAT_END: onChatEnded(obj.u); break;
@@ -1714,17 +1765,6 @@ async function handleFrame(type, obj){
       }
       break;
   }
-}
-
-function onUnread(obj){
-  const uid = obj.u, n = obj.n | 0;
-  if (!uid) return;
-  if (n > 0){
-    unread[uid] = n;
-  } else {
-    delete unread[uid];
-  }
-  renderContacts();
 }
 
 function onContactOk(obj){
@@ -1758,19 +1798,28 @@ function onIncomingMsg(m){
   if (!c){
     c = {uid: peer, online: null};
     contacts.push(c);
-    renderContacts();
   }
 
   const msg = {id: m.i, from: m.f, to: m.t, text: m.x, ts: m.s};
   (threads[peer] = threads[peer] || []).push(msg);
   threads[peer].sort((a,b) => a.ts - b.ts);
 
+  // Только для входящих: сервер прислал абсолютное значение unread
+  if (m.f !== me.uid && typeof m.n === "number"){
+    if (activePeer === peer){
+      unread[peer] = 0;
+      if (ws && ws.readyState === 1){
+        try { ws.send(pack(T.READ, {u: peer})); } catch(e){}
+      }
+    } else {
+      unread[peer] = m.n;
+    }
+  }
+
   if (activePeer === peer){
     appendMsg(msg);
-    renderContacts();
-  } else {
-    renderContacts();
   }
+  renderContacts();
 }
 
 function onChatEnded(peer){
@@ -1980,6 +2029,8 @@ async function onDisconnect(code, reason){
     }
     renderContacts();
     if (activePeer && ws.readyState === 1){
+      // пользователь всё ещё в чате — обнуляем счётчик для него
+      unread[activePeer] = 0;
       try { ws.send(pack(T.READ, {u: activePeer})); } catch(e){}
     }
     startHeartbeat();
@@ -2070,17 +2121,6 @@ $("endModal").addEventListener("click", e => {
 $("welcomeClose").onclick = () => $("welcomeModal").classList.remove("open");
 $("welcomeModal").addEventListener("click", e => {
   if (e.target === $("welcomeModal")) $("welcomeModal").classList.remove("open");
-});
-
-document.addEventListener("visibilitychange", () => {
-  if (!ws || ws.readyState !== 1) return;
-  try {
-    if (document.hidden){
-      ws.send(pack(T.UNFOCUS, {}));
-    } else if (activePeer){
-      ws.send(pack(T.READ, {u: activePeer}));
-    }
-  } catch(e){}
 });
 
 /* ================= AUTOLOGIN ================= */
