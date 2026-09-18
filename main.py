@@ -2,15 +2,15 @@
 """
 SDM — sldshr's direct messanger
 Кроссплатформенный мессенджер 1-на-1.
-История хранится на сервере (RAM). Клиент — тонкий, только UI.
+Вся история и счётчики непрочитанных — на сервере.
 """
 
-# ============================ CONFIG (правь под себя) ============================
-APP_NAME = "SDM"
-APP_SUB = "sldshr's direct messenger"
-DEFAULT_THEME = "system"      # "system" | "light" | "dark"
-WELCOME_MESSAGE = "Welcome to the official SDM community, Pls read the rules: dont spamming, dont fludding"          # если не пусто — показывается один раз при входе
-# =================================================================================
+# ============================ CONFIG ============================
+APP_NAME        = "SDM"
+APP_SUB         = "sldshr's direct messenger"
+DEFAULT_THEME   = "system"     # "system" | "light" | "dark"
+WELCOME_MESSAGE = ""           # если не пусто — показывается при первом входе
+# ================================================================
 
 import os
 import sys
@@ -19,9 +19,9 @@ import importlib
 import time
 
 # ============================ BOOT / DEPS ============================
-RESET = "\x1b[0m"; BOLD = "\x1b[1m"; DIM = "\x1b[2m"
-RED = "\x1b[31m"; GREEN = "\x1b[32m"; YELLOW = "\x1b[33m"
-BLUE = "\x1b[34m"; CYAN = "\x1b[36m"; WHITE = "\x1b[97m"
+RESET="\x1b[0m"; BOLD="\x1b[1m"; DIM="\x1b[2m"
+RED="\x1b[31m"; GREEN="\x1b[32m"; YELLOW="\x1b[33m"
+BLUE="\x1b[34m"; CYAN="\x1b[36m"; WHITE="\x1b[97m"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -46,12 +46,15 @@ REQUIRED = [("fastapi", "fastapi"), ("uvicorn", "uvicorn")]
 OPTIONAL = [("uvloop", "uvloop")]
 
 
-def check_deps():
+def _print_banner():
     print()
     print(_c(CYAN + BOLD, ASCII_SDM))
     print("   " + _c(DIM + WHITE, APP_SUB))
     print()
 
+
+def _check_deps() -> None:
+    _print_banner()
     missing = []
     for mod, pkg in REQUIRED:
         try:
@@ -60,39 +63,32 @@ def check_deps():
         except ImportError:
             print(f"  {_c(RED, '✗')}  {pkg}")
             missing.append(pkg)
-
     for mod, pkg in OPTIONAL:
         try:
             importlib.import_module(mod)
             print(f"  {_c(GREEN, '✓')}  {pkg}")
         except ImportError:
             print(f"  {_c(DIM, '·')}  {_c(DIM, pkg)}")
-
     print()
-
     if not missing:
         return
-
     try:
         ans = input(f"  Установить {', '.join(missing)}? [Y/n] ").strip().lower()
     except (KeyboardInterrupt, EOFError):
-        ans = "n"
-        print()
+        ans = "n"; print()
     if ans not in ("", "y", "yes", "д", "да"):
         print(_c(RED, "  Отменено."))
         sys.exit(1)
-
     rc = subprocess.call([sys.executable, "-m", "pip", "install"] + missing)
     if rc != 0:
         print(_c(RED, "  pip завершился с ошибкой."))
         sys.exit(1)
-
     print(_c(DIM, "\n  Перезапуск...\n"))
     time.sleep(0.5)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-check_deps()
+_check_deps()
 
 # ============================ IMPORTS ============================
 import asyncio
@@ -122,19 +118,22 @@ except ImportError:
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-PAIR_HISTORY_MAX = 500
-MAX_CONTACTS = 500
-MAX_MSG_CHARS = 4000
-SESSION_TTL_MS = 30 * 24 * 3600_000
-AUTH_WINDOW = 60
-AUTH_MAX = 15
-MSG_WINDOW = 10
-MSG_MAX = 30
+PAIR_HISTORY_MAX   = 1000
+MAX_CONTACTS       = 500
+MAX_MSG_CHARS      = 4000
+SESSION_TTL_MS     = 30 * 24 * 3600_000
+AUTH_WINDOW        = 60
+AUTH_MAX           = 15
+MSG_WINDOW         = 10
+MSG_MAX            = 30
+CONN_WINDOW        = 10
+CONN_MAX           = 20
+MAX_WS_FRAME       = MAX_MSG_CHARS * 4 + 4096
 
-SCRYPT_N = 2 ** 15
-SCRYPT_R = 8
-SCRYPT_P = 1
-SCRYPT_MAXMEM = 256 * 1024 * 1024
+SCRYPT_N       = 2 ** 15
+SCRYPT_R       = 8
+SCRYPT_P       = 1
+SCRYPT_MAXMEM  = 256 * 1024 * 1024
 SCRYPT_PARALLEL = 4
 
 
@@ -144,9 +143,11 @@ def log_err(tag: str, exc: BaseException):
 
 
 # ============================ PROTOCOL ============================
+# [type:uint8][length:uint32 BE][JSON UTF-8]
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
  T_HELLO, T_STATUS, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
- T_CHAT_END, T_LOGOUT) = range(1, 15)
+ T_CHAT_END, T_LOGOUT, T_READ, T_UNFOCUS, T_UNREAD) = range(1, 18)
+
 _HDR = struct.Struct(">BI")
 
 
@@ -167,15 +168,18 @@ watchers: dict[str, set] = {}
 messages: dict[tuple, deque] = {}
 sessions: dict[str, dict] = {}
 _auth_buckets: dict[str, deque] = {}
+_conn_buckets: dict[str, deque] = {}
 _scrypt_sem = asyncio.Semaphore(SCRYPT_PARALLEL)
 _DUMMY_SALT = os.urandom(16)
 
 
 # ============================ HELPERS ============================
 def scrypt_raw(pw: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(pw.encode("utf-8"), salt=salt,
-                          n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32,
-                          maxmem=SCRYPT_MAXMEM)
+    return hashlib.scrypt(
+        pw.encode("utf-8"), salt=salt,
+        n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32,
+        maxmem=SCRYPT_MAXMEM,
+    )
 
 
 async def scrypt_async(pw: str, salt: bytes) -> bytes:
@@ -238,11 +242,13 @@ def ws_ip(ws: WebSocket) -> str:
 
 # ============================ CLIENT ============================
 class Client:
-    __slots__ = ("ws", "login", "lock", "ip")
+    __slots__ = ("ws", "login", "lock", "ip", "active_chat")
+
     def __init__(self, ws: WebSocket, ip: str):
         self.ws = ws
         self.login: Optional[str] = None
         self.ip = ip
+        self.active_chat: Optional[str] = None
         self.lock = asyncio.Lock()
 
     async def send(self, t: int, o: Any):
@@ -294,7 +300,7 @@ async def handle_register(c: Client, obj: dict):
             return await c.send_error("SERVER", "Ошибка хэширования пароля",
                                       f"{type(e).__name__}: {e}")
 
-        users[login] = {"salt": salt, "pw": h, "contacts": set()}
+        users[login] = {"salt": salt, "pw": h, "contacts": set(), "unread": {}}
         watchers.setdefault(login, set())
         await _finish_auth(c, login, remember, new_pw_ok=True)
     except Exception as e:
@@ -338,7 +344,7 @@ async def handle_auth(c: Client, obj: dict):
             h = await scrypt_async(pw, u["salt"])
         except Exception as e:
             log_err("scrypt.auth", e)
-            return await c.send_error("SERVER", "Ошибка сервера при проверке пароля",
+            return await c.send_error("SERVER", "Ошибка сервера",
                                       f"{type(e).__name__}: {e}")
 
         if not secrets.compare_digest(u["pw"], h):
@@ -376,10 +382,13 @@ async def _finish_auth(c: Client, login: str, remember: bool,
             hist.extend(dq)
     hist.sort(key=lambda m: m["s"])
 
+    unread_payload = {p: n for p, n in u["unread"].items() if n > 0}
+
     payload = {
         "login": login,
         "contacts": contacts_payload,
         "history": hist,
+        "unread": unread_payload,
     }
 
     if new_pw_ok or remember:
@@ -427,9 +436,15 @@ async def handle_msg(c: Client, obj: dict):
         dq.append(msg)
 
         await c.send(T_MSG, msg)
+
         target = online.get(to_login)
-        if target:
+        if target is not None:
+            if target.active_chat != c.login:
+                peer["unread"][c.login] = peer["unread"].get(c.login, 0) + 1
+                await target.send(T_UNREAD, {"u": c.login, "n": peer["unread"][c.login]})
             await target.send(T_MSG, msg)
+        else:
+            peer["unread"][c.login] = peer["unread"].get(c.login, 0) + 1
     except Exception as e:
         log_err("msg", e)
         await c.send_error("SERVER", "Не удалось доставить сообщение",
@@ -477,8 +492,10 @@ async def handle_chat_end(c: Client, obj: dict):
         my = c.login
 
         users[my]["contacts"].discard(peer)
+        users[my]["unread"].pop(peer, None)
         if peer in users:
             users[peer]["contacts"].discard(my)
+            users[peer]["unread"].pop(my, None)
 
         w_me = watchers.get(my)
         if w_me: w_me.discard(peer)
@@ -494,6 +511,26 @@ async def handle_chat_end(c: Client, obj: dict):
         log_err("chat_end", e)
 
 
+async def handle_read(c: Client, obj: dict):
+    try:
+        peer = (obj.get("u") or "").strip().lower()
+        if not valid_login(peer):
+            return
+        c.active_chat = peer
+        u = users.get(c.login)
+        if u:
+            u["unread"].pop(peer, None)
+    except Exception as e:
+        log_err("read", e)
+
+
+async def handle_unfocus(c: Client, obj: dict):
+    try:
+        c.active_chat = None
+    except Exception as e:
+        log_err("unfocus", e)
+
+
 async def handle_logout(c: Client, obj: dict):
     try:
         tok = obj.get("token")
@@ -501,6 +538,67 @@ async def handle_logout(c: Client, obj: dict):
             drop_session(tok)
     except Exception as e:
         log_err("logout", e)
+
+
+# ============================ SELF-TEST ============================
+def _self_test() -> list[tuple[str, bool]]:
+    checks: list[tuple[str, bool]] = []
+
+    try:
+        h = hashlib.scrypt(b"x", salt=b"0" * 16, n=2 ** 14, r=8, p=1,
+                           dklen=32, maxmem=128 * 1024 * 1024)
+        checks.append(("scrypt", len(h) == 32))
+    except Exception:
+        checks.append(("scrypt", False))
+
+    try:
+        ok = True
+        for i in range(1000):
+            b = pack(T_MSG, {"i": str(i), "x": "привет" * (i % 10), "y": [1, 2, 3]})
+            t, o = unpack(b)
+            if t != T_MSG or o["i"] != str(i):
+                ok = False
+                break
+        checks.append(("protocol", ok))
+    except Exception:
+        checks.append(("protocol", False))
+
+    try:
+        bucket = {}
+        a = all(check_rate(bucket, "k", 5, 1.0) for _ in range(5))
+        b = not check_rate(bucket, "k", 5, 1.0)
+        checks.append(("rate_limiter", a and b))
+    except Exception:
+        checks.append(("rate_limiter", False))
+
+    try:
+        ok = (valid_login("alice") and valid_login("bob.42") and
+              not valid_login("a") and not valid_login("bad name") and
+              not valid_login("") and not valid_login("a" * 30))
+        checks.append(("validation", ok))
+    except Exception:
+        checks.append(("validation", False))
+
+    try:
+        ok = (pair_key("a", "b") == pair_key("b", "a") == ("a", "b"))
+        checks.append(("pair_key", ok))
+    except Exception:
+        checks.append(("pair_key", False))
+
+    return checks
+
+
+def _print_self_test(results):
+    print(_c(BOLD, "  self-test:"))
+    all_ok = True
+    for name, ok in results:
+        if ok:
+            print(f"    {_c(GREEN, '✓')}  {name}")
+        else:
+            print(f"    {_c(RED, '✗')}  {name}")
+            all_ok = False
+    print()
+    return all_ok
 
 
 # ============================ APP ============================
@@ -525,12 +623,25 @@ async def ws_handler(ws: WebSocket):
                     return
             except Exception:
                 pass
+    except Exception:
+        pass
+
+    ip = ws_ip(ws)
+    if not check_rate(_conn_buckets, ip, CONN_MAX, CONN_WINDOW):
+        try:
+            await ws.accept()
+            await ws.close(code=1013)
+        except Exception:
+            pass
+        return
+
+    try:
         await ws.accept()
     except Exception as e:
         log_err("ws.accept", e)
         return
 
-    c = Client(ws, ws_ip(ws))
+    c = Client(ws, ip)
     try:
         await c.send(T_HELLO, {
             "app_name": APP_NAME,
@@ -540,9 +651,11 @@ async def ws_handler(ws: WebSocket):
         })
         while True:
             raw = await ws.receive_bytes()
-            if len(raw) > MAX_MSG_CHARS * 4 + 4096:
+            if len(raw) > MAX_WS_FRAME:
                 await ws.close(code=1009)
                 return
+            if len(raw) < _HDR.size:
+                continue
             try:
                 t, obj = unpack(raw)
             except Exception as e:
@@ -559,6 +672,10 @@ async def ws_handler(ws: WebSocket):
                 await handle_contact_req(c, obj)
             elif t == T_CHAT_END and c.login:
                 await handle_chat_end(c, obj)
+            elif t == T_READ and c.login:
+                await handle_read(c, obj)
+            elif t == T_UNFOCUS and c.login:
+                await handle_unfocus(c, obj)
             elif t == T_LOGOUT and c.login:
                 await handle_logout(c, obj)
             elif t == T_PING:
@@ -582,9 +699,6 @@ async def ws_handler(ws: WebSocket):
 
 
 # ============================ HTML ============================
-# Плейсхолдеры {{APP_NAME}}, {{APP_SUB}}, {{DEFAULT_THEME}}, {{CFG_JSON}}
-# рендерятся ниже один раз при старте, чтобы клиент сразу видел правильные
-# названия без ожидания WS-подключения.
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -592,24 +706,52 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <title>{{APP_NAME}}</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%235865f2'/%3E%3Cpath d='M20 4H4a1 1 0 0 0-1 1v14l3.5-3.5H20a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1z' fill='white'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%232563eb'/%3E%3Cpath d='M18 4H6a2 2 0 0 0-2 2v12l3-3h11a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z' fill='white'/%3E%3C/svg%3E">
 <script>
   window.__CFG = {{CFG_JSON}};
 </script>
 <style>
 :root{
-  --bg-primary:#ffffff;--bg-secondary:#f2f3f5;--bg-tertiary:#e3e5e8;
-  --bg-hover:#e8eaed;--bg-active:#d7dae0;
-  --text-normal:#2e3338;--text-muted:#747f8d;--border:#e3e5e8;
-  --accent:#5865f2;--accent-hover:#4752c4;--green:#3ba55d;--red:#ed4245;
-  --toast-bg:#2e3338;--toast-fg:#fff;--card-shadow:0 10px 30px rgba(0,0,0,.10);
+  --bg-app:#ffffff;
+  --bg-sidebar:#f7f8fa;
+  --bg-panel:#ffffff;
+  --bg-hover:#eef0f3;
+  --bg-active:#e4e8ee;
+  --bg-input:#f2f4f7;
+  --bg-bubble:#f2f4f7;
+  --bg-bubble-me:#2563eb;
+  --fg:#111827;
+  --fg-muted:#6b7280;
+  --fg-on-accent:#ffffff;
+  --border:#e5e7eb;
+  --border-strong:#d1d5db;
+  --accent:#2563eb;
+  --accent-hover:#1d4ed8;
+  --green:#16a34a;
+  --red:#dc2626;
+  --shadow-lg:0 20px 40px rgba(15,23,42,.10);
+  --shadow-sm:0 1px 2px rgba(15,23,42,.06);
 }
 :root[data-theme="dark"]{
-  --bg-primary:#313338;--bg-secondary:#2b2d31;--bg-tertiary:#1e1f22;
-  --bg-hover:#35373c;--bg-active:#404249;
-  --text-normal:#dbdee1;--text-muted:#949ba4;--border:#26272b;
-  --accent:#5865f2;--accent-hover:#4752c4;--green:#23a55a;--red:#f23f43;
-  --toast-bg:#1e1f22;--toast-fg:#fff;--card-shadow:0 10px 30px rgba(0,0,0,.5);
+  --bg-app:#16181d;
+  --bg-sidebar:#1c1f26;
+  --bg-panel:#1c1f26;
+  --bg-hover:#23272f;
+  --bg-active:#2a2e37;
+  --bg-input:#23272f;
+  --bg-bubble:#23272f;
+  --bg-bubble-me:#2563eb;
+  --fg:#e5e7eb;
+  --fg-muted:#9ca3af;
+  --fg-on-accent:#ffffff;
+  --border:#2a2e37;
+  --border-strong:#3a3f4b;
+  --accent:#2563eb;
+  --accent-hover:#3b82f6;
+  --green:#22c55e;
+  --red:#ef4444;
+  --shadow-lg:0 20px 40px rgba(0,0,0,.45);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{
@@ -617,221 +759,329 @@ html,body{
   -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
   -webkit-touch-callout:none;
 }
-input,textarea{-webkit-user-select:text;user-select:text}
-.err-modal pre{-webkit-user-select:text;user-select:text}
+input,textarea,pre{-webkit-user-select:text;user-select:text}
 *{scrollbar-width:none;-ms-overflow-style:none}
 *::-webkit-scrollbar{width:0;height:0;display:none}
-body{background:var(--bg-primary);color:var(--text-normal);
-  font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  transition:background .15s,color .15s}
-button{font:inherit;cursor:pointer;color:inherit}
+body{
+  background:var(--bg-app);color:var(--fg);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  transition:background .18s,color .18s;
+  -webkit-font-smoothing:antialiased;
+}
+button{font:inherit;cursor:pointer;color:inherit;background:none;border:none}
 input{font:inherit}
 
 @keyframes spin{to{transform:rotate(360deg)}}
 button.busy{position:relative;color:transparent !important}
-button.busy::after{content:"";position:absolute;top:50%;left:50%;
-  width:18px;height:18px;margin:-9px 0 0 -9px;
+button.busy::after{
+  content:"";position:absolute;top:50%;left:50%;
+  width:16px;height:16px;margin:-8px 0 0 -8px;
   border:2px solid rgba(255,255,255,.35);border-top-color:#fff;
-  border-radius:50%;animation:spin .7s linear infinite}
-button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-color:var(--accent)}
+  border-radius:50%;animation:spin .7s linear infinite;
+}
+button.btn-secondary.busy::after{
+  border-color:rgba(128,128,128,.2);border-top-color:var(--accent);
+}
 
-#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  padding:20px;background:var(--bg-secondary);z-index:100}
-.card{width:100%;max-width:400px;background:var(--bg-primary);border-radius:14px;
-  padding:26px;box-shadow:var(--card-shadow);position:relative}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:18px}
-.brand-logo{width:42px;height:42px;border-radius:12px;background:var(--accent);
-  display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.brand-text{display:flex;flex-direction:column;line-height:1.2;min-width:0}
-.brand-title{font-weight:700;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.brand-sub{font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#login{
+  position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  padding:20px;background:var(--bg-sidebar);z-index:100;
+}
+.card{
+  width:100%;max-width:400px;background:var(--bg-panel);border-radius:14px;
+  padding:28px;box-shadow:var(--shadow-lg);position:relative;
+  border:1px solid var(--border);
+}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:22px}
+.brand-logo{
+  width:40px;height:40px;border-radius:10px;background:var(--accent);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.brand-text{display:flex;flex-direction:column;line-height:1.15;min-width:0}
+.brand-title{font-weight:700;font-size:16px;letter-spacing:-.01em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brand-sub{font-size:11px;color:var(--fg-muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
 .theme-btn{position:absolute;top:14px;right:14px}
-.tabs{display:flex;background:var(--bg-secondary);border-radius:9px;padding:3px;margin-bottom:18px}
-.tabs button{flex:1;background:none;border:none;color:var(--text-muted);
-  padding:9px;border-radius:7px;font-weight:500;transition:all .15s}
-.tabs button.active{background:var(--bg-primary);color:var(--text-normal);
-  box-shadow:0 1px 2px rgba(0,0,0,.08)}
-.card input[type=text],.card input[type=password]{width:100%;background:var(--bg-secondary);
-  border:1px solid transparent;color:var(--text-normal);padding:12px 14px;border-radius:8px;
-  outline:none;font-size:16px;margin-bottom:10px;transition:border .12s}
+.tabs{display:flex;background:var(--bg-input);border-radius:9px;padding:3px;margin-bottom:18px}
+.tabs button{
+  flex:1;color:var(--fg-muted);padding:8px;border-radius:7px;
+  font-weight:500;font-size:13px;transition:all .15s;
+}
+.tabs button.active{
+  background:var(--bg-panel);color:var(--fg);
+  box-shadow:var(--shadow-sm);
+}
+.card input[type=text],.card input[type=password]{
+  width:100%;background:var(--bg-input);border:1px solid transparent;
+  color:var(--fg);padding:12px 14px;border-radius:8px;outline:none;
+  font-size:15px;margin-bottom:10px;transition:border .12s;
+}
 .card input[type=text]:focus,.card input[type=password]:focus{border-color:var(--accent)}
-.remember{display:flex;align-items:center;gap:8px;font-size:13px;
-  color:var(--text-muted);margin:0 2px 12px;cursor:pointer}
-.remember input{width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer}
-#submitBtn{width:100%;background:var(--accent);color:#fff;border:none;padding:12px;
-  border-radius:8px;font-weight:600;margin-top:4px}
+.remember{
+  display:flex;align-items:center;gap:8px;font-size:13px;
+  color:var(--fg-muted);margin:0 2px 14px;cursor:pointer;
+}
+.remember input{width:15px;height:15px;margin:0;accent-color:var(--accent);cursor:pointer}
+#submitBtn{
+  width:100%;background:var(--accent);color:#fff;padding:12px;
+  border-radius:8px;font-weight:600;font-size:14px;
+  transition:background .12s;
+}
 #submitBtn:hover:not(:disabled){background:var(--accent-hover)}
 #submitBtn:disabled{cursor:default}
-#authErr{color:var(--red);font-size:13px;margin-top:10px;min-height:17px;text-align:center}
-#authNote{color:var(--text-muted);font-size:12px;margin-top:4px;text-align:center;line-height:1.35}
+#authErr{color:var(--red);font-size:13px;margin-top:12px;min-height:17px;text-align:center}
+#authNote{color:var(--fg-muted);font-size:12px;margin-top:4px;text-align:center;line-height:1.4}
 
 #app{display:none;height:100dvh}
 #app.on{display:flex}
-#sidebar{width:320px;flex-shrink:0;background:var(--bg-secondary);
+
+#sidebar{
+  width:300px;flex-shrink:0;background:var(--bg-sidebar);
   display:flex;flex-direction:column;border-right:1px solid var(--border);
-  transition:background .15s}
-.sidebar-header{display:flex;align-items:center;gap:6px;padding:10px 12px;
-  padding-top:calc(10px + env(safe-area-inset-top));
-  border-bottom:1px solid var(--border);background:var(--bg-primary)}
-.avatar{width:38px;height:38px;border-radius:50%;color:#fff;font-weight:600;
-  display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  font-size:15px;text-transform:uppercase}
-.my-info{flex:1;min-width:0;cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;
-  transition:background .12s}
+}
+.sidebar-header{
+  display:flex;align-items:center;gap:4px;padding:12px 14px;
+  padding-top:calc(12px + env(safe-area-inset-top));
+  border-bottom:1px solid var(--border);background:var(--bg-sidebar);
+}
+.my-info{
+  flex:1;min-width:0;cursor:pointer;border-radius:6px;padding:4px 6px;
+  transition:background .12s;
+}
 .my-info:hover{background:var(--bg-hover)}
 .my-info:active{background:var(--bg-active)}
-.my-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
-.my-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
-.icon-btn{background:none;border:none;color:var(--text-muted);padding:7px;
-  border-radius:8px;display:flex;align-items:center;justify-content:center;
-  transition:background .12s,color .12s;flex-shrink:0;min-width:34px;min-height:34px}
-.icon-btn:hover{background:var(--bg-hover);color:var(--text-normal)}
+.my-name{
+  font-weight:600;font-size:14px;letter-spacing:-.005em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.my-sub{font-size:11.5px;color:var(--fg-muted);margin-top:1px;
+  display:flex;align-items:center;gap:5px}
+.dot-mini{width:7px;height:7px;border-radius:50%;background:var(--green);flex-shrink:0}
+.icon-btn{
+  color:var(--fg-muted);padding:7px;border-radius:7px;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .12s,color .12s;flex-shrink:0;
+  min-width:32px;min-height:32px;
+}
+.icon-btn:hover{background:var(--bg-hover);color:var(--fg)}
 .icon-btn.danger{color:var(--red)}
-.icon-btn.danger:hover{background:rgba(237,66,69,.12);color:var(--red)}
+.icon-btn.danger:hover{background:rgba(220,38,38,.10);color:var(--red)}
 
-.sidebar-title{padding:14px 16px 6px;font-size:11px;font-weight:700;
-  color:var(--text-muted);text-transform:uppercase;letter-spacing:.02em;
-  display:flex;justify-content:space-between;align-items:center}
-.sidebar-title .count{font-weight:500;text-transform:none;letter-spacing:0}
+.sidebar-title{
+  padding:16px 16px 6px;font-size:11px;font-weight:600;
+  color:var(--fg-muted);text-transform:uppercase;letter-spacing:.06em;
+  display:flex;justify-content:space-between;align-items:center;
+}
+.sidebar-title .count{font-weight:500;text-transform:none;letter-spacing:0;color:var(--fg-muted)}
+
 #contacts{flex:1;overflow-y:auto;padding:0 8px 8px}
-.empty-list{padding:32px 22px;text-align:center;color:var(--text-muted);
-  font-size:13px;line-height:1.55}
-.contact{display:flex;align-items:center;gap:11px;padding:8px 10px;
-  border-radius:8px;cursor:pointer;transition:background .1s;position:relative;min-height:54px}
+.empty-list{
+  padding:36px 24px;text-align:center;color:var(--fg-muted);
+  font-size:13px;line-height:1.6;
+}
+
+.contact{
+  display:flex;align-items:center;gap:10px;padding:9px 10px;
+  border-radius:8px;cursor:pointer;transition:background .1s;
+  position:relative;min-height:52px;
+}
 .contact:hover{background:var(--bg-hover)}
 .contact.active{background:var(--bg-active)}
-.avatar-wrap{position:relative;flex-shrink:0}
-.status-dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
-  border-radius:50%;background:#b9bbbe;border:3px solid var(--bg-secondary)}
-.status-dot.online{background:var(--green)}
-.status-dot.unknown{background:#c7ccd1}
-.contact.active .status-dot{border-color:var(--bg-active)}
+.status-line{
+  width:8px;height:8px;border-radius:50%;flex-shrink:0;
+  background:var(--border-strong);transition:background .15s;
+}
+.status-line.online{background:var(--green)}
+.status-line.unknown{background:var(--border-strong)}
 .contact-info{flex:1;min-width:0}
-.contact-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;color:var(--text-normal);display:flex;align-items:center;gap:5px}
-.contact-name .pin-i{color:var(--accent);flex-shrink:0;display:none}
-.contact.pinned .contact-name .pin-i{display:inline-flex}
-.contact-preview{font-size:13px;color:var(--text-muted);overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
-.contact.unread .contact-preview{color:var(--text-normal);font-weight:500}
-.badge{background:var(--red);color:#fff;font-size:12px;font-weight:600;
-  min-width:20px;height:20px;padding:0 7px;border-radius:10px;
-  display:flex;align-items:center;justify-content:center;flex-shrink:0;line-height:1}
-.contact .pin-btn{background:none;border:none;color:var(--text-muted);
-  padding:4px;border-radius:6px;display:none;flex-shrink:0;
-  align-items:center;justify-content:center;transition:all .12s;min-width:28px;min-height:28px}
+.contact-name{
+  font-weight:600;font-size:14px;letter-spacing:-.005em;
+  color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.contact-preview{
+  font-size:12.5px;color:var(--fg-muted);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;margin-top:2px;
+}
+.contact.unread .contact-preview{color:var(--fg);font-weight:500}
+.badge{
+  background:var(--red);color:#fff;font-size:11px;font-weight:700;
+  min-width:20px;height:20px;padding:0 6px;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;line-height:1;letter-spacing:-.01em;
+}
+.contact .pin-btn{
+  color:var(--fg-muted);padding:5px;border-radius:6px;
+  display:none;flex-shrink:0;align-items:center;justify-content:center;
+  transition:all .12s;min-width:26px;min-height:26px;
+}
 .contact:hover .pin-btn{display:flex}
 .contact.pinned .pin-btn{display:flex;color:var(--accent)}
 .contact .pin-btn:hover{background:var(--bg-active)}
 @media (hover:none){
-  .contact .pin-btn{display:flex;opacity:.4}
+  .contact .pin-btn{display:flex;opacity:.35}
   .contact.pinned .pin-btn{opacity:1;color:var(--accent)}
 }
 
-#chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-primary)}
-#emptyState{flex:1;display:flex;flex-direction:column;align-items:center;
-  justify-content:center;color:var(--text-muted);gap:14px;padding:24px;text-align:center}
-#emptyState svg{opacity:.28}
-#emptyState p{font-size:14px}
+#chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-app)}
+#emptyState{
+  flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;color:var(--fg-muted);gap:14px;padding:24px;text-align:center;
+}
+#emptyState svg{opacity:.18}
+#emptyState p{font-size:13px;letter-spacing:-.005em}
 #conversation{display:none;flex-direction:column;flex:1;min-height:0}
 #chatPane.has-chat #conversation{display:flex}
 #chatPane.has-chat #emptyState{display:none}
-.conv-header{display:flex;align-items:center;gap:8px;padding:10px 14px;
-  padding-top:calc(10px + env(safe-area-inset-top));
-  border-bottom:1px solid var(--border);background:var(--bg-primary)}
+
+.conv-header{
+  display:flex;align-items:center;gap:6px;padding:11px 16px;
+  padding-top:calc(11px + env(safe-area-inset-top));
+  border-bottom:1px solid var(--border);background:var(--bg-app);
+}
 #backBtn{display:none}
-.conv-peer{display:flex;flex-direction:column;min-width:0;flex:1;
-  cursor:pointer;border-radius:6px;padding:3px 6px;margin:-3px -6px;transition:background .12s}
+.conv-peer{
+  display:flex;flex-direction:column;min-width:0;flex:1;
+  cursor:pointer;border-radius:6px;padding:3px 6px;margin:-3px -6px;
+  transition:background .12s;
+}
 .conv-peer:hover{background:var(--bg-hover)}
 .conv-peer:active{background:var(--bg-active)}
-.peer-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.peer-sub{font-size:12px;color:var(--text-muted);overflow:hidden;
+.peer-name{font-weight:600;font-size:14.5px;letter-spacing:-.005em;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.peer-sub{font-size:12px;color:var(--fg-muted);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
 .peer-sub.online{color:var(--green)}
-#msgs{flex:1;overflow-y:auto;padding:16px 16px 6px;display:flex;
-  flex-direction:column;gap:4px;scroll-behavior:smooth}
-.m{max-width:70%;padding:8px 13px;border-radius:16px;background:var(--bg-secondary);
-  align-self:flex-start;word-wrap:break-word;overflow-wrap:anywhere;
-  animation:pop .13s ease-out;font-size:15px;line-height:1.4}
-@keyframes pop{from{opacity:.4;transform:translateY(3px)}to{opacity:1;transform:none}}
-.m.me{align-self:flex-end;background:var(--accent);color:#fff}
-.m .ts{font-size:11px;opacity:.65;margin-top:2px;display:block;text-align:right}
-.m.me .ts{opacity:.85}
-.day-sep{align-self:center;font-size:11px;color:var(--text-muted);
-  padding:6px 12px;background:var(--bg-secondary);border-radius:10px;margin:8px 0 4px}
-#composer{display:flex;align-items:center;gap:8px;padding:10px 14px;
-  padding-bottom:calc(10px + env(safe-area-inset-bottom));
-  border-top:1px solid var(--border);background:var(--bg-primary)}
-#inp{flex:1;background:var(--bg-secondary);border:1px solid transparent;
-  color:var(--text-normal);padding:11px 16px;border-radius:20px;outline:none;
-  font-size:16px;min-width:0;transition:border .12s}
-#inp:focus{border-color:var(--accent)}
-#sendBtn{width:42px;height:42px;border-radius:50%;background:var(--accent);
-  color:#fff;border:none;display:flex;align-items:center;justify-content:center;
-  flex-shrink:0;transition:background .12s,transform .06s}
-#sendBtn:hover{background:var(--accent-hover)}
-#sendBtn:active{transform:scale(.94)}
 
-.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);
-  display:none;align-items:center;justify-content:center;padding:20px;z-index:200}
-.modal-backdrop.open{display:flex}
-.modal{background:var(--bg-primary);border-radius:14px;padding:22px;width:100%;max-width:460px;
-  box-shadow:var(--card-shadow);max-height:calc(100dvh - 40px);overflow:auto}
-.modal h3{font-size:18px;margin-bottom:6px;font-weight:700}
-.modal .hint{color:var(--text-muted);font-size:13px;margin-bottom:14px;line-height:1.5}
-.modal input{width:100%;padding:12px 14px;border-radius:8px;
-  border:1px solid var(--border);background:var(--bg-secondary);
-  font-size:16px;outline:none;margin-bottom:10px;color:var(--text-normal)}
+#msgs{
+  flex:1;overflow-y:auto;padding:18px 18px 8px;display:flex;
+  flex-direction:column;gap:3px;
+}
+.m{
+  max-width:68%;padding:8px 12px;border-radius:14px;
+  background:var(--bg-bubble);align-self:flex-start;
+  word-wrap:break-word;overflow-wrap:anywhere;
+  font-size:14.5px;line-height:1.4;animation:fade .12s ease-out;
+}
+@keyframes fade{from{opacity:.5}to{opacity:1}}
+.m.me{align-self:flex-end;background:var(--bg-bubble-me);color:#fff}
+.m .ts{font-size:10.5px;opacity:.55;margin-top:3px;display:block;text-align:right}
+.m.me .ts{opacity:.8}
+.day-sep{
+  align-self:center;font-size:11px;color:var(--fg-muted);
+  padding:5px 12px;background:var(--bg-input);border-radius:10px;
+  margin:10px 0 6px;
+}
+
+#composer{
+  display:flex;align-items:center;gap:8px;padding:10px 14px;
+  padding-bottom:calc(10px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--border);background:var(--bg-app);
+}
+#inp{
+  flex:1;background:var(--bg-input);border:1px solid transparent;
+  color:var(--fg);padding:11px 16px;border-radius:10px;outline:none;
+  font-size:15px;min-width:0;transition:border .12s;
+}
+#inp:focus{border-color:var(--accent)}
+#inp::placeholder{color:var(--fg-muted)}
+#sendBtn{
+  width:38px;height:38px;border-radius:9px;background:var(--accent);
+  color:#fff;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;transition:background .12s,transform .06s;
+}
+#sendBtn:hover{background:var(--accent-hover)}
+#sendBtn:active{transform:scale(.95)}
+
+.modal-backdrop{
+  position:fixed;inset:0;background:rgba(15,23,42,.5);
+  display:none;align-items:center;justify-content:center;padding:20px;z-index:200;
+  backdrop-filter:blur(2px);
+}
+.modal-backdrop.open{display:flex;animation:fadein .12s}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.modal{
+  background:var(--bg-panel);border-radius:14px;padding:24px;
+  width:100%;max-width:440px;box-shadow:var(--shadow-lg);
+  max-height:calc(100dvh - 40px);overflow:auto;border:1px solid var(--border);
+}
+.modal h3{font-size:17px;margin-bottom:8px;font-weight:700;letter-spacing:-.01em}
+.modal .hint{color:var(--fg-muted);font-size:13px;margin-bottom:16px;line-height:1.55}
+.modal input{
+  width:100%;padding:12px 14px;border-radius:8px;
+  border:1px solid var(--border);background:var(--bg-input);
+  font-size:15px;outline:none;margin-bottom:10px;color:var(--fg);
+}
 .modal input:focus{border-color:var(--accent)}
-.modal .err{color:var(--red);font-size:13px;min-height:18px;margin-bottom:6px}
-.modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
-.btn-secondary{background:var(--bg-secondary);border:none;padding:10px 16px;
-  border-radius:8px;font-weight:500;color:var(--text-normal);transition:background .12s}
+.modal .err{color:var(--red);font-size:13px;min-height:18px;margin-bottom:8px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:6px}
+.btn-secondary{
+  background:var(--bg-input);padding:10px 16px;border-radius:8px;
+  font-weight:500;color:var(--fg);transition:background .12s;font-size:14px;
+}
 .btn-secondary:hover{background:var(--bg-hover)}
-.btn-primary{background:var(--accent);color:#fff;border:none;
-  padding:10px 22px;border-radius:8px;font-weight:600;transition:background .12s}
+.btn-primary{
+  background:var(--accent);color:#fff;padding:10px 20px;
+  border-radius:8px;font-weight:600;font-size:14px;
+  transition:background .12s;
+}
 .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
-.btn-danger{background:var(--red);color:#fff;border:none;
-  padding:10px 22px;border-radius:8px;font-weight:600;transition:opacity .12s}
-.btn-danger:hover{opacity:.88}
-.btn-primary:disabled,.btn-secondary:disabled,.btn-danger:disabled{cursor:default;opacity:.6}
+.btn-danger{
+  background:var(--red);color:#fff;padding:10px 20px;
+  border-radius:8px;font-weight:600;font-size:14px;transition:opacity .12s;
+}
+.btn-danger:hover{opacity:.9}
+.btn-primary:disabled,.btn-secondary:disabled,.btn-danger:disabled{cursor:default;opacity:.55}
 
 .err-modal h3{color:var(--red)}
-.err-meta{font-size:12px;color:var(--text-muted);margin-bottom:10px}
-.err-meta code{background:var(--bg-secondary);padding:2px 8px;border-radius:6px;
-  color:var(--text-normal);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
-.err-desc{font-size:14px;line-height:1.45;color:var(--text-normal);margin-bottom:12px;
-  word-wrap:break-word}
-.err-log-label{font-size:11px;font-weight:700;color:var(--text-muted);
-  text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
-.err-modal pre.err-log{background:var(--bg-secondary);padding:10px 12px;border-radius:8px;
-  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;
+.err-meta{font-size:12px;color:var(--fg-muted);margin-bottom:10px}
+.err-meta code{
+  background:var(--bg-input);padding:3px 8px;border-radius:5px;
+  color:var(--fg);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;
+}
+.err-desc{font-size:13.5px;line-height:1.5;color:var(--fg);margin-bottom:14px;word-wrap:break-word}
+.err-log-label{
+  font-size:11px;font-weight:700;color:var(--fg-muted);
+  text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;
+}
+.err-modal pre.err-log{
+  background:var(--bg-input);padding:10px 12px;border-radius:8px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;
   max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;
-  color:var(--text-normal);margin-bottom:14px;border:1px solid var(--border)}
+  color:var(--fg);margin-bottom:14px;border:1px solid var(--border);
+}
 
 #welcomeModal .modal h3{color:var(--accent)}
-#welcomeBody{font-size:14px;line-height:1.55;color:var(--text-normal);margin-bottom:16px;
-  white-space:pre-wrap;word-wrap:break-word}
+#welcomeBody{
+  font-size:14px;line-height:1.6;color:var(--fg);margin-bottom:18px;
+  white-space:pre-wrap;word-wrap:break-word;
+}
 
-#toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);
-  background:var(--toast-bg);color:var(--toast-fg);padding:11px 18px;border-radius:8px;
-  font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s, transform .2s;z-index:300;
+#toast{
+  position:fixed;left:50%;bottom:32px;transform:translateX(-50%) translateY(20px);
+  background:var(--fg);color:var(--bg-app);padding:10px 16px;border-radius:8px;
+  font-size:13.5px;font-weight:500;opacity:0;pointer-events:none;
+  transition:opacity .18s,transform .18s;z-index:300;
   box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:80%;text-align:center;
-  word-break:break-all;line-height:1.4}
+  word-break:break-word;line-height:1.4;
+}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 
 @media (max-width:720px){
   #app{position:relative;overflow:hidden}
-  #sidebar{position:absolute;inset:0;width:100%;z-index:2;
-    border-right:none;transition:transform .26s ease}
-  #chatPane{position:absolute;inset:0;z-index:3;transform:translateX(100%);
-    transition:transform .26s ease;box-shadow:-8px 0 24px rgba(0,0,0,.10)}
-  #app.chat-open #sidebar{transform:translateX(-26%)}
+  #sidebar{
+    position:absolute;inset:0;width:100%;z-index:2;
+    border-right:none;transition:transform .24s ease;
+  }
+  #chatPane{
+    position:absolute;inset:0;z-index:3;transform:translateX(100%);
+    transition:transform .24s ease;box-shadow:-8px 0 24px rgba(0,0,0,.10);
+  }
+  #app.chat-open #sidebar{transform:translateX(-22%)}
   #app.chat-open #chatPane{transform:translateX(0)}
   #backBtn{display:flex}
-  .m{max-width:86%}
-  .contact{padding:10px 12px;min-height:60px}
+  .m{max-width:84%}
+  .contact{padding:11px 12px;min-height:58px}
 }
 </style>
 </head>
@@ -847,7 +1097,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
     <div class="brand">
       <div class="brand-logo">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="#fff" aria-hidden="true">
-          <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm6 5H7v-2h6v2zm4-6H7V6h10v2z"/>
+          <path d="M18 4H6a2 2 0 0 0-2 2v12l3-3h11a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/>
         </svg>
       </div>
       <div class="brand-text">
@@ -875,23 +1125,22 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 <div id="app">
   <aside id="sidebar">
     <div class="sidebar-header">
-      <div class="avatar" id="myAvatar">?</div>
       <div class="my-info" id="myInfo" title="Нажмите, чтобы скопировать логин">
         <div class="my-name" id="myLogin">—</div>
-        <div class="my-sub" id="myDomain">в сети</div>
+        <div class="my-sub"><span class="dot-mini"></span>в сети</div>
       </div>
       <button class="icon-btn" id="themeBtn" title="Тема" aria-label="Тема">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
         </svg>
       </button>
       <button class="icon-btn" id="addBtn" title="Добавить чат" aria-label="Добавить">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
         </svg>
       </button>
       <button class="icon-btn" id="logoutBtn" title="Выйти" aria-label="Выйти">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M16 13v-2H7V8l-5 4 5 4v-3zM20 3h-8v2h8v14h-8v2h8a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z"/>
         </svg>
       </button>
@@ -905,15 +1154,15 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 
   <section id="chatPane">
     <div id="emptyState">
-      <svg width="90" height="90" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-        <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm6 5H7v-2h6v2zm4-6H7V6h10v2z"/>
+      <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M18 4H6a2 2 0 0 0-2 2v12l3-3h11a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zM8 9h8v1.5H8V9zm5 3.5H8V11h5v1.5z"/>
       </svg>
       <p>Выберите чат или добавьте новый</p>
     </div>
     <div id="conversation">
       <div class="conv-header">
         <button class="icon-btn" id="backBtn" aria-label="Назад">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
           </svg>
         </button>
@@ -922,10 +1171,10 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
           <div class="peer-sub" id="peerSub"></div>
         </div>
         <button class="icon-btn" id="pinActiveBtn" title="Закрепить/открепить" aria-label="Закрепить">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>
         </button>
         <button class="icon-btn danger" id="endChatBtn" title="Завершить чат" aria-label="Завершить чат">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
           </svg>
         </button>
@@ -935,7 +1184,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
         <input id="inp" placeholder="Написать сообщение…" autocomplete="off"
                autocapitalize="sentences">
         <button id="sendBtn" aria-label="Отправить">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"/>
           </svg>
         </button>
@@ -1045,7 +1294,7 @@ window.addEventListener("unhandledrejection", e => {
 /* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
            HELLO:8, STATUS:9, CONTACT_REQ:10, CONTACT_OK:11, CONTACT_ADD:12,
-           CHAT_END:13, LOGOUT:14};
+           CHAT_END:13, LOGOUT:14, READ:15, UNFOCUS:16, UNREAD:17};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -1073,7 +1322,7 @@ function applyTheme(t){
   if (t === "system") t = systemTheme();
   document.documentElement.setAttribute("data-theme", t);
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute("content", t === "dark" ? "#313338" : "#ffffff");
+  if (meta) meta.setAttribute("content", t === "dark" ? "#16181d" : "#ffffff");
 }
 function getInitialTheme(){
   try {
@@ -1133,14 +1382,6 @@ const $ = id => document.getElementById(id);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
                    : Date.now().toString(36) + Math.random().toString(36).slice(2,10));
 
-function avatarColor(uid){
-  const colors = ["#5865f2","#3ba55d","#faa61a","#ed4245","#eb459e","#9b59b6","#1abc9c","#e67e22"];
-  let h = 0;
-  for (let i=0;i<uid.length;i++) h = (h * 31 + uid.charCodeAt(i)) | 0;
-  return colors[Math.abs(h) % colors.length];
-}
-function avatarChar(uid){ return (uid || "?")[0].toUpperCase(); }
-
 let toastTimer = null;
 function toast(msg){
   const el = $("toast");
@@ -1151,7 +1392,7 @@ function toast(msg){
 }
 
 const LS_SESSION = "sdm_session";
-const LS_PINNED = "sdm_pinned";
+const LS_PINNED  = "sdm_pinned";
 function lsSet(k, v){ try { localStorage.setItem(k, v); return true; } catch(e){ return false; } }
 function lsGet(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }
 function lsDel(k){ try { localStorage.removeItem(k); } catch(e){} }
@@ -1205,33 +1446,17 @@ function renderContacts(){
       + (isActive ? " active" : "")
       + (hasUnread ? " unread" : "")
       + (isPinned ? " pinned" : "");
-
     el.onclick = () => selectPeer(c.uid);
 
-    const wrap = document.createElement("div");
-    wrap.className = "avatar-wrap";
-    const av = document.createElement("div");
-    av.className = "avatar";
-    av.style.background = avatarColor(c.uid);
-    av.textContent = avatarChar(c.uid);
-    const dot = document.createElement("span");
-    dot.className = "status-dot " + (c.online === true ? "online" : (c.online === false ? "" : "unknown"));
-    wrap.append(av, dot);
+    const sl = document.createElement("span");
+    sl.className = "status-line "
+      + (c.online === true ? "online" : (c.online === false ? "" : "unknown"));
 
     const info = document.createElement("div");
     info.className = "contact-info";
     const nm = document.createElement("div");
     nm.className = "contact-name";
-    const pinI = document.createElement("span");
-    pinI.className = "pin-i";
-    pinI.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
-    const nmTxt = document.createElement("span");
-    nmTxt.style.overflow = "hidden";
-    nmTxt.style.textOverflow = "ellipsis";
-    nmTxt.style.whiteSpace = "nowrap";
-    nmTxt.textContent = c.uid;
-    nm.append(pinI, nmTxt);
-
+    nm.textContent = c.uid;
     const pv = document.createElement("div");
     pv.className = "contact-preview";
     const t = threads[c.uid];
@@ -1245,21 +1470,21 @@ function renderContacts(){
     }
     info.append(nm, pv);
 
-    if (hasUnread){
+    if (hasUnread && !isActive){
       const b = document.createElement("span");
       b.className = "badge";
       b.textContent = unread[c.uid] > 99 ? "99+" : unread[c.uid];
-      el.append(wrap, info, b);
+      el.append(sl, info, b);
     } else {
       const pb = document.createElement("button");
       pb.className = "pin-btn";
       pb.title = isPinned ? "Открепить" : "Закрепить";
-      pb.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
+      pb.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
       pb.onclick = (ev) => {
         ev.stopPropagation(); ev.preventDefault();
         togglePin(c.uid);
       };
-      el.append(wrap, info, pb);
+      el.append(sl, info, pb);
     }
     box.appendChild(el);
   }
@@ -1295,9 +1520,17 @@ function selectPeer(uid){
   refreshPeerSub();
   renderThread();
   updatePinActiveBtn();
+  if (ws && ws.readyState === 1){
+    try { ws.send(pack(T.READ, {u: uid})); } catch(e){}
+  }
   setTimeout(() => $("inp").focus(), 60);
 }
-function goBack(){ $("app").classList.remove("chat-open"); }
+function goBack(){
+  $("app").classList.remove("chat-open");
+  if (ws && ws.readyState === 1){
+    try { ws.send(pack(T.UNFOCUS, {})); } catch(e){}
+  }
+}
 function refreshPeerSub(){
   if (!activePeer) return;
   const c = contacts.find(x => x.uid === activePeer);
@@ -1309,7 +1542,9 @@ function refreshPeerSub(){
 }
 
 /* ================= THREAD ================= */
-function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); }
+function fmtTime(ts){
+  return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+}
 function fmtDay(ts){
   const d = new Date(ts), t = new Date();
   if (d.toDateString() === t.toDateString()) return "Сегодня";
@@ -1369,14 +1604,12 @@ function connect(){
       url = proto + "//" + location.host + "/ws";
     } catch(e){
       const err = new Error("Не удалось вычислить адрес WS: " + e);
-      err.code = "WS_URL";
-      return reject(err);
+      err.code = "WS_URL"; return reject(err);
     }
     try { ws = new WebSocket(url); }
     catch(e){
       const err = new Error("Не удалось открыть WebSocket: " + e);
-      err.code = "WS_OPEN";
-      return reject(err);
+      err.code = "WS_OPEN"; return reject(err);
     }
     ws.binaryType = "arraybuffer";
     let settled = false;
@@ -1404,8 +1637,6 @@ function connect(){
         return;
       }
       if (type === T.HELLO){
-        // Название и подпись уже вшиты в HTML при старте сервера,
-        // здесь только тема — если пользователь её не переопределял.
         if (obj.default_theme && !lsGet(LS_THEME)){
           defaultTheme = obj.default_theme;
           applyTheme(defaultTheme);
@@ -1418,10 +1649,8 @@ function connect(){
           settled = true; clearTimeout(to);
           try{ ws.close(); }catch(e){}
           const err = new Error(obj.m || "Ошибка");
-          err.code = obj.c || "AUTH";
-          err.log = obj.l || "";
-          reject(err);
-          return;
+          err.code = obj.c || "AUTH"; err.log = obj.l || "";
+          reject(err); return;
         }
       }
       try { await handleFrame(type, obj); }
@@ -1435,6 +1664,7 @@ function connect(){
         const err = new Error(
           ev.code === 1008 ? "Соединение отклонено"
           : ev.code === 1009 ? "Сообщение слишком большое"
+          : ev.code === 1013 ? "Слишком много подключений"
           : ev.code === 4000 ? "Вошли с другого устройства"
           : "Соединение закрыто (" + ev.code + ")");
         err.code = "WS_CLOSED";
@@ -1444,13 +1674,13 @@ function connect(){
         if (ev.code === 4000){
           clearInterval(heartbeatTimer);
           showError("REPLACED", "Вход выполнен с другого устройства",
-                    "Ваша сессия завершена. Обновите страницу, чтобы войти снова.");
+                    "Сессия завершена. Обновите страницу, чтобы войти снова.");
           return;
         }
         onDisconnect(ev.code, ev.reason);
       }
     };
-    ws.onerror = ev => {
+    ws.onerror = () => {
       if (!settled){
         settled = true; clearTimeout(to);
         const err = new Error("Ошибка соединения");
@@ -1464,6 +1694,7 @@ function connect(){
 async function handleFrame(type, obj){
   switch(type){
     case T.MSG: onIncomingMsg(obj); break;
+    case T.UNREAD: onUnread(obj); break;
     case T.CONTACT_OK: onContactOk(obj); break;
     case T.CONTACT_ADD: onContactAdd(obj); break;
     case T.CHAT_END: onChatEnded(obj.u); break;
@@ -1483,6 +1714,17 @@ async function handleFrame(type, obj){
       }
       break;
   }
+}
+
+function onUnread(obj){
+  const uid = obj.u, n = obj.n | 0;
+  if (!uid) return;
+  if (n > 0){
+    unread[uid] = n;
+  } else {
+    delete unread[uid];
+  }
+  renderContacts();
 }
 
 function onContactOk(obj){
@@ -1527,7 +1769,6 @@ function onIncomingMsg(m){
     appendMsg(msg);
     renderContacts();
   } else {
-    unread[peer] = (unread[peer] || 0) + 1;
     renderContacts();
   }
 }
@@ -1568,7 +1809,6 @@ async function doAuth(login, password, remember){
 
   try {
     authPayload = {login, password, remember};
-
     setBusy($("submitBtn"), true);
     const ok = await connect();
     sessionPassword = password;
@@ -1587,6 +1827,7 @@ async function doAuth(login, password, remember){
 
     contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
     for (const k of Object.keys(threads)) delete threads[k];
+    for (const k of Object.keys(unread)) delete unread[k];
     for (const m of (ok.history || [])){
       const peer = m.f === me.uid ? m.t : m.f;
       seenIds.add(m.i);
@@ -1597,11 +1838,13 @@ async function doAuth(login, password, remember){
     for (const k of Object.keys(threads)){
       threads[k].sort((a,b) => a.ts - b.ts);
     }
+    if (ok.unread){
+      for (const k of Object.keys(ok.unread)){
+        unread[k] = ok.unread[k] | 0;
+      }
+    }
 
     $("myLogin").textContent = me.login;
-    $("myDomain").textContent = "в сети";
-    $("myAvatar").textContent = avatarChar(me.login);
-    $("myAvatar").style.background = avatarColor(me.uid);
     $("login").style.display = "none";
     $("app").classList.add("on");
 
@@ -1673,7 +1916,11 @@ function openAddModal(){
   $("addModal").classList.add("open");
   setTimeout(() => $("addInput").focus(), 40);
 }
-function closeAddModal(){ $("addModal").classList.remove("open"); setBusy($("addConfirm"), false); pendingAdd = null; }
+function closeAddModal(){
+  $("addModal").classList.remove("open");
+  setBusy($("addConfirm"), false);
+  pendingAdd = null;
+}
 function addContactFromInput(){
   const raw = $("addInput").value.trim().toLowerCase();
   const err = $("addErr");
@@ -1715,6 +1962,7 @@ async function onDisconnect(code, reason){
     me = {login: ok.login, uid: ok.login};
     contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
     for (const k of Object.keys(threads)) delete threads[k];
+    for (const k of Object.keys(unread)) delete unread[k];
     for (const m of (ok.history || [])){
       const peer = m.f === me.uid ? m.t : m.f;
       seenIds.add(m.i);
@@ -1725,7 +1973,15 @@ async function onDisconnect(code, reason){
     for (const k of Object.keys(threads)){
       threads[k].sort((a,b) => a.ts - b.ts);
     }
+    if (ok.unread){
+      for (const k of Object.keys(ok.unread)){
+        unread[k] = ok.unread[k] | 0;
+      }
+    }
     renderContacts();
+    if (activePeer && ws.readyState === 1){
+      try { ws.send(pack(T.READ, {u: activePeer})); } catch(e){}
+    }
     startHeartbeat();
     reconnectAttempts = 0;
   } catch(e){
@@ -1816,6 +2072,17 @@ $("welcomeModal").addEventListener("click", e => {
   if (e.target === $("welcomeModal")) $("welcomeModal").classList.remove("open");
 });
 
+document.addEventListener("visibilitychange", () => {
+  if (!ws || ws.readyState !== 1) return;
+  try {
+    if (document.hidden){
+      ws.send(pack(T.UNFOCUS, {}));
+    } else if (activePeer){
+      ws.send(pack(T.READ, {u: activePeer}));
+    }
+  } catch(e){}
+});
+
 /* ================= AUTOLOGIN ================= */
 (function boot(){
   setTimeout(async () => {
@@ -1838,6 +2105,7 @@ $("welcomeModal").addEventListener("click", e => {
 
           contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
           for (const k of Object.keys(threads)) delete threads[k];
+          for (const k of Object.keys(unread)) delete unread[k];
           for (const m of (ok.history || [])){
             const peer = m.f === me.uid ? m.t : m.f;
             seenIds.add(m.i);
@@ -1848,11 +2116,13 @@ $("welcomeModal").addEventListener("click", e => {
           for (const k of Object.keys(threads)){
             threads[k].sort((a,b) => a.ts - b.ts);
           }
+          if (ok.unread){
+            for (const k of Object.keys(ok.unread)){
+              unread[k] = ok.unread[k] | 0;
+            }
+          }
 
           $("myLogin").textContent = me.login;
-          $("myDomain").textContent = "в сети";
-          $("myAvatar").textContent = avatarChar(me.login);
-          $("myAvatar").style.background = avatarColor(me.uid);
           $("login").style.display = "none";
           $("app").classList.add("on");
           renderContacts();
@@ -1886,8 +2156,6 @@ $("welcomeModal").addEventListener("click", e => {
 
 
 # ============================ РЕНДЕР HTML ============================
-# Один раз при старте — подставляем конфиг в плейсхолдеры, чтобы браузер
-# сразу получал правильные названия и welcome без ожидания WS-подключения.
 HTML_PAGE = (HTML_PAGE
     .replace("{{APP_NAME}}", APP_NAME)
     .replace("{{APP_SUB}}",  APP_SUB)
@@ -1906,8 +2174,18 @@ def _run():
             uvloop.install()
         except Exception as e:
             log_err("uvloop", e)
+
+    print(_c(BOLD, "  sdm-server"))
+    print(_c(DIM, f"  {APP_NAME} · {APP_SUB}"))
+    print()
+    ok = _print_self_test(_self_test())
+    if not ok:
+        print("  " + _c(RED, "self-test не пройден — сервер не будет запущен"))
+        sys.exit(1)
+
     shown = HOST if HOST != "0.0.0.0" else "localhost"
-    print(_c(DIM, f"  http://{shown}:{PORT}"))
+    print("  " + _c(DIM, "слушает ") + _c(CYAN, f"http://{shown}:{PORT}"))
+    print("  " + _c(DIM, "остановка: Ctrl+C"))
     print()
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
 
@@ -1916,7 +2194,7 @@ if __name__ == "__main__":
     try:
         _run()
     except KeyboardInterrupt:
-        pass
+        print()
     except Exception as e:
         log_err("startup", e)
         sys.exit(1)
