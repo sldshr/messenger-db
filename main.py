@@ -14,7 +14,7 @@ HOST = "0.0.0.0"
 PORT = 8000
 
 SITE_NAME       = "SldChat"
-LOGO_POSITION   = "left"
+LOGO_POSITION   = "center"
 AUTHOR          = "SldShrLab"
 FONT_FAMILY     = "Verdana, Arial, sans-serif"
 FONT_SIZE       = 15
@@ -36,7 +36,7 @@ SHOW_TIMESTAMPS      = True
 SHOW_COPY_BUTTON     = True
 AUTO_REFRESH_SECONDS = 0
 
-LANG_DEFAULT = "ru"
+LANG_DEFAULT = "en"
 LANG_OPTIONS = ("ru", "en")
 
 # ==============================
