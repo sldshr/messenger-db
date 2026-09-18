@@ -1,10 +1,199 @@
+#!/usr/bin/env python3
+"""
+SDM — sldshr's direct messanger
+E2EE мессенджер 1-на-1. Один файл. Без федерации.
+
+Запуск: python main.py
+"""
+
+import os
+import sys
+import subprocess
+import importlib
+import time
+
+# ============================ TUI / BOOTSTRAP ============================
+# Всё это выполняется ДО импорта FastAPI, чтобы красиво показать проверку зависимостей.
+
+RESET  = "\x1b[0m"
+BOLD   = "\x1b[1m"
+DIM    = "\x1b[2m"
+RED    = "\x1b[31m"
+GREEN  = "\x1b[32m"
+YELLOW = "\x1b[33m"
+BLUE   = "\x1b[34m"
+MAGENTA= "\x1b[35m"
+CYAN   = "\x1b[36m"
+WHITE  = "\x1b[97m"
+BG_BLUE= "\x1b[44m"
+
+# Принудительный UTF-8 вывод
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+ASCII_SDM = r"""
+   ███████╗██████╗ ███╗   ███╗
+   ██╔════╝██╔══██╗████╗ ████║
+   ███████╗██║  ██║██╔████╔██║
+   ╚════██║██║  ██║██║╚██╔╝██║
+   ███████║██████╔╝██║ ╚═╝ ██║
+   ╚══════╝╚═════╝ ╚═╝     ╚═╝
+"""
+
+
+def _c(code: str, text: str) -> str:
+    return f"{code}{text}{RESET}"
+
+
+def print_banner():
+    print()
+    print(_c(CYAN + BOLD, ASCII_SDM))
+    print(" " * 3 + _c(DIM + WHITE, "sldshr's direct messanger"))
+    print(" " * 3 + _c(DIM, "end-to-end encrypted · 1-on-1 · single file"))
+    print()
+
+
+def print_rule(char: str = "─", width: int = 56):
+    print(_c(DIM, " " + char * width))
+
+
+def print_section(title: str):
+    print()
+    print(" " + _c(BOLD + BLUE, "▎") + " " + _c(BOLD, title))
+    print_rule()
+
+
+def print_kv(key: str, value: str, note: str = "", ok: bool = True):
+    marker = _c(GREEN, "●") if ok else _c(RED, "●")
+    k = _c(WHITE, key.ljust(14))
+    v = _c(CYAN, value)
+    n = "  " + _c(DIM, note) if note else ""
+    print(f"  {marker}  {k} {v}{n}")
+
+
+def print_check(name: str, ok: bool, note: str = ""):
+    if ok:
+        print(f"  {_c(GREEN, '✓')}  {_c(WHITE, name.ljust(14))} {_c(DIM, note)}")
+    else:
+        print(f"  {_c(RED, '✗')}  {_c(WHITE, name.ljust(14))} {_c(RED, note)}")
+
+
+def check_and_install_deps():
+    """Проверяет зависимости, предлагает установку."""
+    print_section("Проверка зависимостей")
+
+    deps = [
+        ("fastapi",  "fastapi",  "веб-фреймворк"),
+        ("uvicorn",  "uvicorn",  "ASGI-сервер"),
+    ]
+    optional = [
+        ("uvloop",   "uvloop",   "быстрый event loop (опционально)"),
+    ]
+
+    missing = []
+    for mod, pkg, note in deps:
+        try:
+            importlib.import_module(mod)
+            print_check(pkg, True, note)
+        except ImportError:
+            print_check(pkg, False, "не установлен")
+            missing.append(pkg)
+
+    for mod, pkg, note in optional:
+        try:
+            importlib.import_module(mod)
+            print_check(pkg, True, note + " · +30% скорости")
+        except ImportError:
+            print_check(pkg, False, note + " · можно установить позже")
+
+    if missing:
+        print()
+        print(" " + _c(YELLOW, "Не хватает обязательных библиотек: ") + _c(BOLD, ", ".join(missing)))
+        try:
+            ans = input(" " + _c(CYAN, "Установить сейчас через pip? ") +
+                        _c(DIM, "[Y/n] ") + _c(WHITE, "")).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            ans = "n"
+            print()
+        if ans in ("", "y", "yes", "д", "да"):
+            print()
+            cmd = [sys.executable, "-m", "pip", "install"] + missing
+            print(" " + _c(DIM, "$ " + " ".join(cmd)))
+            print()
+            try:
+                rc = subprocess.call(cmd)
+                if rc != 0:
+                    print(" " + _c(RED, "pip завершился с ошибкой. Установи вручную и запусти снова."))
+                    sys.exit(1)
+            except Exception as e:
+                print(" " + _c(RED, f"Не удалось выполнить pip: {e}"))
+                sys.exit(1)
+            print()
+            # перезапуск процесса
+            print(" " + _c(DIM, "Перезапуск..."))
+            time.sleep(0.6)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            print(" " + _c(RED, "Отменено. Установи зависимости вручную и запусти снова."))
+            sys.exit(1)
+
+
+def print_config(host: str, port: int, history_max: int, uvloop_used: bool):
+    print_section("Конфигурация сервера")
+    print_kv("HOST",      host)
+    print_kv("PORT",      str(port))
+    print_kv("PAIR_MAX",  str(history_max), "сообщений на пару")
+    print_kv("LOOP",      "uvloop" if uvloop_used else "asyncio", "event loop")
+    print_kv("STORAGE",   "RAM", "всё в оперативной памяти")
+    print_kv("E2EE",      "ECDH P-256 + AES-GCM-256", "ключи только у клиентов")
+    print_kv("FEDERATION","off", "каждый сервер автономен")
+
+
+def print_ready(host: str, port: int):
+    print()
+    print_rule("━")
+    print(" " + _c(BOLD + GREEN, "● Сервер готов"))
+    shown_host = host if host != "0.0.0.0" else "localhost"
+    print(" " + _c(DIM, "Открой в браузере:"))
+    print("   " + _c(BOLD + CYAN + BOLD, f"http://{shown_host}:{port}"))
+    print()
+    print(" " + _c(DIM, "Ctrl+C — остановить сервер"))
+    print_rule("━")
+    print()
+
+
+def print_hints(host: str, port: int, uvloop_used: bool):
+    print_section("Подсказки")
+    if host == "0.0.0.0":
+        print("  " + _c(DIM, "•") + " Сервер слушает все интерфейсы (0.0.0.0)")
+        print("  " + _c(DIM, "•") + " В локальной сети доступен по " +
+              _c(CYAN, f"http://<твой-ip>:{port}"))
+    else:
+        print("  " + _c(DIM, "•") + " Сервер слушает только " + _c(CYAN, host))
+    if not uvloop_used:
+        print("  " + _c(DIM, "•") + " Для +30% скорости: " +
+              _c(CYAN, "pip install uvloop") + _c(DIM, " (Linux/macOS)"))
+    print("  " + _c(DIM, "•") + " Переменные окружения: " +
+          _c(CYAN, "HOST, PORT, PAIR_HISTORY_MAX"))
+    print("  " + _c(DIM, "•") + " Пример: " +
+          _c(CYAN, "PORT=9000 python main.py"))
+    print()
+
+
+# ---- Прогоняем bootstrap ----
+print_banner()
+
+# 1. Проверка зависимостей (может установить и перезапуститься)
+check_and_install_deps()
+
+# 2. Теперь можно импортировать всё остальное
 import asyncio
 import hashlib
 import json
-import os
 import secrets
 import struct
-import time
 import uuid
 from collections import deque
 from typing import Any, Optional
@@ -13,11 +202,21 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# ============================ CONFIG ============================
+# 3. Читаем конфиг из env
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
-PAIR_HISTORY_MAX = 200      # максимум сообщений на пару
-STATUS_HEARTBEAT = 30.0     # как часто клиент шлёт ping
+PAIR_HISTORY_MAX = int(os.getenv("PAIR_HISTORY_MAX", "200"))
+STATUS_HEARTBEAT = 30.0
+
+try:
+    import uvloop  # type: ignore
+    _UVLOOP = True
+except ImportError:
+    _UVLOOP = False
+
+# 4. Показываем конфиг
+print_config(HOST, PORT, PAIR_HISTORY_MAX, _UVLOOP)
+print_hints(HOST, PORT, _UVLOOP)
 
 # ============================ PROTOCOL ============================
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
@@ -36,13 +235,10 @@ def unpack(data: bytes):
     return t, json.loads(data[5:5 + ln].decode("utf-8"))
 
 
-# ============================ STATE (RAM only) ============================
-# users[login] = {"salt": b, "pw": b, "pub": str, "contacts": {peer_login: pub}}
+# ============================ STATE ============================
 users: dict[str, dict] = {}
 online: dict[str, "Client"] = {}
-# watchers[login] = {login1, login2, ...} — кто держит login в контактах
 watchers: dict[str, set] = {}
-# messages[(a,b)] = deque[{i,f,t,d,p,s}], a < b
 messages: dict[tuple, deque] = {}
 
 
@@ -54,10 +250,8 @@ def pair_key(a: str, b: str) -> tuple:
     return (a, b) if a < b else (b, a)
 
 
-# ============================ CLIENT ============================
 class Client:
     __slots__ = ("ws", "login", "lock")
-
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.login: Optional[str] = None
@@ -72,7 +266,6 @@ class Client:
 
 
 async def notify_watchers(login: str, is_online: bool):
-    """Сообщаем только тем, у кого login в контактах и кто сейчас online."""
     w = watchers.get(login)
     if not w:
         return
@@ -128,13 +321,11 @@ async def _finish_auth(c: Client, login: str):
     online[login] = c
     u = users[login]
 
-    # контакты с их статусом
     contacts_payload = [
         {"u": peer, "p": pub, "o": peer in online}
         for peer, pub in u["contacts"].items()
     ]
 
-    # история: собираем из всех пар с участием login
     hist = []
     for (a, b), dq in messages.items():
         if a == login or b == login:
@@ -146,8 +337,6 @@ async def _finish_auth(c: Client, login: str):
         "contacts": contacts_payload,
         "history": hist,
     })
-
-    # уведомляем тех, кто следит за мной
     await notify_watchers(login, True)
 
 
@@ -169,7 +358,6 @@ async def handle_msg(c: Client, obj: dict):
         "s": int(time.time() * 1000),
     }
 
-    # сохранение в историю пары
     key = pair_key(c.login, to_login)
     dq = messages.get(key)
     if dq is None:
@@ -177,17 +365,13 @@ async def handle_msg(c: Client, obj: dict):
         messages[key] = dq
     dq.append(msg)
 
-    # эхо отправителю
     await c.send(T_MSG, msg)
-
-    # доставка получателю
     target = online.get(to_login)
     if target:
         await target.send(T_MSG, msg)
 
 
 async def handle_contact_req(c: Client, obj: dict):
-    """Клиент просит добавить контакт. Только локальные пользователи."""
     peer = (obj.get("u") or "").strip().lower()
     if not peer:
         return await c.send(T_ERROR, {"m": "Пустой логин"})
@@ -200,18 +384,14 @@ async def handle_contact_req(c: Client, obj: dict):
     pub = u["pub"]
     my_pub = users[c.login]["pub"]
 
-    # добавляю себе
     users[c.login]["contacts"][peer] = pub
-    # добавляю себя ему (взаимное добавление)
     users[peer]["contacts"][c.login] = my_pub
-    # регистрирую watchers
     watchers.setdefault(peer, set()).add(c.login)
     watchers.setdefault(c.login, set()).add(peer)
 
     online_status = peer in online
     await c.send(T_CONTACT_OK, {"u": peer, "p": pub, "o": online_status})
 
-    # уведомляем собеседника, если он online
     target = online.get(peer)
     if target:
         await target.send(T_CONTACT_ADD, {"u": c.login, "p": my_pub, "o": True})
@@ -232,7 +412,6 @@ async def handle_chat_end(c: Client, obj: dict):
     w_peer = watchers.get(peer)
     if w_peer: w_peer.discard(my)
 
-    # удаляем всю переписку
     messages.pop(pair_key(my, peer), None)
 
     target = online.get(peer)
@@ -240,7 +419,7 @@ async def handle_chat_end(c: Client, obj: dict):
         await target.send(T_CHAT_END, {"u": my})
 
 
-# ============================ HTTP ============================
+# ============================ APP ============================
 app = FastAPI()
 
 
@@ -274,7 +453,6 @@ async def ws_handler(ws: WebSocket):
             elif t == T_PING:
                 await c.send(T_PONG, {})
             elif t == T_SYNC and c.login:
-                # лёгкий пинг статусов (клиент может запросить вручную)
                 u = users[c.login]
                 snapshot = [
                     {"u": peer, "o": peer in online}
@@ -291,14 +469,14 @@ async def ws_handler(ws: WebSocket):
             await notify_watchers(c.login, False)
 
 
-# ============================ HTML ============================
+# ============================ HTML (client) ============================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
-<title>Messages</title>
+<title>SDM · sldshr's direct messanger</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%235865f2'/%3E%3Cpath d='M20 4H4a1 1 0 0 0-1 1v14l3.5-3.5H20a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1z' fill='white'/%3E%3C/svg%3E">
 <style>
 :root{
@@ -342,6 +520,12 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   padding:20px;background:var(--bg-secondary);z-index:100}
 .card{width:100%;max-width:400px;background:var(--bg-primary);border-radius:14px;
   padding:26px;box-shadow:var(--card-shadow);position:relative}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+.brand-logo{width:42px;height:42px;border-radius:12px;background:var(--accent);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.brand-text{display:flex;flex-direction:column;line-height:1.2}
+.brand-title{font-weight:700;font-size:16px}
+.brand-sub{font-size:11px;color:var(--text-muted)}
 .theme-btn{position:absolute;top:14px;right:14px}
 .tabs{display:flex;background:var(--bg-secondary);border-radius:9px;padding:3px;margin-bottom:18px}
 .tabs button{flex:1;background:none;border:none;color:var(--text-muted);
@@ -510,6 +694,17 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
         <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
       </svg>
     </button>
+    <div class="brand">
+      <div class="brand-logo">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="#fff" aria-hidden="true">
+          <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM7 9h10v2H7V9zm6 5H7v-2h6v2zm4-6H7V6h10v2z"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-title">SDM</div>
+        <div class="brand-sub">sldshr's direct messanger</div>
+      </div>
+    </div>
     <div class="tabs">
       <button type="button" id="tabLogin" class="active">Вход</button>
       <button type="button" id="tabReg">Регистрация</button>
@@ -625,7 +820,6 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 (() => {
 "use strict";
 
-/* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
            HELLO:8, STATUS:9, SYNC:10, CONTACT_REQ:11, CONTACT_OK:12,
            CONTACT_ADD:13, CHAT_END:14};
@@ -646,7 +840,6 @@ function unpack(buf){
   return [dv.getUint8(0), JSON.parse(_dec.decode(new Uint8Array(buf, 5, len)))];
 }
 
-/* ================= CRYPTO ================= */
 function b64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function b64url(u8){ return b64(u8).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
 function unb64(s){ const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
@@ -688,8 +881,7 @@ async function decryptBlob(key, blob){
   return _dec.decode(pt);
 }
 
-/* ================= THEME ================= */
-const LS_THEME = "fed_theme";
+const LS_THEME = "sdm_theme";
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
 function systemTheme(){ return mq.matches ? "dark" : "light"; }
 function applyTheme(t){
@@ -719,7 +911,6 @@ mq.addEventListener("change", e => {
   }
 });
 
-/* ================= ANTI-CTX ================= */
 document.addEventListener("contextmenu", e => {
   const t = e.target;
   if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
@@ -736,16 +927,15 @@ document.addEventListener("dragstart", e => {
   e.preventDefault();
 });
 
-/* ================= STATE ================= */
 let ws = null;
 let me = null;
 let myPrivKey = null;
 let myPubRaw = null;
 let sessionPassword = null;
-let contacts = [];          // [{uid, pub, online}] — только в памяти
-const convKeys = {};        // uid|pub16 -> CryptoKey
-const threads = {};         // uid -> [{id,from,to,text,ts,broken}]
-const unread = {};          // uid -> count
+let contacts = [];
+const convKeys = {};
+const threads = {};
+const unread = {};
 const seenIds = new Set();
 let activePeer = null;
 let reconnectAttempts = 0;
@@ -758,7 +948,6 @@ const $ = id => document.getElementById(id);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
                    : Date.now().toString(36) + Math.random().toString(36).slice(2,10));
 
-/* ================= UTILS ================= */
 function avatarColor(uid){
   const colors = ["#5865f2","#3ba55d","#faa61a","#ed4245","#eb459e","#9b59b6","#1abc9c","#e67e22"];
   let h = 0;
@@ -776,12 +965,10 @@ function toast(msg){
   toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-/* ================= STORAGE ================= */
-const LS_REMEMBER = "fed_remember";
-function privStoreKey(login){ return "fed_priv_" + login + "@" + location.host; }
-function privStoreKeyOld(login){ return "fed_priv_" + login; }
+const LS_REMEMBER = "sdm_remember";
+function privStoreKey(login){ return "sdm_priv_" + login + "@" + location.host; }
+function privStoreKeyOld(login){ return "sdm_priv_" + login; }
 
-/* ================= RENDER CONTACTS ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
@@ -849,7 +1036,6 @@ function renderContacts(){
   }
 }
 
-/* ================= SELECT ================= */
 function selectPeer(uid){
   activePeer = uid;
   unread[uid] = 0;
@@ -873,7 +1059,6 @@ function refreshPeerSub(){
   else { sub.textContent = "статус неизвестен"; sub.className = "peer-sub"; }
 }
 
-/* ================= THREAD ================= */
 function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}); }
 function fmtDay(ts){
   const d = new Date(ts), t = new Date();
@@ -925,7 +1110,6 @@ function renderThread(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ================= CRYPTO HELPERS ================= */
 async function getConvKeyFromPub(uid, pub){
   if (!pub) return null;
   const cacheKey = uid + "|" + pub.slice(0, 24);
@@ -939,7 +1123,6 @@ async function getConvKeyFromPub(uid, pub){
 }
 
 async function decryptIncoming(m, peer){
-  // ВСЕГДА используем pub из сообщения (m.p). Fallback — контакт.
   const pubs = [];
   if (m.p) pubs.push(m.p);
   const c = contacts.find(x => x.uid === peer);
@@ -956,7 +1139,6 @@ async function decryptIncoming(m, peer){
   return null;
 }
 
-/* ================= WS ================= */
 function connect(){
   return new Promise((resolve, reject) => {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1010,7 +1192,6 @@ async function handleFrame(type, obj){
     case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
     case T.PONG: break;
     case T.ERROR: {
-      // если ошибка при добавлении — показать
       if (pendingAdd){ $("addErr").textContent = obj.m || "Ошибка"; setBusy($("addConfirm"), false); }
       console.warn("server:", obj.m);
       break;
@@ -1091,7 +1272,6 @@ function removeContact(peer){
   renderContacts();
 }
 
-/* ================= AUTH ================= */
 function setErr(m){ $("authErr").textContent = m || ""; }
 function setNote(m){ $("authNote").textContent = m || ""; }
 function setBusy(btn, busy){ btn.disabled = busy; btn.classList.toggle("busy", busy); }
@@ -1153,7 +1333,6 @@ async function doAuth(login, password, remember){
 
     contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
     for (const k of Object.keys(threads)) delete threads[k];
-    // история
     for (const m of (ok.history || [])){
       const peer = m.f === me.uid ? m.t : m.f;
       seenIds.add(m.i);
@@ -1181,7 +1360,6 @@ async function doAuth(login, password, remember){
   }
 }
 
-/* ================= SEND ================= */
 async function sendMessage(){
   if (!activePeer || !ws || ws.readyState !== 1) return;
   const inp = $("inp");
@@ -1203,7 +1381,6 @@ async function sendMessage(){
   ws.send(pack(T.MSG, {i: id, t: activePeer, d: blob}));
 }
 
-/* ================= END CHAT ================= */
 function openEndModal(){
   if (!activePeer) return;
   $("endHint").textContent =
@@ -1223,7 +1400,6 @@ function confirmEndChat(){
   toast("Чат завершён");
 }
 
-/* ================= ADD CONTACT ================= */
 function openAddModal(){
   $("addInput").value = "";
   $("addErr").textContent = "";
@@ -1246,7 +1422,6 @@ function addContactFromInput(){
   ws.send(pack(T.CONTACT_REQ, {u: raw}));
 }
 
-/* ================= HEARTBEAT / RECONNECT ================= */
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
@@ -1273,7 +1448,6 @@ async function onDisconnect(){
   }
 }
 
-/* ================= COPY ================= */
 async function copyToClipboard(text){
   try { await navigator.clipboard.writeText(text); return true; }
   catch(e){
@@ -1299,7 +1473,6 @@ async function copyPeerUid(){
   else toast("Не удалось скопировать");
 }
 
-/* ================= UI BIND ================= */
 function setMode(m){
   mode = m;
   $("tabLogin").classList.toggle("active", m === "login");
@@ -1347,13 +1520,11 @@ $("convPeer").onclick = copyPeerUid;
 
 $("endChatBtn").onclick = openEndModal;
 $("endCancel").onclick = closeEndModal;
-$("endConfirm").onclick = confirmChatEndBridge;
-function confirmChatEndBridge(){ confirmEndChat(); }
+$("endConfirm").onclick = confirmEndChat;
 $("endModal").addEventListener("click", e => {
   if (e.target === $("endModal")) closeEndModal();
 });
 
-/* ================= AUTOLOGIN ================= */
 (function boot(){
   setTimeout(() => {
     let auto = null;
@@ -1386,10 +1557,22 @@ $("endModal").addEventListener("click", e => {
 
 
 # ============================ RUN ============================
-if __name__ == "__main__":
-    print(f"Server starting on http://{HOST}:{PORT}")
+def _run():
+    print_ready(HOST, PORT)
     try:
-        import uvloop  # type: ignore
-        uvicorn.run(app, host=HOST, port=PORT, log_level="warning", loop="uvloop")
-    except ImportError:
-        uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+        if _UVLOOP:
+            import uvloop  # type: ignore
+            uvloop.install()
+            uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
+        else:
+            uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print()
+        print(" " + _c(YELLOW, "●") + " " + _c(DIM, "Сервер остановлен"))
+        print()
+
+
+if __name__ == "__main__":
+    _run()
