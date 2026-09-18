@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
 SDM — sldshr's direct messanger
-E2EE мессенджер 1-на-1. Один файл.
-
-Запуск: python main.py
+Кроссплатформенный мессенджер 1-на-1.
+История хранится на сервере (RAM). Клиент — тонкий, только UI.
 """
+
+# ============================ CONFIG (правь под себя) ============================
+APP_NAME = "SDM"
+APP_SUB = "sldshr's direct messenger"
+DEFAULT_THEME = "system"      # "system" | "light" | "dark"
+WELCOME_MESSAGE = "Welcome to the official SDM community, Pls read the rules: dont spamming, dont fludding"          # если не пусто — показывается один раз при входе
+# =================================================================================
 
 import os
 import sys
@@ -43,7 +49,7 @@ OPTIONAL = [("uvloop", "uvloop")]
 def check_deps():
     print()
     print(_c(CYAN + BOLD, ASCII_SDM))
-    print("   " + _c(DIM + WHITE, "sldshr's direct messanger"))
+    print("   " + _c(DIM + WHITE, APP_SUB))
     print()
 
     missing = []
@@ -90,7 +96,6 @@ check_deps()
 
 # ============================ IMPORTS ============================
 import asyncio
-import base64
 import hashlib
 import json
 import secrets
@@ -117,17 +122,15 @@ except ImportError:
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
-PAIR_HISTORY_MAX = 200
+PAIR_HISTORY_MAX = 500
 MAX_CONTACTS = 500
-MAX_MSG_BYTES = 64 * 1024
+MAX_MSG_CHARS = 4000
 SESSION_TTL_MS = 30 * 24 * 3600_000
 AUTH_WINDOW = 60
-AUTH_MAX = 10
+AUTH_MAX = 15
 MSG_WINDOW = 10
-MSG_MAX = 40
+MSG_MAX = 30
 
-# scrypt: 128*n*r байт памяти. У OpenSSL лимит по умолчанию 32 MiB,
-# а n=2**15, r=8 требует ровно 32 MiB → падает. Ставим maxmem с запасом.
 SCRYPT_N = 2 ** 15
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -135,7 +138,6 @@ SCRYPT_MAXMEM = 256 * 1024 * 1024
 SCRYPT_PARALLEL = 4
 
 
-# ============================ LOGGER ============================
 def log_err(tag: str, exc: BaseException):
     print(f"[{tag}] {type(exc).__name__}: {exc}", file=_sys.stderr)
     traceback.print_exc()
@@ -143,8 +145,8 @@ def log_err(tag: str, exc: BaseException):
 
 # ============================ PROTOCOL ============================
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
- T_HELLO, T_STATUS, T_SYNC, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
- T_CHAT_END, T_LOGOUT) = range(1, 16)
+ T_HELLO, T_STATUS, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
+ T_CHAT_END, T_LOGOUT) = range(1, 15)
 _HDR = struct.Struct(">BI")
 
 
@@ -158,7 +160,7 @@ def unpack(data: bytes):
     return t, json.loads(data[5:5 + ln].decode("utf-8"))
 
 
-# ============================ STATE ============================
+# ============================ STATE (RAM) ============================
 users: dict[str, dict] = {}
 online: dict[str, "Client"] = {}
 watchers: dict[str, set] = {}
@@ -171,11 +173,9 @@ _DUMMY_SALT = os.urandom(16)
 
 # ============================ HELPERS ============================
 def scrypt_raw(pw: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(
-        pw.encode("utf-8"), salt=salt,
-        n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32,
-        maxmem=SCRYPT_MAXMEM,
-    )
+    return hashlib.scrypt(pw.encode("utf-8"), salt=salt,
+                          n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32,
+                          maxmem=SCRYPT_MAXMEM)
 
 
 async def scrypt_async(pw: str, salt: bytes) -> bytes:
@@ -202,20 +202,14 @@ def check_rate(bucket: dict, key: str, maxn: int, window: float) -> bool:
     return True
 
 
-def valid_pubkey(pub: str) -> bool:
-    if not isinstance(pub, str) or len(pub) < 80 or len(pub) > 200:
-        return False
-    try:
-        raw = base64.b64decode(pub, validate=True)
-    except Exception:
-        return False
-    return len(raw) == 65 and raw[0] == 0x04
-
-
 def valid_login(login: str) -> bool:
     if not isinstance(login, str) or not (3 <= len(login) <= 24):
         return False
     return all(ch.isalnum() or ch in "_-." for ch in login)
+
+
+def valid_pw(pw: str) -> bool:
+    return isinstance(pw, str) and 8 <= len(pw) <= 128
 
 
 def new_session(login: str) -> str:
@@ -283,15 +277,12 @@ async def handle_register(c: Client, obj: dict):
     try:
         login = (obj.get("login") or "").strip().lower()
         pw = obj.get("password") or ""
-        pub = obj.get("pub") or ""
         remember = bool(obj.get("remember"))
 
         if not valid_login(login):
             return await c.send_error("VALIDATION", "Логин: 3–24 символа, a-z 0-9 . _ -")
-        if not isinstance(pw, str) or len(pw) < 8:
+        if not valid_pw(pw):
             return await c.send_error("VALIDATION", "Пароль минимум 8 символов")
-        if not valid_pubkey(pub):
-            return await c.send_error("VALIDATION", "Некорректный публичный ключ")
         if login in users:
             return await c.send_error("LOGIN_TAKEN", "Логин уже занят")
 
@@ -303,7 +294,7 @@ async def handle_register(c: Client, obj: dict):
             return await c.send_error("SERVER", "Ошибка хэширования пароля",
                                       f"{type(e).__name__}: {e}")
 
-        users[login] = {"salt": salt, "pw": h, "pub": pub, "contacts": {}}
+        users[login] = {"salt": salt, "pw": h, "contacts": set()}
         watchers.setdefault(login, set())
         await _finish_auth(c, login, remember, new_pw_ok=True)
     except Exception as e:
@@ -320,13 +311,17 @@ async def handle_auth(c: Client, obj: dict):
             if not login or login not in users:
                 return await c.send_error("SESSION", "Сессия истекла, войдите заново")
             if login in online:
-                return await c.send_error("ALREADY_ONLINE", "Уже в сети с другого устройства")
+                old = online.get(login)
+                try:
+                    if old: await old.ws.close(code=4000, reason="replaced")
+                except Exception:
+                    pass
+                online.pop(login, None)
             return await _finish_auth(c, login, remember=False, restore_token=tok)
 
         login = (obj.get("login") or "").strip().lower()
         pw = obj.get("password") or ""
         remember = bool(obj.get("remember"))
-        pub = (obj.get("pub") or "").strip() or None
 
         if not check_rate(_auth_buckets, c.ip, AUTH_MAX, AUTH_WINDOW):
             return await c.send_error("RATE_LIMIT", "Слишком много попыток входа")
@@ -335,8 +330,8 @@ async def handle_auth(c: Client, obj: dict):
         if u is None:
             try:
                 await scrypt_async(pw if isinstance(pw, str) else "", _DUMMY_SALT)
-            except Exception as e:
-                log_err("scrypt.dummy", e)
+            except Exception:
+                pass
             return await c.send_error("AUTH_FAIL", "Неверный логин или пароль")
 
         try:
@@ -348,11 +343,14 @@ async def handle_auth(c: Client, obj: dict):
 
         if not secrets.compare_digest(u["pw"], h):
             return await c.send_error("AUTH_FAIL", "Неверный логин или пароль")
-        if login in online:
-            return await c.send_error("ALREADY_ONLINE", "Уже в сети с другого устройства")
 
-        if pub and valid_pubkey(pub) and pub != u["pub"]:
-            u["pub"] = pub
+        if login in online:
+            old = online.get(login)
+            try:
+                if old: await old.ws.close(code=4000, reason="replaced")
+            except Exception:
+                pass
+            online.pop(login, None)
 
         await _finish_auth(c, login, remember)
     except Exception as e:
@@ -368,8 +366,8 @@ async def _finish_auth(c: Client, login: str, remember: bool,
     u = users[login]
 
     contacts_payload = [
-        {"u": peer, "p": pub, "o": peer in online}
-        for peer, pub in u["contacts"].items()
+        {"u": peer, "o": peer in online}
+        for peer in u["contacts"]
     ]
 
     hist = []
@@ -378,7 +376,11 @@ async def _finish_auth(c: Client, login: str, remember: bool,
             hist.extend(dq)
     hist.sort(key=lambda m: m["s"])
 
-    payload = {"login": login, "contacts": contacts_payload, "history": hist}
+    payload = {
+        "login": login,
+        "contacts": contacts_payload,
+        "history": hist,
+    }
 
     if new_pw_ok or remember:
         payload["token"] = new_session(login)
@@ -395,13 +397,13 @@ async def handle_msg(c: Client, obj: dict):
             return await c.send_error("RATE_LIMIT", "Слишком много сообщений")
 
         to_login = (obj.get("t") or "").strip().lower()
-        blob = obj.get("d")
-        if not isinstance(to_login, str) or not isinstance(blob, str) or not blob:
+        text = obj.get("x")
+        if not isinstance(to_login, str) or not isinstance(text, str) or not text:
             return await c.send_error("VALIDATION", "Некорректное сообщение")
+        if len(text) > MAX_MSG_CHARS:
+            return await c.send_error("VALIDATION", "Сообщение слишком большое")
         if to_login == c.login:
             return await c.send_error("VALIDATION", "Нельзя писать самому себе")
-        if len(blob) > MAX_MSG_BYTES:
-            return await c.send_error("VALIDATION", "Сообщение слишком большое")
 
         me = users[c.login]
         peer = users.get(to_login)
@@ -413,7 +415,7 @@ async def handle_msg(c: Client, obj: dict):
         mid = obj.get("i") or uuid.uuid4().hex
         msg = {
             "i": mid, "f": c.login, "t": to_login,
-            "d": blob, "p": me["pub"],
+            "x": text,
             "s": int(_time.time() * 1000),
         }
 
@@ -424,9 +426,7 @@ async def handle_msg(c: Client, obj: dict):
             messages[key] = dq
         dq.append(msg)
 
-        # эхо отправителю
         await c.send(T_MSG, msg)
-        # получателю
         target = online.get(to_login)
         if target:
             await target.send(T_MSG, msg)
@@ -453,19 +453,16 @@ async def handle_contact_req(c: Client, obj: dict):
         if len(u["contacts"]) >= MAX_CONTACTS:
             return await c.send_error("CONTACT_LIMIT", "У собеседника лимит контактов")
 
-        pub = u["pub"]
-        my_pub = me["pub"]
-
-        me["contacts"][peer] = pub
-        u["contacts"][c.login] = my_pub
+        me["contacts"].add(peer)
+        u["contacts"].add(c.login)
         watchers.setdefault(peer, set()).add(c.login)
         watchers.setdefault(c.login, set()).add(peer)
 
-        await c.send(T_CONTACT_OK, {"u": peer, "p": pub, "o": peer in online})
+        await c.send(T_CONTACT_OK, {"u": peer, "o": peer in online})
 
         target = online.get(peer)
         if target:
-            await target.send(T_CONTACT_ADD, {"u": c.login, "p": my_pub, "o": True})
+            await target.send(T_CONTACT_ADD, {"u": c.login, "o": True})
     except Exception as e:
         log_err("contact_req", e)
         await c.send_error("SERVER", "Не удалось добавить контакт",
@@ -479,9 +476,9 @@ async def handle_chat_end(c: Client, obj: dict):
             return
         my = c.login
 
-        users[my]["contacts"].pop(peer, None)
+        users[my]["contacts"].discard(peer)
         if peer in users:
-            users[peer]["contacts"].pop(my, None)
+            users[peer]["contacts"].discard(my)
 
         w_me = watchers.get(my)
         if w_me: w_me.discard(peer)
@@ -528,7 +525,6 @@ async def ws_handler(ws: WebSocket):
                     return
             except Exception:
                 pass
-
         await ws.accept()
     except Exception as e:
         log_err("ws.accept", e)
@@ -536,10 +532,15 @@ async def ws_handler(ws: WebSocket):
 
     c = Client(ws, ws_ip(ws))
     try:
-        await c.send(T_HELLO, {})
+        await c.send(T_HELLO, {
+            "app_name": APP_NAME,
+            "app_sub": APP_SUB,
+            "welcome": WELCOME_MESSAGE,
+            "default_theme": DEFAULT_THEME,
+        })
         while True:
             raw = await ws.receive_bytes()
-            if len(raw) > MAX_MSG_BYTES + 4096:
+            if len(raw) > MAX_MSG_CHARS * 4 + 4096:
                 await ws.close(code=1009)
                 return
             try:
@@ -562,13 +563,6 @@ async def ws_handler(ws: WebSocket):
                 await handle_logout(c, obj)
             elif t == T_PING:
                 await c.send(T_PONG, {})
-            elif t == T_SYNC and c.login:
-                u = users[c.login]
-                snapshot = [
-                    {"u": peer, "o": peer in online}
-                    for peer in u["contacts"].keys()
-                ]
-                await c.send(T_STATUS, {"snapshot": snapshot})
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -588,14 +582,20 @@ async def ws_handler(ws: WebSocket):
 
 
 # ============================ HTML ============================
+# Плейсхолдеры {{APP_NAME}}, {{APP_SUB}}, {{DEFAULT_THEME}}, {{CFG_JSON}}
+# рендерятся ниже один раз при старте, чтобы клиент сразу видел правильные
+# названия без ожидания WS-подключения.
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
-<title>SDM · sldshr's direct messanger</title>
+<title>{{APP_NAME}}</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%235865f2'/%3E%3Cpath d='M20 4H4a1 1 0 0 0-1 1v14l3.5-3.5H20a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1z' fill='white'/%3E%3C/svg%3E">
+<script>
+  window.__CFG = {{CFG_JSON}};
+</script>
 <style>
 :root{
   --bg-primary:#ffffff;--bg-secondary:#f2f3f5;--bg-tertiary:#e3e5e8;
@@ -642,9 +642,9 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 .brand{display:flex;align-items:center;gap:10px;margin-bottom:18px}
 .brand-logo{width:42px;height:42px;border-radius:12px;background:var(--accent);
   display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.brand-text{display:flex;flex-direction:column;line-height:1.2}
-.brand-title{font-weight:700;font-size:16px}
-.brand-sub{font-size:11px;color:var(--text-muted)}
+.brand-text{display:flex;flex-direction:column;line-height:1.2;min-width:0}
+.brand-title{font-weight:700;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brand-sub{font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .theme-btn{position:absolute;top:14px;right:14px}
 .tabs{display:flex;background:var(--bg-secondary);border-radius:9px;padding:3px;margin-bottom:18px}
 .tabs button{flex:1;background:none;border:none;color:var(--text-muted);
@@ -669,7 +669,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 #app.on{display:flex}
 #sidebar{width:320px;flex-shrink:0;background:var(--bg-secondary);
   display:flex;flex-direction:column;border-right:1px solid var(--border);
-  transition:background .15s;position:relative}
+  transition:background .15s}
 .sidebar-header{display:flex;align-items:center;gap:6px;padding:10px 12px;
   padding-top:calc(10px + env(safe-area-inset-top));
   border-bottom:1px solid var(--border);background:var(--bg-primary)}
@@ -689,7 +689,6 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 .icon-btn:hover{background:var(--bg-hover);color:var(--text-normal)}
 .icon-btn.danger{color:var(--red)}
 .icon-btn.danger:hover{background:rgba(237,66,69,.12);color:var(--red)}
-.icon-btn.active{background:var(--accent);color:#fff}
 
 .sidebar-title{padding:14px 16px 6px;font-size:11px;font-weight:700;
   color:var(--text-muted);text-transform:uppercase;letter-spacing:.02em;
@@ -702,22 +701,12 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   border-radius:8px;cursor:pointer;transition:background .1s;position:relative;min-height:54px}
 .contact:hover{background:var(--bg-hover)}
 .contact.active{background:var(--bg-active)}
-.contact.selected{background:var(--bg-active);box-shadow:inset 0 0 0 2px var(--accent)}
-.contact .cb{display:none;width:20px;height:20px;border-radius:50%;
-  border:2px solid var(--text-muted);flex-shrink:0;align-items:center;
-  justify-content:center;transition:all .12s}
-.contact.selected .cb{background:var(--accent);border-color:var(--accent);color:#fff}
-.contact.selected .cb svg{display:block}
-.contact .cb svg{display:none}
-body.select-mode .contact .cb{display:flex}
-body.select-mode .contact .avatar-wrap{display:none}
 .avatar-wrap{position:relative;flex-shrink:0}
 .status-dot{position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;
   border-radius:50%;background:#b9bbbe;border:3px solid var(--bg-secondary)}
 .status-dot.online{background:var(--green)}
 .status-dot.unknown{background:#c7ccd1}
 .contact.active .status-dot{border-color:var(--bg-active)}
-.contact.selected .status-dot{border-color:var(--bg-active)}
 .contact-info{flex:1;min-width:0}
 .contact-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;color:var(--text-normal);display:flex;align-items:center;gap:5px}
@@ -735,27 +724,10 @@ body.select-mode .contact .avatar-wrap{display:none}
 .contact:hover .pin-btn{display:flex}
 .contact.pinned .pin-btn{display:flex;color:var(--accent)}
 .contact .pin-btn:hover{background:var(--bg-active)}
-body.select-mode .contact .pin-btn{display:none!important}
 @media (hover:none){
   .contact .pin-btn{display:flex;opacity:.4}
   .contact.pinned .pin-btn{opacity:1;color:var(--accent)}
 }
-
-/* Select bar */
-#selectBar{display:none;background:var(--bg-primary);border-top:1px solid var(--border);
-  padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom));
-  gap:6px;align-items:center;flex-wrap:wrap;justify-content:space-between}
-#selectBar.show{display:flex}
-#selectBar .sc{font-size:12px;color:var(--text-muted);font-weight:600;
-  padding:4px 8px;flex:1 0 auto}
-#selectBar .row{display:flex;gap:6px;flex-wrap:wrap}
-.btn-mini{background:var(--bg-secondary);border:none;padding:7px 12px;
-  border-radius:7px;font-size:13px;font-weight:500;color:var(--text-normal);
-  display:inline-flex;align-items:center;gap:5px;transition:background .12s}
-.btn-mini:hover{background:var(--bg-hover)}
-.btn-mini.danger{color:#fff;background:var(--red)}
-.btn-mini.danger:hover{opacity:.88}
-.btn-mini:disabled{opacity:.5;cursor:default}
 
 #chatPane{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-primary)}
 #emptyState{flex:1;display:flex;flex-direction:column;align-items:center;
@@ -786,8 +758,6 @@ body.select-mode .contact .pin-btn{display:none!important}
 .m.me{align-self:flex-end;background:var(--accent);color:#fff}
 .m .ts{font-size:11px;opacity:.65;margin-top:2px;display:block;text-align:right}
 .m.me .ts{opacity:.85}
-.m.broken{background:transparent;border:1px dashed var(--border);
-  color:var(--text-muted);font-style:italic}
 .day-sep{align-self:center;font-size:11px;color:var(--text-muted);
   padding:6px 12px;background:var(--bg-secondary);border-radius:10px;margin:8px 0 4px}
 #composer{display:flex;align-items:center;gap:8px;padding:10px 14px;
@@ -807,7 +777,7 @@ body.select-mode .contact .pin-btn{display:none!important}
   display:none;align-items:center;justify-content:center;padding:20px;z-index:200}
 .modal-backdrop.open{display:flex}
 .modal{background:var(--bg-primary);border-radius:14px;padding:22px;width:100%;max-width:460px;
-  box-shadow:var(--card-shadow)}
+  box-shadow:var(--card-shadow);max-height:calc(100dvh - 40px);overflow:auto}
 .modal h3{font-size:18px;margin-bottom:6px;font-weight:700}
 .modal .hint{color:var(--text-muted);font-size:13px;margin-bottom:14px;line-height:1.5}
 .modal input{width:100%;padding:12px 14px;border-radius:8px;
@@ -839,6 +809,10 @@ body.select-mode .contact .pin-btn{display:none!important}
   font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;
   max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;
   color:var(--text-normal);margin-bottom:14px;border:1px solid var(--border)}
+
+#welcomeModal .modal h3{color:var(--accent)}
+#welcomeBody{font-size:14px;line-height:1.55;color:var(--text-normal);margin-bottom:16px;
+  white-space:pre-wrap;word-wrap:break-word}
 
 #toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);
   background:var(--toast-bg);color:var(--toast-fg);padding:11px 18px;border-radius:8px;
@@ -877,8 +851,8 @@ body.select-mode .contact .pin-btn{display:none!important}
         </svg>
       </div>
       <div class="brand-text">
-        <div class="brand-title">SDM</div>
-        <div class="brand-sub">sldshr's direct messanger</div>
+        <div class="brand-title" id="brandTitle">{{APP_NAME}}</div>
+        <div class="brand-sub" id="brandSub">{{APP_SUB}}</div>
       </div>
     </div>
     <div class="tabs">
@@ -906,11 +880,6 @@ body.select-mode .contact .pin-btn{display:none!important}
         <div class="my-name" id="myLogin">—</div>
         <div class="my-sub" id="myDomain">в сети</div>
       </div>
-      <button class="icon-btn" id="selectBtn" title="Выбрать" aria-label="Выбрать">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
-        </svg>
-      </button>
       <button class="icon-btn" id="themeBtn" title="Тема" aria-label="Тема">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
@@ -932,18 +901,6 @@ body.select-mode .contact .pin-btn{display:none!important}
       <span class="count" id="chatCount"></span>
     </div>
     <div id="contacts"></div>
-    <div id="selectBar">
-      <span class="sc" id="selCount">0 выбрано</span>
-      <div class="row">
-        <button class="btn-mini" id="selPin" type="button">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>
-          Закрепить
-        </button>
-        <button class="btn-mini" id="selUnpin" type="button">Открепить</button>
-        <button class="btn-mini danger" id="selEnd" type="button">Удалить</button>
-        <button class="btn-mini" id="selCancel" type="button">Отмена</button>
-      </div>
-    </div>
   </aside>
 
   <section id="chatPane">
@@ -1013,6 +970,16 @@ body.select-mode .contact .pin-btn{display:none!important}
   </div>
 </div>
 
+<div class="modal-backdrop" id="welcomeModal">
+  <div class="modal">
+    <h3 id="welcomeTitle">Добро пожаловать</h3>
+    <div id="welcomeBody"></div>
+    <div class="modal-actions">
+      <button class="btn-primary" id="welcomeClose" type="button">Понятно</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="errModal">
   <div class="modal err-modal">
     <h3>Ошибка</h3>
@@ -1047,7 +1014,6 @@ function showError(code, desc, log){
     try { alert("[" + code + "] " + desc + "\n\n" + log); } catch(e2){}
   }
 }
-
 document.getElementById("errClose").onclick = () => {
   document.getElementById("errModal").classList.remove("open");
 };
@@ -1064,7 +1030,6 @@ document.getElementById("errCopy").onclick = async () => {
     } catch(e2){}
   }
 };
-
 window.addEventListener("error", e => {
   showError("CLIENT_ERR", e.message || "Ошибка в клиенте",
     (e.error && e.error.stack) ? e.error.stack
@@ -1079,8 +1044,8 @@ window.addEventListener("unhandledrejection", e => {
 
 /* ================= PROTOCOL ================= */
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
-           HELLO:8, STATUS:9, SYNC:10, CONTACT_REQ:11, CONTACT_OK:12,
-           CONTACT_ADD:13, CHAT_END:14, LOGOUT:15};
+           HELLO:8, STATUS:9, CONTACT_REQ:10, CONTACT_OK:11, CONTACT_ADD:12,
+           CHAT_END:13, LOGOUT:14};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -1098,61 +1063,14 @@ function unpack(buf){
   return [dv.getUint8(0), JSON.parse(_dec.decode(new Uint8Array(buf, 5, len)))];
 }
 
-/* ================= CRYPTO ================= */
-function b64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
-function b64url(u8){ return b64(u8).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
-function unb64(s){ const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
-function unb64url(s){
-  s = s.replace(/-/g,"+").replace(/_/g,"/");
-  while (s.length % 4) s += "=";
-  return unb64(s);
-}
-function jwkToRawPub(jwk){
-  if (!jwk || !jwk.x || !jwk.y) return null;
-  const x = unb64url(jwk.x), y = unb64url(jwk.y);
-  if (x.length !== 32 || y.length !== 32) return null;
-  const raw = new Uint8Array(65);
-  raw[0] = 4; raw.set(x,1); raw.set(y,33);
-  return b64(raw);
-}
-
-function ensureCrypto(){
-  if (!window.crypto || !window.crypto.subtle){
-    const err = new Error("WebCrypto недоступен. Откройте сайт через HTTPS или localhost");
-    err.code = "CRYPTO_UNAVAILABLE";
-    throw err;
-  }
-}
-
-async function genKeyPair(){ ensureCrypto(); return crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]); }
-async function exportPubRaw(pub){ return b64(new Uint8Array(await crypto.subtle.exportKey("raw", pub))); }
-async function exportPrivJWK(priv){ return await crypto.subtle.exportKey("jwk", priv); }
-async function importPrivJWK(jwk){ return crypto.subtle.importKey("jwk",jwk,{name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]); }
-async function importPubRaw(str){ return crypto.subtle.importKey("raw",unb64(str),{name:"ECDH",namedCurve:"P-256"},true,[]); }
-async function deriveAesKey(priv, pub){
-  return crypto.subtle.deriveKey({name:"ECDH",public:pub},priv,
-    {name:"AES-GCM",length:256},false,["encrypt","decrypt"]);
-}
-async function encryptBlob(key, text){
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const buf = await crypto.subtle.encrypt({name:"AES-GCM",iv}, key, _enc.encode(text));
-  const all = new Uint8Array(12 + buf.byteLength);
-  all.set(iv, 0); all.set(new Uint8Array(buf), 12);
-  return b64url(all);
-}
-async function decryptBlob(key, blob){
-  const all = unb64url(blob);
-  const iv = all.slice(0, 12);
-  const ct = all.slice(12);
-  const pt = await crypto.subtle.decrypt({name:"AES-GCM",iv}, key, ct);
-  return _dec.decode(pt);
-}
-
 /* ================= THEME ================= */
 const LS_THEME = "sdm_theme";
+const CFG = window.__CFG || {};
+let defaultTheme = CFG.default_theme || "system";
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
 function systemTheme(){ return mq.matches ? "dark" : "light"; }
 function applyTheme(t){
+  if (t === "system") t = systemTheme();
   document.documentElement.setAttribute("data-theme", t);
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute("content", t === "dark" ? "#313338" : "#ffffff");
@@ -1162,7 +1080,7 @@ function getInitialTheme(){
     const saved = localStorage.getItem(LS_THEME);
     if (saved === "dark" || saved === "light") return saved;
   } catch(e){}
-  return systemTheme();
+  return defaultTheme;
 }
 function toggleTheme(){
   const cur = document.documentElement.getAttribute("data-theme") || "light";
@@ -1196,12 +1114,9 @@ document.addEventListener("dragstart", e => {
 /* ================= STATE ================= */
 let ws = null;
 let me = null;
-let myPrivKey = null;
-let myPubRaw = null;
 let sessionToken = null;
 let sessionPassword = null;
 let contacts = [];
-const convKeys = {};
 const threads = {};
 const unread = {};
 const seenIds = new Set();
@@ -1211,11 +1126,8 @@ let heartbeatTimer = null;
 let mode = "login";
 let authPayload = null;
 let pendingAdd = null;
-
-// pin/selection
 let pinned = new Set();
-let selMode = false;
-let sel = new Set();
+let welcomeShown = false;
 
 const $ = id => document.getElementById(id);
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
@@ -1240,31 +1152,20 @@ function toast(msg){
 
 const LS_SESSION = "sdm_session";
 const LS_PINNED = "sdm_pinned";
-function privStoreKey(login){ return "sdm_priv_" + login + "@" + location.host; }
-function privStoreKeyOld(login){ return "sdm_priv_" + login; }
-
-function lsSet(key, value){
-  try { localStorage.setItem(key, value); return true; }
-  catch(e){ showError("STORAGE", "Не удалось сохранить данные в localStorage", String(e)); return false; }
-}
-function lsGet(key){ try { return localStorage.getItem(key); } catch(e){ return null; } }
-function lsDel(key){ try { localStorage.removeItem(key); } catch(e){} }
+function lsSet(k, v){ try { localStorage.setItem(k, v); return true; } catch(e){ return false; } }
+function lsGet(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }
+function lsDel(k){ try { localStorage.removeItem(k); } catch(e){} }
 
 function pinnedKey(){ return LS_PINNED + "_" + (me ? me.login : "anon"); }
 function loadPinned(){
   pinned = new Set();
   const raw = lsGet(pinnedKey());
   if (!raw) return;
-  try {
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) arr.forEach(x => pinned.add(x));
-  } catch(e){}
+  try { const arr = JSON.parse(raw); if (Array.isArray(arr)) arr.forEach(x => pinned.add(x)); } catch(e){}
 }
-function savePinned(){
-  lsSet(pinnedKey(), JSON.stringify([...pinned]));
-}
+function savePinned(){ lsSet(pinnedKey(), JSON.stringify([...pinned])); }
 
-/* ================= CONTACT LIST ================= */
+/* ================= RENDER ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
@@ -1279,29 +1180,23 @@ function renderContacts(){
   }
 
   const sorted = contacts.slice().sort((a,b) => {
-    // 1. Закреплённые наверх
     const pa = pinned.has(a.uid) ? 0 : 1;
     const pb = pinned.has(b.uid) ? 0 : 1;
     if (pa !== pb) return pa - pb;
-    // 2. Непрочитанные
     const ua = unread[a.uid] > 0 ? 0 : 1;
     const ub = unread[b.uid] > 0 ? 0 : 1;
     if (ua !== ub) return ua - ub;
-    // 3. По времени последнего
     const la = threads[a.uid] || [], lb = threads[b.uid] || [];
     const ta = la.length ? la[la.length-1].ts : 0;
     const tb = lb.length ? lb[lb.length-1].ts : 0;
     if (ta !== tb) return tb - ta;
-    // 4. Online
     const oa = a.online === true ? 0 : 1, ob = b.online === true ? 0 : 1;
     if (oa !== ob) return oa - ob;
-    // 5. Алфавит
     return a.uid.localeCompare(b.uid);
   });
 
   for (const c of sorted){
-    const isActive = c.uid === activePeer && !selMode;
-    const isSelected = sel.has(c.uid);
+    const isActive = c.uid === activePeer;
     const hasUnread = unread[c.uid] > 0;
     const isPinned = pinned.has(c.uid);
 
@@ -1309,26 +1204,10 @@ function renderContacts(){
     el.className = "contact"
       + (isActive ? " active" : "")
       + (hasUnread ? " unread" : "")
-      + (isPinned ? " pinned" : "")
-      + (isSelected ? " selected" : "");
-    el.dataset.uid = c.uid;
+      + (isPinned ? " pinned" : "");
 
-    el.onclick = (ev) => {
-      if (selMode){
-        ev.preventDefault();
-        ev.stopPropagation();
-        toggleSel(c.uid);
-        return;
-      }
-      selectPeer(c.uid);
-    };
+    el.onclick = () => selectPeer(c.uid);
 
-    // Чекбокс (для режима выбора)
-    const cb = document.createElement("span");
-    cb.className = "cb";
-    cb.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-
-    // Аватар + статус
     const wrap = document.createElement("div");
     wrap.className = "avatar-wrap";
     const av = document.createElement("div");
@@ -1339,7 +1218,6 @@ function renderContacts(){
     dot.className = "status-dot " + (c.online === true ? "online" : (c.online === false ? "" : "unknown"));
     wrap.append(av, dot);
 
-    // Инфо
     const info = document.createElement("div");
     info.className = "contact-info";
     const nm = document.createElement("div");
@@ -1360,33 +1238,29 @@ function renderContacts(){
     if (t && t.length){
       const last = t[t.length-1];
       const mine = last.from === me.uid;
-      pv.textContent = (mine ? "Вы: " : "") + (last.broken ? "⚠ зашифровано" : last.text);
+      pv.textContent = (mine ? "Вы: " : "") + last.text;
     } else {
       pv.textContent = c.online === true ? "в сети"
                     : (c.online === false ? "не в сети" : "статус неизвестен");
     }
     info.append(nm, pv);
 
-    // Бейдж
-    if (hasUnread && !selMode){
+    if (hasUnread){
       const b = document.createElement("span");
       b.className = "badge";
       b.textContent = unread[c.uid] > 99 ? "99+" : unread[c.uid];
-      el.append(cb, wrap, info, b);
+      el.append(wrap, info, b);
     } else {
-      // Кнопка pin
       const pb = document.createElement("button");
       pb.className = "pin-btn";
       pb.title = isPinned ? "Открепить" : "Закрепить";
       pb.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z"/></svg>';
       pb.onclick = (ev) => {
-        ev.stopPropagation();
-        ev.preventDefault();
+        ev.stopPropagation(); ev.preventDefault();
         togglePin(c.uid);
       };
-      el.append(cb, wrap, info, pb);
+      el.append(wrap, info, pb);
     }
-
     box.appendChild(el);
   }
 }
@@ -1398,7 +1272,6 @@ function togglePin(uid){
   renderContacts();
   updatePinActiveBtn();
 }
-
 function updatePinActiveBtn(){
   const b = $("pinActiveBtn");
   if (!b) return;
@@ -1411,71 +1284,7 @@ function updatePinActiveBtn(){
   }
 }
 
-/* ================= SELECT MODE ================= */
-function enterSelMode(){
-  selMode = true;
-  sel.clear();
-  document.body.classList.add("select-mode");
-  $("selectBtn").classList.add("active");
-  $("selectBar").classList.add("show");
-  renderSelBar();
-  renderContacts();
-}
-function exitSelMode(){
-  selMode = false;
-  sel.clear();
-  document.body.classList.remove("select-mode");
-  $("selectBtn").classList.remove("active");
-  $("selectBar").classList.remove("show");
-  renderSelBar();
-  renderContacts();
-}
-function toggleSel(uid){
-  if (sel.has(uid)) sel.delete(uid);
-  else sel.add(uid);
-  renderSelBar();
-  renderContacts();
-}
-function renderSelBar(){
-  const n = sel.size;
-  $("selCount").textContent = n + " выбрано";
-  $("selPin").disabled = n === 0;
-  $("selUnpin").disabled = n === 0;
-  $("selEnd").disabled = n === 0;
-}
-function bulkPin(){
-  if (!sel.size) return;
-  for (const u of sel) pinned.add(u);
-  savePinned();
-  const n = sel.size;
-  exitSelMode();
-  toast("Закреплено: " + n);
-}
-function bulkUnpin(){
-  if (!sel.size) return;
-  for (const u of sel) pinned.delete(u);
-  savePinned();
-  const n = sel.size;
-  exitSelMode();
-  toast("Откреплено: " + n);
-}
-function bulkEnd(){
-  if (!sel.size) return;
-  const n = sel.size;
-  if (!confirm("Завершить " + n + " чат(ов)? Переписка удалится у вас и у собеседников.")) return;
-  for (const uid of sel){
-    if (ws && ws.readyState === 1){
-      try { ws.send(pack(T.CHAT_END, {u: uid})); } catch(e){}
-    }
-    removeContact(uid);
-    pinned.delete(uid);
-  }
-  savePinned();
-  exitSelMode();
-  toast("Завершено: " + n);
-}
-
-/* ================= SELECT PEER ================= */
+/* ================= SELECT ================= */
 function selectPeer(uid){
   activePeer = uid;
   unread[uid] = 0;
@@ -1489,7 +1298,6 @@ function selectPeer(uid){
   setTimeout(() => $("inp").focus(), 60);
 }
 function goBack(){ $("app").classList.remove("chat-open"); }
-
 function refreshPeerSub(){
   if (!activePeer) return;
   const c = contacts.find(x => x.uid === activePeer);
@@ -1512,7 +1320,7 @@ function fmtDay(ts){
 function buildMsgEl(m){
   const mine = m.from === me.uid;
   const el = document.createElement("div");
-  el.className = "m" + (mine ? " me" : "") + (m.broken ? " broken" : "");
+  el.className = "m" + (mine ? " me" : "");
   const txt = document.createElement("div");
   txt.textContent = m.text;
   const ts = document.createElement("span");
@@ -1552,39 +1360,6 @@ function renderThread(){
   box.scrollTop = box.scrollHeight;
 }
 
-/* ================= CRYPTO ================= */
-async function getConvKeyFromPub(uid, pub){
-  if (!pub) return null;
-  const cacheKey = uid + "|" + pub.slice(0, 24);
-  if (convKeys[cacheKey]) return convKeys[cacheKey];
-  try {
-    const p = await importPubRaw(pub);
-    const k = await deriveAesKey(myPrivKey, p);
-    convKeys[cacheKey] = k;
-    return k;
-  } catch(e){
-    console.warn("derive key failed", e);
-    return null;
-  }
-}
-
-async function decryptIncoming(m, peer){
-  const pubs = [];
-  if (m.p) pubs.push(m.p);
-  const c = contacts.find(x => x.uid === peer);
-  if (c && c.pub && c.pub !== m.p) pubs.push(c.pub);
-  for (const pub of pubs){
-    const key = await getConvKeyFromPub(peer, pub);
-    if (!key) continue;
-    try {
-      const text = await decryptBlob(key, m.d);
-      if (c && m.p && c.pub !== m.p) c.pub = m.p;
-      return text;
-    } catch(e){}
-  }
-  return null;
-}
-
 /* ================= WS ================= */
 function connect(){
   return new Promise((resolve, reject) => {
@@ -1607,11 +1382,9 @@ function connect(){
     let settled = false;
     const to = setTimeout(() => {
       if (!settled){
-        settled = true;
-        try{ ws.close(); }catch(e){}
+        settled = true; try{ ws.close(); }catch(e){}
         const err = new Error("Таймаут подключения");
-        err.code = "WS_TIMEOUT";
-        reject(err);
+        err.code = "WS_TIMEOUT"; reject(err);
       }
     }, 10000);
 
@@ -1630,7 +1403,15 @@ function connect(){
         showError("WS_PARSE", "Не удалось разобрать сообщение от сервера", String(e));
         return;
       }
-      if (type === T.HELLO) return;
+      if (type === T.HELLO){
+        // Название и подпись уже вшиты в HTML при старте сервера,
+        // здесь только тема — если пользователь её не переопределял.
+        if (obj.default_theme && !lsGet(LS_THEME)){
+          defaultTheme = obj.default_theme;
+          applyTheme(defaultTheme);
+        }
+        return;
+      }
       if (!settled){
         if (type === T.AUTH_OK){ settled = true; clearTimeout(to); resolve(obj); return; }
         if (type === T.ERROR){
@@ -1652,20 +1433,28 @@ function connect(){
       if (!settled){
         settled = true; clearTimeout(to);
         const err = new Error(
-          ev.code === 1008 ? "Соединение отклонено (origin)"
+          ev.code === 1008 ? "Соединение отклонено"
           : ev.code === 1009 ? "Сообщение слишком большое"
+          : ev.code === 4000 ? "Вошли с другого устройства"
           : "Соединение закрыто (" + ev.code + ")");
         err.code = "WS_CLOSED";
         err.log = "code=" + ev.code + " reason=" + (ev.reason || "");
         reject(err);
-      } else if (me) onDisconnect(ev.code, ev.reason);
+      } else if (me){
+        if (ev.code === 4000){
+          clearInterval(heartbeatTimer);
+          showError("REPLACED", "Вход выполнен с другого устройства",
+                    "Ваша сессия завершена. Обновите страницу, чтобы войти снова.");
+          return;
+        }
+        onDisconnect(ev.code, ev.reason);
+      }
     };
     ws.onerror = ev => {
       if (!settled){
         settled = true; clearTimeout(to);
         const err = new Error("Ошибка соединения");
-        err.code = "WS_ERROR";
-        err.log = "url=" + url;
+        err.code = "WS_ERROR"; err.log = "url=" + url;
         reject(err);
       }
     };
@@ -1674,22 +1463,15 @@ function connect(){
 
 async function handleFrame(type, obj){
   switch(type){
-    case T.MSG: await onIncomingMsg(obj); break;
+    case T.MSG: onIncomingMsg(obj); break;
     case T.CONTACT_OK: onContactOk(obj); break;
     case T.CONTACT_ADD: onContactAdd(obj); break;
     case T.CHAT_END: onChatEnded(obj.u); break;
-    case T.STATUS:
-      if (obj.snapshot){
-        for (const it of obj.snapshot){
-          const c = contacts.find(x => x.uid === it.u);
-          if (c) c.online = it.o;
-        }
-        renderContacts(); refreshPeerSub();
-      } else {
-        const c = contacts.find(x => x.uid === obj.u);
-        if (c){ c.online = obj.o; renderContacts(); refreshPeerSub(); }
-      }
+    case T.STATUS: {
+      const c = contacts.find(x => x.uid === obj.u);
+      if (c){ c.online = obj.o; renderContacts(); refreshPeerSub(); }
       break;
+    }
     case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
     case T.PONG: break;
     case T.ERROR:
@@ -1706,8 +1488,8 @@ async function handleFrame(type, obj){
 function onContactOk(obj){
   const uid = obj.u;
   const ex = contacts.find(c => c.uid === uid);
-  if (ex){ ex.pub = obj.p || ex.pub; ex.online = obj.o; }
-  else contacts.push({uid, pub: obj.p || "", online: obj.o});
+  if (ex){ ex.online = obj.o; }
+  else contacts.push({uid, online: obj.o});
   renderContacts();
   if (pendingAdd === uid){ closeAddModal(); pendingAdd = null; selectPeer(uid); }
 }
@@ -1717,48 +1499,30 @@ function onContactAdd(obj){
   if (!uid || uid === me.uid) return;
   const ex = contacts.find(c => c.uid === uid);
   if (ex){
-    if (obj.p && ex.pub !== obj.p) ex.pub = obj.p;
     if (obj.o !== undefined) ex.online = obj.o;
     return;
   }
-  contacts.push({uid, pub: obj.p || "", online: obj.o === undefined ? true : obj.o});
+  contacts.push({uid, online: obj.o === undefined ? true : obj.o});
   renderContacts();
   toast(uid + " добавил(а) вас в контакты");
 }
 
-async function onIncomingMsg(m){
+function onIncomingMsg(m){
   if (seenIds.has(m.i)) return;
   seenIds.add(m.i);
 
   const peer = m.f === me.uid ? m.t : m.f;
-
   let c = contacts.find(x => x.uid === peer);
   if (!c){
-    c = {uid: peer, pub: m.p || "", online: null};
+    c = {uid: peer, online: null};
     contacts.push(c);
     renderContacts();
-  } else if (m.f !== me.uid && m.p && c.pub !== m.p){
-    c.pub = m.p;
   }
 
-  const text = await decryptIncoming(m, peer);
-  const msgText = text !== null ? text : "⚠ не удалось расшифровать";
-  const ts = m.s;
-
-  // ДЕДУП: если в threads уже есть такое же сообщение (from+text+ts±2s) — пропускаем
-  const list = threads[peer] || [];
-  for (let i = list.length - 1; i >= 0 && i >= list.length - 8; i--){
-    const x = list[i];
-    if (x.from === m.f && x.text === msgText && Math.abs(x.ts - ts) < 2000){
-      return;
-    }
-  }
-
-  const msg = {
-    id: m.i, from: m.f, to: m.t,
-    text: msgText, ts, broken: text === null,
-  };
+  const msg = {id: m.i, from: m.f, to: m.t, text: m.x, ts: m.s};
   (threads[peer] = threads[peer] || []).push(msg);
+  threads[peer].sort((a,b) => a.ts - b.ts);
+
   if (activePeer === peer){
     appendMsg(msg);
     renderContacts();
@@ -1782,7 +1546,6 @@ function onChatEnded(peer){
     updatePinActiveBtn();
   }
 }
-
 function removeContact(peer){
   const idx = contacts.findIndex(c => c.uid === peer);
   if (idx >= 0) contacts.splice(idx, 1);
@@ -1795,6 +1558,7 @@ function setErr(m){ $("authErr").textContent = m || ""; }
 function setNote(m){ $("authNote").textContent = m || ""; }
 function setBusy(btn, busy){ btn.disabled = busy; btn.classList.toggle("busy", busy); }
 
+/* ================= AUTH ================= */
 async function doAuth(login, password, remember){
   login = (login || "").trim().toLowerCase();
   if (!login || !password){ setErr("Заполните все поля"); return; }
@@ -1803,36 +1567,7 @@ async function doAuth(login, password, remember){
   setErr(""); setNote("");
 
   try {
-    ensureCrypto();
-
-    if (mode === "register"){
-      const kp = await genKeyPair();
-      myPrivKey = kp.privateKey;
-      const jwk = await exportPrivJWK(kp.privateKey);
-      myPubRaw = await exportPubRaw(kp.publicKey);
-      lsSet(privStoreKey(login), JSON.stringify(jwk));
-      lsDel(privStoreKeyOld(login));
-      authPayload = {login, password, pub: myPubRaw, remember};
-    } else {
-      let saved = lsGet(privStoreKey(login)) || lsGet(privStoreKeyOld(login));
-      if (saved){
-        try {
-          const jwk = JSON.parse(saved);
-          myPrivKey = await importPrivJWK(jwk);
-          myPubRaw = jwkToRawPub(jwk);
-        } catch(e){ setNote("⚠ Ключ повреждён."); }
-      }
-      if (!myPrivKey){
-        setNote("⚠ Приватный ключ не найден — старые сообщения не расшифруются.");
-        const kp = await genKeyPair();
-        myPrivKey = kp.privateKey;
-        const jwk = await exportPrivJWK(kp.privateKey);
-        myPubRaw = await exportPubRaw(kp.publicKey);
-        lsSet(privStoreKey(login), JSON.stringify(jwk));
-      }
-      authPayload = {login, password, remember};
-      if (myPubRaw) authPayload.pub = myPubRaw;
-    }
+    authPayload = {login, password, remember};
 
     setBusy($("submitBtn"), true);
     const ok = await connect();
@@ -1850,18 +1585,17 @@ async function doAuth(login, password, remember){
 
     loadPinned();
 
-    contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
+    contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
     for (const k of Object.keys(threads)) delete threads[k];
-
     for (const m of (ok.history || [])){
       const peer = m.f === me.uid ? m.t : m.f;
       seenIds.add(m.i);
-      const text = await decryptIncoming(m, peer);
       (threads[peer] = threads[peer] || []).push({
-        id: m.i, from: m.f, to: m.t,
-        text: text !== null ? text : "⚠ не удалось расшифровать",
-        ts: m.s, broken: text === null,
+        id: m.i, from: m.f, to: m.t, text: m.x, ts: m.s,
       });
+    }
+    for (const k of Object.keys(threads)){
+      threads[k].sort((a,b) => a.ts - b.ts);
     }
 
     $("myLogin").textContent = me.login;
@@ -1874,40 +1608,40 @@ async function doAuth(login, password, remember){
     renderContacts();
     startHeartbeat();
     reconnectAttempts = 0;
+
+    const wel = CFG.welcome || "";
+    if (wel && !welcomeShown){
+      welcomeShown = true;
+      $("welcomeBody").textContent = wel;
+      $("welcomeModal").classList.add("open");
+    }
   } catch(e){
     setErr(e.message || "Ошибка");
     setBusy($("submitBtn"), false);
-    showError(e.code || "AUTH", e.message || "Ошибка аутентификации", e.log || e.stack || "");
+    showError(e.code || "AUTH", e.message || "Ошибка аутентификации",
+              e.log || e.stack || "");
   }
 }
 
-async function sendMessage(){
+/* ================= SEND ================= */
+function sendMessage(){
   if (!activePeer || !ws || ws.readyState !== 1) return;
   const inp = $("inp");
   const text = inp.value.trim();
   if (!text) return;
-  const c = contacts.find(x => x.uid === activePeer);
-  if (!c || !c.pub){ toast("Нет ключа получателя"); return; }
-  try {
-    const key = await getConvKeyFromPub(activePeer, c.pub);
-    if (!key){ toast("Нет ключа получателя"); return; }
-    const blob = await encryptBlob(key, text);
-    const id = uuid();
-    const now = Date.now();
-    const localMsg = {id, from: me.uid, to: activePeer, text, ts: now};
-    seenIds.add(id);
-    (threads[activePeer] = threads[activePeer] || []).push(localMsg);
-    appendMsg(localMsg);
-    renderContacts();
-    inp.value = "";
-    inp.focus();
-    ws.send(pack(T.MSG, {i: id, t: activePeer, d: blob}));
-  } catch(e){
-    showError("CRYPTO_SEND", "Не удалось зашифровать/отправить",
-              (e && e.stack) ? e.stack : String(e));
-  }
+  const id = uuid();
+  const now = Date.now();
+  const localMsg = {id, from: me.uid, to: activePeer, text, ts: now};
+  seenIds.add(id);
+  (threads[activePeer] = threads[activePeer] || []).push(localMsg);
+  appendMsg(localMsg);
+  renderContacts();
+  inp.value = "";
+  inp.focus();
+  ws.send(pack(T.MSG, {i: id, t: activePeer, x: text}));
 }
 
+/* ================= END CHAT ================= */
 function openEndModal(){
   if (!activePeer) return;
   $("endHint").textContent =
@@ -1932,6 +1666,7 @@ function confirmEndChat(){
   toast("Чат завершён");
 }
 
+/* ================= ADD ================= */
 function openAddModal(){
   $("addInput").value = "";
   $("addErr").textContent = "";
@@ -1939,7 +1674,6 @@ function openAddModal(){
   setTimeout(() => $("addInput").focus(), 40);
 }
 function closeAddModal(){ $("addModal").classList.remove("open"); setBusy($("addConfirm"), false); pendingAdd = null; }
-
 function addContactFromInput(){
   const raw = $("addInput").value.trim().toLowerCase();
   const err = $("addErr");
@@ -1954,6 +1688,7 @@ function addContactFromInput(){
   ws.send(pack(T.CONTACT_REQ, {u: raw}));
 }
 
+/* ================= RECONNECT ================= */
 function startHeartbeat(){
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
@@ -1973,15 +1708,23 @@ async function onDisconnect(code, reason){
     mode = "login";
   } else if (sessionPassword){
     authPayload = {login: me.login, password: sessionPassword};
-    if (myPubRaw) authPayload.pub = myPubRaw;
     mode = "login";
-  } else {
-    return;
-  }
+  } else { return; }
   try {
     const ok = await connect();
     me = {login: ok.login, uid: ok.login};
-    contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
+    contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
+    for (const k of Object.keys(threads)) delete threads[k];
+    for (const m of (ok.history || [])){
+      const peer = m.f === me.uid ? m.t : m.f;
+      seenIds.add(m.i);
+      (threads[peer] = threads[peer] || []).push({
+        id: m.i, from: m.f, to: m.t, text: m.x, ts: m.s,
+      });
+    }
+    for (const k of Object.keys(threads)){
+      threads[k].sort((a,b) => a.ts - b.ts);
+    }
     renderContacts();
     startHeartbeat();
     reconnectAttempts = 0;
@@ -1990,6 +1733,7 @@ async function onDisconnect(code, reason){
   }
 }
 
+/* ================= COPY ================= */
 async function copyToClipboard(text){
   try { await navigator.clipboard.writeText(text); return true; }
   catch(e){
@@ -2013,6 +1757,7 @@ async function copyPeerUid(){
   else toast("Не удалось скопировать");
 }
 
+/* ================= UI BIND ================= */
 function setMode(m){
   mode = m;
   $("tabLogin").classList.toggle("active", m === "login");
@@ -2021,8 +1766,6 @@ function setMode(m){
   $("pwIn").autocomplete = m === "login" ? "current-password" : "new-password";
   setErr(""); setNote("");
 }
-
-/* ================= UI BIND ================= */
 $("themeBtn").onclick = toggleTheme;
 $("themeBtnLogin").onclick = toggleTheme;
 
@@ -2037,19 +1780,9 @@ $("authForm").addEventListener("submit", e => {
 $("logoutBtn").onclick = () => {
   try { if (ws && ws.readyState === 1 && sessionToken) ws.send(pack(T.LOGOUT, {token: sessionToken})); } catch(e){}
   lsDel(LS_SESSION);
-  sessionToken = null;
-  sessionPassword = null;
+  sessionToken = null; sessionPassword = null;
   setTimeout(() => { try { ws && ws.close(); } catch(e){} location.reload(); }, 120);
 };
-
-$("selectBtn").onclick = () => {
-  if (selMode) exitSelMode();
-  else enterSelMode();
-};
-$("selCancel").onclick = exitSelMode;
-$("selPin").onclick = bulkPin;
-$("selUnpin").onclick = bulkUnpin;
-$("selEnd").onclick = bulkEnd;
 
 $("addBtn").onclick = openAddModal;
 $("addCancel").onclick = closeAddModal;
@@ -2069,17 +1802,18 @@ $("inp").addEventListener("keydown", e => {
 $("backBtn").onclick = goBack;
 $("myInfo").onclick = copyMyUid;
 $("convPeer").onclick = copyPeerUid;
-
-$("pinActiveBtn").onclick = () => {
-  if (!activePeer) return;
-  togglePin(activePeer);
-};
+$("pinActiveBtn").onclick = () => { if (activePeer) togglePin(activePeer); };
 
 $("endChatBtn").onclick = openEndModal;
 $("endCancel").onclick = closeEndModal;
 $("endConfirm").onclick = confirmEndChat;
 $("endModal").addEventListener("click", e => {
   if (e.target === $("endModal")) closeEndModal();
+});
+
+$("welcomeClose").onclick = () => $("welcomeModal").classList.remove("open");
+$("welcomeModal").addEventListener("click", e => {
+  if (e.target === $("welcomeModal")) $("welcomeModal").classList.remove("open");
 });
 
 /* ================= AUTOLOGIN ================= */
@@ -2091,52 +1825,50 @@ $("endModal").addEventListener("click", e => {
       if (raw) { try { sess = JSON.parse(raw); } catch(e){} }
 
       if (sess && sess.login && sess.token){
-        let saved = lsGet(privStoreKey(sess.login)) || lsGet(privStoreKeyOld(sess.login));
-        if (saved){
-          try {
-            const jwk = JSON.parse(saved);
-            myPrivKey = await importPrivJWK(jwk);
-            myPubRaw = jwkToRawPub(jwk);
-          } catch(e){}
-        }
-        if (myPrivKey){
-          sessionToken = sess.token;
-          mode = "login";
-          authPayload = {token: sess.token};
-          setBusy($("submitBtn"), true);
-          try {
-            const ok = await connect();
-            me = {login: ok.login, uid: ok.login};
-            if (ok.token) sessionToken = ok.token;
+        sessionToken = sess.token;
+        mode = "login";
+        authPayload = {token: sess.token};
+        setBusy($("submitBtn"), true);
+        try {
+          const ok = await connect();
+          me = {login: ok.login, uid: ok.login};
+          if (ok.token) sessionToken = ok.token;
 
-            loadPinned();
+          loadPinned();
 
-            contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
-            for (const k of Object.keys(threads)) delete threads[k];
-            for (const m of (ok.history || [])){
-              const peer = m.f === me.uid ? m.t : m.f;
-              seenIds.add(m.i);
-              const text = await decryptIncoming(m, peer);
-              (threads[peer] = threads[peer] || []).push({
-                id: m.i, from: m.f, to: m.t,
-                text: text !== null ? text : "⚠ не удалось расшифровать",
-                ts: m.s, broken: text === null,
-              });
-            }
-            $("myLogin").textContent = me.login;
-            $("myDomain").textContent = "в сети";
-            $("myAvatar").textContent = avatarChar(me.login);
-            $("myAvatar").style.background = avatarColor(me.uid);
-            $("login").style.display = "none";
-            $("app").classList.add("on");
-            renderContacts();
-            startHeartbeat();
-            return;
-          } catch(e){
-            lsDel(LS_SESSION);
-            sessionToken = null;
-            setBusy($("submitBtn"), false);
+          contacts = (ok.contacts || []).map(c => ({uid: c.u, online: c.o}));
+          for (const k of Object.keys(threads)) delete threads[k];
+          for (const m of (ok.history || [])){
+            const peer = m.f === me.uid ? m.t : m.f;
+            seenIds.add(m.i);
+            (threads[peer] = threads[peer] || []).push({
+              id: m.i, from: m.f, to: m.t, text: m.x, ts: m.s,
+            });
           }
+          for (const k of Object.keys(threads)){
+            threads[k].sort((a,b) => a.ts - b.ts);
+          }
+
+          $("myLogin").textContent = me.login;
+          $("myDomain").textContent = "в сети";
+          $("myAvatar").textContent = avatarChar(me.login);
+          $("myAvatar").style.background = avatarColor(me.uid);
+          $("login").style.display = "none";
+          $("app").classList.add("on");
+          renderContacts();
+          startHeartbeat();
+
+          const wel = CFG.welcome || "";
+          if (wel && !welcomeShown){
+            welcomeShown = true;
+            $("welcomeBody").textContent = wel;
+            $("welcomeModal").classList.add("open");
+          }
+          return;
+        } catch(e){
+          lsDel(LS_SESSION);
+          sessionToken = null;
+          setBusy($("submitBtn"), false);
         }
       }
     } catch(e){
@@ -2151,6 +1883,19 @@ $("endModal").addEventListener("click", e => {
 </body>
 </html>
 """
+
+
+# ============================ РЕНДЕР HTML ============================
+# Один раз при старте — подставляем конфиг в плейсхолдеры, чтобы браузер
+# сразу получал правильные названия и welcome без ожидания WS-подключения.
+HTML_PAGE = (HTML_PAGE
+    .replace("{{APP_NAME}}", APP_NAME)
+    .replace("{{APP_SUB}}",  APP_SUB)
+    .replace("{{CFG_JSON}}", json.dumps({
+        "welcome": WELCOME_MESSAGE,
+        "default_theme": DEFAULT_THEME,
+    }, ensure_ascii=False))
+)
 
 
 # ============================ RUN ============================
