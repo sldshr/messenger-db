@@ -95,7 +95,9 @@ import hashlib
 import json
 import secrets
 import struct
+import sys as _sys
 import time as _time
+import traceback
 import uuid
 from collections import deque
 from typing import Any, Optional
@@ -117,15 +119,31 @@ PORT = int(os.getenv("PORT", "8000"))
 
 PAIR_HISTORY_MAX = 200
 MAX_CONTACTS = 500
-MAX_MSG_BYTES = 64 * 1024            # 64 KiB на blob
-SESSION_TTL_MS = 30 * 24 * 3600_000  # 30 дней
-AUTH_WINDOW = 60                     # сек
-AUTH_MAX = 10                        # попыток / окно / IP
-MSG_WINDOW = 10                      # сек
-MSG_MAX = 40                         # сообщений / окно / клиент
-SCRYPT_N = 2 ** 15                   # было 2**14
-SCRYPT_PARALLEL = 4                  # одновременных hash'ей
-LOGOUT_CLOSE_DELAY = 0.15
+MAX_MSG_BYTES = 64 * 1024
+SESSION_TTL_MS = 30 * 24 * 3600_000
+AUTH_WINDOW = 60
+AUTH_MAX = 10
+MSG_WINDOW = 10
+MSG_MAX = 40
+
+# scrypt: 128 * n * r = 128 * 32768 * 8 = 32 MiB. OpenSSL по умолчанию
+# ставит лимит ровно 32 MiB и такие параметры ломает с memory limit exceeded.
+# Задаём явно с запасом.
+SCRYPT_N = 2 ** 15
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_MAXMEM = 256 * 1024 * 1024
+SCRYPT_PARALLEL = 4
+
+# ============================ LOGGER ============================
+def log_err(tag: str, exc: BaseException):
+    print(f"[{tag}] {type(exc).__name__}: {exc}", file=_sys.stderr)
+    traceback.print_exc()
+
+
+def log_info(msg: str):
+    print(f"[sdm] {msg}", file=_sys.stderr)
+
 
 # ============================ PROTOCOL ============================
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
@@ -149,16 +167,19 @@ users: dict[str, dict] = {}
 online: dict[str, "Client"] = {}
 watchers: dict[str, set] = {}
 messages: dict[tuple, deque] = {}
-sessions: dict[str, dict] = {}          # token -> {login, exp}
-_auth_buckets: dict[str, deque] = {}    # ip -> [ts]
+sessions: dict[str, dict] = {}
+_auth_buckets: dict[str, deque] = {}
 _scrypt_sem = asyncio.Semaphore(SCRYPT_PARALLEL)
 _DUMMY_SALT = os.urandom(16)
 
 
 # ============================ HELPERS ============================
 def scrypt_raw(pw: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(pw.encode("utf-8"), salt=salt,
-                          n=SCRYPT_N, r=8, p=1, dklen=32)
+    return hashlib.scrypt(
+        pw.encode("utf-8"), salt=salt,
+        n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32,
+        maxmem=SCRYPT_MAXMEM,
+    )
 
 
 async def scrypt_async(pw: str, salt: bytes) -> bytes:
@@ -186,7 +207,6 @@ def check_rate(bucket: dict, key: str, maxn: int, window: float) -> bool:
 
 
 def valid_pubkey(pub: str) -> bool:
-    """P-256 uncompressed point = 65 байт, первый = 0x04."""
     if not isinstance(pub, str) or len(pub) < 80 or len(pub) > 200:
         return False
     try:
@@ -197,7 +217,7 @@ def valid_pubkey(pub: str) -> bool:
 
 
 def valid_login(login: str) -> bool:
-    if not (3 <= len(login) <= 24):
+    if not isinstance(login, str) or not (3 <= len(login) <= 24):
         return False
     return all(ch.isalnum() or ch in "_-." for ch in login)
 
@@ -242,6 +262,9 @@ class Client:
             except Exception:
                 pass
 
+    async def send_error(self, code: str, msg: str, log: str = ""):
+        await self.send(T_ERROR, {"m": msg, "c": code, "l": log[:4000]})
+
 
 async def notify_watchers(login: str, is_online: bool):
     w = watchers.get(login)
@@ -261,65 +284,97 @@ async def notify_watchers(login: str, is_online: bool):
 
 # ============================ HANDLERS ============================
 async def handle_register(c: Client, obj: dict):
-    login = (obj.get("login") or "").strip().lower()
-    pw = obj.get("password") or ""
-    pub = obj.get("pub") or ""
-    remember = bool(obj.get("remember"))
+    try:
+        login = (obj.get("login") or "").strip().lower()
+        pw = obj.get("password") or ""
+        pub = obj.get("pub") or ""
+        remember = bool(obj.get("remember"))
 
-    if not valid_login(login):
-        return await c.send(T_ERROR, {"m": "Логин: 3–24 символа, a-z 0-9 . _ -"})
-    if not isinstance(pw, str) or len(pw) < 8:
-        return await c.send(T_ERROR, {"m": "Пароль минимум 8 символов"})
-    if not valid_pubkey(pub):
-        return await c.send(T_ERROR, {"m": "Некорректный публичный ключ"})
-    if login in users:
-        return await c.send(T_ERROR, {"m": "Логин уже занят"})
+        if not valid_login(login):
+            return await c.send_error(
+                "VALIDATION", "Логин: 3–24 символа, a-z 0-9 . _ -",
+                f"got login={login!r}")
+        if not isinstance(pw, str) or len(pw) < 8:
+            return await c.send_error(
+                "VALIDATION", "Пароль минимум 8 символов",
+                f"len={len(pw) if isinstance(pw,str) else 'not-str'}")
+        if not valid_pubkey(pub):
+            return await c.send_error(
+                "VALIDATION", "Некорректный публичный ключ",
+                f"len={len(pub) if isinstance(pub,str) else 'not-str'} head={str(pub)[:24]}")
+        if login in users:
+            return await c.send_error("LOGIN_TAKEN", "Логин уже занят")
 
-    salt = os.urandom(16)
-    h = await scrypt_async(pw, salt)
-    users[login] = {"salt": salt, "pw": h, "pub": pub, "contacts": {}}
-    watchers.setdefault(login, set())
-    await _finish_auth(c, login, remember, new_pw_ok=True)
+        salt = os.urandom(16)
+        try:
+            h = await scrypt_async(pw, salt)
+        except Exception as e:
+            log_err("scrypt.register", e)
+            return await c.send_error(
+                "SERVER", "Ошибка хэширования пароля",
+                f"{type(e).__name__}: {e}\n"
+                f"n={SCRYPT_N} r={SCRYPT_R} p={SCRYPT_P} maxmem={SCRYPT_MAXMEM}")
+
+        users[login] = {"salt": salt, "pw": h, "pub": pub, "contacts": {}}
+        watchers.setdefault(login, set())
+        await _finish_auth(c, login, remember, new_pw_ok=True)
+    except Exception as e:
+        log_err("register", e)
+        await c.send_error("SERVER", "Внутренняя ошибка регистрации",
+                           f"{type(e).__name__}: {e}")
 
 
 async def handle_auth(c: Client, obj: dict):
-    # 1) токен сессии
-    tok = obj.get("token")
-    if isinstance(tok, str) and tok:
-        login = resolve_session(tok)
-        if not login or login not in users:
-            return await c.send(T_ERROR, {"m": "Сессия истекла"})
+    try:
+        # 1) токен сессии
+        tok = obj.get("token")
+        if isinstance(tok, str) and tok:
+            login = resolve_session(tok)
+            if not login or login not in users:
+                return await c.send_error("SESSION", "Сессия истекла, войдите заново")
+            if login in online:
+                return await c.send_error("ALREADY_ONLINE", "Уже в сети с другого устройства")
+            return await _finish_auth(c, login, remember=False, restore_token=tok)
+
+        # 2) логин/пароль
+        login = (obj.get("login") or "").strip().lower()
+        pw = obj.get("password") or ""
+        remember = bool(obj.get("remember"))
+        pub = (obj.get("pub") or "").strip() or None
+
+        if not check_rate(_auth_buckets, c.ip, AUTH_MAX, AUTH_WINDOW):
+            return await c.send_error("RATE_LIMIT",
+                                      "Слишком много попыток входа, попробуйте позже")
+
+        u = users.get(login)
+        if u is None:
+            try:
+                await scrypt_async(pw if isinstance(pw, str) else "", _DUMMY_SALT)
+            except Exception as e:
+                log_err("scrypt.dummy", e)
+            return await c.send_error("AUTH_FAIL", "Неверный логин или пароль")
+
+        try:
+            h = await scrypt_async(pw, u["salt"])
+        except Exception as e:
+            log_err("scrypt.auth", e)
+            return await c.send_error(
+                "SERVER", "Ошибка сервера при проверке пароля",
+                f"{type(e).__name__}: {e}")
+
+        if not secrets.compare_digest(u["pw"], h):
+            return await c.send_error("AUTH_FAIL", "Неверный логин или пароль")
         if login in online:
-            return await c.send(T_ERROR, {"m": "Уже в сети"})
-        return await _finish_auth(c, login, remember=False, restore_token=tok)
+            return await c.send_error("ALREADY_ONLINE", "Уже в сети с другого устройства")
 
-    # 2) обычный логин/пароль
-    login = (obj.get("login") or "").strip().lower()
-    pw = obj.get("password") or ""
-    remember = bool(obj.get("remember"))
-    pub = (obj.get("pub") or "").strip() or None
+        if pub and valid_pubkey(pub) and pub != u["pub"]:
+            u["pub"] = pub
 
-    # rate-limit на попытки входа с одного IP
-    if not check_rate(_auth_buckets, c.ip, AUTH_MAX, AUTH_WINDOW):
-        await asyncio.sleep(0.5)
-        return await c.send(T_ERROR, {"m": "Слишком много попыток. Попробуйте позже"})
-
-    u = users.get(login)
-    # constant-time: даже если логина нет, гоняем scrypt
-    if u is None:
-        await scrypt_async(pw, _DUMMY_SALT)
-        return await c.send(T_ERROR, {"m": "Неверный логин или пароль"})
-
-    h = await scrypt_async(pw, u["salt"])
-    if not secrets.compare_digest(u["pw"], h):
-        return await c.send(T_ERROR, {"m": "Неверный логин или пароль"})
-    if login in online:
-        return await c.send(T_ERROR, {"m": "Уже в сети"})
-
-    if pub and valid_pubkey(pub) and pub != u["pub"]:
-        u["pub"] = pub
-
-    await _finish_auth(c, login, remember)
+        await _finish_auth(c, login, remember)
+    except Exception as e:
+        log_err("auth", e)
+        await c.send_error("SERVER", "Внутренняя ошибка аутентификации",
+                           f"{type(e).__name__}: {e}")
 
 
 async def _finish_auth(c: Client, login: str, remember: bool,
@@ -356,105 +411,121 @@ async def _finish_auth(c: Client, login: str, remember: bool,
 
 
 async def handle_msg(c: Client, obj: dict):
-    if not check_rate(_auth_buckets, "m:" + (c.login or ""), MSG_MAX, MSG_WINDOW):
-        return await c.send(T_ERROR, {"m": "Слишком много сообщений"})
+    try:
+        if not check_rate(_auth_buckets, "m:" + (c.login or ""), MSG_MAX, MSG_WINDOW):
+            return await c.send_error("RATE_LIMIT", "Слишком много сообщений")
 
-    to_login = (obj.get("t") or "").strip().lower()
-    blob = obj.get("d")
-    if not isinstance(to_login, str) or not isinstance(blob, str) or not blob:
-        return
-    if to_login == c.login:
-        return await c.send(T_ERROR, {"m": "Нельзя писать самому себе"})
-    if len(blob) > MAX_MSG_BYTES:
-        return await c.send(T_ERROR, {"m": "Сообщение слишком большое"})
+        to_login = (obj.get("t") or "").strip().lower()
+        blob = obj.get("d")
+        if not isinstance(to_login, str) or not isinstance(blob, str) or not blob:
+            return await c.send_error("VALIDATION", "Некорректное сообщение")
+        if to_login == c.login:
+            return await c.send_error("VALIDATION", "Нельзя писать самому себе")
+        if len(blob) > MAX_MSG_BYTES:
+            return await c.send_error("VALIDATION", "Сообщение слишком большое",
+                                      f"{len(blob)} > {MAX_MSG_BYTES}")
 
-    me = users[c.login]
-    peer = users.get(to_login)
-    if peer is None:
-        return await c.send(T_ERROR, {"m": "Получатель не найден"})
-    # взаимные контакты
-    if to_login not in me["contacts"] or c.login not in peer["contacts"]:
-        return await c.send(T_ERROR, {"m": "Получатель не в ваших контактах"})
+        me = users[c.login]
+        peer = users.get(to_login)
+        if peer is None:
+            return await c.send_error("NOT_FOUND", "Получатель не найден")
+        if to_login not in me["contacts"] or c.login not in peer["contacts"]:
+            return await c.send_error("NOT_CONTACT", "Получатель не в ваших контактах")
 
-    from_pub = me["pub"]
-    mid = uuid.uuid4().hex
-    msg = {
-        "i": mid, "f": c.login, "t": to_login,
-        "d": blob, "p": from_pub,
-        "s": int(_time.time() * 1000),
-    }
+        from_pub = me["pub"]
+        mid = uuid.uuid4().hex
+        msg = {
+            "i": mid, "f": c.login, "t": to_login,
+            "d": blob, "p": from_pub,
+            "s": int(_time.time() * 1000),
+        }
 
-    key = pair_key(c.login, to_login)
-    dq = messages.get(key)
-    if dq is None:
-        dq = deque(maxlen=PAIR_HISTORY_MAX)
-        messages[key] = dq
-    dq.append(msg)
+        key = pair_key(c.login, to_login)
+        dq = messages.get(key)
+        if dq is None:
+            dq = deque(maxlen=PAIR_HISTORY_MAX)
+            messages[key] = dq
+        dq.append(msg)
 
-    await c.send(T_MSG, msg)
-    target = online.get(to_login)
-    if target:
-        await target.send(T_MSG, msg)
+        await c.send(T_MSG, msg)
+        target = online.get(to_login)
+        if target:
+            await target.send(T_MSG, msg)
+    except Exception as e:
+        log_err("msg", e)
+        await c.send_error("SERVER", "Не удалось доставить сообщение",
+                           f"{type(e).__name__}: {e}")
 
 
 async def handle_contact_req(c: Client, obj: dict):
-    peer = (obj.get("u") or "").strip().lower()
-    if not valid_login(peer):
-        return await c.send(T_ERROR, {"m": "Неверный формат логина"})
-    if peer == c.login:
-        return await c.send(T_ERROR, {"m": "Это ваш логин"})
-    u = users.get(peer)
-    if not u:
-        return await c.send(T_ERROR, {"m": "Пользователь не найден"})
+    try:
+        peer = (obj.get("u") or "").strip().lower()
+        if not valid_login(peer):
+            return await c.send_error("VALIDATION", "Неверный формат логина")
+        if peer == c.login:
+            return await c.send_error("VALIDATION", "Это ваш логин")
+        u = users.get(peer)
+        if not u:
+            return await c.send_error("NOT_FOUND", "Пользователь не найден")
 
-    me = users[c.login]
-    if len(me["contacts"]) >= MAX_CONTACTS:
-        return await c.send(T_ERROR, {"m": "Достигнут лимит контактов"})
-    if len(u["contacts"]) >= MAX_CONTACTS:
-        return await c.send(T_ERROR, {"m": "У собеседника достигнут лимит контактов"})
+        me = users[c.login]
+        if len(me["contacts"]) >= MAX_CONTACTS:
+            return await c.send_error("CONTACT_LIMIT", "Достигнут лимит контактов")
+        if len(u["contacts"]) >= MAX_CONTACTS:
+            return await c.send_error("CONTACT_LIMIT", "У собеседника лимит контактов")
 
-    pub = u["pub"]
-    my_pub = me["pub"]
+        pub = u["pub"]
+        my_pub = me["pub"]
 
-    me["contacts"][peer] = pub
-    u["contacts"][c.login] = my_pub
-    watchers.setdefault(peer, set()).add(c.login)
-    watchers.setdefault(c.login, set()).add(peer)
+        me["contacts"][peer] = pub
+        u["contacts"][c.login] = my_pub
+        watchers.setdefault(peer, set()).add(c.login)
+        watchers.setdefault(c.login, set()).add(peer)
 
-    online_status = peer in online
-    await c.send(T_CONTACT_OK, {"u": peer, "p": pub, "o": online_status})
+        online_status = peer in online
+        await c.send(T_CONTACT_OK, {"u": peer, "p": pub, "o": online_status})
 
-    target = online.get(peer)
-    if target:
-        await target.send(T_CONTACT_ADD, {"u": c.login, "p": my_pub, "o": True})
+        target = online.get(peer)
+        if target:
+            await target.send(T_CONTACT_ADD, {"u": c.login, "p": my_pub, "o": True})
+    except Exception as e:
+        log_err("contact_req", e)
+        await c.send_error("SERVER", "Не удалось добавить контакт",
+                           f"{type(e).__name__}: {e}")
 
 
 async def handle_chat_end(c: Client, obj: dict):
-    peer = (obj.get("u") or "").strip().lower()
-    if not valid_login(peer):
-        return
-    my = c.login
+    try:
+        peer = (obj.get("u") or "").strip().lower()
+        if not valid_login(peer):
+            return
+        my = c.login
 
-    users[my]["contacts"].pop(peer, None)
-    if peer in users:
-        users[peer]["contacts"].pop(my, None)
+        users[my]["contacts"].pop(peer, None)
+        if peer in users:
+            users[peer]["contacts"].pop(my, None)
 
-    w_me = watchers.get(my)
-    if w_me: w_me.discard(peer)
-    w_peer = watchers.get(peer)
-    if w_peer: w_peer.discard(my)
+        w_me = watchers.get(my)
+        if w_me: w_me.discard(peer)
+        w_peer = watchers.get(peer)
+        if w_peer: w_peer.discard(my)
 
-    messages.pop(pair_key(my, peer), None)
+        messages.pop(pair_key(my, peer), None)
 
-    target = online.get(peer)
-    if target:
-        await target.send(T_CHAT_END, {"u": my})
+        target = online.get(peer)
+        if target:
+            await target.send(T_CHAT_END, {"u": my})
+    except Exception as e:
+        log_err("chat_end", e)
 
 
 async def handle_logout(c: Client, obj: dict):
-    tok = obj.get("token")
-    if isinstance(tok, str) and tok:
-        drop_session(tok)
+    try:
+        tok = obj.get("token")
+        if isinstance(tok, str) and tok:
+            drop_session(tok)
+    except Exception as e:
+        log_err("logout", e)
 
 
 # ============================ APP ============================
@@ -468,22 +539,26 @@ async def index():
 
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
-    # Origin-проверка (митигация cross-site WebSocket hijacking)
-    origin = ws.headers.get("origin", "")
-    host = ws.headers.get("host", "")
-    if origin:
-        try:
-            ohost = urlparse(origin).netloc.lower()
-            if ohost and host and ohost != host.lower():
-                await ws.close(code=1008)
-                return
-        except Exception:
-            pass
-
-    await ws.accept()
-    c = Client(ws, ws_ip(ws))
-    await c.send(T_HELLO, {})
     try:
+        origin = ws.headers.get("origin", "")
+        host = ws.headers.get("host", "")
+        if origin:
+            try:
+                ohost = urlparse(origin).netloc.lower()
+                if ohost and host and ohost != host.lower():
+                    await ws.close(code=1008)
+                    return
+            except Exception:
+                pass
+
+        await ws.accept()
+    except Exception as e:
+        log_err("ws.accept", e)
+        return
+
+    c = Client(ws, ws_ip(ws))
+    try:
+        await c.send(T_HELLO, {})
         while True:
             raw = await ws.receive_bytes()
             if len(raw) > MAX_MSG_BYTES + 4096:
@@ -491,8 +566,10 @@ async def ws_handler(ws: WebSocket):
                 return
             try:
                 t, obj = unpack(raw)
-            except Exception:
+            except Exception as e:
+                log_err("ws.unpack", e)
                 continue
+
             if t == T_REGISTER:
                 await handle_register(c, obj)
             elif t == T_AUTH:
@@ -516,12 +593,20 @@ async def ws_handler(ws: WebSocket):
                 await c.send(T_STATUS, {"snapshot": snapshot})
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        log_err("ws.loop", e)
+        try:
+            await c.send_error("SERVER", "Внутренняя ошибка сервера",
+                               f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
     finally:
         if c.login and online.get(c.login) is c:
             online.pop(c.login, None)
-            await notify_watchers(c.login, False)
+            try:
+                await notify_watchers(c.login, False)
+            except Exception as e:
+                log_err("notify_watchers", e)
 
 
 # ============================ HTML (client) ============================
@@ -555,6 +640,7 @@ html,body{
   -webkit-touch-callout:none;
 }
 input,textarea{-webkit-user-select:text;user-select:text}
+.err-modal pre{-webkit-user-select:text;user-select:text}
 *{scrollbar-width:none;-ms-overflow-style:none}
 *::-webkit-scrollbar{width:0;height:0;display:none}
 body{background:var(--bg-primary);color:var(--text-normal);
@@ -699,7 +785,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);
   display:none;align-items:center;justify-content:center;padding:20px;z-index:200}
 .modal-backdrop.open{display:flex}
-.modal{background:var(--bg-primary);border-radius:14px;padding:22px;width:100%;max-width:420px;
+.modal{background:var(--bg-primary);border-radius:14px;padding:22px;width:100%;max-width:460px;
   box-shadow:var(--card-shadow)}
 .modal h3{font-size:18px;margin-bottom:6px;font-weight:700}
 .modal .hint{color:var(--text-muted);font-size:13px;margin-bottom:14px;line-height:1.5}
@@ -708,7 +794,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   font-size:16px;outline:none;margin-bottom:10px;color:var(--text-normal)}
 .modal input:focus{border-color:var(--accent)}
 .modal .err{color:var(--red);font-size:13px;min-height:18px;margin-bottom:6px}
-.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 .btn-secondary{background:var(--bg-secondary);border:none;padding:10px 16px;
   border-radius:8px;font-weight:500;color:var(--text-normal);transition:background .12s}
 .btn-secondary:hover{background:var(--bg-hover)}
@@ -719,6 +805,20 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   padding:10px 22px;border-radius:8px;font-weight:600;transition:opacity .12s}
 .btn-danger:hover{opacity:.88}
 .btn-primary:disabled,.btn-secondary:disabled,.btn-danger:disabled{cursor:default;opacity:.6}
+
+/* ---- error modal ---- */
+.err-modal h3{color:var(--red)}
+.err-meta{font-size:12px;color:var(--text-muted);margin-bottom:10px}
+.err-meta code{background:var(--bg-secondary);padding:2px 8px;border-radius:6px;
+  color:var(--text-normal);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.err-desc{font-size:14px;line-height:1.45;color:var(--text-normal);margin-bottom:12px;
+  word-wrap:break-word}
+.err-log-label{font-size:11px;font-weight:700;color:var(--text-muted);
+  text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.err-modal pre.err-log{background:var(--bg-secondary);padding:10px 12px;border-radius:8px;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;
+  max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+  color:var(--text-normal);margin-bottom:14px;border:1px solid var(--border)}
 
 #toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);
   background:var(--toast-bg);color:var(--toast-fg);padding:11px 18px;border-radius:8px;
@@ -869,6 +969,20 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
   </div>
 </div>
 
+<div class="modal-backdrop" id="errModal">
+  <div class="modal err-modal">
+    <h3>Ошибка</h3>
+    <div class="err-meta">Код: <code id="errCode">—</code></div>
+    <div class="err-desc" id="errDesc"></div>
+    <div class="err-log-label" id="errLogLabel">Лог</div>
+    <pre class="err-log" id="errLog"></pre>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="errCopy" type="button">Копировать</button>
+      <button class="btn-primary" id="errClose" type="button">Закрыть</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -880,6 +994,55 @@ const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
            CONTACT_ADD:13, CHAT_END:14, LOGOUT:15};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
+/* ================= ERROR MODAL ================= */
+function showError(code, desc, log){
+  try {
+    document.getElementById("errCode").textContent = code || "UNKNOWN";
+    document.getElementById("errDesc").textContent = desc || "Неизвестная ошибка";
+    const lg = (log || "").toString();
+    document.getElementById("errLog").textContent = lg || "(пусто)";
+    document.getElementById("errLogLabel").style.display = lg ? "" : "none";
+    document.getElementById("errLog").style.display = lg ? "" : "none";
+    document.getElementById("errModal").classList.add("open");
+  } catch(e){
+    // последняя линия обороны
+    try { alert("[" + code + "] " + desc + "\n\n" + log); } catch(e2){}
+  }
+}
+
+document.getElementById("errClose").onclick = () => {
+  document.getElementById("errModal").classList.remove("open");
+};
+document.getElementById("errCopy").onclick = async () => {
+  const txt = "[" + document.getElementById("errCode").textContent + "] "
+            + document.getElementById("errDesc").textContent + "\n\n"
+            + document.getElementById("errLog").textContent;
+  try { await navigator.clipboard.writeText(txt); } catch(e){
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select(); document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch(e2){}
+  }
+};
+
+window.addEventListener("error", e => {
+  const code = "CLIENT_ERR";
+  const desc = e.message || "Ошибка в клиенте";
+  const log = (e.error && e.error.stack) ? e.error.stack
+            : (e.filename ? `${e.filename}:${e.lineno}:${e.colno}` : "");
+  showError(code, desc, log);
+});
+window.addEventListener("unhandledrejection", e => {
+  const r = e.reason;
+  const code = (r && r.code) ? r.code : "PROMISE_ERR";
+  const desc = (r && r.message) ? r.message : String(r);
+  const log = (r && r.stack) ? r.stack : "";
+  showError(code, desc, log);
+});
+
+/* ================= PROTOCOL ================= */
 function pack(type, obj){
   const p = _enc.encode(JSON.stringify(obj));
   const buf = new ArrayBuffer(5 + p.length);
@@ -895,6 +1058,7 @@ function unpack(buf){
   return [dv.getUint8(0), JSON.parse(_dec.decode(new Uint8Array(buf, 5, len)))];
 }
 
+/* ================= CRYPTO ================= */
 function b64(u8){ let s=""; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return btoa(s); }
 function b64url(u8){ return b64(u8).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
 function unb64(s){ const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
@@ -912,7 +1076,15 @@ function jwkToRawPub(jwk){
   return b64(raw);
 }
 
-async function genKeyPair(){ return crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]); }
+function ensureCrypto(){
+  if (!window.crypto || !window.crypto.subtle){
+    const err = new Error("WebCrypto недоступен. Откройте сайт через HTTPS или localhost");
+    err.code = "CRYPTO_UNAVAILABLE";
+    throw err;
+  }
+}
+
+async function genKeyPair(){ ensureCrypto(); return crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]); }
 async function exportPubRaw(pub){ return b64(new Uint8Array(await crypto.subtle.exportKey("raw", pub))); }
 async function exportPrivJWK(priv){ return await crypto.subtle.exportKey("jwk", priv); }
 async function importPrivJWK(jwk){ return crypto.subtle.importKey("jwk",jwk,{name:"ECDH",namedCurve:"P-256"},true,["deriveKey"]); }
@@ -936,6 +1108,7 @@ async function decryptBlob(key, blob){
   return _dec.decode(pt);
 }
 
+/* ================= THEME ================= */
 const LS_THEME = "sdm_theme";
 const mq = window.matchMedia("(prefers-color-scheme: dark)");
 function systemTheme(){ return mq.matches ? "dark" : "light"; }
@@ -980,12 +1153,13 @@ document.addEventListener("dragstart", e => {
   e.preventDefault();
 });
 
+/* ================= STATE ================= */
 let ws = null;
 let me = null;
 let myPrivKey = null;
 let myPubRaw = null;
-let sessionToken = null;       // если есть — используется для авто-входа
-let sessionPassword = null;    // в памяти, для reconnect
+let sessionToken = null;
+let sessionPassword = null;
 let contacts = [];
 const convKeys = {};
 const threads = {};
@@ -1019,10 +1193,26 @@ function toast(msg){
   toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-const LS_SESSION = "sdm_session";   // {login, token}
+const LS_SESSION = "sdm_session";
 function privStoreKey(login){ return "sdm_priv_" + login + "@" + location.host; }
 function privStoreKeyOld(login){ return "sdm_priv_" + login; }
 
+function lsSet(key, value){
+  try { localStorage.setItem(key, value); return true; }
+  catch(e){
+    const err = new Error("Не удалось сохранить данные в localStorage");
+    err.code = "STORAGE";
+    err.stack = String(e);
+    showError("STORAGE", err.message, String(e));
+    return false;
+  }
+}
+function lsGet(key){
+  try { return localStorage.getItem(key); } catch(e){ return null; }
+}
+function lsDel(key){ try { localStorage.removeItem(key); } catch(e){} }
+
+/* ================= RENDER ================= */
 function renderContacts(){
   const box = $("contacts");
   box.innerHTML = "";
@@ -1164,6 +1354,7 @@ function renderThread(){
   box.scrollTop = box.scrollHeight;
 }
 
+/* ================= CRYPTO HELPERS ================= */
 async function getConvKeyFromPub(uid, pub){
   if (!pub) return null;
   const cacheKey = uid + "|" + pub.slice(0, 24);
@@ -1173,7 +1364,11 @@ async function getConvKeyFromPub(uid, pub){
     const k = await deriveAesKey(myPrivKey, p);
     convKeys[cacheKey] = k;
     return k;
-  } catch(e){ return null; }
+  } catch(e){
+    // не показываем модалку за каждый сбой (например, старый pubkey)
+    console.warn("derive key failed", e);
+    return null;
+  }
 }
 
 async function decryptIncoming(m, peer){
@@ -1193,33 +1388,94 @@ async function decryptIncoming(m, peer){
   return null;
 }
 
+/* ================= WS ================= */
 function connect(){
   return new Promise((resolve, reject) => {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(proto + "//" + location.host + "/ws");
+    let url;
+    try {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      url = proto + "//" + location.host + "/ws";
+    } catch(e){
+      const err = new Error("Не удалось вычислить адрес WS: " + e);
+      err.code = "WS_URL";
+      return reject(err);
+    }
+
+    try { ws = new WebSocket(url); }
+    catch(e){
+      const err = new Error("Не удалось открыть WebSocket: " + e);
+      err.code = "WS_OPEN";
+      return reject(err);
+    }
     ws.binaryType = "arraybuffer";
+
     let settled = false;
     const to = setTimeout(() => {
-      if (!settled){ settled = true; try{ws.close();}catch(e){}; reject(new Error("Таймаут")); }
+      if (!settled){
+        settled = true;
+        try{ ws.close(); }catch(e){}
+        const err = new Error("Таймаут подключения к серверу");
+        err.code = "WS_TIMEOUT";
+        reject(err);
+      }
     }, 10000);
-    ws.onopen = () => ws.send(pack(mode === "register" ? T.REGISTER : T.AUTH, authPayload));
+
+    ws.onopen = () => {
+      try { ws.send(pack(mode === "register" ? T.REGISTER : T.AUTH, authPayload)); }
+      catch(e){
+        if (!settled){ settled = true; clearTimeout(to);
+          const err = new Error("Не удалось отправить приветствие: " + e);
+          err.code = "WS_SEND";
+          reject(err);
+        }
+      }
+    };
     ws.onmessage = async ev => {
       let type, obj;
-      try { [type, obj] = unpack(ev.data); } catch(e){ return; }
+      try { [type, obj] = unpack(ev.data); }
+      catch(e){
+        showError("WS_PARSE", "Не удалось разобрать сообщение от сервера",
+                  String(e) + "\n" + (e.stack || ""));
+        return;
+      }
       if (type === T.HELLO) return;
       if (!settled){
         if (type === T.AUTH_OK){ settled = true; clearTimeout(to); resolve(obj); return; }
-        if (type === T.ERROR){ settled = true; clearTimeout(to);
-          try{ws.close();}catch(e){}; reject(new Error(obj.m || "Ошибка")); return; }
+        if (type === T.ERROR){
+          settled = true; clearTimeout(to);
+          try{ ws.close(); }catch(e){}
+          const err = new Error(obj.m || "Ошибка аутентификации");
+          err.code = obj.c || "AUTH";
+          err.log = obj.l || "";
+          reject(err);
+          return;
+        }
       }
-      await handleFrame(type, obj);
+      try { await handleFrame(type, obj); }
+      catch(e){
+        showError(e.code || "HANDLE", e.message || String(e), e.stack || String(e));
+      }
     };
-    ws.onclose = () => {
-      if (!settled){ settled = true; clearTimeout(to); reject(new Error("Соединение закрыто")); }
-      else if (me) onDisconnect();
+    ws.onclose = ev => {
+      if (!settled){
+        settled = true; clearTimeout(to);
+        const err = new Error(
+          ev.code === 1008 ? "Соединение отклонено (проверка origin)"
+          : ev.code === 1009 ? "Сообщение слишком большое"
+          : "Соединение закрыто (" + ev.code + ")");
+        err.code = "WS_CLOSED";
+        err.log = "code=" + ev.code + " reason=" + (ev.reason || "");
+        reject(err);
+      } else if (me) onDisconnect(ev.code, ev.reason);
     };
-    ws.onerror = () => {
-      if (!settled){ settled = true; clearTimeout(to); reject(new Error("Ошибка соединения")); }
+    ws.onerror = ev => {
+      if (!settled){
+        settled = true; clearTimeout(to);
+        const err = new Error("Ошибка соединения с сервером");
+        err.code = "WS_ERROR";
+        err.log = "event.type=error url=" + url;
+        reject(err);
+      }
     };
   });
 }
@@ -1245,8 +1501,14 @@ async function handleFrame(type, obj){
     case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
     case T.PONG: break;
     case T.ERROR:
-      if (pendingAdd){ $("addErr").textContent = obj.m || "Ошибка"; setBusy($("addConfirm"), false); }
-      else toast(obj.m || "Ошибка");
+      if (pendingAdd){
+        $("addErr").textContent = obj.m || "Ошибка";
+        setBusy($("addConfirm"), false);
+      }
+      // сервер прислал ошибку в рабочем режиме — показываем модалку
+      if (!pendingAdd && (obj.c || obj.m)){
+        showError(obj.c || "SERVER", obj.m || "Ошибка сервера", obj.l || "");
+      }
       break;
   }
 }
@@ -1336,22 +1598,19 @@ async function doAuth(login, password, remember){
   setErr(""); setNote("");
 
   try {
+    ensureCrypto();
+
     if (mode === "register"){
       const kp = await genKeyPair();
       myPrivKey = kp.privateKey;
       const jwk = await exportPrivJWK(kp.privateKey);
       myPubRaw = await exportPubRaw(kp.publicKey);
-      try {
-        localStorage.setItem(privStoreKey(login), JSON.stringify(jwk));
-        localStorage.removeItem(privStoreKeyOld(login));
-      } catch(e){}
+      lsSet(privStoreKey(login), JSON.stringify(jwk));
+      lsDel(privStoreKeyOld(login));
       authPayload = {login, password, pub: myPubRaw, remember};
     } else {
       let saved = null;
-      try {
-        saved = localStorage.getItem(privStoreKey(login))
-             || localStorage.getItem(privStoreKeyOld(login));
-      } catch(e){}
+      saved = lsGet(privStoreKey(login)) || lsGet(privStoreKeyOld(login));
       if (saved){
         try {
           const jwk = JSON.parse(saved);
@@ -1365,7 +1624,7 @@ async function doAuth(login, password, remember){
         myPrivKey = kp.privateKey;
         const jwk = await exportPrivJWK(kp.privateKey);
         myPubRaw = await exportPubRaw(kp.publicKey);
-        try { localStorage.setItem(privStoreKey(login), JSON.stringify(jwk)); } catch(e){}
+        lsSet(privStoreKey(login), JSON.stringify(jwk));
       }
       authPayload = {login, password, remember};
       if (myPubRaw) authPayload.pub = myPubRaw;
@@ -1376,14 +1635,12 @@ async function doAuth(login, password, remember){
     sessionPassword = password;
     me = {login: ok.login, uid: ok.login};
 
-    // сессионный токен от сервера (вместо пароля в localStorage)
     if (ok.token){
       sessionToken = ok.token;
       if (remember || mode === "register"){
-        try { localStorage.setItem(LS_SESSION, JSON.stringify({login: me.login, token: ok.token})); }
-        catch(e){}
+        lsSet(LS_SESSION, JSON.stringify({login: me.login, token: ok.token}));
       } else {
-        try { localStorage.removeItem(LS_SESSION); } catch(e){}
+        lsDel(LS_SESSION);
       }
     }
 
@@ -1413,6 +1670,7 @@ async function doAuth(login, password, remember){
   } catch(e){
     setErr(e.message || "Ошибка");
     setBusy($("submitBtn"), false);
+    showError(e.code || "AUTH", e.message || "Ошибка аутентификации", e.log || e.stack || "");
   }
 }
 
@@ -1423,18 +1681,23 @@ async function sendMessage(){
   if (!text) return;
   const c = contacts.find(x => x.uid === activePeer);
   if (!c || !c.pub){ toast("Нет ключа получателя"); return; }
-  const key = await getConvKeyFromPub(activePeer, c.pub);
-  if (!key){ toast("Нет ключа получателя"); return; }
-  const blob = await encryptBlob(key, text);
-  const id = uuid();
-  const localMsg = {id, from: me.uid, to: activePeer, text, ts: Date.now()};
-  seenIds.add(id);
-  (threads[activePeer] = threads[activePeer] || []).push(localMsg);
-  appendMsg(localMsg);
-  renderContacts();
-  inp.value = "";
-  inp.focus();
-  ws.send(pack(T.MSG, {i: id, t: activePeer, d: blob}));
+  try {
+    const key = await getConvKeyFromPub(activePeer, c.pub);
+    if (!key){ toast("Нет ключа получателя"); return; }
+    const blob = await encryptBlob(key, text);
+    const id = uuid();
+    const localMsg = {id, from: me.uid, to: activePeer, text, ts: Date.now()};
+    seenIds.add(id);
+    (threads[activePeer] = threads[activePeer] || []).push(localMsg);
+    appendMsg(localMsg);
+    renderContacts();
+    inp.value = "";
+    inp.focus();
+    ws.send(pack(T.MSG, {i: id, t: activePeer, d: blob}));
+  } catch(e){
+    showError("CRYPTO_SEND", "Не удалось зашифровать/отправить сообщение",
+              (e && e.stack) ? e.stack : String(e));
+  }
 }
 
 function openEndModal(){
@@ -1484,11 +1747,16 @@ function startHeartbeat(){
     if (ws && ws.readyState === 1) ws.send(pack(T.PING, {}));
   }, 30000);
 }
-async function onDisconnect(){
+async function onDisconnect(code, reason){
   clearInterval(heartbeatTimer);
-  if (reconnectAttempts >= 5){ alert("Соединение потеряно. Обновите страницу."); return; }
+  if (reconnectAttempts >= 5){
+    showError("WS_LOST",
+              "Соединение потеряно. Перезагрузите страницу.",
+              "code=" + code + " reason=" + (reason || "") +
+              "\nreconnectAttempts=" + reconnectAttempts);
+    return;
+  }
   reconnectAttempts++;
-  // предпочитаем токен, если есть
   if (sessionToken){
     authPayload = {token: sessionToken};
     mode = "login";
@@ -1507,7 +1775,7 @@ async function onDisconnect(){
     startHeartbeat();
     reconnectAttempts = 0;
   } catch(e){
-    setTimeout(onDisconnect, 800 * reconnectAttempts);
+    setTimeout(() => onDisconnect(code, reason), 800 * reconnectAttempts);
   }
 }
 
@@ -1557,7 +1825,7 @@ $("authForm").addEventListener("submit", e => {
 
 $("logoutBtn").onclick = () => {
   try { if (ws && ws.readyState === 1 && sessionToken) ws.send(pack(T.LOGOUT, {token: sessionToken})); } catch(e){}
-  try { localStorage.removeItem(LS_SESSION); } catch(e){}
+  lsDel(LS_SESSION);
   sessionToken = null;
   sessionPassword = null;
   setTimeout(() => { try { ws && ws.close(); } catch(e){} location.reload(); }, 120);
@@ -1589,63 +1857,62 @@ $("endModal").addEventListener("click", e => {
   if (e.target === $("endModal")) closeEndModal();
 });
 
+/* ================= AUTOLOGIN ================= */
 (function boot(){
   setTimeout(async () => {
-    // пробуем восстановить сессию по токену
-    let sess = null;
     try {
-      const raw = localStorage.getItem(LS_SESSION);
-      if (raw) sess = JSON.parse(raw);
-    } catch(e){}
+      let sess = null;
+      const raw = lsGet(LS_SESSION);
+      if (raw) { try { sess = JSON.parse(raw); } catch(e){} }
 
-    if (sess && sess.login && sess.token){
-      // загружаем приватный ключ
-      let saved = null;
-      try { saved = localStorage.getItem(privStoreKey(sess.login))
-                   || localStorage.getItem(privStoreKeyOld(sess.login)); } catch(e){}
-      if (saved){
-        try {
-          const jwk = JSON.parse(saved);
-          myPrivKey = await importPrivJWK(jwk);
-          myPubRaw = jwkToRawPub(jwk);
-        } catch(e){}
-      }
-      if (myPrivKey){
-        sessionToken = sess.token;
-        mode = "login";
-        authPayload = {token: sess.token};
-        setBusy($("submitBtn"), true);
-        try {
-          const ok = await connect();
-          me = {login: ok.login, uid: ok.login};
-          if (ok.token) sessionToken = ok.token;
-          contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
-          for (const k of Object.keys(threads)) delete threads[k];
-          for (const m of (ok.history || [])){
-            const peer = m.f === me.uid ? m.t : m.f;
-            seenIds.add(m.i);
-            const text = await decryptIncoming(m, peer);
-            (threads[peer] = threads[peer] || []).push({
-              id: m.i, from: m.f, to: m.t,
-              text: text !== null ? text : "⚠ не удалось расшифровать",
-              ts: m.s, broken: text === null,
-            });
+      if (sess && sess.login && sess.token){
+        let saved = lsGet(privStoreKey(sess.login)) || lsGet(privStoreKeyOld(sess.login));
+        if (saved){
+          try {
+            const jwk = JSON.parse(saved);
+            myPrivKey = await importPrivJWK(jwk);
+            myPubRaw = jwkToRawPub(jwk);
+          } catch(e){}
+        }
+        if (myPrivKey){
+          sessionToken = sess.token;
+          mode = "login";
+          authPayload = {token: sess.token};
+          setBusy($("submitBtn"), true);
+          try {
+            const ok = await connect();
+            me = {login: ok.login, uid: ok.login};
+            if (ok.token) sessionToken = ok.token;
+            contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
+            for (const k of Object.keys(threads)) delete threads[k];
+            for (const m of (ok.history || [])){
+              const peer = m.f === me.uid ? m.t : m.f;
+              seenIds.add(m.i);
+              const text = await decryptIncoming(m, peer);
+              (threads[peer] = threads[peer] || []).push({
+                id: m.i, from: m.f, to: m.t,
+                text: text !== null ? text : "⚠ не удалось расшифровать",
+                ts: m.s, broken: text === null,
+              });
+            }
+            $("myLogin").textContent = me.login;
+            $("myDomain").textContent = "в сети";
+            $("myAvatar").textContent = avatarChar(me.login);
+            $("myAvatar").style.background = avatarColor(me.uid);
+            $("login").style.display = "none";
+            $("app").classList.add("on");
+            renderContacts();
+            startHeartbeat();
+            return;
+          } catch(e){
+            lsDel(LS_SESSION);
+            sessionToken = null;
+            setBusy($("submitBtn"), false);
           }
-          $("myLogin").textContent = me.login;
-          $("myDomain").textContent = "в сети";
-          $("myAvatar").textContent = avatarChar(me.login);
-          $("myAvatar").style.background = avatarColor(me.uid);
-          $("login").style.display = "none";
-          $("app").classList.add("on");
-          renderContacts();
-          startHeartbeat();
-          return;
-        } catch(e){
-          try { localStorage.removeItem(LS_SESSION); } catch(e2){}
-          sessionToken = null;
-          setBusy($("submitBtn"), false);
         }
       }
+    } catch(e){
+      showError(e.code || "BOOT", e.message || "Ошибка загрузки", e.stack || String(e));
     }
     $("loginIn").focus();
   }, 80);
@@ -1664,9 +1931,10 @@ def _run():
         try:
             import uvloop  # type: ignore
             uvloop.install()
-        except Exception:
-            pass
-    print(_c(DIM, f"  http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}"))
+        except Exception as e:
+            log_err("uvloop", e)
+    shown = HOST if HOST != "0.0.0.0" else "localhost"
+    print(_c(DIM, f"  http://{shown}:{PORT}"))
     print()
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
 
@@ -1676,3 +1944,6 @@ if __name__ == "__main__":
         _run()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        log_err("startup", e)
+        sys.exit(1)
