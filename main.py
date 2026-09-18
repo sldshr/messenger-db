@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SDM — sldshr's direct messanger
-E2EE мессенджер 1-на-1. Один файл. Без федерации.
+E2EE мессенджер 1-на-1. Один файл.
 
 Запуск: python main.py
 """
@@ -12,22 +12,11 @@ import subprocess
 import importlib
 import time
 
-# ============================ TUI / BOOTSTRAP ============================
-# Всё это выполняется ДО импорта FastAPI, чтобы красиво показать проверку зависимостей.
+# ============================ BOOT / DEPS ============================
+RESET = "\x1b[0m"; BOLD = "\x1b[1m"; DIM = "\x1b[2m"
+RED = "\x1b[31m"; GREEN = "\x1b[32m"; YELLOW = "\x1b[33m"
+BLUE = "\x1b[34m"; CYAN = "\x1b[36m"; WHITE = "\x1b[97m"
 
-RESET  = "\x1b[0m"
-BOLD   = "\x1b[1m"
-DIM    = "\x1b[2m"
-RED    = "\x1b[31m"
-GREEN  = "\x1b[32m"
-YELLOW = "\x1b[33m"
-BLUE   = "\x1b[34m"
-MAGENTA= "\x1b[35m"
-CYAN   = "\x1b[36m"
-WHITE  = "\x1b[97m"
-BG_BLUE= "\x1b[44m"
-
-# Принудительный UTF-8 вывод
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -47,166 +36,74 @@ def _c(code: str, text: str) -> str:
     return f"{code}{text}{RESET}"
 
 
-def print_banner():
+REQUIRED = [("fastapi", "fastapi"), ("uvicorn", "uvicorn")]
+OPTIONAL = [("uvloop", "uvloop")]
+
+
+def check_deps():
     print()
     print(_c(CYAN + BOLD, ASCII_SDM))
-    print(" " * 3 + _c(DIM + WHITE, "sldshr's direct messanger"))
-    print(" " * 3 + _c(DIM, "end-to-end encrypted · 1-on-1 · single file"))
+    print("   " + _c(DIM + WHITE, "sldshr's direct messanger"))
     print()
-
-
-def print_rule(char: str = "─", width: int = 56):
-    print(_c(DIM, " " + char * width))
-
-
-def print_section(title: str):
-    print()
-    print(" " + _c(BOLD + BLUE, "▎") + " " + _c(BOLD, title))
-    print_rule()
-
-
-def print_kv(key: str, value: str, note: str = "", ok: bool = True):
-    marker = _c(GREEN, "●") if ok else _c(RED, "●")
-    k = _c(WHITE, key.ljust(14))
-    v = _c(CYAN, value)
-    n = "  " + _c(DIM, note) if note else ""
-    print(f"  {marker}  {k} {v}{n}")
-
-
-def print_check(name: str, ok: bool, note: str = ""):
-    if ok:
-        print(f"  {_c(GREEN, '✓')}  {_c(WHITE, name.ljust(14))} {_c(DIM, note)}")
-    else:
-        print(f"  {_c(RED, '✗')}  {_c(WHITE, name.ljust(14))} {_c(RED, note)}")
-
-
-def check_and_install_deps():
-    """Проверяет зависимости, предлагает установку."""
-    print_section("Проверка зависимостей")
-
-    deps = [
-        ("fastapi",  "fastapi",  "веб-фреймворк"),
-        ("uvicorn",  "uvicorn",  "ASGI-сервер"),
-    ]
-    optional = [
-        ("uvloop",   "uvloop",   "быстрый event loop (опционально)"),
-    ]
 
     missing = []
-    for mod, pkg, note in deps:
+    for mod, pkg in REQUIRED:
         try:
             importlib.import_module(mod)
-            print_check(pkg, True, note)
+            print(f"  {_c(GREEN, '✓')}  {pkg}")
         except ImportError:
-            print_check(pkg, False, "не установлен")
+            print(f"  {_c(RED, '✗')}  {pkg}")
             missing.append(pkg)
 
-    for mod, pkg, note in optional:
+    for mod, pkg in OPTIONAL:
         try:
             importlib.import_module(mod)
-            print_check(pkg, True, note + " · +30% скорости")
+            print(f"  {_c(GREEN, '✓')}  {pkg}")
         except ImportError:
-            print_check(pkg, False, note + " · можно установить позже")
+            print(f"  {_c(DIM, '·')}  {_c(DIM, pkg)}")
 
-    if missing:
+    print()
+
+    if not missing:
+        return
+
+    try:
+        ans = input(f"  Установить {', '.join(missing)}? [Y/n] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        ans = "n"
         print()
-        print(" " + _c(YELLOW, "Не хватает обязательных библиотек: ") + _c(BOLD, ", ".join(missing)))
-        try:
-            ans = input(" " + _c(CYAN, "Установить сейчас через pip? ") +
-                        _c(DIM, "[Y/n] ") + _c(WHITE, "")).strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            ans = "n"
-            print()
-        if ans in ("", "y", "yes", "д", "да"):
-            print()
-            cmd = [sys.executable, "-m", "pip", "install"] + missing
-            print(" " + _c(DIM, "$ " + " ".join(cmd)))
-            print()
-            try:
-                rc = subprocess.call(cmd)
-                if rc != 0:
-                    print(" " + _c(RED, "pip завершился с ошибкой. Установи вручную и запусти снова."))
-                    sys.exit(1)
-            except Exception as e:
-                print(" " + _c(RED, f"Не удалось выполнить pip: {e}"))
-                sys.exit(1)
-            print()
-            # перезапуск процесса
-            print(" " + _c(DIM, "Перезапуск..."))
-            time.sleep(0.6)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        else:
-            print(" " + _c(RED, "Отменено. Установи зависимости вручную и запусти снова."))
-            sys.exit(1)
+    if ans not in ("", "y", "yes", "д", "да"):
+        print(_c(RED, "  Отменено."))
+        sys.exit(1)
+
+    rc = subprocess.call([sys.executable, "-m", "pip", "install"] + missing)
+    if rc != 0:
+        print(_c(RED, "  pip завершился с ошибкой."))
+        sys.exit(1)
+
+    print(_c(DIM, "\n  Перезапуск...\n"))
+    time.sleep(0.5)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-def print_config(host: str, port: int, history_max: int, uvloop_used: bool):
-    print_section("Конфигурация сервера")
-    print_kv("HOST",      host)
-    print_kv("PORT",      str(port))
-    print_kv("PAIR_MAX",  str(history_max), "сообщений на пару")
-    print_kv("LOOP",      "uvloop" if uvloop_used else "asyncio", "event loop")
-    print_kv("STORAGE",   "RAM", "всё в оперативной памяти")
-    print_kv("E2EE",      "ECDH P-256 + AES-GCM-256", "ключи только у клиентов")
-    print_kv("FEDERATION","off", "каждый сервер автономен")
+check_deps()
 
-
-def print_ready(host: str, port: int):
-    print()
-    print_rule("━")
-    print(" " + _c(BOLD + GREEN, "● Сервер готов"))
-    shown_host = host if host != "0.0.0.0" else "localhost"
-    print(" " + _c(DIM, "Открой в браузере:"))
-    print("   " + _c(BOLD + CYAN + BOLD, f"http://{shown_host}:{port}"))
-    print()
-    print(" " + _c(DIM, "Ctrl+C — остановить сервер"))
-    print_rule("━")
-    print()
-
-
-def print_hints(host: str, port: int, uvloop_used: bool):
-    print_section("Подсказки")
-    if host == "0.0.0.0":
-        print("  " + _c(DIM, "•") + " Сервер слушает все интерфейсы (0.0.0.0)")
-        print("  " + _c(DIM, "•") + " В локальной сети доступен по " +
-              _c(CYAN, f"http://<твой-ip>:{port}"))
-    else:
-        print("  " + _c(DIM, "•") + " Сервер слушает только " + _c(CYAN, host))
-    if not uvloop_used:
-        print("  " + _c(DIM, "•") + " Для +30% скорости: " +
-              _c(CYAN, "pip install uvloop") + _c(DIM, " (Linux/macOS)"))
-    print("  " + _c(DIM, "•") + " Переменные окружения: " +
-          _c(CYAN, "HOST, PORT, PAIR_HISTORY_MAX"))
-    print("  " + _c(DIM, "•") + " Пример: " +
-          _c(CYAN, "PORT=9000 python main.py"))
-    print()
-
-
-# ---- Прогоняем bootstrap ----
-print_banner()
-
-# 1. Проверка зависимостей (может установить и перезапуститься)
-check_and_install_deps()
-
-# 2. Теперь можно импортировать всё остальное
+# ============================ IMPORTS ============================
 import asyncio
+import base64
 import hashlib
 import json
 import secrets
 import struct
+import time as _time
 import uuid
 from collections import deque
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-
-# 3. Читаем конфиг из env
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", "8000"))
-PAIR_HISTORY_MAX = int(os.getenv("PAIR_HISTORY_MAX", "200"))
-STATUS_HEARTBEAT = 30.0
 
 try:
     import uvloop  # type: ignore
@@ -214,14 +111,26 @@ try:
 except ImportError:
     _UVLOOP = False
 
-# 4. Показываем конфиг
-print_config(HOST, PORT, PAIR_HISTORY_MAX, _UVLOOP)
-print_hints(HOST, PORT, _UVLOOP)
+# ============================ CONSTANTS ============================
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
+PAIR_HISTORY_MAX = 200
+MAX_CONTACTS = 500
+MAX_MSG_BYTES = 64 * 1024            # 64 KiB на blob
+SESSION_TTL_MS = 30 * 24 * 3600_000  # 30 дней
+AUTH_WINDOW = 60                     # сек
+AUTH_MAX = 10                        # попыток / окно / IP
+MSG_WINDOW = 10                      # сек
+MSG_MAX = 40                         # сообщений / окно / клиент
+SCRYPT_N = 2 ** 15                   # было 2**14
+SCRYPT_PARALLEL = 4                  # одновременных hash'ей
+LOGOUT_CLOSE_DELAY = 0.15
 
 # ============================ PROTOCOL ============================
 (T_REGISTER, T_AUTH, T_AUTH_OK, T_MSG, T_PING, T_PONG, T_ERROR,
  T_HELLO, T_STATUS, T_SYNC, T_CONTACT_REQ, T_CONTACT_OK, T_CONTACT_ADD,
- T_CHAT_END) = range(1, 15)
+ T_CHAT_END, T_LOGOUT) = range(1, 16)
 _HDR = struct.Struct(">BI")
 
 
@@ -240,21 +149,90 @@ users: dict[str, dict] = {}
 online: dict[str, "Client"] = {}
 watchers: dict[str, set] = {}
 messages: dict[tuple, deque] = {}
+sessions: dict[str, dict] = {}          # token -> {login, exp}
+_auth_buckets: dict[str, deque] = {}    # ip -> [ts]
+_scrypt_sem = asyncio.Semaphore(SCRYPT_PARALLEL)
+_DUMMY_SALT = os.urandom(16)
 
 
-def scrypt_hash(pw: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+# ============================ HELPERS ============================
+def scrypt_raw(pw: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(pw.encode("utf-8"), salt=salt,
+                          n=SCRYPT_N, r=8, p=1, dklen=32)
+
+
+async def scrypt_async(pw: str, salt: bytes) -> bytes:
+    async with _scrypt_sem:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, scrypt_raw, pw, salt)
 
 
 def pair_key(a: str, b: str) -> tuple:
     return (a, b) if a < b else (b, a)
 
 
+def check_rate(bucket: dict, key: str, maxn: int, window: float) -> bool:
+    now = _time.monotonic()
+    dq = bucket.get(key)
+    if dq is None:
+        dq = deque()
+        bucket[key] = dq
+    while dq and dq[0] < now - window:
+        dq.popleft()
+    if len(dq) >= maxn:
+        return False
+    dq.append(now)
+    return True
+
+
+def valid_pubkey(pub: str) -> bool:
+    """P-256 uncompressed point = 65 байт, первый = 0x04."""
+    if not isinstance(pub, str) or len(pub) < 80 or len(pub) > 200:
+        return False
+    try:
+        raw = base64.b64decode(pub, validate=True)
+    except Exception:
+        return False
+    return len(raw) == 65 and raw[0] == 0x04
+
+
+def valid_login(login: str) -> bool:
+    if not (3 <= len(login) <= 24):
+        return False
+    return all(ch.isalnum() or ch in "_-." for ch in login)
+
+
+def new_session(login: str) -> str:
+    tok = secrets.token_urlsafe(32)
+    sessions[tok] = {"login": login, "exp": int(_time.time() * 1000) + SESSION_TTL_MS}
+    return tok
+
+
+def resolve_session(tok: str) -> Optional[str]:
+    s = sessions.get(tok)
+    if not s:
+        return None
+    if s["exp"] < int(_time.time() * 1000):
+        sessions.pop(tok, None)
+        return None
+    return s["login"]
+
+
+def drop_session(tok: str):
+    sessions.pop(tok, None)
+
+
+def ws_ip(ws: WebSocket) -> str:
+    return ws.client.host if ws.client else "unknown"
+
+
+# ============================ CLIENT ============================
 class Client:
-    __slots__ = ("ws", "login", "lock")
-    def __init__(self, ws: WebSocket):
+    __slots__ = ("ws", "login", "lock", "ip")
+    def __init__(self, ws: WebSocket, ip: str):
         self.ws = ws
         self.login: Optional[str] = None
+        self.ip = ip
         self.lock = asyncio.Lock()
 
     async def send(self, t: int, o: Any):
@@ -286,37 +264,66 @@ async def handle_register(c: Client, obj: dict):
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
     pub = obj.get("pub") or ""
-    if not login or not pw or not pub:
-        return await c.send(T_ERROR, {"m": "Заполните все поля"})
-    if not (3 <= len(login) <= 24):
-        return await c.send(T_ERROR, {"m": "Логин: 3–24 символа"})
-    if not all(ch.isalnum() or ch in "_-." for ch in login):
-        return await c.send(T_ERROR, {"m": "Логин: только a-z 0-9 _ - ."})
-    if len(pw) < 6:
-        return await c.send(T_ERROR, {"m": "Пароль минимум 6 символов"})
+    remember = bool(obj.get("remember"))
+
+    if not valid_login(login):
+        return await c.send(T_ERROR, {"m": "Логин: 3–24 символа, a-z 0-9 . _ -"})
+    if not isinstance(pw, str) or len(pw) < 8:
+        return await c.send(T_ERROR, {"m": "Пароль минимум 8 символов"})
+    if not valid_pubkey(pub):
+        return await c.send(T_ERROR, {"m": "Некорректный публичный ключ"})
     if login in users:
         return await c.send(T_ERROR, {"m": "Логин уже занят"})
+
     salt = os.urandom(16)
-    users[login] = {"salt": salt, "pw": scrypt_hash(pw, salt), "pub": pub, "contacts": {}}
+    h = await scrypt_async(pw, salt)
+    users[login] = {"salt": salt, "pw": h, "pub": pub, "contacts": {}}
     watchers.setdefault(login, set())
-    await _finish_auth(c, login)
+    await _finish_auth(c, login, remember, new_pw_ok=True)
 
 
 async def handle_auth(c: Client, obj: dict):
+    # 1) токен сессии
+    tok = obj.get("token")
+    if isinstance(tok, str) and tok:
+        login = resolve_session(tok)
+        if not login or login not in users:
+            return await c.send(T_ERROR, {"m": "Сессия истекла"})
+        if login in online:
+            return await c.send(T_ERROR, {"m": "Уже в сети"})
+        return await _finish_auth(c, login, remember=False, restore_token=tok)
+
+    # 2) обычный логин/пароль
     login = (obj.get("login") or "").strip().lower()
     pw = obj.get("password") or ""
-    pub = (obj.get("pub") or "").strip()
+    remember = bool(obj.get("remember"))
+    pub = (obj.get("pub") or "").strip() or None
+
+    # rate-limit на попытки входа с одного IP
+    if not check_rate(_auth_buckets, c.ip, AUTH_MAX, AUTH_WINDOW):
+        await asyncio.sleep(0.5)
+        return await c.send(T_ERROR, {"m": "Слишком много попыток. Попробуйте позже"})
+
     u = users.get(login)
-    if not u or not secrets.compare_digest(u["pw"], scrypt_hash(pw, u["salt"])):
+    # constant-time: даже если логина нет, гоняем scrypt
+    if u is None:
+        await scrypt_async(pw, _DUMMY_SALT)
+        return await c.send(T_ERROR, {"m": "Неверный логин или пароль"})
+
+    h = await scrypt_async(pw, u["salt"])
+    if not secrets.compare_digest(u["pw"], h):
         return await c.send(T_ERROR, {"m": "Неверный логин или пароль"})
     if login in online:
-        return await c.send(T_ERROR, {"m": "Вы уже вошли с другого устройства"})
-    if pub and pub != u.get("pub"):
+        return await c.send(T_ERROR, {"m": "Уже в сети"})
+
+    if pub and valid_pubkey(pub) and pub != u["pub"]:
         u["pub"] = pub
-    await _finish_auth(c, login)
+
+    await _finish_auth(c, login, remember)
 
 
-async def _finish_auth(c: Client, login: str):
+async def _finish_auth(c: Client, login: str, remember: bool,
+                       new_pw_ok: bool = False, restore_token: Optional[str] = None):
     c.login = login
     online[login] = c
     u = users[login]
@@ -332,30 +339,49 @@ async def _finish_auth(c: Client, login: str):
             hist.extend(dq)
     hist.sort(key=lambda m: m["s"])
 
-    await c.send(T_AUTH_OK, {
+    payload = {
         "login": login,
         "contacts": contacts_payload,
         "history": hist,
-    })
+    }
+
+    if new_pw_ok or remember:
+        tok = new_session(login)
+        payload["token"] = tok
+    elif restore_token:
+        payload["token"] = restore_token
+
+    await c.send(T_AUTH_OK, payload)
     await notify_watchers(login, True)
 
 
 async def handle_msg(c: Client, obj: dict):
+    if not check_rate(_auth_buckets, "m:" + (c.login or ""), MSG_MAX, MSG_WINDOW):
+        return await c.send(T_ERROR, {"m": "Слишком много сообщений"})
+
     to_login = (obj.get("t") or "").strip().lower()
-    blob = obj.get("d") or ""
-    if not to_login or not blob:
+    blob = obj.get("d")
+    if not isinstance(to_login, str) or not isinstance(blob, str) or not blob:
         return
     if to_login == c.login:
         return await c.send(T_ERROR, {"m": "Нельзя писать самому себе"})
-    if to_login not in users:
-        return await c.send(T_ERROR, {"m": "Пользователь не найден"})
+    if len(blob) > MAX_MSG_BYTES:
+        return await c.send(T_ERROR, {"m": "Сообщение слишком большое"})
 
-    from_pub = users[c.login]["pub"]
-    mid = obj.get("i") or uuid.uuid4().hex
+    me = users[c.login]
+    peer = users.get(to_login)
+    if peer is None:
+        return await c.send(T_ERROR, {"m": "Получатель не найден"})
+    # взаимные контакты
+    if to_login not in me["contacts"] or c.login not in peer["contacts"]:
+        return await c.send(T_ERROR, {"m": "Получатель не в ваших контактах"})
+
+    from_pub = me["pub"]
+    mid = uuid.uuid4().hex
     msg = {
         "i": mid, "f": c.login, "t": to_login,
         "d": blob, "p": from_pub,
-        "s": int(time.time() * 1000),
+        "s": int(_time.time() * 1000),
     }
 
     key = pair_key(c.login, to_login)
@@ -373,19 +399,25 @@ async def handle_msg(c: Client, obj: dict):
 
 async def handle_contact_req(c: Client, obj: dict):
     peer = (obj.get("u") or "").strip().lower()
-    if not peer:
-        return await c.send(T_ERROR, {"m": "Пустой логин"})
+    if not valid_login(peer):
+        return await c.send(T_ERROR, {"m": "Неверный формат логина"})
     if peer == c.login:
-        return await c.send(T_ERROR, {"m": "Это ваш собственный логин"})
+        return await c.send(T_ERROR, {"m": "Это ваш логин"})
     u = users.get(peer)
     if not u:
         return await c.send(T_ERROR, {"m": "Пользователь не найден"})
 
-    pub = u["pub"]
-    my_pub = users[c.login]["pub"]
+    me = users[c.login]
+    if len(me["contacts"]) >= MAX_CONTACTS:
+        return await c.send(T_ERROR, {"m": "Достигнут лимит контактов"})
+    if len(u["contacts"]) >= MAX_CONTACTS:
+        return await c.send(T_ERROR, {"m": "У собеседника достигнут лимит контактов"})
 
-    users[c.login]["contacts"][peer] = pub
-    users[peer]["contacts"][c.login] = my_pub
+    pub = u["pub"]
+    my_pub = me["pub"]
+
+    me["contacts"][peer] = pub
+    u["contacts"][c.login] = my_pub
     watchers.setdefault(peer, set()).add(c.login)
     watchers.setdefault(c.login, set()).add(peer)
 
@@ -399,7 +431,7 @@ async def handle_contact_req(c: Client, obj: dict):
 
 async def handle_chat_end(c: Client, obj: dict):
     peer = (obj.get("u") or "").strip().lower()
-    if not peer:
+    if not valid_login(peer):
         return
     my = c.login
 
@@ -419,6 +451,12 @@ async def handle_chat_end(c: Client, obj: dict):
         await target.send(T_CHAT_END, {"u": my})
 
 
+async def handle_logout(c: Client, obj: dict):
+    tok = obj.get("token")
+    if isinstance(tok, str) and tok:
+        drop_session(tok)
+
+
 # ============================ APP ============================
 app = FastAPI()
 
@@ -430,12 +468,27 @@ async def index():
 
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
+    # Origin-проверка (митигация cross-site WebSocket hijacking)
+    origin = ws.headers.get("origin", "")
+    host = ws.headers.get("host", "")
+    if origin:
+        try:
+            ohost = urlparse(origin).netloc.lower()
+            if ohost and host and ohost != host.lower():
+                await ws.close(code=1008)
+                return
+        except Exception:
+            pass
+
     await ws.accept()
-    c = Client(ws)
+    c = Client(ws, ws_ip(ws))
     await c.send(T_HELLO, {})
     try:
         while True:
             raw = await ws.receive_bytes()
+            if len(raw) > MAX_MSG_BYTES + 4096:
+                await ws.close(code=1009)
+                return
             try:
                 t, obj = unpack(raw)
             except Exception:
@@ -450,6 +503,8 @@ async def ws_handler(ws: WebSocket):
                 await handle_contact_req(c, obj)
             elif t == T_CHAT_END and c.login:
                 await handle_chat_end(c, obj)
+            elif t == T_LOGOUT and c.login:
+                await handle_logout(c, obj)
             elif t == T_PING:
                 await c.send(T_PONG, {})
             elif t == T_SYNC and c.login:
@@ -822,7 +877,7 @@ button.btn-secondary.busy::after{border-color:rgba(128,128,128,.2);border-top-co
 
 const T = {REGISTER:1, AUTH:2, AUTH_OK:3, MSG:4, PING:5, PONG:6, ERROR:7,
            HELLO:8, STATUS:9, SYNC:10, CONTACT_REQ:11, CONTACT_OK:12,
-           CONTACT_ADD:13, CHAT_END:14};
+           CONTACT_ADD:13, CHAT_END:14, LOGOUT:15};
 const _enc = new TextEncoder(), _dec = new TextDecoder();
 
 function pack(type, obj){
@@ -906,9 +961,7 @@ applyTheme(getInitialTheme());
 mq.addEventListener("change", e => {
   let saved = null;
   try { saved = localStorage.getItem(LS_THEME); } catch(e){}
-  if (saved !== "dark" && saved !== "light"){
-    applyTheme(e.matches ? "dark" : "light");
-  }
+  if (saved !== "dark" && saved !== "light") applyTheme(e.matches ? "dark" : "light");
 });
 
 document.addEventListener("contextmenu", e => {
@@ -931,7 +984,8 @@ let ws = null;
 let me = null;
 let myPrivKey = null;
 let myPubRaw = null;
-let sessionPassword = null;
+let sessionToken = null;       // если есть — используется для авто-входа
+let sessionPassword = null;    // в памяти, для reconnect
 let contacts = [];
 const convKeys = {};
 const threads = {};
@@ -965,7 +1019,7 @@ function toast(msg){
   toastTimer = setTimeout(() => el.classList.remove("show"), 1800);
 }
 
-const LS_REMEMBER = "sdm_remember";
+const LS_SESSION = "sdm_session";   // {login, token}
 function privStoreKey(login){ return "sdm_priv_" + login + "@" + location.host; }
 function privStoreKeyOld(login){ return "sdm_priv_" + login; }
 
@@ -1182,8 +1236,7 @@ async function handleFrame(type, obj){
           const c = contacts.find(x => x.uid === it.u);
           if (c) c.online = it.o;
         }
-        renderContacts();
-        refreshPeerSub();
+        renderContacts(); refreshPeerSub();
       } else {
         const c = contacts.find(x => x.uid === obj.u);
         if (c){ c.online = obj.o; renderContacts(); refreshPeerSub(); }
@@ -1191,11 +1244,10 @@ async function handleFrame(type, obj){
       break;
     case T.PING: if (ws && ws.readyState === 1) ws.send(pack(T.PONG, {})); break;
     case T.PONG: break;
-    case T.ERROR: {
+    case T.ERROR:
       if (pendingAdd){ $("addErr").textContent = obj.m || "Ошибка"; setBusy($("addConfirm"), false); }
-      console.warn("server:", obj.m);
+      else toast(obj.m || "Ошибка");
       break;
-    }
   }
 }
 
@@ -1280,7 +1332,7 @@ async function doAuth(login, password, remember){
   login = (login || "").trim().toLowerCase();
   if (!login || !password){ setErr("Заполните все поля"); return; }
   if (!/^[a-z0-9._-]{3,24}$/.test(login)){ setErr("Логин 3–24: a-z 0-9 . _ -"); return; }
-  if (mode === "register" && password.length < 6){ setErr("Пароль минимум 6 символов"); return; }
+  if (mode === "register" && password.length < 8){ setErr("Пароль минимум 8 символов"); return; }
   setErr(""); setNote("");
 
   try {
@@ -1293,7 +1345,7 @@ async function doAuth(login, password, remember){
         localStorage.setItem(privStoreKey(login), JSON.stringify(jwk));
         localStorage.removeItem(privStoreKeyOld(login));
       } catch(e){}
-      authPayload = {login, password, pub: myPubRaw};
+      authPayload = {login, password, pub: myPubRaw, remember};
     } else {
       let saved = null;
       try {
@@ -1315,7 +1367,7 @@ async function doAuth(login, password, remember){
         myPubRaw = await exportPubRaw(kp.publicKey);
         try { localStorage.setItem(privStoreKey(login), JSON.stringify(jwk)); } catch(e){}
       }
-      authPayload = {login, password};
+      authPayload = {login, password, remember};
       if (myPubRaw) authPayload.pub = myPubRaw;
     }
 
@@ -1324,11 +1376,15 @@ async function doAuth(login, password, remember){
     sessionPassword = password;
     me = {login: ok.login, uid: ok.login};
 
-    if (remember){
-      try { localStorage.setItem(LS_REMEMBER, JSON.stringify({login: me.login, password})); }
-      catch(e){}
-    } else {
-      try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
+    // сессионный токен от сервера (вместо пароля в localStorage)
+    if (ok.token){
+      sessionToken = ok.token;
+      if (remember || mode === "register"){
+        try { localStorage.setItem(LS_SESSION, JSON.stringify({login: me.login, token: ok.token})); }
+        catch(e){}
+      } else {
+        try { localStorage.removeItem(LS_SESSION); } catch(e){}
+      }
     }
 
     contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
@@ -1366,9 +1422,9 @@ async function sendMessage(){
   const text = inp.value.trim();
   if (!text) return;
   const c = contacts.find(x => x.uid === activePeer);
-  if (!c || !c.pub){ alert("Нет ключа получателя"); return; }
+  if (!c || !c.pub){ toast("Нет ключа получателя"); return; }
   const key = await getConvKeyFromPub(activePeer, c.pub);
-  if (!key){ alert("Нет ключа получателя"); return; }
+  if (!key){ toast("Нет ключа получателя"); return; }
   const blob = await encryptBlob(key, text);
   const id = uuid();
   const localMsg = {id, from: me.uid, to: activePeer, text, ts: Date.now()};
@@ -1430,13 +1486,20 @@ function startHeartbeat(){
 }
 async function onDisconnect(){
   clearInterval(heartbeatTimer);
-  if (!sessionPassword) return;
   if (reconnectAttempts >= 5){ alert("Соединение потеряно. Обновите страницу."); return; }
   reconnectAttempts++;
-  try {
+  // предпочитаем токен, если есть
+  if (sessionToken){
+    authPayload = {token: sessionToken};
+    mode = "login";
+  } else if (sessionPassword){
     authPayload = {login: me.login, password: sessionPassword};
     if (myPubRaw) authPayload.pub = myPubRaw;
     mode = "login";
+  } else {
+    return;
+  }
+  try {
     const ok = await connect();
     me = {login: ok.login, uid: ok.login};
     contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
@@ -1493,10 +1556,11 @@ $("authForm").addEventListener("submit", e => {
 });
 
 $("logoutBtn").onclick = () => {
+  try { if (ws && ws.readyState === 1 && sessionToken) ws.send(pack(T.LOGOUT, {token: sessionToken})); } catch(e){}
+  try { localStorage.removeItem(LS_SESSION); } catch(e){}
+  sessionToken = null;
   sessionPassword = null;
-  try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
-  try { ws && ws.close(); } catch(e){}
-  location.reload();
+  setTimeout(() => { try { ws && ws.close(); } catch(e){} location.reload(); }, 120);
 };
 
 $("addBtn").onclick = openAddModal;
@@ -1526,26 +1590,64 @@ $("endModal").addEventListener("click", e => {
 });
 
 (function boot(){
-  setTimeout(() => {
-    let auto = null;
+  setTimeout(async () => {
+    // пробуем восстановить сессию по токену
+    let sess = null;
     try {
-      const raw = localStorage.getItem(LS_REMEMBER);
-      if (raw) auto = JSON.parse(raw);
+      const raw = localStorage.getItem(LS_SESSION);
+      if (raw) sess = JSON.parse(raw);
     } catch(e){}
-    if (auto && auto.login && auto.password){
-      $("loginIn").value = auto.login;
-      $("pwIn").value = auto.password;
-      $("rememberIn").checked = true;
-      setTimeout(() => {
-        if (!$("submitBtn").disabled){
-          doAuth(auto.login, auto.password, true).catch(() => {
-            try { localStorage.removeItem(LS_REMEMBER); } catch(e){}
-          });
+
+    if (sess && sess.login && sess.token){
+      // загружаем приватный ключ
+      let saved = null;
+      try { saved = localStorage.getItem(privStoreKey(sess.login))
+                   || localStorage.getItem(privStoreKeyOld(sess.login)); } catch(e){}
+      if (saved){
+        try {
+          const jwk = JSON.parse(saved);
+          myPrivKey = await importPrivJWK(jwk);
+          myPubRaw = jwkToRawPub(jwk);
+        } catch(e){}
+      }
+      if (myPrivKey){
+        sessionToken = sess.token;
+        mode = "login";
+        authPayload = {token: sess.token};
+        setBusy($("submitBtn"), true);
+        try {
+          const ok = await connect();
+          me = {login: ok.login, uid: ok.login};
+          if (ok.token) sessionToken = ok.token;
+          contacts = (ok.contacts || []).map(c => ({uid: c.u, pub: c.p, online: c.o}));
+          for (const k of Object.keys(threads)) delete threads[k];
+          for (const m of (ok.history || [])){
+            const peer = m.f === me.uid ? m.t : m.f;
+            seenIds.add(m.i);
+            const text = await decryptIncoming(m, peer);
+            (threads[peer] = threads[peer] || []).push({
+              id: m.i, from: m.f, to: m.t,
+              text: text !== null ? text : "⚠ не удалось расшифровать",
+              ts: m.s, broken: text === null,
+            });
+          }
+          $("myLogin").textContent = me.login;
+          $("myDomain").textContent = "в сети";
+          $("myAvatar").textContent = avatarChar(me.login);
+          $("myAvatar").style.background = avatarColor(me.uid);
+          $("login").style.display = "none";
+          $("app").classList.add("on");
+          renderContacts();
+          startHeartbeat();
+          return;
+        } catch(e){
+          try { localStorage.removeItem(LS_SESSION); } catch(e2){}
+          sessionToken = null;
+          setBusy($("submitBtn"), false);
         }
-      }, 250);
-    } else {
-      $("loginIn").focus();
+      }
     }
+    $("loginIn").focus();
   }, 80);
 })();
 
@@ -1558,21 +1660,19 @@ $("endModal").addEventListener("click", e => {
 
 # ============================ RUN ============================
 def _run():
-    print_ready(HOST, PORT)
-    try:
-        if _UVLOOP:
+    if _UVLOOP:
+        try:
             import uvloop  # type: ignore
             uvloop.install()
-            uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
-        else:
-            uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        print()
-        print(" " + _c(YELLOW, "●") + " " + _c(DIM, "Сервер остановлен"))
-        print()
+        except Exception:
+            pass
+    print(_c(DIM, f"  http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}"))
+    print()
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning", access_log=False)
 
 
 if __name__ == "__main__":
-    _run()
+    try:
+        _run()
+    except KeyboardInterrupt:
+        pass
