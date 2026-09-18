@@ -10,13 +10,11 @@ from datetime import datetime
 #           НАСТРОЙКИ
 # ==============================
 
-# --- сервер ---
 HOST = "0.0.0.0"
 PORT = 8000
 
-# --- внешний вид ---
 SITE_NAME       = "SldChat"
-LOGO_POSITION   = "center"                    # left | center | right
+LOGO_POSITION   = "left"
 AUTHOR          = "SldShrLab"
 FONT_FAMILY     = "Verdana, Arial, sans-serif"
 FONT_SIZE       = 15
@@ -25,22 +23,124 @@ BG_COLOR        = "#dcdcdc"
 BOX_BG_COLOR    = "#ffffff"
 ACCENT_COLOR    = "#0000cc"
 
-# --- лимиты ---
-MAX_POSTS              = 300    # сколько постов держим в памяти
-MAX_COMMENTS_PER_POST  = 100    # сколько комментариев у одного поста
-MAX_POST_LEN           = 700    # символов в посте
-MAX_COMMENT_LEN        = 500    # символов в комментарии
-MAX_SEARCH_LEN         = 100    # символов в поисковом запросе
+MAX_POSTS              = 300
+MAX_COMMENTS_PER_POST  = 100
+MAX_POST_LEN           = 700
+MAX_COMMENT_LEN        = 500
+MAX_SEARCH_LEN         = 100
 
-# --- поведение ---
-ALLOW_POSTING        = True     # можно ли создавать посты
-ALLOW_COMMENTS       = True     # можно ли комментировать
-ALLOW_SEARCH         = True     # показывать ли поиск
-SHOW_TIMESTAMPS      = True     # показывать дату/время у постов
-SHOW_COPY_BUTTON     = True     # кнопка "скопировать текст"
-AUTO_REFRESH_SECONDS = 0        # автообновление ленты (0 = выключено)
+ALLOW_POSTING        = True
+ALLOW_COMMENTS       = True
+ALLOW_SEARCH         = True
+SHOW_TIMESTAMPS      = True
+SHOW_COPY_BUTTON     = True
+AUTO_REFRESH_SECONDS = 0
+
+LANG_DEFAULT = "ru"
+LANG_OPTIONS = ("ru", "en")
 
 # ==============================
+
+STRINGS = {
+    "ru": {
+        "post_placeholder":     "Что думаешь? (до {n} символов)",
+        "comment_placeholder":  "Анонимный комментарий (до {n} символов)",
+        "send":                 "Отправить",
+        "search_placeholder":   "Поиск по тексту...",
+        "search_button":        "Найти",
+        "sort_new":             "Новые",
+        "sort_old":             "Старые",
+        "sort_hot":             "Много комментов",
+        "sort_cold":            "Мало комментов",
+        "flt_all":              "Все",
+        "flt_with":             "С комментами",
+        "flt_without":          "Без комментов",
+        "all_posts":            "Все посты",
+        "nothing_found":        "Ничего не найдено.",
+        "empty_feed":           "Пока пусто. Напиши первым.",
+        "open_post":            "открыть пост",
+        "comments_word":        "комментариев",
+        "back_home":            "На главную",
+        "post_heading":         "Пост",
+        "comments_heading":     "Комментарии",
+        "no_comments":          "Комментариев пока нет.",
+        "copy_text":            "Скопировать текст",
+        "copied":               "Скопировано",
+        "privacy_link":         "Политика конфиденциальности",
+        "privacy_title":        "Политика конфиденциальности",
+        "posting_disabled":     "Отправка постов сейчас отключена.",
+        "page_not_found_title": "404 — не найдено",
+        "page_not_found":       "Страница не найдена",
+        "post_not_found":       "Пост не найден",
+        "no_page":              "Такой страницы на {site} нет.",
+        "error_heading":        "Ошибка",
+        "link_word":            "ссылка",
+        "privacy_p1_title":     "{site} полностью анонимная.",
+        "privacy_p1_body":      "Ни администратор сервера, ни хостинг, ни кто-либо ещё не знает, кто именно отправил тот или иной пост или комментарий. Мы не запрашиваем имя, e-mail, не ставим куки, не создаём аккаунты и не привязываем записи к человеку. Сервер не сохраняет IP-адреса посетителей, не логирует запросы и не передаёт их третьим лицам. Всё, что сохраняется — это сам текст и время отправки.",
+        "privacy_p2_title":     "При перезагрузке сервера все данные удаляются.",
+        "privacy_p2_body":      "Посты и комментарии хранятся только в оперативной памяти. После любого перезапуска или выключения сервера они исчезают безвозвратно и восстановлению не подлежат.",
+        "privacy_p3_title":     "Администратор сервера не может менять правила на своём сервере.",
+        "privacy_p3_body":      "Правила и принципы работы {site} зафиксированы и не подлежат изменению по желанию администратора или владельца хостинга. Обещанная анонимность и удаление данных при перезагрузке — неотъемлемая часть работы сервиса.",
+    },
+    "en": {
+        "post_placeholder":     "What's on your mind? (up to {n} chars)",
+        "comment_placeholder":  "Anonymous comment (up to {n} chars)",
+        "send":                 "Send",
+        "search_placeholder":   "Search text...",
+        "search_button":        "Search",
+        "sort_new":             "Newest",
+        "sort_old":             "Oldest",
+        "sort_hot":             "Most comments",
+        "sort_cold":            "Fewest comments",
+        "flt_all":              "All",
+        "flt_with":             "With comments",
+        "flt_without":          "Without comments",
+        "all_posts":            "All posts",
+        "nothing_found":        "Nothing found.",
+        "empty_feed":           "Empty for now. Be the first.",
+        "open_post":            "open post",
+        "comments_word":        "comments",
+        "back_home":            "Home",
+        "post_heading":         "Post",
+        "comments_heading":     "Comments",
+        "no_comments":          "No comments yet.",
+        "copy_text":            "Copy text",
+        "copied":               "Copied",
+        "privacy_link":         "Privacy policy",
+        "privacy_title":        "Privacy policy",
+        "posting_disabled":     "Posting is disabled right now.",
+        "page_not_found_title": "404 — not found",
+        "page_not_found":       "Page not found",
+        "post_not_found":       "Post not found",
+        "no_page":              "No such page on {site}.",
+        "error_heading":        "Error",
+        "link_word":            "link",
+        "privacy_p1_title":     "{site} is fully anonymous.",
+        "privacy_p1_body":      "Neither the server administrator, nor the hosting provider, nor anyone else knows who exactly sent a given post or comment. We do not ask for a name or e-mail, we do not set cookies, we do not create accounts, and we do not link records to a person. The server does not store visitors' IP addresses, does not log requests, and does not share them with third parties. All that is stored is the text itself and the time it was sent.",
+        "privacy_p2_title":     "All data is deleted when the server restarts.",
+        "privacy_p2_body":      "Posts and comments are kept only in RAM. After any restart or shutdown of the server they disappear forever and cannot be recovered.",
+        "privacy_p3_title":     "The server administrator cannot change the rules on their own server.",
+        "privacy_p3_body":      "The rules and principles of {site} are fixed and cannot be changed at the will of the administrator or the hosting owner. The promised anonymity and data deletion on restart are an integral part of how the service works.",
+    },
+}
+
+
+def t(lang, key, **kw):
+    table = STRINGS.get(lang) or STRINGS[LANG_DEFAULT]
+    value = table.get(key) or STRINGS[LANG_DEFAULT].get(key, key)
+    return value.format(**kw) if kw else value
+
+
+def pick_lang(lang):
+    return lang if lang in LANG_OPTIONS else LANG_DEFAULT
+
+
+def with_lang(path, lang):
+    if lang == LANG_DEFAULT:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}lang={lang}"
+
 
 if LOGO_POSITION not in ("left", "center", "right"):
     LOGO_POSITION = "left"
@@ -49,10 +149,12 @@ app = FastAPI(title=SITE_NAME)
 posts = {}
 
 
-def page(title, body, refresh=0):
+def page(title, body, lang, refresh=0):
+    lang = pick_lang(lang)
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh > 0 else ""
+    copy_label = t(lang, "copied")
     return f"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -107,10 +209,15 @@ def page(title, body, refresh=0):
     border: 1px solid #999;
     padding: 10px;
     margin-bottom: 10px;
+  }}
+  .comment {{ background: #f6f6f6; margin-left: 14px; }}
+
+  /* сохранение переводов строк и перенос длинных слов */
+  .txt {{
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
     word-wrap: break-word;
   }}
-  .comment {{ background: #f6f6f6; margin-left: 14px; }}
 
   textarea {{
     width: 100%;
@@ -180,6 +287,11 @@ def page(title, body, refresh=0):
   }}
   footer a {{ color: #555; }}
   footer a:hover {{ color: #000; }}
+  footer .lang-switch a.active {{
+    color: #000;
+    font-weight: bold;
+    text-decoration: none;
+  }}
 
   ol.privacy li {{ margin-bottom: 10px; }}
 
@@ -198,9 +310,17 @@ def page(title, body, refresh=0):
 </main>
 <footer>
   {html.escape(SITE_NAME)} &copy; {html.escape(AUTHOR)} &middot;
-  <a href="/privacy">Политика конфиденциальности</a>
+  <a href="{with_lang('/privacy', lang)}">{t(lang, 'privacy_link')}</a>
+  &middot;
+  <span class="lang-switch">
+    <a href="?lang=ru" class="{'active' if lang == 'ru' else ''}">RU</a>
+    /
+    <a href="?lang=en" class="{'active' if lang == 'en' else ''}">EN</a>
+  </span>
 </footer>
 <script>
+var COPY_LABEL = {copy_label!r};
+
 (function () {{
   document.querySelectorAll('[data-counter]').forEach(function (ta) {{
     var counter = document.getElementById(ta.dataset.counter);
@@ -228,7 +348,7 @@ def page(title, body, refresh=0):
       var text = el.textContent.trim();
       var restore = function () {{
         var old = btn.textContent;
-        btn.textContent = 'Скопировано';
+        btn.textContent = COPY_LABEL;
         setTimeout(function () {{ btn.textContent = old; }}, 1200);
       }};
       if (navigator.clipboard && navigator.clipboard.writeText) {{
@@ -258,32 +378,41 @@ def options(pairs, current):
     return "".join(out)
 
 
-def not_found(message):
+def clean_text(raw):
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text
+
+
+def not_found(message, lang):
+    lang = pick_lang(lang)
     body = f"""
-    <p><a href="/">&larr; На главную</a></p>
+    <p><a href="{with_lang('/', lang)}">&larr; {t(lang, 'back_home')}</a></p>
     <h1>404</h1>
     <div class="post">
       <p><b>{html.escape(message)}</b></p>
-      <p class="meta">Такой страницы на {html.escape(SITE_NAME)} нет.</p>
+      <p class="meta">{html.escape(t(lang, 'no_page', site=SITE_NAME))}</p>
     </div>
     """
-    return page("404 — не найдено", body)
+    return page(t(lang, "page_not_found_title"), body, lang)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def on_http_error(request: Request, exc: StarletteHTTPException):
+    lang = pick_lang(request.query_params.get("lang"))
     if exc.status_code == 404:
-        return HTMLResponse(not_found("Страница не найдена"), status_code=404)
+        return HTMLResponse(not_found(t(lang, "page_not_found"), lang), status_code=404)
     body = f"""
-    <p><a href="/">&larr; На главную</a></p>
-    <h1>Ошибка {exc.status_code}</h1>
+    <p><a href="{with_lang('/', lang)}">&larr; {t(lang, 'back_home')}</a></p>
+    <h1>{t(lang, 'error_heading')} {exc.status_code}</h1>
     <div class="post">{html.escape(str(exc.detail))}</div>
     """
-    return HTMLResponse(page(f"Ошибка {exc.status_code}", body), status_code=exc.status_code)
+    return HTMLResponse(page(f"{t(lang, 'error_heading')} {exc.status_code}", body, lang),
+                        status_code=exc.status_code)
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", sort: str = "new", flt: str = "all"):
+def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEFAULT):
+    lang = pick_lang(lang)
     q = (q or "").strip()[:MAX_SEARCH_LEN]
     if sort not in ("new", "old", "hot", "cold"):
         sort = "new"
@@ -315,24 +444,25 @@ def index(q: str = "", sort: str = "new", flt: str = "all"):
         stamp = p["created"].strftime("%d.%m.%Y %H:%M") if SHOW_TIMESTAMPS else ""
         meta_parts = []
         if stamp:
-            meta_parts.append(stamp)
-        meta_parts.append(f'<a href="/p/{p["id"]}">открыть пост</a>')
+            meta_parts.append(html.escape(stamp))
+        meta_parts.append(f'<a href="{with_lang(f"/p/{p["id"]}", lang)}">{t(lang, "open_post")}</a>')
         if ALLOW_COMMENTS:
-            meta_parts.append(f'комментариев: {len(p["comments"])}')
+            meta_parts.append(f'{t(lang, "comments_word")}: {len(p["comments"])}')
         feed.append(f"""
         <div class="post">
-          <div>{html.escape(p["text"])}</div>
+          <div class="txt">{html.escape(p["text"])}</div>
           <div class="meta">{" &middot; ".join(meta_parts)}</div>
         </div>""")
 
     if feed:
         feed_html = "".join(feed)
     elif q or flt != "all":
-        feed_html = "<p>Ничего не найдено.</p>"
+        feed_html = f"<p>{html.escape(t(lang, 'nothing_found'))}</p>"
     else:
-        feed_html = "<p>Пока пусто. Напиши первым.</p>"
+        feed_html = f"<p>{html.escape(t(lang, 'empty_feed'))}</p>"
 
     search_value = html.escape(q, quote=True)
+    lang_input = f'<input type="hidden" name="lang" value="{lang}">' if lang != LANG_DEFAULT else ""
 
     if ALLOW_POSTING:
         compose_html = f"""
@@ -340,35 +470,39 @@ def index(q: str = "", sort: str = "new", flt: str = "all"):
           <form method="post" action="/post">
             <textarea name="text" data-counter="post-count" data-btn="post-btn"
                       data-max="{MAX_POST_LEN}"
-                      placeholder="Что думаешь? (до {MAX_POST_LEN} символов)" required></textarea>
+                      placeholder="{html.escape(t(lang, 'post_placeholder', n=MAX_POST_LEN), quote=True)}"
+                      required></textarea>
             <div class="compose-row">
-              <button type="submit" id="post-btn">Отправить</button>
+              <button type="submit" id="post-btn">{html.escape(t(lang, 'send'))}</button>
               <span class="counter" id="post-count">0 / {MAX_POST_LEN}</span>
             </div>
+            {lang_input}
           </form>
         </div>"""
     else:
-        compose_html = '<div class="compose"><p class="meta">Отправка постов сейчас отключена.</p></div>'
+        compose_html = f'<div class="compose"><p class="meta">{html.escape(t(lang, "posting_disabled"))}</p></div>'
 
     if ALLOW_SEARCH:
         sort_opts = options([
-            ("new", "Новые"),
-            ("old", "Старые"),
-            ("hot", "Много комментов"),
-            ("cold", "Мало комментов"),
+            ("new", t(lang, "sort_new")),
+            ("old", t(lang, "sort_old")),
+            ("hot", t(lang, "sort_hot")),
+            ("cold", t(lang, "sort_cold")),
         ], sort)
         flt_opts = options([
-            ("all", "Все"),
-            ("with", "С комментами"),
-            ("without", "Без комментов"),
+            ("all", t(lang, "flt_all")),
+            ("with", t(lang, "flt_with")),
+            ("without", t(lang, "flt_without")),
         ], flt)
         search_html = f"""
         <form method="get" action="/" class="searchbar">
           <input type="text" name="q" value="{search_value}"
-                 placeholder="Поиск по тексту..." maxlength="{MAX_SEARCH_LEN}">
+                 placeholder="{html.escape(t(lang, 'search_placeholder'), quote=True)}"
+                 maxlength="{MAX_SEARCH_LEN}">
           <select name="sort">{sort_opts}</select>
           <select name="flt">{flt_opts}</select>
-          <button type="submit">Найти</button>
+          <button type="submit">{html.escape(t(lang, 'search_button'))}</button>
+          {lang_input}
         </form>"""
     else:
         search_html = ""
@@ -377,20 +511,21 @@ def index(q: str = "", sort: str = "new", flt: str = "all"):
     <h1>{html.escape(SITE_NAME)}</h1>
     {compose_html}
     {search_html}
-    <h2>Все посты ({len(items)})</h2>
+    <h2>{html.escape(t(lang, 'all_posts'))} ({len(items)})</h2>
     {feed_html}
     """
-    return page(SITE_NAME, body, refresh=AUTO_REFRESH_SECONDS)
+    return page(SITE_NAME, body, lang, refresh=AUTO_REFRESH_SECONDS)
 
 
 @app.post("/post")
-def create_post(text: str = Form(...)):
+def create_post(text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
+    lang = pick_lang(lang)
     if not ALLOW_POSTING:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(with_lang("/", lang), status_code=303)
 
-    text = (text or "").strip()[:MAX_POST_LEN]
+    text = clean_text(text)[:MAX_POST_LEN]
     if not text:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(with_lang("/", lang), status_code=303)
 
     while len(posts) >= MAX_POSTS:
         oldest = next(iter(posts))
@@ -403,85 +538,90 @@ def create_post(text: str = Form(...)):
         "created": datetime.now(),
         "comments": [],
     }
-    return RedirectResponse(f"/p/{pid}", status_code=303)
+    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
 
 
 @app.get("/p/{pid}", response_class=HTMLResponse)
-def view_post(pid: str):
+def view_post(pid: str, lang: str = LANG_DEFAULT):
+    lang = pick_lang(lang)
     p = posts.get(pid)
     if not p:
-        return HTMLResponse(not_found("Пост не найден"), status_code=404)
+        return HTMLResponse(not_found(t(lang, "post_not_found"), lang), status_code=404)
 
     copy_post_html = (
-        '<button type="button" class="copy-btn" data-target="post-body">Скопировать текст</button>'
+        f'<button type="button" class="copy-btn" data-target="post-body">{html.escape(t(lang, "copy_text"))}</button>'
         if SHOW_COPY_BUTTON else ""
     )
 
     stamp = p["created"].strftime("%d.%m.%Y %H:%M") if SHOW_TIMESTAMPS else ""
     meta_parts = []
     if stamp:
-        meta_parts.append(stamp)
-    meta_parts.append(f'ссылка: <code>/p/{p["id"]}</code>')
+        meta_parts.append(html.escape(stamp))
+    meta_parts.append(f'{html.escape(t(lang, "link_word"))}: <code>/p/{p["id"]}</code>')
 
     if ALLOW_COMMENTS:
         comments = []
         for c in p["comments"]:
             c_stamp = c["created"].strftime("%d.%m.%Y %H:%M") if SHOW_TIMESTAMPS else ""
             copy_html = (
-                f'<button type="button" class="copy-btn" data-target="c-{c["id"]}">Скопировать текст</button>'
+                f'<button type="button" class="copy-btn" data-target="c-{c["id"]}">{html.escape(t(lang, "copy_text"))}</button>'
                 if SHOW_COPY_BUTTON else ""
             )
             comments.append(f"""
             <div class="comment">
-              <div id="c-{c["id"]}">{html.escape(c["text"])}</div>
-              {f'<div class="meta">{c_stamp}</div>' if c_stamp else ''}
+              <div class="txt" id="c-{c["id"]}">{html.escape(c["text"])}</div>
+              {f'<div class="meta">{html.escape(c_stamp)}</div>' if c_stamp else ''}
               {copy_html}
             </div>""")
-        comments_html = "".join(comments) if comments else "<p class='meta'>Комментариев пока нет.</p>"
+        comments_html = "".join(comments) if comments else f"<p class='meta'>{html.escape(t(lang, 'no_comments'))}</p>"
 
         compose_html = f"""
         <div class="compose">
           <form method="post" action="/p/{p["id"]}/comment">
             <textarea name="text" data-counter="cmt-count" data-btn="cmt-btn"
                       data-max="{MAX_COMMENT_LEN}"
-                      placeholder="Анонимный комментарий (до {MAX_COMMENT_LEN} символов)" required></textarea>
+                      placeholder="{html.escape(t(lang, 'comment_placeholder', n=MAX_COMMENT_LEN), quote=True)}"
+                      required></textarea>
             <div class="compose-row">
-              <button type="submit" id="cmt-btn">Отправить</button>
+              <button type="submit" id="cmt-btn">{html.escape(t(lang, 'send'))}</button>
               <span class="counter" id="cmt-count">0 / {MAX_COMMENT_LEN}</span>
             </div>
+            <input type="hidden" name="lang" value="{lang}">
           </form>
         </div>"""
+        comments_block = (
+            f'<h2>{html.escape(t(lang, "comments_heading"))} ({len(p["comments"])})</h2>'
+            f'{comments_html}{compose_html}'
+        )
     else:
-        comments_html = ""
-        compose_html = ""
+        comments_block = ""
 
     body = f"""
-    <p><a href="/">&larr; На главную</a></p>
-    <h1>Пост</h1>
+    <p><a href="{with_lang('/', lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
+    <h1>{html.escape(t(lang, 'post_heading'))}</h1>
 
     <div class="post">
-      <div id="post-body">{html.escape(p["text"])}</div>
+      <div class="txt" id="post-body">{html.escape(p["text"])}</div>
       <div class="meta">{" &middot; ".join(meta_parts)}</div>
       {copy_post_html}
     </div>
 
-    {f'<h2>Комментарии ({len(p["comments"])})</h2>' if ALLOW_COMMENTS else ''}
-    {comments_html}
-    {compose_html}
+    {comments_block}
     """
-    return page(f"Пост {pid}", body)
+    return page(f"{t(lang, 'post_heading')} {pid}", body, lang)
 
 
 @app.post("/p/{pid}/comment")
-def add_comment(pid: str, text: str = Form(...)):
+def add_comment(pid: str, text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
+    lang = pick_lang(lang)
     if not ALLOW_COMMENTS:
-        return RedirectResponse(f"/p/{pid}", status_code=303)
+        return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
 
     p = posts.get(pid)
     if not p:
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(with_lang("/", lang), status_code=303)
 
-    text = (text or "").strip()[:MAX_COMMENT_LEN]
+    text = clean_text(text)[:MAX_COMMENT_LEN]
     if text:
         p["comments"].append({
             "id": uuid.uuid4().hex[:8],
@@ -491,43 +631,34 @@ def add_comment(pid: str, text: str = Form(...)):
         if len(p["comments"]) > MAX_COMMENTS_PER_POST:
             del p["comments"][:len(p["comments"]) - MAX_COMMENTS_PER_POST]
 
-    return RedirectResponse(f"/p/{pid}", status_code=303)
+    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
 
 
 @app.get("/privacy", response_class=HTMLResponse)
-def privacy():
+def privacy(lang: str = LANG_DEFAULT):
+    lang = pick_lang(lang)
     body = f"""
-    <p><a href="/">&larr; На главную</a></p>
-    <h1>Политика конфиденциальности</h1>
+    <p><a href="{with_lang('/', lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
+    <h1>{html.escape(t(lang, 'privacy_title'))}</h1>
 
     <div class="post">
       <ol class="privacy">
         <li>
-          <b>{html.escape(SITE_NAME)} полностью анонимная.</b><br>
-          Ни администратор сервера, ни хостинг, ни кто-либо ещё не знает,
-          кто именно отправил тот или иной пост или комментарий. Мы не
-          запрашиваем имя, e-mail, не ставим куки, не создаём аккаунты и
-          не привязываем записи к человеку. Сервер не сохраняет IP-адреса
-          посетителей, не логирует запросы и не передаёт их третьим лицам.
-          Всё, что сохраняется — это сам текст и время отправки.
+          <b>{html.escape(t(lang, 'privacy_p1_title', site=SITE_NAME))}</b><br>
+          {html.escape(t(lang, 'privacy_p1_body'))}
         </li>
         <li>
-          <b>При перезагрузке сервера все данные удаляются.</b><br>
-          Посты и комментарии хранятся только в оперативной памяти.
-          После любого перезапуска или выключения сервера они исчезают
-          безвозвратно и восстановлению не подлежат.
+          <b>{html.escape(t(lang, 'privacy_p2_title'))}</b><br>
+          {html.escape(t(lang, 'privacy_p2_body'))}
         </li>
         <li>
-          <b>Администратор сервера не может менять правила на своём сервере.</b><br>
-          Правила и принципы работы {html.escape(SITE_NAME)} зафиксированы и не подлежат
-          изменению по желанию администратора или владельца хостинга.
-          Обещанная анонимность и удаление данных при перезагрузке —
-          неотъемлемая часть работы сервиса.
+          <b>{html.escape(t(lang, 'privacy_p3_title'))}</b><br>
+          {html.escape(t(lang, 'privacy_p3_body', site=SITE_NAME))}
         </li>
       </ol>
     </div>
     """
-    return page("Политика конфиденциальности", body)
+    return page(t(lang, "privacy_title"), body, lang)
 
 
 if __name__ == "__main__":
