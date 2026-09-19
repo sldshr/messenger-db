@@ -1,7 +1,6 @@
 """
 SldChat — простой мессенджер на Python + FastAPI + WebSocket.
 Запуск:  python main.py
-Всё живёт в оперативной памяти процесса.
 """
 
 import asyncio
@@ -298,22 +297,26 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
 
 
 # ================== ICONS ==================
-FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<rect width="64" height="64" rx="14" fill="#3f6fa8"/>
-<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"
-      fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/>
-</svg>"""
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="14" fill="#3f6fa8"/>'
+    '<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"'
+    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/>'
+    '</svg>'
+)
 
-OG_IMAGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
-<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/>
-</linearGradient></defs>
-<rect width="1200" height="630" fill="url(#g)"/>
-<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">
-  <text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>
-  <text x="600" y="380" font-size="36" fill="#2b3a4a">Быстрый мессенджер для команд</text>
-  <text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · добавление по нику · без рекламы</text>
-</g></svg>"""
+OG_IMAGE_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/>'
+    '</linearGradient></defs>'
+    '<rect width="1200" height="630" fill="url(#g)"/>'
+    '<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">'
+    '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
+    '<text x="600" y="380" font-size="36" fill="#2b3a4a">Быстрый мессенджер для команд</text>'
+    '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · добавление по нику · без рекламы</text>'
+    '</g></svg>'
+)
 
 
 @app.get("/favicon.svg")
@@ -335,7 +338,7 @@ async def og_image():
 
 
 # ================== SHARED CSS ==================
-SHARED_CSS = r"""
+SHARED_CSS = """
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; padding: 0; }
   body {
@@ -347,7 +350,6 @@ SHARED_CSS = r"""
     animation: fadeIn 0.35s ease both;
   }
   input, textarea, .selectable { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
-
   * { scrollbar-width: none; -ms-overflow-style: none; }
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
@@ -373,7 +375,6 @@ SHARED_CSS = r"""
   .icon.xl  { width: 28px; height: 28px; stroke-width: 1.7; }
   .icon.huge{ width: 42px; height: 42px; stroke-width: 1.5; }
 
-  /* ==== Topbar ==== */
   .topbar {
     background: linear-gradient(#fbfcfd, #dce3ea);
     border-bottom: 1px solid #b7c2cd;
@@ -418,7 +419,6 @@ SHARED_CSS = r"""
   .btn-primary:hover { background: linear-gradient(#699bcd, #4577b1); box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
-  /* ==== Sections ==== */
   .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; }
   .section:nth-of-type(even) { background: #f6f8fa; }
   .section h2 { font-size: 27px; font-weight: normal; margin: 0 0 8px; color: #23374b; text-shadow: 0 1px 0 #fff; }
@@ -446,7 +446,6 @@ SHARED_CSS = r"""
   .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
   .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
 
-  /* ==== FAQ ==== */
   .faq { max-width: 760px; margin: 0 auto; }
   .faq details {
     background: #fff; border: 1px solid #cfd7df; border-radius: 5px;
@@ -479,7 +478,6 @@ SHARED_CSS = r"""
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
 
-  /* ==== Custom dropdown ==== */
   .dd { position: relative; display: inline-block; }
   .dd-toggle {
     display: inline-flex; align-items: center; gap: 8px;
@@ -518,10 +516,7 @@ SHARED_CSS = r"""
   }
   .dd-menu li:hover { background: #eef2f6; }
   .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
-  .dd-menu li.active::after {
-    content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8;
-  }
-  /* Light theme variant for in-app usage */
+  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8; }
   .dd.dd-light .dd-toggle {
     background: linear-gradient(#fbfcfd, #cfd8e0);
     border-color: #8b97a3; color: #2b3a4a;
@@ -531,32 +526,19 @@ SHARED_CSS = r"""
   .dd.dd-light .dd-toggle .icon { color: #4a5b6d; }
   .dd.dd-light .dd-toggle .dd-label { color: #5a6c80; }
   .dd.dd-light .dd-toggle .dd-value { color: #2b3a4a; }
-  .dd.dd-light .dd-menu { transform-origin: bottom left; left: 0; right: auto; }
+  .dd.dd-light .dd-menu { transform-origin: top left; left: 0; right: auto; top: calc(100% + 6px); bottom: auto; }
   .dd.dd-up .dd-menu { bottom: calc(100% + 6px); top: auto; }
-  .dd.dd-down .dd-menu { top: calc(100% + 6px); bottom: auto; transform-origin: top right; }
+  .dd.dd-down .dd-menu { top: calc(100% + 6px); bottom: auto; }
 
-  /* ==== Footer ==== */
-  footer {
-    background: #2b3a4a; color: #b8c4ce;
-    padding: 44px 0 26px; font-size: 13px;
-  }
-  footer .foot-cols {
-    display: grid;
-    grid-template-columns: 1.4fr 1fr 1fr 1fr;
-    gap: 30px;
-    margin-bottom: 30px;
-  }
+  footer { background: #2b3a4a; color: #b8c4ce; padding: 44px 0 26px; font-size: 13px; }
+  footer .foot-cols { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 30px; margin-bottom: 30px; }
   footer .foot-brand .brand-name {
     display: flex; align-items: center; gap: 8px;
-    font-size: 17px; color: #fff; font-weight: bold;
-    margin-bottom: 10px;
+    font-size: 17px; color: #fff; font-weight: bold; margin-bottom: 10px;
   }
   footer .foot-brand .brand-name span { color: #9db8d3; }
   footer .foot-brand .brand-name .icon { color: #9db8d3; width: 22px; height: 22px; }
-  footer .foot-brand p {
-    margin: 0; color: #8fa3b6; font-size: 12px; line-height: 1.6;
-    max-width: 280px;
-  }
+  footer .foot-brand p { margin: 0; color: #8fa3b6; font-size: 12px; line-height: 1.6; max-width: 280px; }
   footer .foot-col h4 {
     margin: 0 0 12px; font-size: 12px; text-transform: uppercase;
     letter-spacing: 1px; color: #8fa3b6; font-weight: bold;
@@ -565,7 +547,6 @@ SHARED_CSS = r"""
   footer .foot-col li { margin-bottom: 7px; }
   footer .foot-col a { color: #b8c4ce; font-size: 13px; transition: color 0.14s ease; }
   footer .foot-col a:hover { color: #fff; }
-
   footer .foot-controls {
     display: flex; align-items: center; justify-content: space-between;
     gap: 16px; flex-wrap: wrap;
@@ -589,7 +570,6 @@ SHARED_CSS = r"""
     animation: dotPulse 2s ease-in-out infinite;
     vertical-align: 1px;
   }
-
   footer .foot-bottom {
     padding-top: 20px;
     display: flex; align-items: center; justify-content: space-between;
@@ -599,13 +579,9 @@ SHARED_CSS = r"""
   footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   footer .foot-bottom a { color: #9db8d3; }
 
-  /* ==== Page wrappers ==== */
   .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; }
   .page-head { margin-bottom: 28px; }
-  .page-head h1 {
-    font-size: 32px; font-weight: normal; color: #23374b;
-    margin: 0 0 6px; text-shadow: 0 1px 0 #fff;
-  }
+  .page-head h1 { font-size: 32px; font-weight: normal; color: #23374b; margin: 0 0 6px; text-shadow: 0 1px 0 #fff; }
   .page-head p { margin: 0; color: #6f7c8b; font-size: 14px; }
   .page-card {
     background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
@@ -717,10 +693,9 @@ FOOTER_HTML = """
 
 <script>
 (function(){
-  /* ---------- Uptime + host ---------- */
   function fmtUp(sec){
     sec = Math.floor(sec);
-    var u = (window.__sldUnits) || {d:'д',h:'ч',m:'м',s:'с'};
+    var u = window.__sldUnits || {d:'д',h:'ч',m:'м',s:'с'};
     var d = Math.floor(sec/86400); sec %= 86400;
     var h = Math.floor(sec/3600);  sec %= 3600;
     var m = Math.floor(sec/60);    sec %= 60;
@@ -743,7 +718,6 @@ FOOTER_HTML = """
     if (d && d.ok) { started = d.started; tick(); setInterval(tick, 1000); }
   }).catch(function(){});
 
-  /* ---------- Break long server URLs at dots ---------- */
   function softenUrls(){
     document.querySelectorAll('.server-card .url').forEach(function(el){
       if (el.dataset.wbr === '1') return;
@@ -755,14 +729,12 @@ FOOTER_HTML = """
     });
   }
 
-  /* ---------- Dropdown wiring ---------- */
   function wireDropdown(root, onSelect){
     if (!root) return;
     var toggle = root.querySelector('.dd-toggle');
     var menu = root.querySelector('.dd-menu');
     var valueEl = root.querySelector('.dd-value');
     if (!toggle || !menu) return;
-
     toggle.addEventListener('click', function(e){
       e.stopPropagation();
       document.querySelectorAll('.dd.open').forEach(function(o){ if (o !== root) o.classList.remove('open'); });
@@ -794,7 +766,6 @@ FOOTER_HTML = """
     });
   }
 
-  /* публикуем API для основного скрипта страницы */
   window.SldFooter = {
     wire: wireDropdown,
     markActive: markActive,
@@ -802,7 +773,6 @@ FOOTER_HTML = """
     tick: tick
   };
 
-  /* Автоматически: мягкие переносы в адресах + клик вне закрывает */
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', softenUrls);
   } else {
@@ -821,8 +791,8 @@ HEAD_COMMON = """
 """
 
 
-# ================== I18N (общий для лендинга/privacy/support) ==================
-I18N_JS = r"""
+# ================== I18N (лендинг / privacy / support) ==================
+I18N_JS = """
 const I18N = {
   ru: {
     nav_features: "Возможности", nav_servers: "Серверы", nav_privacy: "Приватность",
@@ -907,7 +877,6 @@ const UPTIME_UNITS = {
   en: {d:'d', h:'h', m:'m', s:'s'}
 };
 
-/* ---------- общий helper ---------- */
 window.SldLang = (function(){
   function pickInitial(){
     var url = new URL(location.href);
@@ -932,7 +901,6 @@ window.SldLang = (function(){
     document.querySelectorAll('a[href]').forEach(function(a){
       var raw = a.getAttribute('href');
       if (!raw || raw.charAt(0) !== '/') return;
-      if (raw.indexOf('#') === 0) return;
       try {
         var u = new URL(raw, location.origin);
         u.searchParams.set('lang', lang);
@@ -1040,8 +1008,7 @@ __SHARED_CSS__
   .server-card .url {
     font-family: Consolas, "Courier New", monospace;
     font-size: 15px; color: #2b3a4a; font-weight: bold;
-    line-height: 1.3;
-    word-break: normal; overflow-wrap: anywhere;
+    line-height: 1.3; overflow-wrap: anywhere;
   }
   .server-card .desc { font-size: 12px; color: #7a8695; margin-top: 3px; }
   .server-card .tags { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
@@ -1141,11 +1108,11 @@ __SHARED_CSS__
     <p class="lead" data-i18n="feat_lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
     <div class="cards">
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-        <h3 data-i18n="feat_1_h">Мгновенная доставка</h3><p data-i18n="feat_1_p">Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.</p></div>
+        <h3 data-i18n="feat_1_h">Мгновенная доставка</h3><p data-i18n="feat_1_p">Сообщения летят через WebSocket — собеседник видит их за миллисекунды.</p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div>
-        <h3 data-i18n="feat_2_h">Добавление по нику</h3><p data-i18n="feat_2_p">Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.</p></div>
+        <h3 data-i18n="feat_2_h">Добавление по нику</h3><p data-i18n="feat_2_p">Никаких публичных каталогов. Ввели ник — и вы друг у друга в контактах.</p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
-        <h3 data-i18n="feat_3_h">Статус «в сети»</h3><p data-i18n="feat_3_p">Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.</p></div>
+        <h3 data-i18n="feat_3_h">Статус «в сети»</h3><p data-i18n="feat_3_p">Видите, кто онлайн прямо сейчас, а кто заходил недавно.</p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
         <h3 data-i18n="feat_4_h">На любом устройстве</h3><p data-i18n="feat_4_p">Один и тот же интерфейс на компьютере и на смартфоне.</p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
@@ -1215,12 +1182,12 @@ __SHARED_CSS__
   <div class="container">
     <h2 data-i18n="faq_h">Ответы на вопросы</h2>
     <div class="faq">
-      <details><summary data-i18n="faq_q1">Сколько стоит SldChat?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a1"></div></div></details>
-      <details><summary data-i18n="faq_q2">Сохраняются ли мои сообщения?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a2"></div></div></details>
-      <details><summary data-i18n="faq_q3">Почему я вижу только своих контактов?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a3"></div></div></details>
-      <details><summary data-i18n="faq_q4">Как удалить контакт?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a4"></div></div></details>
-      <details><summary data-i18n="faq_q5">Чем серверы отличаются друг от друга?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a5"></div></div></details>
-      <details><summary data-i18n="faq_q6">Как выйти из аккаунта?</summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a6"></div></div></details>
+      <details><summary data-i18n="faq_q1"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a1"></div></div></details>
+      <details><summary data-i18n="faq_q2"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a2"></div></div></details>
+      <details><summary data-i18n="faq_q3"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a3"></div></div></details>
+      <details><summary data-i18n="faq_q4"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a4"></div></div></details>
+      <details><summary data-i18n="faq_q5"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a5"></div></div></details>
+      <details><summary data-i18n="faq_q6"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a6"></div></div></details>
     </div>
   </div>
 </section>
@@ -1231,7 +1198,6 @@ __FOOTER__
 __I18N_JS__
 
 (function(){
-  /* FAQ аккордеон */
   document.querySelectorAll('.faq details').forEach(function(d){
     d.addEventListener('toggle', function(){
       if (d.open) {
@@ -1259,27 +1225,9 @@ __I18N_JS__
   });
   SldFooter.markActive(document.getElementById('footLangDd'), lang);
 
-  /* если пользователь вернулся назад/вперёд — применим язык из URL */
-  window.addEventListener('popstate', function(){
-    var url = new URL(location.href);
-    var q = url.searchParams.get('lang');
-    if (q && (q === 'ru' || q === 'en') && q !== lang) {
-      lang = q;
-      SldLang.setGlobalUnits(lang);
-      SldLang.applyTo(document, SldLang.I18N[lang]);
-      SldFooter.markActive(document.getElementById('footLangDd'), lang);
-    }
-  });
-
-  /* Обновим title/meta description */
-  function localizeMeta(l){
-    if (l === 'en') {
-      document.title = 'SldChat — fast messenger for teams';
-      var d = document.querySelector('meta[name=description]');
-      if (d) d.setAttribute('content','SldChat — an independent messenger: register in 5 seconds, add people by nick, instant delivery via WebSocket.');
-    }
+  if (lang === 'en') {
+    document.title = 'SldChat — fast messenger for teams';
   }
-  localizeMeta(lang);
 })();
 </script>
 </body>
@@ -1684,13 +1632,11 @@ __SHARED_CSS__
   formLogin.onsubmit = function(e) { e.preventDefault(); submitForm('/api/login', formLogin); };
   formRegister.onsubmit = function(e) { e.preventDefault(); submitForm('/api/register', formRegister); };
 
-  /* запомним язык из URL */
   (function(){
     try {
       var q = new URL(location.href).searchParams.get('lang');
       if (q === 'ru' || q === 'en') localStorage.setItem('sld_lang', q);
     } catch (e) {}
-    /* и пробросим ?lang во все внутренние ссылки */
     var lang = localStorage.getItem('sld_lang') || 'ru';
     document.querySelectorAll('a[href]').forEach(function(a){
       var raw = a.getAttribute('href');
@@ -1720,7 +1666,7 @@ def render_auth(active: str) -> str:
 
 
 # ================== CHAT ==================
-CHAT_PAGE = r"""<!DOCTYPE html>
+CHAT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -1765,24 +1711,25 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: #e9eef3;
   }
 
-  /* ===== Custom dropdown (light variant) ===== */
+  /* ===== Dropdown ===== */
   .dd { position: relative; display: inline-block; }
   .dd-toggle {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 6px 10px; border-radius: 4px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 9px; border-radius: 4px;
     border: 1px solid #b5bec8; cursor: pointer;
     background: linear-gradient(#fbfcfd, #dce3ea);
     font-family: inherit; font-size: 12px; color: #3a5169;
     text-shadow: 0 1px 0 #fff;
-    transition: background 0.15s ease, transform 0.1s ease;
+    transition: background 0.15s ease;
   }
   .dd-toggle:hover { background: linear-gradient(#fff, #dbe3ea); }
-  .dd-toggle .icon { width: 14px; height: 14px; transition: transform 0.22s ease; }
-  .dd.open .dd-toggle .icon { transform: rotate(180deg); }
+  .dd-toggle .icon { width: 13px; height: 13px; }
+  .dd-toggle .icon.chev { transition: transform 0.22s ease; }
+  .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
   .dd-toggle .dd-value { font-weight: bold; }
 
   .dd-menu {
-    position: absolute; top: calc(100% + 6px); right: 0; left: auto;
+    position: absolute; top: calc(100% + 6px); left: 0;
     min-width: 160px;
     background: #fff;
     border: 1px solid #b7c2cd; border-radius: 6px;
@@ -1790,7 +1737,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     padding: 5px; margin: 0; list-style: none;
     opacity: 0; visibility: hidden;
     transform: translateY(-6px) scale(0.97);
-    transform-origin: top right;
+    transform-origin: top left;
     transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
     z-index: 200;
   }
@@ -1839,11 +1786,11 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     padding: 4px 7px; cursor: pointer; line-height: 1;
     color: #3a5169;
     display: inline-flex; align-items: center; justify-content: center;
-    transition: transform 0.12s ease, background 0.15s ease, box-shadow 0.15s ease;
+    transition: transform 0.12s ease, background 0.15s ease;
     font-family: inherit;
   }
   .icon-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); }
-  .icon-btn:active { transform: translateY(0) scale(0.94); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
+  .icon-btn:active { transform: translateY(0) scale(0.94); }
 
   .add-wrap { padding: 8px 9px; border-bottom: 1px solid #dbe1e7; }
   .add-btn {
@@ -1853,9 +1800,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: linear-gradient(#fbfcfd, #cfd8e0);
     font-family: inherit; font-size: 12px; color: #2b3a4a;
     cursor: pointer; text-shadow: 0 1px 0 #fff;
-    transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
+    transition: transform 0.1s ease, background 0.15s ease;
   }
-  .add-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
+  .add-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); }
   .add-btn:active { transform: translateY(0) scale(0.98); }
 
   .add-form { display: none; gap: 6px; margin-top: 6px; }
@@ -1979,6 +1926,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     float: right; margin-top: 4px;
   }
 
+  /* ===== Input area ===== */
   .input-area {
     border-top: 1px solid #c8d1da; padding: 8px 10px;
     background: #eef2f6;
@@ -1987,23 +1935,29 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .input-area textarea {
     flex: 1; resize: none;
     padding: 8px 12px; font-family: inherit; font-size: 13px;
-    border: 1px solid #b5bec8; border-radius: 16px;
+    border: 1px solid #b5bec8; border-radius: 18px;
     background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
-    max-height: 120px; min-height: 34px; line-height: 1.4;
+    max-height: 120px; min-height: 36px; line-height: 1.4;
+    height: 36px;
   }
   .input-area textarea:focus { border-color: #5a7a9a; }
   .input-area button {
-    padding: 8px 16px; border-radius: 16px;
+    height: 36px;
+    padding: 0 18px;
+    border-radius: 18px;
     border: 1px solid #35597f; cursor: pointer;
     background: linear-gradient(#5b8fc4, #3f6fa8);
     color: #fff; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
-    display: flex; align-items: center; gap: 6px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     transition: transform 0.1s ease, background 0.15s ease;
+    flex-shrink: 0;
+    box-sizing: border-box;
   }
+  .input-area button .icon { width: 15px; height: 15px; }
   .input-area button:hover { background: linear-gradient(#699bcd, #4577b1); }
-  .input-area button:active { transform: scale(0.96); }
+  .input-area button:active { transform: scale(0.97); }
 
   /* ===== Info panel ===== */
   .info-panel {
@@ -2081,6 +2035,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .logo-mini .icon { width: 22px; height: 22px; }
     .sb-header .icon-btn { padding: 9px; }
     .sb-header .icon-btn .icon { width: 20px; height: 20px; }
+    .dd-toggle { padding: 8px 12px; font-size: 13px; }
 
     .me-line { padding: 8px 14px; font-size: 13px; }
 
@@ -2126,11 +2081,20 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .empty { margin-top: 40px; font-size: 14px; }
     .empty .icon.huge { width: 52px; height: 52px; }
 
-    .input-area { padding: 8px 10px; padding-bottom: calc(8px + env(safe-area-inset-bottom)); gap: 6px; align-items: flex-end; }
-    .input-area textarea { padding: 10px 14px; font-size: 15px; min-height: 42px; border-radius: 21px; max-height: 100px; }
+    .input-area {
+      padding: 8px 10px;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom));
+      gap: 6px; align-items: flex-end;
+    }
+    .input-area textarea {
+      padding: 10px 14px; font-size: 15px;
+      min-height: 44px; height: 44px;
+      border-radius: 22px; max-height: 100px;
+    }
     .input-area button {
-      width: 42px; height: 42px; padding: 0;
-      border-radius: 50%; justify-content: center; flex-shrink: 0;
+      width: 44px; height: 44px; min-height: 44px;
+      padding: 0; border-radius: 50%;
+      justify-content: center;
     }
     .input-area button .btn-label { display: none; }
     .input-area button .icon { width: 18px; height: 18px; }
@@ -2142,8 +2106,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 
     .toast-wrap { bottom: calc(16px + env(safe-area-inset-bottom)); right: 12px; left: 12px; }
     .toast { max-width: none; }
-
-    .dd-menu { left: 0; right: auto; transform-origin: top left; }
   }
 
   @media (max-width: 380px) {
@@ -2163,7 +2125,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="sb-actions">
         <div class="dd" id="chatLangDd">
-          <button class="dd-toggle" type="button" title="Язык / Language">
+          <button class="dd-toggle" type="button" title="Language">
             <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
             <span class="dd-value" id="chatLangValue">RU</span>
             <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
@@ -2173,7 +2135,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
             <li data-value="en">English</li>
           </ul>
         </div>
-        <button class="icon-btn" id="logoutBtn" title="Выйти">
+        <button class="icon-btn" id="logoutBtn" title="Logout">
           <svg class="icon" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
         </button>
       </div>
@@ -2252,8 +2214,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
-/* ==================== CHAT I18N ==================== */
-const CI18N = {
+var CI18N = {
   ru: {
     you: "Вы вошли как",
     add_contact: "Добавить контакт",
@@ -2312,7 +2273,7 @@ const CI18N = {
     msg_ph: "Type a message...",
     in_network: "Online",
     empty_pick: "Pick a contact on the left to start chatting",
-    no_contacts: "No contacts yet.<br>Press “Add contact”.",
+    no_contacts: "No contacts yet.<br>Press Add contact.",
     not_found: "Nothing found",
     no_messages: "No messages",
     you_prefix: "You: ",
@@ -2339,12 +2300,13 @@ function T(key){
   var d = CI18N[lang] || CI18N.ru;
   return d[key] != null ? d[key] : (CI18N.ru[key] || key);
 }
+
 function applyCI18n(){
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-ci18n]').forEach(function(el){
     var k = el.getAttribute('data-ci18n');
     var d = CI18N[lang] || CI18N.ru;
-    if (d[k] != null) el.textContent = d[k];
+    if (d[k] != null && el.id !== 'chatTitle') el.textContent = d[k];
   });
   document.querySelectorAll('[data-ci18n-ph]').forEach(function(el){
     var k = el.getAttribute('data-ci18n-ph');
@@ -2356,97 +2318,96 @@ function applyCI18n(){
 }
 
 /* ==================== state ==================== */
-let me = null;
-let current = null;
-const lastIds = {};
-const renderedIds = new Set();
-let usersCache = [];
-let searchQuery = '';
-let currentInfo = null;
-let ws = null;
-let wsReconnectTimer = null;
-let lastContactsSig = '';
-let lastInfoSig = '';
+var me = null;
+var current = null;
+var lastIds = {};
+var renderedIds = {};
+var usersCache = [];
+var searchQuery = '';
+var currentInfo = null;
+var ws = null;
+var wsReconnectTimer = null;
+var lastContactsSig = '';
+var lastInfoSig = '';
 
-const $ = id => document.getElementById(id);
-const app = $('app');
+function $(id){ return document.getElementById(id); }
+var app = $('app');
 
 function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  }[c]));
+  return String(s).replace(/[&<>"']/g, function(c){
+    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+  });
 }
-function pad2(n) { return String(n).padStart(2, '0'); }
-function fmtTime(ts) {
-  const d = new Date(ts * 1000);
-  return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-}
-function fmtDateTime(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts * 1000);
-  return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear();
-}
-function fmtLastSeen(ts) {
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+function fmtTime(ts){ var d = new Date(ts * 1000); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
+function fmtDateTime(ts){ if (!ts) return '—'; var d = new Date(ts * 1000); return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear(); }
+function fmtLastSeen(ts){
   if (!ts) return T('long_ago');
-  const diff = Date.now() / 1000 - ts;
+  var diff = Date.now() / 1000 - ts;
   if (diff < 60) return T('just_now');
   if (diff < 3600) return Math.floor(diff / 60) + ' ' + T('min_ago');
   if (diff < 86400) return Math.floor(diff / 3600) + ' ' + T('hour_ago');
   return fmtDateTime(ts);
 }
-function dayLabel(ts) {
-  const d = new Date(ts * 1000);
-  const today = new Date();
-  const yest = new Date(); yest.setDate(yest.getDate() - 1);
-  const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+function dayLabel(ts){
+  var d = new Date(ts * 1000);
+  var today = new Date();
+  var yest = new Date(); yest.setDate(yest.getDate() - 1);
+  var same = function(a, b){ return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); };
   if (same(d, today)) return T('today');
   if (same(d, yest)) return T('yesterday');
   return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear();
 }
-function scrollIfNearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
-function toast(msg) {
-  const el = document.createElement('div');
+function scrollIfNearBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 160; }
+function toast(msg){
+  var el = document.createElement('div');
   el.className = 'toast';
   el.textContent = msg;
   $('toastWrap').appendChild(el);
-  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 250); }, 3000);
+  setTimeout(function(){ el.classList.add('out'); setTimeout(function(){ el.remove(); }, 250); }, 3000);
 }
 
-function contactsSignature(data) {
-  let s = '';
-  for (const u of data) {
-    s += u.nick + '|' + (u.online ? 1 : 0) + '|' + (u.unread || 0) + '|' + (u.last ? u.last.id : 0) + '\n';
+function contactsSignature(data){
+  var s = '';
+  for (var i = 0; i < data.length; i++) {
+    var u = data[i];
+    s += u.nick + '|' + (u.online ? 1 : 0) + '|' + (u.unread || 0) + '|' + (u.last ? u.last.id : 0) + ';';
   }
   return s;
 }
-function infoSignature(i) {
+function infoSignature(i){
   return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0) + '|' + (i.msg_count || 0);
 }
 
 /* ==================== WS ==================== */
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+function connectWS(){
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); } catch (e) { scheduleReconnect(); return; }
-  ws.onopen = () => {
+  ws.onopen = function(){
     if (ws._pingTimer) clearInterval(ws._pingTimer);
-    ws._pingTimer = setInterval(() => { if (ws && ws.readyState === 1) { try { ws.send('ping'); } catch (e) {} } }, 25000);
+    ws._pingTimer = setInterval(function(){
+      if (ws && ws.readyState === 1) { try { ws.send('ping'); } catch (e) {} }
+    }, 25000);
   };
-  ws.onmessage = e => { let d; try { d = JSON.parse(e.data); } catch (_) { return; } handleWS(d); };
-  ws.onclose = () => { if (ws && ws._pingTimer) clearInterval(ws._pingTimer); scheduleReconnect(); };
-  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  ws.onmessage = function(e){
+    var d; try { d = JSON.parse(e.data); } catch (_) { return; }
+    handleWS(d);
+  };
+  ws.onclose = function(){ if (ws && ws._pingTimer) clearInterval(ws._pingTimer); scheduleReconnect(); };
+  ws.onerror = function(){ try { ws.close(); } catch (e) {} };
 }
-function scheduleReconnect() {
+function scheduleReconnect(){
   if (wsReconnectTimer) return;
-  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWS(); }, 1200);
+  wsReconnectTimer = setTimeout(function(){ wsReconnectTimer = null; connectWS(); }, 1200);
 }
 
-function handleWS(d) {
+function handleWS(d){
   if (d.type === 'message') {
-    const m = d.message;
-    const peer = m.from === me ? m.to : m.from;
+    var m = d.message;
+    var peer = m.from === me ? m.to : m.from;
     if (current === peer) {
-      if (!renderedIds.has(m.id)) {
-        renderedIds.add(m.id);
+      if (!renderedIds[m.id]) {
+        renderedIds[m.id] = true;
         appendMessage(m);
         lastIds[current] = Math.max(lastIds[current] || 0, m.id);
       }
@@ -2455,7 +2416,8 @@ function handleWS(d) {
     }
     loadContacts();
   } else if (d.type === 'presence') {
-    const u = usersCache.find(x => x.nick === d.nick);
+    var u;
+    for (var i = 0; i < usersCache.length; i++) if (usersCache[i].nick === d.nick) u = usersCache[i];
     if (u) { u.online = d.online; lastContactsSig = ''; renderContacts(); }
     if (current === d.nick) {
       currentInfo = Object.assign({}, currentInfo || {}, { online: d.online });
@@ -2473,59 +2435,63 @@ function handleWS(d) {
   }
 }
 
-async function init() {
-  const r = await fetch('/api/me');
+async function init(){
+  var r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
-  const d = await r.json();
+  var d = await r.json();
   me = d.nick;
   $('myNick').textContent = me;
   connectWS();
   await loadContacts();
 }
 
-async function loadContacts() {
-  const r = await fetch('/api/contacts');
+async function loadContacts(){
+  var r = await fetch('/api/contacts');
   if (!r.ok) { location.href = '/'; return; }
-  const d = await r.json();
+  var d = await r.json();
   usersCache = d.contacts || [];
-  const sig = contactsSignature(usersCache);
+  var sig = contactsSignature(usersCache);
   if (sig === lastContactsSig) return;
   lastContactsSig = sig;
   renderContacts();
 }
 
-function renderContacts() {
-  const list = $('userList');
-  const scrollTop = list.scrollTop;
+function renderContacts(){
+  var list = $('userList');
+  var scrollTop = list.scrollTop;
   list.innerHTML = '';
-  const q = searchQuery.trim().toLowerCase();
-  const filtered = q ? usersCache.filter(u => u.nick.toLowerCase().includes(q)) : usersCache;
+  var q = searchQuery.trim().toLowerCase();
+  var filtered = [];
+  for (var i = 0; i < usersCache.length; i++) {
+    if (!q || usersCache[i].nick.toLowerCase().indexOf(q) >= 0) filtered.push(usersCache[i]);
+  }
   if (!filtered.length) {
-    const e = document.createElement('div');
+    var e = document.createElement('div');
     e.className = 'empty-list';
     e.innerHTML = '<svg class="icon huge" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg><div>' + (q ? T('not_found') : T('no_contacts')) + '</div>';
     list.appendChild(e);
     list.scrollTop = scrollTop;
     return;
   }
-  for (const u of filtered) {
-    const div = document.createElement('div');
+  for (var j = 0; j < filtered.length; j++) {
+    var u = filtered[j];
+    var div = document.createElement('div');
     div.className = 'user-item' + (u.nick === current ? ' active' : '');
-    let preview = T('no_messages');
+    var preview = T('no_messages');
     if (u.last) {
-      const prefix = u.last.from === me ? T('you_prefix') : '';
+      var prefix = u.last.from === me ? T('you_prefix') : '';
       preview = prefix + u.last.text;
     }
-    const timeStr = u.last ? fmtTime(u.last.time) : '';
-    const unread = u.unread ? '<span class="badge">' + (u.unread > 99 ? '99+' : u.unread) + '</span>' : '';
+    var timeStr = u.last ? fmtTime(u.last.time) : '';
+    var unread = u.unread ? '<span class="badge">' + (u.unread > 99 ? '99+' : u.unread) + '</span>' : '';
     div.innerHTML = '<div class="row1"><div class="nick"><span class="dot' + (u.online ? ' on' : '') + '"></span>' + esc(u.nick) + '</div><div class="time">' + timeStr + unread + '</div></div><div class="preview">' + esc(preview) + '</div>';
-    div.onclick = () => openDialog(u.nick);
+    (function(nick){ div.onclick = function(){ openDialog(nick); }; })(u.nick);
     list.appendChild(div);
   }
   list.scrollTop = scrollTop;
 }
 
-async function openDialog(nick) {
+async function openDialog(nick){
   if (current === nick) {
     app.classList.remove('info-open');
     $('msgInput').focus();
@@ -2533,7 +2499,7 @@ async function openDialog(nick) {
   }
   current = nick;
   lastIds[nick] = 0;
-  renderedIds.clear();
+  renderedIds = {};
   lastInfoSig = '';
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
@@ -2546,7 +2512,7 @@ async function openDialog(nick) {
   $('msgInput').focus();
 }
 
-function resetChatToEmpty() {
+function resetChatToEmpty(){
   current = null;
   lastInfoSig = '';
   app.classList.remove('chat-open');
@@ -2562,21 +2528,22 @@ function resetChatToEmpty() {
   renderInfoEmpty();
 }
 
-async function refreshDialog() {
+async function refreshDialog(){
   if (!current) return;
-  const nick = current;
-  const since = lastIds[nick] || 0;
-  const r = await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=' + since);
+  var nick = current;
+  var since = lastIds[nick] || 0;
+  var r = await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=' + since);
   if (!r.ok) return;
-  const d = await r.json();
+  var d = await r.json();
   if (!d.ok || current !== nick) return;
   if (!d.messages || !d.messages.length) return;
-  const box = $('messages');
-  const wasNearBottom = scrollIfNearBottom(box);
-  let added = false;
-  for (const m of d.messages) {
-    if (renderedIds.has(m.id)) continue;
-    renderedIds.add(m.id);
+  var box = $('messages');
+  var wasNearBottom = scrollIfNearBottom(box);
+  var added = false;
+  for (var i = 0; i < d.messages.length; i++) {
+    var m = d.messages[i];
+    if (renderedIds[m.id]) continue;
+    renderedIds[m.id] = true;
     lastIds[nick] = Math.max(lastIds[nick] || 0, m.id);
     appendMessage(m);
     added = true;
@@ -2584,47 +2551,47 @@ async function refreshDialog() {
   if (added && (wasNearBottom || !box.querySelector('.msg-row'))) box.scrollTop = box.scrollHeight;
 }
 
-function appendMessage(m) {
-  const box = $('messages');
-  const lastRow = box.querySelector('.msg-row:last-of-type');
-  const lastTs = lastRow ? parseFloat(lastRow.dataset.ts || '0') : 0;
-  const newDay = dayLabel(m.time);
+function appendMessage(m){
+  var box = $('messages');
+  var lastRow = box.querySelector('.msg-row:last-of-type');
+  var lastTs = lastRow ? parseFloat(lastRow.dataset.ts || '0') : 0;
+  var newDay = dayLabel(m.time);
   if (!lastTs || dayLabel(lastTs) !== newDay) {
-    const sep = document.createElement('div');
+    var sep = document.createElement('div');
     sep.className = 'date-sep';
     sep.innerHTML = '<span>' + esc(newDay) + '</span>';
     box.appendChild(sep);
   }
-  const row = document.createElement('div');
+  var row = document.createElement('div');
   row.className = 'msg-row' + (m.from === me ? ' mine' : '');
   row.dataset.id = m.id;
   row.dataset.ts = m.time;
   row.innerHTML = '<div class="msg-bubble">' + esc(m.text) + '<span class="msg-meta">' + fmtTime(m.time) + '</span></div>';
   box.appendChild(row);
-  const nearBottom = scrollIfNearBottom(box) || m.from === me;
+  var nearBottom = scrollIfNearBottom(box) || m.from === me;
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-async function markRead(nick) {
+async function markRead(nick){
   try { await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=0'); } catch (e) {}
   loadContacts();
 }
 
-async function send() {
+async function send(){
   if (!current) return;
-  const inp = $('msgInput');
-  const text = inp.value.trim();
+  var inp = $('msgInput');
+  var text = inp.value.trim();
   if (!text) return;
-  const fd = new FormData();
+  var fd = new FormData();
   fd.append('to', current);
   fd.append('text', text);
   inp.value = '';
-  inp.style.height = 'auto';
-  const r = await fetch('/api/send', { method: 'POST', body: fd });
-  const d = await r.json().catch(() => ({ ok:false }));
+  inp.style.height = '36px';
+  var r = await fetch('/api/send', { method: 'POST', body: fd });
+  var d = await r.json().catch(function(){ return { ok:false }; });
   if (!d.ok) { toast(d.error || 'Ошибка'); return; }
-  if (!renderedIds.has(d.message.id)) {
-    renderedIds.add(d.message.id);
+  if (!renderedIds[d.message.id]) {
+    renderedIds[d.message.id] = true;
     lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
     appendMessage(d.message);
   }
@@ -2632,7 +2599,7 @@ async function send() {
   loadInfo(current);
 }
 
-function renderInfoEmpty() {
+function renderInfoEmpty(){
   $('infoContent').innerHTML =
     '<div class="info-empty">' +
       '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
@@ -2640,18 +2607,20 @@ function renderInfoEmpty() {
     '</div>';
 }
 
-async function loadInfo(nick) {
+async function loadInfo(nick){
   if (!nick) { renderInfoEmpty(); lastInfoSig = ''; return; }
-  const r = await fetch('/api/user/' + encodeURIComponent(nick) + '/info');
+  var r = await fetch('/api/user/' + encodeURIComponent(nick) + '/info');
   if (!r.ok) return;
-  const d = await r.json();
+  var d = await r.json();
   if (!d.ok) return;
-  const i = d.info;
-  const sig = infoSignature(i);
+  var i = d.info;
+  var sig = infoSignature(i);
   if (sig === lastInfoSig) return;
   lastInfoSig = sig;
   currentInfo = { online: i.online, lastSeen: i.last_seen };
-  const status = i.online ? '<div class="status online">' + esc(T('in_network')) + '</div>' : '<div class="status">' + esc(T('was_online')) + ' ' + esc(fmtLastSeen(i.last_seen)) + '</div>';
+  var status = i.online
+    ? '<div class="status online">' + esc(T('in_network')) + '</div>'
+    : '<div class="status">' + esc(T('was_online')) + ' ' + esc(fmtLastSeen(i.last_seen)) + '</div>';
   var html =
     '<div class="info-head"><div class="name">' + esc(i.nick) + '</div>' + status + '</div>' +
     '<div class="info-row"><span class="k">' + esc(T('nick')) + '</span><span class="v">' + esc(i.nick) + '</span></div>' +
@@ -2665,16 +2634,16 @@ async function loadInfo(nick) {
   }
   $('infoContent').innerHTML = html;
   updateChatSubtitle();
-  const btn = document.getElementById('removeBtn');
-  if (btn) btn.onclick = () => removeContact(nick);
+  var btn = document.getElementById('removeBtn');
+  if (btn) btn.onclick = function(){ removeContact(nick); };
 }
 
-async function removeContact(nick) {
+async function removeContact(nick){
   if (!confirm(T('confirm_remove').replace('{nick}', nick))) return;
-  const fd = new FormData();
+  var fd = new FormData();
   fd.append('nick', nick);
-  const r = await fetch('/api/contacts/remove', { method: 'POST', body: fd });
-  const d = await r.json().catch(() => ({ ok:false }));
+  var r = await fetch('/api/contacts/remove', { method: 'POST', body: fd });
+  var d = await r.json().catch(function(){ return { ok:false }; });
   if (!d.ok) { toast(d.error || 'Ошибка'); return; }
   toast(T('removed') + nick);
   if (current === nick) resetChatToEmpty();
@@ -2682,36 +2651,35 @@ async function removeContact(nick) {
   loadContacts();
 }
 
-function updateChatSubtitle() {
-  const el = $('chatSub');
+function updateChatSubtitle(){
+  var el = $('chatSub');
   if (!current || !currentInfo) { el.textContent = ''; return; }
   if (currentInfo.online) { el.textContent = T('online'); el.classList.add('online'); }
   else { el.textContent = T('was_online') + ' ' + fmtLastSeen(currentInfo.lastSeen); el.classList.remove('online'); }
 }
 
-/* ==================== Dropdown ==================== */
-function wireDropdown(root, onSelect) {
+/* ==================== dropdown ==================== */
+function wireDropdown(root, onSelect){
   if (!root) return;
   var toggle = root.querySelector('.dd-toggle');
   var menu = root.querySelector('.dd-menu');
-  var valueEl = root.querySelector('.dd-value');
   if (!toggle || !menu) return;
   toggle.addEventListener('click', function(e){
     e.stopPropagation();
-    document.querySelectorAll('.dd.open').forEach(function(o){ if (o !== root) o.classList.remove('open'); });
+    var opened = document.querySelectorAll('.dd.open');
+    for (var i = 0; i < opened.length; i++) if (opened[i] !== root) opened[i].classList.remove('open');
     root.classList.toggle('open');
   });
   menu.querySelectorAll('li').forEach(function(li){
     li.addEventListener('click', function(){
       var v = li.dataset.value;
       root.classList.remove('open');
-      if (valueEl) valueEl.textContent = li.textContent.trim();
       if (onSelect) onSelect(v);
     });
   });
   document.addEventListener('click', function(){ root.classList.remove('open'); });
 }
-function markActive(root, val) {
+function markActive(root, val){
   if (!root) return;
   var menu = root.querySelector('.dd-menu');
   if (!menu) return;
@@ -2720,33 +2688,33 @@ function markActive(root, val) {
   });
 }
 
-/* ==================== Events ==================== */
-$('addBtn').onclick = () => {
-  const f = $('addForm');
+/* ==================== events ==================== */
+$('addBtn').onclick = function(){
+  var f = $('addForm');
   f.classList.toggle('open');
-  if (f.classList.contains('open')) setTimeout(() => $('addInput').focus(), 60);
+  if (f.classList.contains('open')) setTimeout(function(){ $('addInput').focus(); }, 60);
   $('addMsg').textContent = '';
 };
 
-$('addForm').onsubmit = async e => {
+$('addForm').onsubmit = async function(e){
   e.preventDefault();
-  const inp = $('addInput');
-  const msg = $('addMsg');
-  const nick = inp.value.trim();
+  var inp = $('addInput');
+  var msg = $('addMsg');
+  var nick = inp.value.trim();
   if (!nick) return;
   msg.className = 'add-msg';
   msg.textContent = '...';
-  const fd = new FormData();
+  var fd = new FormData();
   fd.append('nick', nick);
-  const r = await fetch('/api/contacts/add', { method: 'POST', body: fd });
-  const d = await r.json().catch(() => ({ ok:false }));
+  var r = await fetch('/api/contacts/add', { method: 'POST', body: fd });
+  var d = await r.json().catch(function(){ return { ok:false }; });
   if (d.ok) {
     msg.className = 'add-msg ok';
     msg.textContent = T('added') + nick;
     inp.value = '';
     lastContactsSig = '';
     await loadContacts();
-    setTimeout(() => { $('addForm').classList.remove('open'); $('addMsg').textContent = ''; }, 800);
+    setTimeout(function(){ $('addForm').classList.remove('open'); $('addMsg').textContent = ''; }, 800);
     openDialog(nick);
   } else {
     msg.className = 'add-msg err';
@@ -2755,25 +2723,24 @@ $('addForm').onsubmit = async e => {
 };
 
 $('sendBtn').onclick = send;
-$('msgInput').addEventListener('keydown', e => {
+$('msgInput').addEventListener('keydown', function(e){
   if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 900) { e.preventDefault(); send(); }
 });
-$('msgInput').addEventListener('input', e => {
-  const el = e.target;
-  el.style.height = 'auto';
+$('msgInput').addEventListener('input', function(e){
+  var el = e.target;
+  el.style.height = '36px';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 });
-$('logoutBtn').onclick = async () => {
+$('logoutBtn').onclick = async function(){
   if (ws) { try { ws.close(); } catch (e) {} }
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/';
 };
 $('backBtn').onclick = resetChatToEmpty;
-$('infoBtn').onclick = () => app.classList.toggle('info-open');
-$('infoCloseBtn').onclick = () => app.classList.remove('info-open');
-$('searchInput').addEventListener('input', e => { searchQuery = e.target.value; renderContacts(); });
+$('infoBtn').onclick = function(){ app.classList.toggle('info-open'); };
+$('infoCloseBtn').onclick = function(){ app.classList.remove('info-open'); };
+$('searchInput').addEventListener('input', function(e){ searchQuery = e.target.value; renderContacts(); });
 
-/* ==================== Lang switcher ==================== */
 wireDropdown($('chatLangDd'), function(v){
   lang = v;
   localStorage.setItem('sld_lang', v);
@@ -2788,20 +2755,12 @@ wireDropdown($('chatLangDd'), function(v){
   lastInfoSig = '';
   renderContacts();
   if (current) loadInfo(current);
-  if (!current) {
-    var title = $('chatTitle');
-    title.textContent = T('pick_peer');
-  }
-  // обновим тексты внутри чата
-  var empty = document.querySelector('.messages .empty div');
-  if (empty && !current) empty.textContent = T('empty_pick');
 });
 
-/* ==================== Boot ==================== */
 applyCI18n();
 markActive($('chatLangDd'), lang);
 
-setInterval(async () => {
+setInterval(async function(){
   if (ws && ws.readyState === 1) return;
   await loadContacts();
   if (current) { await refreshDialog(); await loadInfo(current); }
