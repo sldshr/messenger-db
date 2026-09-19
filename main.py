@@ -1,556 +1,609 @@
-from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.middleware.gzip import GZipMiddleware
-from starlette.exceptions import HTTPException as StarletteHTTPException
+"""
+Мессенджер на Python + FastAPI (одним файлом).
+Запуск:  python main.py     (или: uvicorn main:app --host 0.0.0.0 --port 8000)
+Всё хранится только в оперативной памяти — при перезапуске данные исчезают.
+"""
+
+import secrets
+import time
+from typing import Dict, List, Optional
+
 import uvicorn
-import uuid
-import html
-from datetime import datetime
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-# ==============================
-#           НАСТРОЙКИ
-# ==============================
+app = FastAPI(title="Мессенджер")
 
-HOST = "0.0.0.0"
-PORT = 8000
-
-SITE_NAME       = "SldChat"
-LOGO_POSITION   = "center"                    # left | center | right
-AUTHOR          = "SldShr"
-FONT_FAMILY     = "Verdana,Arial,sans-serif"
-FONT_SIZE       = 15
-MAX_WIDTH       = 640
-BG_COLOR        = "#dcdcdc"
-BOX_BG_COLOR    = "#ffffff"
-ACCENT_COLOR    = "#0000cc"
-
-MAX_POSTS              = 300
-MAX_COMMENTS_PER_POST  = 100
-MAX_POST_LEN           = 700
-MAX_COMMENT_LEN        = 500
-MAX_SEARCH_LEN         = 100
-
-ALLOW_POSTING        = True
-ALLOW_COMMENTS       = True
-ALLOW_SEARCH         = True
-SHOW_TIMESTAMPS      = True
-SHOW_COPY_BUTTON     = True
-AUTO_REFRESH_SECONDS = 0
-
-LANG_DEFAULT = "ru"
-LANG_OPTIONS = ("ru", "en")
-
-CACHE_SECONDS = 86400
-# ==============================
-
-STRINGS = {
-    "ru": {
-        "post_placeholder":     "Что думаешь? (до {n} символов)",
-        "comment_placeholder":  "Анонимный комментарий (до {n} символов)",
-        "send":                 "Отправить",
-        "search_placeholder":   "Поиск по тексту...",
-        "search_button":        "Найти",
-        "sort_new":             "Новые",
-        "sort_old":             "Старые",
-        "sort_hot":             "Много комментов",
-        "sort_cold":            "Мало комментов",
-        "flt_all":              "Все",
-        "flt_with":             "С комментами",
-        "flt_without":          "Без комментов",
-        "all_posts":            "Все посты",
-        "nothing_found":        "Ничего не найдено.",
-        "empty_feed":           "Пока пусто. Напиши первым.",
-        "open_post":            "открыть пост",
-        "comments_word":        "комментариев",
-        "back_home":            "На главную",
-        "post_heading":         "Пост",
-        "comments_heading":     "Комментарии",
-        "no_comments":          "Комментариев пока нет.",
-        "copy_text":            "Скопировать текст",
-        "copied":               "Скопировано",
-        "privacy_link":         "Политика конфиденциальности",
-        "privacy_title":        "Политика конфиденциальности",
-        "posting_disabled":     "Отправка постов сейчас отключена.",
-        "page_not_found_title": "404 — не найдено",
-        "page_not_found":       "Страница не найдена",
-        "post_not_found":       "Пост не найден",
-        "no_page":              "Такой страницы на {site} нет.",
-        "error_heading":        "Ошибка",
-        "link_word":            "ссылка",
-        "privacy_p1_title":     "{site} полностью анонимная.",
-        "privacy_p1_body":      "Ни администратор сервера, ни хостинг, ни кто-либо ещё не знает, кто именно отправил тот или иной пост или комментарий. Мы не запрашиваем имя, e-mail, не ставим куки, не создаём аккаунты и не привязываем записи к человеку. Сервер не сохраняет IP-адреса посетителей, не логирует запросы и не передаёт их третьим лицам. Всё, что сохраняется — это сам текст и время отправки.",
-        "privacy_p2_title":     "При перезагрузке сервера все данные удаляются.",
-        "privacy_p2_body":      "Посты и комментарии хранятся только в оперативной памяти. После любого перезапуска или выключения сервера они исчезают безвозвратно и восстановлению не подлежат.",
-        "privacy_p3_title":     "Администратор сервера не может менять правила на своём сервере.",
-        "privacy_p3_body":      "Правила и принципы работы {site} зафиксированы и не подлежат изменению по желанию администратора или владельца хостинга. Обещанная анонимность и удаление данных при перезагрузке — неотъемлемая часть работы сервиса.",
-    },
-    "en": {
-        "post_placeholder":     "What's on your mind? (up to {n} chars)",
-        "comment_placeholder":  "Anonymous comment (up to {n} chars)",
-        "send":                 "Send",
-        "search_placeholder":   "Search text...",
-        "search_button":        "Search",
-        "sort_new":             "Newest",
-        "sort_old":             "Oldest",
-        "sort_hot":             "Most comments",
-        "sort_cold":            "Fewest comments",
-        "flt_all":              "All",
-        "flt_with":             "With comments",
-        "flt_without":          "Without comments",
-        "all_posts":            "All posts",
-        "nothing_found":        "Nothing found.",
-        "empty_feed":           "Empty for now. Be the first.",
-        "open_post":            "open post",
-        "comments_word":        "comments",
-        "back_home":            "Home",
-        "post_heading":         "Post",
-        "comments_heading":     "Comments",
-        "no_comments":          "No comments yet.",
-        "copy_text":            "Copy text",
-        "copied":               "Copied",
-        "privacy_link":         "Privacy policy",
-        "privacy_title":        "Privacy policy",
-        "posting_disabled":     "Posting is disabled right now.",
-        "page_not_found_title": "404 — not found",
-        "page_not_found":       "Page not found",
-        "post_not_found":       "Post not found",
-        "no_page":              "No such page on {site}.",
-        "error_heading":        "Error",
-        "link_word":            "link",
-        "privacy_p1_title":     "{site} is fully anonymous.",
-        "privacy_p1_body":      "Neither the server administrator, nor the hosting provider, nor anyone else knows who exactly sent a given post or comment. We do not ask for a name or e-mail, we do not set cookies, we do not create accounts, and we do not link records to a person. The server does not store visitors' IP addresses, does not log requests, and does not share them with third parties. All that is stored is the text itself and the time it was sent.",
-        "privacy_p2_title":     "All data is deleted when the server restarts.",
-        "privacy_p2_body":      "Posts and comments are kept only in RAM. After any restart or shutdown of the server they disappear forever and cannot be recovered.",
-        "privacy_p3_title":     "The server administrator cannot change the rules on their own server.",
-        "privacy_p3_body":      "The rules and principles of {site} are fixed and cannot be changed at the will of the administrator or the hosting owner. The promised anonymity and data deletion on restart are an integral part of how the service works.",
-    },
-}
+# ================== ХРАНИЛИЩЕ (в оперативке) ==================
+users: Dict[str, dict] = {}        # nick -> {"password": str, "created": float}
+sessions: Dict[str, str] = {}      # token -> nick
+messages: List[dict] = []          # {"id", "from", "to", "text", "time"}
+_msg_id = 0
 
 
-def t(lang, key, **kw):
-    table = STRINGS.get(lang) or STRINGS[LANG_DEFAULT]
-    value = table.get(key) or STRINGS[LANG_DEFAULT].get(key, key)
-    return value.format(**kw) if kw else value
+def current_user(request: Request) -> Optional[str]:
+    token = request.cookies.get("session")
+    if not token:
+        return None
+    return sessions.get(token)
 
 
-def pick_lang(lang):
-    return lang if lang in LANG_OPTIONS else LANG_DEFAULT
+# ================== API ==================
+@app.post("/api/register")
+async def api_register(nick: str = Form(...), password: str = Form(...)):
+    nick = nick.strip()
+    if not nick or not password:
+        return JSONResponse({"ok": False, "error": "Заполните все поля"}, status_code=400)
+    if not (3 <= len(nick) <= 20):
+        return JSONResponse({"ok": False, "error": "Ник: 3–20 символов"}, status_code=400)
+    if not nick.replace("_", "").isalnum():
+        return JSONResponse({"ok": False, "error": "Только буквы, цифры и _" }, status_code=400)
+    if len(password) < 3:
+        return JSONResponse({"ok": False, "error": "Пароль: минимум 3 символа"}, status_code=400)
+    if nick in users:
+        return JSONResponse({"ok": False, "error": "Ник уже занят"}, status_code=400)
+
+    users[nick] = {"password": password, "created": time.time()}
+    return {"ok": True}
 
 
-def with_lang(path, lang):
-    if lang == LANG_DEFAULT:
-        return path
-    sep = "&" if "?" in path else "?"
-    return f"{path}{sep}lang={lang}"
+@app.post("/api/login")
+async def api_login(nick: str = Form(...), password: str = Form(...)):
+    nick = nick.strip()
+    user = users.get(nick)
+    if not user or user["password"] != password:
+        return JSONResponse({"ok": False, "error": "Неверный ник или пароль"}, status_code=400)
+
+    token = secrets.token_hex(16)
+    sessions[token] = nick
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie("session", token, httponly=True, samesite="lax")
+    return resp
 
 
-if LOGO_POSITION not in ("left", "center", "right"):
-    LOGO_POSITION = "left"
+@app.post("/api/logout")
+async def api_logout(request: Request):
+    token = request.cookies.get("session")
+    if token:
+        sessions.pop(token, None)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("session")
+    return resp
 
 
-# CSS собирается один раз при старте и отдаётся отдельным файлом.
-# Минифицирован вручную — без переносов и лишних пробелов.
-STYLE_CSS = (
-    "*{box-sizing:border-box;scrollbar-width:none;-ms-overflow-style:none}"
-    "*::-webkit-scrollbar{width:0;height:0;display:none}"
-    "html,body{height:100%}"
-    f"body{{font-family:{FONT_FAMILY};background:{BG_COLOR};color:#000;"
-    f"max-width:{MAX_WIDTH}px;margin:0 auto;padding:10px;font-size:{FONT_SIZE}px;"
-    "display:flex;flex-direction:column;min-height:100vh;"
-    "user-select:none;-webkit-user-select:none}"
-    "input,textarea{user-select:text;-webkit-user-select:text}"
-    f"h1{{font-size:20px;margin:10px 0;text-align:{LOGO_POSITION}}}"
-    "h2{font-size:17px;margin:14px 0 8px}"
-    f"a{{color:{ACCENT_COLOR}}}"
-    "a:hover{color:#c00}"
-    f".post,.comment,.compose{{background:{BOX_BG_COLOR};border:1px solid #999;"
-    "padding:10px;margin-bottom:10px}"
-    ".comment{background:#f6f6f6;margin-left:14px}"
-    ".txt{white-space:pre-wrap;overflow-wrap:anywhere;word-wrap:break-word}"
-    "textarea{width:100%;padding:8px;font-size:inherit;font-family:inherit;"
-    "border:1px solid #888;background:#fff;min-height:90px;max-height:260px;"
-    "resize:vertical;overflow:auto}"
-    ".compose-row{display:flex;align-items:center;justify-content:space-between;"
-    "gap:10px;margin-top:8px;flex-wrap:wrap}"
-    ".compose-row .counter{margin-left:auto}"
-    "button{padding:8px 16px;font-size:inherit;font-family:inherit;background:#eee;"
-    "color:#000;border:1px solid #666;cursor:pointer}"
-    "button:hover:enabled{background:#ccc}"
-    "button:disabled{opacity:.5;cursor:not-allowed}"
-    ".counter{color:#666;font-size:13px}"
-    ".counter.over{color:#c00;font-weight:bold}"
-    ".searchbar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}"
-    ".searchbar input,.searchbar select{padding:8px;font-size:inherit;"
-    "font-family:inherit;border:1px solid #888;background:#fff}"
-    ".searchbar input[type=text]{flex:1 1 180px;min-width:0}"
-    ".meta{color:#666;font-size:12px;margin-top:8px}"
-    "hr{border:none;border-top:1px solid #999;margin:14px 0}"
-    "main{flex:1 0 auto}"
-    "footer{flex-shrink:0;margin-top:20px;padding-top:10px;"
-    "border-top:1px solid #999;color:#555;font-size:12px;text-align:center}"
-    "footer a{color:#555}"
-    "footer a:hover{color:#000}"
-    "footer .lang-switch a.active{color:#000;font-weight:bold;text-decoration:none}"
-    "ol.privacy li{margin-bottom:10px}"
-    ".copy-btn{font-size:12px;padding:4px 10px;margin-top:8px;background:#f0f0f0}"
-    ".copy-btn:hover{background:#ddd}"
-)
+@app.get("/api/me")
+async def api_me(request: Request):
+    nick = current_user(request)
+    if not nick:
+        return JSONResponse({"ok": False}, status_code=401)
+    return {"ok": True, "nick": nick}
 
 
-# JS тоже минифицирован. Язык кнопки "Скопировано" берётся из <html lang>.
-APP_JS = (
-    "var L={ru:'Скопировано',en:'Copied'};"
-    "var lang=document.documentElement.lang||'ru';"
-    "var COPY=L[lang]||L.ru;"
-    "(function(){"
-    "document.querySelectorAll('[data-counter]').forEach(function(ta){"
-    "var c=document.getElementById(ta.dataset.counter);"
-    "var b=document.getElementById(ta.dataset.btn);"
-    "var m=parseInt(ta.dataset.max,10);"
-    "function u(){var n=ta.value.length;c.textContent=n+' / '+m;"
-    "if(n>m){c.classList.add('over');b.disabled=true;}"
-    "else{c.classList.remove('over');b.disabled=false;}}"
-    "ta.addEventListener('input',u);u();});"
-    "document.querySelectorAll('.copy-btn').forEach(function(b){"
-    "b.addEventListener('click',function(){"
-    "var e=document.getElementById(b.dataset.target);if(!e)return;"
-    "var t=e.textContent.trim();"
-    "var r=function(){var o=b.textContent;b.textContent=COPY;"
-    "setTimeout(function(){b.textContent=o;},1200);};"
-    "if(navigator.clipboard&&navigator.clipboard.writeText){"
-    "navigator.clipboard.writeText(t).then(r,r);}"
-    "else{var x=document.createElement('textarea');x.value=t;"
-    "document.body.appendChild(x);x.select();"
-    "try{document.execCommand('copy');}catch(_){}"
-    "document.body.removeChild(x);r();}});});})();"
-)
+@app.get("/api/users")
+async def api_users(request: Request):
+    me = current_user(request)
+    if not me:
+        return JSONResponse({"ok": False}, status_code=401)
+
+    result = []
+    for nick in users:
+        if nick == me:
+            continue
+        last = None
+        for m in messages:
+            if (m["from"] == nick and m["to"] == me) or (m["from"] == me and m["to"] == nick):
+                last = m
+        result.append({"nick": nick, "last": last})
+
+    # сортировка: с кем последний раз общались — наверх
+    result.sort(key=lambda u: (u["last"]["id"] if u["last"] else 0), reverse=True)
+    return {"ok": True, "users": result}
 
 
-app = FastAPI(title=SITE_NAME)
-app.add_middleware(GZipMiddleware, minimum_size=400)
-posts = {}
+@app.get("/api/dialog/{nick}")
+async def api_dialog(nick: str, request: Request, since: int = 0):
+    me = current_user(request)
+    if not me:
+        return JSONResponse({"ok": False}, status_code=401)
+
+    out = [
+        m for m in messages
+        if m["id"] > since and (
+            (m["from"] == me and m["to"] == nick) or
+            (m["from"] == nick and m["to"] == me)
+        )
+    ]
+    return {"ok": True, "messages": out}
 
 
-@app.get("/style.css")
-def style_css():
-    return Response(STYLE_CSS, media_type="text/css",
-                    headers={"Cache-Control": f"public,max-age={CACHE_SECONDS}"})
+@app.post("/api/send")
+async def api_send(request: Request, to: str = Form(...), text: str = Form(...)):
+    global _msg_id
+    me = current_user(request)
+    if not me:
+        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+
+    to = to.strip()
+    text = text.strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "Пустое сообщение"}, status_code=400)
+    if to == me:
+        return JSONResponse({"ok": False, "error": "Нельзя писать себе"}, status_code=400)
+    if to not in users:
+        return JSONResponse({"ok": False, "error": "Получатель не найден"}, status_code=404)
+
+    _msg_id += 1
+    messages.append({
+        "id": _msg_id,
+        "from": me,
+        "to": to,
+        "text": text,
+        "time": time.time(),
+    })
+    return {"ok": True, "id": _msg_id}
 
 
-@app.get("/app.js")
-def app_js():
-    return Response(APP_JS, media_type="application/javascript",
-                    headers={"Cache-Control": f"public,max-age={CACHE_SECONDS}"})
+# ================== СТРАНИЦЫ ==================
+LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Мессенджер — вход</title>
+<style>
+  html, body { margin:0; padding:0; }
+  body {
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 13px;
+    color: #333;
+    background: #c9d4de;
+    background: linear-gradient(#dde5ec, #b4c2ce);
+    min-height: 100vh;
+    padding: 60px 0;
+  }
+  .box {
+    width: 340px;
+    margin: 0 auto;
+    background: #f4f6f8;
+    border: 1px solid #8b97a3;
+    border-radius: 5px;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.25), inset 0 1px 0 #fff;
+    padding: 22px 24px 24px;
+  }
+  h1 {
+    text-align: center;
+    font-size: 22px;
+    font-weight: normal;
+    color: #3a5169;
+    margin: 0 0 18px;
+    text-shadow: 0 1px 0 #fff;
+    letter-spacing: 1px;
+  }
+  .tabs {
+    display: flex;
+    margin-bottom: 14px;
+    border-bottom: 1px solid #a8b2bc;
+  }
+  .tabs button {
+    flex: 1;
+    border: 1px solid #a8b2bc;
+    border-bottom: none;
+    background: linear-gradient(#eef1f4, #d3dae1);
+    border-radius: 4px 4px 0 0;
+    padding: 7px 0;
+    margin-right: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+    color: #445;
+  }
+  .tabs button.active {
+    background: #fff;
+    color: #223;
+    font-weight: bold;
+    position: relative;
+    top: 1px;
+  }
+  label { display: block; margin: 10px 0 4px; color: #445; }
+  input[type=text], input[type=password] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 13px;
+    border: 1px solid #9aa4ae;
+    border-radius: 3px;
+    background: #fff;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
+    outline: none;
+  }
+  input:focus { border-color: #5a7a9a; }
+  .btn {
+    display: block;
+    width: 100%;
+    margin-top: 16px;
+    padding: 8px 0;
+    border: 1px solid #7a8794;
+    border-radius: 4px;
+    background: linear-gradient(#fbfcfd, #ccd5de);
+    font-family: inherit;
+    font-size: 13px;
+    color: #2b3a4a;
+    cursor: pointer;
+    text-shadow: 0 1px 0 #fff;
+  }
+  .btn:hover { background: linear-gradient(#fff, #dbe3ea); }
+  .btn:active { background: linear-gradient(#c2ccd6, #e3e9ee); box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
+  .error {
+    min-height: 18px;
+    color: #c22;
+    margin-bottom: 4px;
+    text-align: center;
+    font-size: 12px;
+  }
+  .hint {
+    margin-top: 14px;
+    text-align: center;
+    color: #889;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>Мессенджер</h1>
+  <div class="tabs">
+    <button type="button" id="tabLogin" class="active">Вход</button>
+    <button type="button" id="tabRegister">Регистрация</button>
+  </div>
+  <div class="error" id="error"></div>
+
+  <form id="formLogin">
+    <label>Ник:</label>
+    <input type="text" name="nick" autocomplete="off" maxlength="20">
+    <label>Пароль:</label>
+    <input type="password" name="password" autocomplete="off">
+    <button type="submit" class="btn">Войти</button>
+  </form>
+
+  <form id="formRegister" style="display:none">
+    <label>Ник:</label>
+    <input type="text" name="nick" autocomplete="off" maxlength="20">
+    <label>Пароль:</label>
+    <input type="password" name="password" autocomplete="off">
+    <button type="submit" class="btn">Зарегистрироваться</button>
+  </form>
+
+  <div class="hint">Всё хранится в оперативной памяти сервера</div>
+</div>
+
+<script>
+  const tabLogin    = document.getElementById('tabLogin');
+  const tabRegister = document.getElementById('tabRegister');
+  const formLogin   = document.getElementById('formLogin');
+  const formRegister= document.getElementById('formRegister');
+  const errorBox    = document.getElementById('error');
+
+  tabLogin.onclick = () => {
+    tabLogin.classList.add('active'); tabRegister.classList.remove('active');
+    formLogin.style.display = ''; formRegister.style.display = 'none';
+    errorBox.textContent = '';
+  };
+  tabRegister.onclick = () => {
+    tabRegister.classList.add('active'); tabLogin.classList.remove('active');
+    formRegister.style.display = ''; formLogin.style.display = 'none';
+    errorBox.textContent = '';
+  };
+
+  async function submitForm(url, form) {
+    errorBox.textContent = '';
+    const fd = new FormData(form);
+    let d;
+    try {
+      const r = await fetch(url, { method: 'POST', body: fd });
+      d = await r.json();
+    } catch (e) {
+      d = {ok:false, error:'Ошибка соединения'};
+    }
+    if (d.ok) { location.href = '/chat'; return; }
+    errorBox.textContent = d.error || 'Ошибка';
+  }
+
+  formLogin.onsubmit    = e => { e.preventDefault(); submitForm('/api/login', formLogin); };
+  formRegister.onsubmit = e => { e.preventDefault(); submitForm('/api/register', formRegister); };
+</script>
+</body>
+</html>
+"""
 
 
-def page(title, body, lang, refresh=0):
-    lang = pick_lang(lang)
-    refresh_tag = f"<meta http-equiv=refresh content={refresh}>" if refresh > 0 else ""
-    a_ru = " class=active" if lang == "ru" else ""
-    a_en = " class=active" if lang == "en" else ""
-    return (
-        f"<!doctype html><html lang={lang}><head>"
-        "<meta charset=utf-8>"
-        '<meta name=viewport content="width=device-width,initial-scale=1">'
-        f"{refresh_tag}"
-        f"<title>{html.escape(title)}</title>"
-        "<link rel=stylesheet href=/style.css>"
-        "</head><body><main>"
-        f"{body}"
-        "</main><footer>"
-        f"{html.escape(SITE_NAME)} &copy; {html.escape(AUTHOR)} &middot; "
-        f'<a href="{with_lang("/privacy", lang)}">{html.escape(t(lang, "privacy_link"))}</a>'
-        " &middot; "
-        f'<span class=lang-switch><a href="?lang=ru"{a_ru}>RU</a>/'
-        f'<a href="?lang=en"{a_en}>EN</a></span>'
-        "</footer>"
-        "<script src=/app.js></script>"
-        "</body></html>"
-    )
+CHAT_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Мессенджер</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; }
+  body {
+    font-family: Tahoma, Arial, sans-serif;
+    font-size: 13px;
+    color: #333;
+    background: #b8c4ce;
+    background: linear-gradient(#cfd9e2, #a8b6c2);
+    padding: 10px;
+    box-sizing: border-box;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .app {
+    display: flex;
+    height: 100%;
+    background: #f4f6f8;
+    border: 1px solid #8b97a3;
+    border-radius: 5px;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.25);
+    overflow: hidden;
+  }
+  .sidebar {
+    width: 230px; min-width: 230px;
+    background: #e9eef2;
+    border-right: 1px solid #b0bac4;
+    display: flex; flex-direction: column;
+  }
+  .me {
+    padding: 9px 10px;
+    background: linear-gradient(#fbfcfd, #d6dee5);
+    border-bottom: 1px solid #b0bac4;
+    color: #2b3a4a;
+    display: flex; justify-content: space-between; align-items: center;
+    text-shadow: 0 1px 0 #fff;
+  }
+  .logout {
+    color: #52708c; cursor: pointer; text-decoration: underline;
+    font-size: 12px; text-shadow: none;
+  }
+  .logout:hover { color: #2b3a4a; }
+  .user-list { flex: 1; overflow-y: auto; }
+  .user-item {
+    padding: 7px 10px;
+    border-bottom: 1px solid #d3dae0;
+    cursor: pointer;
+    background: #eef2f5;
+  }
+  .user-item:hover  { background: #e0e8ef; }
+  .user-item.active { background: #c6d4e2; }
+  .user-item .nick  { color: #2b3a4a; font-weight: bold; }
+  .user-item .preview {
+    color: #7a8695; font-size: 11px; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .chat-header {
+    padding: 9px 12px;
+    background: linear-gradient(#fbfcfd, #d6dee5);
+    border-bottom: 1px solid #b0bac4;
+    color: #2b3a4a; font-weight: bold; text-shadow: 0 1px 0 #fff;
+  }
+  .messages {
+    flex: 1; overflow-y: auto;
+    padding: 10px 12px;
+    background: #fff;
+  }
+  .empty { color: #a2aab3; text-align: center; margin-top: 40px; font-style: italic; }
+  .msg { margin-bottom: 8px; line-height: 1.35; word-wrap: break-word; }
+  .msg .head { color: #7a8695; font-size: 11px; }
+  .msg .author { font-weight: bold; color: #3a5169; }
+  .msg.mine .author { color: #2f6b34; }
+  .msg .text { color: #222; white-space: pre-wrap; }
+  .input-area {
+    border-top: 1px solid #b0bac4;
+    padding: 8px;
+    background: #e9eef2;
+    display: flex; gap: 6px;
+  }
+  .input-area input[type=text] {
+    flex: 1;
+    padding: 7px 9px;
+    font-family: inherit; font-size: 13px;
+    border: 1px solid #9aa4ae; border-radius: 3px;
+    background: #fff;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
+    outline: none;
+  }
+  .input-area input[type=text]:focus { border-color: #5a7a9a; }
+  .input-area button {
+    padding: 0 18px;
+    border: 1px solid #7a8794; border-radius: 4px;
+    background: linear-gradient(#fbfcfd, #ccd5de);
+    font-family: inherit; font-size: 13px;
+    color: #2b3a4a; cursor: pointer; text-shadow: 0 1px 0 #fff;
+  }
+  .input-area button:hover  { background: linear-gradient(#fff, #dbe3ea); }
+  .input-area button:active { background: linear-gradient(#c2ccd6, #e3e9ee); box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="me">
+      <span>Вы: <b id="myNick">…</b></span>
+      <span class="logout" id="logout">Выйти</span>
+    </div>
+    <div class="user-list" id="userList"></div>
+  </div>
+  <div class="chat">
+    <div class="chat-header" id="chatHeader">Выберите собеседника</div>
+    <div class="messages" id="messages">
+      <div class="empty">Слева выберите пользователя, чтобы начать переписку</div>
+    </div>
+    <div class="input-area" id="inputArea" style="display:none">
+      <input type="text" id="msgInput" placeholder="Сообщение..." autocomplete="off" maxlength="1000">
+      <button id="sendBtn">Отправить</button>
+    </div>
+  </div>
+</div>
 
+<script>
+  let me = null;
+  let current = null;
+  const lastIds = {};
+  let polling = false;
 
-def options(pairs, current):
-    out = []
-    for value, label in pairs:
-        sel = " selected" if value == current else ""
-        out.append(f"<option value={value}{sel}>{html.escape(label)}</option>")
-    return "".join(out)
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+  function fmtTime(t) {
+    const d = new Date(t * 1000);
+    return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  }
+  function renderMessage(m) {
+    const el = document.createElement('div');
+    el.className = 'msg' + (m.from === me ? ' mine' : '');
+    el.innerHTML =
+      '<div class="head"><span class="author">' + esc(m.from) + '</span> · ' + fmtTime(m.time) + '</div>' +
+      '<div class="text">' + esc(m.text) + '</div>';
+    return el;
+  }
 
+  async function init() {
+    const r = await fetch('/api/me');
+    if (!r.ok) { location.href = '/'; return; }
+    const d = await r.json();
+    me = d.nick;
+    document.getElementById('myNick').textContent = me;
+    await loadUsers();
+  }
 
-def clean_text(raw):
-    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return text
+  async function loadUsers() {
+    const r = await fetch('/api/users');
+    if (!r.ok) { location.href = '/'; return; }
+    const d = await r.json();
+    const list = document.getElementById('userList');
+    list.innerHTML = '';
 
+    if (!d.users.length) {
+      const e = document.createElement('div');
+      e.style.padding = '10px';
+      e.style.color = '#889';
+      e.style.fontSize = '12px';
+      e.textContent = 'Других пользователей нет';
+      list.appendChild(e);
+      return;
+    }
+    for (const u of d.users) {
+      const div = document.createElement('div');
+      div.className = 'user-item' + (u.nick === current ? ' active' : '');
+      const prev = u.last ? ((u.last.from === me ? 'Вы: ' : '') + u.last.text) : 'Нет сообщений';
+      div.innerHTML =
+        '<div class="nick">' + esc(u.nick) + '</div>' +
+        '<div class="preview">' + esc(prev) + '</div>';
+      div.onclick = () => openDialog(u.nick);
+      list.appendChild(div);
+    }
+  }
 
-def not_found(message, lang):
-    lang = pick_lang(lang)
-    body = (
-        f'<p><a href="{with_lang("/", lang)}">&larr; {html.escape(t(lang, "back_home"))}</a></p>'
-        "<h1>404</h1>"
-        '<div class=post>'
-        f"<p><b>{html.escape(message)}</b></p>"
-        f'<p class=meta>{html.escape(t(lang, "no_page", site=SITE_NAME))}</p>'
-        "</div>"
-    )
-    return page(t(lang, "page_not_found_title"), body, lang)
+  async function openDialog(nick) {
+    current = nick;
+    lastIds[nick] = 0;
+    document.getElementById('chatHeader').textContent = 'Диалог с ' + nick;
+    const box = document.getElementById('messages');
+    box.innerHTML = '';
+    document.getElementById('inputArea').style.display = 'flex';
+    document.getElementById('msgInput').focus();
 
+    const r = await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=0');
+    if (r.ok) {
+      const d = await r.json();
+      if (d.ok && current === nick) {
+        box.innerHTML = '';
+        for (const m of d.messages) {
+          box.appendChild(renderMessage(m));
+          lastIds[nick] = m.id;
+        }
+        box.scrollTop = box.scrollHeight;
+      }
+    }
+    await loadUsers();
+  }
 
-@app.exception_handler(StarletteHTTPException)
-async def on_http_error(request: Request, exc: StarletteHTTPException):
-    lang = pick_lang(request.query_params.get("lang"))
-    if exc.status_code == 404:
-        return HTMLResponse(not_found(t(lang, "page_not_found"), lang), status_code=404)
-    body = (
-        f'<p><a href="{with_lang("/", lang)}">&larr; {html.escape(t(lang, "back_home"))}</a></p>'
-        f'<h1>{html.escape(t(lang, "error_heading"))} {exc.status_code}</h1>'
-        f'<div class=post>{html.escape(str(exc.detail))}</div>'
-    )
-    return HTMLResponse(
-        page(f"{t(lang, 'error_heading')} {exc.status_code}", body, lang),
-        status_code=exc.status_code,
-    )
+  async function pollMessages() {
+    if (!current || polling) return;
+    polling = true;
+    const nick = current;
+    const since = lastIds[nick] || 0;
+    try {
+      const r = await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=' + since);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.ok || current !== nick) return;
+      const box = document.getElementById('messages');
+      let added = false;
+      for (const m of d.messages) {
+        box.appendChild(renderMessage(m));
+        lastIds[nick] = m.id;
+        added = true;
+      }
+      if (added) box.scrollTop = box.scrollHeight;
+    } finally {
+      polling = false;
+    }
+  }
+
+  async function send() {
+    if (!current) return;
+    const inp = document.getElementById('msgInput');
+    const text = inp.value.trim();
+    if (!text) return;
+
+    const fd = new FormData();
+    fd.append('to', current);
+    fd.append('text', text);
+
+    const r = await fetch('/api/send', { method: 'POST', body: fd });
+    const d = await r.json().catch(() => ({ok:false}));
+    if (d.ok) {
+      inp.value = '';
+      await pollMessages();
+      await loadUsers();
+    } else {
+      alert(d.error || 'Ошибка');
+    }
+  }
+
+  document.getElementById('sendBtn').onclick = send;
+  document.getElementById('msgInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+  document.getElementById('logout').onclick = async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    location.href = '/';
+  };
+
+  setInterval(pollMessages, 1500);
+  setInterval(loadUsers,    4000);
+
+  init();
+</script>
+</body>
+</html>
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEFAULT):
-    lang = pick_lang(lang)
-    q = (q or "").strip()[:MAX_SEARCH_LEN]
-    if sort not in ("new", "old", "hot", "cold"):
-        sort = "new"
-    if flt not in ("all", "with", "without"):
-        flt = "all"
-
-    items = list(posts.values())
-    if q:
-        needle = q.lower()
-        items = [p for p in items if needle in p["text"].lower()]
-    if flt == "with":
-        items = [p for p in items if p["comments"]]
-    elif flt == "without":
-        items = [p for p in items if not p["comments"]]
-
-    if sort == "new":
-        items.sort(key=lambda p: p["created"], reverse=True)
-    elif sort == "old":
-        items.sort(key=lambda p: p["created"])
-    elif sort == "hot":
-        items.sort(key=lambda p: len(p["comments"]), reverse=True)
-    else:
-        items.sort(key=lambda p: len(p["comments"]))
-
-    feed = []
-    for p in items:
-        meta_parts = []
-        if SHOW_TIMESTAMPS:
-            meta_parts.append(html.escape(p["created"].strftime("%d.%m.%Y %H:%M")))
-        meta_parts.append(
-            f'<a href="{with_lang(f"/p/{p["id"]}", lang)}">{html.escape(t(lang, "open_post"))}</a>'
-        )
-        if ALLOW_COMMENTS:
-            meta_parts.append(f"{html.escape(t(lang, 'comments_word'))}: {len(p['comments'])}")
-        feed.append(
-            "<div class=post>"
-            f'<div class=txt>{html.escape(p["text"])}</div>'
-            f'<div class=meta>{" &middot; ".join(meta_parts)}</div>'
-            "</div>"
-        )
-
-    if feed:
-        feed_html = "".join(feed)
-    elif q or flt != "all":
-        feed_html = f"<p>{html.escape(t(lang, 'nothing_found'))}</p>"
-    else:
-        feed_html = f"<p>{html.escape(t(lang, 'empty_feed'))}</p>"
-
-    search_value = html.escape(q, quote=True)
-    lang_hidden = f'<input type=hidden name=lang value={lang}>' if lang != LANG_DEFAULT else ""
-
-    if ALLOW_POSTING:
-        compose_html = (
-            "<div class=compose>"
-            '<form method=post action=/post>'
-            f'<textarea name=text data-counter=post-count data-btn=post-btn '
-            f'data-max={MAX_POST_LEN} '
-            f'placeholder="{html.escape(t(lang, "post_placeholder", n=MAX_POST_LEN), quote=True)}" '
-            "required></textarea>"
-            "<div class=compose-row>"
-            f'<button type=submit id=post-btn>{html.escape(t(lang, "send"))}</button>'
-            f'<span class=counter id=post-count>0 / {MAX_POST_LEN}</span>'
-            "</div>"
-            f"{lang_hidden}"
-            "</form></div>"
-        )
-    else:
-        compose_html = f'<div class=compose><p class=meta>{html.escape(t(lang, "posting_disabled"))}</p></div>'
-
-    if ALLOW_SEARCH:
-        sort_opts = options([
-            ("new", t(lang, "sort_new")),
-            ("old", t(lang, "sort_old")),
-            ("hot", t(lang, "sort_hot")),
-            ("cold", t(lang, "sort_cold")),
-        ], sort)
-        flt_opts = options([
-            ("all", t(lang, "flt_all")),
-            ("with", t(lang, "flt_with")),
-            ("without", t(lang, "flt_without")),
-        ], flt)
-        search_html = (
-            '<form method=get action=/ class=searchbar>'
-            f'<input type=text name=q value="{search_value}" '
-            f'placeholder="{html.escape(t(lang, "search_placeholder"), quote=True)}" '
-            f'maxlength={MAX_SEARCH_LEN}>'
-            f"<select name=sort>{sort_opts}</select>"
-            f"<select name=flt>{flt_opts}</select>"
-            f'<button type=submit>{html.escape(t(lang, "search_button"))}</button>'
-            f"{lang_hidden}"
-            "</form>"
-        )
-    else:
-        search_html = ""
-
-    body = (
-        f"<h1>{html.escape(SITE_NAME)}</h1>"
-        f"{compose_html}"
-        f"{search_html}"
-        f"<h2>{html.escape(t(lang, 'all_posts'))} ({len(items)})</h2>"
-        f"{feed_html}"
-    )
-    return page(SITE_NAME, body, lang, refresh=AUTO_REFRESH_SECONDS)
+async def index(request: Request):
+    if current_user(request):
+        return RedirectResponse("/chat")
+    return LOGIN_PAGE
 
 
-@app.post("/post")
-def create_post(text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
-    lang = pick_lang(lang)
-    if not ALLOW_POSTING:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
-
-    text = clean_text(text)[:MAX_POST_LEN]
-    if not text:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
-
-    while len(posts) >= MAX_POSTS:
-        oldest = next(iter(posts))
-        del posts[oldest]
-
-    pid = uuid.uuid4().hex[:8]
-    posts[pid] = {"id": pid, "text": text, "created": datetime.now(), "comments": []}
-    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
-
-
-@app.get("/p/{pid}", response_class=HTMLResponse)
-def view_post(pid: str, lang: str = LANG_DEFAULT):
-    lang = pick_lang(lang)
-    p = posts.get(pid)
-    if not p:
-        return HTMLResponse(not_found(t(lang, "post_not_found"), lang), status_code=404)
-
-    copy_post = ""
-    if SHOW_COPY_BUTTON:
-        copy_post = (
-            '<button type=button class=copy-btn data-target=post-body>'
-            f'{html.escape(t(lang, "copy_text"))}</button>'
-        )
-
-    meta_parts = []
-    if SHOW_TIMESTAMPS:
-        meta_parts.append(html.escape(p["created"].strftime("%d.%m.%Y %H:%M")))
-    meta_parts.append(f'{html.escape(t(lang, "link_word"))}: <code>/p/{p["id"]}</code>')
-
-    if ALLOW_COMMENTS:
-        cmts = []
-        for c in p["comments"]:
-            c_stamp = ""
-            if SHOW_TIMESTAMPS:
-                c_stamp = f'<div class=meta>{html.escape(c["created"].strftime("%d.%m.%Y %H:%M"))}</div>'
-            c_copy = ""
-            if SHOW_COPY_BUTTON:
-                c_copy = (
-                    f'<button type=button class=copy-btn data-target=c-{c["id"]}>'
-                    f'{html.escape(t(lang, "copy_text"))}</button>'
-                )
-            cmts.append(
-                '<div class=comment>'
-                f'<div class=txt id=c-{c["id"]}>{html.escape(c["text"])}</div>'
-                f"{c_stamp}{c_copy}"
-                "</div>"
-            )
-        comments_html = "".join(cmts) if cmts else f'<p class=meta>{html.escape(t(lang, "no_comments"))}</p>'
-        comments_block = (
-            f'<h2>{html.escape(t(lang, "comments_heading"))} ({len(p["comments"])})</h2>'
-            f"{comments_html}"
-            "<div class=compose>"
-            f'<form method=post action="/p/{p["id"]}/comment">'
-            f'<textarea name=text data-counter=cmt-count data-btn=cmt-btn '
-            f'data-max={MAX_COMMENT_LEN} '
-            f'placeholder="{html.escape(t(lang, "comment_placeholder", n=MAX_COMMENT_LEN), quote=True)}" '
-            "required></textarea>"
-            "<div class=compose-row>"
-            f'<button type=submit id=cmt-btn>{html.escape(t(lang, "send"))}</button>'
-            f'<span class=counter id=cmt-count>0 / {MAX_COMMENT_LEN}</span>'
-            "</div>"
-            f'{"" if lang == LANG_DEFAULT else f"<input type=hidden name=lang value={lang}>"}'
-            "</form></div>"
-        )
-    else:
-        comments_block = ""
-
-    body = (
-        f'<p><a href="{with_lang("/", lang)}">&larr; {html.escape(t(lang, "back_home"))}</a></p>'
-        f'<h1>{html.escape(t(lang, "post_heading"))}</h1>'
-        '<div class=post>'
-        f'<div class=txt id=post-body>{html.escape(p["text"])}</div>'
-        f'<div class=meta>{" &middot; ".join(meta_parts)}</div>'
-        f"{copy_post}"
-        "</div>"
-        f"{comments_block}"
-    )
-    return page(f"{t(lang, 'post_heading')} {pid}", body, lang)
-
-
-@app.post("/p/{pid}/comment")
-def add_comment(pid: str, text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
-    lang = pick_lang(lang)
-    if not ALLOW_COMMENTS:
-        return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
-
-    p = posts.get(pid)
-    if not p:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
-
-    text = clean_text(text)[:MAX_COMMENT_LEN]
-    if text:
-        p["comments"].append({"id": uuid.uuid4().hex[:8], "text": text, "created": datetime.now()})
-        if len(p["comments"]) > MAX_COMMENTS_PER_POST:
-            del p["comments"][: len(p["comments"]) - MAX_COMMENTS_PER_POST]
-
-    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
-
-
-@app.get("/privacy", response_class=HTMLResponse)
-def privacy(lang: str = LANG_DEFAULT):
-    lang = pick_lang(lang)
-    body = (
-        f'<p><a href="{with_lang("/", lang)}">&larr; {html.escape(t(lang, "back_home"))}</a></p>'
-        f'<h1>{html.escape(t(lang, "privacy_title"))}</h1>'
-        '<div class=post><ol class=privacy>'
-        f"<li><b>{html.escape(t(lang, 'privacy_p1_title', site=SITE_NAME))}</b><br>"
-        f"{html.escape(t(lang, 'privacy_p1_body'))}</li>"
-        f"<li><b>{html.escape(t(lang, 'privacy_p2_title'))}</b><br>"
-        f"{html.escape(t(lang, 'privacy_p2_body'))}</li>"
-        f"<li><b>{html.escape(t(lang, 'privacy_p3_title'))}</b><br>"
-        f"{html.escape(t(lang, 'privacy_p3_body', site=SITE_NAME))}</li>"
-        "</ol></div>"
-    )
-    return page(t(lang, "privacy_title"), body, lang)
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page(request: Request):
+    if not current_user(request):
+        return RedirectResponse("/")
+    return CHAT_PAGE
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host=HOST,
-        port=PORT,
-        access_log=False,
-        proxy_headers=False,
-        log_level="warning",
-    )
+    # ВАЖНО: один воркер — данные в памяти процесса.
+    uvicorn.run(app, host="0.0.0.0", port=8000)
