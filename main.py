@@ -15,7 +15,7 @@ HOST = "0.0.0.0"
 PORT = 8000
 
 SITE_NAME       = "SldChat"
-LOGO_POSITION   = "left"                    # left | center | right
+LOGO_POSITION   = "left"
 AUTHOR          = "SldShrLab"
 FONT_FAMILY     = "Verdana,Arial,sans-serif"
 FONT_SIZE       = 15
@@ -130,7 +130,12 @@ STRINGS = {
 def t(lang, key, **kw):
     table = STRINGS.get(lang) or STRINGS[LANG_DEFAULT]
     value = table.get(key) or STRINGS[LANG_DEFAULT].get(key, key)
-    return value.format(**kw) if kw else value
+    if not kw:
+        return value
+    try:
+        return value.format(**kw)
+    except Exception:
+        return value
 
 
 def pick_lang(lang):
@@ -148,8 +153,6 @@ if LOGO_POSITION not in ("left", "center", "right"):
     LOGO_POSITION = "left"
 
 
-# CSS собирается один раз при старте и отдаётся отдельным файлом.
-# Минифицирован вручную — без переносов и лишних пробелов.
 STYLE_CSS = (
     "*{box-sizing:border-box;scrollbar-width:none;-ms-overflow-style:none}"
     "*::-webkit-scrollbar{width:0;height:0;display:none}"
@@ -196,8 +199,6 @@ STYLE_CSS = (
     ".copy-btn:hover{background:#ddd}"
 )
 
-
-# JS тоже минифицирован. Язык кнопки "Скопировано" берётся из <html lang>.
 APP_JS = (
     "var L={ru:'Скопировано',en:'Copied'};"
     "var lang=document.documentElement.lang||'ru';"
@@ -243,7 +244,12 @@ def app_js():
                     headers={"Cache-Control": f"public,max-age={CACHE_SECONDS}"})
 
 
-def page(title, body, lang, refresh=0):
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+
+def html_page(title, body, lang, refresh=0):
     lang = pick_lang(lang)
     refresh_tag = f"<meta http-equiv=refresh content={refresh}>" if refresh > 0 else ""
     a_ru = " class=active" if lang == "ru" else ""
@@ -278,8 +284,7 @@ def options(pairs, current):
 
 
 def clean_text(raw):
-    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return text
+    return (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def not_found(message, lang):
@@ -292,7 +297,7 @@ def not_found(message, lang):
         f'<p class=meta>{html.escape(t(lang, "no_page", site=SITE_NAME))}</p>'
         "</div>"
     )
-    return page(t(lang, "page_not_found_title"), body, lang)
+    return html_page(t(lang, "page_not_found_title"), body, lang)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -306,7 +311,7 @@ async def on_http_error(request: Request, exc: StarletteHTTPException):
         f'<div class=post>{html.escape(str(exc.detail))}</div>'
     )
     return HTMLResponse(
-        page(f"{t(lang, 'error_heading')} {exc.status_code}", body, lang),
+        html_page(f"{t(lang, 'error_heading')} {exc.status_code}", body, lang),
         status_code=exc.status_code,
     )
 
@@ -416,7 +421,7 @@ def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEF
         f"<h2>{html.escape(t(lang, 'all_posts'))} ({len(items)})</h2>"
         f"{feed_html}"
     )
-    return page(SITE_NAME, body, lang, refresh=AUTO_REFRESH_SECONDS)
+    return html_page(SITE_NAME, body, lang, refresh=AUTO_REFRESH_SECONDS)
 
 
 @app.post("/post")
@@ -505,7 +510,7 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
         "</div>"
         f"{comments_block}"
     )
-    return page(f"{t(lang, 'post_heading')} {pid}", body, lang)
+    return html_page(f"{t(lang, 'post_heading')} {pid}", body, lang)
 
 
 @app.post("/p/{pid}/comment")
@@ -542,7 +547,7 @@ def privacy(lang: str = LANG_DEFAULT):
         f"{html.escape(t(lang, 'privacy_p3_body', site=SITE_NAME))}</li>"
         "</ol></div>"
     )
-    return page(t(lang, "privacy_title"), body, lang)
+    return html_page(t(lang, "privacy_title"), body, lang)
 
 
 if __name__ == "__main__":
