@@ -1,27 +1,29 @@
 """
-SldChat — простой мессенджер на Python + FastAPI.
+SldChat — простой мессенджер на Python + FastAPI + WebSocket.
 Запуск:  python main.py     (или: uvicorn main:app --host 0.0.0.0 --port 8000)
 Всё хранится только в оперативной памяти процесса.
 """
 
+import asyncio
+import json
 import secrets
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import uvicorn
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 app = FastAPI(title="SldChat")
 
 # ================== ХРАНИЛИЩЕ (в оперативке) ==================
-users: Dict[str, dict] = {}            # nick -> {"password","created","last_seen"}
-sessions: Dict[str, str] = {}          # token -> nick
-messages: List[dict] = []              # {"id","from","to","text","time","deleted"}
-reads: Dict[str, Dict[str, int]] = {}  # reader -> peer -> last_read_msg_id
-deleted_ids: List[int] = []            # для синхронизации удалений
+users: Dict[str, dict] = {}                  # nick -> {"password","created","last_seen"}
+sessions: Dict[str, str] = {}                # token -> nick
+contacts: Dict[str, Set[str]] = {}           # nick -> {друзья}
+messages: List[dict] = []                    # {"id","from","to","text","time"}
+reads: Dict[str, Dict[str, int]] = {}        # reader -> peer -> last_read_id
+active_ws: Dict[str, Set[WebSocket]] = {}    # nick -> set(websocket)
 _msg_id = 0
-ONLINE_WINDOW = 60                     # секунд до "оффлайн"
 
 
 def current_user(request: Request) -> Optional[str]:
@@ -29,17 +31,44 @@ def current_user(request: Request) -> Optional[str]:
     return sessions.get(token) if token else None
 
 
+def is_online(nick: str) -> bool:
+    return bool(active_ws.get(nick))
+
+
 def user_public_info(nick: str) -> dict:
     u = users.get(nick)
     if not u:
         return {}
-    now = time.time()
     return {
         "nick": nick,
-        "online": (now - u.get("last_seen", 0)) < ONLINE_WINDOW,
+        "online": is_online(nick),
         "last_seen": u.get("last_seen", 0),
         "created": u.get("created", 0),
     }
+
+
+async def send_ws(nick: str, payload: dict):
+    """Мгновенно шлём JSON всем открытым WS-сессиям пользователя."""
+    socks = list(active_ws.get(nick, ()))
+    if not socks:
+        return
+    text = json.dumps(payload, ensure_ascii=False)
+    await asyncio.gather(
+        *(_safe_send(ws, text) for ws in socks),
+        return_exceptions=True,
+    )
+
+
+async def _safe_send(ws: WebSocket, text: str):
+    try:
+        await ws.send_text(text)
+    except Exception:
+        pass
+
+
+async def notify_contacts(nick: str, payload: dict):
+    for c in contacts.get(nick, set()):
+        await send_ws(c, payload)
 
 
 @app.middleware("http")
@@ -50,7 +79,42 @@ async def update_last_seen(request: Request, call_next):
     return await call_next(request)
 
 
-# ================== API ==================
+# ================== WEBSOCKET ==================
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    token = websocket.cookies.get("session")
+    nick = sessions.get(token) if token else None
+    if not nick or nick not in users:
+        await websocket.close(code=1008)
+        return
+
+    users[nick]["last_seen"] = time.time()
+    active_ws.setdefault(nick, set()).add(websocket)
+
+    # сообщаем контактам, что пользователь в сети
+    await notify_contacts(nick, {"type": "presence", "nick": nick, "online": True})
+
+    try:
+        while True:
+            # нас интересует только факт соединения; клиент присылает "ping"
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        socks = active_ws.get(nick)
+        if socks:
+            socks.discard(websocket)
+            if not socks:
+                active_ws.pop(nick, None)
+                users[nick]["last_seen"] = time.time()
+                await notify_contacts(nick, {"type": "presence", "nick": nick, "online": False})
+
+
+# ================== API: АУТЕНТИФИКАЦИЯ ==================
 @app.post("/api/register")
 async def api_register(nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
@@ -67,8 +131,8 @@ async def api_register(nick: str = Form(...), password: str = Form(...)):
 
     now = time.time()
     users[nick] = {"password": password, "created": now, "last_seen": now}
+    contacts[nick] = set()
 
-    # Автовход после регистрации
     token = secrets.token_hex(16)
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
@@ -107,38 +171,73 @@ async def api_me(request: Request):
     return {"ok": True, "nick": nick}
 
 
-@app.get("/api/users")
-async def api_users(request: Request):
+# ================== API: КОНТАКТЫ ==================
+@app.post("/api/contacts/add")
+async def api_contacts_add(request: Request, nick: str = Form(...)):
+    me = current_user(request)
+    if not me:
+        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+
+    nick = nick.strip()
+    if not nick:
+        return JSONResponse({"ok": False, "error": "Введите ник"}, status_code=400)
+    if nick == me:
+        return JSONResponse({"ok": False, "error": "Нельзя добавить себя"}, status_code=400)
+    if nick not in users:
+        return JSONResponse({"ok": False, "error": "Пользователь не найден"}, status_code=404)
+
+    contacts.setdefault(me, set())
+    contacts.setdefault(nick, set())
+
+    if nick in contacts[me]:
+        return JSONResponse({"ok": False, "error": "Уже в контактах"}, status_code=400)
+
+    # двусторонняя связь
+    contacts[me].add(nick)
+    contacts[nick].add(me)
+
+    info = user_public_info(nick)
+    # моментально уведомляем обоих
+    await asyncio.gather(
+        send_ws(nick, {"type": "contact_added", "nick": me}),
+        send_ws(me, {"type": "contact_added", "nick": nick}),
+    )
+
+    return {"ok": True, "contact": {"nick": nick, "last": None, "unread": 0,
+                                    "online": info["online"], "last_seen": info["last_seen"]}}
+
+
+@app.get("/api/contacts")
+async def api_contacts(request: Request):
     me = current_user(request)
     if not me:
         return JSONResponse({"ok": False}, status_code=401)
 
     my_reads = reads.get(me, {})
-    result = []
-    for nick in users:
-        if nick == me:
+    out = []
+    for nick in contacts.get(me, set()):
+        if nick not in users:
             continue
         last_msg = None
         unread = 0
         last_read_id = my_reads.get(nick, 0)
         for m in messages:
-            if m.get("deleted"):
-                continue
             if (m["from"] == nick and m["to"] == me) or (m["from"] == me and m["to"] == nick):
                 last_msg = m
                 if m["from"] == nick and m["to"] == me and m["id"] > last_read_id:
                     unread += 1
-        info = user_public_info(nick)
-        result.append({
+        out.append({
             "nick": nick,
             "last": last_msg,
             "unread": unread,
-            "online": info["online"],
+            "online": is_online(nick),
+            "last_seen": users[nick].get("last_seen", 0),
         })
-    result.sort(key=lambda u: (u["last"]["id"] if u["last"] else 0), reverse=True)
-    return {"ok": True, "users": result}
+    out.sort(key=lambda u: (u["last"]["id"] if u["last"] else 0), reverse=True)
+    return {"ok": True, "contacts": out}
 
 
+# ================== API: ДИАЛОГ ==================
 @app.get("/api/user/{nick}/info")
 async def api_user_info(nick: str, request: Request):
     me = current_user(request)
@@ -146,14 +245,13 @@ async def api_user_info(nick: str, request: Request):
         return JSONResponse({"ok": False}, status_code=401)
     if nick not in users:
         return JSONResponse({"ok": False, "error": "Не найден"}, status_code=404)
+
     info = user_public_info(nick)
-    info["msg_count"] = sum(
-        1 for m in messages
-        if not m.get("deleted") and (
-            (m["from"] == me and m["to"] == nick) or
-            (m["from"] == nick and m["to"] == me)
-        )
-    )
+    info["msg_count"] = sum(1 for m in messages if (
+        (m["from"] == me and m["to"] == nick) or
+        (m["from"] == nick and m["to"] == me)
+    ))
+    info["in_contacts"] = nick in contacts.get(me, set())
     return {"ok": True, "info": info}
 
 
@@ -162,14 +260,15 @@ async def api_dialog(nick: str, request: Request, since: int = 0):
     me = current_user(request)
     if not me:
         return JSONResponse({"ok": False}, status_code=401)
+    if nick not in contacts.get(me, set()):
+        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=403)
 
-    # отмечаем прочитанным
-    if nick in users:
-        max_id = reads.setdefault(me, {}).get(nick, 0)
-        for m in messages:
-            if m["from"] == nick and m["to"] == me and m["id"] > max_id:
-                max_id = m["id"]
-        reads[me][nick] = max_id
+    # помечаем прочитанным
+    max_id = reads.setdefault(me, {}).get(nick, 0)
+    for m in messages:
+        if m["from"] == nick and m["to"] == me and m["id"] > max_id:
+            max_id = m["id"]
+    reads[me][nick] = max_id
 
     out = [
         m for m in messages
@@ -178,7 +277,7 @@ async def api_dialog(nick: str, request: Request, since: int = 0):
             (m["from"] == nick and m["to"] == me)
         )
     ]
-    return {"ok": True, "messages": out, "deleted": list(deleted_ids)}
+    return {"ok": True, "messages": out}
 
 
 @app.post("/api/send")
@@ -192,38 +291,20 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     text = text.strip()
     if not text:
         return JSONResponse({"ok": False, "error": "Пустое сообщение"}, status_code=400)
-    if to == me:
-        return JSONResponse({"ok": False, "error": "Нельзя писать себе"}, status_code=400)
-    if to not in users:
-        return JSONResponse({"ok": False, "error": "Получатель не найден"}, status_code=404)
+    if to not in contacts.get(me, set()):
+        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=403)
 
     _msg_id += 1
-    messages.append({
-        "id": _msg_id,
-        "from": me,
-        "to": to,
-        "text": text,
-        "time": time.time(),
-        "deleted": False,
-    })
-    return {"ok": True, "id": _msg_id}
+    msg = {"id": _msg_id, "from": me, "to": to, "text": text, "time": time.time()}
+    messages.append(msg)
 
-
-@app.delete("/api/message/{msg_id}")
-async def api_delete_message(msg_id: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return JSONResponse({"ok": False}, status_code=401)
-    for m in messages:
-        if m["id"] == msg_id:
-            if m["from"] != me:
-                return JSONResponse({"ok": False, "error": "Не ваше сообщение"}, status_code=403)
-            m["deleted"] = True
-            m["text"] = ""
-            if msg_id not in deleted_ids:
-                deleted_ids.append(msg_id)
-            return {"ok": True}
-    return JSONResponse({"ok": False, "error": "Не найдено"}, status_code=404)
+    payload = {"type": "message", "message": msg}
+    # мгновенная доставка через WebSocket (и получателю, и нам на все вкладки)
+    await asyncio.gather(
+        send_ws(to, payload),
+        send_ws(me, payload),
+    )
+    return {"ok": True, "message": msg}
 
 
 # ================== HTML: ГЛАВНАЯ ==================
@@ -238,14 +319,25 @@ LANDING_PAGE = """<!DOCTYPE html>
   html, body { margin: 0; padding: 0; }
   body {
     font-family: Tahoma, Verdana, Arial, sans-serif;
-    font-size: 14px; color: #2b3a4a; line-height: 1.55;
+    font-size: 14px; color: #2b3a4a; line-height: 1.6;
     background: #eef2f6;
   }
   a { color: #3f6fa8; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .container { max-width: 980px; margin: 0 auto; padding: 0 20px; }
+  .container { max-width: 1000px; margin: 0 auto; padding: 0 20px; }
 
-  /* ---- Верхняя панель ---- */
+  /* SVG иконки */
+  .icon {
+    width: 16px; height: 16px; flex-shrink: 0;
+    stroke: currentColor; fill: none;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    vertical-align: -3px;
+  }
+  .icon.lg  { width: 22px; height: 22px; }
+  .icon.xl  { width: 28px; height: 28px; stroke-width: 1.7; }
+  .icon.huge{ width: 42px; height: 42px; stroke-width: 1.5; }
+
+  /* Верхняя панель */
   .topbar {
     background: linear-gradient(#fbfcfd, #dce3ea);
     border-bottom: 1px solid #b7c2cd;
@@ -253,121 +345,204 @@ LANDING_PAGE = """<!DOCTYPE html>
     position: sticky; top: 0; z-index: 50;
   }
   .topbar-inner {
-    display: flex; align-items: center; justify-content: space-between;
-    height: 54px;
+    display: flex; align-items: center; gap: 12px;
+    height: 56px;
   }
   .logo {
-    font-size: 22px; font-weight: bold; color: #2b3a4a;
-    text-shadow: 0 1px 0 #fff; letter-spacing: 1px;
+    display: flex; align-items: center; gap: 7px;
+    font-size: 21px; font-weight: bold; color: #2b3a4a;
+    text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px;
   }
   .logo span { color: #3f6fa8; }
-  .nav { display: flex; align-items: center; gap: 6px; }
+  .logo .icon { color: #3f6fa8; width: 22px; height: 22px; }
+
+  .badge-closed {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: #2b3a4a; color: #dbe5ef;
+    border-radius: 12px;
+    padding: 3px 10px 3px 8px;
+    font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase;
+    font-weight: bold; font-family: Tahoma, sans-serif;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+  }
+  .badge-closed .icon { width: 11px; height: 11px; stroke-width: 2.4; }
+
+  .nav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
   .nav a.navlink {
-    padding: 7px 10px; border-radius: 4px; color: #3a5169;
-    font-size: 13px;
+    padding: 7px 10px; border-radius: 4px; color: #3a5169; font-size: 13px;
   }
   .nav a.navlink:hover { background: #e3e9ef; text-decoration: none; }
 
   .btn {
-    display: inline-block; padding: 7px 14px; border-radius: 4px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px; border-radius: 4px;
     border: 1px solid #8b97a3; font-size: 13px; cursor: pointer;
     font-family: inherit; text-shadow: 0 1px 0 rgba(255,255,255,0.6);
-    text-decoration: none !important;
-    background: linear-gradient(#fbfcfd, #cfd8e0); color: #2b3a4a;
+    text-decoration: none !important; color: #2b3a4a;
+    background: linear-gradient(#fbfcfd, #cfd8e0);
+    white-space: nowrap;
   }
   .btn:hover { background: linear-gradient(#fff, #dbe3ea); }
   .btn-primary {
     background: linear-gradient(#5b8fc4, #3f6fa8);
-    border-color: #35597f; color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,0.2);
+    border-color: #35597f; color: #fff;
+    text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }
   .btn-primary:hover { background: linear-gradient(#699bcd, #4577b1); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
-  /* ---- Hero ---- */
+  /* Hero */
   .hero {
     background:
-      radial-gradient(circle at 20% 20%, #e3ecf5 0%, transparent 60%),
+      radial-gradient(circle at 20% 20%, #e6eef7 0%, transparent 60%),
       linear-gradient(#d5dfe9, #b8c6d3);
     border-bottom: 1px solid #a8b5c2;
-    padding: 70px 0 80px;
+    padding: 78px 0 88px;
     text-align: center;
+    position: relative;
+    overflow: hidden;
   }
+  .hero::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+    height: 1px; background: rgba(255,255,255,0.6);
+  }
+  .hero .badge-closed {
+    background: #b7c8db; color: #2b3a4a;
+    font-size: 11px; padding: 4px 12px 4px 10px;
+    box-shadow: inset 0 1px 0 #fff, 0 1px 0 rgba(0,0,0,0.05);
+    margin-bottom: 22px;
+  }
+  .hero .badge-closed .icon { width: 12px; height: 12px; }
   .hero h1 {
-    font-size: 42px; font-weight: normal; margin: 0 0 16px;
-    color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.15;
-    letter-spacing: 0.5px;
+    font-size: 46px; font-weight: normal; margin: 0 0 18px;
+    color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.1;
+    letter-spacing: 0.4px;
   }
+  .hero h1 b { color: #3f6fa8; font-weight: bold; }
   .hero p {
-    max-width: 540px; margin: 0 auto 28px; color: #4a5f74; font-size: 16px;
+    max-width: 580px; margin: 0 auto 30px;
+    color: #4a5f74; font-size: 16px;
   }
   .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
 
-  /* ---- Секции ---- */
-  .section { padding: 55px 0; border-bottom: 1px solid #dbe1e7; }
+  /* Секции */
+  .section { padding: 60px 0; border-bottom: 1px solid #dbe1e7; }
   .section:nth-child(even) { background: #f6f8fa; }
   .section h2 {
-    font-size: 26px; font-weight: normal; margin: 0 0 18px; color: #23374b;
+    font-size: 27px; font-weight: normal; margin: 0 0 8px; color: #23374b;
     text-shadow: 0 1px 0 #fff;
+  }
+  .section .lead {
+    color: #6f7c8b; font-size: 14px; margin: 0 0 26px;
   }
   .section p { margin: 0 0 12px; color: #47586c; }
 
+  /* Сетка фич */
   .cards {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
-    margin-top: 24px;
+    margin-top: 10px;
   }
   .card {
     background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
-    padding: 18px 18px 20px;
+    padding: 22px 20px 22px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
   }
-  .card h3 {
-    margin: 0 0 8px; font-size: 15px; color: #2b3a4a;
-  }
-  .card p { margin: 0; font-size: 13px; color: #5a6c80; }
   .card .ico {
-    width: 34px; height: 34px; margin-bottom: 10px;
-    border-radius: 6px;
+    width: 46px; height: 46px; margin-bottom: 14px;
+    border-radius: 8px;
     background: linear-gradient(#e4ebf2, #c8d3de);
     border: 1px solid #b7c2cd;
     display: flex; align-items: center; justify-content: center;
-    font-size: 18px; color: #3f6fa8;
+    color: #3f6fa8;
+    box-shadow: inset 0 1px 0 #fff;
   }
+  .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
+  .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
 
-  /* ---- FAQ ---- */
-  .faq { max-width: 720px; margin: 0 auto; }
+  /* Серверы */
+  .servers {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+    margin-top: 10px;
+  }
+  .server-card {
+    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
+    padding: 20px 22px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
+    display: flex; align-items: center; gap: 14px;
+  }
+  .server-card .ico {
+    width: 46px; height: 46px; border-radius: 8px;
+    background: linear-gradient(#e4ebf2, #c8d3de);
+    border: 1px solid #b7c2cd;
+    display: flex; align-items: center; justify-content: center;
+    color: #3f6fa8; flex-shrink: 0;
+    box-shadow: inset 0 1px 0 #fff;
+  }
+  .server-card .body { min-width: 0; }
+  .server-card .url {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 15px; color: #2b3a4a; font-weight: bold;
+    word-break: break-all;
+  }
+  .server-card .desc { font-size: 12px; color: #7a8695; margin-top: 3px; }
+
+  .notice {
+    margin-top: 22px;
+    background: #fff8e1; border: 1px solid #ecdc9b; border-radius: 6px;
+    padding: 14px 16px;
+    display: flex; gap: 12px; align-items: flex-start;
+    color: #6f5a13;
+  }
+  .notice .icon { color: #b8860b; flex-shrink: 0; margin-top: 2px; }
+  .notice b { color: #4f3e07; }
+
+  /* FAQ */
+  .faq { max-width: 760px; margin: 0 auto; }
   .faq details {
     background: #fff; border: 1px solid #cfd7df; border-radius: 5px;
-    margin-bottom: 10px; padding: 0;
+    margin-bottom: 10px;
     box-shadow: 0 1px 2px rgba(0,0,0,0.04);
   }
   .faq summary {
-    padding: 12px 16px; cursor: pointer; font-weight: bold; color: #2b3a4a;
+    padding: 13px 18px; cursor: pointer; font-weight: bold; color: #2b3a4a;
     outline: none; list-style: none; position: relative;
+    display: flex; align-items: center; gap: 10px;
   }
   .faq summary::-webkit-details-marker { display: none; }
   .faq summary::before {
-    content: '+'; display: inline-block; width: 18px;
-    color: #3f6fa8; font-weight: bold;
+    content: '+'; display: inline-block;
+    color: #3f6fa8; font-weight: bold; font-size: 16px;
+    width: 12px; text-align: center;
   }
   .faq details[open] summary::before { content: '−'; }
-  .faq .answer {
-    padding: 0 16px 14px 34px; color: #55677b; font-size: 13px;
-  }
+  .faq .answer { padding: 0 18px 15px 40px; color: #55677b; font-size: 13px; }
 
-  /* ---- Футер ---- */
+  /* Футер */
   footer {
-    background: #2b3a4a; color: #b8c4ce; padding: 28px 0; text-align: center;
-    font-size: 12px;
+    background: #2b3a4a; color: #b8c4ce;
+    padding: 30px 0; font-size: 12px;
+  }
+  footer .foot-inner {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px; flex-wrap: wrap;
   }
   footer a { color: #9db8d3; }
+  footer .brand {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 14px; color: #dbe5ef; font-weight: bold;
+  }
+  footer .brand .icon { color: #9db8d3; }
 
-  @media (max-width: 760px) {
+  @media (max-width: 820px) {
     .nav a.navlink { display: none; }
-    .hero { padding: 45px 0 55px; }
-    .hero h1 { font-size: 28px; }
+    .topbar-inner { gap: 8px; }
+    .badge-closed { display: none; }
+    .hero { padding: 50px 0 60px; }
+    .hero h1 { font-size: 30px; }
     .hero p { font-size: 14px; }
     .cards { grid-template-columns: 1fr; }
-    .section { padding: 35px 0; }
+    .servers { grid-template-columns: 1fr; }
+    .section { padding: 40px 0; }
     .section h2 { font-size: 22px; }
   }
 </style>
@@ -376,11 +551,19 @@ LANDING_PAGE = """<!DOCTYPE html>
 
 <header class="topbar">
   <div class="container topbar-inner">
-    <a href="/" class="logo">Sld<span>Chat</span></a>
+    <a href="/" class="logo">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+      Sld<span>Chat</span>
+    </a>
+    <span class="badge-closed">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      ClosedSource
+    </span>
     <nav class="nav">
       <a class="navlink" href="#about">О нас</a>
       <a class="navlink" href="#app">О приложении</a>
-      <a class="navlink" href="#faq">Ответы на вопросы</a>
+      <a class="navlink" href="#servers">Серверы</a>
+      <a class="navlink" href="#faq">FAQ</a>
       <a class="btn" href="/login">Войти</a>
       <a class="btn btn-primary" href="/register">Регистрация</a>
     </nav>
@@ -389,8 +572,13 @@ LANDING_PAGE = """<!DOCTYPE html>
 
 <section class="hero">
   <div class="container">
-    <h1>SldChat — простой<br>мессенджер без лишнего</h1>
-    <p>Регистрация за 5 секунд — и сразу в чат. Пишите людям по нику, а всё лишнее мы убрали.</p>
+    <span class="badge-closed">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      ClosedSource
+    </span>
+    <h1>Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
+    <p>Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику,
+    мгновенная доставка сообщений через WebSocket.</p>
     <div class="hero-actions">
       <a class="btn btn-primary btn-lg" href="/register">Создать аккаунт</a>
       <a class="btn btn-lg" href="/login">У меня уже есть аккаунт</a>
@@ -401,35 +589,77 @@ LANDING_PAGE = """<!DOCTYPE html>
 <section id="about" class="section">
   <div class="container">
     <h2>О нас</h2>
-    <p>SldChat — небольшой открытый проект, сделанный на Python и FastAPI. Мы верим, что
-    мессенджер не обязан быть перегруженным: достаточно ника, пароля и пары секунд на вход.</p>
-    <p>Проект создан энтузиастами как учебный пример и как рабочий инструмент для общения
-    внутри небольших команд и компаний друзей.</p>
+    <p class="lead">Небольшая команда энтузиастов, которой надоели перегруженные мессенджеры.</p>
+    <p>SldChat — закрытый по исходникам проект на Python и FastAPI. Мы не храним ничего лишнего
+    и не собираем ваши данные: сервер живёт в оперативной памяти, а сессии — только в cookie.</p>
+    <p>Проект создан как инструмент для общения внутри небольших команд и компаний друзей,
+    которым не нужны стикеры, реакции и «истории».</p>
   </div>
 </section>
 
 <section id="app" class="section">
   <div class="container">
     <h2>О приложении</h2>
-    <p>Клиент работает прямо в браузере — на компьютере и на телефоне. Данные хранятся
-    исключительно в оперативной памяти сервера, поэтому сразу после его остановки
-    история не сохраняется.</p>
-
+    <p class="lead">Клиент работает прямо в браузере — на компьютере и на смартфоне.</p>
     <div class="cards">
       <div class="card">
-        <div class="ico">👤</div>
-        <h3>Простой вход</h3>
-        <p>Ник и пароль. Зарегистрировался — и сразу в чат, никаких подтверждений по почте.</p>
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        </div>
+        <h3>Мгновенная доставка</h3>
+        <p>Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без всяких «обновлений».</p>
       </div>
       <div class="card">
-        <div class="ico">💬</div>
-        <h3>Личные сообщения</h3>
-        <p>Пишите любому пользователю по нику. Видите, кто онлайн, а кто давно не заходил.</p>
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+        </div>
+        <h3>Добавление по нику</h3>
+        <p>Никаких глобальных списков. Введите ник — и вы с человеком сразу друг у друга.</p>
       </div>
       <div class="card">
-        <div class="ico">📱</div>
-        <h3>Везде и всюду</h3>
-        <p>Адаптивный интерфейс: удобно и на большом мониторе, и на смартфоне.</p>
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </div>
+        <h3>Приватность</h3>
+        <p>Сообщения не сохраняются на диске. История живёт, пока жив сервер, — и только в памяти.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="servers" class="section">
+  <div class="container">
+    <h2>Серверы SldChat</h2>
+    <p class="lead">Проект работает на двух независимых серверах. Выбирайте любой.</p>
+
+    <div class="servers">
+      <div class="server-card">
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <div class="body">
+          <div class="url">sldchat.fastapicloud.dev</div>
+          <div class="desc">Основной сервер · FastAPI Cloud</div>
+        </div>
+      </div>
+
+      <div class="server-card">
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <div class="body">
+          <div class="url">sldchat.onrunxbuild.com</div>
+          <div class="desc">Резервный сервер · onrunxbuild</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="notice">
+      <svg class="icon lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+      <div>
+        <b>Это разные серверы.</b> У каждого своя база пользователей и сообщений —
+        данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу,
+        зарегистрируйтесь на каждом отдельно.
       </div>
     </div>
   </div>
@@ -441,31 +671,47 @@ LANDING_PAGE = """<!DOCTYPE html>
     <div class="faq">
       <details>
         <summary>Сколько стоит SldChat?</summary>
-        <div class="answer">Нисколько. Проект полностью бесплатный и без рекламы.</div>
+        <div class="answer">Нисколько. Проект полностью бесплатный, без рекламы и подписок.</div>
+      </details>
+      <details>
+        <summary>Почему ClosedSource?</summary>
+        <div class="answer">Исходный код проекта не публикуется. Это осознанное решение —
+        мы не хотим, чтобы под именем SldChat появлялись сторонние клоны.</div>
       </details>
       <details>
         <summary>Сохраняются ли мои сообщения?</summary>
-        <div class="answer">Нет. Всё хранится в оперативной памяти сервера и исчезает при его перезапуске.</div>
+        <div class="answer">Нет. Всё хранится только в оперативной памяти сервера и исчезает
+        при его перезапуске. На диск ничего не пишется.</div>
       </details>
       <details>
-        <summary>Можно ли писать человеку, которого я не знаю?</summary>
-        <div class="answer">Да, достаточно знать его ник. Он отображается в вашем списке пользователей.</div>
+        <summary>Почему я вижу только своих контактов?</summary>
+        <div class="answer">В SldChat нет публичного каталога пользователей. Чтобы начать общение,
+        нажмите «Добавить контакт» и введите ник собеседника. После этого вы появитесь
+        в его списке контактов, а он — в вашем.</div>
       </details>
       <details>
-        <summary>Как удалить сообщение?</summary>
-        <div class="answer">Наведите курсор на своё сообщение и нажмите «×». Оно будет помечено как удалённое для всех.</div>
+        <summary>Можно ли удалять сообщения?</summary>
+        <div class="answer">Нет. Отправленное сообщение остаётся в истории до перезапуска сервера.
+        Так что пишите осознанно :)</div>
       </details>
       <details>
         <summary>Как выйти из аккаунта?</summary>
-        <div class="answer">Кнопка «Выйти» находится в левом верхнем углу чата.</div>
+        <div class="answer">Кнопка выхода — в шапке приложения (значок стрелки из двери).</div>
       </details>
     </div>
   </div>
 </section>
 
 <footer>
-  <div class="container">
-    SldChat © 2026 · <a href="#about">О нас</a> · <a href="#faq">Ответы</a> · <a href="/register">Регистрация</a>
+  <div class="container foot-inner">
+    <div class="brand">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+      SldChat © 2026 · ClosedSource
+    </div>
+    <div>
+      <a href="#about">О нас</a> · <a href="#faq">FAQ</a> ·
+      <a href="/register">Регистрация</a>
+    </div>
   </div>
 </footer>
 
@@ -503,32 +749,50 @@ def render_auth(active: str) -> str:
   a {{ color: #3f6fa8; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
 
+  .icon {{
+    width: 18px; height: 18px;
+    stroke: currentColor; fill: none;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    vertical-align: -3px;
+  }}
+
   .topline {{
-    padding: 14px 20px;
+    padding: 16px 22px;
+    display: flex; align-items: center; gap: 10px;
   }}
   .topline a.logo {{
+    display: flex; align-items: center; gap: 7px;
     font-size: 20px; font-weight: bold; color: #2b3a4a;
-    text-shadow: 0 1px 0 #fff; letter-spacing: 1px;
+    text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px;
   }}
   .topline a.logo span {{ color: #3f6fa8; }}
+  .topline a.logo .icon {{ width: 22px; height: 22px; color: #3f6fa8; }}
+
+  .badge-closed {{
+    display: inline-flex; align-items: center; gap: 5px;
+    background: #2b3a4a; color: #dbe5ef;
+    border-radius: 12px; padding: 3px 10px 3px 8px;
+    font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase;
+    font-weight: bold;
+  }}
+  .badge-closed .icon {{ width: 11px; height: 11px; stroke-width: 2.4; }}
 
   .wrap {{
-    flex: 1;
-    display: flex; align-items: center; justify-content: center;
+    flex: 1; display: flex; align-items: center; justify-content: center;
     padding: 20px;
   }}
 
   .box {{
     width: 100%; max-width: 380px;
     background: #f4f6f8;
-    border: 1px solid #8b97a3;
-    border-radius: 6px;
+    border: 1px solid #8b97a3; border-radius: 6px;
     box-shadow: 0 4px 14px rgba(0,0,0,0.22), inset 0 1px 0 #fff;
     padding: 22px 26px 26px;
   }}
   .box h1 {{
-    text-align: center; font-size: 20px; font-weight: normal; margin: 0 0 18px;
-    color: #23374b; text-shadow: 0 1px 0 #fff; letter-spacing: 1px;
+    text-align: center; font-size: 20px; font-weight: normal;
+    margin: 0 0 18px; color: #23374b; text-shadow: 0 1px 0 #fff;
+    letter-spacing: 1px;
   }}
   .tabs {{
     display: flex; margin-bottom: 16px;
@@ -558,22 +822,24 @@ def render_auth(active: str) -> str:
   input:focus {{ border-color: #5a7a9a; }}
 
   .btn {{
-    display: block; width: 100%; margin-top: 18px;
-    padding: 10px 0;
-    border: 1px solid #7a8794; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; margin-top: 18px;
+    padding: 10px 0; border-radius: 4px;
+    font-family: inherit; font-size: 13px; cursor: pointer;
     background: linear-gradient(#fbfcfd, #ccd5de);
-    font-family: inherit; font-size: 13px; color: #2b3a4a;
-    cursor: pointer; text-shadow: 0 1px 0 #fff;
+    border: 1px solid #7a8794; color: #2b3a4a;
+    text-shadow: 0 1px 0 #fff;
   }}
   .btn-primary {{
     background: linear-gradient(#5b8fc4, #3f6fa8);
-    border-color: #35597f; color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,0.2);
+    border-color: #35597f; color: #fff;
+    text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }}
   .btn-primary:hover {{ background: linear-gradient(#699bcd, #4577b1); }}
 
   .error {{
-    min-height: 18px; color: #c22; text-align: center; font-size: 12px;
-    margin-bottom: 4px;
+    min-height: 18px; color: #c22; text-align: center;
+    font-size: 12px; margin-bottom: 4px;
   }}
   .hint {{
     margin-top: 14px; text-align: center; color: #889; font-size: 11px;
@@ -583,7 +849,16 @@ def render_auth(active: str) -> str:
 </head>
 <body>
 
-<div class="topline"><a href="/" class="logo">Sld<span>Chat</span></a></div>
+<div class="topline">
+  <a href="/" class="logo">
+    <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+    Sld<span>Chat</span>
+  </a>
+  <span class="badge-closed">
+    <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+    ClosedSource
+  </span>
+</div>
 
 <div class="wrap">
   <div class="box">
@@ -658,7 +933,7 @@ def render_auth(active: str) -> str:
 
 
 # ================== HTML: ЧАТ ==================
-CHAT_PAGE = """<!DOCTYPE html>
+CHAT_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -669,56 +944,110 @@ CHAT_PAGE = """<!DOCTYPE html>
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
   body {
     font-family: Tahoma, Verdana, Arial, sans-serif;
-    font-size: 13px; color: #2b3a4a;
-    background: #e9eef3;
+    font-size: 13px; color: #2b3a4a; background: #e9eef3;
   }
 
-  /* ================== Layout ================== */
+  /* SVG */
+  .icon {
+    width: 16px; height: 16px; flex-shrink: 0;
+    stroke: currentColor; fill: none;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    vertical-align: -3px;
+  }
+  .icon.lg { width: 20px; height: 20px; }
+  .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
+
+  /* ====== Layout ====== */
   .app {
     display: grid;
-    grid-template-columns: 300px 1fr 280px;
-    height: 100vh;
-    width: 100vw;
-    overflow: hidden;
+    grid-template-columns: 280px 1fr 260px;
+    height: 100vh; width: 100vw; overflow: hidden;
     background: #e9eef3;
   }
 
-  /* ================== Sidebar ================== */
+  /* ====== Сайдбар ====== */
   .sidebar {
-    background: #f0f3f7;
-    border-right: 1px solid #c8d1da;
-    display: flex; flex-direction: column;
-    min-width: 0;
+    background: #f0f3f7; border-right: 1px solid #c8d1da;
+    display: flex; flex-direction: column; min-width: 0;
   }
   .sb-header {
-    padding: 9px 10px;
+    padding: 8px 10px;
     background: linear-gradient(#fbfcfd, #d6dee5);
     border-bottom: 1px solid #b0bac4;
     display: flex; align-items: center; justify-content: space-between;
-    gap: 8px;
+    gap: 6px;
   }
-  .sb-header .me {
-    display: flex; align-items: center; gap: 8px; min-width: 0;
+  .logo-mini {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 15px; font-weight: bold; color: #2b3a4a;
+    text-shadow: 0 1px 0 #fff;
   }
-  .sb-header .me .name {
-    font-weight: bold; color: #2b3a4a; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-  }
-  .sb-header .logout {
-    color: #52708c; cursor: pointer; font-size: 12px;
-    text-decoration: underline; flex-shrink: 0;
-    background: none; border: none; padding: 0;
-    font-family: inherit;
-  }
-  .sb-header .logout:hover { color: #2b3a4a; }
+  .logo-mini .icon { width: 18px; height: 18px; color: #3f6fa8; }
+  .logo-mini span { color: #3f6fa8; }
 
-  .search {
-    padding: 7px 9px;
+  .me-line {
+    padding: 6px 10px 8px;
+    background: #e8edf3;
     border-bottom: 1px solid #d3dae0;
-    background: #eef2f6;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; font-size: 12px; color: #5a6c80;
+  }
+  .me-line .nick { font-weight: bold; color: #2b3a4a; }
+
+  .icon-btn {
+    border: 1px solid #b5bec8; border-radius: 4px;
+    background: linear-gradient(#fbfcfd, #dce3ea);
+    padding: 4px 7px; cursor: pointer; line-height: 1;
+    color: #3a5169;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .icon-btn:hover { background: linear-gradient(#fff, #dbe3ea); }
+  .icon-btn:active { box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
+
+  .add-wrap { padding: 8px 9px; border-bottom: 1px solid #dbe1e7; }
+  .add-btn {
+    width: 100%; padding: 8px 10px;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    border: 1px solid #7a8794; border-radius: 4px;
+    background: linear-gradient(#fbfcfd, #cfd8e0);
+    font-family: inherit; font-size: 12px; color: #2b3a4a;
+    cursor: pointer; text-shadow: 0 1px 0 #fff;
+  }
+  .add-btn:hover { background: linear-gradient(#fff, #dbe3ea); }
+
+  .add-form {
+    display: none; gap: 6px; margin-top: 6px;
+  }
+  .add-form.open { display: flex; }
+  .add-form input {
+    flex: 1; min-width: 0;
+    padding: 6px 9px; font-family: inherit; font-size: 12px;
+    border: 1px solid #9aa4ae; border-radius: 3px;
+    background: #fff; outline: none;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
+  }
+  .add-form input:focus { border-color: #5a7a9a; }
+  .add-form button {
+    padding: 0 10px; border-radius: 3px;
+    border: 1px solid #35597f; cursor: pointer;
+    background: linear-gradient(#5b8fc4, #3f6fa8);
+    color: #fff; font-family: inherit; font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .add-msg {
+    font-size: 11px; margin-top: 5px; min-height: 14px; color: #7a8695;
+  }
+  .add-msg.err { color: #c22; }
+  .add-msg.ok  { color: #2f8f3d; }
+
+  .search { padding: 7px 9px; border-bottom: 1px solid #d3dae0; background: #eef2f6; }
+  .search-wrap { position: relative; }
+  .search-wrap .icon {
+    position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+    color: #98a2ad; width: 13px; height: 13px;
   }
   .search input {
-    width: 100%; padding: 6px 9px;
+    width: 100%; padding: 6px 9px 6px 26px;
     font-family: inherit; font-size: 12px;
     border: 1px solid #b5bec8; border-radius: 14px;
     background: #fff; outline: none;
@@ -728,25 +1057,27 @@ CHAT_PAGE = """<!DOCTYPE html>
 
   .user-list { flex: 1; overflow-y: auto; }
   .user-item {
-    padding: 9px 11px;
+    padding: 8px 11px;
     border-bottom: 1px solid #dde3e9;
-    background: #f6f8fa;
-    cursor: pointer;
-    display: flex; gap: 9px; align-items: center;
+    background: #f6f8fa; cursor: pointer;
     min-width: 0;
   }
   .user-item:hover  { background: #eaf0f6; }
   .user-item.active { background: #d3e0ec; }
-  .user-item .avatar { flex-shrink: 0; }
-  .user-item .body { min-width: 0; flex: 1; }
   .user-item .row1 {
-    display: flex; justify-content: space-between; align-items: center; gap: 6px;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 6px;
   }
   .user-item .nick {
     font-weight: bold; color: #2b3a4a;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-size: 13px;
+    display: flex; align-items: center; gap: 6px; min-width: 0;
   }
+  .user-item .nick .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #b5bec8; flex-shrink: 0;
+  }
+  .user-item .nick .dot.on { background: #4caf50; }
   .user-item .time {
     font-size: 10px; color: #8a94a0; flex-shrink: 0;
   }
@@ -757,64 +1088,42 @@ CHAT_PAGE = """<!DOCTYPE html>
   .user-item .badge {
     background: #3f6fa8; color: #fff; font-size: 10px;
     border-radius: 9px; padding: 1px 6px; min-width: 18px;
-    text-align: center; margin-left: 4px; flex-shrink: 0;
+    text-align: center; margin-left: 4px;
+  }
+  .empty-list {
+    padding: 22px 14px; text-align: center; color: #98a2ad;
+    font-size: 12px;
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  .avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    background: linear-gradient(#cfdbe6, #a9bacb);
-    border: 1px solid #9aa9b8;
-    color: #fff; display: flex; align-items: center; justify-content: center;
-    font-weight: bold; font-size: 14px; text-shadow: 0 1px 0 rgba(0,0,0,0.15);
-    position: relative;
-  }
-  .avatar.sm { width: 28px; height: 28px; font-size: 12px; }
-  .avatar.lg { width: 72px; height: 72px; font-size: 28px; }
-  .dot {
-    position: absolute; right: -1px; bottom: -1px;
-    width: 10px; height: 10px; border-radius: 50%;
-    border: 2px solid #f0f3f7; background: #9aa4ae;
-  }
-  .dot.on { background: #4caf50; }
-
-  /* ================== Chat ================== */
-  .chat {
-    display: flex; flex-direction: column;
-    background: #fff; min-width: 0;
-  }
+  /* ====== Чат ====== */
+  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; }
   .chat-header {
-    padding: 9px 12px;
+    padding: 8px 12px; min-height: 52px;
     background: linear-gradient(#fbfcfd, #d6dee5);
     border-bottom: 1px solid #b0bac4;
     display: flex; align-items: center; gap: 10px;
-    min-height: 52px;
   }
   .chat-header .title {
-    font-weight: bold; color: #2b3a4a; flex: 1;
+    flex: 1; min-width: 0;
+    font-weight: bold; color: #2b3a4a;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .chat-header .sub {
-    font-size: 11px; color: #7a8695; font-weight: normal;
+    font-size: 11px; color: #7a8695; font-weight: normal; margin-top: 1px;
   }
-  .icon-btn {
-    display: none;
-    border: 1px solid #b5bec8; border-radius: 4px;
-    background: linear-gradient(#fbfcfd, #dce3ea);
-    padding: 5px 9px; cursor: pointer;
-    font-family: inherit; font-size: 15px; color: #3a5169;
-    line-height: 1;
-  }
+  .chat-header .sub.online { color: #2f8f3d; font-weight: bold; }
+  .mobile-only { display: none; }
 
   .messages {
-    flex: 1; overflow-y: auto;
-    padding: 14px 18px;
+    flex: 1; overflow-y: auto; padding: 14px 18px;
     background:
       radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%),
       #fbfcfd;
   }
   .empty {
-    color: #a2aab3; text-align: center; margin-top: 60px;
-    font-style: italic; font-size: 13px;
+    color: #a2aab3; text-align: center; margin-top: 60px; font-size: 13px;
+    display: flex; flex-direction: column; align-items: center; gap: 14px;
   }
 
   .date-sep { text-align: center; margin: 14px 0 10px; }
@@ -825,100 +1134,71 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
 
   .msg-row {
-    display: flex; margin-bottom: 6px;
-    align-items: flex-end; gap: 6px;
+    display: flex; margin-bottom: 4px; align-items: flex-end; gap: 6px;
   }
   .msg-row.mine { justify-content: flex-end; }
-
   .msg-bubble {
-    max-width: min(70%, 520px);
-    padding: 7px 11px;
+    max-width: min(72%, 540px);
+    padding: 7px 12px;
     border-radius: 14px 14px 14px 4px;
-    background: #eef2f6;
-    border: 1px solid #dde4eb;
+    background: #eef2f6; border: 1px solid #dde4eb;
     font-size: 13px; line-height: 1.4;
     word-wrap: break-word; white-space: pre-wrap;
     color: #22303e;
-    position: relative;
   }
   .msg-row.mine .msg-bubble {
-    background: #d3e6c8;
-    border-color: #bed7ad;
+    background: #d3e6c8; border-color: #bed7ad;
     border-radius: 14px 14px 4px 14px;
   }
-  .msg-meta {
-    font-size: 10px; color: #8a94a0; margin-top: 3px;
-  }
+  .msg-meta { font-size: 10px; color: #8a94a0; margin-top: 3px; }
   .msg-row.mine .msg-meta { text-align: right; }
-  .msg-row.mine .msg-meta .edited { color: #7a8695; }
-
-  .msg-bubble.deleted {
-    background: transparent;
-    border: 1px dashed #c8d1da;
-    color: #98a2ad; font-style: italic;
-  }
-
-  .msg-del {
-    position: absolute; top: -7px; right: -7px;
-    width: 18px; height: 18px; border-radius: 50%;
-    background: #c33; color: #fff; border: 2px solid #fff;
-    font-size: 11px; line-height: 1; padding: 0;
-    cursor: pointer; display: none;
-    align-items: center; justify-content: center;
-    font-family: inherit;
-  }
-  .msg-row.mine:hover .msg-del { display: flex; }
 
   .input-area {
-    border-top: 1px solid #c8d1da;
-    padding: 10px 12px;
+    border-top: 1px solid #c8d1da; padding: 10px 12px;
     background: #eef2f6;
-    display: flex; gap: 8px;
-    align-items: flex-end;
+    display: flex; gap: 8px; align-items: flex-end;
   }
   .input-area textarea {
     flex: 1; resize: none;
-    padding: 9px 12px;
-    font-family: inherit; font-size: 13px;
+    padding: 9px 12px; font-family: inherit; font-size: 13px;
     border: 1px solid #b5bec8; border-radius: 16px;
-    background: #fff;
+    background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
-    outline: none;
-    max-height: 120px; min-height: 34px;
-    line-height: 1.4;
+    max-height: 120px; min-height: 34px; line-height: 1.4;
   }
   .input-area textarea:focus { border-color: #5a7a9a; }
   .input-area button {
-    padding: 8px 18px; border-radius: 16px;
-    border: 1px solid #35597f;
+    padding: 8px 16px; border-radius: 16px;
+    border: 1px solid #35597f; cursor: pointer;
     background: linear-gradient(#5b8fc4, #3f6fa8);
-    color: #fff; cursor: pointer;
-    font-family: inherit; font-size: 13px;
+    color: #fff; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
-    flex-shrink: 0;
+    display: flex; align-items: center; gap: 6px;
   }
   .input-area button:hover { background: linear-gradient(#699bcd, #4577b1); }
 
-  /* ================== Info panel ================== */
+  /* ====== Инфо-панель ====== */
   .info-panel {
-    background: #f0f3f7;
-    border-left: 1px solid #c8d1da;
-    padding: 18px 16px;
-    overflow-y: auto;
-    min-width: 0;
+    background: #f0f3f7; border-left: 1px solid #c8d1da;
+    padding: 16px 16px; overflow-y: auto; min-width: 0;
   }
   .info-panel .close-btn { display: none; }
   .info-empty {
-    color: #98a2ad; text-align: center; margin-top: 40px;
-    font-size: 12px; font-style: italic;
+    color: #98a2ad; text-align: center; margin-top: 40px; font-size: 12px;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
   }
   .info-head {
-    text-align: center;
-    padding-bottom: 16px;
-    border-bottom: 1px solid #dbe1e7;
-    margin-bottom: 16px;
+    text-align: center; padding-bottom: 16px;
+    border-bottom: 1px solid #dbe1e7; margin-bottom: 16px;
   }
-  .info-head .avatar.lg { margin: 0 auto 10px; }
+  .info-head .avatar-none {
+    width: 54px; height: 54px; margin: 0 auto 10px;
+    border-radius: 12px;
+    background: linear-gradient(#e4ebf2, #c8d3de);
+    border: 1px solid #b7c2cd;
+    display: flex; align-items: center; justify-content: center;
+    color: #3f6fa8; box-shadow: inset 0 1px 0 #fff;
+  }
   .info-head .name {
     font-size: 16px; font-weight: bold; color: #23374b;
     word-break: break-all;
@@ -933,18 +1213,32 @@ CHAT_PAGE = """<!DOCTYPE html>
   .info-row .k { color: #7a8695; flex-shrink: 0; }
   .info-row .v { color: #2b3a4a; text-align: right; word-break: break-word; }
 
-  /* ================== Mobile ================== */
+  /* ====== Тост ====== */
+  .toast-wrap {
+    position: fixed; bottom: 16px; right: 16px; z-index: 100;
+    display: flex; flex-direction: column; gap: 8px;
+    pointer-events: none;
+  }
+  .toast {
+    background: #2b3a4a; color: #fff;
+    border-radius: 6px; padding: 10px 14px;
+    font-size: 12px; max-width: 300px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+    animation: toast-in 0.18s ease-out;
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ====== Mobile ====== */
   @media (max-width: 900px) {
-    .app {
-      grid-template-columns: 1fr;
-      position: relative;
-    }
+    .app { grid-template-columns: 1fr; position: relative; }
     .sidebar { border-right: none; }
-    .chat { display: none; border-left: none; }
+    .chat { display: none; }
     .info-panel {
       position: fixed; top: 0; right: 0; bottom: 0;
-      width: min(300px, 85vw);
-      z-index: 40;
+      width: min(300px, 85vw); z-index: 40;
       transform: translateX(100%);
       transition: transform 0.22s ease;
       box-shadow: -4px 0 14px rgba(0,0,0,0.18);
@@ -953,18 +1247,13 @@ CHAT_PAGE = """<!DOCTYPE html>
     .app.chat-open .sidebar { display: none; }
     .app.chat-open .chat { display: flex; }
     .app.info-open .info-panel { transform: translateX(0); }
-    .icon-btn { display: inline-block; }
     .info-panel .close-btn {
-      display: block; float: right; margin: -4px -4px 0 0;
+      display: inline-flex; float: right; margin: -4px -4px 0 0;
     }
+    .mobile-only { display: inline-flex; }
     .msg-bubble { max-width: 82%; }
   }
 
-  @media (max-width: 400px) {
-    .sb-header .me .name { font-size: 12px; }
-  }
-
-  /* Скроллбары — по-старому */
   .user-list::-webkit-scrollbar,
   .messages::-webkit-scrollbar,
   .info-panel::-webkit-scrollbar { width: 10px; }
@@ -982,18 +1271,41 @@ CHAT_PAGE = """<!DOCTYPE html>
 
 <div class="app" id="app">
 
-  <!-- ======== Левый сайдбар ======== -->
+  <!-- ======== Сайдбар ======== -->
   <aside class="sidebar">
     <div class="sb-header">
-      <div class="me">
-        <div class="avatar sm" id="myAvatar">?</div>
-        <div class="name" id="myNick">…</div>
+      <div class="logo-mini">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        Sld<span>Chat</span>
       </div>
-      <button class="logout" id="logoutBtn">Выйти</button>
+      <button class="icon-btn" id="logoutBtn" title="Выйти">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+      </button>
+    </div>
+
+    <div class="me-line">
+      Вы вошли как <span class="nick" id="myNick">…</span>
+    </div>
+
+    <div class="add-wrap">
+      <button class="add-btn" id="addBtn">
+        <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Добавить контакт
+      </button>
+      <form class="add-form" id="addForm">
+        <input type="text" id="addInput" placeholder="Ник собеседника" autocomplete="off" maxlength="20">
+        <button type="submit" title="Добавить">
+          <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        </button>
+      </form>
+      <div class="add-msg" id="addMsg"></div>
     </div>
 
     <div class="search">
-      <input type="text" id="searchInput" placeholder="Поиск по нику..." autocomplete="off">
+      <div class="search-wrap">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="searchInput" placeholder="Поиск по контактам" autocomplete="off">
+      </div>
     </div>
 
     <div class="user-list" id="userList"></div>
@@ -1002,44 +1314,62 @@ CHAT_PAGE = """<!DOCTYPE html>
   <!-- ======== Чат ======== -->
   <main class="chat" id="chatMain">
     <header class="chat-header">
-      <button class="icon-btn" id="backBtn" title="Назад">←</button>
+      <button class="icon-btn mobile-only" id="backBtn" title="Назад">
+        <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+      </button>
       <div class="title">
         <div id="chatTitle">Выберите собеседника</div>
         <div class="sub" id="chatSub"></div>
       </div>
-      <button class="icon-btn" id="infoBtn" title="Информация">ⓘ</button>
+      <button class="icon-btn mobile-only" id="infoBtn" title="Информация">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+      </button>
     </header>
 
     <div class="messages" id="messages">
-      <div class="empty">Слева выберите пользователя, чтобы начать переписку</div>
+      <div class="empty">
+        <svg class="icon huge" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        <div>Слева выберите контакт, чтобы начать переписку</div>
+      </div>
     </div>
 
     <div class="input-area" id="inputArea" style="display:none">
       <textarea id="msgInput" placeholder="Введите сообщение..." rows="1"></textarea>
-      <button id="sendBtn">Отправить</button>
+      <button id="sendBtn">
+        <svg class="icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        Отправить
+      </button>
     </div>
   </main>
 
-  <!-- ======== Правая панель ======== -->
+  <!-- ======== Инфо-панель ======== -->
   <aside class="info-panel" id="infoPanel">
-    <button class="icon-btn close-btn" id="infoCloseBtn">×</button>
+    <button class="icon-btn close-btn" id="infoCloseBtn" title="Закрыть">
+      <svg class="icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
     <div id="infoContent">
-      <div class="info-empty">Информация о собеседнике появится здесь</div>
+      <div class="info-empty">
+        <svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        <div>Информация о собеседнике появится здесь</div>
+      </div>
     </div>
   </aside>
 
 </div>
 
+<div class="toast-wrap" id="toastWrap"></div>
+
 <script>
 /* ==================== Состояние ==================== */
 let me = null;
-let current = null;         // ник собеседника
-const lastIds = {};         // ник -> last message id
+let current = null;
+const lastIds = {};
 const renderedIds = new Set();
-let deletedSeen = new Set();
-let polling = false;
 let usersCache = [];
 let searchQuery = '';
+let currentInfo = null;
+let ws = null;
+let wsReconnectTimer = null;
 
 const $ = id => document.getElementById(id);
 const app = $('app');
@@ -1072,22 +1402,99 @@ function dayLabel(ts) {
   const d = new Date(ts * 1000);
   const today = new Date();
   const yest = new Date(); yest.setDate(yest.getDate() - 1);
-  const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const same = (a, b) => a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
   if (same(d, today)) return 'Сегодня';
   if (same(d, yest)) return 'Вчера';
   return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear();
 }
-function initials(nick) {
-  return (nick || '?').slice(0, 1).toUpperCase();
-}
-function avatarHtml(nick, online, size) {
-  const cls = size ? 'avatar ' + size : 'avatar';
-  const dot = online === undefined ? '' :
-    '<span class="dot' + (online ? ' on' : '') + '"></span>';
-  return '<div class="' + cls + '">' + esc(initials(nick)) + dot + '</div>';
-}
 function scrollIfNearBottom(el) {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+}
+function toast(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  $('toastWrap').appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+/* ==================== WebSocket ==================== */
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  try {
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    // периодический ping — держим соединение живым
+    if (ws._pingTimer) clearInterval(ws._pingTimer);
+    ws._pingTimer = setInterval(() => {
+      if (ws && ws.readyState === 1) {
+        try { ws.send('ping'); } catch (e) {}
+      }
+    }, 25000);
+  };
+
+  ws.onmessage = e => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    handleWS(d);
+  };
+
+  ws.onclose = () => {
+    if (ws && ws._pingTimer) clearInterval(ws._pingTimer);
+    scheduleReconnect();
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (e) {}
+  };
+}
+
+function scheduleReconnect() {
+  if (wsReconnectTimer) return;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWS();
+  }, 1200);
+}
+
+function handleWS(d) {
+  if (d.type === 'message') {
+    const m = d.message;
+    const peer = m.from === me ? m.to : m.from;
+    // если открыт диалог с этим человеком — сразу показываем
+    if (current === peer) {
+      if (!renderedIds.has(m.id)) {
+        renderedIds.add(m.id);
+        appendMessage(m);
+        lastIds[current] = Math.max(lastIds[current] || 0, m.id);
+      }
+      // если сообщение от него — оно прочитано
+      if (m.from !== me) markRead(peer);
+    }
+    // обновим список
+    loadContacts();
+  } else if (d.type === 'presence') {
+    updatePresence(d.nick, d.online);
+    loadContacts();
+  } else if (d.type === 'contact_added') {
+    toast('Новый контакт: ' + d.nick);
+    loadContacts();
+  }
+}
+
+function updatePresence(nick, online) {
+  const u = usersCache.find(x => x.nick === nick);
+  if (u) u.online = online;
+  renderContacts();
+  if (current === nick) {
+    currentInfo = { ...(currentInfo || {}), online };
+    updateChatSubtitle();
+  }
 }
 
 /* ==================== Инициализация ==================== */
@@ -1097,20 +1504,20 @@ async function init() {
   const d = await r.json();
   me = d.nick;
   $('myNick').textContent = me;
-  $('myAvatar').textContent = initials(me);
-  await loadUsers();
+  connectWS();
+  await loadContacts();
 }
 
-/* ==================== Список пользователей ==================== */
-async function loadUsers() {
-  const r = await fetch('/api/users');
+/* ==================== Контакты ==================== */
+async function loadContacts() {
+  const r = await fetch('/api/contacts');
   if (!r.ok) { location.href = '/'; return; }
   const d = await r.json();
-  usersCache = d.users || [];
-  renderUsers();
+  usersCache = d.contacts || [];
+  renderContacts();
 }
 
-function renderUsers() {
+function renderContacts() {
   const list = $('userList');
   list.innerHTML = '';
   const q = searchQuery.trim().toLowerCase();
@@ -1120,11 +1527,10 @@ function renderUsers() {
 
   if (!filtered.length) {
     const e = document.createElement('div');
-    e.style.padding = '14px';
-    e.style.color = '#889';
-    e.style.fontSize = '12px';
-    e.style.textAlign = 'center';
-    e.textContent = q ? 'Никого не найдено' : 'Других пользователей пока нет';
+    e.className = 'empty-list';
+    e.innerHTML =
+      '<svg class="icon huge" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>' +
+      '<div>' + (q ? 'Ничего не найдено' : 'Пока нет контактов.<br>Нажмите «Добавить контакт».') + '</div>';
     list.appendChild(e);
     return;
   }
@@ -1135,48 +1541,40 @@ function renderUsers() {
     let preview = 'Нет сообщений';
     if (u.last) {
       const prefix = u.last.from === me ? 'Вы: ' : '';
-      preview = prefix + (u.last.deleted ? 'сообщение удалено' : u.last.text);
+      preview = prefix + u.last.text;
     }
     const timeStr = u.last ? fmtTime(u.last.time) : '';
     const unread = u.unread
       ? '<span class="badge">' + (u.unread > 99 ? '99+' : u.unread) + '</span>'
       : '';
-
     div.innerHTML =
-      avatarHtml(u.nick, u.online) +
-      '<div class="body">' +
-        '<div class="row1">' +
-          '<div class="nick">' + esc(u.nick) + '</div>' +
-          '<div class="time">' + timeStr + unread + '</div>' +
-        '</div>' +
-        '<div class="preview">' + esc(preview) + '</div>' +
-      '</div>';
+      '<div class="row1">' +
+        '<div class="nick"><span class="dot' + (u.online ? ' on' : '') + '"></span>' + esc(u.nick) + '</div>' +
+        '<div class="time">' + timeStr + unread + '</div>' +
+      '</div>' +
+      '<div class="preview">' + esc(preview) + '</div>';
     div.onclick = () => openDialog(u.nick);
     list.appendChild(div);
   }
 }
 
-/* ==================== Открытие диалога ==================== */
+/* ==================== Диалог ==================== */
 async function openDialog(nick) {
   current = nick;
   lastIds[nick] = 0;
   renderedIds.clear();
-  deletedSeen = new Set();
 
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
-  const box = $('messages');
-  box.innerHTML = '';
+  $('messages').innerHTML = '';
   $('inputArea').style.display = 'flex';
 
   app.classList.add('chat-open');
   app.classList.remove('info-open');
 
-  await loadInfo(nick);
-  await refreshDialog();
-
+  await Promise.all([loadInfo(nick), refreshDialog()]);
+  await loadContacts();
   $('msgInput').focus();
-  await loadUsers();
 }
 
 async function refreshDialog() {
@@ -1191,102 +1589,53 @@ async function refreshDialog() {
   const box = $('messages');
   const wasNearBottom = scrollIfNearBottom(box);
 
-  // удаления
-  for (const id of d.deleted) {
-    if (deletedSeen.has(id)) continue;
-    deletedSeen.add(id);
-    const el = box.querySelector('.msg-row[data-id="' + id + '"]');
-    if (el) {
-      const bubble = el.querySelector('.msg-bubble');
-      bubble.classList.add('deleted');
-      bubble.textContent = 'Сообщение удалено';
-      const delBtn = el.querySelector('.msg-del');
-      if (delBtn) delBtn.remove();
-    }
-  }
-
-  // новые сообщения
-  let lastDay = null;
-  const existing = box.querySelectorAll('.msg-row');
-  if (existing.length) {
-    const lastRow = existing[existing.length - 1];
-    const lastTs = parseFloat(lastRow.dataset.ts || '0');
-    if (lastTs) lastDay = dayLabel(lastTs);
-  }
-
   let added = false;
   for (const m of d.messages) {
     if (renderedIds.has(m.id)) continue;
     renderedIds.add(m.id);
     lastIds[nick] = Math.max(lastIds[nick] || 0, m.id);
-
-    const day = dayLabel(m.time);
-    if (day !== lastDay) {
-      const sep = document.createElement('div');
-      sep.className = 'date-sep';
-      sep.innerHTML = '<span>' + esc(day) + '</span>';
-      box.appendChild(sep);
-      lastDay = day;
-    }
-
-    box.appendChild(renderMessage(m, nick));
+    appendMessage(m);
     added = true;
   }
-
-  if (added && (wasNearBottom || existing.length === 0)) {
+  if (added && (wasNearBottom || !box.querySelector('.msg-row'))) {
     box.scrollTop = box.scrollHeight;
   }
-
-  // обновим заголовок статуса
-  updateChatSubtitle();
 }
 
-function renderMessage(m, peer) {
+function appendMessage(m) {
+  const box = $('messages');
+  const lastRow = box.querySelector('.msg-row:last-of-type');
+  const lastTs = lastRow ? parseFloat(lastRow.dataset.ts || '0') : 0;
+
+  const newDay = dayLabel(m.time);
+  if (!lastTs || dayLabel(lastTs) !== newDay) {
+    const sep = document.createElement('div');
+    sep.className = 'date-sep';
+    sep.innerHTML = '<span>' + esc(newDay) + '</span>';
+    box.appendChild(sep);
+  }
+
   const row = document.createElement('div');
   row.className = 'msg-row' + (m.from === me ? ' mine' : '');
   row.dataset.id = m.id;
   row.dataset.ts = m.time;
-
-  const meta = m.deleted
-    ? '<div class="msg-meta">' + fmtTime(m.time) + '</div>'
-    : '<div class="msg-meta">' + fmtTime(m.time) + '</div>';
-
-  const text = m.deleted ? 'Сообщение удалено' : esc(m.text);
-  const delBtn = (!m.deleted && m.from === me)
-    ? '<button class="msg-del" title="Удалить">×</button>'
-    : '';
-
   row.innerHTML =
-    '<div class="msg-bubble' + (m.deleted ? ' deleted' : '') + '">' +
-      text +
-      meta +
-      delBtn +
+    '<div class="msg-bubble">' +
+      esc(m.text) +
+      '<div class="msg-meta">' + fmtTime(m.time) + '</div>' +
     '</div>';
+  box.appendChild(row);
 
-  if (delBtn) {
-    row.querySelector('.msg-del').onclick = (e) => {
-      e.stopPropagation();
-      deleteMessage(m.id);
-    };
-  }
-  return row;
+  const nearBottom = scrollIfNearBottom(box) || m.from === me;
+  if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-async function deleteMessage(id) {
-  if (!confirm('Удалить сообщение?')) return;
-  const r = await fetch('/api/message/' + id, { method: 'DELETE' });
-  if (!r.ok) return;
-  const el = $('messages').querySelector('.msg-row[data-id="' + id + '"]');
-  if (el) {
-    const bubble = el.querySelector('.msg-bubble');
-    bubble.classList.add('deleted');
-    bubble.textContent = 'Сообщение удалено';
-    const delBtn = el.querySelector('.msg-del');
-    if (delBtn) delBtn.remove();
-    deletedSeen.add(id);
-  }
-  await loadUsers();
-  await loadInfo(current);
+async function markRead(nick) {
+  // достаточно вызвать /api/dialog — он проставляет read
+  try {
+    await fetch('/api/dialog/' + encodeURIComponent(nick) + '?since=0', { method: 'GET' });
+  } catch (e) {}
+  loadContacts();
 }
 
 /* ==================== Отправка ==================== */
@@ -1300,41 +1649,51 @@ async function send() {
   fd.append('to', current);
   fd.append('text', text);
 
+  inp.value = '';
+  inp.style.height = 'auto';
+
   const r = await fetch('/api/send', { method: 'POST', body: fd });
   const d = await r.json().catch(() => ({ ok:false }));
-  if (d.ok) {
-    inp.value = '';
-    inp.style.height = 'auto';
-    await refreshDialog();
-    await loadUsers();
-    await loadInfo(current);
-  } else {
-    alert(d.error || 'Ошибка');
+  if (!d.ok) {
+    toast(d.error || 'Не удалось отправить');
+    return;
   }
+  // На случай если WS-эхо не пришло моментально — добавим сами
+  if (!renderedIds.has(d.message.id)) {
+    renderedIds.add(d.message.id);
+    lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
+    appendMessage(d.message);
+  }
+  loadContacts();
+  loadInfo(current);
 }
 
 /* ==================== Инфо о собеседнике ==================== */
 async function loadInfo(nick) {
   if (!nick) {
-    $('infoContent').innerHTML = '<div class="info-empty">Информация о собеседнике появится здесь</div>';
+    $('infoContent').innerHTML =
+      '<div class="info-empty">' +
+        '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
+        '<div>Информация о собеседнике появится здесь</div>' +
+      '</div>';
     return;
   }
   const r = await fetch('/api/user/' + encodeURIComponent(nick) + '/info');
-  if (!r.ok) {
-    $('infoContent').innerHTML = '<div class="info-empty">Пользователь не найден</div>';
-    return;
-  }
+  if (!r.ok) return;
   const d = await r.json();
   if (!d.ok) return;
   const i = d.info;
+  currentInfo = { online: i.online, lastSeen: i.last_seen };
 
   const status = i.online
-    ? '<div class="status online">● В сети</div>'
+    ? '<div class="status online">В сети</div>'
     : '<div class="status">Был(а): ' + esc(fmtLastSeen(i.last_seen)) + '</div>';
 
   $('infoContent').innerHTML =
     '<div class="info-head">' +
-      avatarHtml(i.nick, i.online, 'lg') +
+      '<div class="avatar-none">' +
+        '<svg class="icon" style="width:26px;height:26px" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+      '</div>' +
       '<div class="name">' + esc(i.nick) + '</div>' +
       status +
     '</div>' +
@@ -1343,29 +1702,53 @@ async function loadInfo(nick) {
     '<div class="info-row"><span class="k">Последняя активность</span><span class="v">' + esc(fmtLastSeen(i.last_seen)) + '</span></div>' +
     '<div class="info-row"><span class="k">Сообщений в диалоге</span><span class="v">' + i.msg_count + '</span></div>';
 
-  updateChatSubtitle(i.online, i.last_seen);
+  updateChatSubtitle();
 }
 
-let currentInfo = null;
-function updateChatSubtitle(online, lastSeen) {
-  if (online !== undefined) currentInfo = { online, lastSeen };
+function updateChatSubtitle() {
   const el = $('chatSub');
-  if (!current) { el.textContent = ''; return; }
-  if (!currentInfo) { el.textContent = ''; return; }
-  if (currentInfo.online) el.textContent = 'в сети';
-  else el.textContent = 'был(а): ' + fmtLastSeen(currentInfo.lastSeen);
-}
-
-/* ==================== Polling ==================== */
-async function poll() {
-  if (!current || polling) return;
-  polling = true;
-  try {
-    await refreshDialog();
-  } finally {
-    polling = false;
+  if (!current || !currentInfo) { el.textContent = ''; return; }
+  if (currentInfo.online) {
+    el.textContent = 'в сети';
+    el.classList.add('online');
+  } else {
+    el.textContent = 'был(а): ' + fmtLastSeen(currentInfo.lastSeen);
+    el.classList.remove('online');
   }
 }
+
+/* ==================== Добавление контакта ==================== */
+$('addBtn').onclick = () => {
+  const f = $('addForm');
+  f.classList.toggle('open');
+  if (f.classList.contains('open')) $('addInput').focus();
+  $('addMsg').textContent = '';
+};
+
+$('addForm').onsubmit = async e => {
+  e.preventDefault();
+  const inp = $('addInput');
+  const msg = $('addMsg');
+  const nick = inp.value.trim();
+  if (!nick) return;
+  msg.className = 'add-msg';
+  msg.textContent = '...';
+  const fd = new FormData();
+  fd.append('nick', nick);
+  const r = await fetch('/api/contacts/add', { method: 'POST', body: fd });
+  const d = await r.json().catch(() => ({ ok:false }));
+  if (d.ok) {
+    msg.className = 'add-msg ok';
+    msg.textContent = 'Добавлено: ' + nick;
+    inp.value = '';
+    await loadContacts();
+    setTimeout(() => { $('addForm').classList.remove('open'); $('addMsg').textContent = ''; }, 900);
+    openDialog(nick);
+  } else {
+    msg.className = 'add-msg err';
+    msg.textContent = d.error || 'Ошибка';
+  }
+};
 
 /* ==================== UI события ==================== */
 $('sendBtn').onclick = send;
@@ -1383,6 +1766,7 @@ $('msgInput').addEventListener('input', e => {
 });
 
 $('logoutBtn').onclick = async () => {
+  if (ws) { try { ws.close(); } catch (e) {} }
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/';
 };
@@ -1393,9 +1777,17 @@ $('backBtn').onclick = () => {
   app.classList.remove('info-open');
   $('chatTitle').textContent = 'Выберите собеседника';
   $('chatSub').textContent = '';
-  $('messages').innerHTML = '<div class="empty">Слева выберите пользователя, чтобы начать переписку</div>';
+  $('messages').innerHTML =
+    '<div class="empty">' +
+      '<svg class="icon huge" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>' +
+      '<div>Слева выберите контакт, чтобы начать переписку</div>' +
+    '</div>';
   $('inputArea').style.display = 'none';
-  $('infoContent').innerHTML = '<div class="info-empty">Информация о собеседнике появится здесь</div>';
+  $('infoContent').innerHTML =
+    '<div class="info-empty">' +
+      '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
+      '<div>Информация о собеседнике появится здесь</div>' +
+    '</div>';
 };
 
 $('infoBtn').onclick = () => app.classList.toggle('info-open');
@@ -1403,15 +1795,17 @@ $('infoCloseBtn').onclick = () => app.classList.remove('info-open');
 
 $('searchInput').addEventListener('input', e => {
   searchQuery = e.target.value;
-  renderUsers();
+  renderContacts();
 });
 
-/* ==================== Запуск ==================== */
-setInterval(poll, 1500);
+/* ==================== Поллинг (страховка) ==================== */
 setInterval(async () => {
-  await loadUsers();
-  if (current) await loadInfo(current);
-}, 5000);
+  await loadContacts();
+  if (current) {
+    await refreshDialog();
+    await loadInfo(current);
+  }
+}, 6000);
 
 init();
 </script>
