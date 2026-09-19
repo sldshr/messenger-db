@@ -338,13 +338,11 @@ SHARED_CSS = r"""
   .icon.xl  { width: 28px; height: 28px; stroke-width: 1.7; }
   .icon.huge{ width: 42px; height: 42px; stroke-width: 1.5; }
 
-  /* Topbar */
   .topbar {
     background: linear-gradient(#fbfcfd, #dce3ea);
     border-bottom: 1px solid #b7c2cd;
     box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     position: sticky; top: 0; z-index: 50;
-    animation: fadeIn 0.3s ease both;
   }
   .topbar-inner { display: flex; align-items: center; gap: 12px; height: 56px; }
   .logo {
@@ -386,7 +384,6 @@ SHARED_CSS = r"""
                        box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
-  /* Sections */
   .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; }
   .section:nth-of-type(even) { background: #f6f8fa; }
   .section h2 {
@@ -402,7 +399,6 @@ SHARED_CSS = r"""
     padding: 22px 20px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
     transition: transform 0.2s ease, box-shadow 0.2s ease;
-    animation: fadeUp 0.45s ease both;
   }
   .card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10), inset 0 1px 0 #fff; }
   .card .ico {
@@ -419,7 +415,6 @@ SHARED_CSS = r"""
   .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
   .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
 
-  /* FAQ */
   .faq { max-width: 760px; margin: 0 auto; }
   .faq details {
     background: #fff; border: 1px solid #cfd7df; border-radius: 5px;
@@ -456,7 +451,6 @@ SHARED_CSS = r"""
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
 
-  /* Footer */
   footer {
     background: #2b3a4a; color: #b8c4ce;
     padding: 44px 0 26px; font-size: 13px;
@@ -496,8 +490,7 @@ SHARED_CSS = r"""
   footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   footer .foot-bottom a { color: #9db8d3; }
 
-  /* Page wrappers */
-  .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; animation: fadeUp 0.4s ease both; }
+  .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; }
   .page-head { margin-bottom: 28px; }
   .page-head h1 {
     font-size: 32px; font-weight: normal; color: #23374b;
@@ -509,7 +502,6 @@ SHARED_CSS = r"""
     padding: 26px 28px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
     margin-bottom: 16px;
-    animation: fadeUp 0.45s ease both;
   }
   .page-card h2 { font-size: 18px; margin: 0 0 12px; color: #23374b; font-weight: bold; }
   .page-card p, .page-card li { color: #47586c; margin: 0 0 10px; }
@@ -624,29 +616,22 @@ __SHARED_CSS__
     text-transform: uppercase; font-weight: bold;
     color: #3a5169;
     margin-bottom: 24px;
-    animation: fadeUp 0.5s ease both;
   }
   .hero .eyebrow .icon { width: 13px; height: 13px; color: #3f6fa8; }
   .hero h1 {
     font-size: 46px; font-weight: normal; margin: 0 0 18px;
     color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.12;
     letter-spacing: 0.4px;
-    animation: fadeUp 0.55s ease 0.05s both;
   }
   .hero h1 b { color: #3f6fa8; font-weight: bold; }
   .hero p {
     max-width: 620px; margin: 0 auto 32px;
     color: #4a5f74; font-size: 16px;
-    animation: fadeUp 0.55s ease 0.12s both;
   }
-  .hero-actions {
-    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
-    animation: fadeUp 0.55s ease 0.2s both;
-  }
+  .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
   .hero-meta {
     margin-top: 26px; font-size: 12px; color: #5a6f83;
     display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
-    animation: fadeUp 0.55s ease 0.28s both;
   }
   .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
   .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
@@ -1223,7 +1208,6 @@ __SHARED_CSS__
   .topline {
     padding: 16px 22px;
     display: flex; align-items: center;
-    animation: fadeIn 0.35s ease both;
   }
   .topline a.logo { font-size: 20px; }
   .wrap {
@@ -1396,7 +1380,6 @@ __SHARED_CSS__
 def render_auth(active: str) -> str:
     return (AUTH_TEMPLATE
         .replace("__SHARED_CSS__", SHARED_CSS)
-        .replace("__FOOTER__", "")
         .replace("__TITLE__", "SldChat — Вход" if active == "login" else "SldChat — Регистрация")
         .replace("__LOGIN_ACTIVE__", "active" if active == "login" else "")
         .replace("__REG_ACTIVE__", "active" if active == "register" else "")
@@ -1409,7 +1392,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>SldChat</title>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -1425,18 +1408,13 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   * { scrollbar-width: none; -ms-overflow-style: none; }
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   @keyframes msgIn {
-    from { opacity: 0; transform: translateY(7px) scale(0.98); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
-  }
-  @keyframes itemIn {
-    from { opacity: 0; transform: translateX(-6px); }
-    to   { opacity: 1; transform: translateX(0); }
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
   @keyframes toastIn {
-    from { opacity: 0; transform: translateX(24px) scale(0.96); }
-    to   { opacity: 1; transform: translateX(0) scale(1); }
+    from { opacity: 0; transform: translateX(24px); }
+    to   { opacity: 1; transform: translateX(0); }
   }
   @keyframes popIn { 0% { transform: scale(0.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
   @keyframes dotPulse {
@@ -1458,9 +1436,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     grid-template-columns: 280px 1fr 260px;
     height: 100vh; width: 100vw; overflow: hidden;
     background: #e9eef3;
-    animation: fadeIn 0.3s ease both;
   }
 
+  /* ===== Sidebar ===== */
   .sidebar {
     background: #f0f3f7; border-right: 1px solid #c8d1da;
     display: flex; flex-direction: column; min-width: 0;
@@ -1483,8 +1461,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .me-line {
     padding: 6px 10px 8px;
     background: #e8edf3; border-bottom: 1px solid #d3dae0;
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 6px; font-size: 12px; color: #5a6c80;
+    font-size: 12px; color: #5a6c80;
   }
   .me-line .nick { font-weight: bold; color: #2b3a4a; }
 
@@ -1495,6 +1472,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     color: #3a5169;
     display: inline-flex; align-items: center; justify-content: center;
     transition: transform 0.12s ease, background 0.15s ease, box-shadow 0.15s ease;
+    font-family: inherit;
   }
   .icon-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); }
   .icon-btn:active { transform: translateY(0) scale(0.94); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
@@ -1514,17 +1492,14 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 
   .add-form {
     display: none; gap: 6px; margin-top: 6px;
-    opacity: 0; max-height: 0; overflow: hidden;
-    transition: opacity 0.2s ease, max-height 0.25s ease, margin 0.2s ease;
   }
-  .add-form.open { display: flex; opacity: 1; max-height: 60px; }
+  .add-form.open { display: flex; }
   .add-form input {
     flex: 1; min-width: 0;
     padding: 6px 9px; font-family: inherit; font-size: 12px;
     border: 1px solid #9aa4ae; border-radius: 3px;
     background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
-    transition: border-color 0.15s ease;
   }
   .add-form input:focus { border-color: #5a7a9a; }
   .add-form button {
@@ -1533,9 +1508,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: linear-gradient(#5b8fc4, #3f6fa8);
     color: #fff; font-family: inherit; font-size: 12px;
     display: flex; align-items: center; justify-content: center;
-    transition: transform 0.1s ease;
   }
-  .add-form button:active { transform: scale(0.94); }
   .add-msg { font-size: 11px; margin-top: 5px; min-height: 14px; color: #7a8695; }
   .add-msg.err { color: #c22; }
   .add-msg.ok  { color: #2f8f3d; }
@@ -1552,7 +1525,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     border: 1px solid #b5bec8; border-radius: 14px;
     background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
-    transition: border-color 0.15s ease;
   }
   .search input:focus { border-color: #5a7a9a; }
 
@@ -1562,10 +1534,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     border-bottom: 1px solid #dde3e9;
     background: #f6f8fa; cursor: pointer;
     min-width: 0;
-    transition: background 0.15s ease, transform 0.12s ease;
-    animation: itemIn 0.22s ease both;
+    transition: background 0.12s ease;
   }
-  .user-item:hover  { background: #eaf0f6; transform: translateX(2px); }
+  .user-item:hover  { background: #eaf0f6; }
   .user-item.active { background: #d3e0ec; }
   .user-item .row1 {
     display: flex; justify-content: space-between; align-items: center; gap: 6px;
@@ -1578,7 +1549,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .user-item .nick .dot {
     width: 7px; height: 7px; border-radius: 50%;
     background: #b5bec8; flex-shrink: 0;
-    transition: background 0.2s ease;
   }
   .user-item .nick .dot.on { background: #4caf50; animation: dotPulse 2s ease-in-out infinite; }
   .user-item .time { font-size: 10px; color: #8a94a0; flex-shrink: 0; }
@@ -1590,16 +1560,15 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: #3f6fa8; color: #fff; font-size: 10px;
     border-radius: 9px; padding: 1px 6px; min-width: 18px;
     text-align: center; margin-left: 4px;
-    animation: popIn 0.3s ease;
   }
 
   .empty-list {
     padding: 22px 14px; text-align: center; color: #98a2ad;
     font-size: 12px;
     display: flex; flex-direction: column; align-items: center; gap: 10px;
-    animation: fadeIn 0.4s ease both;
   }
 
+  /* ===== Chat ===== */
   .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
@@ -1614,7 +1583,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   .chat-header .sub {
     font-size: 11px; color: #7a8695; font-weight: normal; margin-top: 1px;
-    transition: color 0.2s ease;
   }
   .chat-header .sub.online { color: #2f8f3d; font-weight: bold; }
   .mobile-only { display: none; }
@@ -1624,14 +1592,14 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background:
       radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%),
       #fbfcfd;
+    -webkit-overflow-scrolling: touch;
   }
   .empty {
     color: #a2aab3; text-align: center; margin-top: 60px; font-size: 13px;
     display: flex; flex-direction: column; align-items: center; gap: 14px;
-    animation: fadeIn 0.4s ease both;
   }
 
-  .date-sep { text-align: center; margin: 14px 0 10px; animation: fadeIn 0.25s ease both; }
+  .date-sep { text-align: center; margin: 14px 0 10px; }
   .date-sep span {
     background: #eef2f6; color: #6f7c8b;
     padding: 3px 11px; border-radius: 10px; font-size: 11px;
@@ -1640,7 +1608,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 
   .msg-row {
     display: flex; margin-bottom: 4px; align-items: flex-end; gap: 6px;
-    animation: msgIn 0.22s ease-out both;
+    animation: msgIn 0.18s ease-out both;
   }
   .msg-row.mine { justify-content: flex-end; }
   .msg-bubble {
@@ -1651,9 +1619,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     font-size: 13px; line-height: 1.4;
     word-wrap: break-word; white-space: pre-wrap;
     color: #22303e;
-    transition: box-shadow 0.18s ease;
   }
-  .msg-bubble:hover { box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
   .msg-row.mine .msg-bubble {
     background: #d3e6c8; border-color: #bed7ad;
     border-radius: 14px 14px 4px 14px;
@@ -1673,12 +1639,8 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
     max-height: 120px; min-height: 34px; line-height: 1.4;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
-  .input-area textarea:focus {
-    border-color: #5a7a9a;
-    box-shadow: inset 0 1px 2px rgba(0,0,0,0.06), 0 0 0 3px rgba(90,122,154,0.12);
-  }
+  .input-area textarea:focus { border-color: #5a7a9a; }
   .input-area button {
     padding: 8px 16px; border-radius: 16px;
     border: 1px solid #35597f; cursor: pointer;
@@ -1686,12 +1648,12 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     color: #fff; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
     display: flex; align-items: center; gap: 6px;
-    transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
+    transition: transform 0.1s ease, background 0.15s ease;
   }
-  .input-area button:hover { background: linear-gradient(#699bcd, #4577b1);
-                             box-shadow: 0 3px 10px rgba(63,111,168,0.35); }
+  .input-area button:hover { background: linear-gradient(#699bcd, #4577b1); }
   .input-area button:active { transform: scale(0.96); }
 
+  /* ===== Info panel ===== */
   .info-panel {
     background: #f0f3f7; border-left: 1px solid #c8d1da;
     padding: 16px 16px; overflow-y: auto; min-width: 0;
@@ -1700,12 +1662,10 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .info-empty {
     color: #98a2ad; text-align: center; margin-top: 40px; font-size: 12px;
     display: flex; flex-direction: column; align-items: center; gap: 12px;
-    animation: fadeIn 0.4s ease both;
   }
   .info-head {
     text-align: center; padding-bottom: 16px;
     border-bottom: 1px solid #dbe1e7; margin-bottom: 16px;
-    animation: fadeIn 0.35s ease both;
   }
   .info-head .avatar-none {
     width: 54px; height: 54px; margin: 0 auto 10px;
@@ -1713,10 +1673,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background: linear-gradient(#e4ebf2, #c8d3de);
     border: 1px solid #b7c2cd;
     display: flex; align-items: center; justify-content: center;
-    color: #3f6fa8; box-shadow: inset 0 1px 0 #fff;
-    transition: transform 0.25s ease;
+    color: #3f6fa8;
+    box-shadow: inset 0 1px 0 #fff;
   }
-  .info-head .avatar-none:hover { transform: rotate(-4deg) scale(1.05); }
   .info-head .name {
     font-size: 16px; font-weight: bold; color: #23374b;
     word-break: break-all;
@@ -1727,7 +1686,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     display: flex; justify-content: space-between;
     padding: 8px 0; border-bottom: 1px solid #e0e6ec;
     font-size: 12px; gap: 8px;
-    animation: fadeIn 0.4s ease both;
   }
   .info-row .k { color: #7a8695; flex-shrink: 0; }
   .info-row .v { color: #2b3a4a; text-align: right; word-break: break-word; }
@@ -1747,26 +1705,142 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
+  /* =============================================
+     МОБИЛЬНАЯ ВЕРСИЯ
+     ============================================= */
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; position: relative; }
-    .sidebar { border-right: none; }
+    .sidebar { border-right: none; padding-bottom: env(safe-area-inset-bottom); }
     .chat { display: none; }
     .info-panel {
       position: fixed; top: 0; right: 0; bottom: 0;
-      width: min(300px, 85vw); z-index: 40;
+      width: min(360px, 92vw); z-index: 40;
       transform: translateX(100%);
-      transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
-      box-shadow: -4px 0 14px rgba(0,0,0,0.18);
+      transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+      box-shadow: -8px 0 24px rgba(0,0,0,0.25);
       border-left: 1px solid #b0bac4;
+      padding-top: calc(16px + env(safe-area-inset-top));
+      padding-bottom: calc(16px + env(safe-area-inset-bottom));
     }
     .app.chat-open .sidebar { display: none; }
     .app.chat-open .chat { display: flex; }
     .app.info-open .info-panel { transform: translateX(0); }
     .info-panel .close-btn {
       display: inline-flex; float: right; margin: -4px -4px 0 0;
+      padding: 8px;
     }
+    .info-panel .close-btn .icon { width: 18px; height: 18px; }
     .mobile-only { display: inline-flex; }
-    .msg-bubble { max-width: 82%; }
+
+    /* === Sidebar === */
+    .sb-header {
+      padding: 12px 14px;
+      padding-top: calc(12px + env(safe-area-inset-top));
+    }
+    .logo-mini { font-size: 18px; gap: 8px; }
+    .logo-mini .icon { width: 22px; height: 22px; }
+    .sb-header .icon-btn { padding: 9px; }
+    .sb-header .icon-btn .icon { width: 20px; height: 20px; }
+
+    .me-line { padding: 8px 14px; font-size: 13px; }
+
+    .add-wrap { padding: 12px 14px; }
+    .add-btn {
+      padding: 12px 14px; font-size: 15px;
+      border-radius: 6px;
+      min-height: 46px;
+    }
+    .add-btn .icon { width: 18px; height: 18px; }
+    .add-form { margin-top: 8px; gap: 8px; }
+    .add-form input {
+      padding: 11px 14px; font-size: 15px; border-radius: 6px;
+      min-height: 46px;
+    }
+    .add-form button { padding: 0 16px; min-height: 46px; border-radius: 6px; }
+    .add-form button .icon { width: 18px; height: 18px; }
+
+    .search { padding: 10px 14px; }
+    .search input {
+      padding: 11px 14px 11px 36px; font-size: 15px; border-radius: 20px;
+      min-height: 42px;
+    }
+    .search-wrap .icon { left: 12px; width: 16px; height: 16px; }
+
+    .user-item { padding: 14px 16px; border-bottom: 1px solid #d3dae0; }
+    .user-item .nick { font-size: 15px; gap: 8px; }
+    .user-item .nick .dot { width: 9px; height: 9px; }
+    .user-item .time { font-size: 11px; }
+    .user-item .preview { font-size: 13px; margin-top: 4px; }
+    .user-item .badge { font-size: 11px; padding: 2px 7px; min-width: 20px; }
+
+    .empty-list { padding: 50px 20px; font-size: 14px; }
+    .empty-list .icon.huge { width: 52px; height: 52px; }
+
+    /* === Chat === */
+    .chat-header {
+      padding: 10px 12px;
+      padding-top: calc(10px + env(safe-area-inset-top));
+      min-height: 60px;
+      gap: 8px;
+    }
+    .chat-header .title { font-size: 16px; }
+    .chat-header .sub { font-size: 12px; margin-top: 2px; }
+    .chat-header .icon-btn { padding: 9px; }
+    .chat-header .icon-btn .icon { width: 22px; height: 22px; }
+
+    .messages {
+      padding: 16px 12px;
+      padding-bottom: 8px;
+    }
+    .msg-bubble {
+      max-width: 85%;
+      font-size: 14px;
+      padding: 9px 13px;
+      border-radius: 16px 16px 16px 4px;
+    }
+    .msg-row.mine .msg-bubble { border-radius: 16px 16px 4px 16px; }
+    .msg-meta { font-size: 11px; margin-top: 4px; }
+    .date-sep { margin: 16px 0 12px; }
+    .date-sep span { font-size: 12px; padding: 4px 12px; }
+
+    .empty { margin-top: 40px; font-size: 14px; }
+    .empty .icon.huge { width: 52px; height: 52px; }
+
+    .input-area {
+      padding: 8px 10px;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom));
+      gap: 6px;
+      align-items: flex-end;
+    }
+    .input-area textarea {
+      padding: 10px 14px;
+      font-size: 15px;
+      min-height: 42px;
+      border-radius: 21px;
+      max-height: 100px;
+    }
+    .input-area button {
+      width: 42px; height: 42px;
+      padding: 0;
+      border-radius: 50%;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .input-area button .btn-label { display: none; }
+    .input-area button .icon { width: 18px; height: 18px; }
+
+    /* === Info panel === */
+    .info-head .avatar-none { width: 64px; height: 64px; }
+    .info-head .name { font-size: 18px; }
+    .info-head .status { font-size: 13px; margin-top: 6px; }
+    .info-row { font-size: 13px; padding: 10px 0; }
+
+    .toast-wrap { bottom: calc(16px + env(safe-area-inset-bottom)); right: 12px; left: 12px; }
+    .toast { max-width: none; }
+  }
+
+  @media (max-width: 380px) {
+    .me-line { display: none; }
   }
 </style>
 </head>
@@ -1834,9 +1908,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 
     <div class="input-area" id="inputArea" style="display:none">
       <textarea id="msgInput" placeholder="Введите сообщение..." rows="1"></textarea>
-      <button id="sendBtn">
+      <button id="sendBtn" title="Отправить">
         <svg class="icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-        Отправить
+        <span class="btn-label">Отправить</span>
       </button>
     </div>
   </main>
@@ -1867,6 +1941,10 @@ let searchQuery = '';
 let currentInfo = null;
 let ws = null;
 let wsReconnectTimer = null;
+
+/* signature-кэш чтобы не перерисовывать DOM без причины */
+let lastContactsSig = '';
+let lastInfoSig = '';
 
 const $ = id => document.getElementById(id);
 const app = $('app');
@@ -1905,7 +1983,7 @@ function dayLabel(ts) {
   return pad2(d.getDate()) + '.' + pad2(d.getMonth() + 1) + '.' + d.getFullYear();
 }
 function scrollIfNearBottom(el) {
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 160;
 }
 function toast(msg) {
   const el = document.createElement('div');
@@ -1918,6 +1996,21 @@ function toast(msg) {
   }, 3000);
 }
 
+/* ---------- подписи состояния ---------- */
+function contactsSignature(data) {
+  let s = '';
+  for (const u of data) {
+    s += u.nick + '|' + (u.online ? 1 : 0) + '|' + (u.unread || 0) + '|'
+       + (u.last ? u.last.id : 0) + '\n';
+  }
+  return s;
+}
+function infoSignature(i) {
+  return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0)
+       + '|' + (i.msg_count || 0);
+}
+
+/* ---------- WebSocket ---------- */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); }
@@ -1959,24 +2052,23 @@ function handleWS(d) {
     }
     loadContacts();
   } else if (d.type === 'presence') {
-    updatePresence(d.nick, d.online);
-    loadContacts();
+    const u = usersCache.find(x => x.nick === d.nick);
+    if (u) {
+      u.online = d.online;
+      lastContactsSig = '';   // форсим обновление
+      renderContacts();
+    }
+    if (current === d.nick) {
+      currentInfo = Object.assign({}, currentInfo || {}, { online: d.online });
+      updateChatSubtitle();
+    }
   } else if (d.type === 'contact_added') {
     toast('Новый контакт: ' + d.nick);
     loadContacts();
   }
 }
 
-function updatePresence(nick, online) {
-  const u = usersCache.find(x => x.nick === nick);
-  if (u) u.online = online;
-  renderContacts();
-  if (current === nick) {
-    currentInfo = { ...(currentInfo || {}), online };
-    updateChatSubtitle();
-  }
-}
-
+/* ---------- init ---------- */
 async function init() {
   const r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
@@ -1987,16 +2079,22 @@ async function init() {
   await loadContacts();
 }
 
+/* ---------- контакты ---------- */
 async function loadContacts() {
   const r = await fetch('/api/contacts');
   if (!r.ok) { location.href = '/'; return; }
   const d = await r.json();
   usersCache = d.contacts || [];
+  const sig = contactsSignature(usersCache);
+  if (sig === lastContactsSig) return;   // ничего не поменялось — не трогаем DOM
+  lastContactsSig = sig;
   renderContacts();
 }
 
 function renderContacts() {
   const list = $('userList');
+  const scrollTop = list.scrollTop;   // сохраняем позицию
+
   list.innerHTML = '';
   const q = searchQuery.trim().toLowerCase();
   const filtered = q ? usersCache.filter(u => u.nick.toLowerCase().includes(q)) : usersCache;
@@ -2008,6 +2106,7 @@ function renderContacts() {
       '<svg class="icon huge" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>' +
       '<div>' + (q ? 'Ничего не найдено' : 'Пока нет контактов.<br>Нажмите «Добавить контакт».') + '</div>';
     list.appendChild(e);
+    list.scrollTop = scrollTop;
     return;
   }
   for (const u of filtered) {
@@ -2031,18 +2130,23 @@ function renderContacts() {
     div.onclick = () => openDialog(u.nick);
     list.appendChild(div);
   }
+  list.scrollTop = scrollTop;
 }
 
+/* ---------- диалог ---------- */
 async function openDialog(nick) {
   current = nick;
   lastIds[nick] = 0;
   renderedIds.clear();
+  lastInfoSig = '';   // форсим обновление инфы при смене собеседника
+
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
   $('messages').innerHTML = '';
   $('inputArea').style.display = 'flex';
   app.classList.add('chat-open');
   app.classList.remove('info-open');
+
   await Promise.all([loadInfo(nick), refreshDialog()]);
   await loadContacts();
   $('msgInput').focus();
@@ -2056,6 +2160,8 @@ async function refreshDialog() {
   if (!r.ok) return;
   const d = await r.json();
   if (!d.ok || current !== nick) return;
+  if (!d.messages || !d.messages.length) return;   // ничего нового — не трогаем DOM
+
   const box = $('messages');
   const wasNearBottom = scrollIfNearBottom(box);
   let added = false;
@@ -2100,6 +2206,7 @@ async function markRead(nick) {
   loadContacts();
 }
 
+/* ---------- отправка ---------- */
 async function send() {
   if (!current) return;
   const inp = $('msgInput');
@@ -2119,9 +2226,9 @@ async function send() {
     appendMessage(d.message);
   }
   loadContacts();
-  loadInfo(current);
 }
 
+/* ---------- инфо ---------- */
 async function loadInfo(nick) {
   if (!nick) {
     $('infoContent').innerHTML =
@@ -2129,6 +2236,7 @@ async function loadInfo(nick) {
         '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
         '<div>Информация о собеседнике появится здесь</div>' +
       '</div>';
+    lastInfoSig = '';
     return;
   }
   const r = await fetch('/api/user/' + encodeURIComponent(nick) + '/info');
@@ -2136,14 +2244,18 @@ async function loadInfo(nick) {
   const d = await r.json();
   if (!d.ok) return;
   const i = d.info;
+  const sig = infoSignature(i);
+  if (sig === lastInfoSig) return;   // не перерисовываем, если не поменялось
+  lastInfoSig = sig;
   currentInfo = { online: i.online, lastSeen: i.last_seen };
+
   const status = i.online
     ? '<div class="status online">В сети</div>'
     : '<div class="status">Был(а): ' + esc(fmtLastSeen(i.last_seen)) + '</div>';
   $('infoContent').innerHTML =
     '<div class="info-head">' +
       '<div class="avatar-none">' +
-        '<svg class="icon" style="width:26px;height:26px" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+        '<svg class="icon" style="width:30px;height:30px" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
       '</div>' +
       '<div class="name">' + esc(i.nick) + '</div>' +
       status +
@@ -2167,10 +2279,11 @@ function updateChatSubtitle() {
   }
 }
 
+/* ---------- добавление ---------- */
 $('addBtn').onclick = () => {
   const f = $('addForm');
   f.classList.toggle('open');
-  if (f.classList.contains('open')) setTimeout(() => $('addInput').focus(), 80);
+  if (f.classList.contains('open')) setTimeout(() => $('addInput').focus(), 60);
   $('addMsg').textContent = '';
 };
 
@@ -2190,8 +2303,9 @@ $('addForm').onsubmit = async e => {
     msg.className = 'add-msg ok';
     msg.textContent = 'Добавлено: ' + nick;
     inp.value = '';
+    lastContactsSig = '';
     await loadContacts();
-    setTimeout(() => { $('addForm').classList.remove('open'); $('addMsg').textContent = ''; }, 900);
+    setTimeout(() => { $('addForm').classList.remove('open'); $('addMsg').textContent = ''; }, 800);
     openDialog(nick);
   } else {
     msg.className = 'add-msg err';
@@ -2199,9 +2313,12 @@ $('addForm').onsubmit = async e => {
   }
 };
 
+/* ---------- UI ---------- */
 $('sendBtn').onclick = send;
 $('msgInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 900) {
+    e.preventDefault(); send();
+  }
 });
 $('msgInput').addEventListener('input', e => {
   const el = e.target;
@@ -2215,6 +2332,7 @@ $('logoutBtn').onclick = async () => {
 };
 $('backBtn').onclick = () => {
   current = null;
+  lastInfoSig = '';
   app.classList.remove('chat-open');
   app.classList.remove('info-open');
   $('chatTitle').textContent = 'Выберите собеседника';
@@ -2235,10 +2353,12 @@ $('infoBtn').onclick = () => app.classList.toggle('info-open');
 $('infoCloseBtn').onclick = () => app.classList.remove('info-open');
 $('searchInput').addEventListener('input', e => { searchQuery = e.target.value; renderContacts(); });
 
+/* ---------- лёгкий фон-поллинг (страховка на случай обрыва WS) ---------- */
 setInterval(async () => {
+  if (ws && ws.readyState === 1) return;   // WS жив — не дублируем нагрузку
   await loadContacts();
   if (current) { await refreshDialog(); await loadInfo(current); }
-}, 6000);
+}, 30000);
 
 init();
 </script>
