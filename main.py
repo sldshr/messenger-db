@@ -12,9 +12,11 @@ from typing import Dict, List, Optional, Set
 
 import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 app = FastAPI(title="SldChat")
+
+START_TIME = time.time()
 
 # ================== ХРАНИЛИЩЕ (в оперативке) ==================
 users: Dict[str, dict] = {}
@@ -175,6 +177,11 @@ async def api_me(request: Request):
     return {"ok": True, "nick": nick}
 
 
+@app.get("/api/server-info")
+async def api_server_info():
+    return {"ok": True, "started": START_TIME}
+
+
 @app.post("/api/contacts/add")
 async def api_contacts_add(request: Request, nick: str = Form(...)):
     me = current_user(request)
@@ -204,6 +211,26 @@ async def api_contacts_add(request: Request, nick: str = Form(...)):
     )
     return {"ok": True, "contact": {"nick": nick, "last": None, "unread": 0,
                                     "online": info["online"], "last_seen": info["last_seen"]}}
+
+
+@app.post("/api/contacts/remove")
+async def api_contacts_remove(request: Request, nick: str = Form(...)):
+    me = current_user(request)
+    if not me:
+        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+
+    nick = nick.strip()
+    if nick not in contacts.get(me, set()):
+        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=400)
+
+    contacts.get(me, set()).discard(nick)
+    contacts.get(nick, set()).discard(me)
+
+    await asyncio.gather(
+        send_ws(nick, {"type": "contact_removed", "nick": me}),
+        send_ws(me, {"type": "contact_removed", "nick": nick}),
+    )
+    return {"ok": True}
 
 
 @app.get("/api/contacts")
@@ -294,6 +321,47 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     payload = {"type": "message", "message": msg}
     await asyncio.gather(send_ws(to, payload), send_ws(me, payload))
     return {"ok": True, "message": msg}
+
+
+# ================== FAVICON / OG ==================
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="14" fill="#3f6fa8"/>
+<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"
+      fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/>
+</svg>"""
+
+OG_IMAGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+<defs>
+  <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#d5dfe9"/>
+    <stop offset="1" stop-color="#a8b6c4"/>
+  </linearGradient>
+</defs>
+<rect width="1200" height="630" fill="url(#g)"/>
+<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">
+  <text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>
+  <text x="600" y="380" font-size="36" fill="#2b3a4a">Быстрый мессенджер для команд</text>
+  <text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · добавление по нику · без рекламы</text>
+</g>
+</svg>"""
+
+
+@app.get("/favicon.svg")
+async def favicon():
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/favicon.ico")
+async def favicon_ico():
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/og-image.svg")
+async def og_image():
+    return Response(content=OG_IMAGE_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ================== SHARED CSS ==================
@@ -451,6 +519,25 @@ SHARED_CSS = r"""
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
 
+  /* Language bar */
+  .lang-bar {
+    background: #e6ebf1;
+    border-top: 1px solid #d3dae0;
+    padding: 14px 0;
+  }
+  .lang-bar .container {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-size: 13px; color: #6f7c8b;
+  }
+  .lang-bar select {
+    padding: 6px 10px; font-family: inherit; font-size: 13px;
+    border: 1px solid #b5bec8; border-radius: 4px;
+    background: #fff; color: #2b3a4a; cursor: pointer;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .lang-bar select:focus { outline: none; border-color: #5a7a9a; }
+
+  /* Footer */
   footer {
     background: #2b3a4a; color: #b8c4ce;
     padding: 44px 0 26px; font-size: 13px;
@@ -480,6 +567,28 @@ SHARED_CSS = r"""
   footer .foot-col li { margin-bottom: 7px; }
   footer .foot-col a { color: #b8c4ce; font-size: 13px; transition: color 0.14s ease; }
   footer .foot-col a:hover { color: #fff; }
+  footer .foot-status {
+    display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+    padding: 16px 0;
+    border-top: 1px solid #3d4d5d;
+    font-size: 12px; color: #8fa3b6;
+  }
+  footer .foot-status b { color: #b8c4ce; font-weight: normal; }
+  footer .foot-status code {
+    font-family: Consolas, "Courier New", monospace;
+    background: #1f2c39; padding: 2px 8px; border-radius: 3px;
+    color: #cfe0f0; font-size: 11px;
+  }
+  footer .foot-status .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #4caf50; margin-right: 6px;
+    animation: dotPulse 2s ease-in-out infinite;
+    vertical-align: 1px;
+  }
+  @keyframes dotPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
+    50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
+  }
   footer .foot-bottom {
     border-top: 1px solid #3d4d5d;
     padding-top: 20px;
@@ -544,42 +653,82 @@ FOOTER_HTML = """
           <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
           Sld<span>Chat</span>
         </div>
-        <p>SldChat — независимый мессенджер для небольших команд, созданный командой SldChat Team.</p>
+        <p data-i18n="foot_brand">SldChat — независимый мессенджер для небольших команд, созданный командой SldChat Team.</p>
       </div>
       <div class="foot-col">
-        <h4>Продукт</h4>
+        <h4 data-i18n="foot_product">Продукт</h4>
         <ul>
-          <li><a href="/#features">Возможности</a></li>
-          <li><a href="/#servers">Серверы</a></li>
-          <li><a href="/register">Регистрация</a></li>
-          <li><a href="/login">Вход</a></li>
+          <li><a href="/#features" data-i18n="nav_features">Возможности</a></li>
+          <li><a href="/#servers" data-i18n="nav_servers">Серверы</a></li>
+          <li><a href="/register" data-i18n="btn_register">Регистрация</a></li>
+          <li><a href="/login" data-i18n="btn_login">Вход</a></li>
         </ul>
       </div>
       <div class="foot-col">
-        <h4>Компания</h4>
+        <h4 data-i18n="foot_company">Компания</h4>
         <ul>
-          <li><a href="/privacy">Приватность</a></li>
-          <li><a href="/support">Поддержка</a></li>
-          <li><a href="/#faq">FAQ</a></li>
+          <li><a href="/privacy" data-i18n="foot_privacy">Приватность</a></li>
+          <li><a href="/support" data-i18n="foot_support">Поддержка</a></li>
+          <li><a href="/#faq" data-i18n="foot_faq">FAQ</a></li>
         </ul>
       </div>
       <div class="foot-col">
-        <h4>Связь</h4>
+        <h4 data-i18n="foot_contact">Связь</h4>
         <ul>
-          <li><a href="mailto:sldshr.confirmation@gmail.com">Почта</a></li>
+          <li><a href="mailto:sldshr.confirmation@gmail.com" data-i18n="foot_mail">Почта</a></li>
           <li><a href="https://discord.com/users/sldshr" target="_blank" rel="noopener">Discord: sldshr</a></li>
         </ul>
       </div>
     </div>
+    <div class="foot-status">
+      <span><span class="dot"></span><b data-i18n="foot_status">Сервер:</b> <code id="srvHost">—</code></span>
+      <span><b data-i18n="foot_uptime">Аптайм:</b> <code id="srvUptime">—</code></span>
+    </div>
     <div class="foot-bottom">
-      <div>© 2026 SldChat Team. Все права защищены.</div>
+      <div data-i18n="foot_copy">© 2026 SldChat Team. Все права защищены.</div>
       <div class="legal">
-        <a href="/privacy">Политика приватности</a>
-        <a href="/support">Поддержка</a>
+        <a href="/privacy" data-i18n="foot_privacy">Приватность</a>
+        <a href="/support" data-i18n="foot_support">Поддержка</a>
       </div>
     </div>
   </div>
 </footer>
+<script>
+(function(){
+  // uptime + host
+  var started = null;
+  function fmtUp(sec){
+    sec = Math.floor(sec);
+    var d = Math.floor(sec/86400); sec %= 86400;
+    var h = Math.floor(sec/3600);  sec %= 3600;
+    var m = Math.floor(sec/60);    sec %= 60;
+    var out = '';
+    if (d) out += d + 'д ';
+    if (d || h) out += h + 'ч ';
+    if (d || h || m) out += m + 'м ';
+    out += sec + 'с';
+    return out;
+  }
+  function tick(){
+    var el = document.getElementById('srvUptime');
+    if (!el || started === null) return;
+    el.textContent = fmtUp((Date.now()/1000) - started);
+  }
+  var hostEl = document.getElementById('srvHost');
+  if (hostEl) hostEl.textContent = location.host;
+  fetch('/api/server-info').then(function(r){return r.json();}).then(function(d){
+    if (d && d.ok) { started = d.started; tick(); setInterval(tick, 1000); }
+  }).catch(function(){});
+})();
+</script>
+"""
+
+
+HEAD_COMMON = """
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<link rel="mask-icon" href="/favicon.svg" color="#3f6fa8">
+<meta name="theme-color" content="#3f6fa8">
 """
 
 
@@ -591,6 +740,20 @@ LANDING_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SldChat — быстрый мессенджер для команд</title>
 <meta name="description" content="SldChat — независимый мессенджер: регистрация за 5 секунд, добавление по нику, мгновенная доставка через WebSocket.">
+__HEAD_COMMON__
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="SldChat">
+<meta property="og:title" content="SldChat — быстрый мессенджер для команд">
+<meta property="og:description" content="Регистрация за 5 секунд, добавление по нику, мгновенная доставка через WebSocket. Без рекламы.">
+<meta property="og:url" content="__BASE_URL__">
+<meta property="og:image" content="__BASE_URL__og-image.svg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:locale" content="ru_RU">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="SldChat — быстрый мессенджер для команд">
+<meta name="twitter:description" content="Регистрация за 5 секунд, добавление по нику, мгновенная доставка.">
+<meta name="twitter:image" content="__BASE_URL__og-image.svg">
 <style>
 __SHARED_CSS__
 
@@ -718,13 +881,13 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="#features">Возможности</a>
-      <a class="navlink" href="#servers">Серверы</a>
-      <a class="navlink" href="#privacy">Приватность</a>
-      <a class="navlink" href="#faq">FAQ</a>
-      <a class="navlink" href="/support">Поддержка</a>
-      <a class="btn" href="/login">Войти</a>
-      <a class="btn btn-primary" href="/register">Регистрация</a>
+      <a class="navlink" href="#features" data-i18n="nav_features">Возможности</a>
+      <a class="navlink" href="#servers" data-i18n="nav_servers">Серверы</a>
+      <a class="navlink" href="#privacy" data-i18n="nav_privacy">Приватность</a>
+      <a class="navlink" href="#faq" data-i18n="nav_faq">FAQ</a>
+      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
+      <a class="btn" href="/login" data-i18n="btn_login">Войти</a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
     </nav>
   </div>
 </header>
@@ -733,27 +896,27 @@ __SHARED_CSS__
   <div class="container">
     <span class="eyebrow">
       <svg class="icon" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      Быстрая доставка через WebSocket
+      <span data-i18n="hero_eyebrow">Быстрая доставка через WebSocket</span>
     </span>
-    <h1>Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
-    <p>Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику,
+    <h1 data-i18n-html="hero_title">Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
+    <p data-i18n="hero_sub">Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику,
     мгновенная доставка сообщений. Работает на телефоне и на компьютере.</p>
     <div class="hero-actions">
-      <a class="btn btn-primary btn-lg" href="/register">Создать аккаунт</a>
-      <a class="btn btn-lg" href="/login">У меня уже есть аккаунт</a>
+      <a class="btn btn-primary btn-lg" href="/register" data-i18n="hero_cta1">Создать аккаунт</a>
+      <a class="btn btn-lg" href="/login" data-i18n="hero_cta2">У меня уже есть аккаунт</a>
     </div>
     <div class="hero-meta">
       <span>
         <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-        Без e-mail и телефона
+        <span data-i18n="hero_m1">Без e-mail и телефона</span>
       </span>
       <span>
         <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-        Без рекламы
+        <span data-i18n="hero_m2">Без рекламы</span>
       </span>
       <span>
         <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
-        Бесплатно
+        <span data-i18n="hero_m3">Бесплатно</span>
       </span>
     </div>
   </div>
@@ -761,50 +924,50 @@ __SHARED_CSS__
 
 <section id="features" class="section">
   <div class="container">
-    <h2>Возможности</h2>
-    <p class="lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
+    <h2 data-i18n="feat_h">Возможности</h2>
+    <p class="lead" data-i18n="feat_lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
     <div class="cards">
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         </div>
-        <h3>Мгновенная доставка</h3>
-        <p>Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.</p>
+        <h3 data-i18n="feat_1_h">Мгновенная доставка</h3>
+        <p data-i18n="feat_1_p">Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
         </div>
-        <h3>Добавление по нику</h3>
-        <p>Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.</p>
+        <h3 data-i18n="feat_2_h">Добавление по нику</h3>
+        <p data-i18n="feat_2_p">Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
         </div>
-        <h3>Статус «в сети»</h3>
-        <p>Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.</p>
+        <h3 data-i18n="feat_3_h">Статус «в сети»</h3>
+        <p data-i18n="feat_3_p">Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
         </div>
-        <h3>На любом устройстве</h3>
-        <p>Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.</p>
+        <h3 data-i18n="feat_4_h">На любом устройстве</h3>
+        <p data-i18n="feat_4_p">Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         </div>
-        <h3>Поиск по контактам</h3>
-        <p>Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.</p>
+        <h3 data-i18n="feat_5_h">Поиск по контактам</h3>
+        <p data-i18n="feat_5_p">Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         </div>
-        <h3>Приватность по умолчанию</h3>
-        <p>Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.</p>
+        <h3 data-i18n="feat_6_h">Приватность по умолчанию</h3>
+        <p data-i18n="feat_6_p">Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.</p>
       </div>
     </div>
   </div>
@@ -812,8 +975,8 @@ __SHARED_CSS__
 
 <section id="servers" class="section">
   <div class="container">
-    <h2>Серверы SldChat</h2>
-    <p class="lead">Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.</p>
+    <h2 data-i18n="srv_h">Серверы SldChat</h2>
+    <p class="lead" data-i18n="srv_lead">Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.</p>
 
     <div class="servers">
       <div class="server-card">
@@ -824,7 +987,7 @@ __SHARED_CSS__
           <div class="url">sldchat.fastapicloud.dev</div>
           <div class="desc">FastAPI Cloud</div>
         </div>
-        <span class="tag">Основной</span>
+        <span class="tag" data-i18n="srv_main">Основной</span>
       </div>
       <div class="server-card">
         <div class="ico">
@@ -834,13 +997,13 @@ __SHARED_CSS__
           <div class="url">sldchat.onrunxbuild.com</div>
           <div class="desc">onrunxbuild</div>
         </div>
-        <span class="tag alt">Резерв</span>
+        <span class="tag alt" data-i18n="srv_alt">Резерв</span>
       </div>
     </div>
 
     <div class="notice">
       <svg class="icon lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-      <div>
+      <div data-i18n-html="srv_notice">
         <b>Это разные серверы.</b> У каждого своя база пользователей и сообщений —
         данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу,
         зарегистрируйтесь на каждом отдельно.
@@ -851,8 +1014,8 @@ __SHARED_CSS__
 
 <section id="privacy" class="section">
   <div class="container">
-    <h2>Приватность</h2>
-    <p class="lead">Коротко о самом главном. Подробности — на отдельной странице.</p>
+    <h2 data-i18n="priv_h">Приватность</h2>
+    <p class="lead" data-i18n="priv_lead">Коротко о самом главном. Подробности — на отдельной странице.</p>
 
     <div class="privacy-mini">
       <div class="privacy-item">
@@ -860,8 +1023,8 @@ __SHARED_CSS__
           <svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         </div>
         <div>
-          <h3>Ничего не пишем на диск</h3>
-          <p>Сообщения и данные аккаунта существуют, пока работает сервер.</p>
+          <h3 data-i18n="priv_1_h">Ничего не пишем на диск</h3>
+          <p data-i18n="priv_1_p">Сообщения и данные аккаунта существуют, пока работает сервер.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -869,8 +1032,8 @@ __SHARED_CSS__
           <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
         </div>
         <div>
-          <h3>Без аналитики и рекламы</h3>
-          <p>Никаких трекеров, пикселей и сторонних скриптов.</p>
+          <h3 data-i18n="priv_2_h">Без аналитики и рекламы</h3>
+          <p data-i18n="priv_2_p">Никаких трекеров, пикселей и сторонних скриптов.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -878,8 +1041,8 @@ __SHARED_CSS__
           <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
         </div>
         <div>
-          <h3>Одна сессионная cookie</h3>
-          <p>HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.</p>
+          <h3 data-i18n="priv_3_h">Одна сессионная cookie</h3>
+          <p data-i18n="priv_3_p">HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -887,14 +1050,14 @@ __SHARED_CSS__
           <svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
         </div>
         <div>
-          <h3>Минимум данных</h3>
-          <p>Только ник и пароль. Ни e-mail, ни телефона, ни IP-логов.</p>
+          <h3 data-i18n="priv_4_h">Минимум данных</h3>
+          <p data-i18n="priv_4_p">Только ник и пароль. Ни e-mail, ни телефона, ни IP-логов.</p>
         </div>
       </div>
     </div>
 
     <a class="link-arrow" href="/privacy">
-      Почитать подробнее
+      <span data-i18n="priv_more">Почитать подробнее</span>
       <svg class="icon" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
     </a>
   </div>
@@ -902,44 +1065,50 @@ __SHARED_CSS__
 
 <section id="faq" class="section">
   <div class="container">
-    <h2>Ответы на вопросы</h2>
+    <h2 data-i18n="faq_h">Ответы на вопросы</h2>
     <div class="faq">
       <details>
-        <summary>Сколько стоит SldChat?</summary>
-        <div class="answer-wrap"><div class="answer">Нисколько. Проект полностью бесплатный, без рекламы и подписок.</div></div>
+        <summary data-i18n="faq_q1">Сколько стоит SldChat?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a1">Нисколько. Проект полностью бесплатный, без рекламы и подписок.</div></div>
       </details>
       <details>
-        <summary>Сохраняются ли мои сообщения?</summary>
-        <div class="answer-wrap"><div class="answer">Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске.
-        На диск ничего не пишется.</div></div>
+        <summary data-i18n="faq_q2">Сохраняются ли мои сообщения?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a2">Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске. На диск ничего не пишется.</div></div>
       </details>
       <details>
-        <summary>Почему я вижу только своих контактов?</summary>
-        <div class="answer-wrap"><div class="answer">В SldChat нет публичного каталога пользователей. Чтобы начать общение,
-        нажмите «Добавить контакт» и введите ник собеседника. После этого вы появитесь
-        в его списке контактов, а он — в вашем.</div></div>
+        <summary data-i18n="faq_q3">Почему я вижу только своих контактов?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a3">В SldChat нет публичного каталога пользователей. Чтобы начать общение, нажмите «Добавить контакт» и введите ник собеседника. После этого вы появитесь в его списке контактов, а он — в вашем.</div></div>
       </details>
       <details>
-        <summary>Можно ли удалять сообщения?</summary>
-        <div class="answer-wrap"><div class="answer">Нет. Отправленное сообщение остаётся в истории до перезапуска сервера.
-        Пишите осознанно.</div></div>
+        <summary data-i18n="faq_q4">Как удалить контакт?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a4">Откройте диалог с человеком и нажмите «Удалить контакт» в панели справа. Контакт исчезнет у обоих.</div></div>
       </details>
       <details>
-        <summary>Чем серверы отличаются друг от друга?</summary>
-        <div class="answer-wrap"><div class="answer">Это два независимых развёртывания. У каждого своя база
-        пользователей и сообщений, между собой они не связаны. Регистрируйтесь там, где удобно.</div></div>
+        <summary data-i18n="faq_q5">Чем серверы отличаются друг от друга?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a5">Это два независимых развёртывания. У каждого своя база пользователей и сообщений, между собой они не связаны. Регистрируйтесь там, где удобно.</div></div>
       </details>
       <details>
-        <summary>Как выйти из аккаунта?</summary>
-        <div class="answer-wrap"><div class="answer">Кнопка выхода — в шапке приложения, справа от списка контактов.</div></div>
+        <summary data-i18n="faq_q6">Как выйти из аккаунта?</summary>
+        <div class="answer-wrap"><div class="answer" data-i18n="faq_a6">Кнопка выхода — в шапке приложения, справа от списка контактов.</div></div>
       </details>
     </div>
   </div>
 </section>
 
+<div class="lang-bar">
+  <div class="container">
+    <label for="langSelect" data-i18n="lang_label">Язык / Language:</label>
+    <select id="langSelect">
+      <option value="ru">Русский</option>
+      <option value="en">English</option>
+    </select>
+  </div>
+</div>
+
 __FOOTER__
 
 <script>
+/* FAQ-аккордеон */
 document.querySelectorAll('.faq details').forEach(d => {
   d.addEventListener('toggle', () => {
     if (d.open) {
@@ -949,6 +1118,113 @@ document.querySelectorAll('.faq details').forEach(d => {
     }
   });
 });
+
+/* ============ i18n ============ */
+const I18N = {
+  ru: {
+    nav_features: "Возможности", nav_servers: "Серверы", nav_privacy: "Приватность",
+    nav_faq: "FAQ", nav_support: "Поддержка",
+    btn_login: "Войти", btn_register: "Регистрация",
+    hero_eyebrow: "Быстрая доставка через WebSocket",
+    hero_title: "Мессенджер <b>SldChat</b> —<br>общайтесь по-простому",
+    hero_sub: "Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику, мгновенная доставка сообщений. Работает на телефоне и на компьютере.",
+    hero_cta1: "Создать аккаунт", hero_cta2: "У меня уже есть аккаунт",
+    hero_m1: "Без e-mail и телефона", hero_m2: "Без рекламы", hero_m3: "Бесплатно",
+    feat_h: "Возможности", feat_lead: "Всё, что нужно для быстрого общения — и ничего лишнего.",
+    feat_1_h: "Мгновенная доставка", feat_1_p: "Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.",
+    feat_2_h: "Добавление по нику", feat_2_p: "Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.",
+    feat_3_h: "Статус «в сети»", feat_3_p: "Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.",
+    feat_4_h: "На любом устройстве", feat_4_p: "Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.",
+    feat_5_h: "Поиск по контактам", feat_5_p: "Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.",
+    feat_6_h: "Приватность по умолчанию", feat_6_p: "Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.",
+    srv_h: "Серверы SldChat", srv_lead: "Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.",
+    srv_main: "Основной", srv_alt: "Резерв",
+    srv_notice: "<b>Это разные серверы.</b> У каждого своя база пользователей и сообщений — данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу, зарегистрируйтесь на каждом отдельно.",
+    priv_h: "Приватность", priv_lead: "Коротко о самом главном. Подробности — на отдельной странице.",
+    priv_1_h: "Ничего не пишем на диск", priv_1_p: "Сообщения и данные аккаунта существуют, пока работает сервер.",
+    priv_2_h: "Без аналитики и рекламы", priv_2_p: "Никаких трекеров, пикселей и сторонних скриптов.",
+    priv_3_h: "Одна сессионная cookie", priv_3_p: "HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.",
+    priv_4_h: "Минимум данных", priv_4_p: "Только ник и пароль. Ни e-mail, ни телефона, ни IP-логов.",
+    priv_more: "Почитать подробнее",
+    faq_h: "Ответы на вопросы",
+    faq_q1: "Сколько стоит SldChat?", faq_a1: "Нисколько. Проект полностью бесплатный, без рекламы и подписок.",
+    faq_q2: "Сохраняются ли мои сообщения?", faq_a2: "Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске. На диск ничего не пишется.",
+    faq_q3: "Почему я вижу только своих контактов?", faq_a3: "В SldChat нет публичного каталога пользователей. Чтобы начать общение, нажмите «Добавить контакт» и введите ник собеседника. После этого вы появитесь в его списке контактов, а он — в вашем.",
+    faq_q4: "Как удалить контакт?", faq_a4: "Откройте диалог с человеком и нажмите «Удалить контакт» в панели справа. Контакт исчезнет у обоих.",
+    faq_q5: "Чем серверы отличаются друг от друга?", faq_a5: "Это два независимых развёртывания. У каждого своя база пользователей и сообщений, между собой они не связаны.",
+    faq_q6: "Как выйти из аккаунта?", faq_a6: "Кнопка выхода — в шапке приложения, справа от списка контактов.",
+    lang_label: "Язык / Language:",
+    foot_brand: "SldChat — независимый мессенджер для небольших команд, созданный командой SldChat Team.",
+    foot_product: "Продукт", foot_company: "Компания", foot_contact: "Связь",
+    foot_privacy: "Приватность", foot_support: "Поддержка", foot_faq: "FAQ", foot_mail: "Почта",
+    foot_status: "Сервер:", foot_uptime: "Аптайм:", foot_copy: "© 2026 SldChat Team. Все права защищены."
+  },
+  en: {
+    nav_features: "Features", nav_servers: "Servers", nav_privacy: "Privacy",
+    nav_faq: "FAQ", nav_support: "Support",
+    btn_login: "Sign in", btn_register: "Sign up",
+    hero_eyebrow: "Instant delivery via WebSocket",
+    hero_title: "Messenger <b>SldChat</b> —<br>just talk, simply",
+    hero_sub: "No useless settings. Register in 5 seconds, add people by nick, messages delivered instantly. Works on phone and desktop.",
+    hero_cta1: "Create account", hero_cta2: "I already have an account",
+    hero_m1: "No email or phone", hero_m2: "No ads", hero_m3: "Free",
+    feat_h: "Features", feat_lead: "Everything you need for quick messaging — and nothing more.",
+    feat_1_h: "Instant delivery", feat_1_p: "Messages travel over WebSocket — the other side sees them in milliseconds.",
+    feat_2_h: "Add by nick", feat_2_p: "No public directory. Type a nick — and you're in each other's contacts.",
+    feat_3_h: "Online status", feat_3_p: "See who's online right now and who was here recently.",
+    feat_4_h: "Any device", feat_4_p: "Same interface on desktop and phone — nicely adapted to the screen.",
+    feat_5_h: "Contact search", feat_5_p: "Fast search among your contacts right in the list.",
+    feat_6_h: "Privacy by default", feat_6_p: "Minimum data collected. One session cookie, no trackers.",
+    srv_h: "SldChat servers", srv_lead: "The project runs on two independent servers. Pick any — data isn't shared between them.",
+    srv_main: "Primary", srv_alt: "Backup",
+    srv_notice: "<b>These are different servers.</b> Each has its own users and messages — data is <b>not shared</b>. To use both, register on each separately.",
+    priv_h: "Privacy", priv_lead: "The essentials. Full details on a dedicated page.",
+    priv_1_h: "Nothing on disk", priv_1_p: "Messages and account data exist only while the server is running.",
+    priv_2_h: "No analytics or ads", priv_2_p: "No trackers, pixels or third-party scripts.",
+    priv_3_h: "A single session cookie", priv_3_p: "HttpOnly and SameSite — only to keep you signed in.",
+    priv_4_h: "Minimal data", priv_4_p: "Just nick and password. No email, phone or IP logs.",
+    priv_more: "Read more",
+    faq_h: "FAQ",
+    faq_q1: "How much does SldChat cost?", faq_a1: "Nothing. Completely free, no ads or subscriptions.",
+    faq_q2: "Are my messages saved?", faq_a2: "No. Everything lives in server RAM and disappears on restart. Nothing is written to disk.",
+    faq_q3: "Why do I only see my contacts?", faq_a3: "SldChat has no public user directory. Press 'Add contact' and enter the nick — you'll appear in each other's lists.",
+    faq_q4: "How do I remove a contact?", faq_a4: "Open the dialog and press 'Remove contact' in the right panel. The contact is removed for both.",
+    faq_q5: "How do servers differ?", faq_a5: "Two independent deployments. Each has its own users and messages; they're not connected.",
+    faq_q6: "How do I log out?", faq_a6: "The logout button is at the top of the chat, next to the contact list.",
+    lang_label: "Язык / Language:",
+    foot_brand: "SldChat — an independent messenger for small teams by SldChat Team.",
+    foot_product: "Product", foot_company: "Company", foot_contact: "Contact",
+    foot_privacy: "Privacy", foot_support: "Support", foot_faq: "FAQ", foot_mail: "Email",
+    foot_status: "Server:", foot_uptime: "Uptime:", foot_copy: "© 2026 SldChat Team. All rights reserved."
+  }
+};
+
+(function(){
+  var select = document.getElementById('langSelect');
+  var saved = localStorage.getItem('sld_lang') || 'ru';
+  if (select) select.value = saved;
+  applyLang(saved);
+
+  function applyLang(lang){
+    var dict = I18N[lang] || I18N.ru;
+    document.documentElement.lang = lang;
+    document.querySelectorAll('[data-i18n]').forEach(function(el){
+      var k = el.getAttribute('data-i18n');
+      if (dict[k] != null) el.textContent = dict[k];
+    });
+    document.querySelectorAll('[data-i18n-html]').forEach(function(el){
+      var k = el.getAttribute('data-i18n-html');
+      if (dict[k] != null) el.innerHTML = dict[k];
+    });
+  }
+
+  if (select) {
+    select.addEventListener('change', function(){
+      localStorage.setItem('sld_lang', select.value);
+      applyLang(select.value);
+    });
+  }
+})();
 </script>
 </body>
 </html>
@@ -962,6 +1238,7 @@ PRIVACY_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SldChat — Политика приватности</title>
+__HEAD_COMMON__
 <style>
 __SHARED_CSS__
 </style>
@@ -1083,6 +1360,7 @@ SUPPORT_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SldChat — Поддержка</title>
+__HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
@@ -1196,6 +1474,7 @@ AUTH_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
+__HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
@@ -1380,6 +1659,7 @@ __SHARED_CSS__
 def render_auth(active: str) -> str:
     return (AUTH_TEMPLATE
         .replace("__SHARED_CSS__", SHARED_CSS)
+        .replace("__HEAD_COMMON__", HEAD_COMMON)
         .replace("__TITLE__", "SldChat — Вход" if active == "login" else "SldChat — Регистрация")
         .replace("__LOGIN_ACTIVE__", "active" if active == "login" else "")
         .replace("__REG_ACTIVE__", "active" if active == "register" else "")
@@ -1394,6 +1674,9 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>SldChat</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/favicon.svg">
+<meta name="theme-color" content="#3f6fa8">
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; overscroll-behavior: none; }
@@ -1409,14 +1692,13 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
   @keyframes msgIn {
-    from { opacity: 0; transform: translateY(6px); }
+    from { opacity: 0; transform: translateY(5px); }
     to   { opacity: 1; transform: translateY(0); }
   }
   @keyframes toastIn {
     from { opacity: 0; transform: translateX(24px); }
     to   { opacity: 1; transform: translateX(0); }
   }
-  @keyframes popIn { 0% { transform: scale(0.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
   @keyframes dotPulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
@@ -1490,9 +1772,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .add-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
   .add-btn:active { transform: translateY(0) scale(0.98); }
 
-  .add-form {
-    display: none; gap: 6px; margin-top: 6px;
-  }
+  .add-form { display: none; gap: 6px; margin-top: 6px; }
   .add-form.open { display: flex; }
   .add-form input {
     flex: 1; min-width: 0;
@@ -1588,7 +1868,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .mobile-only { display: none; }
 
   .messages {
-    flex: 1; overflow-y: auto; padding: 14px 18px;
+    flex: 1; overflow-y: auto; padding: 12px 16px 8px;
     background:
       radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%),
       #fbfcfd;
@@ -1599,42 +1879,50 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 14px;
   }
 
-  .date-sep { text-align: center; margin: 14px 0 10px; }
+  .date-sep { text-align: center; margin: 10px 0 8px; }
   .date-sep span {
     background: #eef2f6; color: #6f7c8b;
-    padding: 3px 11px; border-radius: 10px; font-size: 11px;
+    padding: 2px 10px; border-radius: 10px; font-size: 10px;
     border: 1px solid #dde4eb;
   }
 
+  /* ===== Сообщения — компактнее ===== */
   .msg-row {
-    display: flex; margin-bottom: 4px; align-items: flex-end; gap: 6px;
-    animation: msgIn 0.18s ease-out both;
+    display: flex; margin-bottom: 2px; align-items: flex-end; gap: 4px;
+    animation: msgIn 0.16s ease-out both;
   }
   .msg-row.mine { justify-content: flex-end; }
   .msg-bubble {
-    max-width: min(72%, 540px);
-    padding: 7px 12px;
-    border-radius: 14px 14px 14px 4px;
-    background: #eef2f6; border: 1px solid #dde4eb;
-    font-size: 13px; line-height: 1.4;
+    max-width: min(72%, 560px);
+    padding: 5px 10px 4px;
+    border-radius: 12px 12px 12px 3px;
+    background: #eef2f6; border: 1px solid #e3e9ef;
+    font-size: 13px; line-height: 1.32;
     word-wrap: break-word; white-space: pre-wrap;
     color: #22303e;
   }
   .msg-row.mine .msg-bubble {
-    background: #d3e6c8; border-color: #bed7ad;
-    border-radius: 14px 14px 4px 14px;
+    background: #d3e6c8; border-color: #c5dcb5;
+    border-radius: 12px 12px 3px 12px;
   }
-  .msg-meta { font-size: 10px; color: #8a94a0; margin-top: 3px; }
-  .msg-row.mine .msg-meta { text-align: right; }
+  .msg-meta {
+    display: inline-block;
+    font-size: 9px; color: #8a94a0; margin-left: 8px;
+    vertical-align: bottom;
+    opacity: 0.85;
+    white-space: nowrap;
+    float: right;
+    margin-top: 4px;
+  }
 
   .input-area {
-    border-top: 1px solid #c8d1da; padding: 10px 12px;
+    border-top: 1px solid #c8d1da; padding: 8px 10px;
     background: #eef2f6;
     display: flex; gap: 8px; align-items: flex-end;
   }
   .input-area textarea {
     flex: 1; resize: none;
-    padding: 9px 12px; font-family: inherit; font-size: 13px;
+    padding: 8px 12px; font-family: inherit; font-size: 13px;
     border: 1px solid #b5bec8; border-radius: 16px;
     background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
@@ -1664,20 +1952,11 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 12px;
   }
   .info-head {
-    text-align: center; padding-bottom: 16px;
-    border-bottom: 1px solid #dbe1e7; margin-bottom: 16px;
-  }
-  .info-head .avatar-none {
-    width: 54px; height: 54px; margin: 0 auto 10px;
-    border-radius: 12px;
-    background: linear-gradient(#e4ebf2, #c8d3de);
-    border: 1px solid #b7c2cd;
-    display: flex; align-items: center; justify-content: center;
-    color: #3f6fa8;
-    box-shadow: inset 0 1px 0 #fff;
+    text-align: center; padding-bottom: 14px;
+    border-bottom: 1px solid #dbe1e7; margin-bottom: 14px;
   }
   .info-head .name {
-    font-size: 16px; font-weight: bold; color: #23374b;
+    font-size: 18px; font-weight: bold; color: #23374b;
     word-break: break-all;
   }
   .info-head .status { font-size: 12px; margin-top: 4px; color: #7a8695; }
@@ -1689,6 +1968,21 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   .info-row .k { color: #7a8695; flex-shrink: 0; }
   .info-row .v { color: #2b3a4a; text-align: right; word-break: break-word; }
+
+  .remove-btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; margin-top: 18px;
+    padding: 10px 12px; border-radius: 5px;
+    border: 1px solid #a85a5a; cursor: pointer;
+    background: linear-gradient(#fbfcfd, #e9d8d8);
+    color: #8f2b2b; font-family: inherit; font-size: 13px;
+    text-shadow: 0 1px 0 #fff;
+    transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
+  }
+  .remove-btn:hover { background: linear-gradient(#fff, #f0dcdc); transform: translateY(-1px);
+                      box-shadow: 0 2px 6px rgba(168,90,90,0.25); }
+  .remove-btn:active { transform: translateY(0) scale(0.98); }
+  .remove-btn .icon { width: 15px; height: 15px; }
 
   .toast-wrap {
     position: fixed; bottom: 16px; right: 16px; z-index: 100;
@@ -1705,9 +1999,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
-  /* =============================================
-     МОБИЛЬНАЯ ВЕРСИЯ
-     ============================================= */
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; position: relative; }
     .sidebar { border-right: none; padding-bottom: env(safe-area-inset-bottom); }
@@ -1726,17 +2017,12 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .app.chat-open .chat { display: flex; }
     .app.info-open .info-panel { transform: translateX(0); }
     .info-panel .close-btn {
-      display: inline-flex; float: right; margin: -4px -4px 0 0;
-      padding: 8px;
+      display: inline-flex; float: right; margin: -4px -4px 0 0; padding: 8px;
     }
     .info-panel .close-btn .icon { width: 18px; height: 18px; }
     .mobile-only { display: inline-flex; }
 
-    /* === Sidebar === */
-    .sb-header {
-      padding: 12px 14px;
-      padding-top: calc(12px + env(safe-area-inset-top));
-    }
+    .sb-header { padding: 12px 14px; padding-top: calc(12px + env(safe-area-inset-top)); }
     .logo-mini { font-size: 18px; gap: 8px; }
     .logo-mini .icon { width: 22px; height: 22px; }
     .sb-header .icon-btn { padding: 9px; }
@@ -1745,28 +2031,18 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .me-line { padding: 8px 14px; font-size: 13px; }
 
     .add-wrap { padding: 12px 14px; }
-    .add-btn {
-      padding: 12px 14px; font-size: 15px;
-      border-radius: 6px;
-      min-height: 46px;
-    }
+    .add-btn { padding: 12px 14px; font-size: 15px; border-radius: 6px; min-height: 46px; }
     .add-btn .icon { width: 18px; height: 18px; }
     .add-form { margin-top: 8px; gap: 8px; }
-    .add-form input {
-      padding: 11px 14px; font-size: 15px; border-radius: 6px;
-      min-height: 46px;
-    }
+    .add-form input { padding: 11px 14px; font-size: 15px; border-radius: 6px; min-height: 46px; }
     .add-form button { padding: 0 16px; min-height: 46px; border-radius: 6px; }
     .add-form button .icon { width: 18px; height: 18px; }
 
     .search { padding: 10px 14px; }
-    .search input {
-      padding: 11px 14px 11px 36px; font-size: 15px; border-radius: 20px;
-      min-height: 42px;
-    }
+    .search input { padding: 11px 14px 11px 36px; font-size: 15px; border-radius: 20px; min-height: 42px; }
     .search-wrap .icon { left: 12px; width: 16px; height: 16px; }
 
-    .user-item { padding: 14px 16px; border-bottom: 1px solid #d3dae0; }
+    .user-item { padding: 14px 16px; }
     .user-item .nick { font-size: 15px; gap: 8px; }
     .user-item .nick .dot { width: 9px; height: 9px; }
     .user-item .time { font-size: 11px; }
@@ -1776,7 +2052,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .empty-list { padding: 50px 20px; font-size: 14px; }
     .empty-list .icon.huge { width: 52px; height: 52px; }
 
-    /* === Chat === */
     .chat-header {
       padding: 10px 12px;
       padding-top: calc(10px + env(safe-area-inset-top));
@@ -1788,20 +2063,17 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .chat-header .icon-btn { padding: 9px; }
     .chat-header .icon-btn .icon { width: 22px; height: 22px; }
 
-    .messages {
-      padding: 16px 12px;
-      padding-bottom: 8px;
-    }
+    .messages { padding: 14px 12px 8px; }
     .msg-bubble {
       max-width: 85%;
       font-size: 14px;
-      padding: 9px 13px;
-      border-radius: 16px 16px 16px 4px;
+      padding: 7px 12px 5px;
+      border-radius: 14px 14px 14px 3px;
     }
-    .msg-row.mine .msg-bubble { border-radius: 16px 16px 4px 16px; }
-    .msg-meta { font-size: 11px; margin-top: 4px; }
-    .date-sep { margin: 16px 0 12px; }
-    .date-sep span { font-size: 12px; padding: 4px 12px; }
+    .msg-row.mine .msg-bubble { border-radius: 14px 14px 3px 14px; }
+    .msg-meta { font-size: 10px; }
+    .date-sep { margin: 12px 0 8px; }
+    .date-sep span { font-size: 11px; padding: 3px 11px; }
 
     .empty { margin-top: 40px; font-size: 14px; }
     .empty .icon.huge { width: 52px; height: 52px; }
@@ -1829,11 +2101,10 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     .input-area button .btn-label { display: none; }
     .input-area button .icon { width: 18px; height: 18px; }
 
-    /* === Info panel === */
-    .info-head .avatar-none { width: 64px; height: 64px; }
-    .info-head .name { font-size: 18px; }
+    .info-head .name { font-size: 20px; }
     .info-head .status { font-size: 13px; margin-top: 6px; }
     .info-row { font-size: 13px; padding: 10px 0; }
+    .remove-btn { padding: 13px 12px; font-size: 15px; }
 
     .toast-wrap { bottom: calc(16px + env(safe-area-inset-bottom)); right: 12px; left: 12px; }
     .toast { max-width: none; }
@@ -1942,7 +2213,6 @@ let currentInfo = null;
 let ws = null;
 let wsReconnectTimer = null;
 
-/* signature-кэш чтобы не перерисовывать DOM без причины */
 let lastContactsSig = '';
 let lastInfoSig = '';
 
@@ -1996,7 +2266,6 @@ function toast(msg) {
   }, 3000);
 }
 
-/* ---------- подписи состояния ---------- */
 function contactsSignature(data) {
   let s = '';
   for (const u of data) {
@@ -2010,7 +2279,6 @@ function infoSignature(i) {
        + '|' + (i.msg_count || 0);
 }
 
-/* ---------- WebSocket ---------- */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); }
@@ -2049,26 +2317,30 @@ function handleWS(d) {
         lastIds[current] = Math.max(lastIds[current] || 0, m.id);
       }
       if (m.from !== me) markRead(peer);
+      // обновляем инфу с учётом нового счётчика сообщений
+      loadInfo(current);
     }
     loadContacts();
   } else if (d.type === 'presence') {
     const u = usersCache.find(x => x.nick === d.nick);
-    if (u) {
-      u.online = d.online;
-      lastContactsSig = '';   // форсим обновление
-      renderContacts();
-    }
+    if (u) { u.online = d.online; lastContactsSig = ''; renderContacts(); }
     if (current === d.nick) {
       currentInfo = Object.assign({}, currentInfo || {}, { online: d.online });
       updateChatSubtitle();
     }
   } else if (d.type === 'contact_added') {
     toast('Новый контакт: ' + d.nick);
+    lastContactsSig = '';
+    loadContacts();
+  } else if (d.type === 'contact_removed') {
+    toast('Контакт удалён: ' + d.nick);
+    // если открыт диалог с этим человеком — сбросить чат
+    if (current === d.nick) resetChatToEmpty();
+    lastContactsSig = '';
     loadContacts();
   }
 }
 
-/* ---------- init ---------- */
 async function init() {
   const r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
@@ -2079,22 +2351,20 @@ async function init() {
   await loadContacts();
 }
 
-/* ---------- контакты ---------- */
 async function loadContacts() {
   const r = await fetch('/api/contacts');
   if (!r.ok) { location.href = '/'; return; }
   const d = await r.json();
   usersCache = d.contacts || [];
   const sig = contactsSignature(usersCache);
-  if (sig === lastContactsSig) return;   // ничего не поменялось — не трогаем DOM
+  if (sig === lastContactsSig) return;
   lastContactsSig = sig;
   renderContacts();
 }
 
 function renderContacts() {
   const list = $('userList');
-  const scrollTop = list.scrollTop;   // сохраняем позицию
-
+  const scrollTop = list.scrollTop;
   list.innerHTML = '';
   const q = searchQuery.trim().toLowerCase();
   const filtered = q ? usersCache.filter(u => u.nick.toLowerCase().includes(q)) : usersCache;
@@ -2133,12 +2403,17 @@ function renderContacts() {
   list.scrollTop = scrollTop;
 }
 
-/* ---------- диалог ---------- */
+/* Не перезагружаем диалог, если он уже открыт */
 async function openDialog(nick) {
+  if (current === nick) {
+    app.classList.remove('info-open');
+    $('msgInput').focus();
+    return;
+  }
   current = nick;
   lastIds[nick] = 0;
   renderedIds.clear();
-  lastInfoSig = '';   // форсим обновление инфы при смене собеседника
+  lastInfoSig = '';
 
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
@@ -2152,6 +2427,22 @@ async function openDialog(nick) {
   $('msgInput').focus();
 }
 
+function resetChatToEmpty() {
+  current = null;
+  lastInfoSig = '';
+  app.classList.remove('chat-open');
+  app.classList.remove('info-open');
+  $('chatTitle').textContent = 'Выберите собеседника';
+  $('chatSub').textContent = '';
+  $('messages').innerHTML =
+    '<div class="empty">' +
+      '<svg class="icon huge" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>' +
+      '<div>Слева выберите контакт, чтобы начать переписку</div>' +
+    '</div>';
+  $('inputArea').style.display = 'none';
+  renderInfoEmpty();
+}
+
 async function refreshDialog() {
   if (!current) return;
   const nick = current;
@@ -2160,7 +2451,7 @@ async function refreshDialog() {
   if (!r.ok) return;
   const d = await r.json();
   if (!d.ok || current !== nick) return;
-  if (!d.messages || !d.messages.length) return;   // ничего нового — не трогаем DOM
+  if (!d.messages || !d.messages.length) return;
 
   const box = $('messages');
   const wasNearBottom = scrollIfNearBottom(box);
@@ -2194,7 +2485,7 @@ function appendMessage(m) {
   row.dataset.ts = m.time;
   row.innerHTML =
     '<div class="msg-bubble">' + esc(m.text) +
-      '<div class="msg-meta">' + fmtTime(m.time) + '</div>' +
+      '<span class="msg-meta">' + fmtTime(m.time) + '</span>' +
     '</div>';
   box.appendChild(row);
   const nearBottom = scrollIfNearBottom(box) || m.from === me;
@@ -2206,7 +2497,6 @@ async function markRead(nick) {
   loadContacts();
 }
 
-/* ---------- отправка ---------- */
 async function send() {
   if (!current) return;
   const inp = $('msgInput');
@@ -2226,37 +2516,35 @@ async function send() {
     appendMessage(d.message);
   }
   loadContacts();
+  loadInfo(current);
 }
 
-/* ---------- инфо ---------- */
+function renderInfoEmpty() {
+  $('infoContent').innerHTML =
+    '<div class="info-empty">' +
+      '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
+      '<div>Информация о собеседнике появится здесь</div>' +
+    '</div>';
+}
+
 async function loadInfo(nick) {
-  if (!nick) {
-    $('infoContent').innerHTML =
-      '<div class="info-empty">' +
-        '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
-        '<div>Информация о собеседнике появится здесь</div>' +
-      '</div>';
-    lastInfoSig = '';
-    return;
-  }
+  if (!nick) { renderInfoEmpty(); lastInfoSig = ''; return; }
   const r = await fetch('/api/user/' + encodeURIComponent(nick) + '/info');
   if (!r.ok) return;
   const d = await r.json();
   if (!d.ok) return;
   const i = d.info;
   const sig = infoSignature(i);
-  if (sig === lastInfoSig) return;   // не перерисовываем, если не поменялось
+  if (sig === lastInfoSig) return;
   lastInfoSig = sig;
   currentInfo = { online: i.online, lastSeen: i.last_seen };
 
   const status = i.online
     ? '<div class="status online">В сети</div>'
     : '<div class="status">Был(а): ' + esc(fmtLastSeen(i.last_seen)) + '</div>';
-  $('infoContent').innerHTML =
+
+  var html =
     '<div class="info-head">' +
-      '<div class="avatar-none">' +
-        '<svg class="icon" style="width:30px;height:30px" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-      '</div>' +
       '<div class="name">' + esc(i.nick) + '</div>' +
       status +
     '</div>' +
@@ -2264,7 +2552,31 @@ async function loadInfo(nick) {
     '<div class="info-row"><span class="k">В SldChat с</span><span class="v">' + esc(fmtDateTime(i.created)) + '</span></div>' +
     '<div class="info-row"><span class="k">Последняя активность</span><span class="v">' + esc(fmtLastSeen(i.last_seen)) + '</span></div>' +
     '<div class="info-row"><span class="k">Сообщений в диалоге</span><span class="v">' + i.msg_count + '</span></div>';
+
+  if (i.in_contacts) {
+    html += '<button class="remove-btn" id="removeBtn">' +
+      '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>' +
+      'Удалить контакт</button>';
+  }
+
+  $('infoContent').innerHTML = html;
   updateChatSubtitle();
+
+  const btn = document.getElementById('removeBtn');
+  if (btn) btn.onclick = () => removeContact(nick);
+}
+
+async function removeContact(nick) {
+  if (!confirm('Удалить контакт ' + nick + '? Переписка останется, но собеседник исчезнет из списка.')) return;
+  const fd = new FormData();
+  fd.append('nick', nick);
+  const r = await fetch('/api/contacts/remove', { method: 'POST', body: fd });
+  const d = await r.json().catch(() => ({ ok:false }));
+  if (!d.ok) { toast(d.error || 'Не удалось удалить'); return; }
+  toast('Контакт удалён: ' + nick);
+  if (current === nick) resetChatToEmpty();
+  lastContactsSig = '';
+  loadContacts();
 }
 
 function updateChatSubtitle() {
@@ -2279,7 +2591,6 @@ function updateChatSubtitle() {
   }
 }
 
-/* ---------- добавление ---------- */
 $('addBtn').onclick = () => {
   const f = $('addForm');
   f.classList.toggle('open');
@@ -2313,7 +2624,6 @@ $('addForm').onsubmit = async e => {
   }
 };
 
-/* ---------- UI ---------- */
 $('sendBtn').onclick = send;
 $('msgInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 900) {
@@ -2330,32 +2640,13 @@ $('logoutBtn').onclick = async () => {
   await fetch('/api/logout', { method: 'POST' });
   location.href = '/';
 };
-$('backBtn').onclick = () => {
-  current = null;
-  lastInfoSig = '';
-  app.classList.remove('chat-open');
-  app.classList.remove('info-open');
-  $('chatTitle').textContent = 'Выберите собеседника';
-  $('chatSub').textContent = '';
-  $('messages').innerHTML =
-    '<div class="empty">' +
-      '<svg class="icon huge" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>' +
-      '<div>Слева выберите контакт, чтобы начать переписку</div>' +
-    '</div>';
-  $('inputArea').style.display = 'none';
-  $('infoContent').innerHTML =
-    '<div class="info-empty">' +
-      '<svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>' +
-      '<div>Информация о собеседнике появится здесь</div>' +
-    '</div>';
-};
+$('backBtn').onclick = resetChatToEmpty;
 $('infoBtn').onclick = () => app.classList.toggle('info-open');
 $('infoCloseBtn').onclick = () => app.classList.remove('info-open');
 $('searchInput').addEventListener('input', e => { searchQuery = e.target.value; renderContacts(); });
 
-/* ---------- лёгкий фон-поллинг (страховка на случай обрыва WS) ---------- */
 setInterval(async () => {
-  if (ws && ws.readyState === 1) return;   // WS жив — не дублируем нагрузку
+  if (ws && ws.readyState === 1) return;
   await loadContacts();
   if (current) { await refreshDialog(); await loadInfo(current); }
 }, 30000);
@@ -2368,15 +2659,19 @@ init();
 
 
 # ================== МАРШРУТЫ ==================
-def render_page(html: str) -> str:
-    return html.replace("__SHARED_CSS__", SHARED_CSS).replace("__FOOTER__", FOOTER_HTML)
+def render_page(html: str, base_url: str = "") -> str:
+    return (html
+        .replace("__SHARED_CSS__", SHARED_CSS)
+        .replace("__FOOTER__", FOOTER_HTML)
+        .replace("__HEAD_COMMON__", HEAD_COMMON)
+        .replace("__BASE_URL__", base_url))
 
 
 @app.get("/", response_class=HTMLResponse)
 async def landing(request: Request):
     if current_user(request):
         return RedirectResponse("/chat")
-    return render_page(LANDING_PAGE)
+    return render_page(LANDING_PAGE, str(request.base_url))
 
 
 @app.get("/login", response_class=HTMLResponse)
