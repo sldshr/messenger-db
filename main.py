@@ -1,9 +1,12 @@
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from urllib.parse import quote
 import uvicorn
 import uuid
 import html
+import time
+from collections import deque
 from datetime import datetime
 
 # ==============================
@@ -29,6 +32,8 @@ MAX_POST_LEN           = 700
 MAX_COMMENT_LEN        = 500
 MAX_SEARCH_LEN         = 100
 
+POSTS_PER_PAGE         = 20     # сколько постов показывать на одной странице
+
 ALLOW_POSTING        = True
 ALLOW_COMMENTS       = True
 ALLOW_SEARCH         = True
@@ -36,10 +41,20 @@ SHOW_TIMESTAMPS      = True
 SHOW_COPY_BUTTON     = True
 AUTO_REFRESH_SECONDS = 0
 
-LANG_DEFAULT = "en"
+LANG_DEFAULT = "ru"
 LANG_OPTIONS = ("ru", "en")
 
+# --- защита от DoS ---
+MAX_BODY_BYTES        = 8 * 1024   # 8 KB на любой запрос
+RATE_WINDOW           = 1.0        # окно, сек
+RATE_LIMIT            = 60         # макс. запросов за окно (глобально, без IP)
+MAX_QUERY_PARAM_LEN   = 200        # ограничение длины любого query-параметра
+
 # ==============================
+
+if LOGO_POSITION not in ("left", "center", "right"):
+    LOGO_POSITION = "left"
+
 
 STRINGS = {
     "ru": {
@@ -58,13 +73,13 @@ STRINGS = {
         "all_posts":            "Все посты",
         "nothing_found":        "Ничего не найдено.",
         "empty_feed":           "Пока пусто. Напиши первым.",
-        "open_post":            "открыть пост",
-        "comments_word":        "комментариев",
+        "open_post":            "открыть",
+        "comments_word":        "комм.",
         "back_home":            "На главную",
         "post_heading":         "Пост",
         "comments_heading":     "Комментарии",
         "no_comments":          "Комментариев пока нет.",
-        "copy_text":            "Скопировать текст",
+        "copy_text":            "Скопировать",
         "copied":               "Скопировано",
         "privacy_link":         "Политика конфиденциальности",
         "privacy_title":        "Политика конфиденциальности",
@@ -75,6 +90,14 @@ STRINGS = {
         "no_page":              "Такой страницы на {site} нет.",
         "error_heading":        "Ошибка",
         "link_word":            "ссылка",
+        "too_many_requests":    "Слишком много запросов. Подожди секунду.",
+        "payload_too_large":    "Слишком большой запрос.",
+        "page_of":              "Страница {p} из {t}",
+        "prev":                 "Назад",
+        "next":                 "Вперёд",
+        "first":                "Первая",
+        "last":                 "Последняя",
+        "shortcut_hint":        "Ctrl+Enter — отправить",
         "privacy_p1_title":     "{site} полностью анонимная.",
         "privacy_p1_body":      "Ни администратор сервера, ни хостинг, ни кто-либо ещё не знает, кто именно отправил тот или иной пост или комментарий. Мы не запрашиваем имя, e-mail, не ставим куки, не создаём аккаунты и не привязываем записи к человеку. Сервер не сохраняет IP-адреса посетителей, не логирует запросы и не передаёт их третьим лицам. Всё, что сохраняется — это сам текст и время отправки.",
         "privacy_p2_title":     "При перезагрузке сервера все данные удаляются.",
@@ -98,13 +121,13 @@ STRINGS = {
         "all_posts":            "All posts",
         "nothing_found":        "Nothing found.",
         "empty_feed":           "Empty for now. Be the first.",
-        "open_post":            "open post",
-        "comments_word":        "comments",
+        "open_post":            "open",
+        "comments_word":        "comm.",
         "back_home":            "Home",
         "post_heading":         "Post",
         "comments_heading":     "Comments",
         "no_comments":          "No comments yet.",
-        "copy_text":            "Copy text",
+        "copy_text":            "Copy",
         "copied":               "Copied",
         "privacy_link":         "Privacy policy",
         "privacy_title":        "Privacy policy",
@@ -115,6 +138,14 @@ STRINGS = {
         "no_page":              "No such page on {site}.",
         "error_heading":        "Error",
         "link_word":            "link",
+        "too_many_requests":    "Too many requests. Wait a second.",
+        "payload_too_large":    "Request is too large.",
+        "page_of":              "Page {p} of {t}",
+        "prev":                 "Prev",
+        "next":                 "Next",
+        "first":                "First",
+        "last":                 "Last",
+        "shortcut_hint":        "Ctrl+Enter — send",
         "privacy_p1_title":     "{site} is fully anonymous.",
         "privacy_p1_body":      "Neither the server administrator, nor the hosting provider, nor anyone else knows who exactly sent a given post or comment. We do not ask for a name or e-mail, we do not set cookies, we do not create accounts, and we do not link records to a person. The server does not store visitors' IP addresses, does not log requests, and does not share them with third parties. All that is stored is the text itself and the time it was sent.",
         "privacy_p2_title":     "All data is deleted when the server restarts.",
@@ -135,24 +166,95 @@ def pick_lang(lang):
     return lang if lang in LANG_OPTIONS else LANG_DEFAULT
 
 
-def with_lang(path, lang):
+# ==============================
+#           ССЫЛКИ
+# ==============================
+
+def url_index(lang, q="", sort="new", flt="all", page=1):
+    parts = []
+    if q:
+        parts.append("q=" + quote(q))
+    if sort != "new":
+        parts.append("sort=" + quote(sort))
+    if flt != "all":
+        parts.append("flt=" + quote(flt))
+    if page > 1:
+        parts.append("page=" + str(page))
+    if lang != LANG_DEFAULT:
+        parts.append("lang=" + quote(lang))
+    return "/" + ("?" + "&".join(parts) if parts else "")
+
+
+def url_post(pid, lang):
     if lang == LANG_DEFAULT:
-        return path
-    sep = "&" if "?" in path else "?"
-    return f"{path}{sep}lang={lang}"
+        return f"/p/{pid}"
+    return f"/p/{pid}?lang={quote(lang)}"
 
 
-if LOGO_POSITION not in ("left", "center", "right"):
-    LOGO_POSITION = "left"
+def url_privacy(lang):
+    if lang == LANG_DEFAULT:
+        return "/privacy"
+    return f"/privacy?lang={quote(lang)}"
+
+
+# ==============================
+#           ПРИЛОЖЕНИЕ
+# ==============================
 
 app = FastAPI(title=SITE_NAME)
 posts = {}
 
+# глобальный rate-limiter без хранения IP
+_request_times = deque()
+
+
+@app.middleware("http")
+async def limits_middleware(request: Request, call_next):
+    # 1) ограничение размера запроса
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            size = int(cl)
+        except ValueError:
+            return HTMLResponse("<h1>400</h1>", status_code=400)
+        if size > MAX_BODY_BYTES:
+            lang = pick_lang(request.query_params.get("lang"))
+            return HTMLResponse(
+                _simple_error_page(413, t(lang, "payload_too_large"), lang),
+                status_code=413,
+            )
+
+    # 2) ограничение длины query-параметров (защита от длинных URL)
+    for value in request.query_params.values():
+        if len(value) > MAX_QUERY_PARAM_LEN:
+            lang = pick_lang(request.query_params.get("lang"))
+            return HTMLResponse(
+                _simple_error_page(414, t(lang, "payload_too_large"), lang),
+                status_code=414,
+            )
+
+    # 3) глобальный rate-limit (не читаем IP)
+    now = time.monotonic()
+    while _request_times and now - _request_times[0] > RATE_WINDOW:
+        _request_times.popleft()
+    if len(_request_times) >= RATE_LIMIT:
+        lang = pick_lang(request.query_params.get("lang"))
+        return HTMLResponse(
+            _simple_error_page(429, t(lang, "too_many_requests"), lang),
+            status_code=429,
+        )
+    _request_times.append(now)
+
+    return await call_next(request)
+
+
+# ==============================
+#           РЕНДЕР
+# ==============================
 
 def page(title, body, lang, refresh=0):
     lang = pick_lang(lang)
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh > 0 else ""
-    copy_label = t(lang, "copied")
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
@@ -168,6 +270,8 @@ def page(title, body, lang, refresh=0):
     --font: {FONT_FAMILY};
     --size: {FONT_SIZE}px;
     --width: {MAX_WIDTH}px;
+    --muted: #666;
+    --line: #999;
   }}
 
   * {{
@@ -186,6 +290,7 @@ def page(title, body, lang, refresh=0):
     margin: 0 auto;
     padding: 10px;
     font-size: var(--size);
+    line-height: 1.4;
     display: flex;
     flex-direction: column;
     min-height: 100vh;
@@ -196,23 +301,25 @@ def page(title, body, lang, refresh=0):
 
   h1 {{
     font-size: 20px;
-    margin: 10px 0;
+    margin: 8px 0 14px;
     text-align: {LOGO_POSITION};
+    letter-spacing: 0.5px;
   }}
-  h2 {{ font-size: 17px; margin: 14px 0 8px; }}
+  h2 {{ font-size: 15px; margin: 16px 0 8px; color: #333; font-weight: bold; }}
 
-  a {{ color: var(--accent); }}
-  a:hover {{ color: #cc0000; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  code {{ background: #eee; padding: 1px 5px; font-size: 13px; }}
 
-  .post, .comment, .compose {{
+  .card {{
     background: var(--box);
-    border: 1px solid #999;
-    padding: 10px;
+    border: 1px solid var(--line);
+    padding: 12px;
     margin-bottom: 10px;
   }}
-  .comment {{ background: #f6f6f6; margin-left: 14px; }}
+  .card.post {{ padding: 12px 14px; }}
+  .comment {{ background: #f6f6f6; border-left: 3px solid #ccc; margin-left: 12px; }}
 
-  /* сохранение переводов строк и перенос длинных слов */
   .txt {{
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -221,66 +328,123 @@ def page(title, body, lang, refresh=0):
 
   textarea {{
     width: 100%;
-    padding: 8px;
+    padding: 10px;
     font-size: var(--size);
     font-family: inherit;
+    line-height: 1.4;
     border: 1px solid #888;
     background: #fff;
     min-height: 90px;
     max-height: 260px;
     resize: vertical;
     overflow: auto;
+    border-radius: 0;
+  }}
+  textarea:focus {{
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }}
 
   .compose-row {{
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 10px;
     margin-top: 8px;
     flex-wrap: wrap;
   }}
   .compose-row .counter {{ margin-left: auto; }}
+  .compose-row .hint {{
+    font-size: 11px;
+    color: var(--muted);
+    flex-basis: 100%;
+  }}
 
   button {{
-    padding: 8px 16px;
+    padding: 9px 18px;
     font-size: var(--size);
+    font-family: inherit;
     background: #eee;
     color: #000;
     border: 1px solid #666;
     cursor: pointer;
+    transition: background 0.1s;
   }}
   button:hover:enabled {{ background: #ccc; }}
-  button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  button:active:enabled {{ background: #bbb; }}
+  button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
 
-  .counter {{ color: #666; font-size: 13px; }}
+  .counter {{ color: var(--muted); font-size: 13px; }}
   .counter.over {{ color: #cc0000; font-weight: bold; }}
 
   .searchbar {{
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
   }}
   .searchbar input, .searchbar select {{
-    padding: 8px;
+    padding: 9px 10px;
     font-size: var(--size);
     font-family: inherit;
     border: 1px solid #888;
     background: #fff;
   }}
-  .searchbar input[type="text"] {{ flex: 1 1 180px; min-width: 0; }}
+  .searchbar input[type="text"] {{ flex: 1 1 200px; min-width: 0; }}
+  .searchbar button {{ padding: 9px 16px; }}
 
-  .meta {{ color: #666; font-size: 12px; margin-top: 8px; }}
-  hr {{ border: none; border-top: 1px solid #999; margin: 14px 0; }}
+  .post-head {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }}
+  .post-head .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+  .post-head a {{ color: var(--muted); }}
+  .post-head a:hover {{ color: #000; }}
+
+  .meta {{ color: var(--muted); font-size: 12px; margin-top: 8px; }}
+
+  .copy-btn {{
+    font-size: 12px;
+    padding: 4px 10px;
+    margin-top: 8px;
+    background: #f0f0f0;
+  }}
+  .copy-btn:hover {{ background: #ddd; }}
 
   main {{ flex: 1 0 auto; }}
+
+  .pagination {{
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin: 16px 0 8px;
+    flex-wrap: wrap;
+  }}
+  .pagination a, .pagination span {{
+    padding: 6px 12px;
+    border: 1px solid var(--line);
+    background: var(--box);
+    color: #000;
+    font-size: 13px;
+    text-decoration: none;
+  }}
+  .pagination a:hover {{ background: #eee; text-decoration: none; }}
+  .pagination .current {{
+    border-color: #000;
+    font-weight: bold;
+  }}
 
   footer {{
     flex-shrink: 0;
     margin-top: 20px;
     padding-top: 10px;
-    border-top: 1px solid #999;
+    border-top: 1px solid var(--line);
     color: #555;
     font-size: 12px;
     text-align: center;
@@ -294,14 +458,6 @@ def page(title, body, lang, refresh=0):
   }}
 
   ol.privacy li {{ margin-bottom: 10px; }}
-
-  .copy-btn {{
-    font-size: 12px;
-    padding: 4px 10px;
-    margin-top: 8px;
-    background: #f0f0f0;
-  }}
-  .copy-btn:hover {{ background: #ddd; }}
 </style>
 </head>
 <body>
@@ -310,19 +466,20 @@ def page(title, body, lang, refresh=0):
 </main>
 <footer>
   {html.escape(SITE_NAME)} &copy; {html.escape(AUTHOR)} &middot;
-  <a href="{with_lang('/privacy', lang)}">{t(lang, 'privacy_link')}</a>
+  <a href="{url_privacy(lang)}">{t(lang, 'privacy_link')}</a>
   &middot;
   <span class="lang-switch">
-    <a href="?lang=ru" class="{'active' if lang == 'ru' else ''}">RU</a>
+    <a href="#" data-lang="ru" class="{'active' if lang == 'ru' else ''}">RU</a>
     /
-    <a href="?lang=en" class="{'active' if lang == 'en' else ''}">EN</a>
+    <a href="#" data-lang="en" class="{'active' if lang == 'en' else ''}">EN</a>
   </span>
 </footer>
 <script>
-var COPY_LABEL = {copy_label!r};
+var COPY_LABEL = {t(lang, 'copied')!r};
+var DEFAULT_LANG = {LANG_DEFAULT!r};
 
 (function () {{
-  document.querySelectorAll('[data-counter]').forEach(function (ta) {{
+  document.querySelectorAll('textarea[data-counter]').forEach(function (ta) {{
     var counter = document.getElementById(ta.dataset.counter);
     var btn = document.getElementById(ta.dataset.btn);
     var max = parseInt(ta.dataset.max, 10);
@@ -338,6 +495,16 @@ var COPY_LABEL = {copy_label!r};
       }}
     }}
     ta.addEventListener('input', update);
+    ta.addEventListener('keydown', function (e) {{
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {{
+        e.preventDefault();
+        var b = document.getElementById(ta.dataset.btn);
+        if (!b || b.disabled) return;
+        if (!ta.value.trim()) return;
+        if (ta.form.requestSubmit) ta.form.requestSubmit(b);
+        else ta.form.submit();
+      }}
+    }});
     update();
   }});
 
@@ -364,10 +531,31 @@ var COPY_LABEL = {copy_label!r};
       }}
     }});
   }});
+
+  document.querySelectorAll('.lang-switch a').forEach(function (a) {{
+    a.addEventListener('click', function (e) {{
+      e.preventDefault();
+      var url = new URL(window.location.href);
+      var target = a.dataset.lang;
+      if (target === DEFAULT_LANG) url.searchParams.delete('lang');
+      else url.searchParams.set('lang', target);
+      window.location = url.toString();
+    }});
+  }});
 }})();
 </script>
 </body>
 </html>"""
+
+
+def _simple_error_page(code, message, lang):
+    lang = pick_lang(lang)
+    body = f"""
+    <p><a href="{url_index(lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
+    <h1>{code}</h1>
+    <div class="card post"><p>{html.escape(message)}</p></div>
+    """
+    return page(f"{code}", body, lang)
 
 
 def options(pairs, current):
@@ -379,16 +567,15 @@ def options(pairs, current):
 
 
 def clean_text(raw):
-    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    return text
+    return (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def not_found(message, lang):
     lang = pick_lang(lang)
     body = f"""
-    <p><a href="{with_lang('/', lang)}">&larr; {t(lang, 'back_home')}</a></p>
+    <p><a href="{url_index(lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
     <h1>404</h1>
-    <div class="post">
+    <div class="card post">
       <p><b>{html.escape(message)}</b></p>
       <p class="meta">{html.escape(t(lang, 'no_page', site=SITE_NAME))}</p>
     </div>
@@ -401,23 +588,27 @@ async def on_http_error(request: Request, exc: StarletteHTTPException):
     lang = pick_lang(request.query_params.get("lang"))
     if exc.status_code == 404:
         return HTMLResponse(not_found(t(lang, "page_not_found"), lang), status_code=404)
-    body = f"""
-    <p><a href="{with_lang('/', lang)}">&larr; {t(lang, 'back_home')}</a></p>
-    <h1>{t(lang, 'error_heading')} {exc.status_code}</h1>
-    <div class="post">{html.escape(str(exc.detail))}</div>
-    """
-    return HTMLResponse(page(f"{t(lang, 'error_heading')} {exc.status_code}", body, lang),
-                        status_code=exc.status_code)
+    return HTMLResponse(
+        _simple_error_page(exc.status_code, str(exc.detail), lang),
+        status_code=exc.status_code,
+    )
 
+
+# ==============================
+#           ГЛАВНАЯ
+# ==============================
 
 @app.get("/", response_class=HTMLResponse)
-def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEFAULT):
+def index(q: str = "", sort: str = "new", flt: str = "all",
+          page: int = 1, lang: str = LANG_DEFAULT):
     lang = pick_lang(lang)
     q = (q or "").strip()[:MAX_SEARCH_LEN]
     if sort not in ("new", "old", "hot", "cold"):
         sort = "new"
     if flt not in ("all", "with", "without"):
         flt = "all"
+    if page < 1:
+        page = 1
 
     items = list(posts.values())
 
@@ -439,19 +630,31 @@ def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEF
     else:
         items.sort(key=lambda p: len(p["comments"]))
 
+    total = len(items)
+    total_pages = max(1, (total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE)
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * POSTS_PER_PAGE
+    page_items = items[start:start + POSTS_PER_PAGE]
+
     feed = []
-    for p in items:
-        stamp = p["created"].strftime("%d.%m.%Y %H:%M") if SHOW_TIMESTAMPS else ""
-        meta_parts = []
-        if stamp:
-            meta_parts.append(html.escape(stamp))
-        meta_parts.append(f'<a href="{with_lang(f"/p/{p["id"]}", lang)}">{t(lang, "open_post")}</a>')
+    for p in page_items:
+        head_left = []
+        if SHOW_TIMESTAMPS:
+            head_left.append(html.escape(p["created"].strftime("%d.%m.%Y %H:%M")))
+        head_right = [
+            f'<a href="{url_post(p["id"], lang)}">{html.escape(t(lang, "open_post"))}</a>'
+        ]
         if ALLOW_COMMENTS:
-            meta_parts.append(f'{t(lang, "comments_word")}: {len(p["comments"])}')
+            head_right.append(f'{t(lang, "comments_word")}: {len(p["comments"])}')
+
         feed.append(f"""
-        <div class="post">
+        <div class="card post">
+          <div class="post-head">
+            <span>{"".join(head_left)}</span>
+            <span class="actions">{" &middot; ".join(head_right)}</span>
+          </div>
           <div class="txt">{html.escape(p["text"])}</div>
-          <div class="meta">{" &middot; ".join(meta_parts)}</div>
         </div>""")
 
     if feed:
@@ -461,12 +664,31 @@ def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEF
     else:
         feed_html = f"<p>{html.escape(t(lang, 'empty_feed'))}</p>"
 
+    pagination_html = ""
+    if total_pages > 1:
+        prev_link = url_index(lang, q, sort, flt, page - 1) if page > 1 else None
+        next_link = url_index(lang, q, sort, flt, page + 1) if page < total_pages else None
+        first_link = url_index(lang, q, sort, flt, 1) if page > 1 else None
+        last_link = url_index(lang, q, sort, flt, total_pages) if page < total_pages else None
+
+        p_parts = []
+        p_parts.append(f'<a href="{first_link}">{html.escape(t(lang, "first"))}</a>' if first_link
+                       else f'<span style="opacity:.4">{html.escape(t(lang, "first"))}</span>')
+        p_parts.append(f'<a href="{prev_link}">&larr; {html.escape(t(lang, "prev"))}</a>' if prev_link
+                       else f'<span style="opacity:.4">&larr; {html.escape(t(lang, "prev"))}</span>')
+        p_parts.append(f'<span class="current">{html.escape(t(lang, "page_of", p=page, t=total_pages))}</span>')
+        p_parts.append(f'<a href="{next_link}">{html.escape(t(lang, "next"))} &rarr;</a>' if next_link
+                       else f'<span style="opacity:.4">{html.escape(t(lang, "next"))} &rarr;</span>')
+        p_parts.append(f'<a href="{last_link}">{html.escape(t(lang, "last"))}</a>' if last_link
+                       else f'<span style="opacity:.4">{html.escape(t(lang, "last"))}</span>')
+        pagination_html = f'<div class="pagination">{"".join(p_parts)}</div>'
+
     search_value = html.escape(q, quote=True)
     lang_input = f'<input type="hidden" name="lang" value="{lang}">' if lang != LANG_DEFAULT else ""
 
     if ALLOW_POSTING:
         compose_html = f"""
-        <div class="compose">
+        <div class="card">
           <form method="post" action="/post">
             <textarea name="text" data-counter="post-count" data-btn="post-btn"
                       data-max="{MAX_POST_LEN}"
@@ -475,12 +697,13 @@ def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEF
             <div class="compose-row">
               <button type="submit" id="post-btn">{html.escape(t(lang, 'send'))}</button>
               <span class="counter" id="post-count">0 / {MAX_POST_LEN}</span>
+              <span class="hint">{html.escape(t(lang, 'shortcut_hint'))}</span>
             </div>
             {lang_input}
           </form>
         </div>"""
     else:
-        compose_html = f'<div class="compose"><p class="meta">{html.escape(t(lang, "posting_disabled"))}</p></div>'
+        compose_html = f'<div class="card"><p class="meta">{html.escape(t(lang, "posting_disabled"))}</p></div>'
 
     if ALLOW_SEARCH:
         sort_opts = options([
@@ -511,21 +734,26 @@ def index(q: str = "", sort: str = "new", flt: str = "all", lang: str = LANG_DEF
     <h1>{html.escape(SITE_NAME)}</h1>
     {compose_html}
     {search_html}
-    <h2>{html.escape(t(lang, 'all_posts'))} ({len(items)})</h2>
+    <h2>{html.escape(t(lang, 'all_posts'))} ({total})</h2>
     {feed_html}
+    {pagination_html}
     """
     return page(SITE_NAME, body, lang, refresh=AUTO_REFRESH_SECONDS)
 
+
+# ==============================
+#           ПОСТЫ
+# ==============================
 
 @app.post("/post")
 def create_post(text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
     lang = pick_lang(lang)
     if not ALLOW_POSTING:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
+        return RedirectResponse(url_index(lang), status_code=303)
 
     text = clean_text(text)[:MAX_POST_LEN]
     if not text:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
+        return RedirectResponse(url_index(lang), status_code=303)
 
     while len(posts) >= MAX_POSTS:
         oldest = next(iter(posts))
@@ -538,7 +766,7 @@ def create_post(text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
         "created": datetime.now(),
         "comments": [],
     }
-    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
+    return RedirectResponse(url_post(pid, lang), status_code=303)
 
 
 @app.get("/p/{pid}", response_class=HTMLResponse)
@@ -549,7 +777,8 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
         return HTMLResponse(not_found(t(lang, "post_not_found"), lang), status_code=404)
 
     copy_post_html = (
-        f'<button type="button" class="copy-btn" data-target="post-body">{html.escape(t(lang, "copy_text"))}</button>'
+        f'<button type="button" class="copy-btn" data-target="post-body">'
+        f'{html.escape(t(lang, "copy_text"))}</button>'
         if SHOW_COPY_BUTTON else ""
     )
 
@@ -564,11 +793,12 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
         for c in p["comments"]:
             c_stamp = c["created"].strftime("%d.%m.%Y %H:%M") if SHOW_TIMESTAMPS else ""
             copy_html = (
-                f'<button type="button" class="copy-btn" data-target="c-{c["id"]}">{html.escape(t(lang, "copy_text"))}</button>'
+                f'<button type="button" class="copy-btn" data-target="c-{c["id"]}">'
+                f'{html.escape(t(lang, "copy_text"))}</button>'
                 if SHOW_COPY_BUTTON else ""
             )
             comments.append(f"""
-            <div class="comment">
+            <div class="card comment">
               <div class="txt" id="c-{c["id"]}">{html.escape(c["text"])}</div>
               {f'<div class="meta">{html.escape(c_stamp)}</div>' if c_stamp else ''}
               {copy_html}
@@ -576,7 +806,7 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
         comments_html = "".join(comments) if comments else f"<p class='meta'>{html.escape(t(lang, 'no_comments'))}</p>"
 
         compose_html = f"""
-        <div class="compose">
+        <div class="card">
           <form method="post" action="/p/{p["id"]}/comment">
             <textarea name="text" data-counter="cmt-count" data-btn="cmt-btn"
                       data-max="{MAX_COMMENT_LEN}"
@@ -585,6 +815,7 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
             <div class="compose-row">
               <button type="submit" id="cmt-btn">{html.escape(t(lang, 'send'))}</button>
               <span class="counter" id="cmt-count">0 / {MAX_COMMENT_LEN}</span>
+              <span class="hint">{html.escape(t(lang, 'shortcut_hint'))}</span>
             </div>
             <input type="hidden" name="lang" value="{lang}">
           </form>
@@ -597,10 +828,10 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
         comments_block = ""
 
     body = f"""
-    <p><a href="{with_lang('/', lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
+    <p><a href="{url_index(lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
     <h1>{html.escape(t(lang, 'post_heading'))}</h1>
 
-    <div class="post">
+    <div class="card post">
       <div class="txt" id="post-body">{html.escape(p["text"])}</div>
       <div class="meta">{" &middot; ".join(meta_parts)}</div>
       {copy_post_html}
@@ -615,11 +846,11 @@ def view_post(pid: str, lang: str = LANG_DEFAULT):
 def add_comment(pid: str, text: str = Form(...), lang: str = Form(LANG_DEFAULT)):
     lang = pick_lang(lang)
     if not ALLOW_COMMENTS:
-        return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
+        return RedirectResponse(url_post(pid, lang), status_code=303)
 
     p = posts.get(pid)
     if not p:
-        return RedirectResponse(with_lang("/", lang), status_code=303)
+        return RedirectResponse(url_index(lang), status_code=303)
 
     text = clean_text(text)[:MAX_COMMENT_LEN]
     if text:
@@ -631,17 +862,21 @@ def add_comment(pid: str, text: str = Form(...), lang: str = Form(LANG_DEFAULT))
         if len(p["comments"]) > MAX_COMMENTS_PER_POST:
             del p["comments"][:len(p["comments"]) - MAX_COMMENTS_PER_POST]
 
-    return RedirectResponse(with_lang(f"/p/{pid}", lang), status_code=303)
+    return RedirectResponse(url_post(pid, lang), status_code=303)
 
+
+# ==============================
+#           PRIVACY
+# ==============================
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy(lang: str = LANG_DEFAULT):
     lang = pick_lang(lang)
     body = f"""
-    <p><a href="{with_lang('/', lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
+    <p><a href="{url_index(lang)}">&larr; {html.escape(t(lang, 'back_home'))}</a></p>
     <h1>{html.escape(t(lang, 'privacy_title'))}</h1>
 
-    <div class="post">
+    <div class="card post">
       <ol class="privacy">
         <li>
           <b>{html.escape(t(lang, 'privacy_p1_title', site=SITE_NAME))}</b><br>
@@ -669,4 +904,7 @@ if __name__ == "__main__":
         access_log=False,
         proxy_headers=False,
         log_level="warning",
+        limit_concurrency=200,   # максимум одновременных соединений
+        timeout_keep_alive=5,    # держим keep-alive недолго
+        h11_max_incomplete_event_size=MAX_BODY_BYTES + 1024,  # режем недочитанные запросы
     )
