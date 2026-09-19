@@ -1,7 +1,7 @@
 """
 SldChat — простой мессенджер на Python + FastAPI + WebSocket.
 Запуск:  python main.py     (или: uvicorn main:app --host 0.0.0.0 --port 8000)
-Всё хранится только в оперативной памяти процесса.
+Все данные живут в оперативной памяти процесса.
 """
 
 import asyncio
@@ -67,7 +67,7 @@ async def notify_contacts(nick: str, payload: dict):
         await send_ws(c, payload)
 
 
-# ================== БЕЗОПАСНОСТЬ / ПРИВАТНОСТЬ ==================
+# ================== БЕЗОПАСНОСТЬ ==================
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     nick = current_user(request)
@@ -296,7 +296,7 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     return {"ok": True, "message": msg}
 
 
-# ================== ОБЩИЕ СТИЛИ (строкой) ==================
+# ================== SHARED CSS ==================
 SHARED_CSS = r"""
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; padding: 0; }
@@ -310,7 +310,6 @@ SHARED_CSS = r"""
   }
   input, textarea, .selectable { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
 
-  /* прячем скроллбары, но сохраняем прокрутку */
   * { scrollbar-width: none; -ms-overflow-style: none; }
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
@@ -324,22 +323,10 @@ SHARED_CSS = r"""
     60%  { opacity: 1; transform: scale(1.02); }
     100% { opacity: 1; transform: scale(1); }
   }
-  @keyframes slideInLeft {
-    from { opacity: 0; transform: translateX(-8px); }
-    to   { opacity: 1; transform: translateX(0); }
-  }
-  @keyframes slideInRight {
-    from { opacity: 0; transform: translateX(20px); }
-    to   { opacity: 1; transform: translateX(0); }
-  }
-  @keyframes msgIn {
-    from { opacity: 0; transform: translateY(6px) scale(0.98); }
-    to   { opacity: 1; transform: translateY(0) scale(1); }
-  }
 
   a { color: #3f6fa8; text-decoration: none; transition: color 0.14s ease; }
   a:hover { text-decoration: underline; }
-  .container { max-width: 1000px; margin: 0 auto; padding: 0 20px; }
+  .container { max-width: 1080px; margin: 0 auto; padding: 0 22px; }
 
   .icon {
     width: 16px; height: 16px; flex-shrink: 0;
@@ -351,7 +338,7 @@ SHARED_CSS = r"""
   .icon.xl  { width: 28px; height: 28px; stroke-width: 1.7; }
   .icon.huge{ width: 42px; height: 42px; stroke-width: 1.5; }
 
-  /* Верхняя панель */
+  /* Topbar */
   .topbar {
     background: linear-gradient(#fbfcfd, #dce3ea);
     border-bottom: 1px solid #b7c2cd;
@@ -369,16 +356,6 @@ SHARED_CSS = r"""
   .logo:hover { transform: translateY(-1px); text-decoration: none; }
   .logo span { color: #3f6fa8; }
   .logo .icon { color: #3f6fa8; width: 22px; height: 22px; }
-
-  .badge-closed {
-    display: inline-flex; align-items: center; gap: 5px;
-    background: #2b3a4a; color: #dbe5ef;
-    border-radius: 12px; padding: 3px 10px 3px 8px;
-    font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase;
-    font-weight: bold;
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-  }
-  .badge-closed .icon { width: 11px; height: 11px; stroke-width: 2.4; }
 
   .nav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
   .nav a.navlink {
@@ -409,14 +386,14 @@ SHARED_CSS = r"""
                        box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
-  /* Секции */
-  .section { padding: 60px 0; border-bottom: 1px solid #dbe1e7; }
-  .section:nth-child(even) { background: #f6f8fa; }
+  /* Sections */
+  .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; }
+  .section:nth-of-type(even) { background: #f6f8fa; }
   .section h2 {
     font-size: 27px; font-weight: normal; margin: 0 0 8px; color: #23374b;
     text-shadow: 0 1px 0 #fff;
   }
-  .section .lead { color: #6f7c8b; font-size: 14px; margin: 0 0 26px; }
+  .section .lead { color: #6f7c8b; font-size: 14px; margin: 0 0 30px; }
   .section p { margin: 0 0 12px; color: #47586c; }
 
   .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 10px; }
@@ -457,7 +434,6 @@ SHARED_CSS = r"""
     outline: none; list-style: none;
     display: flex; align-items: center; gap: 10px;
     transition: background 0.15s ease;
-    position: relative;
   }
   .faq summary::-webkit-details-marker { display: none; }
   .faq summary:hover { background: #f6f9fc; }
@@ -480,26 +456,47 @@ SHARED_CSS = r"""
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
 
-  /* Футер */
+  /* Footer */
   footer {
     background: #2b3a4a; color: #b8c4ce;
-    padding: 30px 0; font-size: 12px;
+    padding: 44px 0 26px; font-size: 13px;
   }
-  footer .foot-inner {
+  footer .foot-cols {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
+    gap: 30px;
+    margin-bottom: 34px;
+  }
+  footer .foot-brand .brand-name {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 17px; color: #fff; font-weight: bold;
+    margin-bottom: 10px;
+  }
+  footer .foot-brand .brand-name span { color: #9db8d3; }
+  footer .foot-brand .brand-name .icon { color: #9db8d3; width: 22px; height: 22px; }
+  footer .foot-brand p {
+    margin: 0; color: #8fa3b6; font-size: 12px; line-height: 1.6;
+    max-width: 260px;
+  }
+  footer .foot-col h4 {
+    margin: 0 0 12px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: 1px; color: #8fa3b6; font-weight: bold;
+  }
+  footer .foot-col ul { list-style: none; padding: 0; margin: 0; }
+  footer .foot-col li { margin-bottom: 7px; }
+  footer .foot-col a { color: #b8c4ce; font-size: 13px; transition: color 0.14s ease; }
+  footer .foot-col a:hover { color: #fff; }
+  footer .foot-bottom {
+    border-top: 1px solid #3d4d5d;
+    padding-top: 20px;
     display: flex; align-items: center; justify-content: space-between;
     gap: 14px; flex-wrap: wrap;
+    font-size: 12px; color: #7a8b9c;
   }
-  footer a { color: #9db8d3; transition: color 0.15s ease; }
-  footer a:hover { color: #d6e3f0; }
-  footer .brand {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 14px; color: #dbe5ef; font-weight: bold;
-  }
-  footer .brand .icon { color: #9db8d3; }
-  footer .foot-links { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  footer .foot-links .sep { opacity: 0.4; }
+  footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  footer .foot-bottom a { color: #9db8d3; }
 
-  /* Page wrapper для внутренних страниц */
+  /* Page wrappers */
   .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; animation: fadeUp 0.4s ease both; }
   .page-head { margin-bottom: 28px; }
   .page-head h1 {
@@ -519,6 +516,11 @@ SHARED_CSS = r"""
   .page-card ul { padding-left: 22px; margin: 0 0 10px; }
   .page-card li { margin: 0 0 6px; }
   .page-card b { color: #23374b; }
+  .page-card code {
+    background: #eef2f6; padding: 1px 6px; border-radius: 3px;
+    font-family: Consolas, "Courier New", monospace; font-size: 12px;
+    color: #2b3a4a;
+  }
   .link-arrow {
     display: inline-flex; align-items: center; gap: 6px;
     color: #3f6fa8; font-weight: bold; font-size: 13px;
@@ -530,54 +532,110 @@ SHARED_CSS = r"""
   @media (max-width: 820px) {
     .nav a.navlink { display: none; }
     .topbar-inner { gap: 8px; }
-    .badge-closed.hide-sm { display: none; }
     .cards { grid-template-columns: 1fr; }
-    .section { padding: 40px 0; }
+    .section { padding: 42px 0; }
     .section h2 { font-size: 22px; }
     .page-head h1 { font-size: 24px; }
     .page-card { padding: 20px 18px; }
+    footer .foot-cols { grid-template-columns: 1fr 1fr; gap: 22px; }
+    footer .foot-brand { grid-column: 1 / -1; }
   }
 """
 
 
-# ================== HTML: ГЛАВНАЯ ==================
+FOOTER_HTML = """
+<footer>
+  <div class="container">
+    <div class="foot-cols">
+      <div class="foot-brand">
+        <div class="brand-name">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+          Sld<span>Chat</span>
+        </div>
+        <p>SldChat — независимый мессенджер для небольших команд, созданный командой SldChat Team.</p>
+      </div>
+      <div class="foot-col">
+        <h4>Продукт</h4>
+        <ul>
+          <li><a href="/#features">Возможности</a></li>
+          <li><a href="/#servers">Серверы</a></li>
+          <li><a href="/register">Регистрация</a></li>
+          <li><a href="/login">Вход</a></li>
+        </ul>
+      </div>
+      <div class="foot-col">
+        <h4>Компания</h4>
+        <ul>
+          <li><a href="/privacy">Приватность</a></li>
+          <li><a href="/support">Поддержка</a></li>
+          <li><a href="/#faq">FAQ</a></li>
+        </ul>
+      </div>
+      <div class="foot-col">
+        <h4>Связь</h4>
+        <ul>
+          <li><a href="mailto:sldshr.confirmation@gmail.com">Почта</a></li>
+          <li><a href="https://discord.com/users/sldshr" target="_blank" rel="noopener">Discord: sldshr</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <div>© 2026 SldChat Team. Все права защищены.</div>
+      <div class="legal">
+        <a href="/privacy">Политика приватности</a>
+        <a href="/support">Поддержка</a>
+      </div>
+    </div>
+  </div>
+</footer>
+"""
+
+
+# ================== LANDING ==================
 LANDING_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SldChat — простой мессенджер</title>
+<title>SldChat — быстрый мессенджер для команд</title>
+<meta name="description" content="SldChat — независимый мессенджер: регистрация за 5 секунд, добавление по нику, мгновенная доставка через WebSocket.">
 <style>
-""" + SHARED_CSS + r"""
+__SHARED_CSS__
+
   .hero {
     background:
       radial-gradient(circle at 20% 20%, #e6eef7 0%, transparent 60%),
       linear-gradient(#d5dfe9, #b8c6d3);
     border-bottom: 1px solid #a8b5c2;
-    padding: 78px 0 88px;
+    padding: 84px 0 92px;
     text-align: center; position: relative; overflow: hidden;
   }
   .hero::after {
     content: ''; position: absolute; left: 0; right: 0; bottom: 0;
     height: 1px; background: rgba(255,255,255,0.6);
   }
-  .hero .badge-closed {
-    background: #b7c8db; color: #2b3a4a;
-    font-size: 11px; padding: 4px 12px 4px 10px;
-    box-shadow: inset 0 1px 0 #fff, 0 1px 0 rgba(0,0,0,0.05);
-    margin-bottom: 22px;
+  .hero .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: rgba(255,255,255,0.6);
+    border: 1px solid #b7c8db;
+    border-radius: 20px;
+    padding: 5px 14px 5px 12px;
+    font-size: 11px; letter-spacing: 0.5px;
+    text-transform: uppercase; font-weight: bold;
+    color: #3a5169;
+    margin-bottom: 24px;
     animation: fadeUp 0.5s ease both;
   }
-  .hero .badge-closed .icon { width: 12px; height: 12px; }
+  .hero .eyebrow .icon { width: 13px; height: 13px; color: #3f6fa8; }
   .hero h1 {
     font-size: 46px; font-weight: normal; margin: 0 0 18px;
-    color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.1;
+    color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.12;
     letter-spacing: 0.4px;
     animation: fadeUp 0.55s ease 0.05s both;
   }
   .hero h1 b { color: #3f6fa8; font-weight: bold; }
   .hero p {
-    max-width: 580px; margin: 0 auto 30px;
+    max-width: 620px; margin: 0 auto 32px;
     color: #4a5f74; font-size: 16px;
     animation: fadeUp 0.55s ease 0.12s both;
   }
@@ -585,6 +643,13 @@ LANDING_PAGE = """<!DOCTYPE html>
     display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
     animation: fadeUp 0.55s ease 0.2s both;
   }
+  .hero-meta {
+    margin-top: 26px; font-size: 12px; color: #5a6f83;
+    display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
+    animation: fadeUp 0.55s ease 0.28s both;
+  }
+  .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
 
   .servers { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 10px; }
   .server-card {
@@ -602,25 +667,31 @@ LANDING_PAGE = """<!DOCTYPE html>
     color: #3f6fa8; flex-shrink: 0;
     box-shadow: inset 0 1px 0 #fff;
   }
-  .server-card .body { min-width: 0; }
+  .server-card .body { min-width: 0; flex: 1; }
   .server-card .url {
     font-family: Consolas, "Courier New", monospace;
     font-size: 15px; color: #2b3a4a; font-weight: bold;
     word-break: break-all;
   }
   .server-card .desc { font-size: 12px; color: #7a8695; margin-top: 3px; }
+  .server-card .tag {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+    color: #2f8f3d; font-weight: bold;
+    padding: 2px 8px; border-radius: 10px; background: #e5f3e7;
+    align-self: flex-start; flex-shrink: 0;
+  }
+  .server-card .tag.alt { color: #3f6fa8; background: #e6eef7; }
 
   .notice {
     margin-top: 22px;
     background: #fff8e1; border: 1px solid #ecdc9b; border-radius: 6px;
     padding: 14px 16px;
     display: flex; gap: 12px; align-items: flex-start;
-    color: #6f5a13;
+    color: #6f5a13; font-size: 13px;
   }
   .notice .icon { color: #b8860b; flex-shrink: 0; margin-top: 2px; }
   .notice b { color: #4f3e07; }
 
-  /* Privacy mini */
   .privacy-mini {
     display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
     margin-bottom: 20px;
@@ -645,7 +716,7 @@ LANDING_PAGE = """<!DOCTYPE html>
   .privacy-item p { margin: 0; font-size: 12px; color: #5a6c80; }
 
   @media (max-width: 820px) {
-    .hero { padding: 50px 0 60px; }
+    .hero { padding: 54px 0 64px; }
     .hero h1 { font-size: 30px; }
     .hero p { font-size: 14px; }
     .servers { grid-template-columns: 1fr; }
@@ -661,16 +732,12 @@ LANDING_PAGE = """<!DOCTYPE html>
       <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
       Sld<span>Chat</span>
     </a>
-    <span class="badge-closed hide-sm">
-      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      ClosedSource
-    </span>
     <nav class="nav">
-      <a class="navlink" href="#about">О нас</a>
-      <a class="navlink" href="#app">О приложении</a>
+      <a class="navlink" href="#features">Возможности</a>
       <a class="navlink" href="#servers">Серверы</a>
       <a class="navlink" href="#privacy">Приватность</a>
       <a class="navlink" href="#faq">FAQ</a>
+      <a class="navlink" href="/support">Поддержка</a>
       <a class="btn" href="/login">Войти</a>
       <a class="btn btn-primary" href="/register">Регистрация</a>
     </nav>
@@ -679,56 +746,80 @@ LANDING_PAGE = """<!DOCTYPE html>
 
 <section class="hero">
   <div class="container">
-    <span class="badge-closed">
-      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      ClosedSource
+    <span class="eyebrow">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+      Быстрая доставка через WebSocket
     </span>
     <h1>Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
     <p>Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику,
-    мгновенная доставка сообщений через WebSocket.</p>
+    мгновенная доставка сообщений. Работает на телефоне и на компьютере.</p>
     <div class="hero-actions">
       <a class="btn btn-primary btn-lg" href="/register">Создать аккаунт</a>
       <a class="btn btn-lg" href="/login">У меня уже есть аккаунт</a>
     </div>
+    <div class="hero-meta">
+      <span>
+        <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        Без e-mail и телефона
+      </span>
+      <span>
+        <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        Без рекламы
+      </span>
+      <span>
+        <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        Бесплатно
+      </span>
+    </div>
   </div>
 </section>
 
-<section id="about" class="section">
+<section id="features" class="section">
   <div class="container">
-    <h2>О нас</h2>
-    <p class="lead">Небольшая команда энтузиастов, которой надоели перегруженные мессенджеры.</p>
-    <p>SldChat — закрытый по исходникам проект на Python и FastAPI. Мы не храним ничего лишнего
-    и не собираем ваши данные: сервер живёт в оперативной памяти, а сессии — только в cookie.</p>
-    <p>Проект создан как инструмент для общения внутри небольших команд и компаний друзей,
-    которым не нужны стикеры, реакции и «истории».</p>
-  </div>
-</section>
-
-<section id="app" class="section">
-  <div class="container">
-    <h2>О приложении</h2>
-    <p class="lead">Клиент работает прямо в браузере — на компьютере и на смартфоне.</p>
+    <h2>Возможности</h2>
+    <p class="lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
     <div class="cards">
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         </div>
         <h3>Мгновенная доставка</h3>
-        <p>Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без всяких «обновлений».</p>
+        <p>Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
         </div>
         <h3>Добавление по нику</h3>
-        <p>Никаких глобальных списков. Введите ник — и вы с человеком сразу друг у друга.</p>
+        <p>Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.</p>
+      </div>
+      <div class="card">
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        </div>
+        <h3>Статус «в сети»</h3>
+        <p>Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.</p>
+      </div>
+      <div class="card">
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+        </div>
+        <h3>На любом устройстве</h3>
+        <p>Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.</p>
+      </div>
+      <div class="card">
+        <div class="ico">
+          <svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </div>
+        <h3>Поиск по контактам</h3>
+        <p>Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.</p>
       </div>
       <div class="card">
         <div class="ico">
           <svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
         </div>
-        <h3>Приватность</h3>
-        <p>Сообщения не сохраняются на диске. История живёт, пока жив сервер, — и только в памяти.</p>
+        <h3>Приватность по умолчанию</h3>
+        <p>Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.</p>
       </div>
     </div>
   </div>
@@ -737,7 +828,7 @@ LANDING_PAGE = """<!DOCTYPE html>
 <section id="servers" class="section">
   <div class="container">
     <h2>Серверы SldChat</h2>
-    <p class="lead">Проект работает на двух независимых серверах. Выбирайте любой.</p>
+    <p class="lead">Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.</p>
 
     <div class="servers">
       <div class="server-card">
@@ -746,8 +837,9 @@ LANDING_PAGE = """<!DOCTYPE html>
         </div>
         <div class="body">
           <div class="url">sldchat.fastapicloud.dev</div>
-          <div class="desc">Основной сервер · FastAPI Cloud</div>
+          <div class="desc">FastAPI Cloud</div>
         </div>
+        <span class="tag">Основной</span>
       </div>
       <div class="server-card">
         <div class="ico">
@@ -755,8 +847,9 @@ LANDING_PAGE = """<!DOCTYPE html>
         </div>
         <div class="body">
           <div class="url">sldchat.onrunxbuild.com</div>
-          <div class="desc">Резервный сервер · onrunxbuild</div>
+          <div class="desc">onrunxbuild</div>
         </div>
+        <span class="tag alt">Резерв</span>
       </div>
     </div>
 
@@ -783,7 +876,7 @@ LANDING_PAGE = """<!DOCTYPE html>
         </div>
         <div>
           <h3>Ничего не пишем на диск</h3>
-          <p>Все данные живут только в оперативной памяти сервера и исчезают при перезапуске.</p>
+          <p>Сообщения и данные аккаунта существуют, пока работает сервер.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -792,7 +885,7 @@ LANDING_PAGE = """<!DOCTYPE html>
         </div>
         <div>
           <h3>Без аналитики и рекламы</h3>
-          <p>Никаких трекеров, пикселей, cookies сторонних сервисов и профилирования.</p>
+          <p>Никаких трекеров, пикселей и сторонних скриптов.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -801,7 +894,7 @@ LANDING_PAGE = """<!DOCTYPE html>
         </div>
         <div>
           <h3>Одна сессионная cookie</h3>
-          <p>Только для входа. HttpOnly, SameSite, без сторонних скриптов.</p>
+          <p>HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.</p>
         </div>
       </div>
       <div class="privacy-item">
@@ -816,7 +909,7 @@ LANDING_PAGE = """<!DOCTYPE html>
     </div>
 
     <a class="link-arrow" href="/privacy">
-      Почитать ещё
+      Почитать подробнее
       <svg class="icon" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
     </a>
   </div>
@@ -831,14 +924,9 @@ LANDING_PAGE = """<!DOCTYPE html>
         <div class="answer-wrap"><div class="answer">Нисколько. Проект полностью бесплатный, без рекламы и подписок.</div></div>
       </details>
       <details>
-        <summary>Почему ClosedSource?</summary>
-        <div class="answer-wrap"><div class="answer">Исходный код проекта не публикуется. Это осознанное решение —
-        мы не хотим, чтобы под именем SldChat появлялись сторонние клоны.</div></div>
-      </details>
-      <details>
         <summary>Сохраняются ли мои сообщения?</summary>
-        <div class="answer-wrap"><div class="answer">Нет. Всё хранится только в оперативной памяти сервера и исчезает
-        при его перезапуске. На диск ничего не пишется.</div></div>
+        <div class="answer-wrap"><div class="answer">Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске.
+        На диск ничего не пишется.</div></div>
       </details>
       <details>
         <summary>Почему я вижу только своих контактов?</summary>
@@ -849,33 +937,24 @@ LANDING_PAGE = """<!DOCTYPE html>
       <details>
         <summary>Можно ли удалять сообщения?</summary>
         <div class="answer-wrap"><div class="answer">Нет. Отправленное сообщение остаётся в истории до перезапуска сервера.
-        Так что пишите осознанно :)</div></div>
+        Пишите осознанно.</div></div>
+      </details>
+      <details>
+        <summary>Чем серверы отличаются друг от друга?</summary>
+        <div class="answer-wrap"><div class="answer">Это два независимых развёртывания. У каждого своя база
+        пользователей и сообщений, между собой они не связаны. Регистрируйтесь там, где удобно.</div></div>
       </details>
       <details>
         <summary>Как выйти из аккаунта?</summary>
-        <div class="answer-wrap"><div class="answer">Кнопка выхода — в шапке приложения (значок стрелки из двери).</div></div>
+        <div class="answer-wrap"><div class="answer">Кнопка выхода — в шапке приложения, справа от списка контактов.</div></div>
       </details>
     </div>
   </div>
 </section>
 
-<footer>
-  <div class="container foot-inner">
-    <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-      SldChat © 2026 · ClosedSource
-    </div>
-    <div class="foot-links">
-      <a href="#about">О нас</a><span class="sep">·</span>
-      <a href="/privacy">Приватность</a><span class="sep">·</span>
-      <a href="#faq">FAQ</a><span class="sep">·</span>
-      <a href="/support">Поддержка</a>
-    </div>
-  </div>
-</footer>
+__FOOTER__
 
 <script>
-/* FAQ-аккордеон: открыт только один ответ */
 document.querySelectorAll('.faq details').forEach(d => {
   d.addEventListener('toggle', () => {
     if (d.open) {
@@ -891,15 +970,15 @@ document.querySelectorAll('.faq details').forEach(d => {
 """
 
 
-# ================== HTML: PRIVACY ==================
+# ================== PRIVACY ==================
 PRIVACY_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SldChat — Приватность</title>
+<title>SldChat — Политика приватности</title>
 <style>
-""" + SHARED_CSS + r"""
+__SHARED_CSS__
 </style>
 </head>
 <body>
@@ -910,10 +989,6 @@ PRIVACY_PAGE = """<!DOCTYPE html>
       <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
       Sld<span>Chat</span>
     </a>
-    <span class="badge-closed hide-sm">
-      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      ClosedSource
-    </span>
     <nav class="nav">
       <a class="navlink" href="/">На главную</a>
       <a class="navlink" href="/support">Поддержка</a>
@@ -947,13 +1022,12 @@ PRIVACY_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="page-card selectable">
-    <h2>Чего мы НЕ делаем</h2>
+    <h2>Чего мы не делаем</h2>
     <ul>
-      <li>Не собираем e-mail, телефон, паспортные данные или что-либо подобное.</li>
+      <li>Не собираем e-mail, телефон и другие персональные данные.</li>
       <li>Не ведём логи IP-адресов и не отслеживаем вас между сессиями.</li>
       <li>Не используем аналитику, трекеры, пиксели и сторонние скрипты.</li>
       <li>Не показываем рекламу и не передаём данные третьим лицам.</li>
-      <li>Не продаём и не обмениваем ваши данные — просто потому, что их у нас почти нет.</li>
     </ul>
   </div>
 
@@ -962,19 +1036,18 @@ PRIVACY_PAGE = """<!DOCTYPE html>
     <p>Мы используем <b>одну-единственную cookie</b> — <code>session</code>. Она нужна только для того,
     чтобы вы оставались в аккаунте между запросами.</p>
     <ul>
-      <li>HttpOnly — недоступна из JavaScript, что защищает от XSS-кражи сессии.</li>
+      <li>HttpOnly — недоступна из JavaScript.</li>
       <li>SameSite=Lax — снижает риск CSRF-атак.</li>
       <li>Secure — при работе сайта по HTTPS.</li>
       <li>Срок жизни — до 30 дней или до выхода из аккаунта.</li>
     </ul>
-    <p>Никаких cookie от рекламных сетей, соцсетей или сторонних CDN.</p>
   </div>
 
   <div class="page-card selectable">
     <h2>Сколько данные живут</h2>
-    <p>Ровно столько, сколько работает сервер. Как только сервер перезапускается (или процесс падает),
-    вся информация исчезает безвозвратно. У нас физически нет ни ваших старых сообщений, ни старых
-    паролей, ни старых сессий.</p>
+    <p>Ровно столько, сколько работает сервер. Как только сервер перезапускается, вся информация
+    исчезает безвозвратно. У нас физически нет ни ваших старых сообщений, ни старых паролей,
+    ни старых сессий.</p>
   </div>
 
   <div class="page-card selectable">
@@ -982,7 +1055,7 @@ PRIVACY_PAGE = """<!DOCTYPE html>
     <ul>
       <li>Выйти из аккаунта — удалит активную сессию на этом устройстве.</li>
       <li>Дождаться перезапуска сервера — удалит всё остальное.</li>
-      <li>При желании — написать в поддержку, и мы ускорим процесс.</li>
+      <li>При желании — написать в <a href="/support">поддержку</a>, и мы ускорим процесс.</li>
     </ul>
   </div>
 
@@ -997,18 +1070,12 @@ PRIVACY_PAGE = """<!DOCTYPE html>
     <h2>Безопасность</h2>
     <ul>
       <li>Пароли не возвращаются через API.</li>
-      <li>Все проверки доступа — на стороне сервера.</li>
+      <li>Все проверки доступа выполняются на стороне сервера.</li>
       <li>Заголовки безопасности: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.</li>
       <li>Страницы с приватными данными не кэшируются браузером.</li>
     </ul>
-    <p>Полноценной криптографии у нас нет — это осознанный выбор простого проекта.
+    <p>Полноценной end-to-end криптографии у нас нет — это осознанный выбор простого проекта.
     Не отправляйте через SldChat ничего, что боитесь потерять.</p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2>Вопросы</h2>
-    <p>По любым вопросам пишите на <a href="mailto:sldshr.confirmation@gmail.com">sldshr.confirmation@gmail.com</a>
-    или в Discord: <b>sldshr</b>. Страница поддержки — <a href="/support">/support</a>.</p>
   </div>
 
   <a class="link-arrow" href="/" style="margin-top:8px">
@@ -1017,26 +1084,14 @@ PRIVACY_PAGE = """<!DOCTYPE html>
   </a>
 </div>
 
-<footer>
-  <div class="container foot-inner">
-    <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-      SldChat © 2026 · ClosedSource
-    </div>
-    <div class="foot-links">
-      <a href="/">Главная</a><span class="sep">·</span>
-      <a href="/privacy">Приватность</a><span class="sep">·</span>
-      <a href="/support">Поддержка</a>
-    </div>
-  </div>
-</footer>
+__FOOTER__
 
 </body>
 </html>
 """
 
 
-# ================== HTML: SUPPORT ==================
+# ================== SUPPORT ==================
 SUPPORT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1044,7 +1099,8 @@ SUPPORT_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SldChat — Поддержка</title>
 <style>
-""" + SHARED_CSS + r"""
+__SHARED_CSS__
+
   .contact-card {
     display: flex; align-items: center; gap: 16px;
     background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
@@ -1089,10 +1145,6 @@ SUPPORT_PAGE = """<!DOCTYPE html>
       <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
       Sld<span>Chat</span>
     </a>
-    <span class="badge-closed hide-sm">
-      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-      ClosedSource
-    </span>
     <nav class="nav">
       <a class="navlink" href="/">На главную</a>
       <a class="navlink" href="/privacy">Приватность</a>
@@ -1103,12 +1155,12 @@ SUPPORT_PAGE = """<!DOCTYPE html>
 
 <div class="page-wrap">
   <div class="page-head">
-    <h1>Поддержка SldChat</h1>
+    <h1>Поддержка</h1>
     <p>Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.</p>
   </div>
 
   <div class="page-card">
-    <h2>Связаться с нами</h2>
+    <h2>Связаться</h2>
 
     <a class="contact-card" href="mailto:sldshr.confirmation@gmail.com">
       <div class="ico">
@@ -1136,56 +1188,32 @@ SUPPORT_PAGE = """<!DOCTYPE html>
   <div class="page-card selectable">
     <h2>Перед обращением</h2>
     <ul>
-      <li>Убедитесь, что вы находитесь на нужном сервере: <code>sldchat.fastapicloud.dev</code>
-          или <code>sldchat.onrunxbuild.com</code>. Данные между ними не передаются.</li>
-      <li>Если не получается войти — проверьте, что ник написан точно так же, как при регистрации.</li>
+      <li>Убедитесь, что вы на нужном сервере: <code>sldchat.fastapicloud.dev</code>
+          или <code>sldchat.onrunxbuild.com</code> — данные между ними не передаются.</li>
+      <li>Если не получается войти — проверьте, что ник введён точно так же, как при регистрации.</li>
       <li>Сообщения не сохраняются после перезапуска сервера — это нормальное поведение.</li>
-      <li>Пользователь не появился в списке контактов, если он ещё не добавил вас взаимно?</li>
       <li>Опишите проблему подробно: что делали, что ожидали, что получилось.</li>
     </ul>
   </div>
-
-  <a class="link-arrow" href="/" style="margin-top:8px">
-    <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-    На главную
-  </a>
 </div>
 
-<footer>
-  <div class="container foot-inner">
-    <div class="brand">
-      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-      SldChat © 2026 · ClosedSource
-    </div>
-    <div class="foot-links">
-      <a href="/">Главная</a><span class="sep">·</span>
-      <a href="/privacy">Приватность</a><span class="sep">·</span>
-      <a href="/support">Поддержка</a>
-    </div>
-  </div>
-</footer>
+__FOOTER__
 
 </body>
 </html>
 """
 
 
-# ================== HTML: АВТОРИЗАЦИЯ ==================
-def render_auth(active: str) -> str:
-    login_active = "active" if active == "login" else ""
-    reg_active = "active" if active == "register" else ""
-    login_style = "" if active == "login" else "display:none"
-    reg_style = "" if active == "register" else "display:none"
-    title = "Вход" if active == "login" else "Регистрация"
-
-    return f"""<!DOCTYPE html>
+# ================== AUTH ==================
+AUTH_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SldChat — {title}</title>
+<title>__TITLE__</title>
 <style>
-""" + SHARED_CSS + """
+__SHARED_CSS__
+
   body {
     min-height: 100vh; display: flex; flex-direction: column;
     background:
@@ -1194,7 +1222,7 @@ def render_auth(active: str) -> str:
   }
   .topline {
     padding: 16px 22px;
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center;
     animation: fadeIn 0.35s ease both;
   }
   .topline a.logo { font-size: 20px; }
@@ -1212,23 +1240,28 @@ def render_auth(active: str) -> str:
   .box h1 {
     text-align: center; font-size: 20px; font-weight: normal;
     margin: 0 0 18px; color: #23374b; text-shadow: 0 1px 0 #fff;
-    letter-spacing: 1px;
+    letter-spacing: 0.5px;
   }
-  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid #a8b2bc; }
+  .tabs {
+    display: flex; margin-bottom: 16px;
+    border-bottom: 1px solid #a8b2bc;
+  }
   .tabs button {
-    flex: 1; border: 1px solid #a8b2bc; border-bottom: none;
+    flex: 1;
+    border: 1px solid #a8b2bc; border-bottom: none;
     background: linear-gradient(#eef1f4, #d3dae1);
     border-radius: 4px 4px 0 0;
     padding: 8px 0; margin-right: 4px; cursor: pointer;
     font-family: inherit; font-size: 13px; color: #445;
     transition: background 0.15s ease, color 0.15s ease;
   }
+  .tabs button:last-child { margin-right: 0; }
   .tabs button:hover { background: linear-gradient(#f4f6f8, #dae0e6); }
   .tabs button.active {
     background: #f4f6f8; color: #223; font-weight: bold;
     position: relative; top: 1px;
   }
-  label { display: block; margin: 10px 0 4px; color: #445; }
+  label { display: block; margin: 10px 0 4px; color: #445; font-size: 13px; }
   input[type=text], input[type=password] {
     width: 100%; padding: 8px 10px;
     font-family: inherit; font-size: 13px;
@@ -1237,7 +1270,10 @@ def render_auth(active: str) -> str:
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
-  input:focus { border-color: #5a7a9a; box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 3px rgba(90,122,154,0.15); }
+  input:focus {
+    border-color: #5a7a9a;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 3px rgba(90,122,154,0.15);
+  }
 
   .btn2 {
     display: flex; align-items: center; justify-content: center; gap: 8px;
@@ -1254,8 +1290,10 @@ def render_auth(active: str) -> str:
     border-color: #35597f; color: #fff;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }
-  .btn2-primary:hover { background: linear-gradient(#699bcd, #4577b1);
-                        box-shadow: 0 4px 12px rgba(63,111,168,0.35); }
+  .btn2-primary:hover {
+    background: linear-gradient(#699bcd, #4577b1);
+    box-shadow: 0 4px 12px rgba(63,111,168,0.35);
+  }
   .btn2:active { transform: scale(0.98); }
 
   .error {
@@ -1264,6 +1302,9 @@ def render_auth(active: str) -> str:
   }
   .hint { margin-top: 14px; text-align: center; color: #889; font-size: 11px; }
   .back { text-align: center; margin-top: 14px; font-size: 12px; }
+
+  .form { display: block; }
+  .form.hidden { display: none; }
 </style>
 </head>
 <body>
@@ -1273,22 +1314,18 @@ def render_auth(active: str) -> str:
     <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
     Sld<span>Chat</span>
   </a>
-  <span class="badge-closed">
-    <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-    ClosedSource
-  </span>
 </div>
 
 <div class="wrap">
   <div class="box">
     <h1>Добро пожаловать</h1>
     <div class="tabs">
-      <button type="button" id="tabLogin" class="{login_active}">Вход</button>
-      <button type="button" id="tabRegister" class="{reg_active}">Регистрация</button>
+      <button type="button" id="tabLogin" class="__LOGIN_ACTIVE__">Вход</button>
+      <button type="button" id="tabRegister" class="__REG_ACTIVE__">Регистрация</button>
     </div>
     <div class="error" id="error"></div>
 
-    <form id="formLogin" style="{login_style}">
+    <form id="formLogin" class="form __LOGIN_HIDDEN__">
       <label>Ник:</label>
       <input type="text" name="nick" autocomplete="username" maxlength="20">
       <label>Пароль:</label>
@@ -1296,7 +1333,7 @@ def render_auth(active: str) -> str:
       <button type="submit" class="btn2 btn2-primary">Войти</button>
     </form>
 
-    <form id="formRegister" style="{reg_style}">
+    <form id="formRegister" class="form __REG_HIDDEN__">
       <label>Ник:</label>
       <input type="text" name="nick" autocomplete="username" maxlength="20" placeholder="3–20 символов">
       <label>Пароль:</label>
@@ -1304,53 +1341,70 @@ def render_auth(active: str) -> str:
       <button type="submit" class="btn2 btn2-primary">Зарегистрироваться</button>
     </form>
 
-    <div class="hint">Всё хранится только в оперативной памяти</div>
+    <div class="hint">Регистрация занимает меньше минуты</div>
     <div class="back"><a href="/">← На главную</a></div>
   </div>
 </div>
 
 <script>
-  const tabLogin = document.getElementById('tabLogin');
-  const tabRegister = document.getElementById('tabRegister');
-  const formLogin = document.getElementById('formLogin');
-  const formRegister = document.getElementById('formRegister');
-  const errorBox = document.getElementById('error');
+  var tabLogin = document.getElementById('tabLogin');
+  var tabRegister = document.getElementById('tabRegister');
+  var formLogin = document.getElementById('formLogin');
+  var formRegister = document.getElementById('formRegister');
+  var errorBox = document.getElementById('error');
 
-  function showTab(which) {{
-    if (which === 'login') {{
-      tabLogin.classList.add('active'); tabRegister.classList.remove('active');
-      formLogin.style.display = ''; formRegister.style.display = 'none';
-    }} else {{
-      tabRegister.classList.add('active'); tabLogin.classList.remove('active');
-      formRegister.style.display = ''; formLogin.style.display = 'none';
-    }}
+  function showTab(which) {
+    if (which === 'login') {
+      tabLogin.classList.add('active');
+      tabRegister.classList.remove('active');
+      formLogin.classList.remove('hidden');
+      formRegister.classList.add('hidden');
+    } else {
+      tabRegister.classList.add('active');
+      tabLogin.classList.remove('active');
+      formRegister.classList.remove('hidden');
+      formLogin.classList.add('hidden');
+    }
     errorBox.textContent = '';
-  }}
-  tabLogin.onclick = () => {{ showTab('login'); history.replaceState(null, '', '/login'); }};
-  tabRegister.onclick = () => {{ showTab('register'); history.replaceState(null, '', '/register'); }};
+  }
 
-  async function submitForm(url, form) {{
+  tabLogin.onclick = function() { showTab('login'); history.replaceState(null, '', '/login'); };
+  tabRegister.onclick = function() { showTab('register'); history.replaceState(null, '', '/register'); };
+
+  function submitForm(url, form) {
     errorBox.textContent = '';
-    const fd = new FormData(form);
-    let d;
-    try {{
-      const r = await fetch(url, {{ method: 'POST', body: fd }});
-      d = await r.json();
-    }} catch (e) {{
-      d = {{ ok:false, error:'Ошибка соединения' }};
-    }}
-    if (d.ok) {{ location.href = '/chat'; return; }}
-    errorBox.textContent = d.error || 'Ошибка';
-  }}
-  formLogin.onsubmit = e => {{ e.preventDefault(); submitForm('/api/login', formLogin); }};
-  formRegister.onsubmit = e => {{ e.preventDefault(); submitForm('/api/register', formRegister); }};
+    var fd = new FormData(form);
+    fetch(url, { method: 'POST', body: fd })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) { location.href = '/chat'; return; }
+        errorBox.textContent = d.error || 'Ошибка';
+      })
+      .catch(function() {
+        errorBox.textContent = 'Ошибка соединения';
+      });
+  }
+
+  formLogin.onsubmit = function(e) { e.preventDefault(); submitForm('/api/login', formLogin); };
+  formRegister.onsubmit = function(e) { e.preventDefault(); submitForm('/api/register', formRegister); };
 </script>
 </body>
 </html>
 """
 
 
-# ================== HTML: ЧАТ ==================
+def render_auth(active: str) -> str:
+    return (AUTH_TEMPLATE
+        .replace("__SHARED_CSS__", SHARED_CSS)
+        .replace("__FOOTER__", "")
+        .replace("__TITLE__", "SldChat — Вход" if active == "login" else "SldChat — Регистрация")
+        .replace("__LOGIN_ACTIVE__", "active" if active == "login" else "")
+        .replace("__REG_ACTIVE__", "active" if active == "register" else "")
+        .replace("__LOGIN_HIDDEN__", "" if active == "login" else "hidden")
+        .replace("__REG_HIDDEN__", "" if active == "register" else "hidden"))
+
+
+# ================== CHAT ==================
 CHAT_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1368,7 +1422,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   input, textarea, .msg-bubble { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
 
-  /* Скрываем скроллбары везде */
   * { scrollbar-width: none; -ms-overflow-style: none; }
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
@@ -1385,16 +1438,12 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     from { opacity: 0; transform: translateX(24px) scale(0.96); }
     to   { opacity: 1; transform: translateX(0) scale(1); }
   }
-  @keyframes toastOut {
-    from { opacity: 1; transform: translateX(0); }
-    to   { opacity: 0; transform: translateX(24px); }
-  }
+  @keyframes popIn { 0% { transform: scale(0.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
   @keyframes dotPulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
   }
 
-  /* SVG */
   .icon {
     width: 16px; height: 16px; flex-shrink: 0;
     stroke: currentColor; fill: none;
@@ -1404,7 +1453,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .icon.lg { width: 20px; height: 20px; }
   .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
 
-  /* Layout */
   .app {
     display: grid;
     grid-template-columns: 280px 1fr 260px;
@@ -1413,7 +1461,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     animation: fadeIn 0.3s ease both;
   }
 
-  /* Сайдбар */
   .sidebar {
     background: #f0f3f7; border-right: 1px solid #c8d1da;
     display: flex; flex-direction: column; min-width: 0;
@@ -1545,7 +1592,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     text-align: center; margin-left: 4px;
     animation: popIn 0.3s ease;
   }
-  @keyframes popIn { 0% { transform: scale(0.5); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
 
   .empty-list {
     padding: 22px 14px; text-align: center; color: #98a2ad;
@@ -1554,7 +1600,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     animation: fadeIn 0.4s ease both;
   }
 
-  /* Чат */
   .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
@@ -1579,7 +1624,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     background:
       radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%),
       #fbfcfd;
-    scroll-behavior: smooth;
   }
   .empty {
     color: #a2aab3; text-align: center; margin-top: 60px; font-size: 13px;
@@ -1587,10 +1631,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     animation: fadeIn 0.4s ease both;
   }
 
-  .date-sep {
-    text-align: center; margin: 14px 0 10px;
-    animation: fadeIn 0.25s ease both;
-  }
+  .date-sep { text-align: center; margin: 14px 0 10px; animation: fadeIn 0.25s ease both; }
   .date-sep span {
     background: #eef2f6; color: #6f7c8b;
     padding: 3px 11px; border-radius: 10px; font-size: 11px;
@@ -1610,7 +1651,7 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     font-size: 13px; line-height: 1.4;
     word-wrap: break-word; white-space: pre-wrap;
     color: #22303e;
-    transition: box-shadow 0.18s ease, transform 0.18s ease;
+    transition: box-shadow 0.18s ease;
   }
   .msg-bubble:hover { box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
   .msg-row.mine .msg-bubble {
@@ -1624,7 +1665,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     border-top: 1px solid #c8d1da; padding: 10px 12px;
     background: #eef2f6;
     display: flex; gap: 8px; align-items: flex-end;
-    transition: background 0.2s ease;
   }
   .input-area textarea {
     flex: 1; resize: none;
@@ -1652,7 +1692,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
                              box-shadow: 0 3px 10px rgba(63,111,168,0.35); }
   .input-area button:active { transform: scale(0.96); }
 
-  /* Инфо-панель */
   .info-panel {
     background: #f0f3f7; border-left: 1px solid #c8d1da;
     padding: 16px 16px; overflow-y: auto; min-width: 0;
@@ -1693,7 +1732,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   .info-row .k { color: #7a8695; flex-shrink: 0; }
   .info-row .v { color: #2b3a4a; text-align: right; word-break: break-word; }
 
-  /* Тост */
   .toast-wrap {
     position: fixed; bottom: 16px; right: 16px; z-index: 100;
     display: flex; flex-direction: column; gap: 8px;
@@ -1709,7 +1747,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
   }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
-  /* Mobile */
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; position: relative; }
     .sidebar { border-right: none; }
@@ -1737,7 +1774,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 
 <div class="app" id="app">
 
-  <!-- Сайдбар -->
   <aside class="sidebar">
     <div class="sb-header">
       <div class="logo-mini">
@@ -1775,7 +1811,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     <div class="user-list" id="userList"></div>
   </aside>
 
-  <!-- Чат -->
   <main class="chat" id="chatMain">
     <header class="chat-header">
       <button class="icon-btn mobile-only" id="backBtn" title="Назад">
@@ -1806,7 +1841,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
     </div>
   </main>
 
-  <!-- Инфо-панель -->
   <aside class="info-panel" id="infoPanel">
     <button class="icon-btn close-btn" id="infoCloseBtn" title="Закрыть">
       <svg class="icon" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -1824,7 +1858,6 @@ CHAT_PAGE = r"""<!DOCTYPE html>
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
-/* ==================== Состояние ==================== */
 let me = null;
 let current = null;
 const lastIds = {};
@@ -1838,7 +1871,6 @@ let wsReconnectTimer = null;
 const $ = id => document.getElementById(id);
 const app = $('app');
 
-/* ==================== Утилиты ==================== */
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -1886,12 +1918,10 @@ function toast(msg) {
   }, 3000);
 }
 
-/* ==================== WebSocket ==================== */
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  try {
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
-  } catch (e) { scheduleReconnect(); return; }
+  try { ws = new WebSocket(proto + '//' + location.host + '/ws'); }
+  catch (e) { scheduleReconnect(); return; }
 
   ws.onopen = () => {
     if (ws._pingTimer) clearInterval(ws._pingTimer);
@@ -1947,7 +1977,6 @@ function updatePresence(nick, online) {
   }
 }
 
-/* ==================== Инициализация ==================== */
 async function init() {
   const r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
@@ -1958,7 +1987,6 @@ async function init() {
   await loadContacts();
 }
 
-/* ==================== Контакты ==================== */
 async function loadContacts() {
   const r = await fetch('/api/contacts');
   if (!r.ok) { location.href = '/'; return; }
@@ -2005,7 +2033,6 @@ function renderContacts() {
   }
 }
 
-/* ==================== Диалог ==================== */
 async function openDialog(nick) {
   current = nick;
   lastIds[nick] = 0;
@@ -2073,7 +2100,6 @@ async function markRead(nick) {
   loadContacts();
 }
 
-/* ==================== Отправка ==================== */
 async function send() {
   if (!current) return;
   const inp = $('msgInput');
@@ -2096,7 +2122,6 @@ async function send() {
   loadInfo(current);
 }
 
-/* ==================== Инфо ==================== */
 async function loadInfo(nick) {
   if (!nick) {
     $('infoContent').innerHTML =
@@ -2142,7 +2167,6 @@ function updateChatSubtitle() {
   }
 }
 
-/* ==================== Добавление ==================== */
 $('addBtn').onclick = () => {
   const f = $('addForm');
   f.classList.toggle('open');
@@ -2175,7 +2199,6 @@ $('addForm').onsubmit = async e => {
   }
 };
 
-/* ==================== UI ==================== */
 $('sendBtn').onclick = send;
 $('msgInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -2212,7 +2235,6 @@ $('infoBtn').onclick = () => app.classList.toggle('info-open');
 $('infoCloseBtn').onclick = () => app.classList.remove('info-open');
 $('searchInput').addEventListener('input', e => { searchQuery = e.target.value; renderContacts(); });
 
-/* ==================== Поллинг (страховка) ==================== */
 setInterval(async () => {
   await loadContacts();
   if (current) { await refreshDialog(); await loadInfo(current); }
@@ -2226,11 +2248,15 @@ init();
 
 
 # ================== МАРШРУТЫ ==================
+def render_page(html: str) -> str:
+    return html.replace("__SHARED_CSS__", SHARED_CSS).replace("__FOOTER__", FOOTER_HTML)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def landing(request: Request):
     if current_user(request):
         return RedirectResponse("/chat")
-    return LANDING_PAGE
+    return render_page(LANDING_PAGE)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -2256,12 +2282,12 @@ async def chat_page(request: Request):
 
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy_page():
-    return PRIVACY_PAGE
+    return render_page(PRIVACY_PAGE)
 
 
 @app.get("/support", response_class=HTMLResponse)
 async def support_page():
-    return SUPPORT_PAGE
+    return render_page(SUPPORT_PAGE)
 
 
 if __name__ == "__main__":
