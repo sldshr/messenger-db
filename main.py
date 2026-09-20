@@ -9,8 +9,8 @@ import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-VERSION = "0.2"
-VERSION_NAME = "Aurora"
+VERSION = "0.3"
+VERSION_NAME = "Prism"
 VERSION_DATE = "2026-09-20"
 
 app = FastAPI(title=f"SldChat v{VERSION}")
@@ -344,7 +344,7 @@ async def og_image():
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-SHARED_CSS = """
+CSS_VARS = """
   :root {
     --bg: #eef2f6;
     --bg-2: #f6f8fa;
@@ -445,7 +445,9 @@ SHARED_CSS = """
     --online: #4caf50;
     --dot-off: #5a6470;
   }
+"""
 
+SHARED_CSS = CSS_VARS + """
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { scroll-behavior: smooth; scroll-padding-top: 76px; }
   html, body { margin: 0; padding: 0; }
@@ -614,18 +616,18 @@ SHARED_CSS = """
   .dd-toggle {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 7px 12px; border-radius: 4px;
-    border: 1px solid var(--footer-border); cursor: pointer;
-    background: rgba(255,255,255,0.06);
-    font-family: inherit; font-size: 13px; color: var(--footer-strong);
+    border: 1px solid var(--btn-border); cursor: pointer;
+    background: var(--btn-bg);
+    font-family: inherit; font-size: 13px; color: var(--text);
     transition: background 0.15s ease, border-color 0.15s ease;
     white-space: nowrap;
   }
-  .dd-toggle .icon { width: 14px; height: 14px; color: var(--footer-muted); transition: transform 0.22s ease; }
+  .dd-toggle .icon { width: 14px; height: 14px; color: var(--text-soft); transition: transform 0.22s ease; }
   .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
-  .dd-toggle .dd-label { color: var(--footer-muted); }
-  .dd-toggle .dd-value { color: #fff; font-weight: bold; }
+  .dd-toggle .dd-label { color: var(--text-muted); }
+  .dd-toggle .dd-value { color: var(--text); font-weight: bold; }
   @media (hover: hover) and (pointer: fine) {
-    .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: var(--accent); }
+    .dd-toggle:hover { background: var(--btn-bg-hover); border-color: var(--accent); }
   }
 
   .dd-menu {
@@ -655,29 +657,20 @@ SHARED_CSS = """
     display: inline-flex; align-items: center; justify-content: center;
     width: 36px; height: 34px;
     border-radius: 4px;
-    border: 1px solid var(--footer-border);
-    background: rgba(255,255,255,0.06);
-    color: var(--footer-muted);
+    border: 1px solid var(--btn-border);
+    background: var(--btn-bg);
+    color: var(--text-soft);
     cursor: pointer; padding: 0; font-family: inherit;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
   .theme-toggle .icon { width: 16px; height: 16px; }
   @media (hover: hover) and (pointer: fine) {
-    .theme-toggle:hover { background: rgba(255,255,255,0.12); border-color: var(--accent); color: #fff; }
+    .theme-toggle:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
   }
   .theme-toggle:active { transform: scale(0.94); }
   .theme-toggle .icon-sun, .theme-toggle .icon-moon { display: none; }
   html[data-theme="light"] .theme-toggle .icon-moon { display: block; }
   html[data-theme="dark"]  .theme-toggle .icon-sun  { display: block; }
-
-  .theme-toggle-light {
-    border-color: var(--border-2);
-    background: var(--btn-bg);
-    color: var(--text);
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .theme-toggle-light:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
-  }
 
   footer { background: var(--footer-bg); color: var(--footer-text); padding: 44px 0 26px; font-size: 13px; }
   footer .foot-cols { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 30px; margin-bottom: 30px; }
@@ -1013,6 +1006,8 @@ HEAD_COMMON = """
       t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
     document.documentElement.setAttribute('data-theme', t);
+    var tc = document.querySelector('meta[name="theme-color"]');
+    if (tc) tc.setAttribute('content', t === 'dark' ? '#14161c' : '#3f6fa8');
   } catch (e) {
     document.documentElement.setAttribute('data-theme', 'light');
   }
@@ -1554,10 +1549,24 @@ __SHARED_CSS__
 
     <div class="cl-item reveal">
       <div class="cl-head">
+        <span class="cl-ver">v0.3</span>
+        <span class="cl-name">Prism</span>
+        <span class="cl-date">20 сентября 2026</span>
+        <span class="cl-current" data-i18n="cl_current"></span>
+      </div>
+      <ul class="cl-list">
+        <li><b>Исправлены стили клиента.</b> Восстановлена загрузка CSS-переменных в чате — интерфейс больше не рассыпается.</li>
+        <li>Полностью переработана структура CSS: единый блок <code>:root</code> с палитрой для всех страниц.</li>
+        <li>Иконки тем и переключателей корректно отображаются в обеих темах.</li>
+        <li>Улучшено выравнивание элементов в шапке клиента на мобильных.</li>
+      </ul>
+    </div>
+
+    <div class="cl-item reveal">
+      <div class="cl-head">
         <span class="cl-ver">v0.2</span>
         <span class="cl-name">Aurora</span>
         <span class="cl-date">20 сентября 2026</span>
-        <span class="cl-current" data-i18n="cl_current"></span>
       </div>
       <ul class="cl-list">
         <li><b>Тёмная тема.</b> Переключение одной кнопкой — в подвале сайта и в клиенте рядом с переключателем языка. Тема запоминается.</li>
@@ -1918,7 +1927,7 @@ __SHARED_CSS__
     background-size: cover;
     background-repeat: no-repeat;
   }
-  [data-theme="dark"] html, html[data-theme="dark"] {
+  html[data-theme="dark"] {
     background:
       radial-gradient(circle at 30% 10%, rgba(60,80,110,0.35) 0%, transparent 55%),
       linear-gradient(#1c2028, #0f1115);
@@ -1982,28 +1991,15 @@ __SHARED_CSS__
   .form { display: block; }
   .form.hidden { display: none; }
 
-  .dd.dd-light .dd-toggle {
-    background: var(--btn-bg);
-    border-color: var(--border-2); color: var(--text);
+  .dd .dd-toggle {
     padding: 6px 10px; font-size: 12px;
   }
-  .dd.dd-light .dd-toggle .icon { color: var(--text-soft); }
-  .dd.dd-light .dd-toggle .dd-value { color: var(--text); }
-  .dd.dd-light .dd-menu {
+  .dd .dd-menu {
     top: calc(100% + 6px); bottom: auto;
     transform-origin: top right;
     transform: translateY(-6px) scale(0.97);
   }
-  .dd.dd-light.open .dd-menu { transform: translateY(0) scale(1); }
-
-  .theme-toggle.auth-theme {
-    border-color: var(--border-2);
-    background: var(--btn-bg);
-    color: var(--text-soft);
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .theme-toggle.auth-theme:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
-  }
+  .dd.open .dd-menu { transform: translateY(0) scale(1); }
 
   @media (max-width: 820px) {
     .topline { padding: 12px 16px; }
@@ -2020,11 +2016,11 @@ __SHARED_CSS__
     Sld<span>Chat</span>
   </a>
   <div class="top-actions">
-    <button class="theme-toggle auth-theme" id="authThemeBtn" type="button" title="Theme">
+    <button class="theme-toggle" id="authThemeBtn" type="button" title="Theme">
       <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
     </button>
-    <div class="dd dd-light" id="authLangDd">
+    <div class="dd" id="authLangDd">
       <button class="dd-toggle" type="button" aria-haspopup="listbox">
         <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
         <span class="dd-value" id="authLangValue">RU</span>
@@ -2211,6 +2207,8 @@ CHAT_PAGE = """<!DOCTYPE html>
 <link rel="apple-touch-icon" href="/favicon.svg">
 __HEAD_COMMON__
 <style>
+__SHARED_CSS__
+
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; padding: 0;
@@ -2259,20 +2257,21 @@ __HEAD_COMMON__
     background: var(--bg);
   }
 
-  .dd { position: relative; display: inline-block; }
-  .dd-toggle {
+  .sidebar .dd, .sb-actions .dd {
+    position: relative;
+  }
+  .sb-actions .dd .dd-toggle {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 5px 9px; border-radius: 4px;
     border: 1px solid var(--btn-border); cursor: pointer;
     background: var(--btn-bg);
     font-family: inherit; font-size: 12px; color: var(--text);
   }
-  .dd-toggle .icon { width: 13px; height: 13px; }
-  .dd-toggle .icon.chev { transition: transform 0.22s ease; }
-  .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
-  .dd-toggle .dd-value { font-weight: bold; }
-
-  .dd-menu {
+  .sb-actions .dd .dd-toggle .icon { width: 13px; height: 13px; color: var(--text-soft); }
+  .sb-actions .dd .dd-toggle .icon.chev { transition: transform 0.22s ease; }
+  .sb-actions .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
+  .sb-actions .dd .dd-toggle .dd-value { font-weight: bold; }
+  .sb-actions .dd .dd-menu {
     position: absolute; top: calc(100% + 6px); left: 0;
     min-width: 160px;
     background: var(--bg-card);
@@ -2285,25 +2284,34 @@ __HEAD_COMMON__
     transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
     z-index: 200;
   }
-  .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
-  .dd-menu li {
+  .sb-actions .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
+  .sb-actions .dd .dd-menu li {
     padding: 8px 12px; border-radius: 4px; cursor: pointer;
     font-size: 13px; color: var(--text);
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
   }
-  .dd-menu li:hover { background: var(--selection-bg); }
-  .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
-  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .sb-actions .dd .dd-menu li:hover { background: var(--selection-bg); }
+  .sb-actions .dd .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
+  .sb-actions .dd .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
-  .theme-toggle.client-theme {
-    border-color: var(--btn-border);
+  .theme-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 30px;
+    border-radius: 4px;
+    border: 1px solid var(--btn-border);
     background: var(--btn-bg);
     color: var(--text-soft);
-    width: 32px; height: 28px;
+    cursor: pointer; padding: 0; font-family: inherit;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
+  .theme-toggle .icon { width: 15px; height: 15px; }
   @media (hover: hover) and (pointer: fine) {
-    .theme-toggle.client-theme:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
+    .theme-toggle:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
   }
+  .theme-toggle:active { transform: scale(0.94); }
+  .theme-toggle .icon-sun, .theme-toggle .icon-moon { display: none; }
+  html[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+  html[data-theme="dark"]  .theme-toggle .icon-sun  { display: block; }
 
   .sidebar {
     background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border);
@@ -2628,9 +2636,10 @@ __HEAD_COMMON__
     .logo-mini .icon { width: 22px; height: 22px; }
     .sb-header .icon-btn { padding: 10px; min-width: 44px; min-height: 44px; }
     .sb-header .icon-btn .icon { width: 22px; height: 22px; }
-    .dd-toggle { padding: 10px 12px; font-size: 13px; min-height: 44px; }
-    .theme-toggle.client-theme { width: 44px; height: 44px; }
-    .theme-toggle.client-theme .icon { width: 20px; height: 20px; }
+    .sb-actions { gap: 8px; }
+    .sb-actions .dd .dd-toggle { padding: 8px 12px; font-size: 13px; min-height: 44px; }
+    .theme-toggle { width: 44px; height: 44px; }
+    .theme-toggle .icon { width: 20px; height: 20px; }
 
     .me-line {
       padding: 10px 14px;
@@ -2733,7 +2742,7 @@ __HEAD_COMMON__
         Sld<span>Chat</span>
       </div>
       <div class="sb-actions">
-        <button class="theme-toggle client-theme" id="chatThemeBtn" type="button" title="Theme">
+        <button class="theme-toggle" id="chatThemeBtn" type="button" title="Theme">
           <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
           <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
         </button>
