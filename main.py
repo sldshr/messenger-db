@@ -1,10 +1,6 @@
-"""
-SldChat — простой мессенджер на Python + FastAPI + WebSocket.
-Запуск:  python main.py
-"""
-
 import asyncio
 import json
+import os
 import secrets
 import time
 from typing import Dict, List, Optional, Set
@@ -13,7 +9,12 @@ import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-app = FastAPI(title="SldChat")
+# ================== ВЕРСИЯ ==================
+VERSION = "0.1"
+VERSION_NAME = "Genesis"
+VERSION_DATE = "2026-09-20"
+
+app = FastAPI(title=f"SldChat v{VERSION}")
 START_TIME = time.time()
 
 # ================== ХРАНИЛИЩЕ ==================
@@ -74,7 +75,7 @@ async def security_middleware(request: Request, call_next):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "interest-cohort=()"
-    if request.url.path in ("/", "/chat", "/login", "/register", "/privacy", "/support"):
+    if request.url.path in ("/", "/chat", "/login", "/register", "/privacy", "/support", "/changelog"):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -110,6 +111,18 @@ async def ws_endpoint(websocket: WebSocket):
                 active_ws.pop(nick, None)
                 users[nick]["last_seen"] = time.time()
                 await notify_contacts(nick, {"type": "presence", "nick": nick, "online": False})
+
+
+# ================== HEALTH / SERVER-INFO ==================
+@app.get("/health")
+async def health():
+    return {"ok": True, "version": VERSION, "uptime": round(time.time() - START_TIME, 1),
+            "users": len(users), "online": sum(1 for n in users if is_online(n))}
+
+
+@app.get("/api/server-info")
+async def api_server_info():
+    return {"ok": True, "started": START_TIME, "version": VERSION}
 
 
 # ================== API ==================
@@ -159,11 +172,6 @@ async def api_me(request: Request):
     nick = current_user(request)
     if not nick: return JSONResponse({"ok": False}, status_code=401)
     return {"ok": True, "nick": nick}
-
-
-@app.get("/api/server-info")
-async def api_server_info():
-    return {"ok": True, "started": START_TIME}
 
 
 @app.post("/api/contacts/add")
@@ -548,6 +556,13 @@ SHARED_CSS = """
   }
   footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   footer .foot-bottom a { color: #9db8d3; }
+  footer .foot-version {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: #1f2c39; color: #9db8d3;
+    padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-family: Consolas, "Courier New", monospace;
+    margin-left: 8px;
+  }
 
   .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; }
   .page-head { margin-bottom: 28px; }
@@ -576,6 +591,56 @@ SHARED_CSS = """
   }
   .link-arrow:hover { gap: 10px; text-decoration: none; }
 
+  /* ==== Changelog timeline ==== */
+  .changelog { max-width: 820px; margin: 0 auto; }
+  .cl-item {
+    position: relative;
+    padding-left: 30px;
+    padding-bottom: 30px;
+    border-left: 2px solid #cfd7df;
+    margin-left: 8px;
+  }
+  .cl-item:last-child { border-left: 2px solid transparent; }
+  .cl-item::before {
+    content: ''; position: absolute; left: -8px; top: 4px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #3f6fa8; border: 3px solid #eef2f6;
+    box-shadow: 0 0 0 2px #3f6fa8;
+  }
+  .cl-head {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .cl-ver {
+    font-size: 22px; font-weight: bold; color: #23374b;
+    font-family: Consolas, "Courier New", monospace;
+  }
+  .cl-name {
+    font-size: 15px; color: #3f6fa8; font-weight: bold;
+  }
+  .cl-date {
+    font-size: 12px; color: #7a8695;
+    background: #eef2f6; padding: 2px 10px; border-radius: 10px;
+  }
+  .cl-list { list-style: none; padding: 0; margin: 0; }
+  .cl-list li {
+    padding: 6px 0 6px 24px; position: relative;
+    color: #47586c; font-size: 13px;
+    line-height: 1.5;
+  }
+  .cl-list li::before {
+    content: ''; position: absolute; left: 6px; top: 12px;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #a8b8ca;
+  }
+  .cl-current {
+    display: inline-block;
+    background: #e5f3e7; color: #2f8f3d;
+    font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.6px; font-weight: bold;
+    padding: 2px 8px; border-radius: 10px;
+  }
+
   @media (max-width: 820px) {
     .nav a.navlink { display: none; }
     .topbar-inner { gap: 8px; }
@@ -589,6 +654,7 @@ SHARED_CSS = """
     footer .foot-controls { flex-direction: column; align-items: flex-start; gap: 12px; }
     footer .foot-status { gap: 14px; }
     .dd-menu { left: 0; right: auto; transform-origin: bottom left; }
+    .cl-ver { font-size: 18px; }
   }
 """
 
@@ -609,9 +675,9 @@ FOOTER_HTML = """
         <h4 data-i18n="foot_product">Продукт</h4>
         <ul>
           <li><a href="/#features" data-i18n="nav_features">Возможности</a></li>
-          <li><a href="/#servers" data-i18n="nav_servers">Серверы</a></li>
           <li><a href="/register" data-i18n="btn_register">Регистрация</a></li>
           <li><a href="/login" data-i18n="btn_login">Вход</a></li>
+          <li><a href="/changelog" data-i18n="nav_changelog">Changelog</a></li>
         </ul>
       </div>
       <div class="foot-col">
@@ -652,10 +718,14 @@ FOOTER_HTML = """
     </div>
 
     <div class="foot-bottom">
-      <div data-i18n="foot_copy">© 2026 SldChat Team. Все права защищены.</div>
+      <div>
+        <span data-i18n="foot_copy">© 2026 SldChat Team. Все права защищены.</span>
+        <span class="foot-version" title="__VERSION_NAME__ · __VERSION_DATE__">v__VERSION__</span>
+      </div>
       <div class="legal">
         <a href="/privacy" data-i18n="foot_privacy">Приватность</a>
         <a href="/support" data-i18n="foot_support">Поддержка</a>
+        <a href="/changelog" data-i18n="nav_changelog">Changelog</a>
       </div>
     </div>
   </div>
@@ -687,17 +757,6 @@ FOOTER_HTML = """
   fetch('/api/server-info').then(function(r){return r.json();}).then(function(d){
     if (d && d.ok) { started = d.started; tick(); setInterval(tick, 1000); }
   }).catch(function(){});
-
-  function softenUrls(){
-    document.querySelectorAll('.server-card .url').forEach(function(el){
-      if (el.dataset.wbr === '1') return;
-      el.dataset.wbr = '1';
-      var parts = el.textContent.split('.');
-      el.innerHTML = parts.map(function(p, i){
-        return i < parts.length - 1 ? p + '.<wbr>' : p;
-      }).join('');
-    });
-  }
 
   function wireDropdown(root, onSelect){
     if (!root) return;
@@ -750,11 +809,11 @@ FOOTER_HTML = """
     els.forEach(function(el){ io.observe(el); });
   }
 
-  window.SldFooter = { wire: wireDropdown, markActive: markActive, softenUrls: softenUrls, tick: tick };
+  window.SldFooter = { wire: wireDropdown, markActive: markActive, tick: tick };
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function(){ softenUrls(); setupReveal(); });
-  } else { softenUrls(); setupReveal(); }
+    document.addEventListener('DOMContentLoaded', setupReveal);
+  } else { setupReveal(); }
 })();
 </script>
 """
@@ -774,6 +833,7 @@ var I18N = {
   ru: {
     nav_features: "Возможности", nav_servers: "Серверы", nav_privacy: "Приватность",
     nav_faq: "FAQ", nav_support: "Поддержка", nav_home: "На главную",
+    nav_changelog: "Changelog",
     btn_login: "Войти", btn_register: "Регистрация",
     lang_short: "Язык:",
 
@@ -791,11 +851,6 @@ var I18N = {
     feat_5_h: "Поиск по контактам", feat_5_p: "Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.",
     feat_6_h: "Приватность по умолчанию", feat_6_p: "Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.",
 
-    srv_h: "Серверы SldChat",
-    srv_lead: "Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.",
-    srv_main: "Основной", srv_alt: "Резерв", srv_unstable: "Unstable",
-    srv_notice: "<b>Это разные серверы.</b> У каждого своя база пользователей и сообщений — данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу, зарегистрируйтесь на каждом отдельно.",
-
     priv_h: "Приватность", priv_lead: "Коротко о самом главном. Подробности — на отдельной странице.",
     priv_1_h: "Ничего не пишем на диск", priv_1_p: "Сообщения и данные аккаунта существуют, пока работает сервер.",
     priv_2_h: "Без аналитики и рекламы", priv_2_p: "Никаких трекеров, пикселей и сторонних скриптов.",
@@ -808,7 +863,7 @@ var I18N = {
     faq_q2: "Сохраняются ли мои сообщения?", faq_a2: "Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске. На диск ничего не пишется.",
     faq_q3: "Почему я вижу только своих контактов?", faq_a3: "В SldChat нет публичного каталога пользователей. Чтобы начать общение, нажмите «Добавить контакт» и введите ник собеседника.",
     faq_q4: "Как удалить контакт?", faq_a4: "Откройте диалог с человеком и нажмите «Удалить контакт» в панели справа.",
-    faq_q5: "Чем серверы отличаются друг от друга?", faq_a5: "Это два независимых развёртывания. У каждого своя база пользователей и сообщений, между собой они не связаны.",
+    faq_q5: "Как установить SldChat у себя?", faq_a5: "Скачайте main.py, установите зависимости (pip install fastapi uvicorn) и запустите python main.py. Больше ничего не нужно — база данных не требуется, всё работает в оперативной памяти.",
     faq_q6: "Как выйти из аккаунта?", faq_a6: "Кнопка выхода — в шапке приложения, справа от списка контактов.",
 
     auth_welcome: "Добро пожаловать",
@@ -824,11 +879,15 @@ var I18N = {
     foot_brand: "SldChat — независимый мессенджер от SldChat Team.",
     foot_product: "Продукт", foot_company: "Компания", foot_contact: "Связь",
     foot_privacy: "Приватность", foot_support: "Поддержка", foot_faq: "FAQ", foot_mail: "Почта",
-    foot_status: "Сервер:", foot_uptime: "Аптайм:", foot_copy: "© 2026 SldChat Team. Все права защищены."
+    foot_status: "Сервер:", foot_uptime: "Аптайм:", foot_copy: "© 2026 SldChat Team. Все права защищены.",
+
+    cl_h: "История версий", cl_sub: "Все релизы SldChat — от первого до последнего.",
+    cl_current: "текущая"
   },
   en: {
     nav_features: "Features", nav_servers: "Servers", nav_privacy: "Privacy",
     nav_faq: "FAQ", nav_support: "Support", nav_home: "Home",
+    nav_changelog: "Changelog",
     btn_login: "Sign in", btn_register: "Sign up",
     lang_short: "Language:",
 
@@ -846,11 +905,6 @@ var I18N = {
     feat_5_h: "Contact search", feat_5_p: "Fast search among your contacts right in the list — filtering as you type.",
     feat_6_h: "Privacy by default", feat_6_p: "Minimum data collected. One session cookie, no trackers.",
 
-    srv_h: "SldChat servers",
-    srv_lead: "The project runs on two independent servers. Pick any — data isn't shared between them.",
-    srv_main: "Primary", srv_alt: "Backup", srv_unstable: "Unstable",
-    srv_notice: "<b>These are different servers.</b> Each has its own users and messages — data is <b>not shared</b>. To use both, register on each separately.",
-
     priv_h: "Privacy", priv_lead: "The essentials. Full details on a dedicated page.",
     priv_1_h: "Nothing on disk", priv_1_p: "Messages and account data exist only while the server is running.",
     priv_2_h: "No analytics or ads", priv_2_p: "No trackers, pixels or third-party scripts.",
@@ -863,9 +917,8 @@ var I18N = {
     faq_q2: "Are my messages saved?", faq_a2: "No. Everything lives in server RAM and disappears on restart. Nothing is written to disk.",
     faq_q3: "Why do I only see my contacts?", faq_a3: "SldChat has no public user directory. Press 'Add contact' and enter the nick.",
     faq_q4: "How do I remove a contact?", faq_a4: "Open the dialog and press 'Remove contact' in the right panel.",
-    faq_q5: "How do servers differ?", faq_a5: "Two independent deployments. Each has its own users and messages; they're not connected.",
-    faq_q6: "How do I log out?", faq_q6_a: "",
-    faq_a6: "The logout button is at the top of the chat, next to the contact list.",
+    faq_q5: "How do I host SldChat myself?", faq_a5: "Download main.py, install dependencies (pip install fastapi uvicorn) and run python main.py. That's it — no database needed, everything is in memory.",
+    faq_q6: "How do I log out?", faq_a6: "The logout button is at the top of the chat, next to the contact list.",
 
     auth_welcome: "Welcome",
     auth_tab_login: "Sign in", auth_tab_register: "Sign up",
@@ -880,7 +933,10 @@ var I18N = {
     foot_brand: "SldChat — an independent messenger by SldChat Team.",
     foot_product: "Product", foot_company: "Company", foot_contact: "Contact",
     foot_privacy: "Privacy", foot_support: "Support", foot_faq: "FAQ", foot_mail: "Email",
-    foot_status: "Server:", foot_uptime: "Uptime:", foot_copy: "© 2026 SldChat Team. All rights reserved."
+    foot_status: "Server:", foot_uptime: "Uptime:", foot_copy: "© 2026 SldChat Team. All rights reserved.",
+
+    cl_h: "Version history", cl_sub: "All SldChat releases — from the first to the latest.",
+    cl_current: "current"
   }
 };
 
@@ -1063,48 +1119,6 @@ __SHARED_CSS__
   .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
   .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
 
-  .servers { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 10px; }
-  .server-card {
-    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
-    padding: 20px 22px; display: flex; align-items: center; gap: 14px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
-    min-width: 0;
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .server-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10); }
-  }
-  .server-card .ico {
-    width: 46px; height: 46px; border-radius: 8px;
-    background: linear-gradient(#e4ebf2, #c8d3de);
-    border: 1px solid #b7c2cd;
-    display: flex; align-items: center; justify-content: center;
-    color: #3f6fa8; flex-shrink: 0;
-    box-shadow: inset 0 1px 0 #fff;
-  }
-  .server-card .body { min-width: 0; flex: 1; }
-  .server-card .url {
-    font-family: Consolas, "Courier New", monospace;
-    font-size: 15px; color: #2b3a4a; font-weight: bold;
-    line-height: 1.3; overflow-wrap: anywhere;
-  }
-  .server-card .desc { font-size: 12px; color: #7a8695; margin-top: 3px; }
-  .server-card .tags { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
-  .server-card .tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
-    font-weight: bold; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
-  .server-card .tag.main { color: #2f8f3d; background: #e5f3e7; }
-  .server-card .tag.alt  { color: #3f6fa8; background: #e6eef7; }
-  .server-card .tag.unstable { color: #a05a00; background: #fdefd6; }
-
-  .notice {
-    margin-top: 22px;
-    background: #fff8e1; border: 1px solid #ecdc9b; border-radius: 6px;
-    padding: 14px 16px; display: flex; gap: 12px; align-items: flex-start;
-    color: #6f5a13; font-size: 13px;
-  }
-  .notice .icon { color: #b8860b; flex-shrink: 0; margin-top: 2px; }
-  .notice b { color: #4f3e07; }
-
   .privacy-mini { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 20px; }
   .privacy-item {
     background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
@@ -1128,15 +1142,7 @@ __SHARED_CSS__
     .hero h1 { font-size: 30px; }
     .hero p { font-size: 14px; }
     .hero .eyebrow { animation: none; }
-    .servers { grid-template-columns: 1fr; }
     .privacy-mini { grid-template-columns: 1fr; }
-  }
-  @media (max-width: 460px) {
-    .server-card { padding: 16px 16px; gap: 10px; align-items: flex-start; }
-    .server-card .ico { width: 40px; height: 40px; }
-    .server-card .ico .icon { width: 22px; height: 22px; }
-    .server-card .url { font-size: 13px; }
-    .server-card .desc { font-size: 11px; }
   }
 </style>
 </head>
@@ -1150,9 +1156,9 @@ __SHARED_CSS__
     </a>
     <nav class="nav">
       <a class="navlink" href="#features" data-i18n="nav_features">Возможности</a>
-      <a class="navlink" href="#servers" data-i18n="nav_servers">Серверы</a>
       <a class="navlink" href="#privacy" data-i18n="nav_privacy">Приватность</a>
       <a class="navlink" href="#faq" data-i18n="nav_faq">FAQ</a>
+      <a class="navlink" href="/changelog" data-i18n="nav_changelog">Changelog</a>
       <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
       <a class="btn" href="/login" data-i18n="btn_login">Войти</a>
       <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
@@ -1197,34 +1203,6 @@ __SHARED_CSS__
         <h3 data-i18n="feat_5_h"></h3><p data-i18n="feat_5_p"></p></div>
       <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
         <h3 data-i18n="feat_6_h"></h3><p data-i18n="feat_6_p"></p></div>
-    </div>
-  </div>
-</section>
-
-<section id="servers" class="section">
-  <div class="container">
-    <h2 data-i18n="srv_h">Серверы SldChat</h2>
-    <p class="lead" data-i18n="srv_lead"></p>
-
-    <div class="servers">
-      <div class="server-card reveal">
-        <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
-        <div class="body"><div class="url">sldchat.fastapicloud.dev</div><div class="desc">FastAPI Cloud</div></div>
-        <div class="tags"><span class="tag main" data-i18n="srv_main">Основной</span></div>
-      </div>
-      <div class="server-card reveal">
-        <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
-        <div class="body"><div class="url">sldchat.onrunxbuild.com</div><div class="desc">RunxBuild</div></div>
-        <div class="tags">
-          <span class="tag alt" data-i18n="srv_alt">Резерв</span>
-          <span class="tag unstable" data-i18n="srv_unstable">Unstable</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="notice reveal">
-      <svg class="icon lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-      <div data-i18n-html="srv_notice"></div>
     </div>
   </div>
 </section>
@@ -1332,6 +1310,122 @@ __I18N_JS__
 """
 
 
+# ================== CHANGELOG ==================
+CHANGELOG_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SldChat — Changelog</title>
+__HEAD_COMMON__
+<style>
+__SHARED_CSS__
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="container topbar-inner">
+    <a href="/" class="logo">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+      Sld<span>Chat</span>
+    </a>
+    <nav class="nav">
+      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
+      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page-wrap">
+  <div class="page-head">
+    <h1 data-i18n="cl_h">История версий</h1>
+    <p data-i18n="cl_sub">Все релизы SldChat — от первого до последнего.</p>
+  </div>
+
+  <div class="changelog">
+
+    <!-- ===== 0.1 ===== -->
+    <div class="cl-item reveal">
+      <div class="cl-head">
+        <span class="cl-ver">v0.1</span>
+        <span class="cl-name">Genesis</span>
+        <span class="cl-date">20 сентября 2026</span>
+        <span class="cl-current" data-i18n="cl_current">текущая</span>
+      </div>
+      <ul class="cl-list">
+        <li><b>Первый публичный релиз SldChat.</b></li>
+        <li>Регистрация и вход по нику и паролю.</li>
+        <li>Мгновенная доставка сообщений через WebSocket.</li>
+        <li>Добавление контактов по нику (двусторонняя связь).</li>
+        <li>Удаление контакта из диалога.</li>
+        <li>Статус «в сети / был(а) недавно».</li>
+        <li>Индикатор «печатает…» в шапке чата.</li>
+        <li>Поиск по контактам.</li>
+        <li>Разделители дат («Сегодня», «Вчера», …).</li>
+        <li>Кнопка «вниз к новым» с бейджем непрочитанных.</li>
+        <li>Адаптивный интерфейс для ПК, планшетов и смартфонов.</li>
+        <li>Свайп от левого края — возврат в список чатов (мобильный).</li>
+        <li>Двуязычный интерфейс: русский и английский.</li>
+        <li>Параметр <code>?lang=ru</code> / <code>?lang=en</code> в ссылках.</li>
+        <li>OpenGraph и Twitter Cards для красивых превью.</li>
+        <li>Собственная SVG-иконка и OG-баннер.</li>
+        <li>Страницы: <code>/privacy</code>, <code>/support</code>, <code>/changelog</code>.</li>
+        <li>Health-check эндпоинт <code>/health</code>.</li>
+        <li>Простой хостинг: один файл <code>main.py</code>, никакой БД.</li>
+      </ul>
+    </div>
+
+    <!--
+      ШАБЛОН ДЛЯ НОВЫХ ВЕРСИЙ — просто копируйте и меняйте:
+
+      <div class="cl-item">
+        <div class="cl-head">
+          <span class="cl-ver">v0.2</span>
+          <span class="cl-name">Название релиза</span>
+          <span class="cl-date">ДД месяца ГГГГ</span>
+        </div>
+        <ul class="cl-list">
+          <li>Что добавлено</li>
+          <li>Что исправлено</li>
+        </ul>
+      </div>
+    -->
+
+  </div>
+</div>
+
+__FOOTER__
+
+<script>
+__I18N_JS__
+
+(function(){
+  var lang = SldLang.pickInitial();
+  localStorage.setItem('sld_lang', lang);
+  SldLang.setGlobalUnits(lang);
+  SldLang.applyTo(document, SldLang.I18N[lang]);
+  SldLang.updateUrl(lang);
+  SldLang.propagateLinks(lang);
+  document.documentElement.lang = lang;
+  SldFooter.markActive(document.getElementById('footLangDd'), lang);
+  SldFooter.wire(document.getElementById('footLangDd'), function(v){
+    localStorage.setItem('sld_lang', v);
+    SldLang.setGlobalUnits(v);
+    SldLang.applyTo(document, SldLang.I18N[v]);
+    SldLang.updateUrl(v);
+    SldLang.propagateLinks(v);
+    SldFooter.markActive(document.getElementById('footLangDd'), v);
+    document.documentElement.lang = v;
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
 # ================== PRIVACY ==================
 PRIVACY_PAGE = """<!DOCTYPE html>
 <html lang="ru">
@@ -1390,7 +1484,6 @@ __SHARED_CSS__
       <li data-i18n="priv_page_del_1"></li><li data-i18n="priv_page_del_2"></li>
       <li data-i18n="priv_page_del_3"></li>
     </ul></div>
-  <div class="page-card selectable"><h2 data-i18n="priv_page_srv_h"></h2><p data-i18n-html="priv_page_srv_p"></p></div>
   <div class="page-card selectable"><h2 data-i18n="priv_page_sec_h"></h2>
     <ul>
       <li data-i18n="priv_page_sec_1"></li><li data-i18n="priv_page_sec_2"></li>
@@ -1441,9 +1534,6 @@ I18N.ru.priv_page_del_h = "Как удалить свои данные"; I18N.en
 I18N.ru.priv_page_del_1 = "Выйти из аккаунта — удалит активную сессию на этом устройстве."; I18N.en.priv_page_del_1 = "Log out — deletes the active session on this device.";
 I18N.ru.priv_page_del_2 = "Дождаться перезапуска сервера — удалит всё остальное."; I18N.en.priv_page_del_2 = "Wait for a server restart — that removes the rest.";
 I18N.ru.priv_page_del_3 = "Написать в поддержку, чтобы ускорить процесс."; I18N.en.priv_page_del_3 = "Contact support to speed up the process.";
-I18N.ru.priv_page_srv_h = "Два независимых сервера"; I18N.en.priv_page_srv_h = "Two independent servers";
-I18N.ru.priv_page_srv_p = "У SldChat есть <b>два отдельных развёртывания</b> — <code>sldchat.fastapicloud.dev</code> и <code>sldchat.onrunxbuild.com</code>. Это разные серверы с разными базами пользователей. <b>Данные между ними не передаются.</b>";
-I18N.en.priv_page_srv_p = "SldChat has <b>two separate deployments</b> — <code>sldchat.fastapicloud.dev</code> and <code>sldchat.onrunxbuild.com</code>. They are different servers with different user bases. <b>Data is not shared between them.</b>";
 I18N.ru.priv_page_sec_h = "Безопасность"; I18N.en.priv_page_sec_h = "Security";
 I18N.ru.priv_page_sec_1 = "Пароли не возвращаются через API."; I18N.en.priv_page_sec_1 = "Passwords are never returned via the API.";
 I18N.ru.priv_page_sec_2 = "Все проверки доступа — на стороне сервера."; I18N.en.priv_page_sec_2 = "All access checks happen server-side.";
@@ -1567,8 +1657,8 @@ I18N.ru.sup_h = "Поддержка"; I18N.en.sup_h = "Support";
 I18N.ru.sup_sub = "Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим."; I18N.en.sup_sub = "Found a problem or have a suggestion? Write to us — we'll definitely reply.";
 I18N.ru.sup_contact_h = "Связаться"; I18N.en.sup_contact_h = "Contact us";
 I18N.ru.sup_before_h = "Перед обращением"; I18N.en.sup_before_h = "Before contacting";
-I18N.ru.sup_before_1 = "Убедитесь, что вы на нужном сервере: sldchat.fastapicloud.dev или sldchat.onrunxbuild.com — данные между ними не передаются.";
-I18N.en.sup_before_1 = "Make sure you're on the right server: sldchat.fastapicloud.dev or sldchat.onrunxbuild.com — data is not shared between them.";
+I18N.ru.sup_before_1 = "Убедитесь, что вы вошли под тем же ником, что и при регистрации.";
+I18N.en.sup_before_1 = "Make sure you signed in with the same nick you registered with.";
 I18N.ru.sup_before_2 = "Если не получается войти — проверьте, что ник введён точно так же, как при регистрации.";
 I18N.en.sup_before_2 = "If you can't log in — make sure the nick matches exactly what you registered.";
 I18N.ru.sup_before_3 = "Сообщения не сохраняются после перезапуска сервера — это нормально.";
@@ -1612,7 +1702,7 @@ __HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
-  /* Фон на html с фиксированной привязкой, чтобы при скролле не было "обрыва" */
+  /* Фон на html, зафиксирован — при скролле не рвётся */
   html {
     min-height: 100vh;
     min-height: 100dvh;
@@ -1694,7 +1784,6 @@ __SHARED_CSS__
   }
   .dd.dd-light.open .dd-menu { transform: translateY(0) scale(1); }
 
-  /* Скрываем фейковый "пробел" под контентом, чтобы фон был всегда целым */
   @media (max-width: 820px) {
     .topline { padding: 12px 16px; }
     .wrap { padding: 16px; align-items: flex-start; padding-top: 24px; padding-bottom: 40px; }
@@ -1733,7 +1822,7 @@ __SHARED_CSS__
 
     <form id="formLogin" class="form hidden">
       <label data-i18n="auth_nick">Ник:</label>
-      <input type="text" name="nick" autocomplete="username" maxlength="20" inputmode="text" enterkeyhint="next">
+      <input type="text" name="nick" autocomplete="username" maxlength="20" enterkeyhint="next">
       <label data-i18n="auth_password">Пароль:</label>
       <input type="password" name="password" autocomplete="current-password" enterkeyhint="go">
       <button type="submit" class="btn2 btn2-primary" data-i18n="auth_login_btn">Войти</button>
@@ -1884,7 +1973,7 @@ CHAT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#3f6fa8">
 <title>SldChat</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -1902,7 +1991,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
     position: fixed; inset: 0;
-    touch-action: manipulation;
   }
   input, textarea, .msg-bubble { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
@@ -1933,13 +2021,10 @@ CHAT_PAGE = """<!DOCTYPE html>
   .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
 
   .app {
-    position: fixed;
-    inset: 0;
+    position: fixed; inset: 0;
     display: grid;
     grid-template-columns: 280px 1fr 260px;
-    height: 100vh;
-    height: 100dvh;
-    width: 100vw;
+    height: 100vh; height: 100dvh; width: 100vw;
     overflow: hidden;
     background: #e9eef3;
   }
@@ -2099,7 +2184,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  /* .chat position: relative — для абсолютных кнопок */
   .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; overflow: hidden; position: relative; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
@@ -2107,8 +2191,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     border-bottom: 1px solid #b0bac4;
     display: flex; align-items: center; gap: 10px;
     flex-shrink: 0;
-    position: relative;
-    z-index: 5;
+    position: relative; z-index: 5;
   }
   .chat-header .title {
     flex: 1; min-width: 0;
@@ -2160,11 +2243,8 @@ CHAT_PAGE = """<!DOCTYPE html>
     float: right; margin-top: 4px;
   }
 
-  /* Кнопка "вниз к новым" */
   .jump-down {
-    position: absolute;
-    right: 16px;
-    bottom: 70px;
+    position: absolute; right: 16px; bottom: 70px;
     width: 40px; height: 40px;
     border-radius: 50%;
     border: 1px solid #b5bec8;
@@ -2172,11 +2252,9 @@ CHAT_PAGE = """<!DOCTYPE html>
     box-shadow: 0 4px 14px rgba(0,0,0,0.18);
     cursor: pointer;
     display: none;
-    align-items: center;
-    justify-content: center;
+    align-items: center; justify-content: center;
     z-index: 20;
-    color: #3f6fa8;
-    padding: 0;
+    color: #3f6fa8; padding: 0;
     animation: jumpIn 0.22s ease-out both;
   }
   .jump-down.visible { display: flex; }
@@ -2216,6 +2294,9 @@ CHAT_PAGE = """<!DOCTYPE html>
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     flex-shrink: 0;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none; -webkit-user-select: none;
   }
   .input-area button .icon { width: 15px; height: 15px; }
   .input-area button:active { transform: scale(0.97); }
@@ -2266,7 +2347,6 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
-  /* ================= МОБИЛЬНАЯ ВЕРСИЯ ================= */
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; }
     .sidebar { border-right: none; padding-bottom: env(safe-area-inset-bottom); }
@@ -2322,7 +2402,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     .empty-list { padding: 50px 20px; font-size: 14px; }
     .empty-list .icon.huge { width: 52px; height: 52px; }
 
-    /* Хедер чата всегда виден, safe-area top учтён */
     .chat-header {
       padding: 10px 12px;
       padding-top: max(10px, env(safe-area-inset-top));
@@ -2470,7 +2549,7 @@ CHAT_PAGE = """<!DOCTYPE html>
 
     <div class="input-area" id="inputArea" style="display:none">
       <textarea id="msgInput" placeholder="Введите сообщение..." data-ci18n-ph="msg_ph" rows="1" enterkeyhint="send"></textarea>
-      <button id="sendBtn" title="Send">
+      <button id="sendBtn" type="button" title="Send">
         <svg class="icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <span class="btn-label" data-ci18n="send">Отправить</span>
       </button>
@@ -2496,7 +2575,6 @@ CHAT_PAGE = """<!DOCTYPE html>
 <script>
 __I18N_JS__
 
-/* ==== Chat-specific ==== */
 I18N.ru.you = "Вы вошли как";
 I18N.en.you = "Signed in as";
 I18N.ru.add_contact = "Добавить контакт";
@@ -2652,7 +2730,6 @@ function infoSignature(i){
   return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0) + '|' + (i.msg_count || 0);
 }
 
-/* ============ Jump to bottom button ============ */
 function updateJumpBtn(){
   var box = $('messages');
   var btn = $('jumpDownBtn');
@@ -2673,7 +2750,6 @@ $('jumpDownBtn').addEventListener('click', function(){
   setTimeout(updateJumpBtn, 400);
 });
 
-/* ============ WS ============ */
 function connectWS(){
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); } catch (e) { scheduleReconnect(); return; }
@@ -2735,7 +2811,6 @@ function handleWS(d){
   }
 }
 
-/* ============ Typing indicator ============ */
 function sendTyping(){
   if (!current || !ws || ws.readyState !== 1) return;
   var now = Date.now();
@@ -2752,7 +2827,6 @@ function setPeerTyping(on){
   updateChatSubtitle();
 }
 
-/* ============ Init ============ */
 async function init(){
   var r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
@@ -2827,7 +2901,6 @@ async function openDialog(nick){
   app.classList.add('chat-open');
   app.classList.remove('info-open');
   updateJumpBtn();
-  /* НЕ фокусируемся автоматически */
   await Promise.all([loadInfo(nick), refreshDialog()]);
   await loadContacts();
   var box = $('messages');
@@ -2920,7 +2993,6 @@ async function send(){
   var d = await r.json().catch(function(){ return { ok:false }; });
   if (!d.ok) {
     toast(errText(d) || E('send_failed'));
-    /* возвращаем фокус и текст, чтобы не потерять ввод */
     inp.value = text;
     inp.focus({preventScroll: true});
     return;
@@ -2930,7 +3002,7 @@ async function send(){
     lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
     appendMessage(d.message);
   }
-  /* Возвращаем фокус, чтобы можно было продолжать печатать */
+  /* возвращаем фокус, чтобы продолжать печатать */
   if (document.activeElement !== inp) {
     try { inp.focus({preventScroll: true}); } catch (e) { inp.focus(); }
   }
@@ -3033,7 +3105,6 @@ function markActive(root, val){
   });
 }
 
-/* ============ UI events ============ */
 $('addBtn').onclick = function(){
   var f = $('addForm');
   f.classList.toggle('open');
@@ -3067,21 +3138,32 @@ $('addForm').onsubmit = async function(e){
   }
 };
 
-/* ======== Не теряем фокус при тапе на кнопку Send ======== */
+/* ======== Отправка: работаем через pointerdown, чтобы не терять фокус ======== */
 (function(){
   var sendBtn = $('sendBtn');
-  var inp = $('msgInput');
-  function keepFocus(e){
-    /* не даём кнопке украсть фокус с textarea */
-    e.preventDefault();
+  var lastSendTs = 0;
+  function trySend(e){
+    if (e && e.preventDefault) e.preventDefault();
+    var now = Date.now();
+    if (now - lastSendTs < 400) return;  // защита от двойного вызова
+    lastSendTs = now;
+    send();
   }
-  sendBtn.addEventListener('mousedown', keepFocus);
-  sendBtn.addEventListener('touchstart', keepFocus, {passive: false});
-  sendBtn.onclick = send;
+  /* pointerdown — универсальное событие (мышь + тач) */
+  sendBtn.addEventListener('pointerdown', trySend);
+  /* fallback для очень старых браузеров */
+  if (!window.PointerEvent) {
+    sendBtn.addEventListener('mousedown', trySend);
+    sendBtn.addEventListener('touchstart', trySend, {passive: false});
+  }
 })();
 
+/* ======== Enter — всегда отправляет, Shift+Enter — перенос ======== */
 $('msgInput').addEventListener('keydown', function(e){
-  if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 900) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
 });
 $('msgInput').addEventListener('input', function(e){
   var el = e.target;
@@ -3089,6 +3171,7 @@ $('msgInput').addEventListener('input', function(e){
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
   sendTyping();
 });
+
 $('logoutBtn').onclick = async function(){
   if (ws) { try { ws.close(); } catch (e) {} }
   await fetch('/api/logout', { method: 'POST' });
@@ -3119,7 +3202,7 @@ wireDropdown($('chatLangDd'), function(v){
   else { $('chatTitle').textContent = T('pick_peer'); }
 });
 
-/* ============ Мобильные жесты: свайп от левого края → возврат в список ============ */
+/* ============ Мобильные жесты ============ */
 (function(){
   var tSX = 0, tSY = 0, tT = 0;
   document.addEventListener('touchstart', function(e){
@@ -3165,7 +3248,10 @@ def render_page(html: str, base_url: str = "") -> str:
         .replace("__FOOTER__", FOOTER_HTML)
         .replace("__HEAD_COMMON__", HEAD_COMMON)
         .replace("__I18N_JS__", I18N_JS)
-        .replace("__BASE_URL__", base_url))
+        .replace("__BASE_URL__", base_url)
+        .replace("__VERSION__", VERSION)
+        .replace("__VERSION_NAME__", VERSION_NAME)
+        .replace("__VERSION_DATE__", VERSION_DATE))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3206,5 +3292,25 @@ async def support_page():
     return render_page(SUPPORT_PAGE)
 
 
+@app.get("/changelog", response_class=HTMLResponse)
+async def changelog_page():
+    return render_page(CHANGELOG_PAGE)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Значения по умолчанию: доступно со всех интерфейсов, порт 8000.
+    # Можно переопределить через переменные окружения:
+    #   HOST=127.0.0.1 PORT=8080 python main.py
+    host = os.getenv("SLDCHAT_HOST") or os.getenv("HOST") or "0.0.0.0"
+    try:
+        port = int(os.getenv("SLDCHAT_PORT") or os.getenv("PORT") or "8000")
+    except ValueError:
+        port = 8000
+
+    print("=" * 60)
+    print(f"  SldChat v{VERSION} \"{VERSION_NAME}\" ({VERSION_DATE})")
+    print(f"  Слушаю {host}:{port}")
+    print(f"  Открой в браузере: http://{'localhost' if host == '0.0.0.0' else host}:{port}")
+    print("=" * 60)
+
+    uvicorn.run(app, host=host, port=port)
