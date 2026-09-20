@@ -64,6 +64,11 @@ async def notify_contacts(nick: str, payload: dict):
         await send_ws(c, payload)
 
 
+def err(key: str, status: int = 400):
+    """Единый формат ошибки. error_key — для клиентской локализации."""
+    return JSONResponse({"ok": False, "error_key": key}, status_code=status)
+
+
 # ================== БЕЗОПАСНОСТЬ ==================
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
@@ -114,15 +119,15 @@ async def ws_endpoint(websocket: WebSocket):
 async def api_register(request: Request, nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
     if not nick or not password:
-        return JSONResponse({"ok": False, "error": "Заполните все поля"}, status_code=400)
+        return err("fill_all")
     if not (3 <= len(nick) <= 20):
-        return JSONResponse({"ok": False, "error": "Ник: 3–20 символов"}, status_code=400)
+        return err("nick_len")
     if not nick.replace("_", "").isalnum():
-        return JSONResponse({"ok": False, "error": "Ник: только буквы, цифры и _"}, status_code=400)
+        return err("nick_chars")
     if len(password) < 3:
-        return JSONResponse({"ok": False, "error": "Пароль: минимум 3 символа"}, status_code=400)
+        return err("pass_len")
     if nick in users:
-        return JSONResponse({"ok": False, "error": "Ник уже занят"}, status_code=400)
+        return err("nick_taken")
     now = time.time()
     users[nick] = {"password": password, "created": now, "last_seen": now}
     contacts[nick] = set()
@@ -140,7 +145,7 @@ async def api_login(request: Request, nick: str = Form(...), password: str = For
     nick = nick.strip()
     u = users.get(nick)
     if not u or u["password"] != password:
-        return JSONResponse({"ok": False, "error": "Неверный ник или пароль"}, status_code=400)
+        return err("bad_login")
     token = secrets.token_hex(32)
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
@@ -177,18 +182,18 @@ async def api_server_info():
 async def api_contacts_add(request: Request, nick: str = Form(...)):
     me = current_user(request)
     if not me:
-        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+        return err("not_authorized", 401)
     nick = nick.strip()
     if not nick:
-        return JSONResponse({"ok": False, "error": "Введите ник"}, status_code=400)
+        return err("enter_nick")
     if nick == me:
-        return JSONResponse({"ok": False, "error": "Нельзя добавить себя"}, status_code=400)
+        return err("cant_add_self")
     if nick not in users:
-        return JSONResponse({"ok": False, "error": "Пользователь не найден"}, status_code=404)
+        return err("user_not_found", 404)
     contacts.setdefault(me, set())
     contacts.setdefault(nick, set())
     if nick in contacts[me]:
-        return JSONResponse({"ok": False, "error": "Уже в контактах"}, status_code=400)
+        return err("already_contact")
     contacts[me].add(nick)
     contacts[nick].add(me)
     info = user_public_info(nick)
@@ -204,10 +209,10 @@ async def api_contacts_add(request: Request, nick: str = Form(...)):
 async def api_contacts_remove(request: Request, nick: str = Form(...)):
     me = current_user(request)
     if not me:
-        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+        return err("not_authorized", 401)
     nick = nick.strip()
     if nick not in contacts.get(me, set()):
-        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=400)
+        return err("not_in_contacts")
     contacts.get(me, set()).discard(nick)
     contacts.get(nick, set()).discard(me)
     await asyncio.gather(
@@ -247,7 +252,7 @@ async def api_user_info(nick: str, request: Request):
     if not me:
         return JSONResponse({"ok": False}, status_code=401)
     if nick not in users:
-        return JSONResponse({"ok": False, "error": "Не найден"}, status_code=404)
+        return err("user_not_found", 404)
     info = user_public_info(nick)
     info["msg_count"] = sum(1 for m in messages if (
         (m["from"] == me and m["to"] == nick) or (m["from"] == nick and m["to"] == me)
@@ -262,7 +267,7 @@ async def api_dialog(nick: str, request: Request, since: int = 0):
     if not me:
         return JSONResponse({"ok": False}, status_code=401)
     if nick not in contacts.get(me, set()):
-        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=403)
+        return err("not_in_contacts", 403)
     max_id = reads.setdefault(me, {}).get(nick, 0)
     for m in messages:
         if m["from"] == nick and m["to"] == me and m["id"] > max_id:
@@ -279,15 +284,15 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     global _msg_id
     me = current_user(request)
     if not me:
-        return JSONResponse({"ok": False, "error": "Не авторизован"}, status_code=401)
+        return err("not_authorized", 401)
     to = to.strip()
     text = text.strip()
     if not text:
-        return JSONResponse({"ok": False, "error": "Пустое сообщение"}, status_code=400)
+        return err("empty_msg")
     if len(text) > 4000:
         text = text[:4000]
     if to not in contacts.get(me, set()):
-        return JSONResponse({"ok": False, "error": "Не в контактах"}, status_code=403)
+        return err("not_in_contacts", 403)
     _msg_id += 1
     msg = {"id": _msg_id, "from": me, "to": to, "text": text, "time": time.time()}
     messages.append(msg)
@@ -313,8 +318,8 @@ OG_IMAGE_SVG = (
     '<rect width="1200" height="630" fill="url(#g)"/>'
     '<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">'
     '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
-    '<text x="600" y="380" font-size="36" fill="#2b3a4a">Быстрый мессенджер для команд</text>'
-    '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · добавление по нику · без рекламы</text>'
+    '<text x="600" y="380" font-size="36" fill="#2b3a4a">Fast messenger for teams</text>'
+    '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · add by nick · no ads</text>'
     '</g></svg>'
 )
 
@@ -347,14 +352,12 @@ SHARED_CSS = """
     background: #eef2f6;
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
-    animation: fadeIn 0.35s ease both;
   }
   input, textarea, .selectable { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
   *::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-  @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes popIn { 0% { opacity: 0; transform: scale(0.94); } 60% { opacity: 1; transform: scale(1.02); } 100% { opacity: 1; transform: scale(1); } }
   @keyframes dotPulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
@@ -490,7 +493,7 @@ SHARED_CSS = """
   }
   .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: #6b7f93; }
   .dd-toggle .icon { width: 14px; height: 14px; color: #9db8d3; transition: transform 0.22s ease; }
-  .dd.open .dd-toggle .icon { transform: rotate(180deg); }
+  .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
   .dd-toggle .dd-label { color: #8fa3b6; }
   .dd-toggle .dd-value { color: #fff; font-weight: bold; }
 
@@ -517,18 +520,6 @@ SHARED_CSS = """
   .dd-menu li:hover { background: #eef2f6; }
   .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
   .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8; }
-  .dd.dd-light .dd-toggle {
-    background: linear-gradient(#fbfcfd, #cfd8e0);
-    border-color: #8b97a3; color: #2b3a4a;
-    text-shadow: 0 1px 0 rgba(255,255,255,0.6);
-  }
-  .dd.dd-light .dd-toggle:hover { background: linear-gradient(#fff, #dbe3ea); }
-  .dd.dd-light .dd-toggle .icon { color: #4a5b6d; }
-  .dd.dd-light .dd-toggle .dd-label { color: #5a6c80; }
-  .dd.dd-light .dd-toggle .dd-value { color: #2b3a4a; }
-  .dd.dd-light .dd-menu { transform-origin: top left; left: 0; right: auto; top: calc(100% + 6px); bottom: auto; }
-  .dd.dd-up .dd-menu { bottom: calc(100% + 6px); top: auto; }
-  .dd.dd-down .dd-menu { top: calc(100% + 6px); bottom: auto; }
 
   footer { background: #2b3a4a; color: #b8c4ce; padding: 44px 0 26px; font-size: 13px; }
   footer .foot-cols { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 30px; margin-bottom: 30px; }
@@ -695,7 +686,7 @@ FOOTER_HTML = """
 (function(){
   function fmtUp(sec){
     sec = Math.floor(sec);
-    var u = window.__sldUnits || {d:'д',h:'ч',m:'м',s:'с'};
+    var u = window.__sldUnits || {d:'d',h:'h',m:'m',s:'s'};
     var d = Math.floor(sec/86400); sec %= 86400;
     var h = Math.floor(sec/3600);  sec %= 3600;
     var m = Math.floor(sec/60);    sec %= 60;
@@ -791,18 +782,25 @@ HEAD_COMMON = """
 """
 
 
-# ================== I18N (лендинг / privacy / support) ==================
+# ================== I18N (единый словарь) ==================
+# ВАЖНО: набор ключей в ru и en идентичен — правь оба при добавлении.
 I18N_JS = """
-const I18N = {
+var I18N = {
   ru: {
+    /* ==== Common / nav ==== */
     nav_features: "Возможности", nav_servers: "Серверы", nav_privacy: "Приватность",
     nav_faq: "FAQ", nav_support: "Поддержка",
     btn_login: "Войти", btn_register: "Регистрация",
+    lang_short: "Язык:",
+
+    /* ==== Landing: hero ==== */
     hero_eyebrow: "Быстрая доставка через WebSocket",
     hero_title: "Мессенджер <b>SldChat</b> —<br>общайтесь по-простому",
     hero_sub: "Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику, мгновенная доставка сообщений. Работает на телефоне и на компьютере.",
     hero_cta1: "Создать аккаунт", hero_cta2: "У меня уже есть аккаунт",
     hero_m1: "Без e-mail и телефона", hero_m2: "Без рекламы", hero_m3: "Бесплатно",
+
+    /* ==== Landing: features ==== */
     feat_h: "Возможности", feat_lead: "Всё, что нужно для быстрого общения — и ничего лишнего.",
     feat_1_h: "Мгновенная доставка", feat_1_p: "Сообщения летят через WebSocket — собеседник видит их за миллисекунды, без перезагрузок.",
     feat_2_h: "Добавление по нику", feat_2_p: "Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.",
@@ -810,15 +808,22 @@ const I18N = {
     feat_4_h: "На любом устройстве", feat_4_p: "Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.",
     feat_5_h: "Поиск по контактам", feat_5_p: "Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.",
     feat_6_h: "Приватность по умолчанию", feat_6_p: "Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.",
-    srv_h: "Серверы SldChat", srv_lead: "Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.",
+
+    /* ==== Landing: servers ==== */
+    srv_h: "Серверы SldChat",
+    srv_lead: "Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.",
     srv_main: "Основной", srv_alt: "Резерв", srv_unstable: "Unstable",
     srv_notice: "<b>Это разные серверы.</b> У каждого своя база пользователей и сообщений — данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу, зарегистрируйтесь на каждом отдельно.",
+
+    /* ==== Landing: privacy ==== */
     priv_h: "Приватность", priv_lead: "Коротко о самом главном. Подробности — на отдельной странице.",
     priv_1_h: "Ничего не пишем на диск", priv_1_p: "Сообщения и данные аккаунта существуют, пока работает сервер.",
     priv_2_h: "Без аналитики и рекламы", priv_2_p: "Никаких трекеров, пикселей и сторонних скриптов.",
     priv_3_h: "Одна сессионная cookie", priv_3_p: "HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.",
     priv_4_h: "Минимум данных", priv_4_p: "Только ник и пароль. Ни e-mail, ни телефона, ни IP-логов.",
     priv_more: "Почитать подробнее",
+
+    /* ==== Landing: faq ==== */
     faq_h: "Ответы на вопросы",
     faq_q1: "Сколько стоит SldChat?", faq_a1: "Нисколько. Проект полностью бесплатный, без рекламы и подписок.",
     faq_q2: "Сохраняются ли мои сообщения?", faq_a2: "Нет. Всё живёт в оперативной памяти сервера и исчезает при его перезапуске. На диск ничего не пишется.",
@@ -826,7 +831,17 @@ const I18N = {
     faq_q4: "Как удалить контакт?", faq_a4: "Откройте диалог с человеком и нажмите «Удалить контакт» в панели справа.",
     faq_q5: "Чем серверы отличаются друг от друга?", faq_a5: "Это два независимых развёртывания. У каждого своя база пользователей и сообщений, между собой они не связаны.",
     faq_q6: "Как выйти из аккаунта?", faq_a6: "Кнопка выхода — в шапке приложения, справа от списка контактов.",
-    lang_short: "Язык:",
+
+    /* ==== Auth ==== */
+    auth_welcome: "Добро пожаловать",
+    auth_tab_login: "Вход", auth_tab_register: "Регистрация",
+    auth_nick: "Ник:", auth_password: "Пароль:",
+    auth_login_btn: "Войти", auth_register_btn: "Зарегистрироваться",
+    auth_nick_ph: "3–20 символов", auth_pass_ph: "минимум 3 символа",
+    auth_hint: "Регистрация занимает меньше минуты",
+    auth_back: "← На главную",
+
+    /* ==== Footer ==== */
     foot_brand: "SldChat — независимый мессенджер от SldChat Team.",
     foot_product: "Продукт", foot_company: "Компания", foot_contact: "Связь",
     foot_privacy: "Приватность", foot_support: "Поддержка", foot_faq: "FAQ", foot_mail: "Почта",
@@ -836,35 +851,50 @@ const I18N = {
     nav_features: "Features", nav_servers: "Servers", nav_privacy: "Privacy",
     nav_faq: "FAQ", nav_support: "Support",
     btn_login: "Sign in", btn_register: "Sign up",
+    lang_short: "Language:",
+
     hero_eyebrow: "Instant delivery via WebSocket",
     hero_title: "Messenger <b>SldChat</b> —<br>just talk, simply",
     hero_sub: "No useless settings. Register in 5 seconds, add people by nick, messages delivered instantly. Works on phone and desktop.",
     hero_cta1: "Create account", hero_cta2: "I already have an account",
     hero_m1: "No email or phone", hero_m2: "No ads", hero_m3: "Free",
+
     feat_h: "Features", feat_lead: "Everything you need for quick messaging — and nothing more.",
-    feat_1_h: "Instant delivery", feat_1_p: "Messages travel over WebSocket — the other side sees them in milliseconds.",
+    feat_1_h: "Instant delivery", feat_1_p: "Messages travel over WebSocket — the other side sees them in milliseconds, no reloads.",
     feat_2_h: "Add by nick", feat_2_p: "No public directory. Type a nick — and you're in each other's contacts.",
-    feat_3_h: "Online status", feat_3_p: "See who's online right now and who was here recently.",
+    feat_3_h: "Online status", feat_3_p: "See who's online right now and who was here recently — without clutter.",
     feat_4_h: "Any device", feat_4_p: "Same interface on desktop and phone — nicely adapted to the screen.",
-    feat_5_h: "Contact search", feat_5_p: "Fast search among your contacts right in the list.",
+    feat_5_h: "Contact search", feat_5_p: "Fast search among your contacts right in the list — filtering as you type.",
     feat_6_h: "Privacy by default", feat_6_p: "Minimum data collected. One session cookie, no trackers.",
-    srv_h: "SldChat servers", srv_lead: "The project runs on two independent servers. Pick any — data isn't shared between them.",
+
+    srv_h: "SldChat servers",
+    srv_lead: "The project runs on two independent servers. Pick any — data isn't shared between them.",
     srv_main: "Primary", srv_alt: "Backup", srv_unstable: "Unstable",
     srv_notice: "<b>These are different servers.</b> Each has its own users and messages — data is <b>not shared</b>. To use both, register on each separately.",
+
     priv_h: "Privacy", priv_lead: "The essentials. Full details on a dedicated page.",
     priv_1_h: "Nothing on disk", priv_1_p: "Messages and account data exist only while the server is running.",
     priv_2_h: "No analytics or ads", priv_2_p: "No trackers, pixels or third-party scripts.",
     priv_3_h: "A single session cookie", priv_3_p: "HttpOnly and SameSite — only to keep you signed in.",
     priv_4_h: "Minimal data", priv_4_p: "Just nick and password. No email, phone or IP logs.",
     priv_more: "Read more",
+
     faq_h: "FAQ",
     faq_q1: "How much does SldChat cost?", faq_a1: "Nothing. Completely free, no ads or subscriptions.",
-    faq_q2: "Are my messages saved?", faq_a2: "No. Everything lives in server RAM and disappears on restart.",
+    faq_q2: "Are my messages saved?", faq_a2: "No. Everything lives in server RAM and disappears on restart. Nothing is written to disk.",
     faq_q3: "Why do I only see my contacts?", faq_a3: "SldChat has no public user directory. Press 'Add contact' and enter the nick.",
     faq_q4: "How do I remove a contact?", faq_a4: "Open the dialog and press 'Remove contact' in the right panel.",
-    faq_q5: "How do servers differ?", faq_a5: "Two independent deployments, not connected to each other.",
-    faq_q6: "How do I log out?", faq_a6: "The logout button is at the top of the chat.",
-    lang_short: "Language:",
+    faq_q5: "How do servers differ?", faq_a5: "Two independent deployments. Each has its own users and messages; they're not connected.",
+    faq_q6: "How do I log out?", faq_a6: "The logout button is at the top of the chat, next to the contact list.",
+
+    auth_welcome: "Welcome",
+    auth_tab_login: "Sign in", auth_tab_register: "Sign up",
+    auth_nick: "Nick:", auth_password: "Password:",
+    auth_login_btn: "Sign in", auth_register_btn: "Create account",
+    auth_nick_ph: "3–20 characters", auth_pass_ph: "min 3 characters",
+    auth_hint: "Registration takes less than a minute",
+    auth_back: "← Back to home",
+
     foot_brand: "SldChat — an independent messenger by SldChat Team.",
     foot_product: "Product", foot_company: "Company", foot_contact: "Contact",
     foot_privacy: "Privacy", foot_support: "Support", foot_faq: "FAQ", foot_mail: "Email",
@@ -872,7 +902,47 @@ const I18N = {
   }
 };
 
-const UPTIME_UNITS = {
+/* Error messages — identical set on both languages */
+var ERRORS = {
+  ru: {
+    fill_all: "Заполните все поля",
+    nick_len: "Ник: 3–20 символов",
+    nick_chars: "Ник: только буквы, цифры и _",
+    pass_len: "Пароль: минимум 3 символа",
+    nick_taken: "Ник уже занят",
+    bad_login: "Неверный ник или пароль",
+    not_authorized: "Не авторизован",
+    enter_nick: "Введите ник",
+    cant_add_self: "Нельзя добавить себя",
+    user_not_found: "Пользователь не найден",
+    already_contact: "Уже в контактах",
+    not_in_contacts: "Не в контактах",
+    empty_msg: "Пустое сообщение",
+    send_failed: "Не удалось отправить",
+    error: "Ошибка",
+    conn_error: "Ошибка соединения"
+  },
+  en: {
+    fill_all: "Fill in all fields",
+    nick_len: "Nick: 3–20 characters",
+    nick_chars: "Nick: letters, digits and _ only",
+    pass_len: "Password: min 3 characters",
+    nick_taken: "Nick already taken",
+    bad_login: "Invalid nick or password",
+    not_authorized: "Not authorized",
+    enter_nick: "Enter a nick",
+    cant_add_self: "You can't add yourself",
+    user_not_found: "User not found",
+    already_contact: "Already in contacts",
+    not_in_contacts: "Not in contacts",
+    empty_msg: "Empty message",
+    send_failed: "Failed to send",
+    error: "Error",
+    conn_error: "Connection error"
+  }
+};
+
+var UPTIME_UNITS = {
   ru: {d:'д', h:'ч', m:'м', s:'с'},
   en: {d:'d', h:'h', m:'m', s:'s'}
 };
@@ -896,6 +966,10 @@ window.SldLang = (function(){
       var k = e.getAttribute('data-i18n-html');
       if (dict[k] != null) e.innerHTML = dict[k];
     });
+    el.querySelectorAll('[data-i18n-ph]').forEach(function(e){
+      var k = e.getAttribute('data-i18n-ph');
+      if (dict[k] != null) e.setAttribute('placeholder', dict[k]);
+    });
   }
   function propagateLinks(lang){
     document.querySelectorAll('a[href]').forEach(function(a){
@@ -918,15 +992,28 @@ window.SldLang = (function(){
     } catch (e) {}
   }
   function setGlobalUnits(lang){
-    window.__sldUnits = UPTIME_UNITS[lang] || UPTIME_UNITS.ru;
+    window.__sldUnits = UPTIME_UNITS[lang] || UPTIME_UNITS.en;
+  }
+  function tr(key, lang){
+    var d = ERRORS[lang] || ERRORS.en;
+    return d[key] || (ERRORS.en[key] || key);
+  }
+  function errText(payload, lang){
+    if (!payload) return tr('error', lang);
+    if (payload.error_key) return tr(payload.error_key, lang);
+    if (payload.error) return payload.error;
+    return tr('error', lang);
   }
   return {
     I18N: I18N,
+    ERRORS: ERRORS,
     pickInitial: pickInitial,
     applyTo: applyTo,
     propagateLinks: propagateLinks,
     updateUrl: updateUrl,
-    setGlobalUnits: setGlobalUnits
+    setGlobalUnits: setGlobalUnits,
+    tr: tr,
+    errText: errText
   };
 })();
 """
@@ -1108,17 +1195,17 @@ __SHARED_CSS__
     <p class="lead" data-i18n="feat_lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
     <div class="cards">
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-        <h3 data-i18n="feat_1_h">Мгновенная доставка</h3><p data-i18n="feat_1_p">Сообщения летят через WebSocket — собеседник видит их за миллисекунды.</p></div>
+        <h3 data-i18n="feat_1_h"></h3><p data-i18n="feat_1_p"></p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div>
-        <h3 data-i18n="feat_2_h">Добавление по нику</h3><p data-i18n="feat_2_p">Никаких публичных каталогов. Ввели ник — и вы друг у друга в контактах.</p></div>
+        <h3 data-i18n="feat_2_h"></h3><p data-i18n="feat_2_p"></p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
-        <h3 data-i18n="feat_3_h">Статус «в сети»</h3><p data-i18n="feat_3_p">Видите, кто онлайн прямо сейчас, а кто заходил недавно.</p></div>
+        <h3 data-i18n="feat_3_h"></h3><p data-i18n="feat_3_p"></p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
-        <h3 data-i18n="feat_4_h">На любом устройстве</h3><p data-i18n="feat_4_p">Один и тот же интерфейс на компьютере и на смартфоне.</p></div>
+        <h3 data-i18n="feat_4_h"></h3><p data-i18n="feat_4_p"></p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
-        <h3 data-i18n="feat_5_h">Поиск по контактам</h3><p data-i18n="feat_5_p">Быстрый поиск среди ваших собеседников прямо в списке.</p></div>
+        <h3 data-i18n="feat_5_h"></h3><p data-i18n="feat_5_p"></p></div>
       <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-        <h3 data-i18n="feat_6_h">Приватность по умолчанию</h3><p data-i18n="feat_6_p">Минимум данных, одна сессионная cookie, никакой аналитики.</p></div>
+        <h3 data-i18n="feat_6_h"></h3><p data-i18n="feat_6_p"></p></div>
     </div>
   </div>
 </section>
@@ -1152,7 +1239,7 @@ __SHARED_CSS__
 
     <div class="notice">
       <svg class="icon lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-      <div data-i18n-html="srv_notice"><b>Это разные серверы.</b> У каждого своя база пользователей и сообщений — данные между ними <b>не передаются</b>. Чтобы общаться на двух серверах сразу, зарегистрируйтесь на каждом отдельно.</div>
+      <div data-i18n-html="srv_notice"></div>
     </div>
   </div>
 </section>
@@ -1163,13 +1250,13 @@ __SHARED_CSS__
     <p class="lead" data-i18n="priv_lead">Коротко о самом главном. Подробности — на отдельной странице.</p>
     <div class="privacy-mini">
       <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-        <div><h3 data-i18n="priv_1_h">Ничего не пишем на диск</h3><p data-i18n="priv_1_p">Сообщения и данные аккаунта существуют, пока работает сервер.</p></div></div>
+        <div><h3 data-i18n="priv_1_h"></h3><p data-i18n="priv_1_p"></p></div></div>
       <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></div>
-        <div><h3 data-i18n="priv_2_h">Без аналитики и рекламы</h3><p data-i18n="priv_2_p">Никаких трекеров, пикселей и сторонних скриптов.</p></div></div>
+        <div><h3 data-i18n="priv_2_h"></h3><p data-i18n="priv_2_p"></p></div></div>
       <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
-        <div><h3 data-i18n="priv_3_h">Одна сессионная cookie</h3><p data-i18n="priv_3_p">HttpOnly и SameSite — только для того, чтобы вы остались в аккаунте.</p></div></div>
+        <div><h3 data-i18n="priv_3_h"></h3><p data-i18n="priv_3_p"></p></div></div>
       <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
-        <div><h3 data-i18n="priv_4_h">Минимум данных</h3><p data-i18n="priv_4_p">Только ник и пароль. Ни e-mail, ни телефона, ни IP-логов.</p></div></div>
+        <div><h3 data-i18n="priv_4_h"></h3><p data-i18n="priv_4_p"></p></div></div>
     </div>
     <a class="link-arrow" href="/privacy">
       <span data-i18n="priv_more">Почитать подробнее</span>
@@ -1222,11 +1309,23 @@ __I18N_JS__
     SldLang.updateUrl(v);
     SldLang.propagateLinks(v);
     SldFooter.markActive(document.getElementById('footLangDd'), v);
+    document.documentElement.lang = v;
+    updateTitle(v);
   });
   SldFooter.markActive(document.getElementById('footLangDd'), lang);
+  document.documentElement.lang = lang;
+  updateTitle(lang);
 
-  if (lang === 'en') {
-    document.title = 'SldChat — fast messenger for teams';
+  function updateTitle(l){
+    if (l === 'en') {
+      document.title = 'SldChat — fast messenger for teams';
+      var d = document.querySelector('meta[name=description]');
+      if (d) d.setAttribute('content','SldChat — an independent messenger: register in 5 seconds, add people by nick, instant delivery via WebSocket.');
+    } else {
+      document.title = 'SldChat — быстрый мессенджер для команд';
+      var d2 = document.querySelector('meta[name=description]');
+      if (d2) d2.setAttribute('content','SldChat — независимый мессенджер: регистрация за 5 секунд, добавление по нику, мгновенная доставка через WebSocket.');
+    }
   }
 })();
 </script>
@@ -1256,95 +1355,90 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="/">На главную</a>
-      <a class="navlink" href="/support">Поддержка</a>
-      <a class="btn btn-primary" href="/register">Регистрация</a>
+      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
+      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
     </nav>
   </div>
 </header>
 
-<div class="page-wrap">
+<div class="page-wrap" data-i18n-html-scope="privacy">
   <div class="page-head">
-    <h1>Политика приватности</h1>
-    <p>Что мы собираем, что нет, и почему SldChat по-настоящему прост.</p>
+    <h1 data-i18n="priv_page_h">Политика приватности</h1>
+    <p data-i18n="priv_page_sub">Что мы собираем, что нет, и почему SldChat по-настоящему прост.</p>
   </div>
 
   <div class="page-card selectable">
-    <h2>Коротко</h2>
-    <p>SldChat собирает <b>минимум данных</b>. Мы не хотим знать о вас больше, чем нужно для работы
-    мессенджера. Всё хранится в оперативной памяти сервера и стирается при его перезапуске.</p>
+    <h2 data-i18n="priv_page_short_h">Коротко</h2>
+    <p data-i18n-html="priv_page_short_p">SldChat собирает <b>минимум данных</b>. Мы не хотим знать о вас больше, чем нужно для работы мессенджера. Всё хранится в оперативной памяти сервера и стирается при его перезапуске.</p>
   </div>
 
   <div class="page-card selectable">
-    <h2>Что мы храним</h2>
+    <h2 data-i18n="priv_page_store_h">Что мы храним</h2>
     <ul>
-      <li><b>Ник</b> — то, как вас видят другие пользователи.</li>
-      <li><b>Пароль</b> — только в оперативной памяти.</li>
-      <li><b>Сообщения</b> — тексты и время отправки.</li>
-      <li><b>Список контактов</b> — с кем вы общаетесь.</li>
-      <li><b>Время последней активности</b> — для статуса «в сети».</li>
+      <li data-i18n="priv_page_store_1"></li>
+      <li data-i18n="priv_page_store_2"></li>
+      <li data-i18n="priv_page_store_3"></li>
+      <li data-i18n="priv_page_store_4"></li>
+      <li data-i18n="priv_page_store_5"></li>
     </ul>
-    <p>Всё это живёт исключительно в ОЗУ процесса. На диск ничего не записывается.</p>
+    <p data-i18n="priv_page_store_foot"></p>
   </div>
 
   <div class="page-card selectable">
-    <h2>Чего мы не делаем</h2>
+    <h2 data-i18n="priv_page_dont_h">Чего мы не делаем</h2>
     <ul>
-      <li>Не собираем e-mail, телефон и другие персональные данные.</li>
-      <li>Не ведём логи IP-адресов и не отслеживаем вас между сессиями.</li>
-      <li>Не используем аналитику, трекеры, пиксели и сторонние скрипты.</li>
-      <li>Не показываем рекламу и не передаём данные третьим лицам.</li>
-    </ul>
-  </div>
-
-  <div class="page-card selectable">
-    <h2>Cookie</h2>
-    <p>Мы используем <b>одну-единственную cookie</b> — <code>session</code>. Она нужна только для того,
-    чтобы вы оставались в аккаунте между запросами.</p>
-    <ul>
-      <li>HttpOnly — недоступна из JavaScript.</li>
-      <li>SameSite=Lax — снижает риск CSRF-атак.</li>
-      <li>Secure — при работе сайта по HTTPS.</li>
-      <li>Срок жизни — до 30 дней или до выхода из аккаунта.</li>
+      <li data-i18n="priv_page_dont_1"></li>
+      <li data-i18n="priv_page_dont_2"></li>
+      <li data-i18n="priv_page_dont_3"></li>
+      <li data-i18n="priv_page_dont_4"></li>
     </ul>
   </div>
 
   <div class="page-card selectable">
-    <h2>Сколько данные живут</h2>
-    <p>Ровно столько, сколько работает сервер. Как только он перезапускается, вся информация
-    исчезает безвозвратно.</p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2>Как удалить свои данные</h2>
+    <h2 data-i18n="priv_page_cookie_h">Cookie</h2>
+    <p data-i18n-html="priv_page_cookie_p"></p>
     <ul>
-      <li>Выйти из аккаунта — удалит активную сессию на этом устройстве.</li>
-      <li>Дождаться перезапуска сервера — удалит всё остальное.</li>
-      <li>Написать в <a href="/support">поддержку</a>, чтобы ускорить процесс.</li>
+      <li data-i18n="priv_page_cookie_1"></li>
+      <li data-i18n="priv_page_cookie_2"></li>
+      <li data-i18n="priv_page_cookie_3"></li>
+      <li data-i18n="priv_page_cookie_4"></li>
     </ul>
   </div>
 
   <div class="page-card selectable">
-    <h2>Два независимых сервера</h2>
-    <p>У SldChat есть <b>два отдельных развёртывания</b> — <code>sldchat.fastapicloud.dev</code>
-    и <code>sldchat.onrunxbuild.com</code>. Это разные серверы с разными базами пользователей.
-    <b>Данные между ними не передаются.</b></p>
+    <h2 data-i18n="priv_page_life_h">Сколько данные живут</h2>
+    <p data-i18n="priv_page_life_p"></p>
   </div>
 
   <div class="page-card selectable">
-    <h2>Безопасность</h2>
+    <h2 data-i18n="priv_page_del_h">Как удалить свои данные</h2>
     <ul>
-      <li>Пароли не возвращаются через API.</li>
-      <li>Все проверки доступа — на стороне сервера.</li>
-      <li>Заголовки безопасности: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.</li>
-      <li>Приватные страницы не кэшируются браузером.</li>
+      <li data-i18n="priv_page_del_1"></li>
+      <li data-i18n="priv_page_del_2"></li>
+      <li data-i18n="priv_page_del_3"></li>
     </ul>
-    <p>Полноценной end-to-end криптографии у нас нет. Не отправляйте через SldChat ничего, что боитесь потерять.</p>
+  </div>
+
+  <div class="page-card selectable">
+    <h2 data-i18n="priv_page_srv_h">Два независимых сервера</h2>
+    <p data-i18n-html="priv_page_srv_p"></p>
+  </div>
+
+  <div class="page-card selectable">
+    <h2 data-i18n="priv_page_sec_h">Безопасность</h2>
+    <ul>
+      <li data-i18n="priv_page_sec_1"></li>
+      <li data-i18n="priv_page_sec_2"></li>
+      <li data-i18n="priv_page_sec_3"></li>
+      <li data-i18n="priv_page_sec_4"></li>
+    </ul>
+    <p data-i18n="priv_page_sec_foot"></p>
   </div>
 
   <a class="link-arrow" href="/" style="margin-top:8px">
     <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-    На главную
+    <span data-i18n="nav_home">На главную</span>
   </a>
 </div>
 
@@ -1352,19 +1446,109 @@ __FOOTER__
 
 <script>
 __I18N_JS__
+
+/* Extend I18N with privacy keys */
+I18N.ru.nav_home = "На главную";
+I18N.en.nav_home = "Home";
+
+I18N.ru.priv_page_h = "Политика приватности";
+I18N.en.priv_page_h = "Privacy policy";
+I18N.ru.priv_page_sub = "Что мы собираем, что нет, и почему SldChat по-настоящему прост.";
+I18N.en.priv_page_sub = "What we collect, what we don't, and why SldChat is truly simple.";
+
+I18N.ru.priv_page_short_h = "Коротко";
+I18N.en.priv_page_short_h = "In short";
+I18N.ru.priv_page_short_p = "SldChat собирает <b>минимум данных</b>. Мы не хотим знать о вас больше, чем нужно для работы мессенджера. Всё хранится в оперативной памяти сервера и стирается при его перезапуске.";
+I18N.en.priv_page_short_p = "SldChat collects the <b>bare minimum</b>. We don't want to know more about you than needed to run a messenger. Everything lives in server RAM and is erased on restart.";
+
+I18N.ru.priv_page_store_h = "Что мы храним";
+I18N.en.priv_page_store_h = "What we store";
+I18N.ru.priv_page_store_1 = "Ник — то, как вас видят другие пользователи.";
+I18N.en.priv_page_store_1 = "Nick — how other users see you.";
+I18N.ru.priv_page_store_2 = "Пароль — только в оперативной памяти.";
+I18N.en.priv_page_store_2 = "Password — only in RAM.";
+I18N.ru.priv_page_store_3 = "Сообщения — тексты и время отправки.";
+I18N.en.priv_page_store_3 = "Messages — texts and timestamps.";
+I18N.ru.priv_page_store_4 = "Список контактов — с кем вы общаетесь.";
+I18N.en.priv_page_store_4 = "Contact list — whom you talk to.";
+I18N.ru.priv_page_store_5 = "Время последней активности — для статуса «в сети».";
+I18N.en.priv_page_store_5 = "Last activity time — for the online status.";
+I18N.ru.priv_page_store_foot = "Всё это живёт исключительно в ОЗУ процесса. На диск ничего не записывается.";
+I18N.en.priv_page_store_foot = "All of it lives only in the process RAM. Nothing is written to disk.";
+
+I18N.ru.priv_page_dont_h = "Чего мы не делаем";
+I18N.en.priv_page_dont_h = "What we don't do";
+I18N.ru.priv_page_dont_1 = "Не собираем e-mail, телефон и другие персональные данные.";
+I18N.en.priv_page_dont_1 = "We don't collect email, phone, or other personal data.";
+I18N.ru.priv_page_dont_2 = "Не ведём логи IP-адресов и не отслеживаем вас между сессиями.";
+I18N.en.priv_page_dont_2 = "We don't log IPs or track you between sessions.";
+I18N.ru.priv_page_dont_3 = "Не используем аналитику, трекеры, пиксели и сторонние скрипты.";
+I18N.en.priv_page_dont_3 = "We don't use analytics, trackers, pixels, or third-party scripts.";
+I18N.ru.priv_page_dont_4 = "Не показываем рекламу и не передаём данные третьим лицам.";
+I18N.en.priv_page_dont_4 = "We show no ads and share no data with third parties.";
+
+I18N.ru.priv_page_cookie_h = "Cookie";
+I18N.en.priv_page_cookie_h = "Cookies";
+I18N.ru.priv_page_cookie_p = "Мы используем <b>одну-единственную cookie</b> — <code>session</code>. Она нужна только для того, чтобы вы оставались в аккаунте между запросами.";
+I18N.en.priv_page_cookie_p = "We use <b>a single cookie</b> — <code>session</code>. It only keeps you signed in between requests.";
+I18N.ru.priv_page_cookie_1 = "HttpOnly — недоступна из JavaScript.";
+I18N.en.priv_page_cookie_1 = "HttpOnly — not accessible from JavaScript.";
+I18N.ru.priv_page_cookie_2 = "SameSite=Lax — снижает риск CSRF-атак.";
+I18N.en.priv_page_cookie_2 = "SameSite=Lax — reduces CSRF risks.";
+I18N.ru.priv_page_cookie_3 = "Secure — при работе сайта по HTTPS.";
+I18N.en.priv_page_cookie_3 = "Secure — when the site runs over HTTPS.";
+I18N.ru.priv_page_cookie_4 = "Срок жизни — до 30 дней или до выхода из аккаунта.";
+I18N.en.priv_page_cookie_4 = "Lifetime — up to 30 days or until you log out.";
+
+I18N.ru.priv_page_life_h = "Сколько данные живут";
+I18N.en.priv_page_life_h = "How long data lives";
+I18N.ru.priv_page_life_p = "Ровно столько, сколько работает сервер. Как только он перезапускается, вся информация исчезает безвозвратно.";
+I18N.en.priv_page_life_p = "Exactly as long as the server runs. Once it restarts, all information disappears permanently.";
+
+I18N.ru.priv_page_del_h = "Как удалить свои данные";
+I18N.en.priv_page_del_h = "How to delete your data";
+I18N.ru.priv_page_del_1 = "Выйти из аккаунта — удалит активную сессию на этом устройстве.";
+I18N.en.priv_page_del_1 = "Log out — deletes the active session on this device.";
+I18N.ru.priv_page_del_2 = "Дождаться перезапуска сервера — удалит всё остальное.";
+I18N.en.priv_page_del_2 = "Wait for a server restart — that removes the rest.";
+I18N.ru.priv_page_del_3 = "Написать в поддержку, чтобы ускорить процесс.";
+I18N.en.priv_page_del_3 = "Contact support to speed up the process.";
+
+I18N.ru.priv_page_srv_h = "Два независимых сервера";
+I18N.en.priv_page_srv_h = "Two independent servers";
+I18N.ru.priv_page_srv_p = "У SldChat есть <b>два отдельных развёртывания</b> — <code>sldchat.fastapicloud.dev</code> и <code>sldchat.onrunxbuild.com</code>. Это разные серверы с разными базами пользователей. <b>Данные между ними не передаются.</b>";
+I18N.en.priv_page_srv_p = "SldChat has <b>two separate deployments</b> — <code>sldchat.fastapicloud.dev</code> and <code>sldchat.onrunxbuild.com</code>. They are different servers with different user bases. <b>Data is not shared between them.</b>";
+
+I18N.ru.priv_page_sec_h = "Безопасность";
+I18N.en.priv_page_sec_h = "Security";
+I18N.ru.priv_page_sec_1 = "Пароли не возвращаются через API.";
+I18N.en.priv_page_sec_1 = "Passwords are never returned via the API.";
+I18N.ru.priv_page_sec_2 = "Все проверки доступа — на стороне сервера.";
+I18N.en.priv_page_sec_2 = "All access checks happen server-side.";
+I18N.ru.priv_page_sec_3 = "Заголовки безопасности: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.";
+I18N.en.priv_page_sec_3 = "Security headers: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.";
+I18N.ru.priv_page_sec_4 = "Приватные страницы не кэшируются браузером.";
+I18N.en.priv_page_sec_4 = "Private pages are not cached by the browser.";
+I18N.ru.priv_page_sec_foot = "Полноценной end-to-end криптографии у нас нет. Не отправляйте через SldChat ничего, что боитесь потерять.";
+I18N.en.priv_page_sec_foot = "We don't have full end-to-end encryption. Don't send anything through SldChat that you'd hate to lose.";
+
 (function(){
   var lang = SldLang.pickInitial();
   localStorage.setItem('sld_lang', lang);
   SldLang.setGlobalUnits(lang);
+  SldLang.applyTo(document, SldLang.I18N[lang]);
   SldLang.updateUrl(lang);
   SldLang.propagateLinks(lang);
+  document.documentElement.lang = lang;
   SldFooter.markActive(document.getElementById('footLangDd'), lang);
   SldFooter.wire(document.getElementById('footLangDd'), function(v){
     localStorage.setItem('sld_lang', v);
     SldLang.setGlobalUnits(v);
+    SldLang.applyTo(document, SldLang.I18N[v]);
     SldLang.updateUrl(v);
     SldLang.propagateLinks(v);
     SldFooter.markActive(document.getElementById('footLangDd'), v);
+    document.documentElement.lang = v;
   });
 })();
 </script>
@@ -1416,21 +1600,21 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="/">На главную</a>
-      <a class="navlink" href="/privacy">Приватность</a>
-      <a class="btn btn-primary" href="/register">Регистрация</a>
+      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
+      <a class="navlink" href="/privacy" data-i18n="nav_privacy">Приватность</a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
     </nav>
   </div>
 </header>
 
 <div class="page-wrap">
   <div class="page-head">
-    <h1>Поддержка</h1>
-    <p>Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.</p>
+    <h1 data-i18n="sup_h">Поддержка</h1>
+    <p data-i18n="sup_sub">Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.</p>
   </div>
 
   <div class="page-card">
-    <h2>Связаться</h2>
+    <h2 data-i18n="sup_contact_h">Связаться</h2>
 
     <a class="contact-card" href="mailto:sldshr.confirmation@gmail.com">
       <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
@@ -1452,13 +1636,12 @@ __SHARED_CSS__
   </div>
 
   <div class="page-card selectable">
-    <h2>Перед обращением</h2>
+    <h2 data-i18n="sup_before_h">Перед обращением</h2>
     <ul>
-      <li>Убедитесь, что вы на нужном сервере: <code>sldchat.fastapicloud.dev</code>
-          или <code>sldchat.onrunxbuild.com</code> — данные между ними не передаются.</li>
-      <li>Если не получается войти — проверьте, что ник введён точно так же, как при регистрации.</li>
-      <li>Сообщения не сохраняются после перезапуска сервера — это нормально.</li>
-      <li>Опишите проблему подробно: что делали, что ожидали, что получилось.</li>
+      <li data-i18n="sup_before_1"></li>
+      <li data-i18n="sup_before_2"></li>
+      <li data-i18n="sup_before_3"></li>
+      <li data-i18n="sup_before_4"></li>
     </ul>
   </div>
 </div>
@@ -1467,19 +1650,46 @@ __FOOTER__
 
 <script>
 __I18N_JS__
+
+I18N.ru.nav_home = "На главную";
+I18N.en.nav_home = "Home";
+
+I18N.ru.sup_h = "Поддержка";
+I18N.en.sup_h = "Support";
+I18N.ru.sup_sub = "Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.";
+I18N.en.sup_sub = "Found a problem or have a suggestion? Write to us — we'll definitely reply.";
+
+I18N.ru.sup_contact_h = "Связаться";
+I18N.en.sup_contact_h = "Contact us";
+
+I18N.ru.sup_before_h = "Перед обращением";
+I18N.en.sup_before_h = "Before contacting";
+I18N.ru.sup_before_1 = "Убедитесь, что вы на нужном сервере: sldchat.fastapicloud.dev или sldchat.onrunxbuild.com — данные между ними не передаются.";
+I18N.en.sup_before_1 = "Make sure you're on the right server: sldchat.fastapicloud.dev or sldchat.onrunxbuild.com — data is not shared between them.";
+I18N.ru.sup_before_2 = "Если не получается войти — проверьте, что ник введён точно так же, как при регистрации.";
+I18N.en.sup_before_2 = "If you can't log in — make sure the nick matches exactly what you registered.";
+I18N.ru.sup_before_3 = "Сообщения не сохраняются после перезапуска сервера — это нормально.";
+I18N.en.sup_before_3 = "Messages don't survive a server restart — that's normal.";
+I18N.ru.sup_before_4 = "Опишите проблему подробно: что делали, что ожидали, что получилось.";
+I18N.en.sup_before_4 = "Describe the issue in detail: what you did, what you expected, what actually happened.";
+
 (function(){
   var lang = SldLang.pickInitial();
   localStorage.setItem('sld_lang', lang);
   SldLang.setGlobalUnits(lang);
+  SldLang.applyTo(document, SldLang.I18N[lang]);
   SldLang.updateUrl(lang);
   SldLang.propagateLinks(lang);
+  document.documentElement.lang = lang;
   SldFooter.markActive(document.getElementById('footLangDd'), lang);
   SldFooter.wire(document.getElementById('footLangDd'), function(v){
     localStorage.setItem('sld_lang', v);
     SldLang.setGlobalUnits(v);
+    SldLang.applyTo(document, SldLang.I18N[v]);
     SldLang.updateUrl(v);
     SldLang.propagateLinks(v);
     SldFooter.markActive(document.getElementById('footLangDd'), v);
+    document.documentElement.lang = v;
   });
 })();
 </script>
@@ -1488,13 +1698,13 @@ __I18N_JS__
 """
 
 
-# ================== AUTH ==================
+# ================== AUTH (полностью i18n) ==================
 AUTH_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__</title>
+<title>SldChat</title>
 __HEAD_COMMON__
 <style>
 __SHARED_CSS__
@@ -1503,7 +1713,7 @@ __SHARED_CSS__
     background: radial-gradient(circle at 30% 10%, #e6eef6 0%, transparent 55%),
                 linear-gradient(#cfd9e3, #a8b6c4);
   }
-  .topline { padding: 16px 22px; display: flex; align-items: center; }
+  .topline { padding: 16px 22px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .topline a.logo { font-size: 20px; }
   .wrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px; }
   .box {
@@ -1553,6 +1763,23 @@ __SHARED_CSS__
   .back { text-align: center; margin-top: 14px; font-size: 12px; }
   .form { display: block; }
   .form.hidden { display: none; }
+
+  /* Light dropdown in topline */
+  .dd.dd-light .dd-toggle {
+    background: linear-gradient(#fbfcfd, #cfd8e0);
+    border-color: #8b97a3; color: #2b3a4a;
+    text-shadow: 0 1px 0 rgba(255,255,255,0.6);
+    padding: 6px 10px; font-size: 12px;
+  }
+  .dd.dd-light .dd-toggle:hover { background: linear-gradient(#fff, #dbe3ea); }
+  .dd.dd-light .dd-toggle .icon { color: #4a5b6d; }
+  .dd.dd-light .dd-toggle .dd-value { color: #2b3a4a; }
+  .dd.dd-light .dd-menu {
+    top: calc(100% + 6px); bottom: auto;
+    transform-origin: top right;
+    transform: translateY(-6px) scale(0.97);
+  }
+  .dd.dd-light.open .dd-menu { transform: translateY(0) scale(1); }
 </style>
 </head>
 <body>
@@ -1562,46 +1789,62 @@ __SHARED_CSS__
     <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
     Sld<span>Chat</span>
   </a>
+  <div class="dd dd-light" id="authLangDd">
+    <button class="dd-toggle" type="button" aria-haspopup="listbox">
+      <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+      <span class="dd-value" id="authLangValue">RU</span>
+      <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <ul class="dd-menu">
+      <li data-value="ru">Русский</li>
+      <li data-value="en">English</li>
+    </ul>
+  </div>
 </div>
 
 <div class="wrap">
   <div class="box">
-    <h1>Добро пожаловать</h1>
+    <h1 data-i18n="auth_welcome">Добро пожаловать</h1>
     <div class="tabs">
-      <button type="button" id="tabLogin" class="__LOGIN_ACTIVE__">Вход</button>
-      <button type="button" id="tabRegister" class="__REG_ACTIVE__">Регистрация</button>
+      <button type="button" id="tabLogin" data-i18n="auth_tab_login">Вход</button>
+      <button type="button" id="tabRegister" data-i18n="auth_tab_register">Регистрация</button>
     </div>
     <div class="error" id="error"></div>
 
-    <form id="formLogin" class="form __LOGIN_HIDDEN__">
-      <label>Ник:</label>
+    <form id="formLogin" class="form hidden">
+      <label data-i18n="auth_nick">Ник:</label>
       <input type="text" name="nick" autocomplete="username" maxlength="20">
-      <label>Пароль:</label>
+      <label data-i18n="auth_password">Пароль:</label>
       <input type="password" name="password" autocomplete="current-password">
-      <button type="submit" class="btn2 btn2-primary">Войти</button>
+      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_login_btn">Войти</button>
     </form>
 
-    <form id="formRegister" class="form __REG_HIDDEN__">
-      <label>Ник:</label>
-      <input type="text" name="nick" autocomplete="username" maxlength="20" placeholder="3–20 символов">
-      <label>Пароль:</label>
-      <input type="password" name="password" autocomplete="new-password" placeholder="минимум 3 символа">
-      <button type="submit" class="btn2 btn2-primary">Зарегистрироваться</button>
+    <form id="formRegister" class="form hidden">
+      <label data-i18n="auth_nick">Ник:</label>
+      <input type="text" name="nick" autocomplete="username" maxlength="20" data-i18n-ph="auth_nick_ph" placeholder="3–20 символов">
+      <label data-i18n="auth_password">Пароль:</label>
+      <input type="password" name="password" autocomplete="new-password" data-i18n-ph="auth_pass_ph" placeholder="минимум 3 символа">
+      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_register_btn">Зарегистрироваться</button>
     </form>
 
-    <div class="hint">Регистрация занимает меньше минуты</div>
-    <div class="back"><a href="/">← На главную</a></div>
+    <div class="hint" data-i18n="auth_hint">Регистрация занимает меньше минуты</div>
+    <div class="back"><a href="/" data-i18n="auth_back">← На главную</a></div>
   </div>
 </div>
 
 <script>
+__I18N_JS__
+
+(function(){
   var tabLogin = document.getElementById('tabLogin');
   var tabRegister = document.getElementById('tabRegister');
   var formLogin = document.getElementById('formLogin');
   var formRegister = document.getElementById('formRegister');
   var errorBox = document.getElementById('error');
 
-  function showTab(which) {
+  var initialTab = "__ACTIVE_TAB__";
+
+  function showTab(which){
     if (which === 'login') {
       tabLogin.classList.add('active'); tabRegister.classList.remove('active');
       formLogin.classList.remove('hidden'); formRegister.classList.add('hidden');
@@ -1611,43 +1854,80 @@ __SHARED_CSS__
     }
     errorBox.textContent = '';
   }
-  tabLogin.onclick = function() { showTab('login'); };
-  tabRegister.onclick = function() { showTab('register'); };
+  tabLogin.onclick = function(){ showTab('login'); };
+  tabRegister.onclick = function(){ showTab('register'); };
 
-  function submitForm(url, form) {
+  function submitForm(url, form){
     errorBox.textContent = '';
     var fd = new FormData(form);
     fetch(url, { method: 'POST', body: fd })
-      .then(function(r) { return r.json(); })
-      .then(function(d) {
+      .then(function(r){ return r.json(); })
+      .then(function(d){
         if (d.ok) {
-          var lang = localStorage.getItem('sld_lang') || 'ru';
-          location.href = '/chat?lang=' + lang;
+          var l = localStorage.getItem('sld_lang') || 'ru';
+          location.href = '/chat?lang=' + l;
           return;
         }
-        errorBox.textContent = d.error || 'Ошибка';
+        errorBox.textContent = SldLang.errText(d, lang);
       })
-      .catch(function() { errorBox.textContent = 'Ошибка соединения'; });
+      .catch(function(){ errorBox.textContent = SldLang.tr('conn_error', lang); });
   }
-  formLogin.onsubmit = function(e) { e.preventDefault(); submitForm('/api/login', formLogin); };
-  formRegister.onsubmit = function(e) { e.preventDefault(); submitForm('/api/register', formRegister); };
+  formLogin.onsubmit = function(e){ e.preventDefault(); submitForm('/api/login', formLogin); };
+  formRegister.onsubmit = function(e){ e.preventDefault(); submitForm('/api/register', formRegister); };
 
-  (function(){
-    try {
-      var q = new URL(location.href).searchParams.get('lang');
-      if (q === 'ru' || q === 'en') localStorage.setItem('sld_lang', q);
-    } catch (e) {}
-    var lang = localStorage.getItem('sld_lang') || 'ru';
-    document.querySelectorAll('a[href]').forEach(function(a){
-      var raw = a.getAttribute('href');
-      if (!raw || raw.charAt(0) !== '/') return;
-      try {
-        var u = new URL(raw, location.origin);
-        u.searchParams.set('lang', lang);
-        a.setAttribute('href', u.pathname + (u.search ? u.search : ''));
-      } catch (e) {}
+  /* ---------- language ---------- */
+  var lang = SldLang.pickInitial();
+  localStorage.setItem('sld_lang', lang);
+  SldLang.setGlobalUnits(lang);
+  SldLang.applyTo(document, SldLang.I18N[lang]);
+  SldLang.updateUrl(lang);
+  SldLang.propagateLinks(lang);
+  document.documentElement.lang = lang;
+  setLangValue(lang);
+  showTab(initialTab);
+  updateTitle(lang);
+
+  function setLangValue(v){
+    var el = document.getElementById('authLangValue');
+    if (el) el.textContent = (v === 'ru') ? 'RU' : 'EN';
+    var menu = document.querySelector('#authLangDd .dd-menu');
+    if (menu) {
+      menu.querySelectorAll('li').forEach(function(li){
+        if (li.dataset.value === v) li.classList.add('active'); else li.classList.remove('active');
+      });
+    }
+  }
+
+  function updateTitle(l){
+    document.title = (l === 'en') ? 'SldChat — Sign in' : 'SldChat — Вход';
+  }
+
+  var authDd = document.getElementById('authLangDd');
+  if (authDd) {
+    var toggle = authDd.querySelector('.dd-toggle');
+    toggle.addEventListener('click', function(e){
+      e.stopPropagation();
+      authDd.classList.toggle('open');
     });
-  })();
+    authDd.querySelectorAll('.dd-menu li').forEach(function(li){
+      li.addEventListener('click', function(){
+        var v = li.dataset.value;
+        lang = v;
+        localStorage.setItem('sld_lang', v);
+        SldLang.setGlobalUnits(v);
+        SldLang.applyTo(document, SldLang.I18N[v]);
+        SldLang.updateUrl(v);
+        SldLang.propagateLinks(v);
+        document.documentElement.lang = v;
+        setLangValue(v);
+        updateTitle(v);
+        authDd.classList.remove('open');
+        errorBox.textContent = '';
+      });
+    });
+    document.addEventListener('click', function(){ authDd.classList.remove('open'); });
+  }
+})();
 </script>
 </body>
 </html>
@@ -1658,11 +1938,8 @@ def render_auth(active: str) -> str:
     return (AUTH_TEMPLATE
         .replace("__SHARED_CSS__", SHARED_CSS)
         .replace("__HEAD_COMMON__", HEAD_COMMON)
-        .replace("__TITLE__", "SldChat — Вход" if active == "login" else "SldChat — Регистрация")
-        .replace("__LOGIN_ACTIVE__", "active" if active == "login" else "")
-        .replace("__REG_ACTIVE__", "active" if active == "register" else "")
-        .replace("__LOGIN_HIDDEN__", "" if active == "login" else "hidden")
-        .replace("__REG_HIDDEN__", "" if active == "register" else "hidden"))
+        .replace("__I18N_JS__", I18N_JS)
+        .replace("__ACTIVE_TAB__", "login" if active == "login" else "register"))
 
 
 # ================== CHAT ==================
@@ -1752,7 +2029,6 @@ CHAT_PAGE = """<!DOCTYPE html>
   .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
   .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8; }
 
-  /* ===== Sidebar ===== */
   .sidebar {
     background: #f0f3f7; border-right: 1px solid #c8d1da;
     display: flex; flex-direction: column; min-width: 0;
@@ -1874,7 +2150,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  /* ===== Chat ===== */
   .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
@@ -1926,7 +2201,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     float: right; margin-top: 4px;
   }
 
-  /* ===== Input area ===== */
   .input-area {
     border-top: 1px solid #c8d1da; padding: 8px 10px;
     background: #eef2f6;
@@ -1953,13 +2227,11 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     transition: transform 0.1s ease, background 0.15s ease;
     flex-shrink: 0;
-    box-sizing: border-box;
   }
   .input-area button .icon { width: 15px; height: 15px; }
   .input-area button:hover { background: linear-gradient(#699bcd, #4577b1); }
   .input-area button:active { transform: scale(0.97); }
 
-  /* ===== Info panel ===== */
   .info-panel {
     background: #f0f3f7; border-left: 1px solid #c8d1da;
     padding: 16px; overflow-y: auto; min-width: 0;
@@ -2092,7 +2364,7 @@ CHAT_PAGE = """<!DOCTYPE html>
       border-radius: 22px; max-height: 100px;
     }
     .input-area button {
-      width: 44px; height: 44px; min-height: 44px;
+      width: 44px; height: 44px;
       padding: 0; border-radius: 50%;
       justify-content: center;
     }
@@ -2214,110 +2486,103 @@ CHAT_PAGE = """<!DOCTYPE html>
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
-var CI18N = {
-  ru: {
-    you: "Вы вошли как",
-    add_contact: "Добавить контакт",
-    nick_ph: "Ник собеседника",
-    search_ph: "Поиск по контактам",
-    pick_peer: "Выберите собеседника",
-    online: "в сети",
-    was_online: "был(а):",
-    just_now: "только что",
-    min_ago: "мин назад",
-    hour_ago: "ч назад",
-    long_ago: "давно",
-    today: "Сегодня",
-    yesterday: "Вчера",
-    info_empty: "Информация о собеседнике появится здесь",
-    nick: "Ник",
-    since: "В SldChat с",
-    last_activity: "Последняя активность",
-    msg_count: "Сообщений в диалоге",
-    remove_contact: "Удалить контакт",
-    send: "Отправить",
-    msg_ph: "Введите сообщение...",
-    in_network: "В сети",
-    empty_pick: "Слева выберите контакт, чтобы начать переписку",
-    no_contacts: "Пока нет контактов.<br>Нажмите «Добавить контакт».",
-    not_found: "Ничего не найдено",
-    no_messages: "Нет сообщений",
-    you_prefix: "Вы: ",
-    confirm_remove: "Удалить контакт {nick}?",
-    removed: "Контакт удалён: ",
-    added: "Добавлено: ",
-    new_contact: "Новый контакт: ",
-    lang_value: "RU"
-  },
-  en: {
-    you: "Signed in as",
-    add_contact: "Add contact",
-    nick_ph: "Contact nick",
-    search_ph: "Search contacts",
-    pick_peer: "Pick a contact",
-    online: "online",
-    was_online: "was online:",
-    just_now: "just now",
-    min_ago: "min ago",
-    hour_ago: "h ago",
-    long_ago: "long ago",
-    today: "Today",
-    yesterday: "Yesterday",
-    info_empty: "Contact info will appear here",
-    nick: "Nick",
-    since: "On SldChat since",
-    last_activity: "Last activity",
-    msg_count: "Messages in dialog",
-    remove_contact: "Remove contact",
-    send: "Send",
-    msg_ph: "Type a message...",
-    in_network: "Online",
-    empty_pick: "Pick a contact on the left to start chatting",
-    no_contacts: "No contacts yet.<br>Press Add contact.",
-    not_found: "Nothing found",
-    no_messages: "No messages",
-    you_prefix: "You: ",
-    confirm_remove: "Remove contact {nick}?",
-    removed: "Contact removed: ",
-    added: "Added: ",
-    new_contact: "New contact: ",
-    lang_value: "EN"
-  }
-};
+__I18N_JS__
 
-var lang = (function(){
-  var q = null;
-  try { q = new URL(location.href).searchParams.get('lang'); } catch (e) {}
-  if (q === 'ru' || q === 'en') return q;
-  var ls = localStorage.getItem('sld_lang');
-  if (ls === 'ru' || ls === 'en') return ls;
-  var nav = (navigator.language || 'ru').toLowerCase();
-  return nav.indexOf('ru') === 0 ? 'ru' : 'en';
-})();
+/* ==== Chat-specific words ==== */
+I18N.ru.you = "Вы вошли как";
+I18N.en.you = "Signed in as";
+I18N.ru.add_contact = "Добавить контакт";
+I18N.en.add_contact = "Add contact";
+I18N.ru.nick_ph = "Ник собеседника";
+I18N.en.nick_ph = "Contact nick";
+I18N.ru.search_ph = "Поиск по контактам";
+I18N.en.search_ph = "Search contacts";
+I18N.ru.pick_peer = "Выберите собеседника";
+I18N.en.pick_peer = "Pick a contact";
+I18N.ru.online = "в сети";
+I18N.en.online = "online";
+I18N.ru.was_online = "был(а):";
+I18N.en.was_online = "was online:";
+I18N.ru.just_now = "только что";
+I18N.en.just_now = "just now";
+I18N.ru.min_ago = "мин назад";
+I18N.en.min_ago = "min ago";
+I18N.ru.hour_ago = "ч назад";
+I18N.en.hour_ago = "h ago";
+I18N.ru.long_ago = "давно";
+I18N.en.long_ago = "long ago";
+I18N.ru.today = "Сегодня";
+I18N.en.today = "Today";
+I18N.ru.yesterday = "Вчера";
+I18N.en.yesterday = "Yesterday";
+I18N.ru.info_empty = "Информация о собеседнике появится здесь";
+I18N.en.info_empty = "Contact info will appear here";
+I18N.ru.nick = "Ник";
+I18N.en.nick = "Nick";
+I18N.ru.since = "В SldChat с";
+I18N.en.since = "On SldChat since";
+I18N.ru.last_activity = "Последняя активность";
+I18N.en.last_activity = "Last activity";
+I18N.ru.msg_count = "Сообщений в диалоге";
+I18N.en.msg_count = "Messages in dialog";
+I18N.ru.remove_contact = "Удалить контакт";
+I18N.en.remove_contact = "Remove contact";
+I18N.ru.send = "Отправить";
+I18N.en.send = "Send";
+I18N.ru.msg_ph = "Введите сообщение...";
+I18N.en.msg_ph = "Type a message...";
+I18N.ru.in_network = "В сети";
+I18N.en.in_network = "Online";
+I18N.ru.empty_pick = "Слева выберите контакт, чтобы начать переписку";
+I18N.en.empty_pick = "Pick a contact on the left to start chatting";
+I18N.ru.no_contacts = "Пока нет контактов.<br>Нажмите «Добавить контакт».";
+I18N.en.no_contacts = "No contacts yet.<br>Press Add contact.";
+I18N.ru.not_found = "Ничего не найдено";
+I18N.en.not_found = "Nothing found";
+I18N.ru.no_messages = "Нет сообщений";
+I18N.en.no_messages = "No messages";
+I18N.ru.you_prefix = "Вы: ";
+I18N.en.you_prefix = "You: ";
+I18N.ru.confirm_remove = "Удалить контакт {nick}?";
+I18N.en.confirm_remove = "Remove contact {nick}?";
+I18N.ru.removed = "Контакт удалён: ";
+I18N.en.removed = "Contact removed: ";
+I18N.ru.added = "Добавлено: ";
+I18N.en.added = "Added: ";
+I18N.ru.new_contact = "Новый контакт: ";
+I18N.en.new_contact = "New contact: ";
+
+/* ==================== state ==================== */
+var lang = SldLang.pickInitial();
 localStorage.setItem('sld_lang', lang);
 
 function T(key){
-  var d = CI18N[lang] || CI18N.ru;
-  return d[key] != null ? d[key] : (CI18N.ru[key] || key);
+  var d = I18N[lang] || I18N.ru;
+  return d[key] != null ? d[key] : (I18N.ru[key] || key);
+}
+function E(key){
+  return SldLang.tr(key, lang);
+}
+function errText(payload){
+  return SldLang.errText(payload, lang);
 }
 
 function applyCI18n(){
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-ci18n]').forEach(function(el){
     var k = el.getAttribute('data-ci18n');
-    var d = CI18N[lang] || CI18N.ru;
-    if (d[k] != null && el.id !== 'chatTitle') el.textContent = d[k];
+    if (el.id === 'chatTitle' && current) return;
+    if (el.id === 'chatTitle') { el.textContent = T('pick_peer'); return; }
+    if (I18N[lang][k] != null) el.textContent = I18N[lang][k];
   });
   document.querySelectorAll('[data-ci18n-ph]').forEach(function(el){
     var k = el.getAttribute('data-ci18n-ph');
-    var d = CI18N[lang] || CI18N.ru;
-    if (d[k] != null) el.setAttribute('placeholder', d[k]);
+    if (I18N[lang][k] != null) el.setAttribute('placeholder', I18N[lang][k]);
   });
   var v = document.getElementById('chatLangValue');
   if (v) v.textContent = (lang === 'ru') ? 'RU' : 'EN';
 }
 
-/* ==================== state ==================== */
 var me = null;
 var current = null;
 var lastIds = {};
@@ -2379,7 +2644,6 @@ function infoSignature(i){
   return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0) + '|' + (i.msg_count || 0);
 }
 
-/* ==================== WS ==================== */
 function connectWS(){
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); } catch (e) { scheduleReconnect(); return; }
@@ -2589,7 +2853,7 @@ async function send(){
   inp.style.height = '36px';
   var r = await fetch('/api/send', { method: 'POST', body: fd });
   var d = await r.json().catch(function(){ return { ok:false }; });
-  if (!d.ok) { toast(d.error || 'Ошибка'); return; }
+  if (!d.ok) { toast(errText(d) || E('send_failed')); return; }
   if (!renderedIds[d.message.id]) {
     renderedIds[d.message.id] = true;
     lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
@@ -2644,7 +2908,7 @@ async function removeContact(nick){
   fd.append('nick', nick);
   var r = await fetch('/api/contacts/remove', { method: 'POST', body: fd });
   var d = await r.json().catch(function(){ return { ok:false }; });
-  if (!d.ok) { toast(d.error || 'Ошибка'); return; }
+  if (!d.ok) { toast(errText(d) || E('error')); return; }
   toast(T('removed') + nick);
   if (current === nick) resetChatToEmpty();
   lastContactsSig = '';
@@ -2658,7 +2922,6 @@ function updateChatSubtitle(){
   else { el.textContent = T('was_online') + ' ' + fmtLastSeen(currentInfo.lastSeen); el.classList.remove('online'); }
 }
 
-/* ==================== dropdown ==================== */
 function wireDropdown(root, onSelect){
   if (!root) return;
   var toggle = root.querySelector('.dd-toggle');
@@ -2688,7 +2951,6 @@ function markActive(root, val){
   });
 }
 
-/* ==================== events ==================== */
 $('addBtn').onclick = function(){
   var f = $('addForm');
   f.classList.toggle('open');
@@ -2718,7 +2980,7 @@ $('addForm').onsubmit = async function(e){
     openDialog(nick);
   } else {
     msg.className = 'add-msg err';
-    msg.textContent = d.error || 'Ошибка';
+    msg.textContent = errText(d) || E('error');
   }
 };
 
@@ -2744,6 +3006,7 @@ $('searchInput').addEventListener('input', function(e){ searchQuery = e.target.v
 wireDropdown($('chatLangDd'), function(v){
   lang = v;
   localStorage.setItem('sld_lang', v);
+  SldLang.setGlobalUnits(v);
   try {
     var u = new URL(location.href);
     u.searchParams.set('lang', v);
@@ -2754,11 +3017,13 @@ wireDropdown($('chatLangDd'), function(v){
   lastContactsSig = '';
   lastInfoSig = '';
   renderContacts();
-  if (current) loadInfo(current);
+  if (current) { loadInfo(current); updateChatSubtitle(); }
+  else { $('chatTitle').textContent = T('pick_peer'); }
 });
 
 applyCI18n();
 markActive($('chatLangDd'), lang);
+SldLang.setGlobalUnits(lang);
 
 setInterval(async function(){
   if (ws && ws.readyState === 1) return;
