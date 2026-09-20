@@ -14,7 +14,6 @@ from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 app = FastAPI(title="SldChat")
-
 START_TIME = time.time()
 
 # ================== ХРАНИЛИЩЕ ==================
@@ -84,7 +83,7 @@ async def security_middleware(request: Request, call_next):
     return resp
 
 
-# ================== WEBSOCKET ==================
+# ================== WEBSOCKET (с typing) ==================
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -98,7 +97,18 @@ async def ws_endpoint(websocket: WebSocket):
     await notify_contacts(nick, {"type": "presence", "nick": nick, "online": True})
     try:
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
+            if not raw or raw == "ping":
+                continue
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
+            t = d.get("type")
+            if t == "typing":
+                to = (d.get("to") or "").strip()
+                if to and to in contacts.get(nick, set()):
+                    await send_ws(to, {"type": "typing", "from": nick})
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -117,16 +127,11 @@ async def ws_endpoint(websocket: WebSocket):
 @app.post("/api/register")
 async def api_register(request: Request, nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
-    if not nick or not password:
-        return err("fill_all")
-    if not (3 <= len(nick) <= 20):
-        return err("nick_len")
-    if not nick.replace("_", "").isalnum():
-        return err("nick_chars")
-    if len(password) < 3:
-        return err("pass_len")
-    if nick in users:
-        return err("nick_taken")
+    if not nick or not password: return err("fill_all")
+    if not (3 <= len(nick) <= 20): return err("nick_len")
+    if not nick.replace("_", "").isalnum(): return err("nick_chars")
+    if len(password) < 3: return err("pass_len")
+    if nick in users: return err("nick_taken")
     now = time.time()
     users[nick] = {"password": password, "created": now, "last_seen": now}
     contacts[nick] = set()
@@ -143,8 +148,7 @@ async def api_register(request: Request, nick: str = Form(...), password: str = 
 async def api_login(request: Request, nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
     u = users.get(nick)
-    if not u or u["password"] != password:
-        return err("bad_login")
+    if not u or u["password"] != password: return err("bad_login")
     token = secrets.token_hex(32)
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
@@ -157,8 +161,7 @@ async def api_login(request: Request, nick: str = Form(...), password: str = For
 @app.post("/api/logout")
 async def api_logout(request: Request):
     token = request.cookies.get("session")
-    if token:
-        sessions.pop(token, None)
+    if token: sessions.pop(token, None)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie("session", path="/")
     return resp
@@ -167,8 +170,7 @@ async def api_logout(request: Request):
 @app.get("/api/me")
 async def api_me(request: Request):
     nick = current_user(request)
-    if not nick:
-        return JSONResponse({"ok": False}, status_code=401)
+    if not nick: return JSONResponse({"ok": False}, status_code=401)
     return {"ok": True, "nick": nick}
 
 
@@ -180,19 +182,14 @@ async def api_server_info():
 @app.post("/api/contacts/add")
 async def api_contacts_add(request: Request, nick: str = Form(...)):
     me = current_user(request)
-    if not me:
-        return err("not_authorized", 401)
+    if not me: return err("not_authorized", 401)
     nick = nick.strip()
-    if not nick:
-        return err("enter_nick")
-    if nick == me:
-        return err("cant_add_self")
-    if nick not in users:
-        return err("user_not_found", 404)
+    if not nick: return err("enter_nick")
+    if nick == me: return err("cant_add_self")
+    if nick not in users: return err("user_not_found", 404)
     contacts.setdefault(me, set())
     contacts.setdefault(nick, set())
-    if nick in contacts[me]:
-        return err("already_contact")
+    if nick in contacts[me]: return err("already_contact")
     contacts[me].add(nick)
     contacts[nick].add(me)
     info = user_public_info(nick)
@@ -207,11 +204,9 @@ async def api_contacts_add(request: Request, nick: str = Form(...)):
 @app.post("/api/contacts/remove")
 async def api_contacts_remove(request: Request, nick: str = Form(...)):
     me = current_user(request)
-    if not me:
-        return err("not_authorized", 401)
+    if not me: return err("not_authorized", 401)
     nick = nick.strip()
-    if nick not in contacts.get(me, set()):
-        return err("not_in_contacts")
+    if nick not in contacts.get(me, set()): return err("not_in_contacts")
     contacts.get(me, set()).discard(nick)
     contacts.get(nick, set()).discard(me)
     await asyncio.gather(
@@ -224,13 +219,11 @@ async def api_contacts_remove(request: Request, nick: str = Form(...)):
 @app.get("/api/contacts")
 async def api_contacts(request: Request):
     me = current_user(request)
-    if not me:
-        return JSONResponse({"ok": False}, status_code=401)
+    if not me: return JSONResponse({"ok": False}, status_code=401)
     my_reads = reads.get(me, {})
     out = []
     for nick in contacts.get(me, set()):
-        if nick not in users:
-            continue
+        if nick not in users: continue
         last_msg = None
         unread = 0
         last_read_id = my_reads.get(nick, 0)
@@ -248,10 +241,8 @@ async def api_contacts(request: Request):
 @app.get("/api/user/{nick}/info")
 async def api_user_info(nick: str, request: Request):
     me = current_user(request)
-    if not me:
-        return JSONResponse({"ok": False}, status_code=401)
-    if nick not in users:
-        return err("user_not_found", 404)
+    if not me: return JSONResponse({"ok": False}, status_code=401)
+    if nick not in users: return err("user_not_found", 404)
     info = user_public_info(nick)
     info["msg_count"] = sum(1 for m in messages if (
         (m["from"] == me and m["to"] == nick) or (m["from"] == nick and m["to"] == me)
@@ -263,10 +254,8 @@ async def api_user_info(nick: str, request: Request):
 @app.get("/api/dialog/{nick}")
 async def api_dialog(nick: str, request: Request, since: int = 0):
     me = current_user(request)
-    if not me:
-        return JSONResponse({"ok": False}, status_code=401)
-    if nick not in contacts.get(me, set()):
-        return err("not_in_contacts", 403)
+    if not me: return JSONResponse({"ok": False}, status_code=401)
+    if nick not in contacts.get(me, set()): return err("not_in_contacts", 403)
     max_id = reads.setdefault(me, {}).get(nick, 0)
     for m in messages:
         if m["from"] == nick and m["to"] == me and m["id"] > max_id:
@@ -282,16 +271,12 @@ async def api_dialog(nick: str, request: Request, since: int = 0):
 async def api_send(request: Request, to: str = Form(...), text: str = Form(...)):
     global _msg_id
     me = current_user(request)
-    if not me:
-        return err("not_authorized", 401)
+    if not me: return err("not_authorized", 401)
     to = to.strip()
     text = text.strip()
-    if not text:
-        return err("empty_msg")
-    if len(text) > 4000:
-        text = text[:4000]
-    if to not in contacts.get(me, set()):
-        return err("not_in_contacts", 403)
+    if not text: return err("empty_msg")
+    if len(text) > 4000: text = text[:4000]
+    if to not in contacts.get(me, set()): return err("not_in_contacts", 403)
     _msg_id += 1
     msg = {"id": _msg_id, "from": me, "to": to, "text": text, "time": time.time()}
     messages.append(msg)
@@ -305,15 +290,12 @@ FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
     '<rect width="64" height="64" rx="14" fill="#3f6fa8"/>'
     '<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"'
-    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/>'
-    '</svg>'
+    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/></svg>'
 )
-
 OG_IMAGE_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">'
     '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
-    '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/>'
-    '</linearGradient></defs>'
+    '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/></linearGradient></defs>'
     '<rect width="1200" height="630" fill="url(#g)"/>'
     '<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">'
     '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
@@ -328,12 +310,10 @@ async def favicon():
     return Response(content=FAVICON_SVG, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
 
-
 @app.get("/favicon.ico")
 async def favicon_ico():
     return Response(content=FAVICON_SVG, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
-
 
 @app.get("/og-image.svg")
 async def og_image():
@@ -364,6 +344,39 @@ SHARED_CSS = """
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
   }
 
+  /* === Reveal on scroll (лёгкое появление) === */
+  .reveal {
+    opacity: 0;
+    transform: translateY(14px);
+    transition: opacity 0.5s ease, transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
+  }
+  .reveal.in { opacity: 1; transform: translateY(0); will-change: auto; }
+  .cards .reveal:nth-child(1) { transition-delay: 0ms; }
+  .cards .reveal:nth-child(2) { transition-delay: 60ms; }
+  .cards .reveal:nth-child(3) { transition-delay: 120ms; }
+  .cards .reveal:nth-child(4) { transition-delay: 30ms; }
+  .cards .reveal:nth-child(5) { transition-delay: 90ms; }
+  .cards .reveal:nth-child(6) { transition-delay: 150ms; }
+
+  /* На мобилке — только opacity, без translate (меньше композитинга) */
+  @media (max-width: 820px) {
+    .reveal { transform: none; transition: opacity 0.4s ease; }
+    .reveal.in { transform: none; }
+    .cards .reveal:nth-child(n) { transition-delay: 0ms; }
+  }
+
+  /* Уважаем reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+    .reveal { opacity: 1 !important; transform: none !important; }
+  }
+
   a { color: #3f6fa8; text-decoration: none; transition: color 0.14s ease; }
   a:hover { text-decoration: underline; }
   .container { max-width: 1080px; margin: 0 auto; padding: 0 22px; }
@@ -389,18 +402,14 @@ SHARED_CSS = """
     display: flex; align-items: center; gap: 7px;
     font-size: 21px; font-weight: bold; color: #2b3a4a;
     text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px;
-    transition: transform 0.15s ease;
   }
-  .logo:hover { transform: translateY(-1px); text-decoration: none; }
   .logo span { color: #3f6fa8; }
   .logo .icon { color: #3f6fa8; width: 22px; height: 22px; }
 
   .nav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
   .nav a.navlink {
     padding: 7px 10px; border-radius: 4px; color: #3a5169; font-size: 13px;
-    transition: background 0.14s ease, transform 0.14s ease;
   }
-  .nav a.navlink:hover { background: #e3e9ef; text-decoration: none; transform: translateY(-1px); }
 
   .btn {
     display: inline-flex; align-items: center; gap: 6px;
@@ -412,14 +421,12 @@ SHARED_CSS = """
     white-space: nowrap;
     transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
   }
-  .btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
-  .btn:active { transform: translateY(0) scale(0.98); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
+  .btn:active { transform: scale(0.98); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
   .btn-primary {
     background: linear-gradient(#5b8fc4, #3f6fa8);
     border-color: #35597f; color: #fff;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }
-  .btn-primary:hover { background: linear-gradient(#699bcd, #4577b1); box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
   .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; scroll-margin-top: 76px; }
@@ -433,9 +440,7 @@ SHARED_CSS = """
     background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
     padding: 22px 20px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
   }
-  .card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10), inset 0 1px 0 #fff; }
   .card .ico {
     width: 46px; height: 46px; margin-bottom: 14px;
     border-radius: 8px;
@@ -443,11 +448,22 @@ SHARED_CSS = """
     border: 1px solid #b7c2cd;
     display: flex; align-items: center; justify-content: center;
     color: #3f6fa8; box-shadow: inset 0 1px 0 #fff;
-    transition: transform 0.2s ease;
   }
-  .card:hover .ico { transform: scale(1.06) rotate(-2deg); }
   .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
   .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
+
+  /* Дорогие hover-эффекты — только для мыши */
+  @media (hover: hover) and (pointer: fine) {
+    .logo:hover { transform: translateY(-1px); text-decoration: none; }
+    .nav a.navlink:hover { background: #e3e9ef; text-decoration: none; }
+    .btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
+    .btn-primary:hover { background: linear-gradient(#699bcd, #4577b1); box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
+    a:hover { text-decoration: underline; }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10), inset 0 1px 0 #fff; }
+    .card:hover .ico { transform: scale(1.06) rotate(-2deg); }
+    .card { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+    .card .ico { transition: transform 0.25s ease; }
+  }
 
   .faq { max-width: 760px; margin: 0 auto; }
   .faq details {
@@ -475,8 +491,7 @@ SHARED_CSS = """
   .faq .answer-wrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.28s ease; }
   .faq details[open] .answer-wrap { grid-template-rows: 1fr; }
   .faq .answer-wrap > .answer {
-    overflow: hidden;
-    padding: 0 18px 0 40px; color: #55677b; font-size: 13px;
+    overflow: hidden; padding: 0 18px 0 40px; color: #55677b; font-size: 13px;
     transition: padding 0.28s ease;
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
@@ -491,11 +506,13 @@ SHARED_CSS = """
     transition: background 0.15s ease, border-color 0.15s ease;
     white-space: nowrap;
   }
-  .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: #6b7f93; }
   .dd-toggle .icon { width: 14px; height: 14px; color: #9db8d3; transition: transform 0.22s ease; }
   .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
   .dd-toggle .dd-label { color: #8fa3b6; }
   .dd-toggle .dd-value { color: #fff; font-weight: bold; }
+  @media (hover: hover) and (pointer: fine) {
+    .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: #6b7f93; }
+  }
 
   .dd-menu {
     position: absolute; bottom: calc(100% + 6px); right: 0; left: auto;
@@ -515,7 +532,6 @@ SHARED_CSS = """
     padding: 8px 12px; border-radius: 4px; cursor: pointer;
     font-size: 13px; color: #2b3a4a;
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    transition: background 0.1s ease;
   }
   .dd-menu li:hover { background: #eef2f6; }
   .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
@@ -536,14 +552,11 @@ SHARED_CSS = """
   }
   footer .foot-col ul { list-style: none; padding: 0; margin: 0; }
   footer .foot-col li { margin-bottom: 7px; }
-  footer .foot-col a { color: #b8c4ce; font-size: 13px; transition: color 0.14s ease; }
-  footer .foot-col a:hover { color: #fff; }
+  footer .foot-col a { color: #b8c4ce; font-size: 13px; }
   footer .foot-controls {
     display: flex; align-items: center; justify-content: space-between;
-    gap: 16px; flex-wrap: wrap;
-    padding: 16px 0;
-    border-top: 1px solid #3d4d5d;
-    border-bottom: 1px solid #3d4d5d;
+    gap: 16px; flex-wrap: wrap; padding: 16px 0;
+    border-top: 1px solid #3d4d5d; border-bottom: 1px solid #3d4d5d;
   }
   footer .foot-status {
     display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
@@ -564,8 +577,7 @@ SHARED_CSS = """
   footer .foot-bottom {
     padding-top: 20px;
     display: flex; align-items: center; justify-content: space-between;
-    gap: 14px; flex-wrap: wrap;
-    font-size: 12px; color: #7a8b9c;
+    gap: 14px; flex-wrap: wrap; font-size: 12px; color: #7a8b9c;
   }
   footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   footer .foot-bottom a { color: #9db8d3; }
@@ -758,16 +770,33 @@ FOOTER_HTML = """
   }
 
   window.SldFooter = {
-    wire: wireDropdown,
-    markActive: markActive,
-    softenUrls: softenUrls,
-    tick: tick
+    wire: wireDropdown, markActive: markActive, softenUrls: softenUrls, tick: tick
   };
 
+  /* ========== Reveal on scroll (лёгкий) ========== */
+  function setupReveal(){
+    var els = document.querySelectorAll('.reveal');
+    if (!els.length) return;
+    if (!('IntersectionObserver' in window)) {
+      els.forEach(function(el){ el.classList.add('in'); });
+      return;
+    }
+    var io = new IntersectionObserver(function(entries){
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        if (e.isIntersecting) {
+          e.target.classList.add('in');
+          io.unobserve(e.target);
+        }
+      }
+    }, { rootMargin: '0px 0px -60px 0px', threshold: 0.02 });
+    els.forEach(function(el){ io.observe(el); });
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', softenUrls);
+    document.addEventListener('DOMContentLoaded', function(){ softenUrls(); setupReveal(); });
   } else {
-    softenUrls();
+    softenUrls(); setupReveal();
   }
 })();
 </script>
@@ -999,15 +1028,9 @@ window.SldLang = (function(){
     return tr('error', lang);
   }
   return {
-    I18N: I18N,
-    ERRORS: ERRORS,
-    pickInitial: pickInitial,
-    applyTo: applyTo,
-    propagateLinks: propagateLinks,
-    updateUrl: updateUrl,
-    setGlobalUnits: setGlobalUnits,
-    tr: tr,
-    errText: errText
+    I18N: I18N, ERRORS: ERRORS,
+    pickInitial: pickInitial, applyTo: applyTo, propagateLinks: propagateLinks,
+    updateUrl: updateUrl, setGlobalUnits: setGlobalUnits, tr: tr, errText: errText
   };
 })();
 """
@@ -1038,6 +1061,18 @@ __HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
+  /* content-visibility экономит рендер невидимых секций на телефоне */
+  .section { content-visibility: auto; contain-intrinsic-size: 1px 900px; }
+
+  @keyframes eyebrowPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(63,111,168,0.20); }
+    50%      { box-shadow: 0 0 0 6px rgba(63,111,168,0); }
+  }
+  @keyframes heroUp {
+    from { opacity: 0; transform: translateY(18px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
   .hero {
     background: radial-gradient(circle at 20% 20%, #e6eef7 0%, transparent 60%),
                 linear-gradient(#d5dfe9, #b8c6d3);
@@ -1051,19 +1086,29 @@ __SHARED_CSS__
     border-radius: 20px; padding: 5px 14px 5px 12px;
     font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
     font-weight: bold; color: #3a5169; margin-bottom: 24px;
+    animation: eyebrowPulse 2.6s ease-in-out infinite;
   }
   .hero .eyebrow .icon { width: 13px; height: 13px; color: #3f6fa8; }
   .hero h1 {
     font-size: 46px; font-weight: normal; margin: 0 0 18px;
     color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.12;
     letter-spacing: 0.4px;
+    animation: heroUp 0.55s ease-out both;
+    animation-delay: 0.05s;
   }
   .hero h1 b { color: #3f6fa8; font-weight: bold; }
-  .hero p { max-width: 620px; margin: 0 auto 32px; color: #4a5f74; font-size: 16px; }
-  .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .hero p {
+    max-width: 620px; margin: 0 auto 32px; color: #4a5f74; font-size: 16px;
+    animation: heroUp 0.55s ease-out 0.12s both;
+  }
+  .hero-actions {
+    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
+    animation: heroUp 0.55s ease-out 0.20s both;
+  }
   .hero-meta {
     margin-top: 26px; font-size: 12px; color: #5a6f83;
     display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
+    animation: heroUp 0.55s ease-out 0.28s both;
   }
   .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
   .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
@@ -1076,7 +1121,9 @@ __SHARED_CSS__
     transition: transform 0.2s ease, box-shadow 0.2s ease;
     min-width: 0;
   }
-  .server-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10); }
+  @media (hover: hover) and (pointer: fine) {
+    .server-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10); }
+  }
   .server-card .ico {
     width: 46px; height: 46px; border-radius: 8px;
     background: linear-gradient(#e4ebf2, #c8d3de);
@@ -1095,8 +1142,7 @@ __SHARED_CSS__
   .server-card .tags { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
   .server-card .tag {
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
-    font-weight: bold; padding: 2px 8px; border-radius: 10px;
-    white-space: nowrap;
+    font-weight: bold; padding: 2px 8px; border-radius: 10px; white-space: nowrap;
   }
   .server-card .tag.main { color: #2f8f3d; background: #e5f3e7; }
   .server-card .tag.alt  { color: #3f6fa8; background: #e6eef7; }
@@ -1118,7 +1164,9 @@ __SHARED_CSS__
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
     transition: transform 0.18s ease, box-shadow 0.18s ease;
   }
-  .privacy-item:hover { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(0,0,0,0.08); }
+  @media (hover: hover) and (pointer: fine) {
+    .privacy-item:hover { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(0,0,0,0.08); }
+  }
   .privacy-item .ico {
     width: 36px; height: 36px; flex-shrink: 0; border-radius: 8px;
     background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid #b7c2cd;
@@ -1131,6 +1179,7 @@ __SHARED_CSS__
     .hero { padding: 54px 0 64px; }
     .hero h1 { font-size: 30px; }
     .hero p { font-size: 14px; }
+    .hero .eyebrow { animation: none; }
     .servers { grid-template-columns: 1fr; }
     .privacy-mini { grid-template-columns: 1fr; }
   }
@@ -1170,15 +1219,15 @@ __SHARED_CSS__
       <span data-i18n="hero_eyebrow">Быстрая доставка через WebSocket</span>
     </span>
     <h1 data-i18n-html="hero_title">Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
-    <p data-i18n="hero_sub">Никаких лишних настроек. Регистрация за 5 секунд, добавление по нику, мгновенная доставка сообщений. Работает на телефоне и на компьютере.</p>
+    <p data-i18n="hero_sub"></p>
     <div class="hero-actions">
       <a class="btn btn-primary btn-lg" href="/register" data-i18n="hero_cta1">Создать аккаунт</a>
       <a class="btn btn-lg" href="/login" data-i18n="hero_cta2">У меня уже есть аккаунт</a>
     </div>
     <div class="hero-meta">
-      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m1">Без e-mail и телефона</span></span>
-      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m2">Без рекламы</span></span>
-      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m3">Бесплатно</span></span>
+      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m1"></span></span>
+      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m2"></span></span>
+      <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m3"></span></span>
     </div>
   </div>
 </section>
@@ -1186,19 +1235,19 @@ __SHARED_CSS__
 <section id="features" class="section">
   <div class="container">
     <h2 data-i18n="feat_h">Возможности</h2>
-    <p class="lead" data-i18n="feat_lead">Всё, что нужно для быстрого общения — и ничего лишнего.</p>
+    <p class="lead" data-i18n="feat_lead"></p>
     <div class="cards">
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
         <h3 data-i18n="feat_1_h"></h3><p data-i18n="feat_1_p"></p></div>
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div>
         <h3 data-i18n="feat_2_h"></h3><p data-i18n="feat_2_p"></p></div>
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
         <h3 data-i18n="feat_3_h"></h3><p data-i18n="feat_3_p"></p></div>
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
         <h3 data-i18n="feat_4_h"></h3><p data-i18n="feat_4_p"></p></div>
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
         <h3 data-i18n="feat_5_h"></h3><p data-i18n="feat_5_p"></p></div>
-      <div class="card"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
         <h3 data-i18n="feat_6_h"></h3><p data-i18n="feat_6_p"></p></div>
     </div>
   </div>
@@ -1207,10 +1256,10 @@ __SHARED_CSS__
 <section id="servers" class="section">
   <div class="container">
     <h2 data-i18n="srv_h">Серверы SldChat</h2>
-    <p class="lead" data-i18n="srv_lead">Проект работает на двух независимых серверах. Выбирайте любой — данные между ними не передаются.</p>
+    <p class="lead" data-i18n="srv_lead"></p>
 
     <div class="servers">
-      <div class="server-card">
+      <div class="server-card reveal">
         <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
         <div class="body">
           <div class="url">sldchat.fastapicloud.dev</div>
@@ -1218,7 +1267,7 @@ __SHARED_CSS__
         </div>
         <div class="tags"><span class="tag main" data-i18n="srv_main">Основной</span></div>
       </div>
-      <div class="server-card">
+      <div class="server-card reveal">
         <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
         <div class="body">
           <div class="url">sldchat.onrunxbuild.com</div>
@@ -1231,7 +1280,7 @@ __SHARED_CSS__
       </div>
     </div>
 
-    <div class="notice">
+    <div class="notice reveal">
       <svg class="icon lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
       <div data-i18n-html="srv_notice"></div>
     </div>
@@ -1241,15 +1290,15 @@ __SHARED_CSS__
 <section id="privacy" class="section">
   <div class="container">
     <h2 data-i18n="priv_h">Приватность</h2>
-    <p class="lead" data-i18n="priv_lead">Коротко о самом главном. Подробности — на отдельной странице.</p>
+    <p class="lead" data-i18n="priv_lead"></p>
     <div class="privacy-mini">
-      <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+      <div class="privacy-item reveal"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
         <div><h3 data-i18n="priv_1_h"></h3><p data-i18n="priv_1_p"></p></div></div>
-      <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></div>
+      <div class="privacy-item reveal"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></div>
         <div><h3 data-i18n="priv_2_h"></h3><p data-i18n="priv_2_p"></p></div></div>
-      <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+      <div class="privacy-item reveal"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
         <div><h3 data-i18n="priv_3_h"></h3><p data-i18n="priv_3_p"></p></div></div>
-      <div class="privacy-item"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
+      <div class="privacy-item reveal"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>
         <div><h3 data-i18n="priv_4_h"></h3><p data-i18n="priv_4_p"></p></div></div>
     </div>
     <a class="link-arrow" href="/privacy">
@@ -1263,12 +1312,12 @@ __SHARED_CSS__
   <div class="container">
     <h2 data-i18n="faq_h">Ответы на вопросы</h2>
     <div class="faq">
-      <details><summary data-i18n="faq_q1"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a1"></div></div></details>
-      <details><summary data-i18n="faq_q2"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a2"></div></div></details>
-      <details><summary data-i18n="faq_q3"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a3"></div></div></details>
-      <details><summary data-i18n="faq_q4"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a4"></div></div></details>
-      <details><summary data-i18n="faq_q5"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a5"></div></div></details>
-      <details><summary data-i18n="faq_q6"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a6"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q1"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a1"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q2"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a2"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q3"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a3"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q4"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a4"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q5"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a5"></div></div></details>
+      <details class="reveal"><summary data-i18n="faq_q6"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a6"></div></div></details>
     </div>
   </div>
 </section>
@@ -1289,7 +1338,6 @@ __I18N_JS__
     });
   });
 
-  /* smooth scroll по якорям с оффсетом под sticky-шапку */
   document.querySelectorAll('a[href^="#"]').forEach(function(a){
     a.addEventListener('click', function(e){
       var id = a.getAttribute('href');
@@ -1373,76 +1421,40 @@ __SHARED_CSS__
 <div class="page-wrap">
   <div class="page-head">
     <h1 data-i18n="priv_page_h">Политика приватности</h1>
-    <p data-i18n="priv_page_sub">Что мы собираем, что нет, и почему SldChat по-настоящему прост.</p>
+    <p data-i18n="priv_page_sub"></p>
   </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_short_h">Коротко</h2>
-    <p data-i18n-html="priv_page_short_p"></p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_store_h">Что мы храним</h2>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_short_h"></h2><p data-i18n-html="priv_page_short_p"></p></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_store_h"></h2>
     <ul>
-      <li data-i18n="priv_page_store_1"></li>
-      <li data-i18n="priv_page_store_2"></li>
-      <li data-i18n="priv_page_store_3"></li>
-      <li data-i18n="priv_page_store_4"></li>
+      <li data-i18n="priv_page_store_1"></li><li data-i18n="priv_page_store_2"></li>
+      <li data-i18n="priv_page_store_3"></li><li data-i18n="priv_page_store_4"></li>
       <li data-i18n="priv_page_store_5"></li>
     </ul>
-    <p data-i18n="priv_page_store_foot"></p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_dont_h">Чего мы не делаем</h2>
+    <p data-i18n="priv_page_store_foot"></p></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_dont_h"></h2>
     <ul>
-      <li data-i18n="priv_page_dont_1"></li>
-      <li data-i18n="priv_page_dont_2"></li>
-      <li data-i18n="priv_page_dont_3"></li>
-      <li data-i18n="priv_page_dont_4"></li>
-    </ul>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_cookie_h">Cookie</h2>
+      <li data-i18n="priv_page_dont_1"></li><li data-i18n="priv_page_dont_2"></li>
+      <li data-i18n="priv_page_dont_3"></li><li data-i18n="priv_page_dont_4"></li>
+    </ul></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_cookie_h"></h2>
     <p data-i18n-html="priv_page_cookie_p"></p>
     <ul>
-      <li data-i18n="priv_page_cookie_1"></li>
-      <li data-i18n="priv_page_cookie_2"></li>
-      <li data-i18n="priv_page_cookie_3"></li>
-      <li data-i18n="priv_page_cookie_4"></li>
-    </ul>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_life_h">Сколько данные живут</h2>
-    <p data-i18n="priv_page_life_p"></p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_del_h">Как удалить свои данные</h2>
+      <li data-i18n="priv_page_cookie_1"></li><li data-i18n="priv_page_cookie_2"></li>
+      <li data-i18n="priv_page_cookie_3"></li><li data-i18n="priv_page_cookie_4"></li>
+    </ul></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_life_h"></h2><p data-i18n="priv_page_life_p"></p></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_del_h"></h2>
     <ul>
-      <li data-i18n="priv_page_del_1"></li>
-      <li data-i18n="priv_page_del_2"></li>
+      <li data-i18n="priv_page_del_1"></li><li data-i18n="priv_page_del_2"></li>
       <li data-i18n="priv_page_del_3"></li>
-    </ul>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_srv_h">Два независимых сервера</h2>
-    <p data-i18n-html="priv_page_srv_p"></p>
-  </div>
-
-  <div class="page-card selectable">
-    <h2 data-i18n="priv_page_sec_h">Безопасность</h2>
+    </ul></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_srv_h"></h2><p data-i18n-html="priv_page_srv_p"></p></div>
+  <div class="page-card selectable"><h2 data-i18n="priv_page_sec_h"></h2>
     <ul>
-      <li data-i18n="priv_page_sec_1"></li>
-      <li data-i18n="priv_page_sec_2"></li>
-      <li data-i18n="priv_page_sec_3"></li>
-      <li data-i18n="priv_page_sec_4"></li>
+      <li data-i18n="priv_page_sec_1"></li><li data-i18n="priv_page_sec_2"></li>
+      <li data-i18n="priv_page_sec_3"></li><li data-i18n="priv_page_sec_4"></li>
     </ul>
-    <p data-i18n="priv_page_sec_foot"></p>
-  </div>
+    <p data-i18n="priv_page_sec_foot"></p></div>
 
   <a class="link-arrow" href="/" style="margin-top:8px">
     <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
@@ -1455,84 +1467,46 @@ __FOOTER__
 <script>
 __I18N_JS__
 
-I18N.ru.priv_page_h = "Политика приватности";
-I18N.en.priv_page_h = "Privacy policy";
-I18N.ru.priv_page_sub = "Что мы собираем, что нет, и почему SldChat по-настоящему прост.";
-I18N.en.priv_page_sub = "What we collect, what we don't, and why SldChat is truly simple.";
-
-I18N.ru.priv_page_short_h = "Коротко";
-I18N.en.priv_page_short_h = "In short";
+I18N.ru.priv_page_h = "Политика приватности"; I18N.en.priv_page_h = "Privacy policy";
+I18N.ru.priv_page_sub = "Что мы собираем, что нет, и почему SldChat по-настоящему прост."; I18N.en.priv_page_sub = "What we collect, what we don't, and why SldChat is truly simple.";
+I18N.ru.priv_page_short_h = "Коротко"; I18N.en.priv_page_short_h = "In short";
 I18N.ru.priv_page_short_p = "SldChat собирает <b>минимум данных</b>. Мы не хотим знать о вас больше, чем нужно для работы мессенджера. Всё хранится в оперативной памяти сервера и стирается при его перезапуске.";
 I18N.en.priv_page_short_p = "SldChat collects the <b>bare minimum</b>. We don't want to know more about you than needed to run a messenger. Everything lives in server RAM and is erased on restart.";
-
-I18N.ru.priv_page_store_h = "Что мы храним";
-I18N.en.priv_page_store_h = "What we store";
-I18N.ru.priv_page_store_1 = "Ник — то, как вас видят другие пользователи.";
-I18N.en.priv_page_store_1 = "Nick — how other users see you.";
-I18N.ru.priv_page_store_2 = "Пароль — только в оперативной памяти.";
-I18N.en.priv_page_store_2 = "Password — only in RAM.";
-I18N.ru.priv_page_store_3 = "Сообщения — тексты и время отправки.";
-I18N.en.priv_page_store_3 = "Messages — texts and timestamps.";
-I18N.ru.priv_page_store_4 = "Список контактов — с кем вы общаетесь.";
-I18N.en.priv_page_store_4 = "Contact list — whom you talk to.";
-I18N.ru.priv_page_store_5 = "Время последней активности — для статуса «в сети».";
-I18N.en.priv_page_store_5 = "Last activity time — for the online status.";
+I18N.ru.priv_page_store_h = "Что мы храним"; I18N.en.priv_page_store_h = "What we store";
+I18N.ru.priv_page_store_1 = "Ник — то, как вас видят другие пользователи."; I18N.en.priv_page_store_1 = "Nick — how other users see you.";
+I18N.ru.priv_page_store_2 = "Пароль — только в оперативной памяти."; I18N.en.priv_page_store_2 = "Password — only in RAM.";
+I18N.ru.priv_page_store_3 = "Сообщения — тексты и время отправки."; I18N.en.priv_page_store_3 = "Messages — texts and timestamps.";
+I18N.ru.priv_page_store_4 = "Список контактов — с кем вы общаетесь."; I18N.en.priv_page_store_4 = "Contact list — whom you talk to.";
+I18N.ru.priv_page_store_5 = "Время последней активности — для статуса «в сети»."; I18N.en.priv_page_store_5 = "Last activity time — for the online status.";
 I18N.ru.priv_page_store_foot = "Всё это живёт исключительно в ОЗУ процесса. На диск ничего не записывается.";
 I18N.en.priv_page_store_foot = "All of it lives only in the process RAM. Nothing is written to disk.";
-
-I18N.ru.priv_page_dont_h = "Чего мы не делаем";
-I18N.en.priv_page_dont_h = "What we don't do";
-I18N.ru.priv_page_dont_1 = "Не собираем e-mail, телефон и другие персональные данные.";
-I18N.en.priv_page_dont_1 = "We don't collect email, phone, or other personal data.";
-I18N.ru.priv_page_dont_2 = "Не ведём логи IP-адресов и не отслеживаем вас между сессиями.";
-I18N.en.priv_page_dont_2 = "We don't log IPs or track you between sessions.";
-I18N.ru.priv_page_dont_3 = "Не используем аналитику, трекеры, пиксели и сторонние скрипты.";
-I18N.en.priv_page_dont_3 = "We don't use analytics, trackers, pixels, or third-party scripts.";
-I18N.ru.priv_page_dont_4 = "Не показываем рекламу и не передаём данные третьим лицам.";
-I18N.en.priv_page_dont_4 = "We show no ads and share no data with third parties.";
-
-I18N.ru.priv_page_cookie_h = "Cookie";
-I18N.en.priv_page_cookie_h = "Cookies";
+I18N.ru.priv_page_dont_h = "Чего мы не делаем"; I18N.en.priv_page_dont_h = "What we don't do";
+I18N.ru.priv_page_dont_1 = "Не собираем e-mail, телефон и другие персональные данные."; I18N.en.priv_page_dont_1 = "We don't collect email, phone, or other personal data.";
+I18N.ru.priv_page_dont_2 = "Не ведём логи IP-адресов и не отслеживаем вас между сессиями."; I18N.en.priv_page_dont_2 = "We don't log IPs or track you between sessions.";
+I18N.ru.priv_page_dont_3 = "Не используем аналитику, трекеры, пиксели и сторонние скрипты."; I18N.en.priv_page_dont_3 = "We don't use analytics, trackers, pixels, or third-party scripts.";
+I18N.ru.priv_page_dont_4 = "Не показываем рекламу и не передаём данные третьим лицам."; I18N.en.priv_page_dont_4 = "We show no ads and share no data with third parties.";
+I18N.ru.priv_page_cookie_h = "Cookie"; I18N.en.priv_page_cookie_h = "Cookies";
 I18N.ru.priv_page_cookie_p = "Мы используем <b>одну-единственную cookie</b> — <code>session</code>. Она нужна только для того, чтобы вы оставались в аккаунте между запросами.";
 I18N.en.priv_page_cookie_p = "We use <b>a single cookie</b> — <code>session</code>. It only keeps you signed in between requests.";
-I18N.ru.priv_page_cookie_1 = "HttpOnly — недоступна из JavaScript.";
-I18N.en.priv_page_cookie_1 = "HttpOnly — not accessible from JavaScript.";
-I18N.ru.priv_page_cookie_2 = "SameSite=Lax — снижает риск CSRF-атак.";
-I18N.en.priv_page_cookie_2 = "SameSite=Lax — reduces CSRF risks.";
-I18N.ru.priv_page_cookie_3 = "Secure — при работе сайта по HTTPS.";
-I18N.en.priv_page_cookie_3 = "Secure — when the site runs over HTTPS.";
-I18N.ru.priv_page_cookie_4 = "Срок жизни — до 30 дней или до выхода из аккаунта.";
-I18N.en.priv_page_cookie_4 = "Lifetime — up to 30 days or until you log out.";
-
-I18N.ru.priv_page_life_h = "Сколько данные живут";
-I18N.en.priv_page_life_h = "How long data lives";
+I18N.ru.priv_page_cookie_1 = "HttpOnly — недоступна из JavaScript."; I18N.en.priv_page_cookie_1 = "HttpOnly — not accessible from JavaScript.";
+I18N.ru.priv_page_cookie_2 = "SameSite=Lax — снижает риск CSRF-атак."; I18N.en.priv_page_cookie_2 = "SameSite=Lax — reduces CSRF risks.";
+I18N.ru.priv_page_cookie_3 = "Secure — при работе сайта по HTTPS."; I18N.en.priv_page_cookie_3 = "Secure — when the site runs over HTTPS.";
+I18N.ru.priv_page_cookie_4 = "Срок жизни — до 30 дней или до выхода из аккаунта."; I18N.en.priv_page_cookie_4 = "Lifetime — up to 30 days or until you log out.";
+I18N.ru.priv_page_life_h = "Сколько данные живут"; I18N.en.priv_page_life_h = "How long data lives";
 I18N.ru.priv_page_life_p = "Ровно столько, сколько работает сервер. Как только он перезапускается, вся информация исчезает безвозвратно.";
 I18N.en.priv_page_life_p = "Exactly as long as the server runs. Once it restarts, all information disappears permanently.";
-
-I18N.ru.priv_page_del_h = "Как удалить свои данные";
-I18N.en.priv_page_del_h = "How to delete your data";
-I18N.ru.priv_page_del_1 = "Выйти из аккаунта — удалит активную сессию на этом устройстве.";
-I18N.en.priv_page_del_1 = "Log out — deletes the active session on this device.";
-I18N.ru.priv_page_del_2 = "Дождаться перезапуска сервера — удалит всё остальное.";
-I18N.en.priv_page_del_2 = "Wait for a server restart — that removes the rest.";
-I18N.ru.priv_page_del_3 = "Написать в поддержку, чтобы ускорить процесс.";
-I18N.en.priv_page_del_3 = "Contact support to speed up the process.";
-
-I18N.ru.priv_page_srv_h = "Два независимых сервера";
-I18N.en.priv_page_srv_h = "Two independent servers";
+I18N.ru.priv_page_del_h = "Как удалить свои данные"; I18N.en.priv_page_del_h = "How to delete your data";
+I18N.ru.priv_page_del_1 = "Выйти из аккаунта — удалит активную сессию на этом устройстве."; I18N.en.priv_page_del_1 = "Log out — deletes the active session on this device.";
+I18N.ru.priv_page_del_2 = "Дождаться перезапуска сервера — удалит всё остальное."; I18N.en.priv_page_del_2 = "Wait for a server restart — that removes the rest.";
+I18N.ru.priv_page_del_3 = "Написать в поддержку, чтобы ускорить процесс."; I18N.en.priv_page_del_3 = "Contact support to speed up the process.";
+I18N.ru.priv_page_srv_h = "Два независимых сервера"; I18N.en.priv_page_srv_h = "Two independent servers";
 I18N.ru.priv_page_srv_p = "У SldChat есть <b>два отдельных развёртывания</b> — <code>sldchat.fastapicloud.dev</code> и <code>sldchat.onrunxbuild.com</code>. Это разные серверы с разными базами пользователей. <b>Данные между ними не передаются.</b>";
 I18N.en.priv_page_srv_p = "SldChat has <b>two separate deployments</b> — <code>sldchat.fastapicloud.dev</code> and <code>sldchat.onrunxbuild.com</code>. They are different servers with different user bases. <b>Data is not shared between them.</b>";
-
-I18N.ru.priv_page_sec_h = "Безопасность";
-I18N.en.priv_page_sec_h = "Security";
-I18N.ru.priv_page_sec_1 = "Пароли не возвращаются через API.";
-I18N.en.priv_page_sec_1 = "Passwords are never returned via the API.";
-I18N.ru.priv_page_sec_2 = "Все проверки доступа — на стороне сервера.";
-I18N.en.priv_page_sec_2 = "All access checks happen server-side.";
-I18N.ru.priv_page_sec_3 = "Заголовки безопасности: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.";
-I18N.en.priv_page_sec_3 = "Security headers: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.";
-I18N.ru.priv_page_sec_4 = "Приватные страницы не кэшируются браузером.";
-I18N.en.priv_page_sec_4 = "Private pages are not cached by the browser.";
+I18N.ru.priv_page_sec_h = "Безопасность"; I18N.en.priv_page_sec_h = "Security";
+I18N.ru.priv_page_sec_1 = "Пароли не возвращаются через API."; I18N.en.priv_page_sec_1 = "Passwords are never returned via the API.";
+I18N.ru.priv_page_sec_2 = "Все проверки доступа — на стороне сервера."; I18N.en.priv_page_sec_2 = "All access checks happen server-side.";
+I18N.ru.priv_page_sec_3 = "Заголовки безопасности: X-Frame-Options, X-Content-Type-Options, Referrer-Policy."; I18N.en.priv_page_sec_3 = "Security headers: X-Frame-Options, X-Content-Type-Options, Referrer-Policy.";
+I18N.ru.priv_page_sec_4 = "Приватные страницы не кэшируются браузером."; I18N.en.priv_page_sec_4 = "Private pages are not cached by the browser.";
 I18N.ru.priv_page_sec_foot = "Полноценной end-to-end криптографии у нас нет. Не отправляйте через SldChat ничего, что боитесь потерять.";
 I18N.en.priv_page_sec_foot = "We don't have full end-to-end encryption. Don't send anything through SldChat that you'd hate to lose.";
 
@@ -1580,7 +1554,9 @@ __SHARED_CSS__
     transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
     text-decoration: none !important;
   }
-  .contact-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.09); border-color: #a8b8ca; text-decoration: none; }
+  @media (hover: hover) and (pointer: fine) {
+    .contact-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.09); border-color: #a8b8ca; text-decoration: none; }
+  }
   .contact-card .ico {
     width: 48px; height: 48px; flex-shrink: 0; border-radius: 10px;
     background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid #b7c2cd;
@@ -1614,27 +1590,19 @@ __SHARED_CSS__
 <div class="page-wrap">
   <div class="page-head">
     <h1 data-i18n="sup_h">Поддержка</h1>
-    <p data-i18n="sup_sub">Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.</p>
+    <p data-i18n="sup_sub"></p>
   </div>
 
   <div class="page-card">
     <h2 data-i18n="sup_contact_h">Связаться</h2>
-
     <a class="contact-card" href="mailto:sldshr.confirmation@gmail.com">
       <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
-      <div class="body">
-        <div class="label">E-mail</div>
-        <div class="value mono">sldshr.confirmation@gmail.com</div>
-      </div>
+      <div class="body"><div class="label">E-mail</div><div class="value mono">sldshr.confirmation@gmail.com</div></div>
       <svg class="icon arrow" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
     </a>
-
     <a class="contact-card" href="https://discord.com/users/sldshr" target="_blank" rel="noopener noreferrer">
       <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
-      <div class="body">
-        <div class="label">Discord</div>
-        <div class="value">sldshr</div>
-      </div>
+      <div class="body"><div class="label">Discord</div><div class="value">sldshr</div></div>
       <svg class="icon arrow" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
     </a>
   </div>
@@ -1642,10 +1610,8 @@ __SHARED_CSS__
   <div class="page-card selectable">
     <h2 data-i18n="sup_before_h">Перед обращением</h2>
     <ul>
-      <li data-i18n="sup_before_1"></li>
-      <li data-i18n="sup_before_2"></li>
-      <li data-i18n="sup_before_3"></li>
-      <li data-i18n="sup_before_4"></li>
+      <li data-i18n="sup_before_1"></li><li data-i18n="sup_before_2"></li>
+      <li data-i18n="sup_before_3"></li><li data-i18n="sup_before_4"></li>
     </ul>
   </div>
 </div>
@@ -1655,16 +1621,10 @@ __FOOTER__
 <script>
 __I18N_JS__
 
-I18N.ru.sup_h = "Поддержка";
-I18N.en.sup_h = "Support";
-I18N.ru.sup_sub = "Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим.";
-I18N.en.sup_sub = "Found a problem or have a suggestion? Write to us — we'll definitely reply.";
-
-I18N.ru.sup_contact_h = "Связаться";
-I18N.en.sup_contact_h = "Contact us";
-
-I18N.ru.sup_before_h = "Перед обращением";
-I18N.en.sup_before_h = "Before contacting";
+I18N.ru.sup_h = "Поддержка"; I18N.en.sup_h = "Support";
+I18N.ru.sup_sub = "Возникла проблема или есть предложение? Напишите нам — мы обязательно ответим."; I18N.en.sup_sub = "Found a problem or have a suggestion? Write to us — we'll definitely reply.";
+I18N.ru.sup_contact_h = "Связаться"; I18N.en.sup_contact_h = "Contact us";
+I18N.ru.sup_before_h = "Перед обращением"; I18N.en.sup_before_h = "Before contacting";
 I18N.ru.sup_before_1 = "Убедитесь, что вы на нужном сервере: sldchat.fastapicloud.dev или sldchat.onrunxbuild.com — данные между ними не передаются.";
 I18N.en.sup_before_1 = "Make sure you're on the right server: sldchat.fastapicloud.dev or sldchat.onrunxbuild.com — data is not shared between them.";
 I18N.ru.sup_before_2 = "Если не получается войти — проверьте, что ник введён точно так же, как при регистрации.";
@@ -1704,13 +1664,15 @@ AUTH_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>SldChat</title>
 __HEAD_COMMON__
 <style>
 __SHARED_CSS__
   body {
-    min-height: 100vh; display: flex; flex-direction: column;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex; flex-direction: column;
     background: radial-gradient(circle at 30% 10%, #e6eef6 0%, transparent 55%),
                 linear-gradient(#cfd9e3, #a8b6c4);
   }
@@ -1734,7 +1696,6 @@ __SHARED_CSS__
     transition: background 0.15s ease, color 0.15s ease;
   }
   .tabs button:last-child { margin-right: 0; }
-  .tabs button:hover { background: linear-gradient(#f4f6f8, #dae0e6); }
   .tabs button.active { background: #f4f6f8; color: #223; font-weight: bold; position: relative; top: 1px; }
   label { display: block; margin: 10px 0 4px; color: #445; font-size: 13px; }
   input[type=text], input[type=password] {
@@ -1757,7 +1718,6 @@ __SHARED_CSS__
     border-color: #35597f; color: #fff;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }
-  .btn2-primary:hover { background: linear-gradient(#699bcd, #4577b1); box-shadow: 0 4px 12px rgba(63,111,168,0.35); }
   .btn2:active { transform: scale(0.98); }
   .error { min-height: 18px; color: #c22; text-align: center; font-size: 12px; margin-bottom: 4px; }
   .hint { margin-top: 14px; text-align: center; color: #889; font-size: 11px; }
@@ -1771,7 +1731,6 @@ __SHARED_CSS__
     text-shadow: 0 1px 0 rgba(255,255,255,0.6);
     padding: 6px 10px; font-size: 12px;
   }
-  .dd.dd-light .dd-toggle:hover { background: linear-gradient(#fff, #dbe3ea); }
   .dd.dd-light .dd-toggle .icon { color: #4a5b6d; }
   .dd.dd-light .dd-toggle .dd-value { color: #2b3a4a; }
   .dd.dd-light .dd-menu {
@@ -1841,7 +1800,6 @@ __I18N_JS__
   var formLogin = document.getElementById('formLogin');
   var formRegister = document.getElementById('formRegister');
   var errorBox = document.getElementById('error');
-
   var initialTab = "__ACTIVE_TAB__";
 
   function showTab(which, opts){
@@ -1856,7 +1814,6 @@ __I18N_JS__
     updateDocTitle(which);
     if (opts && opts.pushUrl) pushTabUrl(which);
   }
-
   function pushTabUrl(which){
     var path = (which === 'login') ? '/login' : '/register';
     if (location.pathname === path) return;
@@ -1866,7 +1823,6 @@ __I18N_JS__
       history.pushState({tab: which}, '', u.pathname + u.search);
     } catch (e) {}
   }
-
   function updateDocTitle(which){
     var key = (which === 'login') ? 'auth_title_login' : 'auth_title_register';
     var d = I18N[lang] || I18N.ru;
@@ -1899,7 +1855,6 @@ __I18N_JS__
   formLogin.onsubmit = function(e){ e.preventDefault(); submitForm('/api/login', formLogin); };
   formRegister.onsubmit = function(e){ e.preventDefault(); submitForm('/api/register', formRegister); };
 
-  /* ---------- language ---------- */
   var lang = SldLang.pickInitial();
   localStorage.setItem('sld_lang', lang);
   SldLang.setGlobalUnits(lang);
@@ -1940,7 +1895,6 @@ __I18N_JS__
         SldLang.propagateLinks(v);
         document.documentElement.lang = v;
         setLangValue(v);
-        /* обновляем title под текущий таб */
         var curTab = formLogin.classList.contains('hidden') ? 'register' : 'login';
         updateDocTitle(curTab);
         authDd.classList.remove('open');
@@ -1970,18 +1924,23 @@ CHAT_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#3f6fa8">
 <title>SldChat</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/favicon.svg">
-<meta name="theme-color" content="#3f6fa8">
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; overscroll-behavior: none; }
+  html, body {
+    margin: 0; padding: 0;
+    height: 100%; height: 100dvh;
+    overflow: hidden; overscroll-behavior: none;
+  }
   body {
     font-family: Tahoma, Verdana, Arial, sans-serif;
     font-size: 13px; color: #2b3a4a; background: #e9eef3;
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
+    position: fixed; inset: 0;
   }
   input, textarea, .msg-bubble { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
@@ -1993,6 +1952,10 @@ CHAT_PAGE = """<!DOCTYPE html>
     0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
   }
+  @keyframes typingPulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.45; }
+  }
 
   .icon {
     width: 16px; height: 16px; flex-shrink: 0;
@@ -2003,10 +1966,16 @@ CHAT_PAGE = """<!DOCTYPE html>
   .icon.lg { width: 20px; height: 20px; }
   .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
 
+  /* === Ключевое: app занимает ровно видимую область === */
   .app {
+    position: fixed;
+    inset: 0;
     display: grid;
     grid-template-columns: 280px 1fr 260px;
-    height: 100vh; width: 100vw; overflow: hidden;
+    height: 100vh;
+    height: 100dvh;
+    width: 100vw;
+    overflow: hidden;
     background: #e9eef3;
   }
 
@@ -2018,9 +1987,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     background: linear-gradient(#fbfcfd, #dce3ea);
     font-family: inherit; font-size: 12px; color: #3a5169;
     text-shadow: 0 1px 0 #fff;
-    transition: background 0.15s ease;
   }
-  .dd-toggle:hover { background: linear-gradient(#fff, #dbe3ea); }
   .dd-toggle .icon { width: 13px; height: 13px; }
   .dd-toggle .icon.chev { transition: transform 0.22s ease; }
   .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
@@ -2044,7 +2011,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     padding: 8px 12px; border-radius: 4px; cursor: pointer;
     font-size: 13px; color: #2b3a4a;
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    transition: background 0.1s ease;
   }
   .dd-menu li:hover { background: #eef2f6; }
   .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
@@ -2053,6 +2019,7 @@ CHAT_PAGE = """<!DOCTYPE html>
   .sidebar {
     background: #f0f3f7; border-right: 1px solid #c8d1da;
     display: flex; flex-direction: column; min-width: 0;
+    overflow: hidden;
   }
   .sb-header {
     padding: 8px 10px;
@@ -2080,14 +2047,13 @@ CHAT_PAGE = """<!DOCTYPE html>
   .icon-btn {
     border: 1px solid #b5bec8; border-radius: 4px;
     background: linear-gradient(#fbfcfd, #dce3ea);
-    padding: 4px 7px; cursor: pointer; line-height: 1;
+    padding: 6px 9px; cursor: pointer; line-height: 1;
     color: #3a5169;
     display: inline-flex; align-items: center; justify-content: center;
-    transition: transform 0.12s ease, background 0.15s ease;
     font-family: inherit;
+    min-width: 36px; min-height: 32px;
   }
-  .icon-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); }
-  .icon-btn:active { transform: translateY(0) scale(0.94); }
+  .icon-btn:active { transform: scale(0.94); }
 
   .add-wrap { padding: 8px 9px; border-bottom: 1px solid #dbe1e7; }
   .add-btn {
@@ -2097,10 +2063,8 @@ CHAT_PAGE = """<!DOCTYPE html>
     background: linear-gradient(#fbfcfd, #cfd8e0);
     font-family: inherit; font-size: 12px; color: #2b3a4a;
     cursor: pointer; text-shadow: 0 1px 0 #fff;
-    transition: transform 0.1s ease, background 0.15s ease;
   }
-  .add-btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); }
-  .add-btn:active { transform: translateY(0) scale(0.98); }
+  .add-btn:active { transform: scale(0.98); }
 
   .add-form { display: none; gap: 6px; margin-top: 6px; }
   .add-form.open { display: flex; }
@@ -2138,11 +2102,10 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   .search input:focus { border-color: #5a7a9a; }
 
-  .user-list { flex: 1; overflow-y: auto; }
+  .user-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
   .user-item {
     padding: 8px 11px; border-bottom: 1px solid #dde3e9;
     background: #f6f8fa; cursor: pointer; min-width: 0;
-    transition: background 0.12s ease;
   }
   .user-item:hover  { background: #eaf0f6; }
   .user-item.active { background: #d3e0ec; }
@@ -2171,7 +2134,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; }
+  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; overflow: hidden; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
     background: linear-gradient(#fbfcfd, #d6dee5);
@@ -2185,6 +2148,10 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   .chat-header .sub { font-size: 11px; color: #7a8695; font-weight: normal; margin-top: 1px; }
   .chat-header .sub.online { color: #2f8f3d; font-weight: bold; }
+  .chat-header .sub.typing {
+    color: #3f6fa8; font-weight: bold; font-style: italic;
+    animation: typingPulse 1.4s ease-in-out infinite;
+  }
   .mobile-only { display: none; }
 
   .messages {
@@ -2226,6 +2193,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     border-top: 1px solid #c8d1da; padding: 8px 10px;
     background: #eef2f6;
     display: flex; gap: 8px; align-items: flex-end;
+    flex-shrink: 0;
   }
   .input-area textarea {
     flex: 1; resize: none;
@@ -2246,11 +2214,9 @@ CHAT_PAGE = """<!DOCTYPE html>
     color: #fff; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-    transition: transform 0.1s ease, background 0.15s ease;
     flex-shrink: 0;
   }
   .input-area button .icon { width: 15px; height: 15px; }
-  .input-area button:hover { background: linear-gradient(#699bcd, #4577b1); }
   .input-area button:active { transform: scale(0.97); }
 
   .info-panel {
@@ -2282,10 +2248,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     background: linear-gradient(#fbfcfd, #e9d8d8);
     color: #8f2b2b; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 #fff;
-    transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
   }
-  .remove-btn:hover { background: linear-gradient(#fff, #f0dcdc); transform: translateY(-1px); box-shadow: 0 2px 6px rgba(168,90,90,0.25); }
-  .remove-btn:active { transform: translateY(0) scale(0.98); }
   .remove-btn .icon { width: 15px; height: 15px; }
 
   .toast-wrap {
@@ -2302,8 +2265,9 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
+  /* ================= МОБИЛЬНАЯ ВЕРСИЯ ================= */
   @media (max-width: 900px) {
-    .app { grid-template-columns: 1fr; position: relative; }
+    .app { grid-template-columns: 1fr; }
     .sidebar { border-right: none; padding-bottom: env(safe-area-inset-bottom); }
     .chat { display: none; }
     .info-panel {
@@ -2313,22 +2277,26 @@ CHAT_PAGE = """<!DOCTYPE html>
       transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
       box-shadow: -8px 0 24px rgba(0,0,0,0.25);
       border-left: 1px solid #b0bac4;
-      padding-top: calc(16px + env(safe-area-inset-top));
-      padding-bottom: calc(16px + env(safe-area-inset-bottom));
+      padding-top: max(16px, env(safe-area-inset-top));
+      padding-bottom: max(16px, env(safe-area-inset-bottom));
     }
     .app.chat-open .sidebar { display: none; }
     .app.chat-open .chat { display: flex; }
     .app.info-open .info-panel { transform: translateX(0); }
-    .info-panel .close-btn { display: inline-flex; float: right; margin: -4px -4px 0 0; padding: 8px; }
+    .info-panel .close-btn { display: inline-flex; float: right; margin: -4px -4px 0 0; padding: 10px; }
     .info-panel .close-btn .icon { width: 18px; height: 18px; }
     .mobile-only { display: inline-flex; }
 
-    .sb-header { padding: 12px 14px; padding-top: calc(12px + env(safe-area-inset-top)); }
+    /* ===== Sidebar (список чатов) ===== */
+    .sb-header {
+      padding: 12px 14px;
+      padding-top: max(12px, env(safe-area-inset-top));
+    }
     .logo-mini { font-size: 18px; gap: 8px; }
     .logo-mini .icon { width: 22px; height: 22px; }
-    .sb-header .icon-btn { padding: 9px; }
-    .sb-header .icon-btn .icon { width: 20px; height: 20px; }
-    .dd-toggle { padding: 8px 12px; font-size: 13px; }
+    .sb-header .icon-btn { padding: 10px; min-width: 44px; min-height: 44px; }
+    .sb-header .icon-btn .icon { width: 22px; height: 22px; }
+    .dd-toggle { padding: 10px 12px; font-size: 13px; min-height: 44px; }
 
     .me-line { padding: 8px 14px; font-size: 13px; }
 
@@ -2354,15 +2322,23 @@ CHAT_PAGE = """<!DOCTYPE html>
     .empty-list { padding: 50px 20px; font-size: 14px; }
     .empty-list .icon.huge { width: 52px; height: 52px; }
 
+    /* ===== Чат (важно: safe-area TOP, чтобы backBtn не уходил под адресную строку) ===== */
     .chat-header {
       padding: 10px 12px;
-      padding-top: calc(10px + env(safe-area-inset-top));
-      min-height: 60px; gap: 8px;
+      padding-top: max(10px, env(safe-area-inset-top));
+      min-height: 60px;
+      gap: 8px;
+      flex-shrink: 0;
     }
     .chat-header .title { font-size: 16px; }
     .chat-header .sub { font-size: 12px; margin-top: 2px; }
-    .chat-header .icon-btn { padding: 9px; }
-    .chat-header .icon-btn .icon { width: 22px; height: 22px; }
+    .chat-header .icon-btn {
+      padding: 10px;
+      min-width: 44px;
+      min-height: 44px;
+      border-radius: 6px;
+    }
+    .chat-header .icon-btn .icon { width: 24px; height: 24px; }
 
     .messages { padding: 14px 12px 8px; }
     .msg-bubble { max-width: 85%; font-size: 14px; padding: 7px 12px 5px; border-radius: 14px 14px 14px 3px; }
@@ -2376,11 +2352,12 @@ CHAT_PAGE = """<!DOCTYPE html>
 
     .input-area {
       padding: 8px 10px;
-      padding-bottom: calc(8px + env(safe-area-inset-bottom));
+      padding-bottom: max(8px, env(safe-area-inset-bottom));
       gap: 6px; align-items: flex-end;
+      flex-shrink: 0;
     }
     .input-area textarea {
-      padding: 10px 14px; font-size: 15px;
+      padding: 10px 14px; font-size: 16px;
       min-height: 44px; height: 44px;
       border-radius: 22px; max-height: 100px;
     }
@@ -2395,9 +2372,9 @@ CHAT_PAGE = """<!DOCTYPE html>
     .info-head .name { font-size: 20px; }
     .info-head .status { font-size: 13px; margin-top: 6px; }
     .info-row { font-size: 13px; padding: 10px 0; }
-    .remove-btn { padding: 13px 12px; font-size: 13px; }
+    .remove-btn { padding: 13px 12px; font-size: 15px; }
 
-    .toast-wrap { bottom: calc(16px + env(safe-area-inset-bottom)); right: 12px; left: 12px; }
+    .toast-wrap { bottom: max(16px, env(safe-area-inset-bottom)); right: 12px; left: 12px; }
     .toast { max-width: none; }
   }
 
@@ -2522,6 +2499,8 @@ I18N.ru.pick_peer = "Выберите собеседника";
 I18N.en.pick_peer = "Pick a contact";
 I18N.ru.online = "в сети";
 I18N.en.online = "online";
+I18N.ru.typing = "печатает";
+I18N.en.typing = "typing";
 I18N.ru.was_online = "был(а):";
 I18N.en.was_online = "was online:";
 I18N.ru.just_now = "только что";
@@ -2612,6 +2591,9 @@ var ws = null;
 var wsReconnectTimer = null;
 var lastContactsSig = '';
 var lastInfoSig = '';
+var peerTyping = false;
+var peerTypingTimer = null;
+var lastTypingSent = 0;
 
 function $(id){ return document.getElementById(id); }
 var app = $('app');
@@ -2662,6 +2644,7 @@ function infoSignature(i){
   return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0) + '|' + (i.msg_count || 0);
 }
 
+/* ============ WS ============ */
 function connectWS(){
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try { ws = new WebSocket(proto + '//' + location.host + '/ws'); } catch (e) { scheduleReconnect(); return; }
@@ -2695,6 +2678,8 @@ function handleWS(d){
       }
       if (m.from !== me) markRead(peer);
       loadInfo(current);
+      /* если собеседник прислал сообщение — он не печатает */
+      if (m.from === peer) setPeerTyping(false);
     }
     loadContacts();
   } else if (d.type === 'presence') {
@@ -2705,6 +2690,8 @@ function handleWS(d){
       currentInfo = Object.assign({}, currentInfo || {}, { online: d.online });
       updateChatSubtitle();
     }
+  } else if (d.type === 'typing') {
+    if (current === d.from) setPeerTyping(true);
   } else if (d.type === 'contact_added') {
     toast(T('new_contact') + d.nick);
     lastContactsSig = '';
@@ -2717,6 +2704,27 @@ function handleWS(d){
   }
 }
 
+/* ============ Typing indicator ============ */
+function sendTyping(){
+  if (!current || !ws || ws.readyState !== 1) return;
+  var now = Date.now();
+  if (now - lastTypingSent < 1800) return;
+  lastTypingSent = now;
+  try { ws.send(JSON.stringify({type:'typing', to: current})); } catch (e) {}
+}
+function setPeerTyping(on){
+  peerTyping = !!on;
+  if (peerTypingTimer) { clearTimeout(peerTypingTimer); peerTypingTimer = null; }
+  if (peerTyping) {
+    peerTypingTimer = setTimeout(function(){
+      peerTyping = false;
+      updateChatSubtitle();
+    }, 3500);
+  }
+  updateChatSubtitle();
+}
+
+/* ============ Init ============ */
 async function init(){
   var r = await fetch('/api/me');
   if (!r.ok) { location.href = '/'; return; }
@@ -2783,6 +2791,7 @@ async function openDialog(nick){
   lastIds[nick] = 0;
   renderedIds = {};
   lastInfoSig = '';
+  setPeerTyping(false);
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
   $('messages').innerHTML = '';
@@ -2797,6 +2806,7 @@ async function openDialog(nick){
 function resetChatToEmpty(){
   current = null;
   lastInfoSig = '';
+  setPeerTyping(false);
   app.classList.remove('chat-open');
   app.classList.remove('info-open');
   $('chatTitle').textContent = T('pick_peer');
@@ -2869,6 +2879,9 @@ async function send(){
   fd.append('text', text);
   inp.value = '';
   inp.style.height = '36px';
+  /* отправим typing ещё раз перед отправкой — необязательно, но приятно */
+  try { ws.send(JSON.stringify({type:'typing', to: current})); } catch (e) {}
+  lastTypingSent = Date.now();
   var r = await fetch('/api/send', { method: 'POST', body: fd });
   var d = await r.json().catch(function(){ return { ok:false }; });
   if (!d.ok) { toast(errText(d) || E('send_failed')); return; }
@@ -2935,7 +2948,19 @@ async function removeContact(nick){
 
 function updateChatSubtitle(){
   var el = $('chatSub');
-  if (!current || !currentInfo) { el.textContent = ''; return; }
+  if (!current) {
+    el.textContent = '';
+    el.classList.remove('online', 'typing');
+    return;
+  }
+  if (peerTyping) {
+    el.textContent = T('typing');
+    el.classList.add('typing');
+    el.classList.remove('online');
+    return;
+  }
+  el.classList.remove('typing');
+  if (!currentInfo) { el.textContent = ''; return; }
   if (currentInfo.online) { el.textContent = T('online'); el.classList.add('online'); }
   else { el.textContent = T('was_online') + ' ' + fmtLastSeen(currentInfo.lastSeen); el.classList.remove('online'); }
 }
@@ -2969,6 +2994,7 @@ function markActive(root, val){
   });
 }
 
+/* ============ UI events ============ */
 $('addBtn').onclick = function(){
   var f = $('addForm');
   f.classList.toggle('open');
@@ -3010,6 +3036,7 @@ $('msgInput').addEventListener('input', function(e){
   var el = e.target;
   el.style.height = '36px';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  sendTyping();
 });
 $('logoutBtn').onclick = async function(){
   if (ws) { try { ws.close(); } catch (e) {} }
@@ -3091,8 +3118,6 @@ async def register_page(request: Request):
 async def chat_page(request: Request):
     if not current_user(request):
         return RedirectResponse("/")
-    # ВАЖНО: подставляем __I18N_JS__ через render_page, иначе будет
-    # "Uncaught ReferenceError: __I18N_JS__ is not defined"
     return render_page(CHAT_PAGE)
 
 
