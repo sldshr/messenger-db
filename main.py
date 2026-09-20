@@ -37,25 +37,21 @@ def is_online(nick: str) -> bool:
 
 def user_public_info(nick: str) -> dict:
     u = users.get(nick)
-    if not u:
-        return {}
+    if not u: return {}
     return {"nick": nick, "online": is_online(nick),
             "last_seen": u.get("last_seen", 0), "created": u.get("created", 0)}
 
 
 async def send_ws(nick: str, payload: dict):
     socks = list(active_ws.get(nick, ()))
-    if not socks:
-        return
+    if not socks: return
     text = json.dumps(payload, ensure_ascii=False)
     await asyncio.gather(*(_safe_send(ws, text) for ws in socks), return_exceptions=True)
 
 
 async def _safe_send(ws: WebSocket, text: str):
-    try:
-        await ws.send_text(text)
-    except Exception:
-        pass
+    try: await ws.send_text(text)
+    except Exception: pass
 
 
 async def notify_contacts(nick: str, payload: dict):
@@ -83,36 +79,29 @@ async def security_middleware(request: Request, call_next):
     return resp
 
 
-# ================== WEBSOCKET (с typing) ==================
+# ================== WEBSOCKET ==================
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     token = websocket.cookies.get("session")
     nick = sessions.get(token) if token else None
     if not nick or nick not in users:
-        await websocket.close(code=1008)
-        return
+        await websocket.close(code=1008); return
     users[nick]["last_seen"] = time.time()
     active_ws.setdefault(nick, set()).add(websocket)
     await notify_contacts(nick, {"type": "presence", "nick": nick, "online": True})
     try:
         while True:
             raw = await websocket.receive_text()
-            if not raw or raw == "ping":
-                continue
-            try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            t = d.get("type")
-            if t == "typing":
+            if not raw or raw == "ping": continue
+            try: d = json.loads(raw)
+            except Exception: continue
+            if d.get("type") == "typing":
                 to = (d.get("to") or "").strip()
                 if to and to in contacts.get(nick, set()):
                     await send_ws(to, {"type": "typing", "from": nick})
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+    except WebSocketDisconnect: pass
+    except Exception: pass
     finally:
         socks = active_ws.get(nick)
         if socks:
@@ -139,8 +128,7 @@ async def api_register(request: Request, nick: str = Form(...), password: str = 
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
     resp.set_cookie("session", token, httponly=True, samesite="lax",
-                    secure=request.url.scheme == "https",
-                    max_age=60 * 60 * 24 * 30, path="/")
+                    secure=request.url.scheme == "https", max_age=60*60*24*30, path="/")
     return resp
 
 
@@ -153,8 +141,7 @@ async def api_login(request: Request, nick: str = Form(...), password: str = For
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
     resp.set_cookie("session", token, httponly=True, samesite="lax",
-                    secure=request.url.scheme == "https",
-                    max_age=60 * 60 * 24 * 30, path="/")
+                    secure=request.url.scheme == "https", max_age=60*60*24*30, path="/")
     return resp
 
 
@@ -187,11 +174,9 @@ async def api_contacts_add(request: Request, nick: str = Form(...)):
     if not nick: return err("enter_nick")
     if nick == me: return err("cant_add_self")
     if nick not in users: return err("user_not_found", 404)
-    contacts.setdefault(me, set())
-    contacts.setdefault(nick, set())
+    contacts.setdefault(me, set()); contacts.setdefault(nick, set())
     if nick in contacts[me]: return err("already_contact")
-    contacts[me].add(nick)
-    contacts[nick].add(me)
+    contacts[me].add(nick); contacts[nick].add(me)
     info = user_public_info(nick)
     await asyncio.gather(
         send_ws(nick, {"type": "contact_added", "nick": me}),
@@ -207,8 +192,7 @@ async def api_contacts_remove(request: Request, nick: str = Form(...)):
     if not me: return err("not_authorized", 401)
     nick = nick.strip()
     if nick not in contacts.get(me, set()): return err("not_in_contacts")
-    contacts.get(me, set()).discard(nick)
-    contacts.get(nick, set()).discard(me)
+    contacts.get(me, set()).discard(nick); contacts.get(nick, set()).discard(me)
     await asyncio.gather(
         send_ws(nick, {"type": "contact_removed", "nick": me}),
         send_ws(me, {"type": "contact_removed", "nick": nick}),
@@ -224,8 +208,7 @@ async def api_contacts(request: Request):
     out = []
     for nick in contacts.get(me, set()):
         if nick not in users: continue
-        last_msg = None
-        unread = 0
+        last_msg = None; unread = 0
         last_read_id = my_reads.get(nick, 0)
         for m in messages:
             if (m["from"] == nick and m["to"] == me) or (m["from"] == me and m["to"] == nick):
@@ -272,8 +255,7 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     global _msg_id
     me = current_user(request)
     if not me: return err("not_authorized", 401)
-    to = to.strip()
-    text = text.strip()
+    to = to.strip(); text = text.strip()
     if not text: return err("empty_msg")
     if len(text) > 4000: text = text[:4000]
     if to not in contacts.get(me, set()): return err("not_in_contacts", 403)
@@ -286,14 +268,11 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
 
 
 # ================== ICONS ==================
-FAVICON_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
     '<rect width="64" height="64" rx="14" fill="#3f6fa8"/>'
     '<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"'
-    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/></svg>'
-)
-OG_IMAGE_SVG = (
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">'
+    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/></svg>')
+OG_IMAGE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">'
     '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
     '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/></linearGradient></defs>'
     '<rect width="1200" height="630" fill="url(#g)"/>'
@@ -301,8 +280,7 @@ OG_IMAGE_SVG = (
     '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
     '<text x="600" y="380" font-size="36" fill="#2b3a4a">Fast messenger for teams</text>'
     '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · add by nick · no ads</text>'
-    '</g></svg>'
-)
+    '</g></svg>')
 
 
 @app.get("/favicon.svg")
@@ -344,14 +322,11 @@ SHARED_CSS = """
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
   }
 
-  /* === Reveal on scroll (лёгкое появление) === */
   .reveal {
-    opacity: 0;
-    transform: translateY(14px);
+    opacity: 0; transform: translateY(14px);
     transition: opacity 0.5s ease, transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
-    will-change: opacity, transform;
   }
-  .reveal.in { opacity: 1; transform: translateY(0); will-change: auto; }
+  .reveal.in { opacity: 1; transform: translateY(0); }
   .cards .reveal:nth-child(1) { transition-delay: 0ms; }
   .cards .reveal:nth-child(2) { transition-delay: 60ms; }
   .cards .reveal:nth-child(3) { transition-delay: 120ms; }
@@ -359,14 +334,12 @@ SHARED_CSS = """
   .cards .reveal:nth-child(5) { transition-delay: 90ms; }
   .cards .reveal:nth-child(6) { transition-delay: 150ms; }
 
-  /* На мобилке — только opacity, без translate (меньше композитинга) */
   @media (max-width: 820px) {
     .reveal { transform: none; transition: opacity 0.4s ease; }
     .reveal.in { transform: none; }
     .cards .reveal:nth-child(n) { transition-delay: 0ms; }
   }
 
-  /* Уважаем reduced motion */
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     *, *::before, *::after {
@@ -407,9 +380,7 @@ SHARED_CSS = """
   .logo .icon { color: #3f6fa8; width: 22px; height: 22px; }
 
   .nav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
-  .nav a.navlink {
-    padding: 7px 10px; border-radius: 4px; color: #3a5169; font-size: 13px;
-  }
+  .nav a.navlink { padding: 7px 10px; border-radius: 4px; color: #3a5169; font-size: 13px; }
 
   .btn {
     display: inline-flex; align-items: center; gap: 6px;
@@ -422,11 +393,8 @@ SHARED_CSS = """
     transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
   }
   .btn:active { transform: scale(0.98); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
-  .btn-primary {
-    background: linear-gradient(#5b8fc4, #3f6fa8);
-    border-color: #35597f; color: #fff;
-    text-shadow: 0 1px 0 rgba(0,0,0,0.2);
-  }
+  .btn-primary { background: linear-gradient(#5b8fc4, #3f6fa8); border-color: #35597f;
+                 color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,0.2); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
   .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; scroll-margin-top: 76px; }
@@ -452,7 +420,6 @@ SHARED_CSS = """
   .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
   .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
 
-  /* Дорогие hover-эффекты — только для мыши */
   @media (hover: hover) and (pointer: fine) {
     .logo:hover { transform: translateY(-1px); text-decoration: none; }
     .nav a.navlink:hover { background: #e3e9ef; text-decoration: none; }
@@ -763,17 +730,10 @@ FOOTER_HTML = """
       if (li.dataset.value === val) {
         li.classList.add('active');
         if (valueEl) valueEl.textContent = li.textContent.trim();
-      } else {
-        li.classList.remove('active');
-      }
+      } else li.classList.remove('active');
     });
   }
 
-  window.SldFooter = {
-    wire: wireDropdown, markActive: markActive, softenUrls: softenUrls, tick: tick
-  };
-
-  /* ========== Reveal on scroll (лёгкий) ========== */
   function setupReveal(){
     var els = document.querySelectorAll('.reveal');
     if (!els.length) return;
@@ -784,20 +744,17 @@ FOOTER_HTML = """
     var io = new IntersectionObserver(function(entries){
       for (var i = 0; i < entries.length; i++) {
         var e = entries[i];
-        if (e.isIntersecting) {
-          e.target.classList.add('in');
-          io.unobserve(e.target);
-        }
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
       }
     }, { rootMargin: '0px 0px -60px 0px', threshold: 0.02 });
     els.forEach(function(el){ io.observe(el); });
   }
 
+  window.SldFooter = { wire: wireDropdown, markActive: markActive, softenUrls: softenUrls, tick: tick };
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function(){ softenUrls(); setupReveal(); });
-  } else {
-    softenUrls(); setupReveal();
-  }
+  } else { softenUrls(); setupReveal(); }
 })();
 </script>
 """
@@ -907,7 +864,8 @@ var I18N = {
     faq_q3: "Why do I only see my contacts?", faq_a3: "SldChat has no public user directory. Press 'Add contact' and enter the nick.",
     faq_q4: "How do I remove a contact?", faq_a4: "Open the dialog and press 'Remove contact' in the right panel.",
     faq_q5: "How do servers differ?", faq_a5: "Two independent deployments. Each has its own users and messages; they're not connected.",
-    faq_q6: "How do I log out?", faq_a6: "The logout button is at the top of the chat, next to the contact list.",
+    faq_q6: "How do I log out?", faq_q6_a: "",
+    faq_a6: "The logout button is at the top of the chat, next to the contact list.",
 
     auth_welcome: "Welcome",
     auth_tab_login: "Sign in", auth_tab_register: "Sign up",
@@ -1061,7 +1019,6 @@ __HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
-  /* content-visibility экономит рендер невидимых секций на телефоне */
   .section { content-visibility: auto; contain-intrinsic-size: 1px 900px; }
 
   @keyframes eyebrowPulse {
@@ -1093,23 +1050,16 @@ __SHARED_CSS__
     font-size: 46px; font-weight: normal; margin: 0 0 18px;
     color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.12;
     letter-spacing: 0.4px;
-    animation: heroUp 0.55s ease-out both;
-    animation-delay: 0.05s;
+    animation: heroUp 0.55s ease-out 0.05s both;
   }
   .hero h1 b { color: #3f6fa8; font-weight: bold; }
-  .hero p {
-    max-width: 620px; margin: 0 auto 32px; color: #4a5f74; font-size: 16px;
-    animation: heroUp 0.55s ease-out 0.12s both;
-  }
-  .hero-actions {
-    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
-    animation: heroUp 0.55s ease-out 0.20s both;
-  }
-  .hero-meta {
-    margin-top: 26px; font-size: 12px; color: #5a6f83;
-    display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
-    animation: heroUp 0.55s ease-out 0.28s both;
-  }
+  .hero p { max-width: 620px; margin: 0 auto 32px; color: #4a5f74; font-size: 16px;
+            animation: heroUp 0.55s ease-out 0.12s both; }
+  .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
+                  animation: heroUp 0.55s ease-out 0.20s both; }
+  .hero-meta { margin-top: 26px; font-size: 12px; color: #5a6f83;
+               display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
+               animation: heroUp 0.55s ease-out 0.28s both; }
   .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
   .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
 
@@ -1140,10 +1090,8 @@ __SHARED_CSS__
   }
   .server-card .desc { font-size: 12px; color: #7a8695; margin-top: 3px; }
   .server-card .tags { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; flex-shrink: 0; }
-  .server-card .tag {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
-    font-weight: bold; padding: 2px 8px; border-radius: 10px; white-space: nowrap;
-  }
+  .server-card .tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px;
+    font-weight: bold; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
   .server-card .tag.main { color: #2f8f3d; background: #e5f3e7; }
   .server-card .tag.alt  { color: #3f6fa8; background: #e6eef7; }
   .server-card .tag.unstable { color: #a05a00; background: #fdefd6; }
@@ -1261,18 +1209,12 @@ __SHARED_CSS__
     <div class="servers">
       <div class="server-card reveal">
         <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
-        <div class="body">
-          <div class="url">sldchat.fastapicloud.dev</div>
-          <div class="desc">FastAPI Cloud</div>
-        </div>
+        <div class="body"><div class="url">sldchat.fastapicloud.dev</div><div class="desc">FastAPI Cloud</div></div>
         <div class="tags"><span class="tag main" data-i18n="srv_main">Основной</span></div>
       </div>
       <div class="server-card reveal">
         <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg></div>
-        <div class="body">
-          <div class="url">sldchat.onrunxbuild.com</div>
-          <div class="desc">RunxBuild</div>
-        </div>
+        <div class="body"><div class="url">sldchat.onrunxbuild.com</div><div class="desc">RunxBuild</div></div>
         <div class="tags">
           <span class="tag alt" data-i18n="srv_alt">Резерв</span>
           <span class="tag unstable" data-i18n="srv_unstable">Unstable</span>
@@ -1664,17 +1606,28 @@ AUTH_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>SldChat</title>
 __HEAD_COMMON__
 <style>
 __SHARED_CSS__
+
+  /* Фон на html с фиксированной привязкой, чтобы при скролле не было "обрыва" */
+  html {
+    min-height: 100vh;
+    min-height: 100dvh;
+    background:
+      radial-gradient(circle at 30% 10%, #e6eef6 0%, transparent 55%),
+      linear-gradient(#cfd9e3, #a8b6c4);
+    background-attachment: fixed;
+    background-size: cover;
+    background-repeat: no-repeat;
+  }
   body {
+    background: transparent;
     min-height: 100vh;
     min-height: 100dvh;
     display: flex; flex-direction: column;
-    background: radial-gradient(circle at 30% 10%, #e6eef6 0%, transparent 55%),
-                linear-gradient(#cfd9e3, #a8b6c4);
   }
   .topline { padding: 16px 22px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .topline a.logo { font-size: 20px; }
@@ -1685,6 +1638,7 @@ __SHARED_CSS__
     border: 1px solid #8b97a3; border-radius: 6px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.22), inset 0 1px 0 #fff;
     padding: 22px 26px 26px; animation: popIn 0.4s ease both;
+    margin: 0 auto;
   }
   .box h1 { text-align: center; font-size: 20px; font-weight: normal; margin: 0 0 18px; color: #23374b; text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px; }
   .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid #a8b2bc; }
@@ -1699,7 +1653,7 @@ __SHARED_CSS__
   .tabs button.active { background: #f4f6f8; color: #223; font-weight: bold; position: relative; top: 1px; }
   label { display: block; margin: 10px 0 4px; color: #445; font-size: 13px; }
   input[type=text], input[type=password] {
-    width: 100%; padding: 8px 10px; font-family: inherit; font-size: 13px;
+    width: 100%; padding: 10px 12px; font-family: inherit; font-size: 14px;
     border: 1px solid #9aa4ae; border-radius: 3px; background: #fff; outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -1707,8 +1661,8 @@ __SHARED_CSS__
   input:focus { border-color: #5a7a9a; box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 3px rgba(90,122,154,0.15); }
   .btn2 {
     display: flex; align-items: center; justify-content: center; gap: 8px;
-    width: 100%; margin-top: 18px; padding: 10px 0; border-radius: 4px;
-    font-family: inherit; font-size: 13px; cursor: pointer;
+    width: 100%; margin-top: 18px; padding: 12px 0; border-radius: 4px;
+    font-family: inherit; font-size: 14px; cursor: pointer;
     background: linear-gradient(#fbfcfd, #ccd5de);
     border: 1px solid #7a8794; color: #2b3a4a; text-shadow: 0 1px 0 #fff;
     transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease;
@@ -1739,6 +1693,13 @@ __SHARED_CSS__
     transform: translateY(-6px) scale(0.97);
   }
   .dd.dd-light.open .dd-menu { transform: translateY(0) scale(1); }
+
+  /* Скрываем фейковый "пробел" под контентом, чтобы фон был всегда целым */
+  @media (max-width: 820px) {
+    .topline { padding: 12px 16px; }
+    .wrap { padding: 16px; align-items: flex-start; padding-top: 24px; padding-bottom: 40px; }
+    .box { padding: 20px 20px 22px; }
+  }
 </style>
 </head>
 <body>
@@ -1772,17 +1733,17 @@ __SHARED_CSS__
 
     <form id="formLogin" class="form hidden">
       <label data-i18n="auth_nick">Ник:</label>
-      <input type="text" name="nick" autocomplete="username" maxlength="20">
+      <input type="text" name="nick" autocomplete="username" maxlength="20" inputmode="text" enterkeyhint="next">
       <label data-i18n="auth_password">Пароль:</label>
-      <input type="password" name="password" autocomplete="current-password">
+      <input type="password" name="password" autocomplete="current-password" enterkeyhint="go">
       <button type="submit" class="btn2 btn2-primary" data-i18n="auth_login_btn">Войти</button>
     </form>
 
     <form id="formRegister" class="form hidden">
       <label data-i18n="auth_nick">Ник:</label>
-      <input type="text" name="nick" autocomplete="username" maxlength="20" data-i18n-ph="auth_nick_ph" placeholder="3–20 символов">
+      <input type="text" name="nick" autocomplete="username" maxlength="20" data-i18n-ph="auth_nick_ph" placeholder="3–20 символов" enterkeyhint="next">
       <label data-i18n="auth_password">Пароль:</label>
-      <input type="password" name="password" autocomplete="new-password" data-i18n-ph="auth_pass_ph" placeholder="минимум 3 символа">
+      <input type="password" name="password" autocomplete="new-password" data-i18n-ph="auth_pass_ph" placeholder="минимум 3 символа" enterkeyhint="go">
       <button type="submit" class="btn2 btn2-primary" data-i18n="auth_register_btn">Зарегистрироваться</button>
     </form>
 
@@ -1923,7 +1884,7 @@ CHAT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="theme-color" content="#3f6fa8">
 <title>SldChat</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -1941,6 +1902,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
     position: fixed; inset: 0;
+    touch-action: manipulation;
   }
   input, textarea, .msg-bubble { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
@@ -1956,6 +1918,10 @@ CHAT_PAGE = """<!DOCTYPE html>
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.45; }
   }
+  @keyframes jumpIn {
+    from { opacity: 0; transform: translateY(8px) scale(0.9); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
 
   .icon {
     width: 16px; height: 16px; flex-shrink: 0;
@@ -1966,7 +1932,6 @@ CHAT_PAGE = """<!DOCTYPE html>
   .icon.lg { width: 20px; height: 20px; }
   .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
 
-  /* === Ключевое: app занимает ровно видимую область === */
   .app {
     position: fixed;
     inset: 0;
@@ -2102,7 +2067,7 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   .search input:focus { border-color: #5a7a9a; }
 
-  .user-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .user-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .user-item {
     padding: 8px 11px; border-bottom: 1px solid #dde3e9;
     background: #f6f8fa; cursor: pointer; min-width: 0;
@@ -2134,12 +2099,16 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; overflow: hidden; }
+  /* .chat position: relative — для абсолютных кнопок */
+  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; overflow: hidden; position: relative; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
     background: linear-gradient(#fbfcfd, #d6dee5);
     border-bottom: 1px solid #b0bac4;
     display: flex; align-items: center; gap: 10px;
+    flex-shrink: 0;
+    position: relative;
+    z-index: 5;
   }
   .chat-header .title {
     flex: 1; min-width: 0;
@@ -2158,6 +2127,8 @@ CHAT_PAGE = """<!DOCTYPE html>
     flex: 1; overflow-y: auto; padding: 12px 16px 8px;
     background: radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%), #fbfcfd;
     -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    min-height: 0;
   }
   .empty {
     color: #a2aab3; text-align: center; margin-top: 60px; font-size: 13px;
@@ -2187,6 +2158,36 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: inline-block; font-size: 9px; color: #8a94a0; margin-left: 8px;
     vertical-align: bottom; opacity: 0.85; white-space: nowrap;
     float: right; margin-top: 4px;
+  }
+
+  /* Кнопка "вниз к новым" */
+  .jump-down {
+    position: absolute;
+    right: 16px;
+    bottom: 70px;
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    border: 1px solid #b5bec8;
+    background: #fff;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 20;
+    color: #3f6fa8;
+    padding: 0;
+    animation: jumpIn 0.22s ease-out both;
+  }
+  .jump-down.visible { display: flex; }
+  .jump-down:active { transform: scale(0.94); }
+  .jump-down .icon { width: 20px; height: 20px; }
+  .jump-down .badge {
+    position: absolute; top: -4px; right: -4px;
+    background: #e53935; color: #fff; font-size: 10px;
+    border-radius: 9px; padding: 1px 6px; min-width: 18px;
+    text-align: center; border: 2px solid #fff;
+    font-weight: bold;
   }
 
   .input-area {
@@ -2287,7 +2288,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     .info-panel .close-btn .icon { width: 18px; height: 18px; }
     .mobile-only { display: inline-flex; }
 
-    /* ===== Sidebar (список чатов) ===== */
     .sb-header {
       padding: 12px 14px;
       padding-top: max(12px, env(safe-area-inset-top));
@@ -2322,13 +2322,12 @@ CHAT_PAGE = """<!DOCTYPE html>
     .empty-list { padding: 50px 20px; font-size: 14px; }
     .empty-list .icon.huge { width: 52px; height: 52px; }
 
-    /* ===== Чат (важно: safe-area TOP, чтобы backBtn не уходил под адресную строку) ===== */
+    /* Хедер чата всегда виден, safe-area top учтён */
     .chat-header {
       padding: 10px 12px;
       padding-top: max(10px, env(safe-area-inset-top));
       min-height: 60px;
       gap: 8px;
-      flex-shrink: 0;
     }
     .chat-header .title { font-size: 16px; }
     .chat-header .sub { font-size: 12px; margin-top: 2px; }
@@ -2354,7 +2353,6 @@ CHAT_PAGE = """<!DOCTYPE html>
       padding: 8px 10px;
       padding-bottom: max(8px, env(safe-area-inset-bottom));
       gap: 6px; align-items: flex-end;
-      flex-shrink: 0;
     }
     .input-area textarea {
       padding: 10px 14px; font-size: 16px;
@@ -2368,6 +2366,13 @@ CHAT_PAGE = """<!DOCTYPE html>
     }
     .input-area button .btn-label { display: none; }
     .input-area button .icon { width: 18px; height: 18px; }
+
+    .jump-down {
+      right: 12px;
+      bottom: calc(70px + env(safe-area-inset-bottom));
+      width: 44px; height: 44px;
+    }
+    .jump-down .icon { width: 22px; height: 22px; }
 
     .info-head .name { font-size: 20px; }
     .info-head .status { font-size: 13px; margin-top: 6px; }
@@ -2419,7 +2424,7 @@ CHAT_PAGE = """<!DOCTYPE html>
         <span data-ci18n="add_contact">Добавить контакт</span>
       </button>
       <form class="add-form" id="addForm">
-        <input type="text" id="addInput" placeholder="Ник собеседника" data-ci18n-ph="nick_ph" autocomplete="off" maxlength="20">
+        <input type="text" id="addInput" placeholder="Ник собеседника" data-ci18n-ph="nick_ph" autocomplete="off" maxlength="20" enterkeyhint="done">
         <button type="submit" title="OK">
           <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
         </button>
@@ -2430,7 +2435,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     <div class="search">
       <div class="search-wrap">
         <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="searchInput" placeholder="Поиск по контактам" data-ci18n-ph="search_ph" autocomplete="off">
+        <input type="text" id="searchInput" placeholder="Поиск по контактам" data-ci18n-ph="search_ph" autocomplete="off" enterkeyhint="search">
       </div>
     </div>
 
@@ -2458,8 +2463,13 @@ CHAT_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <button class="jump-down" id="jumpDownBtn" title="К новым">
+      <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="5 12 12 19 19 12"/></svg>
+      <span class="badge" id="jumpBadge" style="display:none">0</span>
+    </button>
+
     <div class="input-area" id="inputArea" style="display:none">
-      <textarea id="msgInput" placeholder="Введите сообщение..." data-ci18n-ph="msg_ph" rows="1"></textarea>
+      <textarea id="msgInput" placeholder="Введите сообщение..." data-ci18n-ph="msg_ph" rows="1" enterkeyhint="send"></textarea>
       <button id="sendBtn" title="Send">
         <svg class="icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         <span class="btn-label" data-ci18n="send">Отправить</span>
@@ -2486,7 +2496,7 @@ CHAT_PAGE = """<!DOCTYPE html>
 <script>
 __I18N_JS__
 
-/* ==== Chat-specific words ==== */
+/* ==== Chat-specific ==== */
 I18N.ru.you = "Вы вошли как";
 I18N.en.you = "Signed in as";
 I18N.ru.add_contact = "Добавить контакт";
@@ -2566,10 +2576,7 @@ function applyCI18n(){
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-ci18n]').forEach(function(el){
     var k = el.getAttribute('data-ci18n');
-    if (el.id === 'chatTitle') {
-      el.textContent = current ? current : T('pick_peer');
-      return;
-    }
+    if (el.id === 'chatTitle') { el.textContent = current ? current : T('pick_peer'); return; }
     if (I18N[lang][k] != null) el.textContent = I18N[lang][k];
   });
   document.querySelectorAll('[data-ci18n-ph]').forEach(function(el){
@@ -2594,6 +2601,7 @@ var lastInfoSig = '';
 var peerTyping = false;
 var peerTypingTimer = null;
 var lastTypingSent = 0;
+var unreadWhileScrolled = 0;
 
 function $(id){ return document.getElementById(id); }
 var app = $('app');
@@ -2644,6 +2652,27 @@ function infoSignature(i){
   return i.nick + '|' + (i.online ? 1 : 0) + '|' + Math.floor(i.last_seen || 0) + '|' + (i.msg_count || 0);
 }
 
+/* ============ Jump to bottom button ============ */
+function updateJumpBtn(){
+  var box = $('messages');
+  var btn = $('jumpDownBtn');
+  if (!box || !btn) return;
+  var far = box.scrollHeight - box.scrollTop - box.clientHeight > 200;
+  if (far && current) btn.classList.add('visible'); else btn.classList.remove('visible');
+  if (!far) { unreadWhileScrolled = 0; }
+  var badge = $('jumpBadge');
+  if (badge) {
+    if (unreadWhileScrolled > 0) { badge.style.display = ''; badge.textContent = unreadWhileScrolled > 99 ? '99+' : unreadWhileScrolled; }
+    else badge.style.display = 'none';
+  }
+}
+$('jumpDownBtn').addEventListener('click', function(){
+  var box = $('messages');
+  box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+  unreadWhileScrolled = 0;
+  setTimeout(updateJumpBtn, 400);
+});
+
 /* ============ WS ============ */
 function connectWS(){
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -2673,12 +2702,14 @@ function handleWS(d){
     if (current === peer) {
       if (!renderedIds[m.id]) {
         renderedIds[m.id] = true;
+        var wasNear = scrollIfNearBottom($('messages'));
         appendMessage(m);
         lastIds[current] = Math.max(lastIds[current] || 0, m.id);
+        if (m.from === peer && !wasNear) { unreadWhileScrolled++; }
+        updateJumpBtn();
       }
       if (m.from !== me) markRead(peer);
       loadInfo(current);
-      /* если собеседник прислал сообщение — он не печатает */
       if (m.from === peer) setPeerTyping(false);
     }
     loadContacts();
@@ -2716,10 +2747,7 @@ function setPeerTyping(on){
   peerTyping = !!on;
   if (peerTypingTimer) { clearTimeout(peerTypingTimer); peerTypingTimer = null; }
   if (peerTyping) {
-    peerTypingTimer = setTimeout(function(){
-      peerTyping = false;
-      updateChatSubtitle();
-    }, 3500);
+    peerTypingTimer = setTimeout(function(){ peerTyping = false; updateChatSubtitle(); }, 3500);
   }
   updateChatSubtitle();
 }
@@ -2784,13 +2812,13 @@ function renderContacts(){
 async function openDialog(nick){
   if (current === nick) {
     app.classList.remove('info-open');
-    $('msgInput').focus();
     return;
   }
   current = nick;
   lastIds[nick] = 0;
   renderedIds = {};
   lastInfoSig = '';
+  unreadWhileScrolled = 0;
   setPeerTyping(false);
   $('chatTitle').textContent = nick;
   $('chatSub').textContent = '';
@@ -2798,14 +2826,19 @@ async function openDialog(nick){
   $('inputArea').style.display = 'flex';
   app.classList.add('chat-open');
   app.classList.remove('info-open');
+  updateJumpBtn();
+  /* НЕ фокусируемся автоматически */
   await Promise.all([loadInfo(nick), refreshDialog()]);
   await loadContacts();
-  $('msgInput').focus();
+  var box = $('messages');
+  box.scrollTop = box.scrollHeight;
+  updateJumpBtn();
 }
 
 function resetChatToEmpty(){
   current = null;
   lastInfoSig = '';
+  unreadWhileScrolled = 0;
   setPeerTyping(false);
   app.classList.remove('chat-open');
   app.classList.remove('info-open');
@@ -2817,6 +2850,7 @@ function resetChatToEmpty(){
       '<div>' + esc(T('empty_pick')) + '</div>' +
     '</div>';
   $('inputArea').style.display = 'none';
+  updateJumpBtn();
   renderInfoEmpty();
 }
 
@@ -2841,6 +2875,7 @@ async function refreshDialog(){
     added = true;
   }
   if (added && (wasNearBottom || !box.querySelector('.msg-row'))) box.scrollTop = box.scrollHeight;
+  updateJumpBtn();
 }
 
 function appendMessage(m){
@@ -2879,16 +2914,25 @@ async function send(){
   fd.append('text', text);
   inp.value = '';
   inp.style.height = '36px';
-  /* отправим typing ещё раз перед отправкой — необязательно, но приятно */
   try { ws.send(JSON.stringify({type:'typing', to: current})); } catch (e) {}
   lastTypingSent = Date.now();
   var r = await fetch('/api/send', { method: 'POST', body: fd });
   var d = await r.json().catch(function(){ return { ok:false }; });
-  if (!d.ok) { toast(errText(d) || E('send_failed')); return; }
+  if (!d.ok) {
+    toast(errText(d) || E('send_failed'));
+    /* возвращаем фокус и текст, чтобы не потерять ввод */
+    inp.value = text;
+    inp.focus({preventScroll: true});
+    return;
+  }
   if (!renderedIds[d.message.id]) {
     renderedIds[d.message.id] = true;
     lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
     appendMessage(d.message);
+  }
+  /* Возвращаем фокус, чтобы можно было продолжать печатать */
+  if (document.activeElement !== inp) {
+    try { inp.focus({preventScroll: true}); } catch (e) { inp.focus(); }
   }
   loadContacts();
   loadInfo(current);
@@ -2948,15 +2992,10 @@ async function removeContact(nick){
 
 function updateChatSubtitle(){
   var el = $('chatSub');
-  if (!current) {
-    el.textContent = '';
-    el.classList.remove('online', 'typing');
-    return;
-  }
+  if (!current) { el.textContent = ''; el.classList.remove('online', 'typing'); return; }
   if (peerTyping) {
     el.textContent = T('typing');
-    el.classList.add('typing');
-    el.classList.remove('online');
+    el.classList.add('typing'); el.classList.remove('online');
     return;
   }
   el.classList.remove('typing');
@@ -3028,7 +3067,19 @@ $('addForm').onsubmit = async function(e){
   }
 };
 
-$('sendBtn').onclick = send;
+/* ======== Не теряем фокус при тапе на кнопку Send ======== */
+(function(){
+  var sendBtn = $('sendBtn');
+  var inp = $('msgInput');
+  function keepFocus(e){
+    /* не даём кнопке украсть фокус с textarea */
+    e.preventDefault();
+  }
+  sendBtn.addEventListener('mousedown', keepFocus);
+  sendBtn.addEventListener('touchstart', keepFocus, {passive: false});
+  sendBtn.onclick = send;
+})();
+
 $('msgInput').addEventListener('keydown', function(e){
   if (e.key === 'Enter' && !e.shiftKey && window.innerWidth > 900) { e.preventDefault(); send(); }
 });
@@ -3048,6 +3099,8 @@ $('infoBtn').onclick = function(){ app.classList.toggle('info-open'); };
 $('infoCloseBtn').onclick = function(){ app.classList.remove('info-open'); };
 $('searchInput').addEventListener('input', function(e){ searchQuery = e.target.value; renderContacts(); });
 
+$('messages').addEventListener('scroll', updateJumpBtn, {passive: true});
+
 wireDropdown($('chatLangDd'), function(v){
   lang = v;
   localStorage.setItem('sld_lang', v);
@@ -3065,6 +3118,28 @@ wireDropdown($('chatLangDd'), function(v){
   if (current) { loadInfo(current); updateChatSubtitle(); }
   else { $('chatTitle').textContent = T('pick_peer'); }
 });
+
+/* ============ Мобильные жесты: свайп от левого края → возврат в список ============ */
+(function(){
+  var tSX = 0, tSY = 0, tT = 0;
+  document.addEventListener('touchstart', function(e){
+    if (!current) return;
+    if (window.innerWidth > 900) return;
+    var t = e.touches[0];
+    tSX = t.clientX; tSY = t.clientY; tT = Date.now();
+  }, {passive: true});
+  document.addEventListener('touchend', function(e){
+    if (!current) return;
+    if (window.innerWidth > 900) return;
+    var t = e.changedTouches[0];
+    var dx = t.clientX - tSX;
+    var dy = t.clientY - tSY;
+    var dt = Date.now() - tT;
+    if (tSX < 30 && dx > 70 && Math.abs(dy) < 60 && dt < 500) {
+      resetChatToEmpty();
+    }
+  }, {passive: true});
+})();
 
 applyCI18n();
 markActive($('chatLangDd'), lang);
