@@ -9,15 +9,13 @@ import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-# ================== ВЕРСИЯ ==================
-VERSION = "0.1"
-VERSION_NAME = "Genesis"
+VERSION = "0.2"
+VERSION_NAME = "Aurora"
 VERSION_DATE = "2026-09-20"
 
 app = FastAPI(title=f"SldChat v{VERSION}")
 START_TIME = time.time()
 
-# ================== ХРАНИЛИЩЕ ==================
 users: Dict[str, dict] = {}
 sessions: Dict[str, str] = {}
 contacts: Dict[str, Set[str]] = {}
@@ -38,21 +36,25 @@ def is_online(nick: str) -> bool:
 
 def user_public_info(nick: str) -> dict:
     u = users.get(nick)
-    if not u: return {}
+    if not u:
+        return {}
     return {"nick": nick, "online": is_online(nick),
             "last_seen": u.get("last_seen", 0), "created": u.get("created", 0)}
 
 
 async def send_ws(nick: str, payload: dict):
     socks = list(active_ws.get(nick, ()))
-    if not socks: return
+    if not socks:
+        return
     text = json.dumps(payload, ensure_ascii=False)
     await asyncio.gather(*(_safe_send(ws, text) for ws in socks), return_exceptions=True)
 
 
 async def _safe_send(ws: WebSocket, text: str):
-    try: await ws.send_text(text)
-    except Exception: pass
+    try:
+        await ws.send_text(text)
+    except Exception:
+        pass
 
 
 async def notify_contacts(nick: str, payload: dict):
@@ -64,7 +66,6 @@ def err(key: str, status: int = 400):
     return JSONResponse({"ok": False, "error_key": key}, status_code=status)
 
 
-# ================== БЕЗОПАСНОСТЬ ==================
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     nick = current_user(request)
@@ -80,29 +81,34 @@ async def security_middleware(request: Request, call_next):
     return resp
 
 
-# ================== WEBSOCKET ==================
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     token = websocket.cookies.get("session")
     nick = sessions.get(token) if token else None
     if not nick or nick not in users:
-        await websocket.close(code=1008); return
+        await websocket.close(code=1008)
+        return
     users[nick]["last_seen"] = time.time()
     active_ws.setdefault(nick, set()).add(websocket)
     await notify_contacts(nick, {"type": "presence", "nick": nick, "online": True})
     try:
         while True:
             raw = await websocket.receive_text()
-            if not raw or raw == "ping": continue
-            try: d = json.loads(raw)
-            except Exception: continue
+            if not raw or raw == "ping":
+                continue
+            try:
+                d = json.loads(raw)
+            except Exception:
+                continue
             if d.get("type") == "typing":
                 to = (d.get("to") or "").strip()
                 if to and to in contacts.get(nick, set()):
                     await send_ws(to, {"type": "typing", "from": nick})
-    except WebSocketDisconnect: pass
-    except Exception: pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
     finally:
         socks = active_ws.get(nick)
         if socks:
@@ -113,7 +119,6 @@ async def ws_endpoint(websocket: WebSocket):
                 await notify_contacts(nick, {"type": "presence", "nick": nick, "online": False})
 
 
-# ================== HEALTH / SERVER-INFO ==================
 @app.get("/health")
 async def health():
     return {"ok": True, "version": VERSION, "uptime": round(time.time() - START_TIME, 1),
@@ -125,15 +130,19 @@ async def api_server_info():
     return {"ok": True, "started": START_TIME, "version": VERSION}
 
 
-# ================== API ==================
 @app.post("/api/register")
 async def api_register(request: Request, nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
-    if not nick or not password: return err("fill_all")
-    if not (3 <= len(nick) <= 20): return err("nick_len")
-    if not nick.replace("_", "").isalnum(): return err("nick_chars")
-    if len(password) < 3: return err("pass_len")
-    if nick in users: return err("nick_taken")
+    if not nick or not password:
+        return err("fill_all")
+    if not (3 <= len(nick) <= 20):
+        return err("nick_len")
+    if not nick.replace("_", "").isalnum():
+        return err("nick_chars")
+    if len(password) < 3:
+        return err("pass_len")
+    if nick in users:
+        return err("nick_taken")
     now = time.time()
     users[nick] = {"password": password, "created": now, "last_seen": now}
     contacts[nick] = set()
@@ -141,7 +150,7 @@ async def api_register(request: Request, nick: str = Form(...), password: str = 
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
     resp.set_cookie("session", token, httponly=True, samesite="lax",
-                    secure=request.url.scheme == "https", max_age=60*60*24*30, path="/")
+                    secure=request.url.scheme == "https", max_age=60 * 60 * 24 * 30, path="/")
     return resp
 
 
@@ -149,19 +158,21 @@ async def api_register(request: Request, nick: str = Form(...), password: str = 
 async def api_login(request: Request, nick: str = Form(...), password: str = Form(...)):
     nick = nick.strip()
     u = users.get(nick)
-    if not u or u["password"] != password: return err("bad_login")
+    if not u or u["password"] != password:
+        return err("bad_login")
     token = secrets.token_hex(32)
     sessions[token] = nick
     resp = JSONResponse({"ok": True})
     resp.set_cookie("session", token, httponly=True, samesite="lax",
-                    secure=request.url.scheme == "https", max_age=60*60*24*30, path="/")
+                    secure=request.url.scheme == "https", max_age=60 * 60 * 24 * 30, path="/")
     return resp
 
 
 @app.post("/api/logout")
 async def api_logout(request: Request):
     token = request.cookies.get("session")
-    if token: sessions.pop(token, None)
+    if token:
+        sessions.pop(token, None)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie("session", path="/")
     return resp
@@ -170,21 +181,29 @@ async def api_logout(request: Request):
 @app.get("/api/me")
 async def api_me(request: Request):
     nick = current_user(request)
-    if not nick: return JSONResponse({"ok": False}, status_code=401)
+    if not nick:
+        return JSONResponse({"ok": False}, status_code=401)
     return {"ok": True, "nick": nick}
 
 
 @app.post("/api/contacts/add")
 async def api_contacts_add(request: Request, nick: str = Form(...)):
     me = current_user(request)
-    if not me: return err("not_authorized", 401)
+    if not me:
+        return err("not_authorized", 401)
     nick = nick.strip()
-    if not nick: return err("enter_nick")
-    if nick == me: return err("cant_add_self")
-    if nick not in users: return err("user_not_found", 404)
-    contacts.setdefault(me, set()); contacts.setdefault(nick, set())
-    if nick in contacts[me]: return err("already_contact")
-    contacts[me].add(nick); contacts[nick].add(me)
+    if not nick:
+        return err("enter_nick")
+    if nick == me:
+        return err("cant_add_self")
+    if nick not in users:
+        return err("user_not_found", 404)
+    contacts.setdefault(me, set())
+    contacts.setdefault(nick, set())
+    if nick in contacts[me]:
+        return err("already_contact")
+    contacts[me].add(nick)
+    contacts[nick].add(me)
     info = user_public_info(nick)
     await asyncio.gather(
         send_ws(nick, {"type": "contact_added", "nick": me}),
@@ -197,10 +216,13 @@ async def api_contacts_add(request: Request, nick: str = Form(...)):
 @app.post("/api/contacts/remove")
 async def api_contacts_remove(request: Request, nick: str = Form(...)):
     me = current_user(request)
-    if not me: return err("not_authorized", 401)
+    if not me:
+        return err("not_authorized", 401)
     nick = nick.strip()
-    if nick not in contacts.get(me, set()): return err("not_in_contacts")
-    contacts.get(me, set()).discard(nick); contacts.get(nick, set()).discard(me)
+    if nick not in contacts.get(me, set()):
+        return err("not_in_contacts")
+    contacts.get(me, set()).discard(nick)
+    contacts.get(nick, set()).discard(me)
     await asyncio.gather(
         send_ws(nick, {"type": "contact_removed", "nick": me}),
         send_ws(me, {"type": "contact_removed", "nick": nick}),
@@ -211,12 +233,15 @@ async def api_contacts_remove(request: Request, nick: str = Form(...)):
 @app.get("/api/contacts")
 async def api_contacts(request: Request):
     me = current_user(request)
-    if not me: return JSONResponse({"ok": False}, status_code=401)
+    if not me:
+        return JSONResponse({"ok": False}, status_code=401)
     my_reads = reads.get(me, {})
     out = []
     for nick in contacts.get(me, set()):
-        if nick not in users: continue
-        last_msg = None; unread = 0
+        if nick not in users:
+            continue
+        last_msg = None
+        unread = 0
         last_read_id = my_reads.get(nick, 0)
         for m in messages:
             if (m["from"] == nick and m["to"] == me) or (m["from"] == me and m["to"] == nick):
@@ -232,8 +257,10 @@ async def api_contacts(request: Request):
 @app.get("/api/user/{nick}/info")
 async def api_user_info(nick: str, request: Request):
     me = current_user(request)
-    if not me: return JSONResponse({"ok": False}, status_code=401)
-    if nick not in users: return err("user_not_found", 404)
+    if not me:
+        return JSONResponse({"ok": False}, status_code=401)
+    if nick not in users:
+        return err("user_not_found", 404)
     info = user_public_info(nick)
     info["msg_count"] = sum(1 for m in messages if (
         (m["from"] == me and m["to"] == nick) or (m["from"] == nick and m["to"] == me)
@@ -245,8 +272,10 @@ async def api_user_info(nick: str, request: Request):
 @app.get("/api/dialog/{nick}")
 async def api_dialog(nick: str, request: Request, since: int = 0):
     me = current_user(request)
-    if not me: return JSONResponse({"ok": False}, status_code=401)
-    if nick not in contacts.get(me, set()): return err("not_in_contacts", 403)
+    if not me:
+        return JSONResponse({"ok": False}, status_code=401)
+    if nick not in contacts.get(me, set()):
+        return err("not_in_contacts", 403)
     max_id = reads.setdefault(me, {}).get(nick, 0)
     for m in messages:
         if m["from"] == nick and m["to"] == me and m["id"] > max_id:
@@ -262,11 +291,16 @@ async def api_dialog(nick: str, request: Request, since: int = 0):
 async def api_send(request: Request, to: str = Form(...), text: str = Form(...)):
     global _msg_id
     me = current_user(request)
-    if not me: return err("not_authorized", 401)
-    to = to.strip(); text = text.strip()
-    if not text: return err("empty_msg")
-    if len(text) > 4000: text = text[:4000]
-    if to not in contacts.get(me, set()): return err("not_in_contacts", 403)
+    if not me:
+        return err("not_authorized", 401)
+    to = to.strip()
+    text = text.strip()
+    if not text:
+        return err("empty_msg")
+    if len(text) > 4000:
+        text = text[:4000]
+    if to not in contacts.get(me, set()):
+        return err("not_in_contacts", 403)
     _msg_id += 1
     msg = {"id": _msg_id, "from": me, "to": to, "text": text, "time": time.time()}
     messages.append(msg)
@@ -275,20 +309,21 @@ async def api_send(request: Request, to: str = Form(...), text: str = Form(...))
     return {"ok": True, "message": msg}
 
 
-# ================== ICONS ==================
 FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    '<rect width="64" height="64" rx="14" fill="#3f6fa8"/>'
-    '<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"'
-    ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/></svg>')
+               '<rect width="64" height="64" rx="14" fill="#3f6fa8"/>'
+               '<path d="M50 28a13 13 0 0 1-14.7 12.8l-8.1 4.8v-6A13 13 0 0 1 14 28a13 13 0 0 1 13-12.8h10A13 13 0 0 1 50 28z"'
+               ' fill="none" stroke="#fff" stroke-width="3.6" stroke-linejoin="round"/></svg>')
+
 OG_IMAGE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">'
-    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
-    '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/></linearGradient></defs>'
-    '<rect width="1200" height="630" fill="url(#g)"/>'
-    '<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">'
-    '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
-    '<text x="600" y="380" font-size="36" fill="#2b3a4a">Fast messenger for teams</text>'
-    '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · add by nick · no ads</text>'
-    '</g></svg>')
+                '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+                '<stop offset="0" stop-color="#d5dfe9"/><stop offset="1" stop-color="#a8b6c4"/>'
+                '</linearGradient></defs>'
+                '<rect width="1200" height="630" fill="url(#g)"/>'
+                '<g font-family="Tahoma, Arial, sans-serif" text-anchor="middle">'
+                '<text x="600" y="290" font-size="104" font-weight="bold" fill="#3f6fa8">SldChat</text>'
+                '<text x="600" y="380" font-size="36" fill="#2b3a4a">Fast messenger for teams</text>'
+                '<text x="600" y="446" font-size="22" fill="#5a6c80">WebSocket · add by nick · no ads</text>'
+                '</g></svg>')
 
 
 @app.get("/favicon.svg")
@@ -296,10 +331,12 @@ async def favicon():
     return Response(content=FAVICON_SVG, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
 
+
 @app.get("/favicon.ico")
 async def favicon_ico():
     return Response(content=FAVICON_SVG, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
+
 
 @app.get("/og-image.svg")
 async def og_image():
@@ -307,17 +344,118 @@ async def og_image():
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-# ================== SHARED CSS ==================
 SHARED_CSS = """
+  :root {
+    --bg: #eef2f6;
+    --bg-2: #f6f8fa;
+    --bg-card: #ffffff;
+    --bg-soft: #f4f6f8;
+    --topbar-top: #fbfcfd;
+    --topbar-bot: #dce3ea;
+    --border: #cfd7df;
+    --border-2: #b7c2cd;
+    --border-3: #dbe1e7;
+    --text: #2b3a4a;
+    --text-strong: #23374b;
+    --text-muted: #7a8695;
+    --text-muted-2: #98a2ad;
+    --text-soft: #6f7c8b;
+    --accent: #3f6fa8;
+    --accent-hover: #35597f;
+    --accent-bg: linear-gradient(#5b8fc4, #3f6fa8);
+    --accent-bg-hover: linear-gradient(#699bcd, #4577b1);
+    --input-bg: #ffffff;
+    --input-border: #9aa4ae;
+    --btn-bg: linear-gradient(#fbfcfd, #cfd8e0);
+    --btn-bg-hover: linear-gradient(#fff, #dbe3ea);
+    --btn-border: #8b97a3;
+    --footer-bg: #2b3a4a;
+    --footer-text: #b8c4ce;
+    --footer-strong: #dbe5ef;
+    --footer-muted: #8fa3b6;
+    --footer-code-bg: #1f2c39;
+    --footer-code-text: #cfe0f0;
+    --footer-border: #3d4d5d;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow-md: 0 8px 20px rgba(0,0,0,0.10);
+    --separator: #dde4eb;
+    --selection-bg: #e4ebf3;
+    --chat-bg: #ffffff;
+    --messages-bg: #fbfcfd;
+    --input-area-bg: #eef2f6;
+    --sidebar-bg: #f0f3f7;
+    --sidebar-border: #c8d1da;
+    --iconbtn-bg: linear-gradient(#fbfcfd, #dce3ea);
+    --msg-them-bg: #eef2f6;
+    --msg-them-border: #e3e9ef;
+    --msg-them-text: #22303e;
+    --msg-mine-bg: #d3e6c8;
+    --msg-mine-border: #c5dcb5;
+    --msg-meta: #8a94a0;
+    --online: #4caf50;
+    --dot-off: #b5bec8;
+  }
+  [data-theme="dark"] {
+    --bg: #14161c;
+    --bg-2: #1a1d24;
+    --bg-card: #1e222b;
+    --bg-soft: #22262e;
+    --topbar-top: #242932;
+    --topbar-bot: #1c2028;
+    --border: #2a3038;
+    --border-2: #353c46;
+    --border-3: #262c34;
+    --text: #d5dae0;
+    --text-strong: #eaeef3;
+    --text-muted: #8a94a2;
+    --text-muted-2: #6f7986;
+    --text-soft: #95a0ae;
+    --accent: #7ea7d8;
+    --accent-hover: #98b8e3;
+    --accent-bg: linear-gradient(#4a80b8, #3a6ba0);
+    --accent-bg-hover: linear-gradient(#5a90c8, #4577b1);
+    --input-bg: #23272f;
+    --input-border: #3a4149;
+    --btn-bg: linear-gradient(#2a2f38, #21252d);
+    --btn-bg-hover: linear-gradient(#343a44, #282d36);
+    --btn-border: #3f4650;
+    --footer-bg: #0f1115;
+    --footer-text: #aab4c0;
+    --footer-strong: #d5dae0;
+    --footer-muted: #7a8695;
+    --footer-code-bg: #1a1e26;
+    --footer-code-text: #b8c8dc;
+    --footer-border: #262c34;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+    --shadow-md: 0 8px 20px rgba(0,0,0,0.5);
+    --separator: #2a3038;
+    --selection-bg: #2a3a52;
+    --chat-bg: #1a1d24;
+    --messages-bg: #1a1d24;
+    --input-area-bg: #1e222a;
+    --sidebar-bg: #1a1d24;
+    --sidebar-border: #2a3038;
+    --iconbtn-bg: linear-gradient(#2a2f38, #21252d);
+    --msg-them-bg: #262b34;
+    --msg-them-border: #2f3540;
+    --msg-them-text: #d5dae0;
+    --msg-mine-bg: #2c4a35;
+    --msg-mine-border: #375c43;
+    --msg-meta: #7a8492;
+    --online: #4caf50;
+    --dot-off: #5a6470;
+  }
+
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { scroll-behavior: smooth; scroll-padding-top: 76px; }
   html, body { margin: 0; padding: 0; }
   body {
     font-family: Tahoma, Verdana, Arial, sans-serif;
-    font-size: 14px; color: #2b3a4a; line-height: 1.6;
-    background: #eef2f6;
+    font-size: 14px; color: var(--text); line-height: 1.6;
+    background: var(--bg);
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
+    transition: background 0.2s ease, color 0.2s ease;
   }
   input, textarea, .selectable { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
@@ -347,7 +485,6 @@ SHARED_CSS = """
     .reveal.in { transform: none; }
     .cards .reveal:nth-child(n) { transition-delay: 0ms; }
   }
-
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     *, *::before, *::after {
@@ -358,7 +495,7 @@ SHARED_CSS = """
     .reveal { opacity: 1 !important; transform: none !important; }
   }
 
-  a { color: #3f6fa8; text-decoration: none; transition: color 0.14s ease; }
+  a { color: var(--accent); text-decoration: none; transition: color 0.14s ease; }
   a:hover { text-decoration: underline; }
   .container { max-width: 1080px; margin: 0 auto; padding: 0 22px; }
 
@@ -373,100 +510,102 @@ SHARED_CSS = """
   .icon.huge{ width: 42px; height: 42px; stroke-width: 1.5; }
 
   .topbar {
-    background: linear-gradient(#fbfcfd, #dce3ea);
-    border-bottom: 1px solid #b7c2cd;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    background: linear-gradient(var(--topbar-top), var(--topbar-bot));
+    border-bottom: 1px solid var(--border-2);
+    box-shadow: var(--shadow-sm);
     position: sticky; top: 0; z-index: 50;
   }
   .topbar-inner { display: flex; align-items: center; gap: 12px; height: 56px; }
   .logo {
     display: flex; align-items: center; gap: 7px;
-    font-size: 21px; font-weight: bold; color: #2b3a4a;
-    text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px;
+    font-size: 21px; font-weight: bold; color: var(--text);
+    letter-spacing: 0.5px;
   }
-  .logo span { color: #3f6fa8; }
-  .logo .icon { color: #3f6fa8; width: 22px; height: 22px; }
+  .logo span { color: var(--accent); }
+  .logo .icon { color: var(--accent); width: 22px; height: 22px; }
 
   .nav { display: flex; align-items: center; gap: 4px; margin-left: auto; }
-  .nav a.navlink { padding: 7px 10px; border-radius: 4px; color: #3a5169; font-size: 13px; }
+  .nav a.navlink { padding: 7px 10px; border-radius: 4px; color: var(--text); font-size: 13px; }
 
   .btn {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 7px 14px; border-radius: 4px;
-    border: 1px solid #8b97a3; font-size: 13px; cursor: pointer;
-    font-family: inherit; text-shadow: 0 1px 0 rgba(255,255,255,0.6);
-    text-decoration: none !important; color: #2b3a4a;
-    background: linear-gradient(#fbfcfd, #cfd8e0);
+    border: 1px solid var(--btn-border); font-size: 13px; cursor: pointer;
+    font-family: inherit;
+    text-decoration: none !important; color: var(--text);
+    background: var(--btn-bg);
     white-space: nowrap;
     transition: transform 0.1s ease, background 0.15s ease, box-shadow 0.15s ease;
   }
   .btn:active { transform: scale(0.98); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15); }
-  .btn-primary { background: linear-gradient(#5b8fc4, #3f6fa8); border-color: #35597f;
-                 color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,0.2); }
+  .btn-primary { background: var(--accent-bg); border-color: var(--accent-hover); color: #fff;
+                 text-shadow: 0 1px 0 rgba(0,0,0,0.2); }
   .btn-lg { padding: 11px 22px; font-size: 15px; }
 
-  .section { padding: 64px 0; border-bottom: 1px solid #dbe1e7; scroll-margin-top: 76px; }
-  .section:nth-of-type(even) { background: #f6f8fa; }
-  .section h2 { font-size: 27px; font-weight: normal; margin: 0 0 8px; color: #23374b; text-shadow: 0 1px 0 #fff; }
-  .section .lead { color: #6f7c8b; font-size: 14px; margin: 0 0 30px; }
-  .section p { margin: 0 0 12px; color: #47586c; }
+  .section { padding: 64px 0; border-bottom: 1px solid var(--border-3); scroll-margin-top: 76px; }
+  .section:nth-of-type(even) { background: var(--bg-2); }
+  .section h2 { font-size: 27px; font-weight: normal; margin: 0 0 8px; color: var(--text-strong); }
+  .section .lead { color: var(--text-soft); font-size: 14px; margin: 0 0 30px; }
+  .section p { margin: 0 0 12px; color: var(--text-soft); }
 
   .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 10px; }
   .card {
-    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
     padding: 22px 20px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
+    box-shadow: var(--shadow-sm);
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
   .card .ico {
     width: 46px; height: 46px; margin-bottom: 14px;
     border-radius: 8px;
     background: linear-gradient(#e4ebf2, #c8d3de);
-    border: 1px solid #b7c2cd;
+    border: 1px solid var(--border-2);
     display: flex; align-items: center; justify-content: center;
-    color: #3f6fa8; box-shadow: inset 0 1px 0 #fff;
+    color: var(--accent);
   }
-  .card h3 { margin: 0 0 6px; font-size: 15px; color: #2b3a4a; }
-  .card p  { margin: 0; font-size: 13px; color: #5a6c80; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; color: var(--text); }
+  .card p  { margin: 0; font-size: 13px; color: var(--text-soft); }
+  [data-theme="dark"] .card .ico { background: linear-gradient(#2a3038, #23272f); }
 
   @media (hover: hover) and (pointer: fine) {
     .logo:hover { transform: translateY(-1px); text-decoration: none; }
-    .nav a.navlink:hover { background: #e3e9ef; text-decoration: none; }
-    .btn:hover { background: linear-gradient(#fff, #dbe3ea); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
-    .btn-primary:hover { background: linear-gradient(#699bcd, #4577b1); box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
+    .nav a.navlink:hover { background: var(--selection-bg); text-decoration: none; }
+    .btn:hover { background: var(--btn-bg-hover); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.08); }
+    .btn-primary:hover { background: var(--accent-bg-hover); box-shadow: 0 2px 8px rgba(63,111,168,0.35); }
     a:hover { text-decoration: underline; }
-    .card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.10), inset 0 1px 0 #fff; }
+    .card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
     .card:hover .ico { transform: scale(1.06) rotate(-2deg); }
-    .card { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+    .card { transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, border-color 0.2s ease; }
     .card .ico { transition: transform 0.25s ease; }
   }
 
   .faq { max-width: 760px; margin: 0 auto; }
   .faq details {
-    background: #fff; border: 1px solid #cfd7df; border-radius: 5px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 5px;
     margin-bottom: 10px;
     box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
     overflow: hidden;
   }
-  .faq details[open] { border-color: #a8b8ca; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+  .faq details[open] { border-color: var(--accent); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
   .faq summary {
-    padding: 13px 18px; cursor: pointer; font-weight: bold; color: #2b3a4a;
+    padding: 13px 18px; cursor: pointer; font-weight: bold; color: var(--text);
     outline: none; list-style: none;
     display: flex; align-items: center; gap: 10px;
     transition: background 0.15s ease;
   }
   .faq summary::-webkit-details-marker { display: none; }
-  .faq summary:hover { background: #f6f9fc; }
+  .faq summary:hover { background: var(--bg-soft); }
   .faq summary::before {
     content: '+'; display: inline-block;
-    color: #3f6fa8; font-weight: bold; font-size: 16px;
+    color: var(--accent); font-weight: bold; font-size: 16px;
     width: 12px; text-align: center; transition: transform 0.25s ease;
   }
   .faq details[open] summary::before { content: '−'; transform: rotate(180deg); }
   .faq .answer-wrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.28s ease; }
   .faq details[open] .answer-wrap { grid-template-rows: 1fr; }
   .faq .answer-wrap > .answer {
-    overflow: hidden; padding: 0 18px 0 40px; color: #55677b; font-size: 13px;
+    overflow: hidden; padding: 0 18px 0 40px; color: var(--text-soft); font-size: 13px;
     transition: padding 0.28s ease;
   }
   .faq details[open] .answer-wrap > .answer { padding: 0 18px 15px 40px; }
@@ -475,25 +614,25 @@ SHARED_CSS = """
   .dd-toggle {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 7px 12px; border-radius: 4px;
-    border: 1px solid #4d5f72; cursor: pointer;
+    border: 1px solid var(--footer-border); cursor: pointer;
     background: rgba(255,255,255,0.06);
-    font-family: inherit; font-size: 13px; color: #dbe5ef;
+    font-family: inherit; font-size: 13px; color: var(--footer-strong);
     transition: background 0.15s ease, border-color 0.15s ease;
     white-space: nowrap;
   }
-  .dd-toggle .icon { width: 14px; height: 14px; color: #9db8d3; transition: transform 0.22s ease; }
+  .dd-toggle .icon { width: 14px; height: 14px; color: var(--footer-muted); transition: transform 0.22s ease; }
   .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
-  .dd-toggle .dd-label { color: #8fa3b6; }
+  .dd-toggle .dd-label { color: var(--footer-muted); }
   .dd-toggle .dd-value { color: #fff; font-weight: bold; }
   @media (hover: hover) and (pointer: fine) {
-    .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: #6b7f93; }
+    .dd-toggle:hover { background: rgba(255,255,255,0.12); border-color: var(--accent); }
   }
 
   .dd-menu {
     position: absolute; bottom: calc(100% + 6px); right: 0; left: auto;
     min-width: 170px;
-    background: #fff; color: #2b3a4a;
-    border: 1px solid #b7c2cd; border-radius: 6px;
+    background: var(--bg-card); color: var(--text);
+    border: 1px solid var(--border-2); border-radius: 6px;
     box-shadow: 0 10px 28px rgba(0,0,0,0.28);
     padding: 5px; margin: 0; list-style: none;
     opacity: 0; visibility: hidden;
@@ -505,60 +644,91 @@ SHARED_CSS = """
   .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
   .dd-menu li {
     padding: 8px 12px; border-radius: 4px; cursor: pointer;
-    font-size: 13px; color: #2b3a4a;
+    font-size: 13px; color: var(--text);
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
   }
-  .dd-menu li:hover { background: #eef2f6; }
-  .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
-  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8; }
+  .dd-menu li:hover { background: var(--selection-bg); }
+  .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
+  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
-  footer { background: #2b3a4a; color: #b8c4ce; padding: 44px 0 26px; font-size: 13px; }
+  .theme-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 36px; height: 34px;
+    border-radius: 4px;
+    border: 1px solid var(--footer-border);
+    background: rgba(255,255,255,0.06);
+    color: var(--footer-muted);
+    cursor: pointer; padding: 0; font-family: inherit;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  }
+  .theme-toggle .icon { width: 16px; height: 16px; }
+  @media (hover: hover) and (pointer: fine) {
+    .theme-toggle:hover { background: rgba(255,255,255,0.12); border-color: var(--accent); color: #fff; }
+  }
+  .theme-toggle:active { transform: scale(0.94); }
+  .theme-toggle .icon-sun, .theme-toggle .icon-moon { display: none; }
+  html[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+  html[data-theme="dark"]  .theme-toggle .icon-sun  { display: block; }
+
+  .theme-toggle-light {
+    border-color: var(--border-2);
+    background: var(--btn-bg);
+    color: var(--text);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .theme-toggle-light:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
+  }
+
+  footer { background: var(--footer-bg); color: var(--footer-text); padding: 44px 0 26px; font-size: 13px; }
   footer .foot-cols { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 30px; margin-bottom: 30px; }
   footer .foot-brand .brand-name {
     display: flex; align-items: center; gap: 8px;
     font-size: 17px; color: #fff; font-weight: bold; margin-bottom: 10px;
   }
-  footer .foot-brand .brand-name span { color: #9db8d3; }
-  footer .foot-brand .brand-name .icon { color: #9db8d3; width: 22px; height: 22px; }
-  footer .foot-brand p { margin: 0; color: #8fa3b6; font-size: 12px; line-height: 1.6; max-width: 280px; }
+  footer .foot-brand .brand-name span { color: var(--footer-muted); }
+  footer .foot-brand .brand-name .icon { color: var(--footer-muted); width: 22px; height: 22px; }
+  footer .foot-brand p { margin: 0; color: var(--footer-muted); font-size: 12px; line-height: 1.6; max-width: 280px; }
   footer .foot-col h4 {
     margin: 0 0 12px; font-size: 12px; text-transform: uppercase;
-    letter-spacing: 1px; color: #8fa3b6; font-weight: bold;
+    letter-spacing: 1px; color: var(--footer-muted); font-weight: bold;
   }
   footer .foot-col ul { list-style: none; padding: 0; margin: 0; }
   footer .foot-col li { margin-bottom: 7px; }
-  footer .foot-col a { color: #b8c4ce; font-size: 13px; }
+  footer .foot-col a { color: var(--footer-text); font-size: 13px; }
   footer .foot-controls {
     display: flex; align-items: center; justify-content: space-between;
     gap: 16px; flex-wrap: wrap; padding: 16px 0;
-    border-top: 1px solid #3d4d5d; border-bottom: 1px solid #3d4d5d;
+    border-top: 1px solid var(--footer-border); border-bottom: 1px solid var(--footer-border);
+  }
+  footer .foot-right {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
   footer .foot-status {
     display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
-    font-size: 12px; color: #8fa3b6;
+    font-size: 12px; color: var(--footer-muted);
   }
-  footer .foot-status b { color: #b8c4ce; font-weight: normal; }
+  footer .foot-status b { color: var(--footer-text); font-weight: normal; }
   footer .foot-status code {
     font-family: Consolas, "Courier New", monospace;
-    background: #1f2c39; padding: 2px 8px; border-radius: 3px;
-    color: #cfe0f0; font-size: 11px;
+    background: var(--footer-code-bg); padding: 2px 8px; border-radius: 3px;
+    color: var(--footer-code-text); font-size: 11px;
   }
   footer .foot-status .dot {
     display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-    background: #4caf50; margin-right: 6px;
+    background: var(--online); margin-right: 6px;
     animation: dotPulse 2s ease-in-out infinite;
     vertical-align: 1px;
   }
   footer .foot-bottom {
     padding-top: 20px;
     display: flex; align-items: center; justify-content: space-between;
-    gap: 14px; flex-wrap: wrap; font-size: 12px; color: #7a8b9c;
+    gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--footer-muted);
   }
   footer .foot-bottom .legal { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-  footer .foot-bottom a { color: #9db8d3; }
+  footer .foot-bottom a { color: var(--footer-muted); }
   footer .foot-version {
     display: inline-flex; align-items: center; gap: 6px;
-    background: #1f2c39; color: #9db8d3;
+    background: var(--footer-code-bg); color: var(--footer-muted);
     padding: 2px 8px; border-radius: 10px;
     font-size: 11px; font-family: Consolas, "Courier New", monospace;
     margin-left: 8px;
@@ -566,72 +736,69 @@ SHARED_CSS = """
 
   .page-wrap { max-width: 820px; margin: 0 auto; padding: 40px 20px 60px; }
   .page-head { margin-bottom: 28px; }
-  .page-head h1 { font-size: 32px; font-weight: normal; color: #23374b; margin: 0 0 6px; text-shadow: 0 1px 0 #fff; }
-  .page-head p { margin: 0; color: #6f7c8b; font-size: 14px; }
+  .page-head h1 { font-size: 32px; font-weight: normal; color: var(--text-strong); margin: 0 0 6px; }
+  .page-head p { margin: 0; color: var(--text-soft); font-size: 14px; }
   .page-card {
-    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
     padding: 26px 28px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05), inset 0 1px 0 #fff;
+    box-shadow: var(--shadow-sm);
     margin-bottom: 16px;
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
-  .page-card h2 { font-size: 18px; margin: 0 0 12px; color: #23374b; font-weight: bold; }
-  .page-card p, .page-card li { color: #47586c; margin: 0 0 10px; }
+  .page-card h2 { font-size: 18px; margin: 0 0 12px; color: var(--text-strong); font-weight: bold; }
+  .page-card p, .page-card li { color: var(--text-soft); margin: 0 0 10px; }
   .page-card ul { padding-left: 22px; margin: 0 0 10px; }
   .page-card li { margin: 0 0 6px; }
-  .page-card b { color: #23374b; }
+  .page-card b { color: var(--text-strong); }
   .page-card code {
-    background: #eef2f6; padding: 1px 6px; border-radius: 3px;
+    background: var(--bg); padding: 1px 6px; border-radius: 3px;
     font-family: Consolas, "Courier New", monospace; font-size: 12px;
-    color: #2b3a4a;
+    color: var(--text);
   }
   .link-arrow {
     display: inline-flex; align-items: center; gap: 6px;
-    color: #3f6fa8; font-weight: bold; font-size: 13px;
+    color: var(--accent); font-weight: bold; font-size: 13px;
     margin-top: 6px; transition: gap 0.15s ease;
   }
   .link-arrow:hover { gap: 10px; text-decoration: none; }
 
-  /* ==== Changelog timeline ==== */
   .changelog { max-width: 820px; margin: 0 auto; }
   .cl-item {
     position: relative;
     padding-left: 30px;
     padding-bottom: 30px;
-    border-left: 2px solid #cfd7df;
+    border-left: 2px solid var(--border);
     margin-left: 8px;
   }
   .cl-item:last-child { border-left: 2px solid transparent; }
   .cl-item::before {
     content: ''; position: absolute; left: -8px; top: 4px;
     width: 14px; height: 14px; border-radius: 50%;
-    background: #3f6fa8; border: 3px solid #eef2f6;
-    box-shadow: 0 0 0 2px #3f6fa8;
+    background: var(--accent); border: 3px solid var(--bg);
+    box-shadow: 0 0 0 2px var(--accent);
   }
   .cl-head {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
     margin-bottom: 10px;
   }
   .cl-ver {
-    font-size: 22px; font-weight: bold; color: #23374b;
+    font-size: 22px; font-weight: bold; color: var(--text-strong);
     font-family: Consolas, "Courier New", monospace;
   }
-  .cl-name {
-    font-size: 15px; color: #3f6fa8; font-weight: bold;
-  }
+  .cl-name { font-size: 15px; color: var(--accent); font-weight: bold; }
   .cl-date {
-    font-size: 12px; color: #7a8695;
-    background: #eef2f6; padding: 2px 10px; border-radius: 10px;
+    font-size: 12px; color: var(--text-muted);
+    background: var(--bg); padding: 2px 10px; border-radius: 10px;
   }
   .cl-list { list-style: none; padding: 0; margin: 0; }
   .cl-list li {
     padding: 6px 0 6px 24px; position: relative;
-    color: #47586c; font-size: 13px;
-    line-height: 1.5;
+    color: var(--text-soft); font-size: 13px; line-height: 1.5;
   }
   .cl-list li::before {
     content: ''; position: absolute; left: 6px; top: 12px;
     width: 6px; height: 6px; border-radius: 50%;
-    background: #a8b8ca;
+    background: var(--border-2);
   }
   .cl-current {
     display: inline-block;
@@ -640,6 +807,7 @@ SHARED_CSS = """
     letter-spacing: 0.6px; font-weight: bold;
     padding: 2px 8px; border-radius: 10px;
   }
+  [data-theme="dark"] .cl-current { background: #1e3a26; color: #6fd183; }
 
   @media (max-width: 820px) {
     .nav a.navlink { display: none; }
@@ -659,7 +827,6 @@ SHARED_CSS = """
 """
 
 
-# ================== FOOTER ==================
 FOOTER_HTML = """
 <footer>
   <div class="container">
@@ -669,29 +836,29 @@ FOOTER_HTML = """
           <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
           Sld<span>Chat</span>
         </div>
-        <p data-i18n="foot_brand">SldChat — независимый мессенджер от SldChat Team.</p>
+        <p data-i18n="foot_brand"></p>
       </div>
       <div class="foot-col">
-        <h4 data-i18n="foot_product">Продукт</h4>
+        <h4 data-i18n="foot_product"></h4>
         <ul>
-          <li><a href="/#features" data-i18n="nav_features">Возможности</a></li>
-          <li><a href="/register" data-i18n="btn_register">Регистрация</a></li>
-          <li><a href="/login" data-i18n="btn_login">Вход</a></li>
-          <li><a href="/changelog" data-i18n="nav_changelog">Changelog</a></li>
+          <li><a href="/#features" data-i18n="nav_features"></a></li>
+          <li><a href="/register" data-i18n="btn_register"></a></li>
+          <li><a href="/login" data-i18n="btn_login"></a></li>
+          <li><a href="/changelog" data-i18n="nav_changelog"></a></li>
         </ul>
       </div>
       <div class="foot-col">
-        <h4 data-i18n="foot_company">Компания</h4>
+        <h4 data-i18n="foot_company"></h4>
         <ul>
-          <li><a href="/privacy" data-i18n="foot_privacy">Приватность</a></li>
-          <li><a href="/support" data-i18n="foot_support">Поддержка</a></li>
-          <li><a href="/#faq" data-i18n="foot_faq">FAQ</a></li>
+          <li><a href="/privacy" data-i18n="foot_privacy"></a></li>
+          <li><a href="/support" data-i18n="foot_support"></a></li>
+          <li><a href="/#faq" data-i18n="foot_faq"></a></li>
         </ul>
       </div>
       <div class="foot-col">
-        <h4 data-i18n="foot_contact">Связь</h4>
+        <h4 data-i18n="foot_contact"></h4>
         <ul>
-          <li><a href="mailto:sldshr.confirmation@gmail.com" data-i18n="foot_mail">Почта</a></li>
+          <li><a href="mailto:sldshr.confirmation@gmail.com" data-i18n="foot_mail"></a></li>
           <li><a href="https://discord.com/users/sldshr" target="_blank" rel="noopener">Discord: sldshr</a></li>
         </ul>
       </div>
@@ -699,33 +866,40 @@ FOOTER_HTML = """
 
     <div class="foot-controls">
       <div class="foot-status">
-        <span><span class="dot"></span><b data-i18n="foot_status">Сервер:</b> <code id="srvHost">—</code></span>
-        <span><b data-i18n="foot_uptime">Аптайм:</b> <code id="srvUptime">—</code></span>
+        <span><span class="dot"></span><b data-i18n="foot_status"></b> <code id="srvHost">—</code></span>
+        <span><b data-i18n="foot_uptime"></b> <code id="srvUptime">—</code></span>
       </div>
 
-      <div class="dd dd-up" id="footLangDd">
-        <button class="dd-toggle" type="button" aria-haspopup="listbox">
-          <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-          <span class="dd-label" data-i18n="lang_short">Язык:</span>
-          <span class="dd-value" id="footLangValue">Русский</span>
-          <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+      <div class="foot-right">
+        <button class="theme-toggle" id="footThemeBtn" type="button" title="Theme">
+          <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
         </button>
-        <ul class="dd-menu" id="footLangMenu">
-          <li data-value="ru">Русский</li>
-          <li data-value="en">English</li>
-        </ul>
+
+        <div class="dd dd-up" id="footLangDd">
+          <button class="dd-toggle" type="button" aria-haspopup="listbox">
+            <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            <span class="dd-label" data-i18n="lang_short"></span>
+            <span class="dd-value" id="footLangValue">Русский</span>
+            <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <ul class="dd-menu" id="footLangMenu">
+            <li data-value="ru">Русский</li>
+            <li data-value="en">English</li>
+          </ul>
+        </div>
       </div>
     </div>
 
     <div class="foot-bottom">
       <div>
-        <span data-i18n="foot_copy">© 2026 SldChat Team. Все права защищены.</span>
+        <span data-i18n="foot_copy"></span>
         <span class="foot-version" title="__VERSION_NAME__ · __VERSION_DATE__">v__VERSION__</span>
       </div>
       <div class="legal">
-        <a href="/privacy" data-i18n="foot_privacy">Приватность</a>
-        <a href="/support" data-i18n="foot_support">Поддержка</a>
-        <a href="/changelog" data-i18n="nav_changelog">Changelog</a>
+        <a href="/privacy" data-i18n="foot_privacy"></a>
+        <a href="/support" data-i18n="foot_support"></a>
+        <a href="/changelog" data-i18n="nav_changelog"></a>
       </div>
     </div>
   </div>
@@ -809,11 +983,18 @@ FOOTER_HTML = """
     els.forEach(function(el){ io.observe(el); });
   }
 
+  var themeBtn = document.getElementById('footThemeBtn');
+  if (themeBtn) {
+    themeBtn.addEventListener('click', function(){
+      if (window.SldTheme) window.SldTheme.toggle();
+    });
+  }
+
   window.SldFooter = { wire: wireDropdown, markActive: markActive, tick: tick };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', setupReveal);
-  } else { setupReveal(); }
+  } else setupReveal();
 })();
 </script>
 """
@@ -824,14 +1005,26 @@ HEAD_COMMON = """
 <link rel="apple-touch-icon" href="/favicon.svg">
 <link rel="mask-icon" href="/favicon.svg" color="#3f6fa8">
 <meta name="theme-color" content="#3f6fa8">
+<script>
+(function(){
+  try {
+    var t = localStorage.getItem('sld_theme');
+    if (t !== 'light' && t !== 'dark') {
+      t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {
+    document.documentElement.setAttribute('data-theme', 'light');
+  }
+})();
+</script>
 """
 
 
-# ================== I18N ==================
 I18N_JS = """
 var I18N = {
   ru: {
-    nav_features: "Возможности", nav_servers: "Серверы", nav_privacy: "Приватность",
+    nav_features: "Возможности", nav_privacy: "Приватность",
     nav_faq: "FAQ", nav_support: "Поддержка", nav_home: "На главную",
     nav_changelog: "Changelog",
     btn_login: "Войти", btn_register: "Регистрация",
@@ -848,7 +1041,7 @@ var I18N = {
     feat_2_h: "Добавление по нику", feat_2_p: "Никаких публичных каталогов. Ввели ник — и вы с человеком сразу друг у друга в контактах.",
     feat_3_h: "Статус «в сети»", feat_3_p: "Видите, кто онлайн прямо сейчас, а кто заходил недавно — без лишних деталей.",
     feat_4_h: "На любом устройстве", feat_4_p: "Один и тот же интерфейс на компьютере и на смартфоне — с удобной адаптацией под экран.",
-    feat_5_h: "Поиск по контактам", feat_5_p: "Быстрый поиск среди ваших собеседников прямо в списке — с фильтрацией по мере ввода.",
+    feat_5_h: "Светлая и тёмная темы", feat_5_p: "Переключайте оформление одной кнопкой — светлая для дня, тёмная для ночи.",
     feat_6_h: "Приватность по умолчанию", feat_6_p: "Минимум собираемых данных. Одна cookie для сессии, никакой аналитики и трекеров.",
 
     priv_h: "Приватность", priv_lead: "Коротко о самом главном. Подробности — на отдельной странице.",
@@ -885,7 +1078,7 @@ var I18N = {
     cl_current: "текущая"
   },
   en: {
-    nav_features: "Features", nav_servers: "Servers", nav_privacy: "Privacy",
+    nav_features: "Features", nav_privacy: "Privacy",
     nav_faq: "FAQ", nav_support: "Support", nav_home: "Home",
     nav_changelog: "Changelog",
     btn_login: "Sign in", btn_register: "Sign up",
@@ -902,7 +1095,7 @@ var I18N = {
     feat_2_h: "Add by nick", feat_2_p: "No public directory. Type a nick — and you're in each other's contacts.",
     feat_3_h: "Online status", feat_3_p: "See who's online right now and who was here recently — without clutter.",
     feat_4_h: "Any device", feat_4_p: "Same interface on desktop and phone — nicely adapted to the screen.",
-    feat_5_h: "Contact search", feat_5_p: "Fast search among your contacts right in the list — filtering as you type.",
+    feat_5_h: "Light and dark themes", feat_5_p: "Switch appearance with one tap — light for the day, dark for the night.",
     feat_6_h: "Privacy by default", feat_6_p: "Minimum data collected. One session cookie, no trackers.",
 
     priv_h: "Privacy", priv_lead: "The essentials. Full details on a dedicated page.",
@@ -942,40 +1135,24 @@ var I18N = {
 
 var ERRORS = {
   ru: {
-    fill_all: "Заполните все поля",
-    nick_len: "Ник: 3–20 символов",
-    nick_chars: "Ник: только буквы, цифры и _",
-    pass_len: "Пароль: минимум 3 символа",
-    nick_taken: "Ник уже занят",
-    bad_login: "Неверный ник или пароль",
-    not_authorized: "Не авторизован",
-    enter_nick: "Введите ник",
-    cant_add_self: "Нельзя добавить себя",
-    user_not_found: "Пользователь не найден",
-    already_contact: "Уже в контактах",
-    not_in_contacts: "Не в контактах",
-    empty_msg: "Пустое сообщение",
-    send_failed: "Не удалось отправить",
-    error: "Ошибка",
-    conn_error: "Ошибка соединения"
+    fill_all: "Заполните все поля", nick_len: "Ник: 3–20 символов",
+    nick_chars: "Ник: только буквы, цифры и _", pass_len: "Пароль: минимум 3 символа",
+    nick_taken: "Ник уже занят", bad_login: "Неверный ник или пароль",
+    not_authorized: "Не авторизован", enter_nick: "Введите ник",
+    cant_add_self: "Нельзя добавить себя", user_not_found: "Пользователь не найден",
+    already_contact: "Уже в контактах", not_in_contacts: "Не в контактах",
+    empty_msg: "Пустое сообщение", send_failed: "Не удалось отправить",
+    error: "Ошибка", conn_error: "Ошибка соединения"
   },
   en: {
-    fill_all: "Fill in all fields",
-    nick_len: "Nick: 3–20 characters",
-    nick_chars: "Nick: letters, digits and _ only",
-    pass_len: "Password: min 3 characters",
-    nick_taken: "Nick already taken",
-    bad_login: "Invalid nick or password",
-    not_authorized: "Not authorized",
-    enter_nick: "Enter a nick",
-    cant_add_self: "You can't add yourself",
-    user_not_found: "User not found",
-    already_contact: "Already in contacts",
-    not_in_contacts: "Not in contacts",
-    empty_msg: "Empty message",
-    send_failed: "Failed to send",
-    error: "Error",
-    conn_error: "Connection error"
+    fill_all: "Fill in all fields", nick_len: "Nick: 3–20 characters",
+    nick_chars: "Nick: letters, digits and _ only", pass_len: "Password: min 3 characters",
+    nick_taken: "Nick already taken", bad_login: "Invalid nick or password",
+    not_authorized: "Not authorized", enter_nick: "Enter a nick",
+    cant_add_self: "You can't add yourself", user_not_found: "User not found",
+    already_contact: "Already in contacts", not_in_contacts: "Not in contacts",
+    empty_msg: "Empty message", send_failed: "Failed to send",
+    error: "Error", conn_error: "Connection error"
   }
 };
 
@@ -983,6 +1160,32 @@ var UPTIME_UNITS = {
   ru: {d:'д', h:'ч', m:'м', s:'с'},
   en: {d:'d', h:'h', m:'m', s:'s'}
 };
+
+window.SldTheme = (function(){
+  function current(){
+    return document.documentElement.getAttribute('data-theme') || 'light';
+  }
+  function apply(t){
+    if (t !== 'light' && t !== 'dark') t = 'light';
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem('sld_theme', t); } catch (e) {}
+    try {
+      var tc = document.querySelector('meta[name="theme-color"]');
+      if (tc) tc.setAttribute('content', t === 'dark' ? '#14161c' : '#3f6fa8');
+    } catch (e) {}
+    window.dispatchEvent(new CustomEvent('sld-theme-change', { detail: { theme: t } }));
+  }
+  function toggle(){ apply(current() === 'dark' ? 'light' : 'dark'); }
+  function init(){
+    var t;
+    try { t = localStorage.getItem('sld_theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') {
+      t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    apply(t);
+  }
+  return { current: current, apply: apply, toggle: toggle, init: init };
+})();
 
 window.SldLang = (function(){
   function pickInitial(){
@@ -1050,7 +1253,6 @@ window.SldLang = (function(){
 """
 
 
-# ================== LANDING ==================
 LANDING_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1087,55 +1289,60 @@ __SHARED_CSS__
   }
 
   .hero {
-    background: radial-gradient(circle at 20% 20%, #e6eef7 0%, transparent 60%),
+    background: radial-gradient(circle at 20% 20%, rgba(230,238,247,0.7) 0%, transparent 60%),
                 linear-gradient(#d5dfe9, #b8c6d3);
-    border-bottom: 1px solid #a8b5c2;
+    border-bottom: 1px solid var(--border-2);
     padding: 84px 0 92px; text-align: center; position: relative; overflow: hidden;
   }
-  .hero::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 1px; background: rgba(255,255,255,0.6); }
+  [data-theme="dark"] .hero {
+    background: radial-gradient(circle at 20% 20%, rgba(50,70,100,0.35) 0%, transparent 60%),
+                linear-gradient(#232833, #1a1d24);
+  }
   .hero .eyebrow {
     display: inline-flex; align-items: center; gap: 8px;
-    background: rgba(255,255,255,0.6); border: 1px solid #b7c8db;
+    background: rgba(255,255,255,0.6); border: 1px solid var(--border-2);
     border-radius: 20px; padding: 5px 14px 5px 12px;
     font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
-    font-weight: bold; color: #3a5169; margin-bottom: 24px;
+    font-weight: bold; color: var(--text); margin-bottom: 24px;
     animation: eyebrowPulse 2.6s ease-in-out infinite;
   }
-  .hero .eyebrow .icon { width: 13px; height: 13px; color: #3f6fa8; }
+  [data-theme="dark"] .hero .eyebrow { background: rgba(255,255,255,0.06); }
+  .hero .eyebrow .icon { width: 13px; height: 13px; color: var(--accent); }
   .hero h1 {
     font-size: 46px; font-weight: normal; margin: 0 0 18px;
-    color: #23374b; text-shadow: 0 1px 0 #fff; line-height: 1.12;
+    color: var(--text-strong); line-height: 1.12;
     letter-spacing: 0.4px;
     animation: heroUp 0.55s ease-out 0.05s both;
   }
-  .hero h1 b { color: #3f6fa8; font-weight: bold; }
-  .hero p { max-width: 620px; margin: 0 auto 32px; color: #4a5f74; font-size: 16px;
+  .hero h1 b { color: var(--accent); font-weight: bold; }
+  .hero p { max-width: 620px; margin: 0 auto 32px; color: var(--text); font-size: 16px;
             animation: heroUp 0.55s ease-out 0.12s both; }
   .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
                   animation: heroUp 0.55s ease-out 0.20s both; }
-  .hero-meta { margin-top: 26px; font-size: 12px; color: #5a6f83;
+  .hero-meta { margin-top: 26px; font-size: 12px; color: var(--text-soft);
                display: flex; gap: 18px; justify-content: center; flex-wrap: wrap;
                animation: heroUp 0.55s ease-out 0.28s both; }
   .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
-  .hero-meta .icon { width: 13px; height: 13px; color: #3f6fa8; }
+  .hero-meta .icon { width: 13px; height: 13px; color: var(--accent); }
 
   .privacy-mini { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 20px; }
   .privacy-item {
-    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
     padding: 16px 18px; display: flex; gap: 12px; align-items: flex-start;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-    transition: transform 0.18s ease, box-shadow 0.18s ease;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.2s ease, border-color 0.2s ease;
   }
   @media (hover: hover) and (pointer: fine) {
-    .privacy-item:hover { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(0,0,0,0.08); }
+    .privacy-item:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
   }
   .privacy-item .ico {
     width: 36px; height: 36px; flex-shrink: 0; border-radius: 8px;
-    background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid #b7c2cd;
-    display: flex; align-items: center; justify-content: center; color: #3f6fa8;
+    background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid var(--border-2);
+    display: flex; align-items: center; justify-content: center; color: var(--accent);
   }
-  .privacy-item h3 { margin: 0 0 3px; font-size: 13px; color: #2b3a4a; }
-  .privacy-item p { margin: 0; font-size: 12px; color: #5a6c80; }
+  [data-theme="dark"] .privacy-item .ico { background: linear-gradient(#2a3038, #23272f); }
+  .privacy-item h3 { margin: 0 0 3px; font-size: 13px; color: var(--text); }
+  .privacy-item p { margin: 0; font-size: 12px; color: var(--text-soft); }
 
   @media (max-width: 820px) {
     .hero { padding: 54px 0 64px; }
@@ -1155,13 +1362,13 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="#features" data-i18n="nav_features">Возможности</a>
-      <a class="navlink" href="#privacy" data-i18n="nav_privacy">Приватность</a>
-      <a class="navlink" href="#faq" data-i18n="nav_faq">FAQ</a>
-      <a class="navlink" href="/changelog" data-i18n="nav_changelog">Changelog</a>
-      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
-      <a class="btn" href="/login" data-i18n="btn_login">Войти</a>
-      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
+      <a class="navlink" href="#features" data-i18n="nav_features"></a>
+      <a class="navlink" href="#privacy" data-i18n="nav_privacy"></a>
+      <a class="navlink" href="#faq" data-i18n="nav_faq"></a>
+      <a class="navlink" href="/changelog" data-i18n="nav_changelog"></a>
+      <a class="navlink" href="/support" data-i18n="nav_support"></a>
+      <a class="btn" href="/login" data-i18n="btn_login"></a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register"></a>
     </nav>
   </div>
 </header>
@@ -1170,13 +1377,13 @@ __SHARED_CSS__
   <div class="container">
     <span class="eyebrow">
       <svg class="icon" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-      <span data-i18n="hero_eyebrow">Быстрая доставка через WebSocket</span>
+      <span data-i18n="hero_eyebrow"></span>
     </span>
-    <h1 data-i18n-html="hero_title">Мессенджер <b>SldChat</b> —<br>общайтесь по-простому</h1>
+    <h1 data-i18n-html="hero_title"></h1>
     <p data-i18n="hero_sub"></p>
     <div class="hero-actions">
-      <a class="btn btn-primary btn-lg" href="/register" data-i18n="hero_cta1">Создать аккаунт</a>
-      <a class="btn btn-lg" href="/login" data-i18n="hero_cta2">У меня уже есть аккаунт</a>
+      <a class="btn btn-primary btn-lg" href="/register" data-i18n="hero_cta1"></a>
+      <a class="btn btn-lg" href="/login" data-i18n="hero_cta2"></a>
     </div>
     <div class="hero-meta">
       <span><svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg><span data-i18n="hero_m1"></span></span>
@@ -1188,7 +1395,7 @@ __SHARED_CSS__
 
 <section id="features" class="section">
   <div class="container">
-    <h2 data-i18n="feat_h">Возможности</h2>
+    <h2 data-i18n="feat_h"></h2>
     <p class="lead" data-i18n="feat_lead"></p>
     <div class="cards">
       <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
@@ -1199,7 +1406,7 @@ __SHARED_CSS__
         <h3 data-i18n="feat_3_h"></h3><p data-i18n="feat_3_p"></p></div>
       <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
         <h3 data-i18n="feat_4_h"></h3><p data-i18n="feat_4_p"></p></div>
-      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+      <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></div>
         <h3 data-i18n="feat_5_h"></h3><p data-i18n="feat_5_p"></p></div>
       <div class="card reveal"><div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
         <h3 data-i18n="feat_6_h"></h3><p data-i18n="feat_6_p"></p></div>
@@ -1209,7 +1416,7 @@ __SHARED_CSS__
 
 <section id="privacy" class="section">
   <div class="container">
-    <h2 data-i18n="priv_h">Приватность</h2>
+    <h2 data-i18n="priv_h"></h2>
     <p class="lead" data-i18n="priv_lead"></p>
     <div class="privacy-mini">
       <div class="privacy-item reveal"><div class="ico"><svg class="icon" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
@@ -1222,7 +1429,7 @@ __SHARED_CSS__
         <div><h3 data-i18n="priv_4_h"></h3><p data-i18n="priv_4_p"></p></div></div>
     </div>
     <a class="link-arrow" href="/privacy">
-      <span data-i18n="priv_more">Почитать подробнее</span>
+      <span data-i18n="priv_more"></span>
       <svg class="icon" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
     </a>
   </div>
@@ -1230,7 +1437,7 @@ __SHARED_CSS__
 
 <section id="faq" class="section">
   <div class="container">
-    <h2 data-i18n="faq_h">Ответы на вопросы</h2>
+    <h2 data-i18n="faq_h"></h2>
     <div class="faq">
       <details class="reveal"><summary data-i18n="faq_q1"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a1"></div></div></details>
       <details class="reveal"><summary data-i18n="faq_q2"></summary><div class="answer-wrap"><div class="answer" data-i18n="faq_a2"></div></div></details>
@@ -1310,7 +1517,6 @@ __I18N_JS__
 """
 
 
-# ================== CHANGELOG ==================
 CHANGELOG_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1331,31 +1537,49 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
-      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
-      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
+      <a class="navlink" href="/" data-i18n="nav_home"></a>
+      <a class="navlink" href="/support" data-i18n="nav_support"></a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register"></a>
     </nav>
   </div>
 </header>
 
 <div class="page-wrap">
   <div class="page-head">
-    <h1 data-i18n="cl_h">История версий</h1>
-    <p data-i18n="cl_sub">Все релизы SldChat — от первого до последнего.</p>
+    <h1 data-i18n="cl_h"></h1>
+    <p data-i18n="cl_sub"></p>
   </div>
 
   <div class="changelog">
 
-    <!-- ===== 0.1 ===== -->
+    <div class="cl-item reveal">
+      <div class="cl-head">
+        <span class="cl-ver">v0.2</span>
+        <span class="cl-name">Aurora</span>
+        <span class="cl-date">20 сентября 2026</span>
+        <span class="cl-current" data-i18n="cl_current"></span>
+      </div>
+      <ul class="cl-list">
+        <li><b>Тёмная тема.</b> Переключение одной кнопкой — в подвале сайта и в клиенте рядом с переключателем языка. Тема запоминается.</li>
+        <li>Уважение системных настроек: при первом входе автоматически выбирается светлая или тёмная тема по <code>prefers-color-scheme</code>.</li>
+        <li>Плавный переход цветов при смене темы.</li>
+        <li>Вся палитра переведена на CSS-переменные — единый источник правды для цветов.</li>
+        <li><b>Исправлено:</b> отправка сообщений с телефона (кнопка и Enter на клавиатуре).</li>
+        <li><b>Исправлено:</b> на телефоне теперь всегда видно, под каким аккаунтом вы вошли.</li>
+        <li>Убрана секция «Серверы» с главной страницы.</li>
+        <li>В подвале появилась версия продукта.</li>
+        <li>Добавлена страница <code>/changelog</code> с историей версий.</li>
+      </ul>
+    </div>
+
     <div class="cl-item reveal">
       <div class="cl-head">
         <span class="cl-ver">v0.1</span>
         <span class="cl-name">Genesis</span>
         <span class="cl-date">20 сентября 2026</span>
-        <span class="cl-current" data-i18n="cl_current">текущая</span>
       </div>
       <ul class="cl-list">
-        <li><b>Первый публичный релиз SldChat.</b></li>
+        <li>Первый публичный релиз SldChat.</li>
         <li>Регистрация и вход по нику и паролю.</li>
         <li>Мгновенная доставка сообщений через WebSocket.</li>
         <li>Добавление контактов по нику (двусторонняя связь).</li>
@@ -1371,27 +1595,11 @@ __SHARED_CSS__
         <li>Параметр <code>?lang=ru</code> / <code>?lang=en</code> в ссылках.</li>
         <li>OpenGraph и Twitter Cards для красивых превью.</li>
         <li>Собственная SVG-иконка и OG-баннер.</li>
-        <li>Страницы: <code>/privacy</code>, <code>/support</code>, <code>/changelog</code>.</li>
+        <li>Страницы: <code>/privacy</code>, <code>/support</code>.</li>
         <li>Health-check эндпоинт <code>/health</code>.</li>
         <li>Простой хостинг: один файл <code>main.py</code>, никакой БД.</li>
       </ul>
     </div>
-
-    <!--
-      ШАБЛОН ДЛЯ НОВЫХ ВЕРСИЙ — просто копируйте и меняйте:
-
-      <div class="cl-item">
-        <div class="cl-head">
-          <span class="cl-ver">v0.2</span>
-          <span class="cl-name">Название релиза</span>
-          <span class="cl-date">ДД месяца ГГГГ</span>
-        </div>
-        <ul class="cl-list">
-          <li>Что добавлено</li>
-          <li>Что исправлено</li>
-        </ul>
-      </div>
-    -->
 
   </div>
 </div>
@@ -1426,7 +1634,6 @@ __I18N_JS__
 """
 
 
-# ================== PRIVACY ==================
 PRIVACY_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1447,16 +1654,16 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
-      <a class="navlink" href="/support" data-i18n="nav_support">Поддержка</a>
-      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
+      <a class="navlink" href="/" data-i18n="nav_home"></a>
+      <a class="navlink" href="/support" data-i18n="nav_support"></a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register"></a>
     </nav>
   </div>
 </header>
 
 <div class="page-wrap">
   <div class="page-head">
-    <h1 data-i18n="priv_page_h">Политика приватности</h1>
+    <h1 data-i18n="priv_page_h"></h1>
     <p data-i18n="priv_page_sub"></p>
   </div>
   <div class="page-card selectable"><h2 data-i18n="priv_page_short_h"></h2><p data-i18n-html="priv_page_short_p"></p></div>
@@ -1493,7 +1700,7 @@ __SHARED_CSS__
 
   <a class="link-arrow" href="/" style="margin-top:8px">
     <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
-    <span data-i18n="nav_home">На главную</span>
+    <span data-i18n="nav_home"></span>
   </a>
 </div>
 
@@ -1567,7 +1774,6 @@ I18N.en.priv_page_sec_foot = "We don't have full end-to-end encryption. Don't se
 """
 
 
-# ================== SUPPORT ==================
 SUPPORT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1580,27 +1786,28 @@ __SHARED_CSS__
 
   .contact-card {
     display: flex; align-items: center; gap: 16px;
-    background: #fff; border: 1px solid #cfd7df; border-radius: 6px;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
     padding: 18px 20px; margin-bottom: 12px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04), inset 0 1px 0 #fff;
-    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+    box-shadow: var(--shadow-sm);
+    transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.2s ease;
     text-decoration: none !important;
   }
   @media (hover: hover) and (pointer: fine) {
-    .contact-card:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.09); border-color: #a8b8ca; text-decoration: none; }
+    .contact-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--accent); text-decoration: none; }
   }
   .contact-card .ico {
     width: 48px; height: 48px; flex-shrink: 0; border-radius: 10px;
-    background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid #b7c2cd;
+    background: linear-gradient(#e4ebf2, #c8d3de); border: 1px solid var(--border-2);
     display: flex; align-items: center; justify-content: center;
-    color: #3f6fa8; box-shadow: inset 0 1px 0 #fff;
+    color: var(--accent);
   }
+  [data-theme="dark"] .contact-card .ico { background: linear-gradient(#2a3038, #23272f); }
   .contact-card .body { min-width: 0; flex: 1; }
-  .contact-card .label { font-size: 11px; color: #7a8695; text-transform: uppercase; letter-spacing: 0.5px; }
-  .contact-card .value { font-size: 16px; color: #2b3a4a; font-weight: bold; word-break: break-all; margin-top: 2px; }
+  .contact-card .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .contact-card .value { font-size: 16px; color: var(--text); font-weight: bold; word-break: break-all; margin-top: 2px; }
   .contact-card .value.mono { font-family: Consolas, "Courier New", monospace; font-size: 15px; }
-  .contact-card .arrow { color: #a8b8ca; flex-shrink: 0; transition: transform 0.2s ease; }
-  .contact-card:hover .arrow { color: #3f6fa8; transform: translateX(3px); }
+  .contact-card .arrow { color: var(--text-muted-2); flex-shrink: 0; transition: transform 0.2s ease; }
+  .contact-card:hover .arrow { color: var(--accent); transform: translateX(3px); }
 </style>
 </head>
 <body>
@@ -1612,21 +1819,21 @@ __SHARED_CSS__
       Sld<span>Chat</span>
     </a>
     <nav class="nav">
-      <a class="navlink" href="/" data-i18n="nav_home">На главную</a>
-      <a class="navlink" href="/privacy" data-i18n="nav_privacy">Приватность</a>
-      <a class="btn btn-primary" href="/register" data-i18n="btn_register">Регистрация</a>
+      <a class="navlink" href="/" data-i18n="nav_home"></a>
+      <a class="navlink" href="/privacy" data-i18n="nav_privacy"></a>
+      <a class="btn btn-primary" href="/register" data-i18n="btn_register"></a>
     </nav>
   </div>
 </header>
 
 <div class="page-wrap">
   <div class="page-head">
-    <h1 data-i18n="sup_h">Поддержка</h1>
+    <h1 data-i18n="sup_h"></h1>
     <p data-i18n="sup_sub"></p>
   </div>
 
   <div class="page-card">
-    <h2 data-i18n="sup_contact_h">Связаться</h2>
+    <h2 data-i18n="sup_contact_h"></h2>
     <a class="contact-card" href="mailto:sldshr.confirmation@gmail.com">
       <div class="ico"><svg class="icon xl" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
       <div class="body"><div class="label">E-mail</div><div class="value mono">sldshr.confirmation@gmail.com</div></div>
@@ -1640,7 +1847,7 @@ __SHARED_CSS__
   </div>
 
   <div class="page-card selectable">
-    <h2 data-i18n="sup_before_h">Перед обращением</h2>
+    <h2 data-i18n="sup_before_h"></h2>
     <ul>
       <li data-i18n="sup_before_1"></li><li data-i18n="sup_before_2"></li>
       <li data-i18n="sup_before_3"></li><li data-i18n="sup_before_4"></li>
@@ -1691,7 +1898,6 @@ I18N.en.sup_before_4 = "Describe the issue in detail: what you did, what you exp
 """
 
 
-# ================== AUTH ==================
 AUTH_TEMPLATE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1702,16 +1908,20 @@ __HEAD_COMMON__
 <style>
 __SHARED_CSS__
 
-  /* Фон на html, зафиксирован — при скролле не рвётся */
   html {
     min-height: 100vh;
     min-height: 100dvh;
     background:
-      radial-gradient(circle at 30% 10%, #e6eef6 0%, transparent 55%),
+      radial-gradient(circle at 30% 10%, rgba(230,238,246,0.9) 0%, transparent 55%),
       linear-gradient(#cfd9e3, #a8b6c4);
     background-attachment: fixed;
     background-size: cover;
     background-repeat: no-repeat;
+  }
+  [data-theme="dark"] html, html[data-theme="dark"] {
+    background:
+      radial-gradient(circle at 30% 10%, rgba(60,80,110,0.35) 0%, transparent 55%),
+      linear-gradient(#1c2028, #0f1115);
   }
   body {
     background: transparent;
@@ -1721,68 +1931,79 @@ __SHARED_CSS__
   }
   .topline { padding: 16px 22px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .topline a.logo { font-size: 20px; }
+  .topline .top-actions { display: flex; align-items: center; gap: 8px; }
   .wrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px; }
   .box {
     width: 100%; max-width: 380px;
-    background: #f4f6f8;
-    border: 1px solid #8b97a3; border-radius: 6px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.22), inset 0 1px 0 #fff;
+    background: var(--bg-soft);
+    border: 1px solid var(--border-2); border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.22);
     padding: 22px 26px 26px; animation: popIn 0.4s ease both;
     margin: 0 auto;
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
-  .box h1 { text-align: center; font-size: 20px; font-weight: normal; margin: 0 0 18px; color: #23374b; text-shadow: 0 1px 0 #fff; letter-spacing: 0.5px; }
-  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid #a8b2bc; }
+  .box h1 { text-align: center; font-size: 20px; font-weight: normal; margin: 0 0 18px; color: var(--text-strong); letter-spacing: 0.5px; }
+  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid var(--border-2); }
   .tabs button {
-    flex: 1; border: 1px solid #a8b2bc; border-bottom: none;
-    background: linear-gradient(#eef1f4, #d3dae1);
+    flex: 1; border: 1px solid var(--border-2); border-bottom: none;
+    background: var(--btn-bg);
     border-radius: 4px 4px 0 0; padding: 8px 0; margin-right: 4px; cursor: pointer;
-    font-family: inherit; font-size: 13px; color: #445;
+    font-family: inherit; font-size: 13px; color: var(--text);
     transition: background 0.15s ease, color 0.15s ease;
   }
   .tabs button:last-child { margin-right: 0; }
-  .tabs button.active { background: #f4f6f8; color: #223; font-weight: bold; position: relative; top: 1px; }
-  label { display: block; margin: 10px 0 4px; color: #445; font-size: 13px; }
+  .tabs button.active { background: var(--bg-soft); color: var(--text-strong); font-weight: bold; position: relative; top: 1px; }
+  label { display: block; margin: 10px 0 4px; color: var(--text); font-size: 13px; }
   input[type=text], input[type=password] {
     width: 100%; padding: 10px 12px; font-family: inherit; font-size: 14px;
-    border: 1px solid #9aa4ae; border-radius: 3px; background: #fff; outline: none;
+    border: 1px solid var(--input-border); border-radius: 3px; background: var(--input-bg); color: var(--text); outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.08);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
   }
-  input:focus { border-color: #5a7a9a; box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 3px rgba(90,122,154,0.15); }
+  input:focus { border-color: var(--accent); box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 3px rgba(90,122,154,0.15); }
   .btn2 {
     display: flex; align-items: center; justify-content: center; gap: 8px;
     width: 100%; margin-top: 18px; padding: 12px 0; border-radius: 4px;
     font-family: inherit; font-size: 14px; cursor: pointer;
-    background: linear-gradient(#fbfcfd, #ccd5de);
-    border: 1px solid #7a8794; color: #2b3a4a; text-shadow: 0 1px 0 #fff;
+    background: var(--btn-bg);
+    border: 1px solid var(--btn-border); color: var(--text);
     transition: transform 0.1s ease, box-shadow 0.15s ease, background 0.15s ease;
   }
   .btn2-primary {
-    background: linear-gradient(#5b8fc4, #3f6fa8);
-    border-color: #35597f; color: #fff;
+    background: var(--accent-bg);
+    border-color: var(--accent-hover); color: #fff;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
   }
   .btn2:active { transform: scale(0.98); }
   .error { min-height: 18px; color: #c22; text-align: center; font-size: 12px; margin-bottom: 4px; }
-  .hint { margin-top: 14px; text-align: center; color: #889; font-size: 11px; }
+  [data-theme="dark"] .error { color: #f28a8a; }
+  .hint { margin-top: 14px; text-align: center; color: var(--text-muted); font-size: 11px; }
   .back { text-align: center; margin-top: 14px; font-size: 12px; }
   .form { display: block; }
   .form.hidden { display: none; }
 
   .dd.dd-light .dd-toggle {
-    background: linear-gradient(#fbfcfd, #cfd8e0);
-    border-color: #8b97a3; color: #2b3a4a;
-    text-shadow: 0 1px 0 rgba(255,255,255,0.6);
+    background: var(--btn-bg);
+    border-color: var(--border-2); color: var(--text);
     padding: 6px 10px; font-size: 12px;
   }
-  .dd.dd-light .dd-toggle .icon { color: #4a5b6d; }
-  .dd.dd-light .dd-toggle .dd-value { color: #2b3a4a; }
+  .dd.dd-light .dd-toggle .icon { color: var(--text-soft); }
+  .dd.dd-light .dd-toggle .dd-value { color: var(--text); }
   .dd.dd-light .dd-menu {
     top: calc(100% + 6px); bottom: auto;
     transform-origin: top right;
     transform: translateY(-6px) scale(0.97);
   }
   .dd.dd-light.open .dd-menu { transform: translateY(0) scale(1); }
+
+  .theme-toggle.auth-theme {
+    border-color: var(--border-2);
+    background: var(--btn-bg);
+    color: var(--text-soft);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .theme-toggle.auth-theme:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
+  }
 
   @media (max-width: 820px) {
     .topline { padding: 12px 16px; }
@@ -1798,46 +2019,52 @@ __SHARED_CSS__
     <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
     Sld<span>Chat</span>
   </a>
-  <div class="dd dd-light" id="authLangDd">
-    <button class="dd-toggle" type="button" aria-haspopup="listbox">
-      <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-      <span class="dd-value" id="authLangValue">RU</span>
-      <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+  <div class="top-actions">
+    <button class="theme-toggle auth-theme" id="authThemeBtn" type="button" title="Theme">
+      <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
     </button>
-    <ul class="dd-menu">
-      <li data-value="ru">Русский</li>
-      <li data-value="en">English</li>
-    </ul>
+    <div class="dd dd-light" id="authLangDd">
+      <button class="dd-toggle" type="button" aria-haspopup="listbox">
+        <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        <span class="dd-value" id="authLangValue">RU</span>
+        <svg class="icon chev" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <ul class="dd-menu">
+        <li data-value="ru">Русский</li>
+        <li data-value="en">English</li>
+      </ul>
+    </div>
   </div>
 </div>
 
 <div class="wrap">
   <div class="box">
-    <h1 data-i18n="auth_welcome">Добро пожаловать</h1>
+    <h1 data-i18n="auth_welcome"></h1>
     <div class="tabs">
-      <button type="button" id="tabLogin" data-i18n="auth_tab_login">Вход</button>
-      <button type="button" id="tabRegister" data-i18n="auth_tab_register">Регистрация</button>
+      <button type="button" id="tabLogin" data-i18n="auth_tab_login"></button>
+      <button type="button" id="tabRegister" data-i18n="auth_tab_register"></button>
     </div>
     <div class="error" id="error"></div>
 
     <form id="formLogin" class="form hidden">
-      <label data-i18n="auth_nick">Ник:</label>
+      <label data-i18n="auth_nick"></label>
       <input type="text" name="nick" autocomplete="username" maxlength="20" enterkeyhint="next">
-      <label data-i18n="auth_password">Пароль:</label>
+      <label data-i18n="auth_password"></label>
       <input type="password" name="password" autocomplete="current-password" enterkeyhint="go">
-      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_login_btn">Войти</button>
+      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_login_btn"></button>
     </form>
 
     <form id="formRegister" class="form hidden">
-      <label data-i18n="auth_nick">Ник:</label>
-      <input type="text" name="nick" autocomplete="username" maxlength="20" data-i18n-ph="auth_nick_ph" placeholder="3–20 символов" enterkeyhint="next">
-      <label data-i18n="auth_password">Пароль:</label>
-      <input type="password" name="password" autocomplete="new-password" data-i18n-ph="auth_pass_ph" placeholder="минимум 3 символа" enterkeyhint="go">
-      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_register_btn">Зарегистрироваться</button>
+      <label data-i18n="auth_nick"></label>
+      <input type="text" name="nick" autocomplete="username" maxlength="20" data-i18n-ph="auth_nick_ph" enterkeyhint="next">
+      <label data-i18n="auth_password"></label>
+      <input type="password" name="password" autocomplete="new-password" data-i18n-ph="auth_pass_ph" enterkeyhint="go">
+      <button type="submit" class="btn2 btn2-primary" data-i18n="auth_register_btn"></button>
     </form>
 
-    <div class="hint" data-i18n="auth_hint">Регистрация занимает меньше минуты</div>
-    <div class="back"><a href="/" data-i18n="auth_back">← На главную</a></div>
+    <div class="hint" data-i18n="auth_hint"></div>
+    <div class="back"><a href="/" data-i18n="auth_back"></a></div>
   </div>
 </div>
 
@@ -1916,6 +2143,11 @@ __I18N_JS__
   showTab(initialTab, {pushUrl: false});
   updateDocTitle(initialTab);
 
+  var themeBtn = document.getElementById('authThemeBtn');
+  if (themeBtn && window.SldTheme) {
+    themeBtn.addEventListener('click', function(){ window.SldTheme.toggle(); });
+  }
+
   function setLangValue(v){
     var el = document.getElementById('authLangValue');
     if (el) el.textContent = (v === 'ru') ? 'RU' : 'EN';
@@ -1962,13 +2194,12 @@ __I18N_JS__
 
 def render_auth(active: str) -> str:
     return (AUTH_TEMPLATE
-        .replace("__SHARED_CSS__", SHARED_CSS)
-        .replace("__HEAD_COMMON__", HEAD_COMMON)
-        .replace("__I18N_JS__", I18N_JS)
-        .replace("__ACTIVE_TAB__", "login" if active == "login" else "register"))
+            .replace("__SHARED_CSS__", SHARED_CSS)
+            .replace("__HEAD_COMMON__", HEAD_COMMON)
+            .replace("__I18N_JS__", I18N_JS)
+            .replace("__ACTIVE_TAB__", "login" if active == "login" else "register"))
 
 
-# ================== CHAT ==================
 CHAT_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1978,6 +2209,7 @@ CHAT_PAGE = """<!DOCTYPE html>
 <title>SldChat</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/favicon.svg">
+__HEAD_COMMON__
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
@@ -1987,10 +2219,11 @@ CHAT_PAGE = """<!DOCTYPE html>
   }
   body {
     font-family: Tahoma, Verdana, Arial, sans-serif;
-    font-size: 13px; color: #2b3a4a; background: #e9eef3;
+    font-size: 13px; color: var(--text); background: var(--bg);
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
     -webkit-font-smoothing: antialiased;
     position: fixed; inset: 0;
+    transition: background 0.2s ease, color 0.2s ease;
   }
   input, textarea, .msg-bubble { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
   * { scrollbar-width: none; -ms-overflow-style: none; }
@@ -2002,10 +2235,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     0%, 100% { box-shadow: 0 0 0 0 rgba(76,175,80,0.5); }
     50%      { box-shadow: 0 0 0 4px rgba(76,175,80,0); }
   }
-  @keyframes typingPulse {
-    0%, 100% { opacity: 1; }
-    50%      { opacity: 0.45; }
-  }
+  @keyframes typingPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
   @keyframes jumpIn {
     from { opacity: 0; transform: translateY(8px) scale(0.9); }
     to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -2018,7 +2248,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     vertical-align: -3px;
   }
   .icon.lg { width: 20px; height: 20px; }
-  .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: #c1cbd5; }
+  .icon.huge { width: 44px; height: 44px; stroke-width: 1.5; color: var(--text-muted-2); }
 
   .app {
     position: fixed; inset: 0;
@@ -2026,17 +2256,16 @@ CHAT_PAGE = """<!DOCTYPE html>
     grid-template-columns: 280px 1fr 260px;
     height: 100vh; height: 100dvh; width: 100vw;
     overflow: hidden;
-    background: #e9eef3;
+    background: var(--bg);
   }
 
   .dd { position: relative; display: inline-block; }
   .dd-toggle {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 5px 9px; border-radius: 4px;
-    border: 1px solid #b5bec8; cursor: pointer;
-    background: linear-gradient(#fbfcfd, #dce3ea);
-    font-family: inherit; font-size: 12px; color: #3a5169;
-    text-shadow: 0 1px 0 #fff;
+    border: 1px solid var(--btn-border); cursor: pointer;
+    background: var(--btn-bg);
+    font-family: inherit; font-size: 12px; color: var(--text);
   }
   .dd-toggle .icon { width: 13px; height: 13px; }
   .dd-toggle .icon.chev { transition: transform 0.22s ease; }
@@ -2046,8 +2275,8 @@ CHAT_PAGE = """<!DOCTYPE html>
   .dd-menu {
     position: absolute; top: calc(100% + 6px); left: 0;
     min-width: 160px;
-    background: #fff;
-    border: 1px solid #b7c2cd; border-radius: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-2); border-radius: 6px;
     box-shadow: 0 10px 28px rgba(0,0,0,0.22);
     padding: 5px; margin: 0; list-style: none;
     opacity: 0; visibility: hidden;
@@ -2059,60 +2288,70 @@ CHAT_PAGE = """<!DOCTYPE html>
   .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
   .dd-menu li {
     padding: 8px 12px; border-radius: 4px; cursor: pointer;
-    font-size: 13px; color: #2b3a4a;
+    font-size: 13px; color: var(--text);
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
   }
-  .dd-menu li:hover { background: #eef2f6; }
-  .dd-menu li.active { background: #e4ebf3; font-weight: bold; }
-  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3f6fa8; }
+  .dd-menu li:hover { background: var(--selection-bg); }
+  .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
+  .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+  .theme-toggle.client-theme {
+    border-color: var(--btn-border);
+    background: var(--btn-bg);
+    color: var(--text-soft);
+    width: 32px; height: 28px;
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .theme-toggle.client-theme:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
+  }
 
   .sidebar {
-    background: #f0f3f7; border-right: 1px solid #c8d1da;
+    background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border);
     display: flex; flex-direction: column; min-width: 0;
     overflow: hidden;
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
   .sb-header {
     padding: 8px 10px;
-    background: linear-gradient(#fbfcfd, #d6dee5);
-    border-bottom: 1px solid #b0bac4;
+    background: linear-gradient(var(--topbar-top), var(--topbar-bot));
+    border-bottom: 1px solid var(--border-2);
     display: flex; align-items: center; justify-content: space-between;
     gap: 6px;
   }
   .logo-mini {
     display: flex; align-items: center; gap: 6px;
-    font-size: 15px; font-weight: bold; color: #2b3a4a;
-    text-shadow: 0 1px 0 #fff;
+    font-size: 15px; font-weight: bold; color: var(--text);
   }
-  .logo-mini .icon { width: 18px; height: 18px; color: #3f6fa8; }
-  .logo-mini span { color: #3f6fa8; }
+  .logo-mini .icon { width: 18px; height: 18px; color: var(--accent); }
+  .logo-mini span { color: var(--accent); }
   .sb-actions { display: flex; align-items: center; gap: 6px; }
 
   .me-line {
     padding: 6px 10px 8px;
-    background: #e8edf3; border-bottom: 1px solid #d3dae0;
-    font-size: 12px; color: #5a6c80;
+    background: var(--bg-soft); border-bottom: 1px solid var(--border-3);
+    font-size: 12px; color: var(--text-muted);
   }
-  .me-line .nick { font-weight: bold; color: #2b3a4a; }
+  .me-line .nick { font-weight: bold; color: var(--text); }
 
   .icon-btn {
-    border: 1px solid #b5bec8; border-radius: 4px;
-    background: linear-gradient(#fbfcfd, #dce3ea);
+    border: 1px solid var(--btn-border); border-radius: 4px;
+    background: var(--btn-bg);
     padding: 6px 9px; cursor: pointer; line-height: 1;
-    color: #3a5169;
+    color: var(--text);
     display: inline-flex; align-items: center; justify-content: center;
     font-family: inherit;
     min-width: 36px; min-height: 32px;
   }
   .icon-btn:active { transform: scale(0.94); }
 
-  .add-wrap { padding: 8px 9px; border-bottom: 1px solid #dbe1e7; }
+  .add-wrap { padding: 8px 9px; border-bottom: 1px solid var(--border-3); }
   .add-btn {
     width: 100%; padding: 8px 10px;
     display: flex; align-items: center; justify-content: center; gap: 7px;
-    border: 1px solid #7a8794; border-radius: 4px;
-    background: linear-gradient(#fbfcfd, #cfd8e0);
-    font-family: inherit; font-size: 12px; color: #2b3a4a;
-    cursor: pointer; text-shadow: 0 1px 0 #fff;
+    border: 1px solid var(--btn-border); border-radius: 4px;
+    background: var(--btn-bg);
+    font-family: inherit; font-size: 12px; color: var(--text);
+    cursor: pointer;
   }
   .add-btn:active { transform: scale(0.98); }
 
@@ -2121,108 +2360,113 @@ CHAT_PAGE = """<!DOCTYPE html>
   .add-form input {
     flex: 1; min-width: 0;
     padding: 6px 9px; font-family: inherit; font-size: 12px;
-    border: 1px solid #9aa4ae; border-radius: 3px;
-    background: #fff; outline: none;
+    border: 1px solid var(--input-border); border-radius: 3px;
+    background: var(--input-bg); color: var(--text); outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
   }
-  .add-form input:focus { border-color: #5a7a9a; }
+  .add-form input:focus { border-color: var(--accent); }
   .add-form button {
     padding: 0 10px; border-radius: 3px;
-    border: 1px solid #35597f; cursor: pointer;
-    background: linear-gradient(#5b8fc4, #3f6fa8);
+    border: 1px solid var(--accent-hover); cursor: pointer;
+    background: var(--accent-bg);
     color: #fff; font-family: inherit; font-size: 12px;
     display: flex; align-items: center; justify-content: center;
   }
-  .add-msg { font-size: 11px; margin-top: 5px; min-height: 14px; color: #7a8695; }
+  .add-msg { font-size: 11px; margin-top: 5px; min-height: 14px; color: var(--text-muted); }
   .add-msg.err { color: #c22; }
   .add-msg.ok  { color: #2f8f3d; }
+  [data-theme="dark"] .add-msg.err { color: #f28a8a; }
+  [data-theme="dark"] .add-msg.ok { color: #6fd183; }
 
-  .search { padding: 7px 9px; border-bottom: 1px solid #d3dae0; background: #eef2f6; }
+  .search { padding: 7px 9px; border-bottom: 1px solid var(--border-3); background: var(--bg); }
   .search-wrap { position: relative; }
   .search-wrap .icon {
     position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
-    color: #98a2ad; width: 13px; height: 13px;
+    color: var(--text-muted-2); width: 13px; height: 13px;
   }
   .search input {
     width: 100%; padding: 6px 9px 6px 26px;
     font-family: inherit; font-size: 12px;
-    border: 1px solid #b5bec8; border-radius: 14px;
-    background: #fff; outline: none;
+    border: 1px solid var(--input-border); border-radius: 14px;
+    background: var(--input-bg); color: var(--text); outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
   }
-  .search input:focus { border-color: #5a7a9a; }
+  .search input:focus { border-color: var(--accent); }
 
   .user-list { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .user-item {
-    padding: 8px 11px; border-bottom: 1px solid #dde3e9;
-    background: #f6f8fa; cursor: pointer; min-width: 0;
+    padding: 8px 11px; border-bottom: 1px solid var(--border-3);
+    background: var(--bg-soft); cursor: pointer; min-width: 0;
+    transition: background 0.12s ease;
   }
-  .user-item:hover  { background: #eaf0f6; }
-  .user-item.active { background: #d3e0ec; }
+  .user-item:hover  { background: var(--selection-bg); }
+  .user-item.active { background: var(--selection-bg); }
   .user-item .row1 { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
   .user-item .nick {
-    font-weight: bold; color: #2b3a4a;
+    font-weight: bold; color: var(--text);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     display: flex; align-items: center; gap: 6px; min-width: 0;
   }
-  .user-item .nick .dot { width: 7px; height: 7px; border-radius: 50%; background: #b5bec8; flex-shrink: 0; }
-  .user-item .nick .dot.on { background: #4caf50; animation: dotPulse 2s ease-in-out infinite; }
-  .user-item .time { font-size: 10px; color: #8a94a0; flex-shrink: 0; }
+  .user-item .nick .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dot-off); flex-shrink: 0; }
+  .user-item .nick .dot.on { background: var(--online); animation: dotPulse 2s ease-in-out infinite; }
+  .user-item .time { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
   .user-item .preview {
-    color: #7a8695; font-size: 11px; margin-top: 2px;
+    color: var(--text-muted); font-size: 11px; margin-top: 2px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .user-item .badge {
-    background: #3f6fa8; color: #fff; font-size: 10px;
+    background: var(--accent); color: #fff; font-size: 10px;
     border-radius: 9px; padding: 1px 6px; min-width: 18px;
     text-align: center; margin-left: 4px;
   }
 
   .empty-list {
-    padding: 22px 14px; text-align: center; color: #98a2ad;
+    padding: 22px 14px; text-align: center; color: var(--text-muted);
     font-size: 12px;
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  .chat { display: flex; flex-direction: column; background: #fff; min-width: 0; overflow: hidden; position: relative; }
+  .chat { display: flex; flex-direction: column; background: var(--chat-bg); min-width: 0; overflow: hidden; position: relative; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
-    background: linear-gradient(#fbfcfd, #d6dee5);
-    border-bottom: 1px solid #b0bac4;
+    background: linear-gradient(var(--topbar-top), var(--topbar-bot));
+    border-bottom: 1px solid var(--border-2);
     display: flex; align-items: center; gap: 10px;
     flex-shrink: 0;
     position: relative; z-index: 5;
   }
   .chat-header .title {
     flex: 1; min-width: 0;
-    font-weight: bold; color: #2b3a4a;
+    font-weight: bold; color: var(--text);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .chat-header .sub { font-size: 11px; color: #7a8695; font-weight: normal; margin-top: 1px; }
+  .chat-header .sub { font-size: 11px; color: var(--text-muted); font-weight: normal; margin-top: 1px; }
   .chat-header .sub.online { color: #2f8f3d; font-weight: bold; }
+  [data-theme="dark"] .chat-header .sub.online { color: #6fd183; }
   .chat-header .sub.typing {
-    color: #3f6fa8; font-weight: bold; font-style: italic;
+    color: var(--accent); font-weight: bold; font-style: italic;
     animation: typingPulse 1.4s ease-in-out infinite;
   }
   .mobile-only { display: none; }
 
   .messages {
     flex: 1; overflow-y: auto; padding: 12px 16px 8px;
-    background: radial-gradient(circle at 80% 10%, #f6f9fc 0%, transparent 60%), #fbfcfd;
+    background: var(--messages-bg);
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
     min-height: 0;
+    transition: background 0.2s ease;
   }
   .empty {
-    color: #a2aab3; text-align: center; margin-top: 60px; font-size: 13px;
+    color: var(--text-muted-2); text-align: center; margin-top: 60px; font-size: 13px;
     display: flex; flex-direction: column; align-items: center; gap: 14px;
   }
 
   .date-sep { text-align: center; margin: 10px 0 8px; }
   .date-sep span {
-    background: #eef2f6; color: #6f7c8b;
+    background: var(--bg); color: var(--text-muted);
     padding: 2px 10px; border-radius: 10px; font-size: 10px;
-    border: 1px solid #dde4eb;
+    border: 1px solid var(--separator);
   }
 
   .msg-row { display: flex; margin-bottom: 2px; align-items: flex-end; gap: 4px; animation: msgIn 0.16s ease-out both; }
@@ -2231,14 +2475,15 @@ CHAT_PAGE = """<!DOCTYPE html>
     max-width: min(72%, 560px);
     padding: 5px 10px 4px;
     border-radius: 12px 12px 12px 3px;
-    background: #eef2f6; border: 1px solid #e3e9ef;
+    background: var(--msg-them-bg); border: 1px solid var(--msg-them-border);
     font-size: 13px; line-height: 1.32;
     word-wrap: break-word; white-space: pre-wrap;
-    color: #22303e;
+    color: var(--msg-them-text);
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
   }
-  .msg-row.mine .msg-bubble { background: #d3e6c8; border-color: #c5dcb5; border-radius: 12px 12px 3px 12px; }
+  .msg-row.mine .msg-bubble { background: var(--msg-mine-bg); border-color: var(--msg-mine-border); border-radius: 12px 12px 3px 12px; }
   .msg-meta {
-    display: inline-block; font-size: 9px; color: #8a94a0; margin-left: 8px;
+    display: inline-block; font-size: 9px; color: var(--msg-meta); margin-left: 8px;
     vertical-align: bottom; opacity: 0.85; white-space: nowrap;
     float: right; margin-top: 4px;
   }
@@ -2247,14 +2492,14 @@ CHAT_PAGE = """<!DOCTYPE html>
     position: absolute; right: 16px; bottom: 70px;
     width: 40px; height: 40px;
     border-radius: 50%;
-    border: 1px solid #b5bec8;
-    background: #fff;
+    border: 1px solid var(--border-2);
+    background: var(--bg-card);
     box-shadow: 0 4px 14px rgba(0,0,0,0.18);
     cursor: pointer;
     display: none;
     align-items: center; justify-content: center;
     z-index: 20;
-    color: #3f6fa8; padding: 0;
+    color: var(--accent); padding: 0;
     animation: jumpIn 0.22s ease-out both;
   }
   .jump-down.visible { display: flex; }
@@ -2264,32 +2509,33 @@ CHAT_PAGE = """<!DOCTYPE html>
     position: absolute; top: -4px; right: -4px;
     background: #e53935; color: #fff; font-size: 10px;
     border-radius: 9px; padding: 1px 6px; min-width: 18px;
-    text-align: center; border: 2px solid #fff;
+    text-align: center; border: 2px solid var(--bg-card);
     font-weight: bold;
   }
 
   .input-area {
-    border-top: 1px solid #c8d1da; padding: 8px 10px;
-    background: #eef2f6;
+    border-top: 1px solid var(--sidebar-border); padding: 8px 10px;
+    background: var(--input-area-bg);
     display: flex; gap: 8px; align-items: flex-end;
     flex-shrink: 0;
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
   .input-area textarea {
     flex: 1; resize: none;
     padding: 8px 12px; font-family: inherit; font-size: 13px;
-    border: 1px solid #b5bec8; border-radius: 18px;
-    background: #fff; outline: none;
+    border: 1px solid var(--input-border); border-radius: 18px;
+    background: var(--input-bg); color: var(--text); outline: none;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
     max-height: 120px; min-height: 36px; line-height: 1.4;
     height: 36px;
   }
-  .input-area textarea:focus { border-color: #5a7a9a; }
+  .input-area textarea:focus { border-color: var(--accent); }
   .input-area button {
     height: 36px;
     padding: 0 18px;
     border-radius: 18px;
-    border: 1px solid #35597f; cursor: pointer;
-    background: linear-gradient(#5b8fc4, #3f6fa8);
+    border: 1px solid var(--accent-hover); cursor: pointer;
+    background: var(--accent-bg);
     color: #fff; font-family: inherit; font-size: 13px;
     text-shadow: 0 1px 0 rgba(0,0,0,0.2);
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -2302,25 +2548,27 @@ CHAT_PAGE = """<!DOCTYPE html>
   .input-area button:active { transform: scale(0.97); }
 
   .info-panel {
-    background: #f0f3f7; border-left: 1px solid #c8d1da;
+    background: var(--sidebar-bg); border-left: 1px solid var(--sidebar-border);
     padding: 16px; overflow-y: auto; min-width: 0;
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
   .info-panel .close-btn { display: none; }
   .info-empty {
-    color: #98a2ad; text-align: center; margin-top: 40px; font-size: 12px;
+    color: var(--text-muted); text-align: center; margin-top: 40px; font-size: 12px;
     display: flex; flex-direction: column; align-items: center; gap: 12px;
   }
-  .info-head { text-align: center; padding-bottom: 14px; border-bottom: 1px solid #dbe1e7; margin-bottom: 14px; }
-  .info-head .name { font-size: 18px; font-weight: bold; color: #23374b; word-break: break-all; }
-  .info-head .status { font-size: 12px; margin-top: 4px; color: #7a8695; }
+  .info-head { text-align: center; padding-bottom: 14px; border-bottom: 1px solid var(--border-3); margin-bottom: 14px; }
+  .info-head .name { font-size: 18px; font-weight: bold; color: var(--text-strong); word-break: break-all; }
+  .info-head .status { font-size: 12px; margin-top: 4px; color: var(--text-muted); }
   .info-head .status.online { color: #2f8f3d; font-weight: bold; }
+  [data-theme="dark"] .info-head .status.online { color: #6fd183; }
   .info-row {
     display: flex; justify-content: space-between;
-    padding: 8px 0; border-bottom: 1px solid #e0e6ec;
+    padding: 8px 0; border-bottom: 1px solid var(--border-3);
     font-size: 12px; gap: 8px;
   }
-  .info-row .k { color: #7a8695; flex-shrink: 0; }
-  .info-row .v { color: #2b3a4a; text-align: right; word-break: break-word; }
+  .info-row .k { color: var(--text-muted); flex-shrink: 0; }
+  .info-row .v { color: var(--text); text-align: right; word-break: break-word; }
 
   .remove-btn {
     display: flex; align-items: center; justify-content: center; gap: 8px;
@@ -2329,7 +2577,10 @@ CHAT_PAGE = """<!DOCTYPE html>
     border: 1px solid #a85a5a; cursor: pointer;
     background: linear-gradient(#fbfcfd, #e9d8d8);
     color: #8f2b2b; font-family: inherit; font-size: 13px;
-    text-shadow: 0 1px 0 #fff;
+  }
+  [data-theme="dark"] .remove-btn {
+    background: linear-gradient(#2a2f38, #3a2626);
+    color: #f28a8a; border-color: #5a3535;
   }
   .remove-btn .icon { width: 15px; height: 15px; }
 
@@ -2338,13 +2589,14 @@ CHAT_PAGE = """<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 8px; pointer-events: none;
   }
   .toast {
-    background: #2b3a4a; color: #fff;
+    background: var(--footer-bg); color: #fff;
     border-radius: 6px; padding: 10px 14px;
     font-size: 12px; max-width: 300px;
     box-shadow: 0 6px 18px rgba(0,0,0,0.25);
     animation: toastIn 0.22s ease-out both;
     transition: opacity 0.25s ease, transform 0.25s ease;
   }
+  [data-theme="dark"] .toast { background: #2a3038; }
   .toast.out { opacity: 0; transform: translateX(24px); }
 
   @media (max-width: 900px) {
@@ -2357,7 +2609,7 @@ CHAT_PAGE = """<!DOCTYPE html>
       transform: translateX(100%);
       transition: transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
       box-shadow: -8px 0 24px rgba(0,0,0,0.25);
-      border-left: 1px solid #b0bac4;
+      border-left: 1px solid var(--border-2);
       padding-top: max(16px, env(safe-area-inset-top));
       padding-bottom: max(16px, env(safe-area-inset-bottom));
     }
@@ -2377,8 +2629,15 @@ CHAT_PAGE = """<!DOCTYPE html>
     .sb-header .icon-btn { padding: 10px; min-width: 44px; min-height: 44px; }
     .sb-header .icon-btn .icon { width: 22px; height: 22px; }
     .dd-toggle { padding: 10px 12px; font-size: 13px; min-height: 44px; }
+    .theme-toggle.client-theme { width: 44px; height: 44px; }
+    .theme-toggle.client-theme .icon { width: 20px; height: 20px; }
 
-    .me-line { padding: 8px 14px; font-size: 13px; }
+    .me-line {
+      padding: 10px 14px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .me-line .nick { font-size: 14px; }
 
     .add-wrap { padding: 12px 14px; }
     .add-btn { padding: 12px 14px; font-size: 15px; border-radius: 6px; min-height: 46px; }
@@ -2461,10 +2720,6 @@ CHAT_PAGE = """<!DOCTYPE html>
     .toast-wrap { bottom: max(16px, env(safe-area-inset-bottom)); right: 12px; left: 12px; }
     .toast { max-width: none; }
   }
-
-  @media (max-width: 380px) {
-    .me-line { display: none; }
-  }
 </style>
 </head>
 <body>
@@ -2478,6 +2733,10 @@ CHAT_PAGE = """<!DOCTYPE html>
         Sld<span>Chat</span>
       </div>
       <div class="sb-actions">
+        <button class="theme-toggle client-theme" id="chatThemeBtn" type="button" title="Theme">
+          <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
+        </button>
         <div class="dd" id="chatLangDd">
           <button class="dd-toggle" type="button" title="Language">
             <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
@@ -2495,15 +2754,15 @@ CHAT_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="me-line"><span data-ci18n="you">Вы вошли как</span> <span class="nick" id="myNick">…</span></div>
+    <div class="me-line"><span data-ci18n="you"></span> <span class="nick" id="myNick">…</span></div>
 
     <div class="add-wrap">
       <button class="add-btn" id="addBtn">
         <svg class="icon" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-        <span data-ci18n="add_contact">Добавить контакт</span>
+        <span data-ci18n="add_contact"></span>
       </button>
       <form class="add-form" id="addForm">
-        <input type="text" id="addInput" placeholder="Ник собеседника" data-ci18n-ph="nick_ph" autocomplete="off" maxlength="20" enterkeyhint="done">
+        <input type="text" id="addInput" data-ci18n-ph="nick_ph" autocomplete="off" maxlength="20" enterkeyhint="done">
         <button type="submit" title="OK">
           <svg class="icon" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
         </button>
@@ -2514,7 +2773,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     <div class="search">
       <div class="search-wrap">
         <svg class="icon" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="searchInput" placeholder="Поиск по контактам" data-ci18n-ph="search_ph" autocomplete="off" enterkeyhint="search">
+        <input type="text" id="searchInput" data-ci18n-ph="search_ph" autocomplete="off" enterkeyhint="search">
       </div>
     </div>
 
@@ -2527,7 +2786,7 @@ CHAT_PAGE = """<!DOCTYPE html>
         <svg class="icon" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
       </button>
       <div class="title">
-        <div id="chatTitle" data-ci18n="pick_peer">Выберите собеседника</div>
+        <div id="chatTitle" data-ci18n="pick_peer"></div>
         <div class="sub" id="chatSub"></div>
       </div>
       <button class="icon-btn mobile-only" id="infoBtn" title="Info">
@@ -2538,7 +2797,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     <div class="messages" id="messages">
       <div class="empty">
         <svg class="icon huge" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-        <div data-ci18n="empty_pick">Слева выберите контакт, чтобы начать переписку</div>
+        <div data-ci18n="empty_pick"></div>
       </div>
     </div>
 
@@ -2548,10 +2807,10 @@ CHAT_PAGE = """<!DOCTYPE html>
     </button>
 
     <div class="input-area" id="inputArea" style="display:none">
-      <textarea id="msgInput" placeholder="Введите сообщение..." data-ci18n-ph="msg_ph" rows="1" enterkeyhint="send"></textarea>
+      <textarea id="msgInput" data-ci18n-ph="msg_ph" rows="1" enterkeyhint="send"></textarea>
       <button id="sendBtn" type="button" title="Send">
         <svg class="icon" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-        <span class="btn-label" data-ci18n="send">Отправить</span>
+        <span class="btn-label" data-ci18n="send"></span>
       </button>
     </div>
   </main>
@@ -2563,7 +2822,7 @@ CHAT_PAGE = """<!DOCTYPE html>
     <div id="infoContent">
       <div class="info-empty">
         <svg class="icon huge" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-        <div data-ci18n="info_empty">Информация о собеседнике появится здесь</div>
+        <div data-ci18n="info_empty"></div>
       </div>
     </div>
   </aside>
@@ -3002,7 +3261,6 @@ async function send(){
     lastIds[current] = Math.max(lastIds[current] || 0, d.message.id);
     appendMessage(d.message);
   }
-  /* возвращаем фокус, чтобы продолжать печатать */
   if (document.activeElement !== inp) {
     try { inp.focus({preventScroll: true}); } catch (e) { inp.focus(); }
   }
@@ -3138,27 +3396,25 @@ $('addForm').onsubmit = async function(e){
   }
 };
 
-/* ======== Отправка: работаем через pointerdown, чтобы не терять фокус ======== */
 (function(){
   var sendBtn = $('sendBtn');
   var lastSendTs = 0;
   function trySend(e){
     if (e && e.preventDefault) e.preventDefault();
+    if (e && e.button !== undefined && e.button !== 0) return;
     var now = Date.now();
-    if (now - lastSendTs < 400) return;  // защита от двойного вызова
+    if (now - lastSendTs < 400) return;
     lastSendTs = now;
     send();
   }
-  /* pointerdown — универсальное событие (мышь + тач) */
-  sendBtn.addEventListener('pointerdown', trySend);
-  /* fallback для очень старых браузеров */
-  if (!window.PointerEvent) {
+  if (window.PointerEvent) {
+    sendBtn.addEventListener('pointerdown', trySend);
+  } else {
     sendBtn.addEventListener('mousedown', trySend);
     sendBtn.addEventListener('touchstart', trySend, {passive: false});
   }
 })();
 
-/* ======== Enter — всегда отправляет, Shift+Enter — перенос ======== */
 $('msgInput').addEventListener('keydown', function(e){
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -3184,6 +3440,11 @@ $('searchInput').addEventListener('input', function(e){ searchQuery = e.target.v
 
 $('messages').addEventListener('scroll', updateJumpBtn, {passive: true});
 
+var chatThemeBtn = document.getElementById('chatThemeBtn');
+if (chatThemeBtn && window.SldTheme) {
+  chatThemeBtn.addEventListener('click', function(){ window.SldTheme.toggle(); });
+}
+
 wireDropdown($('chatLangDd'), function(v){
   lang = v;
   localStorage.setItem('sld_lang', v);
@@ -3202,7 +3463,6 @@ wireDropdown($('chatLangDd'), function(v){
   else { $('chatTitle').textContent = T('pick_peer'); }
 });
 
-/* ============ Мобильные жесты ============ */
 (function(){
   var tSX = 0, tSY = 0, tT = 0;
   document.addEventListener('touchstart', function(e){
@@ -3241,17 +3501,16 @@ init();
 """
 
 
-# ================== МАРШРУТЫ ==================
 def render_page(html: str, base_url: str = "") -> str:
     return (html
-        .replace("__SHARED_CSS__", SHARED_CSS)
-        .replace("__FOOTER__", FOOTER_HTML)
-        .replace("__HEAD_COMMON__", HEAD_COMMON)
-        .replace("__I18N_JS__", I18N_JS)
-        .replace("__BASE_URL__", base_url)
-        .replace("__VERSION__", VERSION)
-        .replace("__VERSION_NAME__", VERSION_NAME)
-        .replace("__VERSION_DATE__", VERSION_DATE))
+            .replace("__SHARED_CSS__", SHARED_CSS)
+            .replace("__FOOTER__", FOOTER_HTML)
+            .replace("__HEAD_COMMON__", HEAD_COMMON)
+            .replace("__I18N_JS__", I18N_JS)
+            .replace("__BASE_URL__", base_url)
+            .replace("__VERSION__", VERSION)
+            .replace("__VERSION_NAME__", VERSION_NAME)
+            .replace("__VERSION_DATE__", VERSION_DATE))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3298,9 +3557,6 @@ async def changelog_page():
 
 
 if __name__ == "__main__":
-    # Значения по умолчанию: доступно со всех интерфейсов, порт 8000.
-    # Можно переопределить через переменные окружения:
-    #   HOST=127.0.0.1 PORT=8080 python main.py
     host = os.getenv("SLDCHAT_HOST") or os.getenv("HOST") or "0.0.0.0"
     try:
         port = int(os.getenv("SLDCHAT_PORT") or os.getenv("PORT") or "8000")
@@ -3309,8 +3565,8 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print(f"  SldChat v{VERSION} \"{VERSION_NAME}\" ({VERSION_DATE})")
-    print(f"  Слушаю {host}:{port}")
-    print(f"  Открой в браузере: http://{'localhost' if host == '0.0.0.0' else host}:{port}")
+    print(f"  Listening on {host}:{port}")
+    print(f"  Open: http://{'localhost' if host == '0.0.0.0' else host}:{port}")
     print("=" * 60)
 
     uvicorn.run(app, host=host, port=port)
