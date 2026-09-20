@@ -9,8 +9,8 @@ import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-VERSION = "0.3"
-VERSION_NAME = "Prism"
+VERSION = "0.3.2"
+VERSION_NAME = "Polish"
 VERSION_DATE = "2026-09-20"
 
 app = FastAPI(title=f"SldChat v{VERSION}")
@@ -344,7 +344,7 @@ async def og_image():
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
-CSS_VARS = """
+SHARED_CSS = """
   :root {
     --bg: #eef2f6;
     --bg-2: #f6f8fa;
@@ -445,9 +445,7 @@ CSS_VARS = """
     --online: #4caf50;
     --dot-off: #5a6470;
   }
-"""
 
-SHARED_CSS = CSS_VARS + """
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html { scroll-behavior: smooth; scroll-padding-top: 76px; }
   html, body { margin: 0; padding: 0; }
@@ -622,7 +620,7 @@ SHARED_CSS = CSS_VARS + """
     transition: background 0.15s ease, border-color 0.15s ease;
     white-space: nowrap;
   }
-  .dd-toggle .icon { width: 14px; height: 14px; color: var(--text-soft); transition: transform 0.22s ease; }
+  .dd-toggle .icon { transition: transform 0.22s ease; }
   .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
   .dd-toggle .dd-label { color: var(--text-muted); }
   .dd-toggle .dd-value { color: var(--text); font-weight: bold; }
@@ -631,17 +629,17 @@ SHARED_CSS = CSS_VARS + """
   }
 
   .dd-menu {
-    position: absolute; bottom: calc(100% + 6px); right: 0; left: auto;
+    position: absolute; top: calc(100% + 6px); right: 0; left: auto;
     min-width: 170px;
     background: var(--bg-card); color: var(--text);
     border: 1px solid var(--border-2); border-radius: 6px;
     box-shadow: 0 10px 28px rgba(0,0,0,0.28);
     padding: 5px; margin: 0; list-style: none;
     opacity: 0; visibility: hidden;
-    transform: translateY(6px) scale(0.97);
-    transform-origin: bottom right;
+    transform: translateY(-6px) scale(0.97);
+    transform-origin: top right;
     transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
-    z-index: 200;
+    z-index: 1000;
   }
   .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
   .dd-menu li {
@@ -652,6 +650,7 @@ SHARED_CSS = CSS_VARS + """
   .dd-menu li:hover { background: var(--selection-bg); }
   .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
   .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+  .dd.dd-up .dd-menu { top: auto; bottom: calc(100% + 6px); transform-origin: bottom right; }
 
   .theme-toggle {
     display: inline-flex; align-items: center; justify-content: center;
@@ -755,52 +754,57 @@ SHARED_CSS = CSS_VARS + """
   }
   .link-arrow:hover { gap: 10px; text-decoration: none; }
 
-  .changelog { max-width: 820px; margin: 0 auto; }
-  .cl-item {
-    position: relative;
-    padding-left: 30px;
-    padding-bottom: 30px;
-    border-left: 2px solid var(--border);
-    margin-left: 8px;
+  .changelog { max-width: 780px; margin: 0 auto; }
+  .cl-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 22px 24px 20px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow-sm);
+    transition: background 0.2s ease, border-color 0.2s ease;
   }
-  .cl-item:last-child { border-left: 2px solid transparent; }
-  .cl-item::before {
-    content: ''; position: absolute; left: -8px; top: 4px;
-    width: 14px; height: 14px; border-radius: 50%;
-    background: var(--accent); border: 3px solid var(--bg);
-    box-shadow: 0 0 0 2px var(--accent);
+  .cl-card.current {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(63,111,168,0.12), var(--shadow-sm);
   }
   .cl-head {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    margin-bottom: 10px;
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-3);
   }
   .cl-ver {
     font-size: 22px; font-weight: bold; color: var(--text-strong);
     font-family: Consolas, "Courier New", monospace;
+    line-height: 1;
   }
   .cl-name { font-size: 15px; color: var(--accent); font-weight: bold; }
   .cl-date {
     font-size: 12px; color: var(--text-muted);
-    background: var(--bg); padding: 2px 10px; border-radius: 10px;
-  }
-  .cl-list { list-style: none; padding: 0; margin: 0; }
-  .cl-list li {
-    padding: 6px 0 6px 24px; position: relative;
-    color: var(--text-soft); font-size: 13px; line-height: 1.5;
-  }
-  .cl-list li::before {
-    content: ''; position: absolute; left: 6px; top: 12px;
-    width: 6px; height: 6px; border-radius: 50%;
-    background: var(--border-2);
+    margin-left: auto;
   }
   .cl-current {
-    display: inline-block;
     background: #e5f3e7; color: #2f8f3d;
     font-size: 10px; text-transform: uppercase;
     letter-spacing: 0.6px; font-weight: bold;
     padding: 2px 8px; border-radius: 10px;
   }
   [data-theme="dark"] .cl-current { background: #1e3a26; color: #6fd183; }
+  .cl-list { list-style: none; padding: 0; margin: 0; }
+  .cl-list li {
+    padding: 5px 0 5px 20px; position: relative;
+    color: var(--text-soft); font-size: 13px; line-height: 1.6;
+    word-wrap: break-word;
+  }
+  .cl-list li::before {
+    content: '';
+    position: absolute; left: 3px; top: 12px;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.55;
+  }
+  .cl-list li b { color: var(--text); }
 
   @media (max-width: 820px) {
     .nav a.navlink { display: none; }
@@ -810,12 +814,15 @@ SHARED_CSS = CSS_VARS + """
     .section h2 { font-size: 22px; }
     .page-head h1 { font-size: 24px; }
     .page-card { padding: 20px 18px; }
+    .cl-card { padding: 18px 18px 16px; }
+    .cl-ver { font-size: 19px; }
+    .cl-date { margin-left: 0; }
     footer .foot-cols { grid-template-columns: 1fr 1fr; gap: 22px; }
     footer .foot-brand { grid-column: 1 / -1; }
     footer .foot-controls { flex-direction: column; align-items: flex-start; gap: 12px; }
     footer .foot-status { gap: 14px; }
-    .dd-menu { left: 0; right: auto; transform-origin: bottom left; }
-    .cl-ver { font-size: 18px; }
+    .dd-menu { left: auto; right: 0; transform-origin: top right; }
+    .dd.dd-up .dd-menu { transform-origin: bottom right; }
   }
 """
 
@@ -1545,78 +1552,163 @@ __SHARED_CSS__
     <p data-i18n="cl_sub"></p>
   </div>
 
-  <div class="changelog">
-
-    <div class="cl-item reveal">
-      <div class="cl-head">
-        <span class="cl-ver">v0.3</span>
-        <span class="cl-name">Prism</span>
-        <span class="cl-date">20 сентября 2026</span>
-        <span class="cl-current" data-i18n="cl_current"></span>
-      </div>
-      <ul class="cl-list">
-        <li><b>Исправлены стили клиента.</b> Восстановлена загрузка CSS-переменных в чате — интерфейс больше не рассыпается.</li>
-        <li>Полностью переработана структура CSS: единый блок <code>:root</code> с палитрой для всех страниц.</li>
-        <li>Иконки тем и переключателей корректно отображаются в обеих темах.</li>
-        <li>Улучшено выравнивание элементов в шапке клиента на мобильных.</li>
-      </ul>
-    </div>
-
-    <div class="cl-item reveal">
-      <div class="cl-head">
-        <span class="cl-ver">v0.2</span>
-        <span class="cl-name">Aurora</span>
-        <span class="cl-date">20 сентября 2026</span>
-      </div>
-      <ul class="cl-list">
-        <li><b>Тёмная тема.</b> Переключение одной кнопкой — в подвале сайта и в клиенте рядом с переключателем языка. Тема запоминается.</li>
-        <li>Уважение системных настроек: при первом входе автоматически выбирается светлая или тёмная тема по <code>prefers-color-scheme</code>.</li>
-        <li>Плавный переход цветов при смене темы.</li>
-        <li>Вся палитра переведена на CSS-переменные — единый источник правды для цветов.</li>
-        <li><b>Исправлено:</b> отправка сообщений с телефона (кнопка и Enter на клавиатуре).</li>
-        <li><b>Исправлено:</b> на телефоне теперь всегда видно, под каким аккаунтом вы вошли.</li>
-        <li>Убрана секция «Серверы» с главной страницы.</li>
-        <li>В подвале появилась версия продукта.</li>
-        <li>Добавлена страница <code>/changelog</code> с историей версий.</li>
-      </ul>
-    </div>
-
-    <div class="cl-item reveal">
-      <div class="cl-head">
-        <span class="cl-ver">v0.1</span>
-        <span class="cl-name">Genesis</span>
-        <span class="cl-date">20 сентября 2026</span>
-      </div>
-      <ul class="cl-list">
-        <li>Первый публичный релиз SldChat.</li>
-        <li>Регистрация и вход по нику и паролю.</li>
-        <li>Мгновенная доставка сообщений через WebSocket.</li>
-        <li>Добавление контактов по нику (двусторонняя связь).</li>
-        <li>Удаление контакта из диалога.</li>
-        <li>Статус «в сети / был(а) недавно».</li>
-        <li>Индикатор «печатает…» в шапке чата.</li>
-        <li>Поиск по контактам.</li>
-        <li>Разделители дат («Сегодня», «Вчера», …).</li>
-        <li>Кнопка «вниз к новым» с бейджем непрочитанных.</li>
-        <li>Адаптивный интерфейс для ПК, планшетов и смартфонов.</li>
-        <li>Свайп от левого края — возврат в список чатов (мобильный).</li>
-        <li>Двуязычный интерфейс: русский и английский.</li>
-        <li>Параметр <code>?lang=ru</code> / <code>?lang=en</code> в ссылках.</li>
-        <li>OpenGraph и Twitter Cards для красивых превью.</li>
-        <li>Собственная SVG-иконка и OG-баннер.</li>
-        <li>Страницы: <code>/privacy</code>, <code>/support</code>.</li>
-        <li>Health-check эндпоинт <code>/health</code>.</li>
-        <li>Простой хостинг: один файл <code>main.py</code>, никакой БД.</li>
-      </ul>
-    </div>
-
-  </div>
+  <div class="changelog" id="changelogRoot"></div>
 </div>
 
 __FOOTER__
 
 <script>
 __I18N_JS__
+
+var CHANGELOG_DATA = [
+  {
+    ver: "0.3.2",
+    name: { ru: "Полировка", en: "Polish" },
+    date: { ru: "20 сентября 2026", en: "September 20, 2026" },
+    current: true,
+    items: {
+      ru: [
+        "<b>Исправлено</b> выпадающее меню выбора языка в клиенте: больше не обрезается, аккуратно позиционируется под кнопкой.",
+        "<b>Исправлена</b> страница Changelog: теперь переводится на английский язык вместе с остальным интерфейсом.",
+        "<b>Переработан</b> дизайн ленты изменений — карточки вместо таймлайна, читается проще.",
+        "Добавлены подверсии 0.3.1 и 0.3.2 в историю релизов.",
+        "Улучшена вёрстка страницы Changelog на мобильных устройствах.",
+      ],
+      en: [
+        "<b>Fixed</b> the language dropdown in the client: no longer clipped, aligned nicely under the button.",
+        "<b>Fixed</b> the Changelog page: now translated to English along with the rest of the interface.",
+        "<b>Redesigned</b> the release timeline — cards instead of a timeline, easier to read.",
+        "Added 0.3.1 and 0.3.2 subversions to the release history.",
+        "Improved the Changelog page layout on mobile.",
+      ]
+    }
+  },
+  {
+    ver: "0.3.1",
+    name: { ru: "Исправление", en: "Patch" },
+    date: { ru: "20 сентября 2026", en: "September 20, 2026" },
+    items: {
+      ru: [
+        "<b>Исправлены</b> стили клиента: восстановлена загрузка CSS-переменных на странице чата.",
+        "Иконки переключателей корректно отображаются в обеих темах.",
+        "Улучшено выравнивание элементов в шапке клиента на мобильных.",
+      ],
+      en: [
+        "<b>Fixed</b> client styles: restored CSS variables loading on the chat page.",
+        "Toggle icons render correctly in both themes.",
+        "Improved alignment of client header on mobile.",
+      ]
+    }
+  },
+  {
+    ver: "0.3.0",
+    name: { ru: "Призм", en: "Prism" },
+    date: { ru: "20 сентября 2026", en: "September 20, 2026" },
+    items: {
+      ru: [
+        "<b>Тёмная тема.</b> Переключение одной кнопкой — в подвале сайта и в клиенте.",
+        "Уважение системных настроек <code>prefers-color-scheme</code> при первом входе.",
+        "Плавный переход цветов при смене темы.",
+        "Вся палитра переведена на CSS-переменные — единый источник правды.",
+        "Исправлена отправка сообщений с телефона (кнопка и Enter).",
+        "На телефоне всегда видно, под каким аккаунтом вы вошли.",
+        "Убрана секция «Серверы» с главной страницы.",
+        "Добавлена страница /changelog и версия продукта в подвале.",
+      ],
+      en: [
+        "<b>Dark theme.</b> Switch with one tap — in the footer and in the client.",
+        "Respects system <code>prefers-color-scheme</code> on first visit.",
+        "Smooth color transitions when switching themes.",
+        "Entire palette moved to CSS variables — single source of truth.",
+        "Fixed sending messages from mobile (button and Enter).",
+        "The client always shows which account you're signed in as.",
+        "Removed the Servers section from the landing page.",
+        "Added /changelog page and product version in the footer.",
+      ]
+    }
+  },
+  {
+    ver: "0.2.0",
+    name: { ru: "Аврора", en: "Aurora" },
+    date: { ru: "20 сентября 2026", en: "September 20, 2026" },
+    items: {
+      ru: [
+        "Первая версия тёмной темы.",
+        "Индикатор «печатает…» в шапке чата.",
+        "Кнопка «вниз к новым» с бейджем непрочитанных.",
+        "Свайп от левого края — возврат в список чатов.",
+        "Переключатель языка в клиенте.",
+      ],
+      en: [
+        "First dark theme version.",
+        "Typing indicator in the chat header.",
+        "Jump-to-latest button with unread badge.",
+        "Swipe from left edge to go back to the chat list.",
+        "Language switcher inside the client.",
+      ]
+    }
+  },
+  {
+    ver: "0.1.0",
+    name: { ru: "Genesis", en: "Genesis" },
+    date: { ru: "20 сентября 2026", en: "September 20, 2026" },
+    items: {
+      ru: [
+        "Первый публичный релиз SldChat.",
+        "Регистрация и вход по нику и паролю.",
+        "Мгновенная доставка сообщений через WebSocket.",
+        "Добавление контактов по нику (двусторонняя связь).",
+        "Удаление контакта из диалога.",
+        "Статус «в сети / был(а) недавно».",
+        "Поиск по контактам, разделители дат.",
+        "Двуязычный интерфейс: русский и английский.",
+        "OpenGraph и Twitter Cards для превью.",
+        "Страницы: /privacy, /support.",
+        "Простой хостинг: один файл main.py, никакой БД.",
+      ],
+      en: [
+        "First public release of SldChat.",
+        "Sign-up and sign-in by nick and password.",
+        "Instant message delivery via WebSocket.",
+        "Add contacts by nick (bidirectional).",
+        "Remove a contact from the dialog.",
+        "Online / last-seen status.",
+        "Contact search, date separators.",
+        "Bilingual interface: Russian and English.",
+        "OpenGraph and Twitter Cards for previews.",
+        "Pages: /privacy, /support.",
+        "Simple hosting: a single main.py file, no DB.",
+      ]
+    }
+  }
+];
+
+function renderChangelog(lang){
+  var root = document.getElementById('changelogRoot');
+  if (!root) return;
+  var cur = (I18N[lang] || I18N.ru).cl_current || 'current';
+  var html = '';
+  for (var i = 0; i < CHANGELOG_DATA.length; i++) {
+    var e = CHANGELOG_DATA[i];
+    var items = (e.items && (e.items[lang] || e.items.ru)) || [];
+    var name  = (e.name && (e.name[lang] || e.name.ru)) || '';
+    var date  = (e.date && (e.date[lang] || e.date.ru)) || '';
+    html += '<div class="cl-card' + (e.current ? ' current' : '') + '">';
+    html += '<div class="cl-head">';
+    html += '<span class="cl-ver">v' + e.ver + '</span>';
+    html += '<span class="cl-name">' + name + '</span>';
+    html += '<span class="cl-date">' + date + '</span>';
+    if (e.current) html += '<span class="cl-current">' + cur + '</span>';
+    html += '</div>';
+    html += '<ul class="cl-list">';
+    for (var j = 0; j < items.length; j++) {
+      html += '<li>' + items[j] + '</li>';
+    }
+    html += '</ul>';
+    html += '</div>';
+  }
+  root.innerHTML = html;
+}
 
 (function(){
   var lang = SldLang.pickInitial();
@@ -1626,6 +1718,7 @@ __I18N_JS__
   SldLang.updateUrl(lang);
   SldLang.propagateLinks(lang);
   document.documentElement.lang = lang;
+  renderChangelog(lang);
   SldFooter.markActive(document.getElementById('footLangDd'), lang);
   SldFooter.wire(document.getElementById('footLangDd'), function(v){
     localStorage.setItem('sld_lang', v);
@@ -1635,6 +1728,7 @@ __I18N_JS__
     SldLang.propagateLinks(v);
     SldFooter.markActive(document.getElementById('footLangDd'), v);
     document.documentElement.lang = v;
+    renderChangelog(v);
   });
 })();
 </script>
@@ -1991,15 +2085,12 @@ __SHARED_CSS__
   .form { display: block; }
   .form.hidden { display: none; }
 
-  .dd .dd-toggle {
-    padding: 6px 10px; font-size: 12px;
-  }
-  .dd .dd-menu {
+  .topline .dd-menu {
     top: calc(100% + 6px); bottom: auto;
-    transform-origin: top right;
     transform: translateY(-6px) scale(0.97);
+    transform-origin: top right;
   }
-  .dd.open .dd-menu { transform: translateY(0) scale(1); }
+  .topline .dd.open .dd-menu { transform: translateY(0) scale(1); }
 
   @media (max-width: 820px) {
     .topline { padding: 12px 16px; }
@@ -2253,70 +2344,12 @@ __SHARED_CSS__
     display: grid;
     grid-template-columns: 280px 1fr 260px;
     height: 100vh; height: 100dvh; width: 100vw;
-    overflow: hidden;
     background: var(--bg);
   }
-
-  .sidebar .dd, .sb-actions .dd {
-    position: relative;
-  }
-  .sb-actions .dd .dd-toggle {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 5px 9px; border-radius: 4px;
-    border: 1px solid var(--btn-border); cursor: pointer;
-    background: var(--btn-bg);
-    font-family: inherit; font-size: 12px; color: var(--text);
-  }
-  .sb-actions .dd .dd-toggle .icon { width: 13px; height: 13px; color: var(--text-soft); }
-  .sb-actions .dd .dd-toggle .icon.chev { transition: transform 0.22s ease; }
-  .sb-actions .dd.open .dd-toggle .icon.chev { transform: rotate(180deg); }
-  .sb-actions .dd .dd-toggle .dd-value { font-weight: bold; }
-  .sb-actions .dd .dd-menu {
-    position: absolute; top: calc(100% + 6px); left: 0;
-    min-width: 160px;
-    background: var(--bg-card);
-    border: 1px solid var(--border-2); border-radius: 6px;
-    box-shadow: 0 10px 28px rgba(0,0,0,0.22);
-    padding: 5px; margin: 0; list-style: none;
-    opacity: 0; visibility: hidden;
-    transform: translateY(-6px) scale(0.97);
-    transform-origin: top left;
-    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
-    z-index: 200;
-  }
-  .sb-actions .dd.open .dd-menu { opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
-  .sb-actions .dd .dd-menu li {
-    padding: 8px 12px; border-radius: 4px; cursor: pointer;
-    font-size: 13px; color: var(--text);
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  }
-  .sb-actions .dd .dd-menu li:hover { background: var(--selection-bg); }
-  .sb-actions .dd .dd-menu li.active { background: var(--selection-bg); font-weight: bold; }
-  .sb-actions .dd .dd-menu li.active::after { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
-
-  .theme-toggle {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 32px; height: 30px;
-    border-radius: 4px;
-    border: 1px solid var(--btn-border);
-    background: var(--btn-bg);
-    color: var(--text-soft);
-    cursor: pointer; padding: 0; font-family: inherit;
-    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  }
-  .theme-toggle .icon { width: 15px; height: 15px; }
-  @media (hover: hover) and (pointer: fine) {
-    .theme-toggle:hover { background: var(--btn-bg-hover); border-color: var(--accent); color: var(--accent); }
-  }
-  .theme-toggle:active { transform: scale(0.94); }
-  .theme-toggle .icon-sun, .theme-toggle .icon-moon { display: none; }
-  html[data-theme="light"] .theme-toggle .icon-moon { display: block; }
-  html[data-theme="dark"]  .theme-toggle .icon-sun  { display: block; }
 
   .sidebar {
     background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border);
     display: flex; flex-direction: column; min-width: 0;
-    overflow: hidden;
     transition: background 0.2s ease, border-color 0.2s ease;
   }
   .sb-header {
@@ -2325,6 +2358,8 @@ __SHARED_CSS__
     border-bottom: 1px solid var(--border-2);
     display: flex; align-items: center; justify-content: space-between;
     gap: 6px;
+    position: relative;
+    z-index: 10;
   }
   .logo-mini {
     display: flex; align-items: center; gap: 6px;
@@ -2333,6 +2368,12 @@ __SHARED_CSS__
   .logo-mini .icon { width: 18px; height: 18px; color: var(--accent); }
   .logo-mini span { color: var(--accent); }
   .sb-actions { display: flex; align-items: center; gap: 6px; }
+  .sb-actions .dd { position: relative; }
+
+  .theme-toggle.compact {
+    width: 32px; height: 30px;
+  }
+  .theme-toggle.compact .icon { width: 15px; height: 15px; }
 
   .me-line {
     padding: 6px 10px 8px;
@@ -2434,7 +2475,7 @@ __SHARED_CSS__
     display: flex; flex-direction: column; align-items: center; gap: 10px;
   }
 
-  .chat { display: flex; flex-direction: column; background: var(--chat-bg); min-width: 0; overflow: hidden; position: relative; }
+  .chat { display: flex; flex-direction: column; background: var(--chat-bg); min-width: 0; position: relative; }
   .chat-header {
     padding: 8px 12px; min-height: 52px;
     background: linear-gradient(var(--topbar-top), var(--topbar-bot));
@@ -2637,9 +2678,9 @@ __SHARED_CSS__
     .sb-header .icon-btn { padding: 10px; min-width: 44px; min-height: 44px; }
     .sb-header .icon-btn .icon { width: 22px; height: 22px; }
     .sb-actions { gap: 8px; }
-    .sb-actions .dd .dd-toggle { padding: 8px 12px; font-size: 13px; min-height: 44px; }
-    .theme-toggle { width: 44px; height: 44px; }
-    .theme-toggle .icon { width: 20px; height: 20px; }
+    .sb-actions .dd .dd-toggle { padding: 10px 12px; font-size: 13px; min-height: 44px; }
+    .theme-toggle.compact { width: 44px; height: 44px; }
+    .theme-toggle.compact .icon { width: 20px; height: 20px; }
 
     .me-line {
       padding: 10px 14px;
@@ -2742,7 +2783,7 @@ __SHARED_CSS__
         Sld<span>Chat</span>
       </div>
       <div class="sb-actions">
-        <button class="theme-toggle" id="chatThemeBtn" type="button" title="Theme">
+        <button class="theme-toggle compact" id="chatThemeBtn" type="button" title="Theme">
           <svg class="icon icon-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
           <svg class="icon icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>
         </button>
@@ -3350,8 +3391,7 @@ function wireDropdown(root, onSelect){
   if (!toggle || !menu) return;
   toggle.addEventListener('click', function(e){
     e.stopPropagation();
-    var opened = document.querySelectorAll('.dd.open');
-    for (var i = 0; i < opened.length; i++) if (opened[i] !== root) opened[i].classList.remove('open');
+    document.querySelectorAll('.dd.open').forEach(function(o){ if (o !== root) o.classList.remove('open'); });
     root.classList.toggle('open');
   });
   menu.querySelectorAll('li').forEach(function(li){
