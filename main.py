@@ -2,19 +2,9 @@
 # pip install fastapi uvicorn supabase
 # uvicorn main:app --reload
 
-import os
-import time
-import uuid
-import json
-import hmac
-import hashlib
-import secrets
-import asyncio
-import re
-import urllib.request
+import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -25,7 +15,6 @@ app.add_middleware(GZipMiddleware, minimum_size=800)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
-
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -48,22 +37,18 @@ MAX_BIO_LEN = 200
 MAX_DM_LEN = 2000
 TRUNCATE_LINES = 100
 TRUNCATE_CHARS = 500
-
 SESSION_TTL = 30 * 24 * 3600
 USER_CACHE_TTL = 3.0
 RATE_WINDOW = 60.0
 PRESENCE_TTL = 45.0
-
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
-
-RU_COUNTRIES = {"RU", "BY", "KZ", "UA", "KG", "TJ", "UZ", "AM", "AZ", "MD"}
+RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 _lang_cache: Dict[str, str] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
 
-# ============ Event Bus (SSE) ============
 class EventBus:
     def __init__(self):
         self.clients: Dict[str, List[asyncio.Queue]] = {}
@@ -79,10 +64,8 @@ class EventBus:
     def unsubscribe(self, nick: str, q: asyncio.Queue):
         lst = self.clients.get(nick)
         if lst and q in lst:
-            try:
-                lst.remove(q)
-            except ValueError:
-                pass
+            try: lst.remove(q)
+            except ValueError: pass
         if not self.clients.get(nick):
             self.clients.pop(nick, None)
             self.presence[nick] = time.time() - PRESENCE_TTL + 4.0
@@ -94,40 +77,30 @@ class EventBus:
             self._broadcast_presence(nick, False)
 
     def touch(self, nick: str):
-        if nick:
-            self.presence[nick] = time.time()
+        if nick: self.presence[nick] = time.time()
 
     def is_online(self, nick: str) -> bool:
-        if not nick:
-            return False
-        if self.clients.get(nick):
-            return True
+        if not nick: return False
+        if self.clients.get(nick): return True
         return (time.time() - self.presence.get(nick, 0)) < 5.0
 
     def _broadcast_presence(self, nick: str, online: bool):
-        if not nick:
-            return
+        if not nick: return
         ev = {"type": "presence", "nick": nick, "online": online}
-        try:
-            threads = db_dm_my_threads(nick)
-        except Exception:
-            threads = []
+        try: threads = db_dm_my_threads(nick)
+        except Exception: threads = []
         seen = set()
         for t in threads:
             other = t["user_b"] if t["user_a"] == nick else t["user_a"]
-            if other in seen:
-                continue
+            if other in seen: continue
             seen.add(other)
             self._deliver(other, ev)
 
     def _deliver(self, nick: str, ev: dict):
         for q in list(self.clients.get(nick, [])):
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:
-                pass
-            except Exception:
-                pass
+            try: q.put_nowait(ev)
+            except asyncio.QueueFull: pass
+            except Exception: pass
 
 
 bus = EventBus()
@@ -141,18 +114,15 @@ async def _startup():
 
 
 def bus_publish(nick: str, ev: dict) -> None:
-    if not nick:
-        return
+    if not nick: return
     if MAIN_LOOP and not MAIN_LOOP.is_closed():
         try:
             MAIN_LOOP.call_soon_threadsafe(bus._deliver, nick, ev)
             return
-        except RuntimeError:
-            pass
+        except RuntimeError: pass
     bus._deliver(nick, ev)
 
 
-# ============ Password / tokens / utils ============
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     iters = 100_000
@@ -190,70 +160,52 @@ def rate_limit(key: str, max_req: int, window: float = RATE_WINDOW) -> bool:
 
 
 def ts_to_iso(ts) -> str:
-    if isinstance(ts, str):
-        return ts
-    try:
-        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
-    except Exception:
-        return datetime.now(tz=timezone.utc).isoformat()
+    if isinstance(ts, str): return ts
+    try: return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception: return datetime.now(tz=timezone.utc).isoformat()
 
 
 def iso_to_ts(s) -> float:
-    if isinstance(s, (int, float)):
-        return float(s)
-    if not s:
-        return time.time()
+    if isinstance(s, (int, float)): return float(s)
+    if not s: return time.time()
     try:
-        if isinstance(s, str) and s.endswith("Z"):
-            s = s[:-1] + "+00:00"
+        if isinstance(s, str) and s.endswith("Z"): s = s[:-1] + "+00:00"
         return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return time.time()
+    except Exception: return time.time()
 
 
 def extract_mentions(text: str) -> List[str]:
     out, seen = [], set()
     for m in MENTION_RE.finditer(text):
         n = m.group(1)
-        if n.lower() in seen:
-            continue
-        seen.add(n.lower())
-        out.append(n)
+        if n.lower() in seen: continue
+        seen.add(n.lower()); out.append(n)
     return out
 
 
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
-    if fwd:
-        return fwd.split(",")[0].strip()
+    if fwd: return fwd.split(",")[0].strip()
     return request.client.host if request.client else ""
 
 
 def detect_lang(ip: str, accept_language: str) -> str:
     key = ip or "unknown"
-    if key in _lang_cache:
-        return _lang_cache[key]
+    if key in _lang_cache: return _lang_cache[key]
     lang = None
-    private = (
-        not ip or ip.startswith("127.") or ip.startswith("10.")
-        or ip.startswith("192.168.") or ip.startswith("172.")
-        or ip in ("::1", "localhost")
-    )
+    private = (not ip or ip.startswith("127.") or ip.startswith("10.")
+               or ip.startswith("192.168.") or ip.startswith("172.")
+               or ip in ("::1","localhost"))
     if not private:
         try:
-            req = urllib.request.Request(
-                f"http://ip-api.com/json/{ip}?fields=countryCode",
-                headers={"User-Agent": "sldChat"},
-            )
+            req = urllib.request.Request(f"http://ip-api.com/json/{ip}?fields=countryCode",
+                                         headers={"User-Agent": "sldChat"})
             with urllib.request.urlopen(req, timeout=2) as r:
                 data = json.loads(r.read().decode())
                 cc = (data.get("countryCode") or "").upper()
-                if cc in RU_COUNTRIES:
-                    lang = "ru"
-                elif cc:
-                    lang = "en"
-        except Exception:
-            pass
+                if cc in RU_COUNTRIES: lang = "ru"
+                elif cc: lang = "en"
+        except Exception: pass
     if not lang:
         al = (accept_language or "").lower()
         lang = "ru" if (al.startswith("ru") or ",ru" in al or "ru-" in al) else "en"
@@ -263,49 +215,38 @@ def detect_lang(ip: str, accept_language: str) -> str:
 
 def get_lang(request: Request) -> str:
     qp = request.query_params.get("lang")
-    if qp in ("ru", "en"):
-        return qp
+    if qp in ("ru","en"): return qp
     ck = request.cookies.get("sldchat_lang")
-    if ck in ("ru", "en"):
-        return ck
-    return detect_lang(get_client_ip(request), request.headers.get("accept-language", ""))
+    if ck in ("ru","en"): return ck
+    return detect_lang(get_client_ip(request), request.headers.get("accept-language",""))
 
 
 def get_current_user(request: Request) -> Optional[dict]:
     token = request.headers.get("x-auth")
-    if not token:
-        return None
+    if not token: return None
     sess = SESSIONS.get(token)
-    if not sess:
-        return None
+    if not sess: return None
     if time.time() - sess.get("created", 0) > SESSION_TTL:
-        SESSIONS.pop(token, None)
-        return None
+        SESSIONS.pop(token, None); return None
     nick = sess.get("nick")
-    if not nick:
-        return None
+    if not nick: return None
     return db_load_user_cached(nick)
 
 
 def require_user(request: Request) -> dict:
     u = get_current_user(request)
-    if not u:
-        raise HTTPException(401, "unauthorized")
+    if not u: raise HTTPException(401, "unauthorized")
     bus.touch(u["nick"])
     return u
 
 
 def invalidate_user_cache(nick: Optional[str] = None) -> None:
-    if nick is None:
-        _USER_CACHE.clear()
-    else:
-        _USER_CACHE.pop(nick.lower(), None)
+    if nick is None: _USER_CACHE.clear()
+    else: _USER_CACHE.pop(nick.lower(), None)
 
 
-# ============ DB: users ============
 def db_load_user(nick: str) -> Optional[dict]:
-    if not nick:
-        return None
+    if not nick: return None
     if supabase:
         try:
             r = supabase.table("users").select("*").ilike("nick", nick).limit(1).execute()
@@ -317,35 +258,31 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
+                row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
                 return row
-        except Exception as e:
-            print("[sldChat] db_load_user error:", e)
+        except Exception as e: print("[sldChat] db_load_user error:", e)
         return None
     for u in USERS.values():
-        if u["nick"].lower() == nick.lower():
-            return u
+        if u["nick"].lower() == nick.lower(): return u
     return None
 
 
 def db_load_user_cached(nick: str) -> Optional[dict]:
     now = time.time()
-    entry = _USER_CACHE.get(nick.lower())
-    if entry and now - entry[0] < USER_CACHE_TTL:
-        return entry[1]
+    e = _USER_CACHE.get(nick.lower())
+    if e and now - e[0] < USER_CACHE_TTL: return e[1]
     u = db_load_user(nick)
-    if u is not None:
-        _USER_CACHE[nick.lower()] = (now, u)
+    if u is not None: _USER_CACHE[nick.lower()] = (now, u)
     return u
 
 
 def db_save_user(u: dict) -> None:
     USERS[u["nick"]] = u
     if not supabase:
-        invalidate_user_cache(u["nick"])
-        return
+        invalidate_user_cache(u["nick"]); return
     try:
         supabase.table("users").upsert({
-            "nick": u["nick"], "name": u["name"], "bio": u.get("bio", ""),
+            "nick": u["nick"], "name": u["name"], "bio": u.get("bio",""),
             "password": u["password"], "created_at": ts_to_iso(u["created_at"]),
             "following": list(u.get("following") or []),
             "followers": list(u.get("followers") or []),
@@ -353,23 +290,19 @@ def db_save_user(u: dict) -> None:
             "allow_followers_view": u.get("allow_followers_view", True),
             "allow_following_view": u.get("allow_following_view", True),
             "notify_on_new_post": u.get("notify_on_new_post", True),
+            "allow_wall_posts": u.get("allow_wall_posts", True),
         }).execute()
-    except Exception as e:
-        print("[sldChat] db_save_user error:", e)
+    except Exception as e: print("[sldChat] db_save_user error:", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
 
 def db_update_user_fields(nick: str, patch: dict) -> None:
     if not supabase:
-        if nick in USERS:
-            USERS[nick].update(patch)
-        invalidate_user_cache(nick)
-        return
-    try:
-        supabase.table("users").update(patch).eq("nick", nick).execute()
-    except Exception as e:
-        print("[sldChat] db_update_user_fields error:", e)
+        if nick in USERS: USERS[nick].update(patch)
+        invalidate_user_cache(nick); return
+    try: supabase.table("users").update(patch).eq("nick", nick).execute()
+    except Exception as e: print("[sldChat] db_update_user_fields error:", e)
     invalidate_user_cache(nick)
 
 
@@ -385,84 +318,70 @@ def db_all_users() -> List[dict]:
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
+                row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
                 out.append(row)
             return out
         except Exception as e:
-            print("[sldChat] db_all_users error:", e)
-            return []
+            print("[sldChat] db_all_users error:", e); return []
     return list(USERS.values())
 
 
-# ============ DB: posts ============
 def db_create_post(p: dict) -> None:
     if not supabase:
-        POSTS_MEM[p["id"]] = p
-        return
+        POSTS_MEM[p["id"]] = p; return
     try:
         supabase.table("posts").insert({
             "id": p["id"], "text": p["text"], "author": p["author"],
             "created_at": ts_to_iso(p["created_at"]),
+            "wall_owner": p.get("wall_owner"),
         }).execute()
-    except Exception as e:
-        print("[sldChat] db_create_post error:", e)
+    except Exception as e: print("[sldChat] db_create_post error:", e)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
     if not supabase:
-        if pid in POSTS_MEM:
-            POSTS_MEM[pid]["text"] = text
+        if pid in POSTS_MEM: POSTS_MEM[pid]["text"] = text
         return
-    try:
-        supabase.table("posts").update({"text": text}).eq("id", pid).execute()
-    except Exception as e:
-        print("[sldChat] db_update_post error:", e)
+    try: supabase.table("posts").update({"text": text}).eq("id", pid).execute()
+    except Exception as e: print("[sldChat] db_update_post error:", e)
 
 
 def db_delete_post(pid: str) -> None:
     if not supabase:
-        POSTS_MEM.pop(pid, None)
-        return
+        POSTS_MEM.pop(pid, None); return
     try:
         supabase.table("notifications").delete().eq("post_id", pid).execute()
         supabase.table("posts").delete().eq("id", pid).execute()
-    except Exception as e:
-        print("[sldChat] db_delete_post error:", e)
+    except Exception as e: print("[sldChat] db_delete_post error:", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
     if supabase:
         try:
             r = supabase.table("posts").select("*").eq("id", pid).limit(1).execute()
-            if not r.data:
-                return None
+            if not r.data: return None
             row = r.data[0]
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldChat] db_get_post error:", e)
-            return None
+            print("[sldChat] db_get_post error:", e); return None
     return POSTS_MEM.get(pid)
 
 
 def db_list_posts(q: str = "", author: str = "") -> List[dict]:
     if supabase:
         try:
-            query = supabase.table("posts").select("*")
-            if author:
-                query = query.eq("author", author)
-            if q:
-                query = query.ilike("text", f"%{q}%")
+            query = supabase.table("posts").select("*").is_("wall_owner", "null")
+            if author: query = query.eq("author", author)
+            if q: query = query.ilike("text", f"%{q}%")
             query = query.order("created_at", desc=True).limit(300)
             rows = query.execute().data or []
-            for row in rows:
-                row["created_at"] = iso_to_ts(row.get("created_at"))
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_list_posts error:", e)
-            return []
-    items = list(POSTS_MEM.values())
-    if author:
-        items = [p for p in items if p["author"] == author]
+            print("[sldChat] db_list_posts error:", e); return []
+    items = [p for p in POSTS_MEM.values() if not p.get("wall_owner")]
+    if author: items = [p for p in items if p["author"] == author]
     if q:
         n = q.lower()
         items = [p for p in items if n in p["text"].lower()]
@@ -470,15 +389,28 @@ def db_list_posts(q: str = "", author: str = "") -> List[dict]:
     return items
 
 
+def db_list_wall_posts(owner: str) -> List[dict]:
+    if supabase:
+        try:
+            r = (supabase.table("posts").select("*")
+                 .eq("wall_owner", owner).order("created_at", desc=True).limit(200).execute())
+            rows = r.data or []
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
+        except Exception as e:
+            print("[sldChat] db_list_wall_posts error:", e); return []
+    items = [p for p in POSTS_MEM.values() if p.get("wall_owner") == owner]
+    items.sort(key=lambda p: p["created_at"], reverse=True)
+    return items
+
+
 def db_post_votes(post_ids: List[str]) -> List[dict]:
-    if not post_ids:
-        return []
+    if not post_ids: return []
     if supabase:
         try:
             return supabase.table("post_votes").select("*").in_("post_id", post_ids).execute().data or []
         except Exception as e:
-            print("[sldChat] db_post_votes error:", e)
-            return []
+            print("[sldChat] db_post_votes error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -495,57 +427,43 @@ def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
                 supabase.table("post_votes").delete().eq("post_id", post_id).eq("voter_id", voter_id).execute()
             else:
                 supabase.table("post_votes").upsert({
-                    "post_id": post_id, "voter_id": voter_id, "direction": direction,
-                }).execute()
-        except Exception as e:
-            print("[sldChat] db_set_post_vote error:", e)
+                    "post_id": post_id, "voter_id": voter_id, "direction": direction}).execute()
+        except Exception as e: print("[sldChat] db_set_post_vote error:", e)
         return
     p = POSTS_MEM.get(post_id)
-    if not p:
-        return
-    if direction == 0:
-        p["votes"].pop(voter_id, None)
-    else:
-        p["votes"][voter_id] = direction
+    if not p: return
+    if direction == 0: p["votes"].pop(voter_id, None)
+    else: p["votes"][voter_id] = direction
 
 
 def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
-    if not post_ids:
-        return []
+    if not post_ids: return []
     if supabase:
         try:
-            rows = (supabase.table("comments").select("*")
-                    .in_("post_id", post_ids)
-                    .order("created_at")
-                    .execute().data or [])
-            for row in rows:
-                row["created_at"] = iso_to_ts(row.get("created_at"))
+            rows = (supabase.table("comments").select("*").in_("post_id", post_ids)
+                    .order("created_at").execute().data or [])
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_comments_for_posts error:", e)
-            return []
+            print("[sldChat] db_comments_for_posts error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
         if p:
             for c in p.get("comments", []):
-                out.append({
-                    "id": c["id"], "post_id": pid, "author": c["author"],
-                    "parent_id": c.get("parent_id"),
-                    "text": c["text"], "created_at": c["created_at"],
-                })
+                out.append({"id": c["id"], "post_id": pid, "author": c["author"],
+                            "parent_id": c.get("parent_id"), "text": c["text"],
+                            "created_at": c["created_at"]})
     return out
 
 
 def db_comment_votes(comment_ids: List[str]) -> List[dict]:
-    if not comment_ids:
-        return []
+    if not comment_ids: return []
     if supabase:
         try:
             return supabase.table("comment_votes").select("*").in_("comment_id", comment_ids).execute().data or []
         except Exception as e:
-            print("[sldChat] db_comment_votes error:", e)
-            return []
+            print("[sldChat] db_comment_votes error:", e); return []
     out = []
     for pid, p in POSTS_MEM.items():
         for c in p.get("comments", []):
@@ -561,17 +479,14 @@ def db_create_comment(c: dict) -> None:
         if p:
             p.setdefault("comments", []).append({
                 "id": c["id"], "author": c["author"], "parent_id": c.get("parent_id"),
-                "text": c["text"], "created_at": c["created_at"], "votes": {},
-            })
+                "text": c["text"], "created_at": c["created_at"], "votes": {}})
         return
     try:
         supabase.table("comments").insert({
             "id": c["id"], "post_id": c["post_id"], "author": c["author"],
-            "parent_id": c.get("parent_id"),
-            "text": c["text"], "created_at": ts_to_iso(c["created_at"]),
-        }).execute()
-    except Exception as e:
-        print("[sldChat] db_create_comment error:", e)
+            "parent_id": c.get("parent_id"), "text": c["text"],
+            "created_at": ts_to_iso(c["created_at"])}).execute()
+    except Exception as e: print("[sldChat] db_create_comment error:", e)
 
 
 def db_update_comment_text(cid: str, text: str) -> None:
@@ -579,13 +494,10 @@ def db_update_comment_text(cid: str, text: str) -> None:
         for p in POSTS_MEM.values():
             for c in p.get("comments", []):
                 if c["id"] == cid:
-                    c["text"] = text
-                    return
+                    c["text"] = text; return
         return
-    try:
-        supabase.table("comments").update({"text": text}).eq("id", cid).execute()
-    except Exception as e:
-        print("[sldChat] db_update_comment error:", e)
+    try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
+    except Exception as e: print("[sldChat] db_update_comment error:", e)
 
 
 def db_delete_comment(cid: str) -> None:
@@ -596,30 +508,25 @@ def db_delete_comment(cid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("comment_id", cid).execute()
         supabase.table("comments").delete().eq("id", cid).execute()
-    except Exception as e:
-        print("[sldChat] db_delete_comment error:", e)
+    except Exception as e: print("[sldChat] db_delete_comment error:", e)
 
 
 def db_get_comment(cid: str) -> Optional[dict]:
     if supabase:
         try:
             r = supabase.table("comments").select("*").eq("id", cid).limit(1).execute()
-            if not r.data:
-                return None
+            if not r.data: return None
             row = r.data[0]
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldChat] db_get_comment error:", e)
-            return None
+            print("[sldChat] db_get_comment error:", e); return None
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
-                return {
-                    "id": c["id"], "post_id": p["id"], "author": c["author"],
-                    "parent_id": c.get("parent_id"),
-                    "text": c["text"], "created_at": c["created_at"],
-                }
+                return {"id": c["id"], "post_id": p["id"], "author": c["author"],
+                        "parent_id": c.get("parent_id"), "text": c["text"],
+                        "created_at": c["created_at"]}
     return None
 
 
@@ -630,52 +537,37 @@ def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
                 supabase.table("comment_votes").delete().eq("comment_id", cid).eq("voter_id", voter_id).execute()
             else:
                 supabase.table("comment_votes").upsert({
-                    "comment_id": cid, "voter_id": voter_id, "direction": direction,
-                }).execute()
-        except Exception as e:
-            print("[sldChat] db_set_comment_vote error:", e)
+                    "comment_id": cid, "voter_id": voter_id, "direction": direction}).execute()
+        except Exception as e: print("[sldChat] db_set_comment_vote error:", e)
         return
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
-                if direction == 0:
-                    c["votes"].pop(voter_id, None)
-                else:
-                    c["votes"][voter_id] = direction
+                if direction == 0: c["votes"].pop(voter_id, None)
+                else: c["votes"][voter_id] = direction
                 return
 
 
-# ============ DB: notifications ============
 def db_notify(to_nick: str, ntype: str, from_nick: str,
               post_id: str = "", comment_id: str = "", text: str = "") -> None:
-    if not to_nick or to_nick == from_nick:
-        return
+    if not to_nick or to_nick == from_nick: return
     to_user = db_load_user_cached(to_nick)
     if to_user:
         bl = to_user.get("blacklist") or []
-        if from_nick in bl:
-            return
-        if ntype == "new_post" and not to_user.get("notify_on_new_post", True):
-            return
-    n = {
-        "id": uuid.uuid4().hex[:10],
-        "to_nick": to_nick, "type": ntype, "from_nick": from_nick,
-        "post_id": post_id, "comment_id": comment_id,
-        "text": text, "read": False, "created_at": time.time(),
-    }
+        if from_nick in bl: return
+        if ntype == "new_post" and not to_user.get("notify_on_new_post", True): return
+    n = {"id": uuid.uuid4().hex[:10], "to_nick": to_nick, "type": ntype,
+         "from_nick": from_nick, "post_id": post_id, "comment_id": comment_id,
+         "text": text, "read": False, "created_at": time.time()}
     if supabase:
         try:
             supabase.table("notifications").insert({
                 "id": n["id"], "to_nick": n["to_nick"], "type": n["type"],
                 "from_nick": n["from_nick"], "post_id": n["post_id"],
-                "comment_id": n["comment_id"] or None,
-                "text": n["text"], "read": n["read"],
-                "created_at": ts_to_iso(n["created_at"]),
-            }).execute()
-        except Exception as e:
-            print("[sldChat] db_notify error:", e)
-        bus_publish(to_nick, {"type": "notification", "notif": n})
-        return
+                "comment_id": n["comment_id"] or None, "text": n["text"],
+                "read": n["read"], "created_at": ts_to_iso(n["created_at"])}).execute()
+        except Exception as e: print("[sldChat] db_notify error:", e)
+        bus_publish(to_nick, {"type": "notification", "notif": n}); return
     NOTIFS_MEM.setdefault(to_nick, []).append(n)
     bus_publish(to_nick, {"type": "notification", "notif": n})
 
@@ -683,15 +575,13 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
 def db_notifications(nick: str) -> List[dict]:
     if supabase:
         try:
-            r = (supabase.table("notifications").select("*")
-                 .eq("to_nick", nick).order("created_at", desc=True).limit(100).execute())
+            r = (supabase.table("notifications").select("*").eq("to_nick", nick)
+                 .order("created_at", desc=True).limit(100).execute())
             rows = r.data or []
-            for row in rows:
-                row["created_at"] = iso_to_ts(row.get("created_at"))
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_notifications error:", e)
-            return []
+            print("[sldChat] db_notifications error:", e); return []
     items = list(NOTIFS_MEM.get(nick, []))
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:100]
@@ -704,28 +594,22 @@ def db_notifications_unread_count(nick: str) -> int:
                  .eq("to_nick", nick).eq("read", False).limit(1).execute())
             return r.count or 0
         except Exception as e:
-            print("[sldChat] db_notif_unread error:", e)
-            return 0
+            print("[sldChat] db_notif_unread error:", e); return 0
     return sum(1 for n in NOTIFS_MEM.get(nick, []) if not n.get("read"))
 
 
 def db_notifications_mark_read(nick: str) -> None:
     if supabase:
-        try:
-            supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
-        except Exception as e:
-            print("[sldChat] db_notif_read error:", e)
+        try: supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
+        except Exception as e: print("[sldChat] db_notif_read error:", e)
         return
-    for n in NOTIFS_MEM.get(nick, []):
-        n["read"] = True
+    for n in NOTIFS_MEM.get(nick, []): n["read"] = True
 
 
 def db_notifications_clear(nick: str) -> None:
     if supabase:
-        try:
-            supabase.table("notifications").delete().eq("to_nick", nick).execute()
-        except Exception as e:
-            print("[sldChat] db_notif_clear error:", e)
+        try: supabase.table("notifications").delete().eq("to_nick", nick).execute()
+        except Exception as e: print("[sldChat] db_notif_clear error:", e)
         return
     NOTIFS_MEM[nick] = []
 
@@ -734,22 +618,17 @@ def db_clear_dm_start_notifs(nick: str, from_nick: Optional[str] = None) -> None
     if supabase:
         try:
             q = supabase.table("notifications").delete().eq("to_nick", nick).eq("type", "dm_start")
-            if from_nick:
-                q = q.eq("from_nick", from_nick)
+            if from_nick: q = q.eq("from_nick", from_nick)
             q.execute()
-        except Exception as e:
-            print("[sldChat] clear_dm_start error:", e)
+        except Exception as e: print("[sldChat] clear_dm_start error:", e)
         return
     def keep(n):
-        if n.get("type") != "dm_start":
-            return True
-        if from_nick and n.get("from_nick") != from_nick:
-            return True
+        if n.get("type") != "dm_start": return True
+        if from_nick and n.get("from_nick") != from_nick: return True
         return False
     NOTIFS_MEM[nick] = [n for n in NOTIFS_MEM.get(nick, []) if keep(n)]
 
 
-# ============ DB: DM ============
 def thread_pair(a: str, b: str) -> Tuple[str, str]:
     return (a, b) if a < b else (b, a)
 
@@ -767,8 +646,7 @@ def db_dm_find_thread(a: str, b: str) -> Optional[dict]:
                 row["last_read_a"] = iso_to_ts(row.get("last_read_a")) if row.get("last_read_a") else 0
                 row["last_read_b"] = iso_to_ts(row.get("last_read_b")) if row.get("last_read_b") else 0
                 return row
-        except Exception as e:
-            print("[sldChat] db_dm_find_thread error:", e)
+        except Exception as e: print("[sldChat] db_dm_find_thread error:", e)
         return None
     return DM_THREADS_MEM.get(ua + "|" + ub)
 
@@ -776,20 +654,15 @@ def db_dm_find_thread(a: str, b: str) -> Optional[dict]:
 def db_dm_create_thread(a: str, b: str) -> dict:
     ua, ub = thread_pair(a, b)
     tid = uuid.uuid4().hex[:12]
-    row = {
-        "id": tid, "user_a": ua, "user_b": ub,
-        "created_at": time.time(), "last_message_at": time.time(),
-        "last_read_a": 0, "last_read_b": 0,
-    }
+    row = {"id": tid, "user_a": ua, "user_b": ub, "created_at": time.time(),
+           "last_message_at": time.time(), "last_read_a": 0, "last_read_b": 0}
     if supabase:
         try:
             supabase.table("dm_threads").insert({
                 "id": tid, "user_a": ua, "user_b": ub,
                 "created_at": ts_to_iso(row["created_at"]),
-                "last_message_at": ts_to_iso(row["last_message_at"]),
-            }).execute()
-        except Exception as e:
-            print("[sldChat] db_dm_create_thread error:", e)
+                "last_message_at": ts_to_iso(row["last_message_at"])}).execute()
+        except Exception as e: print("[sldChat] db_dm_create_thread error:", e)
         return row
     DM_THREADS_MEM[ua + "|" + ub] = row
     return row
@@ -797,61 +670,47 @@ def db_dm_create_thread(a: str, b: str) -> dict:
 
 def db_dm_get_or_create_thread(a: str, b: str) -> Tuple[dict, bool]:
     t = db_dm_find_thread(a, b)
-    if t:
-        return t, False
+    if t: return t, False
     return db_dm_create_thread(a, b), True
 
 
 def db_dm_delete_thread(tid: str) -> None:
     if supabase:
-        try:
-            supabase.table("dm_threads").delete().eq("id", tid).execute()
-        except Exception as e:
-            print("[sldChat] db_dm_delete_thread error:", e)
+        try: supabase.table("dm_threads").delete().eq("id", tid).execute()
+        except Exception as e: print("[sldChat] db_dm_delete_thread error:", e)
         return
     for k in list(DM_THREADS_MEM.keys()):
-        if DM_THREADS_MEM[k]["id"] == tid:
-            del DM_THREADS_MEM[k]
+        if DM_THREADS_MEM[k]["id"] == tid: del DM_THREADS_MEM[k]
     DM_MSGS_MEM.pop(tid, None)
 
 
 def db_dm_update_thread_last_message(tid: str, ts: float) -> None:
     if supabase:
-        try:
-            supabase.table("dm_threads").update({"last_message_at": ts_to_iso(ts)}).eq("id", tid).execute()
-        except Exception as e:
-            print("[sldChat] db_dm_update_thread error:", e)
+        try: supabase.table("dm_threads").update({"last_message_at": ts_to_iso(ts)}).eq("id", tid).execute()
+        except Exception as e: print("[sldChat] db_dm_update_thread error:", e)
         return
     for k, v in DM_THREADS_MEM.items():
-        if v["id"] == tid:
-            v["last_message_at"] = ts
-            return
+        if v["id"] == tid: v["last_message_at"] = ts; return
 
 
 def db_dm_mark_read(tid: str, nick: str) -> None:
     t = db_dm_get_thread_by_id(tid)
-    if not t:
-        return
+    if not t: return
     now = time.time()
     field = "last_read_a" if t["user_a"] == nick else "last_read_b"
     if supabase:
-        try:
-            supabase.table("dm_threads").update({field: ts_to_iso(now)}).eq("id", tid).execute()
-        except Exception as e:
-            print("[sldChat] db_dm_mark_read error:", e)
+        try: supabase.table("dm_threads").update({field: ts_to_iso(now)}).eq("id", tid).execute()
+        except Exception as e: print("[sldChat] db_dm_mark_read error:", e)
         return
     for k, v in DM_THREADS_MEM.items():
-        if v["id"] == tid:
-            v[field] = now
-            return
+        if v["id"] == tid: v[field] = now; return
 
 
 def db_dm_get_thread_by_id(tid: str) -> Optional[dict]:
     if supabase:
         try:
             r = supabase.table("dm_threads").select("*").eq("id", tid).limit(1).execute()
-            if not r.data:
-                return None
+            if not r.data: return None
             row = r.data[0]
             row["created_at"] = iso_to_ts(row.get("created_at"))
             row["last_message_at"] = iso_to_ts(row.get("last_message_at"))
@@ -859,11 +718,9 @@ def db_dm_get_thread_by_id(tid: str) -> Optional[dict]:
             row["last_read_b"] = iso_to_ts(row.get("last_read_b")) if row.get("last_read_b") else 0
             return row
         except Exception as e:
-            print("[sldChat] db_dm_get_thread error:", e)
-            return None
+            print("[sldChat] db_dm_get_thread error:", e); return None
     for v in DM_THREADS_MEM.values():
-        if v["id"] == tid:
-            return v
+        if v["id"] == tid: return v
     return None
 
 
@@ -875,10 +732,8 @@ def db_dm_create_message(tid: str, from_nick: str, text: str) -> dict:
         try:
             supabase.table("dm_messages").insert({
                 "id": mid, "thread_id": tid, "from_nick": from_nick,
-                "text": text, "created_at": ts_to_iso(ts),
-            }).execute()
-        except Exception as e:
-            print("[sldChat] db_dm_create_message error:", e)
+                "text": text, "created_at": ts_to_iso(ts)}).execute()
+        except Exception as e: print("[sldChat] db_dm_create_message error:", e)
         return row
     DM_MSGS_MEM.setdefault(tid, []).append(row)
     return row
@@ -887,15 +742,13 @@ def db_dm_create_message(tid: str, from_nick: str, text: str) -> dict:
 def db_dm_messages(tid: str) -> List[dict]:
     if supabase:
         try:
-            r = (supabase.table("dm_messages").select("*")
-                 .eq("thread_id", tid).order("created_at").limit(500).execute())
+            r = (supabase.table("dm_messages").select("*").eq("thread_id", tid)
+                 .order("created_at").limit(500).execute())
             rows = r.data or []
-            for row in rows:
-                row["created_at"] = iso_to_ts(row.get("created_at"))
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_dm_messages error:", e)
-            return []
+            print("[sldChat] db_dm_messages error:", e); return []
     items = list(DM_MSGS_MEM.get(tid, []))
     items.sort(key=lambda x: x["created_at"])
     return items
@@ -904,10 +757,10 @@ def db_dm_messages(tid: str) -> List[dict]:
 def db_dm_my_threads(nick: str) -> List[dict]:
     if supabase:
         try:
-            r1 = (supabase.table("dm_threads").select("*")
-                  .eq("user_a", nick).order("last_message_at", desc=True).limit(100).execute())
-            r2 = (supabase.table("dm_threads").select("*")
-                  .eq("user_b", nick).order("last_message_at", desc=True).limit(100).execute())
+            r1 = (supabase.table("dm_threads").select("*").eq("user_a", nick)
+                  .order("last_message_at", desc=True).limit(100).execute())
+            r2 = (supabase.table("dm_threads").select("*").eq("user_b", nick)
+                  .order("last_message_at", desc=True).limit(100).execute())
             rows = (r1.data or []) + (r2.data or [])
             for row in rows:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
@@ -917,8 +770,7 @@ def db_dm_my_threads(nick: str) -> List[dict]:
             rows.sort(key=lambda x: x["last_message_at"], reverse=True)
             return rows
         except Exception as e:
-            print("[sldChat] db_dm_my_threads error:", e)
-            return []
+            print("[sldChat] db_dm_my_threads error:", e); return []
     rows = [v for v in DM_THREADS_MEM.values() if v["user_a"] == nick or v["user_b"] == nick]
     rows.sort(key=lambda x: x["last_message_at"], reverse=True)
     return rows
@@ -938,36 +790,30 @@ def db_dm_unread_count(nick: str) -> int:
                 other = t["user_b"] if t["user_a"] == nick else t["user_a"]
                 q = (supabase.table("dm_messages").select("id", count="exact")
                      .eq("thread_id", t["id"]).eq("from_nick", other)
-                     .gt("created_at", my_read or "1970-01-01T00:00:00+00:00")
-                     .limit(1).execute())
+                     .gt("created_at", my_read or "1970-01-01T00:00:00+00:00").limit(1).execute())
                 total += (q.count or 0)
             return total
         except Exception as e:
-            print("[sldChat] db_dm_unread error:", e)
-            return 0
+            print("[sldChat] db_dm_unread error:", e); return 0
     threads = db_dm_my_threads(nick)
     total = 0
     for t in threads:
         my_read = t["last_read_a"] if t["user_a"] == nick else t["last_read_b"]
         other = t["user_b"] if t["user_a"] == nick else t["user_a"]
         for m in db_dm_messages(t["id"]):
-            if m["from_nick"] == other and m["created_at"] > (my_read or 0):
-                total += 1
+            if m["from_nick"] == other and m["created_at"] > (my_read or 0): total += 1
     return total
 
 
 def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
     if not supabase:
         if old_nick in USERS:
-            u = USERS.pop(old_nick)
-            u["nick"] = new_nick
-            USERS[new_nick] = u
+            u = USERS.pop(old_nick); u["nick"] = new_nick; USERS[new_nick] = u
         for p in POSTS_MEM.values():
-            if p["author"] == old_nick:
-                p["author"] = new_nick
+            if p["author"] == old_nick: p["author"] = new_nick
+            if p.get("wall_owner") == old_nick: p["wall_owner"] = new_nick
             for c in p.get("comments", []):
-                if c["author"] == old_nick:
-                    c["author"] = new_nick
+                if c["author"] == old_nick: c["author"] = new_nick
         for u in USERS.values():
             if old_nick in u.get("following", set()):
                 u["following"].discard(old_nick); u["following"].add(new_nick)
@@ -985,12 +831,10 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
         for msgs in DM_MSGS_MEM.values():
             for m in msgs:
                 if m["from_nick"] == old_nick: m["from_nick"] = new_nick
-        invalidate_user_cache()
-        return
+        invalidate_user_cache(); return
     try:
         old = db_load_user(old_nick)
-        if not old:
-            return
+        if not old: return
         supabase.table("users").insert({
             "nick": new_nick, "name": old.get("name", new_nick),
             "bio": old.get("bio", ""), "password": old.get("password", ""),
@@ -1001,9 +845,10 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "allow_followers_view": old.get("allow_followers_view", True),
             "allow_following_view": old.get("allow_following_view", True),
             "notify_on_new_post": old.get("notify_on_new_post", True),
-        }).execute()
+            "allow_wall_posts": old.get("allow_wall_posts", True)}).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
+        supabase.table("posts").update({"wall_owner": new_nick}).eq("wall_owner", old_nick).execute()
         supabase.table("comments").update({"author": new_nick}).eq("author", old_nick).execute()
         supabase.table("post_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
         supabase.table("comment_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
@@ -1015,38 +860,29 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
         for u in db_all_users():
             patch = {}
             fl = u.get("following") or set()
-            if old_nick in fl:
-                patch["following"] = [new_nick if x == old_nick else x for x in fl]
+            if old_nick in fl: patch["following"] = [new_nick if x == old_nick else x for x in fl]
             fw = u.get("followers") or set()
-            if old_nick in fw:
-                patch["followers"] = [new_nick if x == old_nick else x for x in fw]
+            if old_nick in fw: patch["followers"] = [new_nick if x == old_nick else x for x in fw]
             bl = u.get("blacklist") or []
-            if old_nick in bl:
-                patch["blacklist"] = [new_nick if x == old_nick else x for x in bl]
-            if patch:
-                db_update_user_fields(u["nick"], patch)
-    except Exception as e:
-        print("[sldChat] _rename_user_everywhere error:", e)
+            if old_nick in bl: patch["blacklist"] = [new_nick if x == old_nick else x for x in bl]
+            if patch: db_update_user_fields(u["nick"], patch)
+    except Exception as e: print("[sldChat] _rename_user_everywhere error:", e)
     invalidate_user_cache()
 
 
 def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
-    if not posts:
-        return []
+    if not posts: return []
     post_ids = [p["id"] for p in posts]
     votes = db_post_votes(post_ids)
     vmap: Dict[str, Dict[str, int]] = {}
-    for v in votes:
-        vmap.setdefault(v["post_id"], {})[v["voter_id"]] = v["direction"]
+    for v in votes: vmap.setdefault(v["post_id"], {})[v["voter_id"]] = v["direction"]
     comments = db_comments_for_posts(post_ids)
     cmap: Dict[str, List[dict]] = {}
-    for c in comments:
-        cmap.setdefault(c["post_id"], []).append(c)
+    for c in comments: cmap.setdefault(c["post_id"], []).append(c)
     comment_ids = [c["id"] for c in comments]
     cvotes = db_comment_votes(comment_ids)
     cvmap: Dict[str, Dict[str, int]] = {}
-    for v in cvotes:
-        cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
+    for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
     out = []
     for p in posts:
         pvotes = vmap.get(p["id"], {})
@@ -1059,117 +895,66 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
             cup = sum(1 for d in cv.values() if d == 1)
             cdown = sum(1 for d in cv.values() if d == -1)
             cuv = cv.get(voter_id, 0)
-            clist.append({
-                "id": c["id"], "text": c["text"], "created_at": c["created_at"],
-                "author": c.get("author"), "parent_id": c.get("parent_id"),
-                "upvotes": cup, "downvotes": cdown, "user_vote": cuv,
-            })
-        out.append({
-            "id": p["id"], "text": p["text"], "created_at": p["created_at"],
-            "author": p.get("author"),
-            "upvotes": up, "downvotes": down, "user_vote": uv,
-            "comments": clist,
-        })
+            clist.append({"id": c["id"], "text": c["text"], "created_at": c["created_at"],
+                          "author": c.get("author"), "parent_id": c.get("parent_id"),
+                          "upvotes": cup, "downvotes": cdown, "user_vote": cuv})
+        out.append({"id": p["id"], "text": p["text"], "created_at": p["created_at"],
+                    "author": p.get("author"), "wall_owner": p.get("wall_owner"),
+                    "upvotes": up, "downvotes": down, "user_vote": uv, "comments": clist})
     return out
 
 
 def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
-    d = {
-        "nick": u["nick"], "name": u["name"], "bio": u.get("bio") or "",
-        "created_at": u["created_at"],
-        "followers": len(u.get("followers") or []),
-        "following": len(u.get("following") or []),
-        "is_me": viewer_nick == u["nick"],
-        "online": bus.is_online(u["nick"]),
-    }
+    d = {"nick": u["nick"], "name": u["name"], "bio": u.get("bio") or "",
+         "created_at": u["created_at"],
+         "followers": len(u.get("followers") or []),
+         "following": len(u.get("following") or []),
+         "is_me": viewer_nick == u["nick"],
+         "online": bus.is_online(u["nick"])}
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
         d["blacklist"] = list(u.get("blacklist") or [])
         d["notify_on_new_post"] = u.get("notify_on_new_post", True)
+        d["allow_wall_posts"] = u.get("allow_wall_posts", True)
+    else:
+        d["allow_wall_posts"] = u.get("allow_wall_posts", True)
     return d
 
 
-class PostIn(BaseModel):
-    text: str
-
-
-class PostEditIn(BaseModel):
-    text: str
-
-
-class VoteIn(BaseModel):
-    direction: int
-
-
-class CommentIn(BaseModel):
-    text: str
-    parent_id: Optional[str] = None
-
-
-class CommentEditIn(BaseModel):
-    text: str
-
-
-class RegisterIn(BaseModel):
-    name: str
-    nick: str
-    password: str
-    password_confirm: str
-
-
-class LoginIn(BaseModel):
-    nick: str
-    password: str
-
-
-class ProfileUpdateIn(BaseModel):
-    name: str
-    nick: str
-    bio: str = ""
-
-
+class PostIn(BaseModel): text: str
+class PostEditIn(BaseModel): text: str
+class VoteIn(BaseModel): direction: int
+class CommentIn(BaseModel): text: str; parent_id: Optional[str] = None
+class CommentEditIn(BaseModel): text: str
+class RegisterIn(BaseModel): name: str; nick: str; password: str; password_confirm: str
+class LoginIn(BaseModel): nick: str; password: str
+class ProfileUpdateIn(BaseModel): name: str; nick: str; bio: str = ""
 class SettingsIn(BaseModel):
     allow_followers_view: Optional[bool] = None
     allow_following_view: Optional[bool] = None
     notify_on_new_post: Optional[bool] = None
+    allow_wall_posts: Optional[bool] = None
+class DMSendIn(BaseModel): to: str; text: str
+class BlacklistIn(BaseModel): nick: str
 
 
-class DMSendIn(BaseModel):
-    to: str
-    text: str
-
-
-class BlacklistIn(BaseModel):
-    nick: str
-
-
-# ============ API: auth ============
 @app.post("/api/register")
 def api_register(data: RegisterIn, request: Request):
     ip = get_client_ip(request)
-    if not rate_limit("reg:" + ip, 5, 3600):
-        raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("reg:" + ip, 5, 3600): raise HTTPException(429, "err_rate_limit")
     name = data.name.strip()
     nick = data.nick.strip().lstrip("@")
-    if not NICK_RE.match(nick):
-        raise HTTPException(400, "err_bad_nick")
-    if len(name) < 1 or len(name) > 50:
-        raise HTTPException(400, "err_bad_name")
-    if len(data.password) < 6:
-        raise HTTPException(400, "err_short_pass")
-    if data.password != data.password_confirm:
-        raise HTTPException(400, "err_pass_mismatch")
-    if db_load_user(nick):
-        raise HTTPException(400, "err_nick_taken")
-    u = {
-        "nick": nick, "name": name, "bio": "",
-        "password": hash_password(data.password),
-        "created_at": time.time(),
-        "following": set(), "followers": set(), "blacklist": [],
-        "allow_followers_view": True, "allow_following_view": True,
-        "notify_on_new_post": True,
-    }
+    if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
+    if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
+    if len(data.password) < 6: raise HTTPException(400, "err_short_pass")
+    if data.password != data.password_confirm: raise HTTPException(400, "err_pass_mismatch")
+    if db_load_user(nick): raise HTTPException(400, "err_nick_taken")
+    u = {"nick": nick, "name": name, "bio": "",
+         "password": hash_password(data.password), "created_at": time.time(),
+         "following": set(), "followers": set(), "blacklist": [],
+         "allow_followers_view": True, "allow_following_view": True,
+         "notify_on_new_post": True, "allow_wall_posts": True}
     db_save_user(u)
     token = new_token()
     SESSIONS[token] = {"nick": nick, "created": time.time()}
@@ -1179,12 +964,10 @@ def api_register(data: RegisterIn, request: Request):
 @app.post("/api/login")
 def api_login(data: LoginIn, request: Request):
     ip = get_client_ip(request)
-    if not rate_limit("log:" + ip, 10, 300):
-        raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("log:" + ip, 10, 300): raise HTTPException(429, "err_rate_limit")
     nick = data.nick.strip().lstrip("@")
     u = db_load_user(nick)
-    if not u or not check_password(data.password, u["password"]):
-        raise HTTPException(400, "err_bad_login")
+    if not u or not check_password(data.password, u["password"]): raise HTTPException(400, "err_bad_login")
     token = new_token()
     SESSIONS[token] = {"nick": u["nick"], "created": time.time()}
     return {"token": token, "user": serialize_user(u, u["nick"])}
@@ -1195,8 +978,7 @@ def api_logout(request: Request):
     token = request.headers.get("x-auth")
     if token:
         sess = SESSIONS.pop(token, None)
-        if sess:
-            bus.set_offline(sess.get("nick"))
+        if sess: bus.set_offline(sess.get("nick"))
     return {"ok": True}
 
 
@@ -1212,24 +994,19 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     name = data.name.strip()
     nick = data.nick.strip().lstrip("@")
     bio = data.bio.strip()
-    if len(name) < 1 or len(name) > 50:
-        raise HTTPException(400, "err_bad_name")
-    if not NICK_RE.match(nick):
-        raise HTTPException(400, "err_bad_nick")
-    if len(bio) > MAX_BIO_LEN:
-        raise HTTPException(400, "err_bio_too_long")
+    if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
+    if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
+    if len(bio) > MAX_BIO_LEN: raise HTTPException(400, "err_bio_too_long")
     old_nick = me["nick"]
     nick_changed = (nick.lower() != old_nick.lower())
     if nick_changed:
         exists = db_load_user(nick)
-        if exists and exists["nick"].lower() != old_nick.lower():
-            raise HTTPException(400, "err_nick_taken")
+        if exists and exists["nick"].lower() != old_nick.lower(): raise HTTPException(400, "err_nick_taken")
     db_update_user_fields(old_nick, {"name": name, "bio": bio})
     if nick_changed:
         _rename_user_everywhere(old_nick, nick)
         for t, s in list(SESSIONS.items()):
-            if s.get("nick") == old_nick:
-                s["nick"] = nick
+            if s.get("nick") == old_nick: s["nick"] = nick
         invalidate_user_cache()
     u = db_load_user(nick)
     return {"ok": True, "user": serialize_user(u, u["nick"])}
@@ -1239,14 +1016,11 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
 def api_set_settings(data: SettingsIn, request: Request):
     me = require_user(request)
     patch = {}
-    if data.allow_followers_view is not None:
-        patch["allow_followers_view"] = bool(data.allow_followers_view)
-    if data.allow_following_view is not None:
-        patch["allow_following_view"] = bool(data.allow_following_view)
-    if data.notify_on_new_post is not None:
-        patch["notify_on_new_post"] = bool(data.notify_on_new_post)
-    if patch:
-        db_update_user_fields(me["nick"], patch)
+    if data.allow_followers_view is not None: patch["allow_followers_view"] = bool(data.allow_followers_view)
+    if data.allow_following_view is not None: patch["allow_following_view"] = bool(data.allow_following_view)
+    if data.notify_on_new_post is not None: patch["notify_on_new_post"] = bool(data.notify_on_new_post)
+    if data.allow_wall_posts is not None: patch["allow_wall_posts"] = bool(data.allow_wall_posts)
+    if patch: db_update_user_fields(me["nick"], patch)
     return {"ok": True}
 
 
@@ -1254,17 +1028,13 @@ def api_set_settings(data: SettingsIn, request: Request):
 def api_bl_add(data: BlacklistIn, request: Request):
     me = require_user(request)
     nick = data.nick.strip().lstrip("@")
-    if not nick:
-        raise HTTPException(400, "empty")
+    if not nick: raise HTTPException(400, "empty")
     target = db_load_user(nick)
-    if not target:
-        raise HTTPException(404, "not found")
-    if target["nick"] == me["nick"]:
-        raise HTTPException(400, "self")
+    if not target: raise HTTPException(404, "not found")
+    if target["nick"] == me["nick"]: raise HTTPException(400, "self")
     bl = list(me.get("blacklist") or [])
     if target["nick"] not in bl:
-        bl.append(target["nick"])
-        db_update_user_fields(me["nick"], {"blacklist": bl})
+        bl.append(target["nick"]); db_update_user_fields(me["nick"], {"blacklist": bl})
     return {"ok": True, "blacklist": bl}
 
 
@@ -1277,7 +1047,6 @@ def api_bl_remove(nick: str, request: Request):
     return {"ok": True, "blacklist": bl}
 
 
-# ============ API: users ============
 @app.get("/api/users")
 def api_users_list(request: Request, q: str = ""):
     users = db_all_users()
@@ -1293,8 +1062,7 @@ def api_users_list(request: Request, q: str = ""):
 @app.get("/api/users/{nick}")
 def api_user(nick: str, request: Request):
     u = db_load_user(nick)
-    if not u:
-        raise HTTPException(404, "not found")
+    if not u: raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     data = serialize_user(u, viewer["nick"] if viewer else None)
     data["is_following"] = bool(viewer and u["nick"] in (viewer.get("following") or set()))
@@ -1304,8 +1072,7 @@ def api_user(nick: str, request: Request):
 @app.get("/api/users/{nick}/followers")
 def api_followers(nick: str, request: Request):
     u = db_load_user(nick)
-    if not u:
-        raise HTTPException(404, "not found")
+    if not u: raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     vn = viewer["nick"] if viewer else None
     is_owner = vn == u["nick"]
@@ -1319,8 +1086,7 @@ def api_followers(nick: str, request: Request):
     out = []
     for n in followers:
         fu = db_load_user(n)
-        if fu:
-            out.append(serialize_user(fu, vn))
+        if fu: out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out, "limited": False}
 
@@ -1328,8 +1094,7 @@ def api_followers(nick: str, request: Request):
 @app.get("/api/users/{nick}/following")
 def api_following(nick: str, request: Request):
     u = db_load_user(nick)
-    if not u:
-        raise HTTPException(404, "not found")
+    if not u: raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     vn = viewer["nick"] if viewer else None
     is_owner = vn == u["nick"]
@@ -1343,8 +1108,7 @@ def api_following(nick: str, request: Request):
     out = []
     for n in following:
         fu = db_load_user(n)
-        if fu:
-            out.append(serialize_user(fu, vn))
+        if fu: out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out, "limited": False}
 
@@ -1353,10 +1117,8 @@ def api_following(nick: str, request: Request):
 def api_follow(nick: str, request: Request):
     me = require_user(request)
     target = db_load_user(nick)
-    if not target:
-        raise HTTPException(404, "not found")
-    if target["nick"] == me["nick"]:
-        raise HTTPException(400, "self")
+    if not target: raise HTTPException(404, "not found")
+    if target["nick"] == me["nick"]: raise HTTPException(400, "self")
     if target["nick"] not in (me.get("following") or set()):
         nf = set(me.get("following") or set()); nf.add(target["nick"])
         db_update_user_fields(me["nick"], {"following": list(nf)})
@@ -1364,8 +1126,7 @@ def api_follow(nick: str, request: Request):
         db_update_user_fields(target["nick"], {"followers": list(nfw)})
         db_notify(target["nick"], "follow", me["nick"])
     target = db_load_user(nick)
-    data = serialize_user(target, me["nick"])
-    data["is_following"] = True
+    data = serialize_user(target, me["nick"]); data["is_following"] = True
     return data
 
 
@@ -1373,20 +1134,17 @@ def api_follow(nick: str, request: Request):
 def api_unfollow(nick: str, request: Request):
     me = require_user(request)
     target = db_load_user(nick)
-    if not target:
-        raise HTTPException(404, "not found")
+    if not target: raise HTTPException(404, "not found")
     if target["nick"] in (me.get("following") or set()):
         nf = set(me.get("following") or set()); nf.discard(target["nick"])
         db_update_user_fields(me["nick"], {"following": list(nf)})
         nfw = set(target.get("followers") or set()); nfw.discard(me["nick"])
         db_update_user_fields(target["nick"], {"followers": list(nfw)})
     target = db_load_user(nick)
-    data = serialize_user(target, me["nick"])
-    data["is_following"] = False
+    data = serialize_user(target, me["nick"]); data["is_following"] = False
     return data
 
 
-# ============ API: posts ============
 @app.get("/api/posts")
 def api_list(request: Request, q: str = "", author: str = ""):
     posts = db_list_posts(q=q, author=author)
@@ -1395,11 +1153,52 @@ def api_list(request: Request, q: str = "", author: str = ""):
     return {"posts": build_posts_full(posts, vid)}
 
 
+@app.get("/api/users/{nick}/wall")
+def api_wall(nick: str, request: Request):
+    u = db_load_user(nick)
+    if not u: raise HTTPException(404, "not found")
+    posts = db_list_wall_posts(u["nick"])
+    viewer = get_current_user(request)
+    vid = "u:" + viewer["nick"] if viewer else "c:anon"
+    return {"posts": build_posts_full(posts, vid),
+            "allow_wall_posts": u.get("allow_wall_posts", True)}
+
+
+@app.post("/api/users/{nick}/wall")
+def api_wall_post(nick: str, payload: PostIn, request: Request):
+    me = require_user(request)
+    ip = get_client_ip(request)
+    if not rate_limit("wall:" + ip, 20, 60): raise HTTPException(429, "err_rate_limit")
+    owner = db_load_user(nick)
+    if not owner: raise HTTPException(404, "not found")
+    if owner["nick"] != me["nick"] and not owner.get("allow_wall_posts", True):
+        raise HTTPException(403, "err_wall_disabled")
+    if me["nick"] in (owner.get("blacklist") or []):
+        raise HTTPException(403, "err_user_blocked")
+    text = payload.text.strip()
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
+    pid = uuid.uuid4().hex[:10]
+    p = {"id": pid, "text": text, "author": me["nick"],
+         "created_at": time.time(), "wall_owner": owner["nick"]}
+    db_create_post(p)
+    notified = set()
+    for m in extract_mentions(text):
+        if m == me["nick"]: continue
+        k = m.lower()
+        if k in notified: continue
+        if not db_load_user_cached(m): continue
+        db_notify(m, "mention", me["nick"], post_id=pid, text=text[:140])
+        notified.add(k)
+    if owner["nick"] != me["nick"] and owner["nick"].lower() not in notified:
+        db_notify(owner["nick"], "wall_post", me["nick"], post_id=pid, text=text[:140])
+    return build_posts_full([p], "u:" + me["nick"])[0]
+
+
 @app.get("/api/posts/{pid}")
 def api_get(pid: str, request: Request):
     p = db_get_post(pid)
-    if not p:
-        raise HTTPException(404, "not found")
+    if not p: raise HTTPException(404, "not found")
     u = get_current_user(request)
     vid = "u:" + u["nick"] if u else "c:anon"
     return build_posts_full([p], vid)[0]
@@ -1409,39 +1208,28 @@ def api_get(pid: str, request: Request):
 def api_create(payload: PostIn, request: Request):
     u = require_user(request)
     ip = get_client_ip(request)
-    if not rate_limit("post:" + ip, 30, 60):
-        raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("post:" + ip, 30, 60): raise HTTPException(429, "err_rate_limit")
     text = payload.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_POST_LEN:
-        raise HTTPException(400, "too long")
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
-    p = {"id": pid, "text": text, "author": u["nick"], "created_at": time.time()}
+    p = {"id": pid, "text": text, "author": u["nick"],
+         "created_at": time.time(), "wall_owner": None}
     db_create_post(p)
-
     notified = set()
     for nick in extract_mentions(text):
-        if nick == u["nick"]:
-            continue
-        key = nick.lower()
-        if key in notified:
-            continue
-        if not db_load_user_cached(nick):
-            continue
+        if nick == u["nick"]: continue
+        k = nick.lower()
+        if k in notified: continue
+        if not db_load_user_cached(nick): continue
         db_notify(nick, "mention", u["nick"], post_id=pid, text=text[:140])
-        notified.add(key)
-
+        notified.add(k)
     for f in (u.get("followers") or set()):
-        if f == u["nick"]:
-            continue
-        if f.lower() in notified:
-            continue
-        if not db_load_user_cached(f):
-            continue
+        if f == u["nick"]: continue
+        if f.lower() in notified: continue
+        if not db_load_user_cached(f): continue
         db_notify(f, "new_post", u["nick"], post_id=pid, text=text[:140])
         notified.add(f.lower())
-
     return build_posts_full([p], "u:" + u["nick"])[0]
 
 
@@ -1449,15 +1237,14 @@ def api_create(payload: PostIn, request: Request):
 def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     u = require_user(request)
     p = db_get_post(pid)
-    if not p:
-        raise HTTPException(404, "not found")
+    if not p: raise HTTPException(404, "not found")
+    if p["author"] != u["nick"] and p.get("wall_owner") != u["nick"]:
+        raise HTTPException(403, "forbidden")
     if p["author"] != u["nick"]:
         raise HTTPException(403, "forbidden")
     text = payload.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_POST_LEN:
-        raise HTTPException(400, "too long")
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     db_update_post_text(pid, text)
     p = db_get_post(pid)
     return build_posts_full([p], "u:" + u["nick"])[0]
@@ -1467,9 +1254,8 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
 def api_delete_post(pid: str, request: Request):
     u = require_user(request)
     p = db_get_post(pid)
-    if not p:
-        raise HTTPException(404, "not found")
-    if p["author"] != u["nick"]:
+    if not p: raise HTTPException(404, "not found")
+    if p["author"] != u["nick"] and p.get("wall_owner") != u["nick"]:
         raise HTTPException(403, "forbidden")
     db_delete_post(pid)
     return {"ok": True}
@@ -1477,17 +1263,14 @@ def api_delete_post(pid: str, request: Request):
 
 @app.post("/api/posts/{pid}/vote")
 def api_vote_post(pid: str, v: VoteIn, request: Request):
-    if not db_get_post(pid):
-        raise HTTPException(404, "not found")
-    if v.direction not in (-1, 1):
-        raise HTTPException(400, "bad request")
+    if not db_get_post(pid): raise HTTPException(404, "not found")
+    if v.direction not in (-1, 1): raise HTTPException(400, "bad request")
     u = require_user(request)
     vid = "u:" + u["nick"]
     existing = db_post_votes([pid])
     cur = 0
     for row in existing:
-        if row["voter_id"] == vid:
-            cur = row["direction"]; break
+        if row["voter_id"] == vid: cur = row["direction"]; break
     new = 0 if cur == v.direction else v.direction
     db_set_post_vote(pid, vid, new)
     p = db_get_post(pid)
@@ -1498,26 +1281,19 @@ def api_vote_post(pid: str, v: VoteIn, request: Request):
 def api_add_comment(pid: str, c: CommentIn, request: Request):
     u = require_user(request)
     post = db_get_post(pid)
-    if not post:
-        raise HTTPException(404, "not found")
+    if not post: raise HTTPException(404, "not found")
     text = c.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_COMMENT_LEN:
-        raise HTTPException(400, "too long")
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
     parent_id = c.parent_id or None
     parent = None
     if parent_id:
         parent = db_get_comment(parent_id)
-        if not parent or parent["post_id"] != pid:
-            raise HTTPException(400, "bad parent")
-        if parent.get("parent_id"):
-            raise HTTPException(400, "reply_only_one_level")
+        if not parent or parent["post_id"] != pid: raise HTTPException(400, "bad parent")
+        if parent.get("parent_id"): raise HTTPException(400, "reply_only_one_level")
     cid = uuid.uuid4().hex[:10]
-    db_create_comment({
-        "id": cid, "post_id": pid, "author": u["nick"],
-        "parent_id": parent_id, "text": text, "created_at": time.time(),
-    })
+    db_create_comment({"id": cid, "post_id": pid, "author": u["nick"],
+                       "parent_id": parent_id, "text": text, "created_at": time.time()})
     notified = set()
     if parent_id and parent:
         if parent["author"] != u["nick"]:
@@ -1528,15 +1304,12 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
             db_notify(post["author"], "comment", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
             notified.add(post["author"].lower())
     for nick in extract_mentions(text):
-        if nick == u["nick"]:
-            continue
-        key = nick.lower()
-        if key in notified:
-            continue
-        if not db_load_user_cached(nick):
-            continue
+        if nick == u["nick"]: continue
+        k = nick.lower()
+        if k in notified: continue
+        if not db_load_user_cached(nick): continue
         db_notify(nick, "mention", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
-        notified.add(key)
+        notified.add(k)
     return build_posts_full([post], "u:" + u["nick"])[0]
 
 
@@ -1544,15 +1317,11 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
 def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Request):
     u = require_user(request)
     c = db_get_comment(cid)
-    if not c or c["post_id"] != pid:
-        raise HTTPException(404, "not found")
-    if c["author"] != u["nick"]:
-        raise HTTPException(403, "forbidden")
+    if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
+    if c["author"] != u["nick"]: raise HTTPException(403, "forbidden")
     text = payload.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_COMMENT_LEN:
-        raise HTTPException(400, "too long")
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
     db_update_comment_text(cid, text)
     post = db_get_post(pid)
     return build_posts_full([post], "u:" + u["nick"])[0]
@@ -1562,42 +1331,35 @@ def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Reques
 def api_delete_comment(pid: str, cid: str, request: Request):
     u = require_user(request)
     c = db_get_comment(cid)
-    if not c or c["post_id"] != pid:
-        raise HTTPException(404, "not found")
-    if c["author"] != u["nick"]:
+    if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
+    post = db_get_post(pid)
+    if c["author"] != u["nick"] and (not post or post.get("wall_owner") != u["nick"]):
         raise HTTPException(403, "forbidden")
     db_delete_comment(cid)
-    post = db_get_post(pid)
     return build_posts_full([post], "u:" + u["nick"])[0]
 
 
 @app.post("/api/posts/{pid}/comments/{cid}/vote")
 def api_vote_comment(pid: str, cid: str, v: VoteIn, request: Request):
-    if not db_get_post(pid):
-        raise HTTPException(404, "not found")
-    if v.direction not in (-1, 1):
-        raise HTTPException(400, "bad request")
+    if not db_get_post(pid): raise HTTPException(404, "not found")
+    if v.direction not in (-1, 1): raise HTTPException(400, "bad request")
     u = require_user(request)
     vid = "u:" + u["nick"]
     existing = db_comment_votes([cid])
     cur = 0
     for row in existing:
-        if row["voter_id"] == vid:
-            cur = row["direction"]; break
+        if row["voter_id"] == vid: cur = row["direction"]; break
     new = 0 if cur == v.direction else v.direction
     db_set_comment_vote(cid, vid, new)
     p = db_get_post(pid)
     return build_posts_full([p], vid)[0]
 
 
-# ============ API: counters & notifications ============
 @app.get("/api/counters")
 def api_counters(request: Request):
     me = require_user(request)
-    return {
-        "notif": db_notifications_unread_count(me["nick"]),
-        "dm": db_dm_unread_count(me["nick"]),
-    }
+    return {"notif": db_notifications_unread_count(me["nick"]),
+            "dm": db_dm_unread_count(me["nick"])}
 
 
 @app.get("/api/notifications")
@@ -1622,7 +1384,6 @@ def api_notifications_clear(request: Request):
     return {"ok": True}
 
 
-# ============ API: DM ============
 def serialize_dm_thread(t: dict, me: str) -> dict:
     other = t["user_b"] if t["user_a"] == me else t["user_a"]
     ou = db_load_user_cached(other)
@@ -1631,17 +1392,13 @@ def serialize_dm_thread(t: dict, me: str) -> dict:
     my_read = t["last_read_a"] if t["user_a"] == me else t["last_read_b"]
     unread = 0
     for m in msgs:
-        if m["from_nick"] == other and m["created_at"] > (my_read or 0):
-            unread += 1
-    return {
-        "id": t["id"], "other_nick": other,
-        "other_name": (ou or {}).get("name", other),
-        "last_message": (last or {}).get("text", ""),
-        "last_message_at": t["last_message_at"],
-        "last_from_me": bool(last and last["from_nick"] == me),
-        "unread": unread,
-        "online": bus.is_online(other),
-    }
+        if m["from_nick"] == other and m["created_at"] > (my_read or 0): unread += 1
+    return {"id": t["id"], "other_nick": other,
+            "other_name": (ou or {}).get("name", other),
+            "last_message": (last or {}).get("text", ""),
+            "last_message_at": t["last_message_at"],
+            "last_from_me": bool(last and last["from_nick"] == me),
+            "unread": unread, "online": bus.is_online(other)}
 
 
 @app.get("/api/dm/threads")
@@ -1650,54 +1407,38 @@ def api_dm_threads(request: Request):
     db_clear_dm_start_notifs(me["nick"])
     threads = db_dm_my_threads(me["nick"])
     out = [serialize_dm_thread(t, me["nick"]) for t in threads]
-    return {
-        "threads": out,
-        "unread": sum(x["unread"] for x in out),
-        "unread_notif": db_notifications_unread_count(me["nick"]),
-    }
+    return {"threads": out, "unread": sum(x["unread"] for x in out),
+            "unread_notif": db_notifications_unread_count(me["nick"])}
 
 
 @app.get("/api/dm/with/{nick}")
 def api_dm_with(nick: str, request: Request):
     me = require_user(request)
     other = db_load_user(nick)
-    if not other:
-        raise HTTPException(404, "not found")
-    if other["nick"] == me["nick"]:
-        raise HTTPException(400, "self")
+    if not other: raise HTTPException(404, "not found")
+    if other["nick"] == me["nick"]: raise HTTPException(400, "self")
     db_clear_dm_start_notifs(me["nick"], other["nick"])
     t = db_dm_find_thread(me["nick"], other["nick"])
     if not t:
-        return {
-            "thread_id": None,
-            "other": serialize_user(other, me["nick"]),
-            "messages": [],
-            "unread_dm": db_dm_unread_count(me["nick"]),
-            "unread_notif": db_notifications_unread_count(me["nick"]),
-        }
+        return {"thread_id": None, "other": serialize_user(other, me["nick"]),
+                "messages": [], "unread_dm": db_dm_unread_count(me["nick"]),
+                "unread_notif": db_notifications_unread_count(me["nick"])}
     msgs = db_dm_messages(t["id"])
     db_dm_mark_read(t["id"], me["nick"])
-    return {
-        "thread_id": t["id"],
-        "other": serialize_user(other, me["nick"]),
-        "messages": [
-            {"id": m["id"], "from_nick": m["from_nick"], "text": m["text"],
-             "created_at": m["created_at"], "mine": m["from_nick"] == me["nick"]}
-            for m in msgs
-        ],
-        "unread_dm": db_dm_unread_count(me["nick"]),
-        "unread_notif": db_notifications_unread_count(me["nick"]),
-    }
+    return {"thread_id": t["id"], "other": serialize_user(other, me["nick"]),
+            "messages": [{"id": m["id"], "from_nick": m["from_nick"], "text": m["text"],
+                          "created_at": m["created_at"], "mine": m["from_nick"] == me["nick"]}
+                         for m in msgs],
+            "unread_dm": db_dm_unread_count(me["nick"]),
+            "unread_notif": db_notifications_unread_count(me["nick"])}
 
 
 @app.delete("/api/dm/thread/{tid}")
 def api_dm_delete_thread(tid: str, request: Request):
     me = require_user(request)
     t = db_dm_get_thread_by_id(tid)
-    if not t:
-        raise HTTPException(404, "not found")
-    if me["nick"] != t["user_a"] and me["nick"] != t["user_b"]:
-        raise HTTPException(403, "forbidden")
+    if not t: raise HTTPException(404, "not found")
+    if me["nick"] != t["user_a"] and me["nick"] != t["user_b"]: raise HTTPException(403, "forbidden")
     db_dm_delete_thread(tid)
     other = t["user_b"] if t["user_a"] == me["nick"] else t["user_a"]
     bus_publish(me["nick"], {"type": "thread_deleted", "thread_id": tid, "other": other})
@@ -1709,33 +1450,21 @@ def api_dm_delete_thread(tid: str, request: Request):
 def api_dm_send(data: DMSendIn, request: Request):
     me = require_user(request)
     other = db_load_user(data.to)
-    if not other:
-        raise HTTPException(404, "not found")
-    if other["nick"] == me["nick"]:
-        raise HTTPException(400, "self")
-    if me["nick"] in (other.get("blacklist") or []):
-        raise HTTPException(403, "err_user_blocked")
-    if other["nick"] in (me.get("blacklist") or []):
-        raise HTTPException(403, "err_user_blocked")
+    if not other: raise HTTPException(404, "not found")
+    if other["nick"] == me["nick"]: raise HTTPException(400, "self")
+    if me["nick"] in (other.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
+    if other["nick"] in (me.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
     text = data.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_DM_LEN:
-        raise HTTPException(400, "too long")
+    if not text: raise HTTPException(400, "empty")
+    if len(text) > MAX_DM_LEN: raise HTTPException(400, "too long")
+    if not rate_limit("dm:" + me["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     t, is_new = db_dm_get_or_create_thread(me["nick"], other["nick"])
     msg = db_dm_create_message(t["id"], me["nick"], text)
     db_dm_update_thread_last_message(t["id"], msg["created_at"])
-    if is_new:
-        db_notify(other["nick"], "dm_start", me["nick"], text=text[:140])
-    payload = {
-        "type": "message",
-        "thread_id": t["id"],
-        "id": msg["id"],
-        "from": me["nick"],
-        "to": other["nick"],
-        "text": text,
-        "created_at": msg["created_at"],
-    }
+    if is_new: db_notify(other["nick"], "dm_start", me["nick"], text=text[:140])
+    payload = {"type": "message", "thread_id": t["id"], "id": msg["id"],
+               "from": me["nick"], "to": other["nick"], "text": text,
+               "created_at": msg["created_at"]}
     bus_publish(other["nick"], payload)
     bus_publish(me["nick"], payload)
     return {"thread_id": t["id"], "is_new": is_new}
@@ -1745,13 +1474,11 @@ def api_dm_send(data: DMSendIn, request: Request):
 def api_dm_typing(nick: str, request: Request):
     me = require_user(request)
     target = db_load_user(nick)
-    if not target:
-        return {"ok": False}
+    if not target: return {"ok": False}
     bus_publish(target["nick"], {"type": "typing", "from": me["nick"]})
     return {"ok": True}
 
 
-# ============ API: presence / SSE ============
 @app.post("/api/presence")
 def api_presence(request: Request):
     me = require_user(request)
@@ -1761,60 +1488,43 @@ def api_presence(request: Request):
 
 @app.post("/api/presence/offline")
 async def api_presence_offline(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    try: body = await request.json()
+    except Exception: body = {}
     token = (body or {}).get("token") or request.headers.get("x-auth")
-    if not token:
-        return {"ok": False}
+    if not token: return {"ok": False}
     sess = SESSIONS.get(token)
-    if sess:
-        bus.set_offline(sess["nick"])
+    if sess: bus.set_offline(sess["nick"])
     return {"ok": True}
 
 
 @app.get("/api/events")
 async def api_events(request: Request, token: str = ""):
     sess = SESSIONS.get(token) if token else None
-    if not sess:
-        raise HTTPException(401, "unauthorized")
+    if not sess: raise HTTPException(401, "unauthorized")
     nick = sess["nick"]
     u = db_load_user_cached(nick)
-    if not u:
-        raise HTTPException(401, "unauthorized")
-
+    if not u: raise HTTPException(401, "unauthorized")
     q = await bus.subscribe(nick)
     bus.touch(nick)
-
     async def gen():
         try:
             yield "retry: 3000\n\n"
-            yield f"data: {json.dumps({'type': 'hello', 'nick': nick}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type':'hello','nick':nick}, ensure_ascii=False)}\n\n"
             while True:
-                if await request.is_disconnected():
-                    break
+                if await request.is_disconnected(): break
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=20)
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
                     bus.touch(nick)
                     yield ": ka\n\n"
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError: pass
         finally:
             bus.unsubscribe(nick, q)
             invalidate_user_cache(nick)
-
-    return StreamingResponse(
-        gen(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+    return StreamingResponse(gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no", "Connection": "keep-alive"})
 
 
 TEXTS = {
@@ -1828,9 +1538,13 @@ TEXTS = {
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
         "read_more": "читать дальше", "copy": "Копировать", "copied": "Скопировано",
         "edit": "Редактировать", "delete": "Удалить", "save": "Сохранить",
-        "cancel": "Отмена", "confirm_delete": "Удалить без возможности восстановления?",
+        "cancel": "Отмена",
+        "confirm_delete": "Удалить без возможности восстановления?",
+        "confirm_delete_yes": "Да, удалить",
         "confirm_logout": "Вы действительно хотите выйти из аккаунта?",
         "confirm_yes": "Да, выйти", "confirm_no": "Отмена",
+        "notif_clear": "Очистить все",
+        "notif_clear_confirm": "Очистить все уведомления?",
         "author_badge": "автор",
         "f_new": "Новые", "f_top": "Лучшие", "f_bottom": "Худшие", "f_old": "Старые",
         "f_all": "Все", "f_many": "Много комм.", "f_some": "Есть комм.", "f_none": "Без комм.",
@@ -1855,15 +1569,21 @@ TEXTS = {
         "err_private_following": "Пользователь скрыл свои подписки",
         "err_user_blocked": "Пользователь недоступен",
         "err_bio_too_long": "Описание слишком длинное",
+        "err_wall_disabled": "Стена этого пользователя закрыта",
         "login_to_post": "Войдите, чтобы писать посты",
         "login_to_comment": "Войдите, чтобы писать комментарии",
         "login_to_dm": "Войдите, чтобы писать сообщения",
+        "login_to_wall": "Войдите, чтобы писать на стене",
         "go_login": "Войти", "go_register": "Регистрация",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
         "message": "Написать", "edit_profile": "Редактировать",
         "edit_profile_title": "Редактирование профиля",
         "own_profile": "Это ваш профиль", "no_user_posts": "Постов пока нет",
+        "wall_title": "Стена", "wall_empty": "На стене пока ничего нет",
+        "wall_ph": "Написать на стене...", "wall_post": "Отправить",
+        "wall_disabled": "Стена закрыта — только владелец может писать на ней",
+        "wall_owner_badge": "на стене",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Конфиденциальность",
@@ -1874,13 +1594,15 @@ TEXTS = {
         "settings_allow_following": "Разрешить просматривать подписки",
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_notify_new_post_hint": "Получать уведомления, когда люди, на которых вы подписаны, публикуют пост",
+        "settings_allow_wall": "Разрешить посты на моей стене",
+        "settings_allow_wall_hint": "Другие пользователи смогут писать на вашей стене",
         "settings_blacklist": "Блеклист",
         "settings_blacklist_hint": "От людей в блеклисте не приходят уведомления и сообщения",
         "settings_blacklist_add_ph": "@ник",
         "settings_blacklist_add": "Добавить",
         "settings_blacklist_empty": "Блеклист пуст",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldChat — минималистичная соцсеть: посты, комментарии, апвоуты, подписки и личные сообщения в реальном времени.",
+        "settings_desc": "sldChat — минималистичная соцсеть: посты, комментарии, стены, апвоуты, подписки и личные сообщения в реальном времени.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти из аккаунта",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1891,8 +1613,7 @@ TEXTS = {
         "notif_mention": "упомянул(а) вас",
         "notif_dm": "начал(а) переписку с вами",
         "notif_new_post": "опубликовал(а) новый пост",
-        "notif_clear": "Очистить все",
-        "notif_clear_confirm": "Очистить все уведомления?",
+        "notif_wall_post": "написал(а) на вашей стене",
         "back_to_main": "В главное меню",
         "bio_ph": "Описание профиля...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
         "bio_empty": "Описание пока не заполнено",
@@ -1904,11 +1625,11 @@ TEXTS = {
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "1. Мы храним минимум данных: имя, ник, пароль (pbkdf2-хеш), посты, комментарии, "
-            "голоса, подписки, блеклист, сообщения и уведомления.\n\n"
+            "стену, голоса, подписки, блеклист, сообщения и уведомления.\n\n"
             "2. Пароль хранится только в виде pbkdf2-hmac-sha256 (100 000 итераций) с солью.\n\n"
             "3. Данные хранятся на серверах Supabase (Postgres). Мы не продаём и не передаём их третьим лицам.\n\n"
-            "4. Приватность профиля управляется в Настройках: можно скрыть подписчиков и подписки.\n\n"
-            "5. Редактировать и удалять можно только свои посты и комментарии.\n\n"
+            "4. Приватность профиля управляется в Настройках: можно скрыть подписчиков, подписки и закрыть стену.\n\n"
+            "5. Редактировать и удалять можно только свои посты и комментарии. Владелец стены может удалять любые посты и комментарии на своей стене.\n\n"
             "6. Личные сообщения доступны только участникам диалога. Блеклист полностью блокирует уведомления и сообщения.\n\n"
             "7. IP используется только для определения языка (не сохраняется).\n\n"
             "8. Сервис предоставляется as-is."
@@ -1922,9 +1643,7 @@ TEXTS = {
         "dm_no_messages": "Напишите первое сообщение",
         "dm_delete": "Удалить переписку",
         "dm_delete_confirm": "Удалить переписку? Сообщения исчезнут у обоих участников.",
-        "dm_typing": "печатает…",
-        "dm_online": "в сети",
-        "dm_offline": "не в сети",
+        "dm_typing": "печатает…", "dm_online": "в сети", "dm_offline": "не в сети",
         "err_dm_self": "Нельзя написать самому себе",
     },
     "en": {
@@ -1937,9 +1656,13 @@ TEXTS = {
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
         "read_more": "read more", "copy": "Copy", "copied": "Copied",
         "edit": "Edit", "delete": "Delete", "save": "Save",
-        "cancel": "Cancel", "confirm_delete": "Delete permanently?",
+        "cancel": "Cancel",
+        "confirm_delete": "Delete permanently?",
+        "confirm_delete_yes": "Yes, delete",
         "confirm_logout": "Are you sure you want to log out?",
         "confirm_yes": "Yes, log out", "confirm_no": "Cancel",
+        "notif_clear": "Clear all",
+        "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
         "f_new": "New", "f_top": "Top", "f_bottom": "Worst", "f_old": "Old",
         "f_all": "All", "f_many": "Many", "f_some": "Some", "f_none": "None",
@@ -1964,15 +1687,21 @@ TEXTS = {
         "err_private_following": "User hid their following",
         "err_user_blocked": "User is unavailable",
         "err_bio_too_long": "Bio is too long",
+        "err_wall_disabled": "This user's wall is closed",
         "login_to_post": "Log in to write posts",
         "login_to_comment": "Log in to write comments",
         "login_to_dm": "Log in to send messages",
+        "login_to_wall": "Log in to post on the wall",
         "go_login": "Log in", "go_register": "Sign up",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
         "message": "Message", "edit_profile": "Edit",
         "edit_profile_title": "Edit profile",
         "own_profile": "This is your profile", "no_user_posts": "No posts yet",
+        "wall_title": "Wall", "wall_empty": "Nothing on the wall yet",
+        "wall_ph": "Write on the wall...", "wall_post": "Post",
+        "wall_disabled": "Wall is closed — only owner can post here",
+        "wall_owner_badge": "on wall",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1983,13 +1712,15 @@ TEXTS = {
         "settings_allow_following": "Allow viewing following",
         "settings_notify_new_post": "New post notifications",
         "settings_notify_new_post_hint": "Get notified when people you follow publish a post",
+        "settings_allow_wall": "Allow posts on my wall",
+        "settings_allow_wall_hint": "Other users can post on your wall",
         "settings_blacklist": "Blacklist",
         "settings_blacklist_hint": "People in the blacklist cannot send you notifications or messages",
         "settings_blacklist_add_ph": "@nick",
         "settings_blacklist_add": "Add",
         "settings_blacklist_empty": "Blacklist is empty",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldChat is a minimalist social network: posts, comments, upvotes, follows and realtime direct messages.",
+        "settings_desc": "sldChat is a minimalist social network: posts, comments, walls, upvotes, follows and realtime direct messages.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -2000,8 +1731,7 @@ TEXTS = {
         "notif_mention": "mentioned you",
         "notif_dm": "started a chat with you",
         "notif_new_post": "published a new post",
-        "notif_clear": "Clear all",
-        "notif_clear_confirm": "Clear all notifications?",
+        "notif_wall_post": "posted on your wall",
         "back_to_main": "Back to main",
         "bio_ph": "Profile bio...", "bio_save": "Save", "bio_saved": "Saved",
         "bio_empty": "No bio yet",
@@ -2012,11 +1742,12 @@ TEXTS = {
         "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
-            "1. We store minimum data: name, nick, password (pbkdf2 hash), posts, comments, votes, follows, blacklist, messages and notifications.\n\n"
+            "1. We store minimum data: name, nick, password (pbkdf2 hash), posts, comments, "
+            "wall, votes, follows, blacklist, messages and notifications.\n\n"
             "2. Password is stored only as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
             "3. Data is stored on Supabase (Postgres). We do not sell or share it.\n\n"
-            "4. Profile privacy is controlled in Settings.\n\n"
-            "5. You can only edit or delete your own posts and comments.\n\n"
+            "4. Profile privacy is controlled in Settings: you can hide followers/following and close your wall.\n\n"
+            "5. You can only edit or delete your own posts and comments. Wall owner can delete anything on their wall.\n\n"
             "6. Direct messages are visible only to conversation participants. Blacklist fully blocks notifications and messages.\n\n"
             "7. IP is used only to detect language (not stored).\n\n"
             "8. Service is provided as-is."
@@ -2030,26 +1761,21 @@ TEXTS = {
         "dm_no_messages": "Send the first message",
         "dm_delete": "Delete conversation",
         "dm_delete_confirm": "Delete conversation? Messages will disappear for both.",
-        "dm_typing": "typing…",
-        "dm_online": "online",
-        "dm_offline": "offline",
+        "dm_typing": "typing…", "dm_online": "online", "dm_offline": "offline",
         "err_dm_self": "Cannot message yourself",
     },
 }
 
 
 def svg(paths: str, size: int = 16, sw: float = 2) -> str:
-    return (
-        f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
-        f'stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" '
-        f'stroke-linejoin="round">{paths}</svg>'
-    )
+    return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+            f'stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" '
+            f'stroke-linejoin="round">{paths}</svg>')
 
 
 ICON_SEARCH = svg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
 ICON_MOON = svg('<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>')
-ICON_SUN = svg(
-    '<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/>'
+ICON_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/>'
     '<line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/>'
     '<line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/>'
     '<line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/>'
@@ -2057,75 +1783,56 @@ ICON_SUN = svg(
 ICON_BACK = svg('<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>')
 ICON_UP = svg('<polyline points="6 15 12 9 18 15"/>', size=12, sw=2.5)
 ICON_DOWN = svg('<polyline points="6 9 12 15 18 9"/>', size=12, sw=2.5)
-ICON_COMMENT = svg(
-    '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
-    size=13)
+ICON_COMMENT = svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>', size=13)
 ICON_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=13)
 ICON_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=13, sw=2.5)
-ICON_EDIT = svg(
-    '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=13)
+ICON_EDIT = svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=13)
 ICON_HOME = svg('<path d="M3 10l9-7 9 7v11a2 2 0 0 1-2 2h-4v-8h-6v8H5a2 2 0 0 1-2-2z"/>', size=15)
-ICON_USERS = svg(
-    '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
-    '<circle cx="9" cy="7" r="4"/>'
-    '<path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
+ICON_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
+    '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>', size=15)
 ICON_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>', size=15)
-ICON_MAIL = svg(
-    '<rect x="3" y="5" width="18" height="14" rx="0" ry="0"/>'
-    '<polyline points="3 7 12 13 21 7"/>', size=15)
-ICON_BELL = svg(
-    '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
+ICON_MAIL = svg('<rect x="3" y="5" width="18" height="14" rx="0" ry="0"/><polyline points="3 7 12 13 21 7"/>', size=15)
+ICON_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
     '<path d="M13.7 21a2 2 0 0 1-3.4 0"/>', size=15)
-ICON_GEAR = svg(
-    '<circle cx="12" cy="12" r="3"/>'
-    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
-    size=15)
-ICON_LOGOUT = svg(
-    '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
+ICON_GEAR = svg('<circle cx="12" cy="12" r="3"/>'
+    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>', size=15)
+ICON_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
     '<polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>', size=15)
 ICON_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>', size=15)
-ICON_LOGIN = svg(
-    '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
+ICON_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
     '<polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>', size=15)
-ICON_TRASH = svg(
-    '<polyline points="3 6 5 6 21 6"/>'
+ICON_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
     '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
     '<path d="M10 11v6M14 11v6"/>', size=15)
 
-FAVICON = (
-    "data:image/svg+xml,"
-    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-    "%3Crect width='64' height='64' fill='%230866ff'/%3E"
-    "%3Cpath d='M14 16h36v24H28l-14 12V16z' fill='%23ffffff'/%3E"
-    "%3C/svg%3E"
-)
+FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+           "%3Crect width='64' height='64' fill='%230866ff'/%3E"
+           "%3Cpath d='M14 16h36v24H28l-14 12V16z' fill='%23ffffff'/%3E%3C/svg%3E")
 
 
 CSS = """
 :root, [data-theme="light"] {
-  --bg:#f4f5f7; --card:#ffffff; --line:#e4e6eb; --line-strong:#bcc0c4;
+  --bg:#f4f5f7; --card:#fff; --line:#e4e6eb; --line-strong:#bcc0c4;
   --text:#1a1d21; --muted:#65676b; --hover:#f0f2f5;
-  --accent:#0866ff; --accent-fg:#ffffff;
+  --accent:#0866ff; --accent-fg:#fff;
   --up:#16a34a; --down:#dc2626; --comment-bg:#f0f2f5;
   --danger:#dc2626; --mention:#0866ff;
-  --bubble-mine:#0866ff; --bubble-mine-fg:#ffffff;
+  --bubble-mine:#0866ff; --bubble-mine-fg:#fff;
   --bubble-theirs:#f0f2f5; --bubble-theirs-fg:#1a1d21;
-  --online:#22c55e;
-  --shadow:0 1px 2px rgba(0,0,0,.04);
+  --online:#22c55e; --shadow:0 1px 2px rgba(0,0,0,.04);
 }
 [data-theme="dark"] {
   --bg:#0b0d10; --card:#161a1f; --line:#272c33; --line-strong:#3a4149;
   --text:#e7eaee; --muted:#8a929c; --hover:#1e232a;
-  --accent:#4a90ff; --accent-fg:#ffffff;
+  --accent:#4a90ff; --accent-fg:#fff;
   --up:#34d058; --down:#ff5c5c; --comment-bg:#1e232a;
   --danger:#ff5c5c; --mention:#6aa9ff;
-  --bubble-mine:#4a90ff; --bubble-mine-fg:#ffffff;
+  --bubble-mine:#4a90ff; --bubble-mine-fg:#fff;
   --bubble-theirs:#1e232a; --bubble-theirs-fg:#e7eaee;
-  --online:#34d058;
-  --shadow:0 1px 2px rgba(0,0,0,.4);
+  --online:#34d058; --shadow:0 1px 2px rgba(0,0,0,.4);
 }
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -2134,13 +1841,12 @@ body {
   user-select: none; -webkit-user-select: none; -ms-user-select: none;
   display: flex;
 }
-input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select: text; }
+input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select: text; font-size: 16px; }
 * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
-::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--line-strong); border: 2px solid var(--card); }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border: 2px solid var(--card); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
-::-webkit-scrollbar-corner { background: transparent; }
 
 .layout { display: flex; width: 100%; height: 100vh; background: var(--bg); }
 .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--card); }
@@ -2148,125 +1854,91 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
   padding: 10px 14px; border-bottom: 1px solid var(--line); min-height: 52px;
 }
-.main-header .title {
-  flex: 1; font-size: 15px; font-weight: 600; padding: 0 6px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
+.main-header .title { flex: 1; font-size: 15px; font-weight: 600; padding: 0 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .main-header .title a { color: var(--text); text-decoration: none; }
 .main-header .title a:hover { color: var(--accent); }
-.main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
+.main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
 
-.sidebar {
-  flex: 0 0 264px; width: 264px; border-left: 1px solid var(--line);
-  background: var(--card); display: flex; flex-direction: column; padding: 18px 12px 12px;
-}
-.sidebar .logo {
-  font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
-  padding: 4px 12px 22px; user-select: none; color: var(--accent);
-}
+.sidebar { flex: 0 0 264px; width: 264px; border-left: 1px solid var(--line);
+  background: var(--card); display: flex; flex-direction: column; padding: 18px 12px 12px; }
+.sidebar .logo { font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
+  padding: 4px 12px 22px; user-select: none; color: var(--accent); }
 .nav { display: flex; flex-direction: column; gap: 2px; }
-.nav-btn {
-  display: flex; align-items: center; gap: 12px;
-  width: 100%; padding: 10px 12px; border: none; background: transparent;
-  color: var(--text); font: inherit; font-size: 14px;
-  cursor: pointer; text-align: left; transition: background .12s;
-  position: relative;
-}
+.nav-btn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 12px;
+  border: none; background: transparent; color: var(--text); font: inherit; font-size: 14px;
+  cursor: pointer; text-align: left; transition: background .12s; position: relative; }
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--hover); font-weight: 600; color: var(--accent); }
 .nav-btn.active svg { color: var(--accent); }
 .nav-btn svg { flex-shrink: 0; color: var(--muted); }
-.nav-btn .badge {
-  margin-left: auto; min-width: 20px; height: 20px;
-  background: var(--danger); color: #fff;
-  font-size: 11px; font-weight: 700; line-height: 20px;
-  text-align: center; padding: 0 6px; border-radius: 10px;
-}
+.nav-btn .badge { margin-left: auto; min-width: 20px; height: 20px;
+  background: var(--danger); color: #fff; font-size: 11px; font-weight: 700;
+  line-height: 20px; text-align: center; padding: 0 6px; border-radius: 10px; }
 .sidebar .spacer { flex: 1; }
-.sidebar-user {
-  padding: 12px; font-size: 13px; color: var(--muted);
-  border-top: 1px solid var(--line);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  display: flex; align-items: center; gap: 8px;
-}
-.sidebar-user .dot {
-  width: 8px; height: 8px; background: var(--online); flex-shrink: 0; border-radius: 50%;
-  box-shadow: 0 0 0 2px rgba(34,197,94,.2);
-}
+.sidebar-user { padding: 12px; font-size: 13px; color: var(--muted);
+  border-top: 1px solid var(--line); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; display: flex; align-items: center; gap: 8px; }
+.sidebar-user .dot { width: 8px; height: 8px; background: var(--online); flex-shrink: 0;
+  border-radius: 50%; box-shadow: 0 0 0 2px rgba(34,197,94,.2); }
 
-.icon-btn {
-  width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center;
-  background: transparent; border: 1px solid var(--line);
+.icon-btn { width: 36px; height: 36px; display: inline-flex; align-items: center;
+  justify-content: center; background: transparent; border: 1px solid var(--line);
   color: var(--text); cursor: pointer; padding: 0; text-decoration: none;
-  transition: background .12s, border-color .12s, color .12s; flex-shrink: 0;
-  border-radius: 6px;
-}
+  transition: background .12s, border-color .12s, color .12s; flex-shrink: 0; border-radius: 8px; }
 .icon-btn:hover { background: var(--hover); border-color: var(--line-strong); color: var(--accent); }
 .icon-btn.danger:hover { color: var(--danger); border-color: var(--danger); }
 .icon-btn svg { display: block; }
 
-header.search-header {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
-  padding: 10px 14px; border-bottom: 1px solid var(--line);
-}
+header.search-header { flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line); }
 header.search-header input[type="search"], header.search-header input[type="text"] {
-  flex: 1; min-width: 0; padding: 0 14px; height: 36px;
+  flex: 1; min-width: 0; padding: 0 14px; height: 40px;
   border: 1px solid var(--line); background: var(--hover);
   color: var(--text); font-size: 14px; font-family: inherit;
-  outline: none; transition: border-color .12s, background .12s;
-  border-radius: 8px;
-}
+  outline: none; transition: border-color .12s, background .12s; border-radius: 10px; }
 header.search-header input:focus { border-color: var(--accent); background: var(--card); }
 
-.filters {
-  flex: 0 0 auto; display: flex; align-items: center;
+.filters { flex: 0 0 auto; display: flex; align-items: center;
   padding: 8px 10px; border-bottom: 1px solid var(--line);
-  overflow-x: auto; scrollbar-width: none;
-}
+  overflow-x: auto; scrollbar-width: none; }
 .filters::-webkit-scrollbar { display: none; }
 .filter-group { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .filter-sep { width: 1px; height: 16px; background: var(--line); margin: 0 8px; flex-shrink: 0; }
-.filter {
-  height: 28px; padding: 0 12px; border: none; background: transparent;
+.filter { height: 32px; padding: 0 14px; border: none; background: transparent;
   color: var(--muted); font-family: inherit; font-size: 12px; font-weight: 500;
-  cursor: pointer; white-space: nowrap; transition: color .12s, background .12s;
-  border-radius: 6px;
-}
+  cursor: pointer; white-space: nowrap; transition: color .12s, background .12s; border-radius: 8px; }
 .filter:hover { background: var(--hover); color: var(--text); }
 .filter.active { color: #fff; background: var(--accent); }
 
 .empty { padding: 80px 20px; text-align: center; color: var(--muted); font-size: 13px; }
 .spinner-wrap { padding: 60px 0; text-align: center; }
-.spinner {
-  display: inline-block; width: 26px; height: 26px;
+.spinner { display: inline-block; width: 26px; height: 26px;
   border: 2px solid var(--line); border-top-color: var(--accent);
-  animation: spin .7s linear infinite; border-radius: 50%;
-}
+  animation: spin .7s linear infinite; border-radius: 50%; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .post { padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .post-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
 .post-author { font-weight: 600; color: var(--text); text-decoration: none; font-size: 13px; }
 .post-author:hover { color: var(--accent); }
+.post-wall-hint { font-size: 11px; color: var(--muted); font-weight: 400; }
+.post-wall-hint a { color: var(--muted); text-decoration: none; }
+.post-wall-hint a:hover { color: var(--accent); }
 .post-time { color: var(--muted); font-size: 12px; margin-left: auto; }
-.post-text {
-  font-size: 15px; line-height: 1.55; white-space: pre-wrap;
-  word-wrap: break-word; overflow-wrap: anywhere; color: var(--text);
-}
+.post-text { font-size: 15px; line-height: 1.55; white-space: pre-wrap;
+  word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); }
 .mention { color: var(--mention); text-decoration: none; font-weight: 500; }
 .mention:hover { text-decoration: underline; }
-.read-more {
-  display: inline-block; margin-top: 8px; color: var(--accent);
-  text-decoration: none; font-size: 13px;
-}
+.read-more { display: inline-block; margin-top: 8px; color: var(--accent);
+  text-decoration: none; font-size: 13px; }
 .read-more:hover { text-decoration: underline; }
-.post-actions { display: flex; align-items: center; gap: 2px; margin-top: 12px; font-size: 12px; color: var(--muted); }
-.vote-btn, .action-btn {
-  display: inline-flex; align-items: center; gap: 5px;
-  height: 30px; padding: 0 10px; background: transparent; border: none;
-  color: var(--muted); cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 500;
-  transition: color .12s, background .12s; border-radius: 6px;
-}
+.post-actions { display: flex; align-items: center; gap: 2px; margin-top: 12px;
+  font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.vote-btn, .action-btn { display: inline-flex; align-items: center; gap: 5px;
+  height: 34px; padding: 0 12px; background: transparent; border: none;
+  color: var(--muted); cursor: pointer; font-family: inherit; font-size: 12px;
+  font-weight: 500; transition: color .12s, background .12s; border-radius: 8px; }
 .vote-btn:hover, .action-btn:hover { background: var(--hover); }
 .vote-btn svg, .action-btn svg { display: block; }
 .vote-btn.up:hover { color: var(--up); }
@@ -2276,69 +1948,55 @@ header.search-header input:focus { border-color: var(--accent); background: var(
 .action-btn:hover { color: var(--text); }
 .action-btn.copied { color: var(--up); }
 .action-btn.danger:hover { color: var(--danger); }
-.score {
-  min-width: 22px; padding: 0 3px; text-align: center;
-  font-weight: 600; font-size: 12px; color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
+.score { min-width: 24px; padding: 0 4px; text-align: center;
+  font-weight: 600; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .score.up { color: var(--up); }
 .score.down { color: var(--down); }
 
 .comments { margin-top: 14px; border-top: 1px solid var(--line); }
-.comment {
-  padding: 12px 14px; margin-top: 10px;
-  background: var(--comment-bg); border-left: 3px solid var(--line-strong);
-  border-radius: 6px;
-}
-.comment.reply {
-  margin-left: 32px; border-left-color: var(--muted);
-  background: transparent; border: 1px solid var(--line); border-left-width: 3px;
-}
+.comment { padding: 12px 14px; margin-top: 10px;
+  background: var(--comment-bg); border-left: 3px solid var(--line-strong); border-radius: 8px; }
+.comment.reply { margin-left: 32px; border-left-color: var(--muted);
+  background: transparent; border: 1px solid var(--line); border-left-width: 3px; }
 .comment.is-author { border-left-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .comment-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }
 .comment-author { font-size: 12px; font-weight: 600; color: var(--text); text-decoration: none; }
 .comment-author:hover { color: var(--accent); }
-.comment-author-badge {
-  font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .5px; padding: 1px 6px; border: 1px solid var(--accent); color: var(--accent);
-}
+.comment-author-badge { font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .5px; padding: 1px 6px; border: 1px solid var(--accent); color: var(--accent); }
 .comment-time { font-size: 11px; color: var(--muted); margin-left: auto; }
-.comment-text { font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); }
-.comment-actions { display: flex; align-items: center; gap: 2px; margin-top: 8px; font-size: 11px; color: var(--muted); }
-.comment-actions .vote-btn { height: 24px; padding: 0 7px; font-size: 11px; }
-.comment-actions .score { font-size: 11px; min-width: 16px; }
-.comment-reply-btn, .comment-edit-btn {
-  background: transparent; border: none; color: var(--muted);
-  font-family: inherit; font-size: 11px; cursor: pointer;
-  padding: 4px 8px; height: 24px; display: inline-flex; align-items: center; gap: 4px;
-  transition: color .12s, background .12s; border-radius: 4px;
-}
+.comment-text { font-size: 13px; line-height: 1.55; white-space: pre-wrap;
+  word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); }
+.comment-actions { display: flex; align-items: center; gap: 2px; margin-top: 8px;
+  font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+.comment-actions .vote-btn { height: 28px; padding: 0 8px; font-size: 11px; }
+.comment-actions .score { font-size: 11px; min-width: 18px; }
+.comment-reply-btn, .comment-edit-btn { background: transparent; border: none;
+  color: var(--muted); font-family: inherit; font-size: 11px; cursor: pointer;
+  padding: 4px 8px; height: 28px; display: inline-flex; align-items: center;
+  gap: 4px; transition: color .12s, background .12s; border-radius: 6px; }
 .comment-reply-btn:hover, .comment-edit-btn:hover { color: var(--text); background: var(--hover); }
 .comment-edit-btn.danger:hover { color: var(--danger); }
 .comment-edit-btn svg { display: block; }
 
 .inline-editor { margin-top: 8px; }
-.inline-editor textarea {
-  display: block; width: 100%; padding: 10px 12px; min-height: 80px;
+.inline-editor textarea { display: block; width: 100%; padding: 10px 12px; min-height: 80px;
   border: 1px solid var(--line-strong); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
-  outline: none; resize: none; border-radius: 6px;
-}
+  outline: none; resize: none; border-radius: 8px; }
 .inline-editor .edit-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
-.inline-editor .edit-actions button {
-  height: 30px; padding: 0 14px; font-family: inherit; font-size: 13px; cursor: pointer;
-  border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 6px;
-}
+.inline-editor .edit-actions button { height: 34px; padding: 0 16px;
+  font-family: inherit; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 8px; }
 .inline-editor .edit-actions button:hover { background: var(--hover); }
-.inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.inline-editor .edit-actions button.edit-save { background: var(--accent);
+  color: var(--accent-fg); border-color: var(--accent); }
 
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 12px 14px; }
-.composer textarea {
-  display: block; width: 100%; min-height: 140px; padding: 12px 14px;
+.composer textarea { display: block; width: 100%; min-height: 140px; padding: 12px 14px;
   border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
-  outline: none; resize: none; transition: border-color .12s; border-radius: 8px;
-}
+  outline: none; resize: none; transition: border-color .12s; border-radius: 10px; }
 .composer.composer-comment textarea { min-height: 84px; }
 .composer textarea:focus { border-color: var(--accent); }
 .composer textarea::placeholder { color: var(--muted); }
@@ -2347,24 +2005,17 @@ header.search-header input:focus { border-color: var(--accent); background: var(
 .composer-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .counter { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .counter.warn { color: var(--danger); }
-.reply-banner {
-  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+.reply-banner { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
   background: var(--hover); border: 1px solid var(--line);
-  font-size: 12px; color: var(--muted); margin-bottom: 8px; border-radius: 6px;
-}
+  font-size: 12px; color: var(--muted); margin-bottom: 8px; border-radius: 8px; }
 .reply-banner b { color: var(--text); font-weight: 600; }
-.reply-banner button {
-  margin-left: auto; background: transparent; border: none;
+.reply-banner button { margin-left: auto; background: transparent; border: none;
   color: var(--text); font-family: inherit; font-size: 12px;
-  cursor: pointer; padding: 2px 8px; border-radius: 4px;
-}
+  cursor: pointer; padding: 4px 10px; border-radius: 6px; }
 .reply-banner button:hover { background: var(--hover); color: var(--accent); }
-
-button.send {
-  height: 36px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
+button.send { height: 40px; padding: 0 22px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent); font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer; transition: opacity .12s, background .12s; border-radius: 8px;
-}
+  cursor: pointer; transition: opacity .12s, background .12s; border-radius: 10px; }
 button.send:hover { opacity: .9; }
 button.send:disabled { opacity: .4; cursor: default; }
 .login-prompt { padding: 16px; text-align: center; color: var(--muted); font-size: 13px; }
@@ -2373,54 +2024,42 @@ button.send:disabled { opacity: .4; cursor: default; }
 .auth-wrap { max-width: 400px; margin: 0 auto; padding: 40px 20px; }
 .auth-title { font-size: 24px; font-weight: 700; margin: 0 0 24px; letter-spacing: -0.5px; }
 .auth-form { display: flex; flex-direction: column; gap: 10px; }
-.auth-form input, .auth-form textarea {
-  width: 100%; padding: 12px 14px; border: 1px solid var(--line); background: var(--card);
+.auth-form input, .auth-form textarea { width: 100%; padding: 14px 14px;
+  border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px;
-  outline: none; transition: border-color .12s; border-radius: 8px;
-}
+  outline: none; transition: border-color .12s; border-radius: 10px; }
 .auth-form textarea { min-height: 80px; resize: none; }
 .auth-form input:focus, .auth-form textarea:focus { border-color: var(--accent); }
-.auth-form button {
-  margin-top: 6px; height: 44px; background: var(--accent); color: var(--accent-fg);
-  border: 1px solid var(--accent); font-family: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer; transition: opacity .12s; border-radius: 8px;
-}
+.auth-form button { margin-top: 6px; height: 48px; background: var(--accent);
+  color: var(--accent-fg); border: 1px solid var(--accent);
+  font-family: inherit; font-size: 14px; font-weight: 600;
+  cursor: pointer; transition: opacity .12s; border-radius: 10px; }
 .auth-form button:hover { opacity: .9; }
 .auth-form button:disabled { opacity: .5; cursor: default; }
 .auth-error { color: var(--danger); font-size: 13px; min-height: 18px; }
 .auth-switch { margin-top: 20px; font-size: 13px; color: var(--muted); text-align: center; }
 .auth-switch a { color: var(--accent); cursor: pointer; text-decoration: underline; }
-.auth-label {
-  font-size: 12px; color: var(--muted); margin-bottom: -4px;
-  text-transform: uppercase; letter-spacing: .5px;
-}
+.auth-label { font-size: 12px; color: var(--muted); margin-bottom: -4px;
+  text-transform: uppercase; letter-spacing: .5px; }
 
 .profile-header { padding: 24px 20px; border-bottom: 1px solid var(--line); }
-.profile-name-big { font-size: 24px; font-weight: 700; letter-spacing: -0.4px; display: flex; align-items: center; gap: 10px; }
-.profile-online {
-  width: 10px; height: 10px; border-radius: 50%;
-  background: var(--online); box-shadow: 0 0 0 3px rgba(34,197,94,.18);
-  flex-shrink: 0;
-}
+.profile-name-big { font-size: 24px; font-weight: 700; letter-spacing: -0.4px;
+  display: flex; align-items: center; gap: 10px; }
+.profile-online { width: 10px; height: 10px; border-radius: 50%;
+  background: var(--online); box-shadow: 0 0 0 3px rgba(34,197,94,.18); flex-shrink: 0; }
 .profile-nick-small { color: var(--muted); font-size: 14px; margin-top: 3px; }
-.profile-bio {
-  margin-top: 14px; font-size: 14px; color: var(--text); line-height: 1.55;
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-}
+.profile-bio { margin-top: 14px; font-size: 14px; color: var(--text); line-height: 1.55;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; }
 .profile-bio-empty { color: var(--muted); font-style: italic; }
-.profile-stats {
-  display: flex; gap: 20px; margin-top: 16px; font-size: 13px; color: var(--muted);
-  user-select: none;
-}
+.profile-stats { display: flex; gap: 20px; margin-top: 16px; font-size: 13px;
+  color: var(--muted); user-select: none; }
 .profile-stats b { color: var(--text); font-weight: 600; cursor: pointer; }
 .profile-stats b:hover { color: var(--accent); }
 .profile-actions { margin-top: 18px; display: flex; gap: 8px; flex-wrap: wrap; }
-.follow-btn {
-  height: 36px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
+.follow-btn { height: 40px; padding: 0 22px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent); font-family: inherit; font-size: 13px; font-weight: 600;
   cursor: pointer; transition: opacity .12s, background .12s;
-  display: inline-flex; align-items: center; gap: 8px; border-radius: 8px;
-}
+  display: inline-flex; align-items: center; gap: 8px; border-radius: 10px; }
 .follow-btn:hover { opacity: .9; }
 .follow-btn.following { background: transparent; color: var(--text); border-color: var(--line-strong); }
 .follow-btn.following:hover { background: var(--hover); }
@@ -2428,238 +2067,189 @@ button.send:disabled { opacity: .4; cursor: default; }
 .follow-btn.secondary:hover { background: var(--hover); border-color: var(--accent); color: var(--accent); }
 .own-note { font-size: 13px; color: var(--muted); }
 
+.wall-section { padding: 16px 20px 0; border-bottom: 1px solid var(--line); }
+.wall-title { font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--muted); margin: 0 0 12px; }
+.wall-composer { padding: 12px 20px; border-bottom: 1px solid var(--line); }
+.wall-composer textarea { display: block; width: 100%; min-height: 60px; padding: 10px 12px;
+  border: 1px solid var(--line); background: var(--card); color: var(--text);
+  font-family: inherit; font-size: 14px; line-height: 1.5; outline: none;
+  resize: none; transition: border-color .12s; border-radius: 10px; }
+.wall-composer textarea:focus { border-color: var(--accent); }
+.wall-composer-row { display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; margin-top: 8px; }
+.wall-notice { padding: 10px 20px; font-size: 12px; color: var(--muted);
+  border-bottom: 1px solid var(--line); font-style: italic; }
+.profile-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); }
+.profile-tab { flex: 1; padding: 12px 8px; background: transparent; border: none;
+  color: var(--muted); font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: color .12s, border-color .12s;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.profile-tab:hover { color: var(--text); }
+.profile-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
 .user-list { padding: 6px 0; }
-.user-item { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+.user-item { display: flex; align-items: center; gap: 12px; padding: 14px 20px;
+  border-bottom: 1px solid var(--line); }
 .user-item .user-info { flex: 1; min-width: 0; }
-.user-item .user-nick {
-  font-weight: 600; color: var(--text); text-decoration: none;
-  font-size: 14px; display: flex; align-items: center; gap: 6px;
-}
+.user-item .user-nick { font-weight: 600; color: var(--text); text-decoration: none;
+  font-size: 14px; display: flex; align-items: center; gap: 6px; }
 .user-item .user-nick:hover { color: var(--accent); }
 .user-item .user-name { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.user-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--line-strong); flex-shrink: 0;
-}
+.user-dot { width: 8px; height: 8px; border-radius: 50%;
+  background: var(--line-strong); flex-shrink: 0; }
 .user-dot.online { background: var(--online); box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
 
 .notif-list { padding: 6px 0; }
-.notif {
-  display: block; padding: 14px 20px; border-bottom: 1px solid var(--line);
-  font-size: 14px; line-height: 1.5; text-decoration: none; color: inherit;
-}
+.notif { display: block; padding: 14px 20px; border-bottom: 1px solid var(--line);
+  font-size: 14px; line-height: 1.5; text-decoration: none; color: inherit; }
 .notif.unread { background: var(--hover); border-left: 3px solid var(--accent); }
 .notif:hover { background: var(--hover); }
 .notif-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .notif-author { font-weight: 600; color: var(--text); }
 .notif-text { color: var(--muted); font-size: 13px; }
-.notif-snippet {
-  margin-top: 6px; padding: 8px 12px; background: var(--comment-bg); border-left: 3px solid var(--line-strong);
-  font-size: 13px; color: var(--text);
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; border-radius: 4px;
-}
+.notif-snippet { margin-top: 6px; padding: 8px 12px; background: var(--comment-bg);
+  border-left: 3px solid var(--line-strong); font-size: 13px; color: var(--text);
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; border-radius: 4px; }
 .notif-time { font-size: 11px; color: var(--muted); margin-top: 4px; }
 
-.btn-danger {
-  height: 34px; padding: 0 16px; background: transparent; color: var(--danger);
+.btn-danger { height: 40px; padding: 0 18px; background: transparent; color: var(--danger);
   border: 1px solid var(--danger); font-family: inherit; font-size: 12px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 6px;
-  transition: background .12s, color .12s; border-radius: 8px;
-}
+  transition: background .12s, color .12s; border-radius: 10px; }
 .btn-danger:hover { background: var(--danger); color: #fff; }
-.btn-secondary {
-  height: 36px; padding: 0 16px; background: transparent; color: var(--text);
-  border: 1px solid var(--line);
-  font-family: inherit; font-size: 13px; cursor: pointer;
-  transition: background .12s, border-color .12s, color .12s;
-  border-radius: 8px;
-  display: inline-flex; align-items: center; gap: 8px;
-}
+.btn-secondary { height: 40px; padding: 0 18px; background: transparent; color: var(--text);
+  border: 1px solid var(--line); font-family: inherit; font-size: 13px; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s; border-radius: 10px;
+  display: inline-flex; align-items: center; gap: 8px; }
 .btn-secondary:hover { background: var(--hover); border-color: var(--line-strong); }
 
 .settings-layout { display: flex; gap: 0; height: 100%; }
-.settings-nav {
-  flex: 0 0 220px; border-right: 1px solid var(--line);
-  padding: 20px 12px; display: flex; flex-direction: column; gap: 4px;
-  overflow-y: auto;
-}
-.settings-nav-btn {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; text-align: left;
-  background: transparent; border: none; color: var(--text);
-  cursor: pointer; border-radius: 8px; font: inherit; font-size: 14px;
-  transition: background .12s;
-}
+.settings-nav { flex: 0 0 220px; border-right: 1px solid var(--line);
+  padding: 20px 12px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.settings-nav-btn { display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; text-align: left; background: transparent; border: none;
+  color: var(--text); cursor: pointer; border-radius: 8px; font: inherit;
+  font-size: 14px; transition: background .12s; }
 .settings-nav-btn:hover { background: var(--hover); }
 .settings-nav-btn.active { background: var(--accent); color: #fff; font-weight: 600; }
 .settings-nav-btn.active svg { color: #fff; }
 .settings-content { flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0; }
 .settings-section { margin-bottom: 32px; }
 .settings-section:last-child { margin-bottom: 0; }
-.settings h2, .settings-section h2 {
-  font-size: 12px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .6px; color: var(--muted); margin: 0 0 12px;
-}
+.settings h2, .settings-section h2 { font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 12px; }
 .opt-row { display: flex; gap: 6px; flex-wrap: wrap; }
-.opt {
-  height: 36px; padding: 0 18px; background: transparent; color: var(--text);
+.opt { height: 40px; padding: 0 20px; background: transparent; color: var(--text);
   border: 1px solid var(--line); font-family: inherit; font-size: 13px;
-  cursor: pointer; transition: border-color .12s, background .12s, color .12s; border-radius: 8px;
-}
+  cursor: pointer; transition: border-color .12s, background .12s, color .12s; border-radius: 10px; }
 .opt:hover { background: var(--hover); }
 .opt.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-
-.toggle-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 14px;
-}
+.toggle-row { display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 14px; gap: 12px; }
 .toggle-row:last-child { border-bottom: none; }
-.toggle {
-  position: relative; width: 44px; height: 24px;
-  background: var(--line); cursor: pointer; transition: background .15s;
-  border: none; flex-shrink: 0; border-radius: 12px;
-}
-.toggle::after {
-  content: ''; position: absolute; left: 2px; top: 2px;
-  width: 20px; height: 20px; background: #fff;
-  transition: transform .15s; border-radius: 50%;
-  box-shadow: 0 1px 3px rgba(0,0,0,.2);
-}
+.toggle { position: relative; width: 48px; height: 26px; background: var(--line);
+  cursor: pointer; transition: background .15s; border: none; flex-shrink: 0; border-radius: 13px; }
+.toggle::after { content: ''; position: absolute; left: 2px; top: 2px;
+  width: 22px; height: 22px; background: #fff; transition: transform .15s;
+  border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.2); }
 .toggle.on { background: var(--up); }
-.toggle.on::after { transform: translateX(20px); }
-
+.toggle.on::after { transform: translateX(22px); }
 .settings-desc { font-size: 13px; line-height: 1.65; color: var(--muted); margin: 0 0 14px; }
-.settings-link {
-  display: inline-block; color: var(--accent); text-decoration: none;
-  font-size: 13px; cursor: pointer;
-}
+.settings-link { display: inline-block; color: var(--accent); text-decoration: none;
+  font-size: 13px; cursor: pointer; }
 .settings-link:hover { text-decoration: underline; }
 .settings-authors { font-size: 14px; color: var(--text); }
 
 .blacklist-add { display: flex; gap: 8px; margin-bottom: 12px; }
-.blacklist-add input {
-  flex: 1; padding: 10px 14px; border: 1px solid var(--line);
-  background: var(--card); color: var(--text); font-family: inherit; font-size: 14px;
-  outline: none; border-radius: 8px;
-}
+.blacklist-add input { flex: 1; padding: 12px 14px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); font-family: inherit;
+  font-size: 14px; outline: none; border-radius: 10px; }
 .blacklist-add input:focus { border-color: var(--accent); }
 .blacklist-list { display: flex; flex-direction: column; gap: 6px; }
-.blacklist-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 10px 14px; background: var(--hover);
-  border-radius: 8px; font-size: 14px;
-}
+.blacklist-item { display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; background: var(--hover); border-radius: 10px; font-size: 14px; }
 .blacklist-item .bl-nick { flex: 1; font-weight: 600; }
 .blacklist-item .bl-nick a { color: var(--text); text-decoration: none; }
 .blacklist-item .bl-nick a:hover { color: var(--accent); }
-.blacklist-item button {
-  height: 28px; padding: 0 12px; background: transparent;
-  border: 1px solid var(--danger); color: var(--danger);
-  font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 6px;
-  transition: background .12s, color .12s;
-}
+.blacklist-item button { height: 32px; padding: 0 14px; background: transparent;
+  border: 1px solid var(--danger); color: var(--danger); font-family: inherit;
+  font-size: 12px; cursor: pointer; border-radius: 8px;
+  transition: background .12s, color .12s; }
 .blacklist-item button:hover { background: var(--danger); color: #fff; }
 
 .policy { padding: 24px; max-width: 720px; }
 .policy h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; }
-.policy p { font-size: 14px; line-height: 1.7; color: var(--text); white-space: pre-wrap; margin: 0; }
+.policy p { font-size: 14px; line-height: 1.7; color: var(--text);
+  white-space: pre-wrap; margin: 0; }
 
 .dm-list { padding: 6px 0; }
-.dm-thread {
-  display: flex; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line);
-  text-decoration: none; color: inherit; transition: background .12s;
-  align-items: center;
-}
+.dm-thread { display: flex; gap: 12px; padding: 14px 20px;
+  border-bottom: 1px solid var(--line); text-decoration: none;
+  color: inherit; transition: background .12s; align-items: center; }
 .dm-thread:hover { background: var(--hover); }
-.dm-thread .info { flex: 1; min-width: 0; text-decoration: none; color: inherit; display: block; }
-.dm-thread .who {
-  font-weight: 600; font-size: 14px;
-  display: flex; align-items: center; gap: 8px;
-}
+.dm-thread .info { flex: 1; min-width: 0; text-decoration: none;
+  color: inherit; display: block; }
+.dm-thread .who { font-weight: 600; font-size: 14px;
+  display: flex; align-items: center; gap: 8px; }
 .dm-thread .preview { font-size: 13px; color: var(--muted); margin-top: 3px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dm-thread .meta { flex-shrink: 0; display: flex; flex-direction: column;
   align-items: flex-end; gap: 6px; }
 .dm-thread .time { font-size: 11px; color: var(--muted); }
-.dm-thread .unread-badge {
-  min-width: 20px; height: 20px; line-height: 20px;
-  background: var(--danger); color: #fff;
-  font-size: 11px; font-weight: 700; text-align: center; padding: 0 6px; border-radius: 10px;
-}
+.dm-thread .unread-badge { min-width: 20px; height: 20px; line-height: 20px;
+  background: var(--danger); color: #fff; font-size: 11px; font-weight: 700;
+  text-align: center; padding: 0 6px; border-radius: 10px; }
 .dm-thread .mine-label { color: var(--muted); }
-.dm-del-btn {
-  width: 32px; height: 32px; flex-shrink: 0;
-  background: transparent; border: 1px solid transparent; color: var(--muted);
-  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
-  transition: color .12s, background .12s, border-color .12s; border-radius: 6px;
-}
+.dm-del-btn { width: 36px; height: 36px; flex-shrink: 0; background: transparent;
+  border: 1px solid transparent; color: var(--muted); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: color .12s, background .12s, border-color .12s; border-radius: 8px; }
 .dm-del-btn:hover { color: var(--danger); border-color: var(--danger); background: rgba(220,38,38,.08); }
 
 .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.chat-header-sub {
-  font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 6px;
-}
+.chat-header-sub { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 6px; }
 .chat-header-sub.online { color: var(--online); }
 .chat-header-sub.typing { color: var(--accent); font-style: italic; }
-.chat-body {
-  flex: 1; overflow-y: auto; overflow-x: hidden;
-  padding: 18px 20px; background: var(--bg);
-}
+.chat-body { flex: 1; overflow-y: auto; overflow-x: hidden;
+  padding: 18px 20px; background: var(--bg); -webkit-overflow-scrolling: touch; }
 .chat-intro { text-align: center; color: var(--muted); font-size: 13px; padding: 20px 0; }
-.chat-msg {
-  width: fit-content; max-width: 70%; margin-bottom: 10px;
-  padding: 10px 14px;
-  word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
-  font-size: 14px; line-height: 1.45; border-radius: 14px;
-  box-shadow: var(--shadow);
-}
-.chat-msg.mine {
-  margin-left: auto; background: var(--bubble-mine); color: var(--bubble-mine-fg);
-  border-bottom-right-radius: 4px;
-}
-.chat-msg.theirs {
-  margin-right: auto; background: var(--bubble-theirs); color: var(--bubble-theirs-fg);
-  border-bottom-left-radius: 4px;
-}
+.chat-msg { width: fit-content; max-width: 70%; margin-bottom: 10px;
+  padding: 10px 14px; word-wrap: break-word; overflow-wrap: anywhere;
+  white-space: pre-wrap; font-size: 14px; line-height: 1.45;
+  border-radius: 14px; box-shadow: var(--shadow); }
+.chat-msg.mine { margin-left: auto; background: var(--bubble-mine);
+  color: var(--bubble-mine-fg); border-bottom-right-radius: 4px; }
+.chat-msg.theirs { margin-right: auto; background: var(--bubble-theirs);
+  color: var(--bubble-theirs-fg); border-bottom-left-radius: 4px; }
 .chat-msg .chat-time { font-size: 10px; opacity: .7; margin-top: 4px; }
-.chat-composer {
-  flex: 0 0 auto; border-top: 1px solid var(--line); padding: 10px 14px;
-  display: flex; gap: 10px; align-items: flex-end; background: var(--card);
-}
-.chat-composer textarea {
-  flex: 1; min-height: 42px; max-height: 160px; padding: 10px 14px;
-  border: 1px solid var(--line); background: var(--hover);
+.chat-composer { flex: 0 0 auto; border-top: 1px solid var(--line);
+  padding: 10px 14px; display: flex; gap: 10px; align-items: flex-end;
+  background: var(--card); padding-bottom: calc(10px + env(safe-area-inset-bottom, 0)); }
+.chat-composer textarea { flex: 1; min-height: 42px; max-height: 160px;
+  padding: 10px 14px; border: 1px solid var(--line); background: var(--hover);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.4;
-  outline: none; resize: none; transition: border-color .12s, background .12s;
-  border-radius: 10px;
-}
+  outline: none; resize: none; transition: border-color .12s, background .12s; border-radius: 12px; }
 .chat-composer textarea:focus { border-color: var(--accent); background: var(--card); }
-.chat-composer button {
-  height: 42px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
-  border: 1px solid var(--accent); font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer; transition: opacity .12s; border-radius: 10px;
-}
+.chat-composer button { height: 42px; padding: 0 22px; background: var(--accent);
+  color: var(--accent-fg); border: 1px solid var(--accent);
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: opacity .12s; border-radius: 12px; }
 .chat-composer button:hover { opacity: .9; }
 .chat-composer button:disabled { opacity: .4; cursor: default; }
 
-.modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,.5);
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5);
   display: flex; align-items: center; justify-content: center;
-  z-index: 1000; padding: 20px;
-  animation: fadeIn .15s ease;
-}
+  z-index: 1000; padding: 20px; animation: fadeIn .15s ease; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-.modal {
-  background: var(--card); border: 1px solid var(--line);
-  padding: 24px; max-width: 380px; width: 100%; border-radius: 12px;
-  box-shadow: 0 10px 40px rgba(0,0,0,.2);
-}
+.modal { background: var(--card); border: 1px solid var(--line);
+  padding: 24px; max-width: 380px; width: 100%; border-radius: 14px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.2); }
 .modal-text { font-size: 15px; line-height: 1.5; color: var(--text); margin-bottom: 20px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.modal-btn {
-  height: 36px; padding: 0 18px; font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer; transition: opacity .12s, background .12s; border-radius: 8px;
-}
+.modal-btn { height: 40px; padding: 0 18px; font-family: inherit;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: opacity .12s, background .12s; border-radius: 10px; }
 .modal-btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
 .modal-btn.secondary:hover { background: var(--hover); }
 .modal-btn.danger { background: var(--danger); color: #fff; border: 1px solid var(--danger); }
@@ -2674,61 +2264,61 @@ button.send:disabled { opacity: .4; cursor: default; }
 @media (max-width: 900px) {
   body { font-size: 15px; }
   .layout { flex-direction: column; }
-  .main { order: 1; height: calc(100vh - 62px); }
-  .sidebar {
-    order: 2; width: 100%; height: 62px;
-    flex-direction: row; border-left: none;
-    border-top: 1px solid var(--line);
-    padding: 0; flex: 0 0 62px;
-    box-shadow: 0 -1px 3px rgba(0,0,0,.04);
-  }
+  .main { order: 1; height: calc(100vh - 62px - env(safe-area-inset-bottom, 0)); }
+  .sidebar { order: 2; width: 100%; height: calc(62px + env(safe-area-inset-bottom, 0));
+    flex-direction: row; border-left: none; border-top: 1px solid var(--line);
+    padding: 0 0 env(safe-area-inset-bottom, 0); flex: 0 0 auto;
+    box-shadow: 0 -1px 3px rgba(0,0,0,.04); }
   .sidebar .logo { display: none; }
   .sidebar .spacer { display: none; }
   .sidebar-user { display: none; }
-  .nav { flex-direction: row; flex: 1; justify-content: space-around; align-items: stretch; gap: 0; }
-  .nav-btn {
-    flex-direction: column; gap: 3px; padding: 6px 4px;
-    flex: 1; justify-content: center; align-items: center; text-align: center; border-radius: 0;
-  }
+  .nav { flex-direction: row; flex: 1;
+    justify-content: space-around; align-items: stretch; gap: 0; }
+  .nav-btn { flex-direction: column; gap: 2px; padding: 6px 4px;
+    flex: 1; justify-content: center; align-items: center;
+    text-align: center; border-radius: 0; min-height: 56px; }
   .nav-btn[data-nav="logout"] { display: none; }
   .nav-btn span { font-size: 10px; line-height: 1; }
-  .nav-btn svg { width: 20px; height: 20px; }
+  .nav-btn svg { width: 22px; height: 22px; }
   .nav-btn.active { background: transparent; }
-  .nav-btn.active svg { color: var(--accent); }
-  .nav-btn.active span { color: var(--accent); }
-  .nav-btn .badge {
-    position: absolute; top: 2px; right: 18%;
-    margin: 0; min-width: 16px; height: 16px;
-    line-height: 16px; font-size: 10px; padding: 0 4px; border-radius: 8px;
-  }
-  .main-header { min-height: 48px; padding: 8px 12px; }
+  .nav-btn.active svg, .nav-btn.active span { color: var(--accent); }
+  .nav-btn .badge { position: absolute; top: 2px; right: 18%;
+    margin: 0; min-width: 16px; height: 16px; line-height: 16px;
+    font-size: 10px; padding: 0 4px; border-radius: 8px; }
+  .main-header { min-height: 52px; padding: 8px 12px;
+    padding-top: calc(8px + env(safe-area-inset-top, 0)); }
   .main-header .title { font-size: 14px; }
   .post { padding: 14px 16px; }
   .post-text { font-size: 15px; }
-  .composer { padding: 10px 12px; }
-  .composer textarea { min-height: 90px; }
-  .composer.composer-comment textarea { min-height: 70px; }
+  .post-actions { gap: 0; }
+  .vote-btn, .action-btn { height: 36px; padding: 0 12px; }
+  .composer { padding: 10px 12px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0)); }
+  .composer textarea { min-height: 96px; }
+  .composer.composer-comment textarea { min-height: 72px; }
   .profile-header { padding: 20px 16px; }
+  .profile-name-big { font-size: 20px; }
+  .wall-composer { padding: 12px 16px; }
   .chat-body { padding: 14px 12px; }
-  .chat-msg { max-width: 82%; font-size: 14px; }
-  .chat-composer { padding: 8px 10px; gap: 8px; }
-  .chat-composer button { padding: 0 14px; }
-  .user-item { padding: 12px 16px; }
-  .notif { padding: 12px 16px; }
-  .dm-thread { padding: 12px 16px; }
-
+  .chat-msg { max-width: 82%; font-size: 15px; }
+  .chat-composer { padding: 8px 10px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0)); gap: 8px; }
+  .chat-composer button { padding: 0 16px; }
+  .user-item { padding: 14px 16px; }
+  .notif { padding: 14px 16px; }
+  .dm-thread { padding: 14px 16px; }
   .settings-layout { flex-direction: column; height: auto; }
-  .settings-nav {
-    flex: 0 0 auto; flex-direction: row;
+  .settings-nav { flex: 0 0 auto; flex-direction: row;
     border-right: none; border-bottom: 1px solid var(--line);
-    padding: 10px 12px; gap: 4px;
-    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
-    position: sticky; top: 0; background: var(--card); z-index: 5;
-  }
+    padding: 10px 12px; gap: 4px; overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none; position: sticky; top: 0; background: var(--card); z-index: 5; }
   .settings-nav::-webkit-scrollbar { display: none; }
-  .settings-nav-btn { flex-shrink: 0; padding: 8px 14px; font-size: 13px; }
+  .settings-nav-btn { flex-shrink: 0; padding: 10px 16px; font-size: 13px; }
   .settings-content { padding: 18px 16px; }
-  .settings-section { margin-bottom: 26px; scroll-margin-top: 120px; }
+  .settings-section { margin-bottom: 26px; scroll-margin-top: 130px; }
+  .blacklist-add input { font-size: 16px; }
+  .auth-form input, .auth-form textarea { font-size: 16px; }
+  .composer textarea, .chat-composer textarea, .wall-composer textarea { font-size: 16px; }
 }
 """
 
@@ -2760,11 +2350,13 @@ var state = {
   usersQuery: '',
   dmQuery: '',
   composerDraft: '',
+  wallDraft: '',
   replyTo: null,
   highlightComment: null,
   suppressRefresh: 0,
   lastChatLen: 0,
   settingsSection: 'account',
+  profileTab: 'posts',
   es: null,
   typingTimer: null,
   lastTypingSent: 0,
@@ -2840,14 +2432,17 @@ function truncateText(text) {
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
 
-function showConfirm(text, onConfirm) {
+function showConfirm(text, onConfirm, opts) {
+  opts = opts || {};
+  var yesText = opts.yesText || tr('confirm_yes');
+  var noText = opts.noText || tr('confirm_no');
   var modal = document.createElement('div');
   modal.className = 'modal-overlay';
   modal.innerHTML = '<div class="modal">'
     + '<div class="modal-text">' + escapeHtml(text) + '</div>'
     + '<div class="modal-actions">'
-    + '<button class="modal-btn secondary" data-modal-cancel>' + escapeHtml(tr('confirm_no')) + '</button>'
-    + '<button class="modal-btn danger" data-modal-confirm>' + escapeHtml(tr('confirm_yes')) + '</button>'
+    + '<button class="modal-btn secondary" data-modal-cancel>' + escapeHtml(noText) + '</button>'
+    + '<button class="modal-btn danger" data-modal-confirm>' + escapeHtml(yesText) + '</button>'
     + '</div></div>';
   document.body.appendChild(modal);
   function close() { if (modal.parentNode) modal.parentNode.removeChild(modal); }
@@ -2877,8 +2472,7 @@ function handleRoute() {
   var m;
   if (path === '/' || path === '') { state.view = 'feed'; state.viewData = {}; }
   else if ((m = path.match(/^\/p\/([a-z0-9]+)$/))) {
-    state.view = 'post';
-    state.viewData = { post_id: m[1] };
+    state.view = 'post'; state.viewData = { post_id: m[1] };
     state.highlightComment = (location.hash && location.hash.match(/^#c-(.+)$/)) ? location.hash.slice(3) : null;
   }
   else if ((m = path.match(/^\/u\/([^\/]+)\/followers$/))) {
@@ -2889,6 +2483,7 @@ function handleRoute() {
   }
   else if ((m = path.match(/^\/u\/(.+)$/))) {
     state.view = 'profile'; state.viewData = { nick: decodeURIComponent(m[1]) };
+    state.profileTab = 'posts';
   }
   else if ((m = path.match(/^\/messages\/(.+)$/))) {
     state.view = 'chat'; state.viewData = { nick: decodeURIComponent(m[1]) };
@@ -2903,48 +2498,33 @@ function handleRoute() {
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'feed'; state.viewData = {}; }
-  renderSidebar();
-  renderMain();
+  renderSidebar(); renderMain();
 }
 window.addEventListener('popstate', handleRoute);
 
 async function loadMe() {
   if (!state.token) return;
-  try {
-    var u = await api('/api/me');
-    setUser(u);
-  } catch(e) { setUser(null); }
+  try { var u = await api('/api/me'); setUser(u); }
+  catch(e) { setUser(null); }
 }
-
 async function doRegister(data) {
   var res = await api('/api/register', { method: 'POST', body: data });
-  state.token = res.token;
-  localStorage.setItem('sldchat_token', res.token);
-  setUser(res.user);
-  connectSSE();
-  navigate('/');
+  state.token = res.token; localStorage.setItem('sldchat_token', res.token);
+  setUser(res.user); connectSSE(); navigate('/');
 }
 async function doLogin(data) {
   var res = await api('/api/login', { method: 'POST', body: data });
-  state.token = res.token;
-  localStorage.setItem('sldchat_token', res.token);
-  setUser(res.user);
-  connectSSE();
-  navigate('/');
+  state.token = res.token; localStorage.setItem('sldchat_token', res.token);
+  setUser(res.user); connectSSE(); navigate('/');
 }
 function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
-    disconnectSSE();
-    setUser(null);
-    state.token = null;
-    setCounters(0, 0);
-    localStorage.removeItem('sldchat_token');
-    navigate('/');
-  });
+    disconnectSSE(); setUser(null); state.token = null;
+    setCounters(0, 0); localStorage.removeItem('sldchat_token'); navigate('/');
+  }, { yesText: tr('confirm_yes') });
 }
 
-// ============ SSE ============
 function refreshCounters() {
   if (!state.token) return;
   api('/api/counters').then(function(data){
@@ -2953,47 +2533,29 @@ function refreshCounters() {
     if (changed) renderSidebar();
   }).catch(function(){});
 }
-
 function disconnectSSE() {
-  if (state.es) {
-    try { state.es.close(); } catch(e) {}
-    state.es = null;
-  }
-  if (state.presenceTimer) {
-    clearInterval(state.presenceTimer);
-    state.presenceTimer = null;
-  }
+  if (state.es) { try { state.es.close(); } catch(e) {} state.es = null; }
+  if (state.presenceTimer) { clearInterval(state.presenceTimer); state.presenceTimer = null; }
 }
-
 function connectSSE() {
   if (!state.token) return;
   disconnectSSE();
   var es = new EventSource('/api/events?token=' + encodeURIComponent(state.token));
   state.es = es;
-  es.onmessage = function(e) {
-    try {
-      var ev = JSON.parse(e.data);
-      handleEvent(ev);
-    } catch(err) {}
-  };
-  es.onerror = function() { /* auto-reconnect */ };
+  es.onmessage = function(e) { try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
+  es.onerror = function() {};
   state.presenceTimer = setInterval(function(){
-    if (state.token) {
-      fetch('/api/presence', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
-    }
+    if (state.token) fetch('/api/presence', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
   }, 20000);
 }
-
 function handleEvent(ev) {
   if (!ev || !ev.type) return;
   if (ev.type === 'hello') return;
-
   if (ev.type === 'notification') {
     refreshCounters();
     if (state.view === 'notifications') loadNotifications();
     return;
   }
-
   if (ev.type === 'message') {
     var myNick = state.user && state.user.nick;
     if (ev.from === myNick) {
@@ -3001,22 +2563,17 @@ function handleEvent(ev) {
       return;
     }
     if (state.view === 'chat' && state.viewData.nick === ev.from) {
-      loadChat(true);
-      refreshCounters();
+      loadChat(true); refreshCounters();
     } else {
       refreshCounters();
       if (state.view === 'messages') loadDMs();
     }
     return;
   }
-
   if (ev.type === 'typing') {
-    if (state.view === 'chat' && state.viewData.nick === ev.from) {
-      showTypingIndicator();
-    }
+    if (state.view === 'chat' && state.viewData.nick === ev.from) showTypingIndicator();
     return;
   }
-
   if (ev.type === 'presence') {
     if (state.view === 'messages') loadDMs();
     if (state.view === 'chat' && state.viewData.nick === ev.nick) {
@@ -3028,14 +2585,12 @@ function handleEvent(ev) {
     }
     return;
   }
-
   if (ev.type === 'thread_deleted') {
     if (state.view === 'messages') loadDMs();
     if (state.view === 'chat' && state.viewData.nick === ev.other) navigate('/messages');
     return;
   }
 }
-
 function showTypingIndicator() {
   var el = document.getElementById('chatStatus');
   if (!el) return;
@@ -3043,22 +2598,16 @@ function showTypingIndicator() {
   el.className = 'chat-header-sub typing';
   clearTimeout(state.typingTimer);
   state.typingTimer = setTimeout(function(){
-    if (el) {
-      el.textContent = '';
-      el.className = 'chat-header-sub';
-    }
+    if (el) { el.textContent = ''; el.className = 'chat-header-sub'; }
   }, 3500);
 }
-
 window.addEventListener('pagehide', function(){
   if (!state.token) return;
   try {
     fetch('/api/presence/offline', {
       method: 'POST',
       headers: { 'X-Auth': state.token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: state.token }),
-      keepalive: true,
-    });
+      body: JSON.stringify({ token: state.token }), keepalive: true });
   } catch(e) {}
 });
 
@@ -3075,11 +2624,14 @@ function renderSidebar() {
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
-    html += navBtn(ICONS.mail, tr('nav_messages'), state.view === 'messages' || state.view === 'chat', 'messages', state.unreadDM);
-    html += navBtn(ICONS.bell, tr('nav_notifications'), state.view === 'notifications', 'notifications', state.unreadNotif);
+    html += navBtn(ICONS.mail, tr('nav_messages'),
+      state.view === 'messages' || state.view === 'chat', 'messages', state.unreadDM);
+    html += navBtn(ICONS.bell, tr('nav_notifications'),
+      state.view === 'notifications', 'notifications', state.unreadNotif);
     html += navBtn(ICONS.user, tr('nav_profile'),
       state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
-    html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings' || state.view === 'edit_profile', 'settings');
+    html += navBtn(ICONS.gear, tr('nav_settings'),
+      state.view === 'settings' || state.view === 'edit_profile', 'settings');
     html += navBtn(ICONS.logout, tr('nav_logout'), false, 'logout');
   } else {
     html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
@@ -3087,9 +2639,7 @@ function renderSidebar() {
     html += navBtn(ICONS.login, tr('nav_login'), state.view === 'login', 'login');
   }
   html += '</div><div class="spacer"></div>';
-  if (state.user) {
-    html += '<div class="sidebar-user"><span class="dot"></span>@' + escapeHtml(state.user.nick) + '</div>';
-  }
+  if (state.user) html += '<div class="sidebar-user"><span class="dot"></span>@' + escapeHtml(state.user.nick) + '</div>';
   el.innerHTML = html;
   el.querySelectorAll('[data-nav]').forEach(function(b){
     b.addEventListener('click', function(){
@@ -3135,10 +2685,7 @@ function bindLinks(root) {
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
     a.dataset.linkBound = '1';
-    a.addEventListener('click', function(e){
-      e.preventDefault();
-      navigate(a.getAttribute('href'));
-    });
+    a.addEventListener('click', function(e){ e.preventDefault(); navigate(a.getAttribute('href')); });
   });
 }
 
@@ -3229,8 +2776,7 @@ function renderFeedView(el) {
       try {
         await api('/api/posts', { method: 'POST', body: { text: text } });
         inputEl.value = ''; state.composerDraft = '';
-        updateCounter();
-        state.searchQuery = '';
+        updateCounter(); state.searchQuery = '';
         await loadFeed();
       } catch(e) { alert(tr(e.message) || e.message); }
       finally { updateCounter(); }
@@ -3248,8 +2794,7 @@ async function loadFeed() {
     var posts = applyFilters(data.posts || []);
     if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
     feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-    bindPostActions(feedEl);
-    bindLinks(feedEl);
+    bindPostActions(feedEl); bindLinks(feedEl);
   } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
 }
 function applyFilters(posts) {
@@ -3289,8 +2834,7 @@ function renderPostView(el) {
       + '</div></div>';
   }
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
 
   if (state.user) {
     var inputEl = document.getElementById('newComment');
@@ -3305,9 +2849,7 @@ function renderPostView(el) {
         state.replyTo = null; renderReplyBanner();
       });
     }
-    renderReplyBanner();
-    state._renderReplyBanner = renderReplyBanner;
-
+    renderReplyBanner(); state._renderReplyBanner = renderReplyBanner;
     function updateCounter(){
       var len = inputEl.value.length;
       counter.textContent = len + ' / ' + MAX_COMMENT_LEN;
@@ -3320,7 +2862,6 @@ function renderPostView(el) {
     });
     sendBtn.addEventListener('click', sendComment);
     updateCounter();
-
     async function sendComment(){
       var text = inputEl.value.trim();
       if (!text) return;
@@ -3330,8 +2871,7 @@ function renderPostView(el) {
         if (state.replyTo) body.parent_id = state.replyTo.id;
         await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
         inputEl.value = '';
-        state.replyTo = null; renderReplyBanner();
-        updateCounter();
+        state.replyTo = null; renderReplyBanner(); updateCounter();
         await loadPostView();
       } catch(e) { alert(tr(e.message) || e.message); }
       finally { updateCounter(); }
@@ -3346,8 +2886,7 @@ async function loadPostView() {
   try {
     var p = await api('/api/posts/' + state.viewData.post_id);
     feedEl.innerHTML = renderPostHtml(p, true);
-    bindPostActions(feedEl);
-    bindLinks(feedEl);
+    bindPostActions(feedEl); bindLinks(feedEl);
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -3368,15 +2907,15 @@ function renderProfileView(el) {
   html += '<div class="title">@' + escapeHtml(nick) + '</div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
-  html += '<div class="main-body"><div id="profileHeader">' + spinner() + '</div><div id="feed"></div></div>';
+  html += '<div class="main-body"><div id="profileHeader">' + spinner() + '</div><div id="profileTabs"></div><div id="feed"></div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   loadProfile(nick);
 }
 
 async function loadProfile(nick) {
   var headerEl = document.getElementById('profileHeader');
+  var tabsEl = document.getElementById('profileTabs');
   var feedEl = document.getElementById('feed');
   try {
     var u = await api('/api/users/' + encodeURIComponent(nick));
@@ -3412,19 +2951,16 @@ async function loadProfile(nick) {
     document.getElementById('followingLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/following');
     });
-
     var editBtn = document.getElementById('editProfileBtn');
     if (editBtn) editBtn.addEventListener('click', function(){ navigate('/settings/profile'); });
-
     var btn = document.getElementById('followBtn');
     if (btn) {
       btn.addEventListener('click', async function(){
         try {
-          if (btn.classList.contains('following')) {
+          if (btn.classList.contains('following'))
             await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-          } else {
+          else
             await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-          }
           loadProfile(nick);
         } catch(e) { alert(tr(e.message) || e.message); }
       });
@@ -3434,18 +2970,101 @@ async function loadProfile(nick) {
       navigate('/messages/' + encodeURIComponent(u.nick));
     });
 
-    var data = await api('/api/posts?author=' + encodeURIComponent(u.nick));
-    var posts = (data.posts || []).slice();
-    posts.sort(function(a, b){ return b.created_at - a.created_at; });
-    if (!posts.length) feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
-    else {
-      feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-      bindPostActions(feedEl);
-      bindLinks(feedEl);
-    }
+    // Tabs
+    var wallVisible = u.allow_wall_posts !== false || isMe;
+    tabsEl.innerHTML = '<div class="profile-tabs">'
+      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('own_profile') === tr('own_profile') ? '' : '' + '</button>'
+      + '</div>';
+    // simpler: build manually
+    var tabsHtml = '<div class="profile-tabs">';
+    tabsHtml += '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + escapeHtml(state.profileTab === 'posts' ? 'Посты' : 'Посты') + '</button>';
+    tabsHtml += '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + escapeHtml(tr('wall_title')) + '</button>';
+    tabsHtml += '</div>';
+    // Set proper labels
+    var labelPosts = (LANG === 'ru' ? 'Посты' : 'Posts');
+    tabsEl.innerHTML = '<div class="profile-tabs">'
+      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + labelPosts + '</button>'
+      + '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_title') + '</button>'
+      + '</div>';
+    tabsEl.querySelectorAll('.profile-tab').forEach(function(t){
+      t.addEventListener('click', function(){
+        state.profileTab = t.dataset.tab;
+        tabsEl.querySelectorAll('.profile-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+        loadProfileTab(u, isMe);
+      });
+    });
+
+    loadProfileTab(u, isMe);
   } catch(e) {
     headerEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
-    feedEl.innerHTML = '';
+    tabsEl.innerHTML = ''; feedEl.innerHTML = '';
+  }
+}
+
+async function loadProfileTab(u, isMe) {
+  var feedEl = document.getElementById('feed');
+  if (!feedEl) return;
+  feedEl.innerHTML = spinner();
+  if (state.profileTab === 'wall') {
+    var wallAllowed = u.allow_wall_posts !== false || isMe;
+    var wallComposer = '';
+    if (state.user && wallAllowed) {
+      wallComposer = '<div class="wall-composer">'
+        + '<textarea id="wallInput" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('wall_ph')) + '">' + escapeHtml(state.wallDraft || '') + '</textarea>'
+        + '<div class="wall-composer-row">'
+        + '<div id="wallCounter" class="counter">0 / ' + MAX_POST_LEN + '</div>'
+        + '<button class="send" id="wallSend" disabled>' + tr('wall_post') + '</button>'
+        + '</div></div>';
+    } else if (state.user && !wallAllowed) {
+      wallComposer = '<div class="wall-notice">' + escapeHtml(tr('wall_disabled')) + '</div>';
+    } else {
+      wallComposer = '<div class="wall-notice">' + escapeHtml(tr('login_to_wall')) + '</div>';
+    }
+    try {
+      var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
+      var posts = data.posts || [];
+      var bodyHtml = posts.length
+        ? posts.map(function(p){ return renderPostHtml(p, false); }).join('')
+        : '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
+      feedEl.innerHTML = wallComposer + bodyHtml;
+      bindPostActions(feedEl); bindLinks(feedEl);
+      var wi = document.getElementById('wallInput');
+      var ws = document.getElementById('wallSend');
+      var wc = document.getElementById('wallCounter');
+      if (wi && ws && wc) {
+        function updateWallCounter(){
+          var len = wi.value.length;
+          wc.textContent = len + ' / ' + MAX_POST_LEN;
+          wc.classList.toggle('warn', len >= MAX_POST_LEN);
+          ws.disabled = len === 0 || len > MAX_POST_LEN;
+        }
+        wi.value = state.wallDraft || '';
+        wi.addEventListener('input', function(){ state.wallDraft = wi.value; updateWallCounter(); });
+        ws.addEventListener('click', async function(){
+          var text = wi.value.trim();
+          if (!text) return;
+          ws.disabled = true;
+          try {
+            await api('/api/users/' + encodeURIComponent(u.nick) + '/wall', { method: 'POST', body: { text: text } });
+            wi.value = ''; state.wallDraft = '';
+            updateWallCounter();
+            loadProfileTab(u, isMe);
+          } catch(e) { alert(tr(e.message) || e.message); updateWallCounter(); }
+        });
+        updateWallCounter();
+      }
+    } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
+  } else {
+    try {
+      var data2 = await api('/api/posts?author=' + encodeURIComponent(u.nick));
+      var posts2 = (data2.posts || []).slice();
+      posts2.sort(function(a, b){ return b.created_at - a.created_at; });
+      if (!posts2.length) feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
+      else {
+        feedEl.innerHTML = posts2.map(function(p){ return renderPostHtml(p, false); }).join('');
+        bindPostActions(feedEl); bindLinks(feedEl);
+      }
+    } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
   }
 }
 
@@ -3468,12 +3087,9 @@ function renderEditProfileView(el) {
   html += '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '">' + escapeHtml(u.bio || '') + '</textarea>';
   html += '<div class="auth-error" id="editError"></div>';
   html += '<button type="submit">' + tr('save') + '</button>';
-  html += '</form>';
-  html += '</div></div>';
+  html += '</form></div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
-
+  attachThemeBtn(); bindLinks(el);
   var form = document.getElementById('editForm');
   var errEl = document.getElementById('editError');
   form.addEventListener('submit', async function(e){
@@ -3489,8 +3105,7 @@ function renderEditProfileView(el) {
     btn.disabled = true;
     try {
       var r = await api('/api/users/me', { method: 'PUT', body: body });
-      setUser(r.user);
-      renderSidebar();
+      setUser(r.user); renderSidebar();
       navigate('/u/' + encodeURIComponent(r.user.nick));
     } catch(err) {
       errEl.textContent = tr(err.message) || err.message;
@@ -3511,21 +3126,16 @@ function renderFollowListView(el) {
   html += '</header>';
   html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   loadFollowList(nick, isFollowers);
 }
-
 function userItemHtml(u) {
   var dotCls = u.online ? ' online' : '';
-  return '<div class="user-item">'
-    + '<div class="user-info">'
+  return '<div class="user-item"><div class="user-info">'
     + '<a class="user-nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>'
     + '<span class="user-dot' + dotCls + '"></span>@' + escapeHtml(u.nick) + '</a>'
-    + '<div class="user-name">' + escapeHtml(u.name) + '</div>'
-    + '</div></div>';
+    + '<div class="user-name">' + escapeHtml(u.name) + '</div></div></div>';
 }
-
 async function loadFollowList(nick, isFollowers) {
   var wrap = document.getElementById('list');
   try {
@@ -3535,17 +3145,11 @@ async function loadFollowList(nick, isFollowers) {
     var data = await api(path);
     var users = data.users || [];
     var limitedNote = data.limited ? '<div class="empty" style="padding:14px 20px;text-align:left">' + escapeHtml(tr('limited_list')) + '</div>' : '';
-    if (!users.length) {
-      wrap.innerHTML = '<div class="empty">' + escapeHtml(isFollowers ? tr('no_followers') : tr('no_following')) + '</div>';
-      return;
-    }
+    if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(isFollowers ? tr('no_followers') : tr('no_following')) + '</div>'; return; }
     wrap.innerHTML = limitedNote + '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
     bindLinks(wrap);
-  } catch(e) {
-    wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>';
-  }
+  } catch(e) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
 }
-
 function renderUsersView(el) {
   var html = '';
   html += '<header class="search-header">';
@@ -3554,8 +3158,7 @@ function renderUsersView(el) {
   html += '</header>';
   html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   var searchEl = document.getElementById('usersSearch');
   var tId;
   searchEl.addEventListener('input', function(){
@@ -3564,7 +3167,6 @@ function renderUsersView(el) {
   });
   loadUsers();
 }
-
 async function loadUsers() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
@@ -3572,10 +3174,7 @@ async function loadUsers() {
     var q = (state.usersQuery || '').trim();
     var data = await api('/api/users?q=' + encodeURIComponent(q));
     var users = data.users || [];
-    if (!users.length) {
-      wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>';
-      return;
-    }
+    if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
     wrap.innerHTML = '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
     bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
@@ -3589,8 +3188,7 @@ function renderMessagesView(el) {
   html += '</header>';
   html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   var searchEl = document.getElementById('dmSearch');
   var tId;
   searchEl.addEventListener('input', function(){
@@ -3599,31 +3197,23 @@ function renderMessagesView(el) {
   });
   loadDMs();
 }
-
 async function loadDMs() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
   try {
     if (!state.user) {
       wrap.innerHTML = '<div class="login-prompt">' + escapeHtml(tr('login_to_dm')) + ' · <a href="/login" data-link>' + tr('go_login') + '</a></div>';
-      bindLinks(wrap);
-      return;
+      bindLinks(wrap); return;
     }
     var data = await api('/api/dm/threads');
     var threads = data.threads || [];
-    setCounters(
-      (typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif),
-      data.unread || 0
-    );
+    setCounters((typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif), data.unread || 0);
     renderSidebar();
     var q = (state.dmQuery || '').trim().toLowerCase();
     if (q) threads = threads.filter(function(t){
       return t.other_nick.toLowerCase().includes(q) || (t.other_name || '').toLowerCase().includes(q);
     });
-    if (!threads.length) {
-      wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('dm_empty')) + '</div>';
-      return;
-    }
+    if (!threads.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('dm_empty')) + '</div>'; return; }
     wrap.innerHTML = '<div class="dm-list">' + threads.map(function(t){
       var badge = t.unread > 0 ? '<span class="unread-badge">' + t.unread + '</span>' : '';
       var mineLabel = t.last_from_me ? '<span class="mine-label">' + escapeHtml(LANG === 'ru' ? 'вы: ' : 'you: ') + '</span>' : '';
@@ -3633,10 +3223,7 @@ async function loadDMs() {
         + '<div class="who">' + dot + '@' + escapeHtml(t.other_nick) + '</div>'
         + '<div class="preview">' + mineLabel + escapeHtml(t.last_message || '') + '</div>'
         + '</a>'
-        + '<div class="meta">'
-        + '<span class="time">' + timeAgo(t.last_message_at) + '</span>'
-        + badge
-        + '</div>'
+        + '<div class="meta"><span class="time">' + timeAgo(t.last_message_at) + '</span>' + badge + '</div>'
         + '<button class="dm-del-btn" data-del-thread="' + t.id + '" title="' + escapeHtml(tr('dm_delete')) + '">' + ICONS.trash + '</button>'
         + '</div>';
     }).join('') + '</div>';
@@ -3650,7 +3237,7 @@ async function loadDMs() {
             await api('/api/dm/thread/' + tid, { method: 'DELETE' });
             loadDMs();
           } catch(err) { alert(tr(err.message) || err.message); }
-        });
+        }, { yesText: tr('delete') });
       });
     });
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
@@ -3661,8 +3248,7 @@ function renderChatView(el) {
   if (!state.user) {
     el.innerHTML = '<header class="main-header"><a href="/messages" class="icon-btn" data-link>' + ICONS.back + '</a><div class="title">@' + escapeHtml(nick) + '</div></header>'
       + '<div class="main-body"><div class="login-prompt">' + escapeHtml(tr('login_to_dm')) + ' · <a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
-    attachThemeBtn(); bindLinks(el);
-    return;
+    attachThemeBtn(); bindLinks(el); return;
   }
   var html = '';
   html += '<header class="main-header">';
@@ -3677,22 +3263,16 @@ function renderChatView(el) {
   html += '<button id="dmSend" disabled>' + tr('dm_send') + '</button>';
   html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
-
+  attachThemeBtn(); bindLinks(el);
   var inputEl = document.getElementById('dmInput');
   var sendBtn = document.getElementById('dmSend');
-
   function updateCounter() { sendBtn.disabled = inputEl.value.trim().length === 0; }
   inputEl.addEventListener('input', function(){
     updateCounter();
     var now = Date.now();
     if (now - state.lastTypingSent > 2500 && state.token) {
       state.lastTypingSent = now;
-      fetch('/api/dm/' + encodeURIComponent(nick) + '/typing', {
-        method: 'POST',
-        headers: { 'X-Auth': state.token },
-      }).catch(function(){});
+      fetch('/api/dm/' + encodeURIComponent(nick) + '/typing', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
     }
   });
   inputEl.addEventListener('keydown', function(e){
@@ -3700,26 +3280,20 @@ function renderChatView(el) {
   });
   sendBtn.addEventListener('click', sendDM);
   updateCounter();
-
   async function sendDM() {
     var text = inputEl.value.trim();
     if (!text) return;
     sendBtn.disabled = true;
     inputEl.value = '';
     updateCounter();
-    try {
-      await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } });
-    } catch(e) {
+    try { await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } }); }
+    catch(e) {
       alert(tr(e.message) || e.message);
-      inputEl.value = text;
-      updateCounter();
+      inputEl.value = text; updateCounter();
     }
   }
-
-  loadChat();
-  refreshCounters();
+  loadChat(); refreshCounters();
 }
-
 async function loadChat(silent) {
   var body = document.getElementById('chatBody');
   if (!body) return;
@@ -3736,30 +3310,21 @@ async function loadChat(silent) {
     }
     if (typeof data.unread_dm === 'number') {
       var changed = (data.unread_dm !== state.unreadDM);
-      setCounters(
-        (typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif),
-        data.unread_dm
-      );
+      setCounters((typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif), data.unread_dm);
       if (changed) renderSidebar();
     }
     var msgs = data.messages || [];
     if (silent && msgs.length === state.lastChatLen) return;
     state.lastChatLen = msgs.length;
-    if (!msgs.length) {
-      body.innerHTML = '<div class="chat-intro">' + escapeHtml(tr('dm_no_messages')) + '</div>';
-      return;
-    }
+    if (!msgs.length) { body.innerHTML = '<div class="chat-intro">' + escapeHtml(tr('dm_no_messages')) + '</div>'; return; }
     var wasAtBottom = (body.scrollHeight - body.scrollTop - body.clientHeight) < 60;
     body.innerHTML = msgs.map(function(m){
       return '<div class="chat-msg ' + (m.mine ? 'mine' : 'theirs') + '">'
         + escapeHtml(m.text)
-        + '<div class="chat-time">' + timeAgo(m.created_at) + '</div>'
-        + '</div>';
+        + '<div class="chat-time">' + timeAgo(m.created_at) + '</div></div>';
     }).join('');
     if (!silent || wasAtBottom) body.scrollTop = body.scrollHeight;
-  } catch(e) {
-    body.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
-  }
+  } catch(e) { body.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>'; }
 }
 
 function renderNotificationsView(el) {
@@ -3771,23 +3336,17 @@ function renderNotificationsView(el) {
   html += '</header>';
   html += '<div class="main-body"><div id="notifList">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
-
+  attachThemeBtn(); bindLinks(el);
   document.getElementById('clearNotifsBtn').addEventListener('click', function(){
     showConfirm(tr('notif_clear_confirm'), async function(){
       try {
         await api('/api/notifications/clear', { method: 'POST' });
-        setCounters(0, undefined);
-        renderSidebar();
-        loadNotifications();
+        setCounters(0, undefined); renderSidebar(); loadNotifications();
       } catch(e) { alert(tr(e.message) || e.message); }
-    });
+    }, { yesText: tr('notif_clear') });
   });
-
   loadNotifications();
 }
-
 async function loadNotifications() {
   var wrap = document.getElementById('notifList');
   if (!wrap) return;
@@ -3798,23 +3357,17 @@ async function loadNotifications() {
     if (data.unread > 0) {
       api('/api/notifications/read', { method: 'POST' }).catch(function(){});
       items.forEach(function(n){ n.read = true; });
-      setCounters(0, undefined);
-      renderSidebar();
+      setCounters(0, undefined); renderSidebar();
     }
-    if (!items.length) {
-      wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('notif_empty')) + '</div>';
-      return;
-    }
+    if (!items.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('notif_empty')) + '</div>'; return; }
     wrap.innerHTML = '<div class="notif-list">' + items.map(renderNotifHtml).join('') + '</div>';
     bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
-
 function renderNotifHtml(n) {
   var cls = 'notif' + (n.read ? '' : ' unread');
   var author = '<span class="notif-author">@' + escapeHtml(n.from_nick || '?') + '</span>';
-  var text = '';
-  var link = null;
+  var text = ''; var link = null;
   if (n.type === 'follow') {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_follow') + '</span></div>';
     link = '/u/' + encodeURIComponent(n.from_nick);
@@ -3832,6 +3385,10 @@ function renderNotifHtml(n) {
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
   } else if (n.type === 'new_post') {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_new_post') + '</span></div>';
+    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    link = n.post_id ? ('/p/' + n.post_id) : null;
+  } else if (n.type === 'wall_post') {
+    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_wall_post') + '</span></div>';
     if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
     link = n.post_id ? ('/p/' + n.post_id) : null;
   } else if (n.type === 'dm_start') {
@@ -3854,10 +3411,9 @@ function renderSettingsView(el) {
   var allowF = me.allow_followers_view !== false;
   var allowG = me.allow_following_view !== false;
   var nnp = me.notify_on_new_post !== false;
+  var allowW = me.allow_wall_posts !== false;
   var bl = me.blacklist || [];
-
   var sec = state.settingsSection || 'account';
-
   var html = '';
   html += '<header class="main-header">';
   html += '<a href="/" class="icon-btn" data-link title="' + escapeHtml(tr('back_to_main')) + '">' + ICONS.back + '</a>';
@@ -3865,19 +3421,16 @@ function renderSettingsView(el) {
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
   html += '<div class="main-body"><div class="settings-layout">';
-
   html += '<nav class="settings-nav">';
   html += '<button class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
   html += '<button class="settings-nav-btn' + (sec==='privacy'?' active':'') + '" data-section="privacy">' + ICONS.bell + ' ' + tr('settings_privacy') + '</button>';
   html += '<button class="settings-nav-btn' + (sec==='appearance'?' active':'') + '" data-section="appearance">' + ICONS.sun + ' ' + tr('settings_appearance') + '</button>';
   html += '<button class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.gear + ' ' + tr('settings_info') + '</button>';
   html += '</nav>';
-
   html += '<div class="settings-content">';
 
   // Account
-  html += '<div class="settings-section" id="section-account">';
-  html += '<h2>' + tr('settings_account') + '</h2>';
+  html += '<div class="settings-section" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">';
     html += '<button class="btn-secondary" id="editProfileBtn2">' + ICONS.edit + ' ' + tr('edit_profile') + '</button>';
@@ -3894,13 +3447,15 @@ function renderSettingsView(el) {
   html += '</div>';
 
   // Privacy
-  html += '<div class="settings-section" id="section-privacy">';
-  html += '<h2>' + tr('settings_privacy') + '</h2>';
+  html += '<div class="settings-section" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   if (state.user) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_followers') + '</span>'
       + '<div class="toggle' + (allowF ? ' on' : '') + '" data-toggle="allow_followers_view"></div></div>';
     html += '<div class="toggle-row"><span>' + tr('settings_allow_following') + '</span>'
       + '<div class="toggle' + (allowG ? ' on' : '') + '" data-toggle="allow_following_view"></div></div>';
+    html += '<div class="toggle-row"><span>' + tr('settings_allow_wall') + '</span>'
+      + '<div class="toggle' + (allowW ? ' on' : '') + '" data-toggle="allow_wall_posts"></div></div>';
+    html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_allow_wall_hint')) + '</p>';
     html += '<div style="margin-top:24px"><h2>' + tr('settings_blacklist') + '</h2>';
     html += '<p class="settings-desc">' + escapeHtml(tr('settings_blacklist_hint')) + '</p>';
     html += '<div class="blacklist-add">';
@@ -3912,8 +3467,7 @@ function renderSettingsView(el) {
       html += bl.map(function(n){
         return '<div class="blacklist-item">'
           + '<span class="bl-nick"><a href="/u/' + encodeURIComponent(n) + '" data-link>@' + escapeHtml(n) + '</a></span>'
-          + '<button data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button>'
-          + '</div>';
+          + '<button data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button></div>';
       }).join('');
       html += '</div>';
     } else {
@@ -3926,8 +3480,7 @@ function renderSettingsView(el) {
   html += '</div>';
 
   // Appearance
-  html += '<div class="settings-section" id="section-appearance">';
-  html += '<h2>' + tr('settings_appearance') + '</h2>';
+  html += '<div class="settings-section" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div style="margin-bottom:16px"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_theme') + '</div><div class="opt-row">';
   html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
   html += '<button class="opt' + (theme==='dark'?' active':'') + '" data-set-theme="dark">' + tr('theme_dark') + '</button>';
@@ -3935,41 +3488,32 @@ function renderSettingsView(el) {
   html += '<div><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_lang') + '</div><div class="opt-row">';
   html += '<button class="opt' + (lang==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
   html += '<button class="opt' + (lang==='en'?' active':'') + '" data-set-lang="en">English</button>';
-  html += '</div></div>';
-  html += '</div>';
+  html += '</div></div></div>';
 
   // Info
-  html += '<div class="settings-section" id="section-info">';
-  html += '<h2>' + tr('settings_info') + '</h2>';
+  html += '<div class="settings-section" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 14px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
   html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_authors') + '</div>';
-  html += '<div class="settings-authors">SldShr, DeepSeek</div>';
-  html += '</div>';
+  html += '<div class="settings-authors">SldShr, DeepSeek</div></div>';
 
   html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
-
+  attachThemeBtn(); bindLinks(el);
   function applySectionVisibility() {
     var isMobile = window.matchMedia('(max-width: 900px)').matches;
     var sections = el.querySelectorAll('.settings-section');
-    if (isMobile) {
-      sections.forEach(function(s){ s.style.display = ''; });
-    } else {
-      sections.forEach(function(s){
-        if (!s.id || !s.id.startsWith('section-')) { return; }
-        var id = s.id.replace('section-', '');
-        s.style.display = (id === state.settingsSection) ? '' : 'none';
-      });
-    }
+    if (isMobile) sections.forEach(function(s){ s.style.display = ''; });
+    else sections.forEach(function(s){
+      if (!s.id || !s.id.startsWith('section-')) return;
+      var id = s.id.replace('section-', '');
+      s.style.display = (id === state.settingsSection) ? '' : 'none';
+    });
     el.querySelectorAll('.settings-nav-btn').forEach(function(b){
       b.classList.toggle('active', b.dataset.section === state.settingsSection);
     });
   }
   applySectionVisibility();
-
   el.querySelectorAll('.settings-nav-btn').forEach(function(b){
     b.addEventListener('click', function(){
       state.settingsSection = b.dataset.section;
@@ -3981,16 +3525,13 @@ function renderSettingsView(el) {
           var navEl = el.querySelector('.settings-nav');
           var offset = (header ? header.offsetHeight : 0) + (navEl ? navEl.offsetHeight : 0);
           var bodyEl = el.querySelector('.main-body');
-          if (bodyEl && target) {
-            bodyEl.scrollTo({ top: target.offsetTop - offset - 8, behavior: 'smooth' });
-          }
+          if (bodyEl && target) bodyEl.scrollTo({ top: target.offsetTop - offset - 8, behavior: 'smooth' });
         }
       }
       applySectionVisibility();
     });
   });
   window.addEventListener('resize', applySectionVisibility);
-
   el.querySelectorAll('[data-set-theme]').forEach(function(b){
     b.addEventListener('click', function(){ applyTheme(b.dataset.setTheme); renderSettingsView(el); });
   });
@@ -4015,7 +3556,6 @@ function renderSettingsView(el) {
       }
     });
   });
-
   var blAdd = document.getElementById('blAdd');
   if (blAdd) {
     var blInput = document.getElementById('blInput');
@@ -4041,7 +3581,6 @@ function renderSettingsView(el) {
       } catch(err) { alert(tr(err.message) || err.message); }
     });
   });
-
   var lo = document.getElementById('settingsLogout');
   if (lo) lo.addEventListener('click', doLogoutConfirm);
   var ep = document.getElementById('editProfileBtn2');
@@ -4060,8 +3599,7 @@ function renderPolicyView(el) {
   html += '<p>' + escapeHtml(tr('policy_content')) + '</p>';
   html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
 }
 
 function renderRegisterView(el) {
@@ -4084,20 +3622,17 @@ function renderRegisterView(el) {
   html += '<div class="auth-switch"><a id="toLogin">' + tr('to_login') + '</a></div>';
   html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   document.getElementById('toLogin').addEventListener('click', function(){ navigate('/login'); });
   var form = document.getElementById('regForm');
   var errEl = document.getElementById('regError');
   form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
+    e.preventDefault(); errEl.textContent = '';
     var fd = new FormData(form);
     try {
       await doRegister({
         name: fd.get('name'), nick: fd.get('nick'),
-        password: fd.get('password'), password_confirm: fd.get('password_confirm')
-      });
+        password: fd.get('password'), password_confirm: fd.get('password_confirm') });
     } catch(err) { errEl.textContent = tr(err.message) || err.message; }
   });
 }
@@ -4120,14 +3655,12 @@ function renderLoginView(el) {
   html += '<div class="auth-switch"><a id="toReg">' + tr('to_reg') + '</a></div>';
   html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn();
-  bindLinks(el);
+  attachThemeBtn(); bindLinks(el);
   document.getElementById('toReg').addEventListener('click', function(){ navigate('/register'); });
   var form = document.getElementById('logForm');
   var errEl = document.getElementById('logError');
   form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
+    e.preventDefault(); errEl.textContent = '';
     var fd = new FormData(form);
     try { await doLogin({ nick: fd.get('nick'), password: fd.get('password') }); }
     catch(err) { errEl.textContent = tr(err.message) || err.message; }
@@ -4139,12 +3672,10 @@ function renderPostHtml(p, showComments) {
   var upCls = p.user_vote === 1 ? 'active' : '';
   var downCls = p.user_vote === -1 ? 'active' : '';
   var scCls = scoreClass(p.upvotes, p.downvotes);
-  var displayText = p.text;
-  var truncated = false;
+  var displayText = p.text; var truncated = false;
   if (!showComments) {
     var res = truncateText(p.text);
-    displayText = res.text;
-    truncated = res.truncated;
+    displayText = res.text; truncated = res.truncated;
   }
   var bodyHtml = linkifyMentions(escapeHtml(displayText));
   var readMore = truncated
@@ -4153,7 +3684,12 @@ function renderPostHtml(p, showComments) {
   var authorLink = p.author
     ? '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>'
     : '';
+  var wallHint = '';
+  if (p.wall_owner) {
+    wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
+  }
   var isMine = state.user && p.author === state.user.nick;
+  var isWallOwner = state.user && p.wall_owner === state.user.nick;
   var commentBtn = '<button class="action-btn" data-action="comment" data-post-id="' + p.id + '">'
     + ICONS.comment + '<span>' + (p.comments ? p.comments.length : 0) + '</span></button>';
   var copyBtn = '<button class="action-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">'
@@ -4161,16 +3697,16 @@ function renderPostHtml(p, showComments) {
   var editBtn = isMine
     ? '<button class="action-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
     : '';
-  var delBtn = isMine
+  var delBtn = (isMine || isWallOwner)
     ? '<button class="action-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
     : '';
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
-    commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id) + '</div>';
+    commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id, p.wall_owner) + '</div>';
   }
   return ''
     + '<div class="post" data-post-id="' + p.id + '">'
-    +   '<div class="post-meta">' + authorLink + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
+    +   '<div class="post-meta">' + authorLink + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
     +   '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>'
     +   readMore
     +   '<div class="post-actions">'
@@ -4183,29 +3719,28 @@ function renderPostHtml(p, showComments) {
     + '</div>';
 }
 
-function renderCommentsTree(comments, postAuthor, postId) {
+function renderCommentsTree(comments, postAuthor, postId, wallOwner) {
   var tops = comments.filter(function(c){ return !c.parent_id; }).sort(function(a,b){ return a.created_at - b.created_at; });
   var repliesBy = {};
-  comments.forEach(function(c){
-    if (c.parent_id) (repliesBy[c.parent_id] = repliesBy[c.parent_id] || []).push(c);
-  });
+  comments.forEach(function(c){ if (c.parent_id) (repliesBy[c.parent_id] = repliesBy[c.parent_id] || []).push(c); });
   var html = '';
   tops.forEach(function(c){
-    html += renderCommentHtml(c, postAuthor, postId, false);
+    html += renderCommentHtml(c, postAuthor, postId, false, wallOwner);
     var reps = repliesBy[c.id] || [];
     reps.sort(function(a,b){ return a.created_at - b.created_at; });
-    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true); });
+    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true, wallOwner); });
   });
   return html;
 }
 
-function renderCommentHtml(c, postAuthor, postId, isReply) {
+function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
   var score = c.upvotes - c.downvotes;
   var upCls = c.user_vote === 1 ? 'active' : '';
   var downCls = c.user_vote === -1 ? 'active' : '';
   var scCls = scoreClass(c.upvotes, c.downvotes);
   var isAuthor = postAuthor && c.author === postAuthor;
   var isMine = state.user && c.author === state.user.nick;
+  var isWallOwner = state.user && wallOwner === state.user.nick;
   var cls = 'comment' + (isReply ? ' reply' : '') + (isAuthor ? ' is-author' : '');
   var authorHtml = c.author
     ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>'
@@ -4218,7 +3753,7 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
   var editBtn = isMine
     ? '<button class="comment-edit-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>'
     : '';
-  var delBtn = isMine
+  var delBtn = (isMine || isWallOwner)
     ? '<button class="comment-edit-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>'
     : '';
   var bodyHtml = linkifyMentions(escapeHtml(c.text));
@@ -4263,7 +3798,6 @@ function applyVoteUI(targetBtn, dir) {
   downBtn.classList.toggle('active', newDown);
   return { upBtn: upBtn, downBtn: downBtn, scoreEl: scoreEl, oldScore: oldScore, wasUp: wasUp, wasDown: wasDown };
 }
-
 function revertVote(snap) {
   if (!snap) return;
   snap.scoreEl.textContent = snap.oldScore;
@@ -4273,7 +3807,6 @@ function revertVote(snap) {
   snap.upBtn.classList.toggle('active', snap.wasUp);
   snap.downBtn.classList.toggle('active', snap.wasDown);
 }
-
 function startInlineEdit(container, textEl, initialText, onSave) {
   var editor = document.createElement('div');
   editor.className = 'inline-editor';
@@ -4285,8 +3818,7 @@ function startInlineEdit(container, textEl, initialText, onSave) {
   textEl.style.display = 'none';
   container.insertBefore(editor, textEl);
   var ta = editor.querySelector('textarea');
-  ta.value = initialText;
-  ta.focus();
+  ta.value = initialText; ta.focus();
   try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch(e) {}
   var cancelBtn = editor.querySelector('.edit-cancel');
   var saveBtn = editor.querySelector('.edit-save');
@@ -4314,7 +3846,6 @@ function bindPostActions(root) {
       var postId = btn.dataset.postId;
       var commentId = btn.dataset.commentId;
       var dir = parseInt(btn.dataset.dir || '0', 10);
-
       if (action === 'vote') {
         if (!state.user) { navigate('/login'); return; }
         var snap = applyVoteUI(btn, dir);
@@ -4358,7 +3889,7 @@ function bindPostActions(root) {
             if (state.view === 'post') navigate('/');
             else refreshCurrentView();
           } catch(err) { alert(tr(err.message) || err.message); }
-        });
+        }, { yesText: tr('confirm_delete_yes') });
         return;
       }
       if (action === 'edit-comment') {
@@ -4377,7 +3908,7 @@ function bindPostActions(root) {
             await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
             refreshCurrentView();
           } catch(err) { alert(tr(err.message) || err.message); }
-        });
+        }, { yesText: tr('confirm_delete_yes') });
         return;
       }
     });
@@ -4385,17 +3916,24 @@ function bindPostActions(root) {
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
     a.dataset.linkBound = '1';
-    a.addEventListener('click', function(e){
-      e.preventDefault();
-      navigate(a.getAttribute('href'));
-    });
+    a.addEventListener('click', function(e){ e.preventDefault(); navigate(a.getAttribute('href')); });
   });
 }
 
 async function refreshCurrentView() {
   if (state.view === 'feed') await loadFeed();
   else if (state.view === 'post') await loadPostView();
-  else if (state.view === 'profile') await loadProfile(state.viewData.nick);
+  else if (state.view === 'profile') {
+    if (state.profileTab === 'wall') {
+      try {
+        var u = await api('/api/users/' + encodeURIComponent(state.viewData.nick));
+        var isMe = state.user && state.user.nick === u.nick;
+        await loadProfileTab(u, isMe);
+      } catch(e) {}
+    } else {
+      await loadProfile(state.viewData.nick);
+    }
+  }
 }
 
 async function copyPost(postId, btn) {
@@ -4415,28 +3953,20 @@ async function copyPost(postId, btn) {
   } catch(e) { alert('Copy failed'); }
 }
 
-// ============ Init ============
 (function init() {
   if (state.user && (state.view === 'login' || state.view === 'register')) {
     history.replaceState({}, '', '/');
     state.view = 'feed'; state.viewData = {};
   }
-  renderSidebar();
-  renderMain();
-
+  renderSidebar(); renderMain();
   loadMe().then(function(){
     if (state.user && (state.view === 'login' || state.view === 'register')) {
       history.replaceState({}, '', '/');
       state.view = 'feed'; state.viewData = {};
     }
-    renderSidebar();
-    renderMain();
-    if (state.user) {
-      connectSSE();
-      refreshCounters();
-    }
+    renderSidebar(); renderMain();
+    if (state.user) { connectSSE(); refreshCounters(); }
   });
-
   setInterval(function(){
     if (document.hidden) return;
     if (!state.user) return;
@@ -4472,13 +4002,11 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__ICON_LOGIN__", json.dumps(ICON_LOGIN))
           .replace("__ICON_TRASH__", json.dumps(ICON_TRASH))
           .replace("__ICON_SEARCH__", json.dumps(ICON_SEARCH)))
-
-    return (
-        '<!DOCTYPE html>\n'
+    return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="light">\n'
         '<head>\n'
         '<meta charset="utf-8" />\n'
-        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
         '<meta name="color-scheme" content="light dark" />\n'
         f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
         '<title>sldChat</title>\n'
@@ -4500,80 +4028,53 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         f'const TRUNCATE_LINES = {TRUNCATE_LINES};\n'
         f'const TRUNCATE_CHARS = {TRUNCATE_CHARS};\n'
         f'const T = {json.dumps(t, ensure_ascii=False)};\n'
-        + js +
-        '\n</script>\n'
-        '</body>\n'
-        '</html>'
-    )
+        + js + '\n</script>\n</body>\n</html>')
 
 
 @app.get("/", response_class=HTMLResponse)
-def page_index(request: Request):
-    return render_page(get_lang(request), "feed")
-
+def page_index(request: Request): return render_page(get_lang(request), "feed")
 
 @app.get("/p/{post_id}", response_class=HTMLResponse)
 def page_post(post_id: str, request: Request):
-    if not db_get_post(post_id):
-        raise HTTPException(404, "not found")
+    if not db_get_post(post_id): raise HTTPException(404, "not found")
     return render_page(get_lang(request), "post", {"post_id": post_id})
-
 
 @app.get("/u/{nick}", response_class=HTMLResponse)
 def page_user(nick: str, request: Request):
     return render_page(get_lang(request), "profile", {"nick": nick})
 
-
 @app.get("/u/{nick}/followers", response_class=HTMLResponse)
 def page_followers(nick: str, request: Request):
     return render_page(get_lang(request), "followers", {"nick": nick})
-
 
 @app.get("/u/{nick}/following", response_class=HTMLResponse)
 def page_following(nick: str, request: Request):
     return render_page(get_lang(request), "following", {"nick": nick})
 
-
 @app.get("/users", response_class=HTMLResponse)
-def page_users(request: Request):
-    return render_page(get_lang(request), "users")
-
+def page_users(request: Request): return render_page(get_lang(request), "users")
 
 @app.get("/messages", response_class=HTMLResponse)
-def page_messages(request: Request):
-    return render_page(get_lang(request), "messages")
-
+def page_messages(request: Request): return render_page(get_lang(request), "messages")
 
 @app.get("/messages/{nick}", response_class=HTMLResponse)
 def page_chat(nick: str, request: Request):
     return render_page(get_lang(request), "chat", {"nick": nick})
 
-
 @app.get("/notifications", response_class=HTMLResponse)
-def page_notifications(request: Request):
-    return render_page(get_lang(request), "notifications")
-
+def page_notifications(request: Request): return render_page(get_lang(request), "notifications")
 
 @app.get("/settings", response_class=HTMLResponse)
-def page_settings(request: Request):
-    return render_page(get_lang(request), "settings")
-
+def page_settings(request: Request): return render_page(get_lang(request), "settings")
 
 @app.get("/settings/profile", response_class=HTMLResponse)
-def page_edit_profile(request: Request):
-    return render_page(get_lang(request), "edit_profile")
-
+def page_edit_profile(request: Request): return render_page(get_lang(request), "edit_profile")
 
 @app.get("/policy", response_class=HTMLResponse)
-def page_policy(request: Request):
-    return render_page(get_lang(request), "policy")
-
+def page_policy(request: Request): return render_page(get_lang(request), "policy")
 
 @app.get("/register", response_class=HTMLResponse)
-def page_register(request: Request):
-    return render_page(get_lang(request), "register")
-
+def page_register(request: Request): return render_page(get_lang(request), "register")
 
 @app.get("/login", response_class=HTMLResponse)
-def page_login(request: Request):
-    return render_page(get_lang(request), "login")
+def page_login(request: Request): return render_page(get_lang(request), "login")
