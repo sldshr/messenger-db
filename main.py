@@ -6,7 +6,6 @@ from typing import Optional
 import uuid
 from datetime import datetime
 
-# --- IN-MEMORY STORAGE ---
 class InMemoryStorage:
     def __init__(self):
         self.users = {}
@@ -18,7 +17,6 @@ class InMemoryStorage:
 db = InMemoryStorage()
 app = FastAPI(title="Litodon")
 
-# --- Pydantic ---
 class UserRegister(BaseModel):
     username: str
     display_name: str
@@ -44,7 +42,11 @@ class VoteRequest(BaseModel):
     target_type: str
     vote_type: str
 
-# --- API ---
+def get_current_user(session_token: Optional[str]):
+    if session_token and session_token in db.sessions:
+        return db.sessions[session_token]
+    return None
+
 @app.post("/api/register")
 async def register(data: UserRegister, response: Response):
     if data.username in db.users:
@@ -85,8 +87,8 @@ async def logout(response: Response, session_token: Optional[str] = Cookie(None)
 
 @app.get("/api/me")
 async def get_me(session_token: Optional[str] = Cookie(None)):
-    if session_token and session_token in db.sessions:
-        username = db.sessions[session_token]
+    username = get_current_user(session_token)
+    if username:
         user_data = db.users[username]
         return {
             "username": username,
@@ -97,9 +99,9 @@ async def get_me(session_token: Optional[str] = Cookie(None)):
 
 @app.post("/api/profile/update")
 async def update_profile(data: ProfileUpdate, session_token: Optional[str] = Cookie(None)):
-    if not session_token or session_token not in db.sessions:
+    username = get_current_user(session_token)
+    if not username:
         raise HTTPException(status_code=401, detail="ERR_UNAUTHORIZED")
-    username = db.sessions[session_token]
     db.users[username]["display_name"] = data.display_name
     db.users[username]["bio"] = data.bio
     return {"message": "OK", "display_name": data.display_name, "bio": data.bio}
@@ -120,12 +122,12 @@ def enrich_post(post, current_user):
 
 @app.get("/api/posts")
 async def get_posts(session_token: Optional[str] = Cookie(None)):
-    current_user = db.sessions.get(session_token) if session_token else None
+    current_user = get_current_user(session_token)
     return [enrich_post(p, current_user) for p in sorted(db.posts, key=lambda x: x["timestamp"], reverse=True)]
 
 @app.get("/api/posts/{post_id}")
 async def get_post(post_id: str, session_token: Optional[str] = Cookie(None)):
-    current_user = db.sessions.get(session_token) if session_token else None
+    current_user = get_current_user(session_token)
     for post in db.posts:
         if post["id"] == post_id:
             return enrich_post(post, current_user)
@@ -133,7 +135,7 @@ async def get_post(post_id: str, session_token: Optional[str] = Cookie(None)):
 
 @app.get("/api/posts/{post_id}/comments")
 async def get_comments(post_id: str, session_token: Optional[str] = Cookie(None)):
-    current_user = db.sessions.get(session_token) if session_token else None
+    current_user = get_current_user(session_token)
     result = []
     for comment in db.comments:
         if comment["post_id"] == post_id:
@@ -153,11 +155,11 @@ async def get_comments(post_id: str, session_token: Optional[str] = Cookie(None)
 
 @app.post("/api/posts")
 async def create_post(post: PostCreate, session_token: Optional[str] = Cookie(None)):
-    if not session_token or session_token not in db.sessions:
+    username = get_current_user(session_token)
+    if not username:
         raise HTTPException(status_code=401, detail="ERR_UNAUTHORIZED")
     if not post.content.strip():
         raise HTTPException(status_code=400, detail="ERR_EMPTY_POST")
-    username = db.sessions[session_token]
     new_post = {
         "id": str(uuid.uuid4()),
         "author": username,
@@ -169,13 +171,13 @@ async def create_post(post: PostCreate, session_token: Optional[str] = Cookie(No
 
 @app.post("/api/posts/{post_id}/comments")
 async def create_comment(post_id: str, data: CommentCreate, session_token: Optional[str] = Cookie(None)):
-    if not session_token or session_token not in db.sessions:
+    username = get_current_user(session_token)
+    if not username:
         raise HTTPException(status_code=401, detail="ERR_UNAUTHORIZED")
     if not data.content.strip():
         raise HTTPException(status_code=400, detail="ERR_EMPTY_COMMENT")
     if not any(p["id"] == post_id for p in db.posts):
         raise HTTPException(status_code=404, detail="ERR_POST_NOT_FOUND")
-    username = db.sessions[session_token]
     new_comment = {
         "id": str(uuid.uuid4()),
         "post_id": post_id,
@@ -188,9 +190,9 @@ async def create_comment(post_id: str, data: CommentCreate, session_token: Optio
 
 @app.post("/api/vote")
 async def vote(data: VoteRequest, session_token: Optional[str] = Cookie(None)):
-    if not session_token or session_token not in db.sessions:
+    username = get_current_user(session_token)
+    if not username:
         raise HTTPException(status_code=401, detail="ERR_UNAUTHORIZED")
-    username = db.sessions[session_token]
     if data.target_id not in db.votes:
         db.votes[data.target_id] = {}
     if username in db.votes[data.target_id]:
@@ -200,9 +202,71 @@ async def vote(data: VoteRequest, session_token: Optional[str] = Cookie(None)):
     db.votes[data.target_id][username] = data.vote_type
     return {"message": "OK"}
 
+@app.get("/api/profile/{username}")
+async def get_profile(username: str, session_token: Optional[str] = Cookie(None)):
+    if username not in db.users:
+        raise HTTPException(status_code=404, detail="ERR_USER_NOT_FOUND")
+    user = db.users[username]
+    return {
+        "username": username,
+        "display_name": user["display_name"],
+        "bio": user["bio"]
+    }
+
+@app.get("/api/profile/{username}/posts")
+async def get_user_posts(username: str, session_token: Optional[str] = Cookie(None)):
+    current_user = get_current_user(session_token)
+    result = []
+    for p in db.posts:
+        if p["author"] == username:
+            result.append(enrich_post(p, current_user))
+    return sorted(result, key=lambda x: x["timestamp"], reverse=True)
+
+@app.get("/api/notifications")
+async def get_notifications(session_token: Optional[str] = Cookie(None)):
+    username = get_current_user(session_token)
+    if not username:
+        raise HTTPException(status_code=401, detail="ERR_UNAUTHORIZED")
+
+    my_post_ids = {p["id"]: p for p in db.posts if p["author"] == username}
+    notifs = []
+
+    for c in db.comments:
+        if c["post_id"] in my_post_ids and c["author"] != username:
+            post = my_post_ids[c["post_id"]]
+            author_data = db.users.get(c["author"], {})
+            notifs.append({
+                "kind": "comment",
+                "id": c["id"],
+                "post_id": c["post_id"],
+                "post_preview": post["content"][:100],
+                "actor": c["author"],
+                "actor_display_name": author_data.get("display_name", c["author"]),
+                "content": c["content"],
+                "timestamp": c["timestamp"]
+            })
+
+    for pid, post in my_post_ids.items():
+        for voter, vote_type in db.votes.get(pid, {}).items():
+            if voter != username:
+                voter_data = db.users.get(voter, {})
+                notifs.append({
+                    "kind": "vote",
+                    "id": f"{pid}_{voter}",
+                    "post_id": pid,
+                    "post_preview": post["content"][:100],
+                    "actor": voter,
+                    "actor_display_name": voter_data.get("display_name", voter),
+                    "vote_type": vote_type,
+                    "timestamp": post["timestamp"]
+                })
+
+    notifs.sort(key=lambda x: x["timestamp"], reverse=True)
+    return notifs
+
 @app.get("/api/search")
 async def search(q: str = "", session_token: Optional[str] = Cookie(None)):
-    current_user = db.sessions.get(session_token) if session_token else None
+    current_user = get_current_user(session_token)
     q_lower = q.lower().strip()
     if not q_lower:
         return {"query": q, "users": [], "posts": [], "comments": []}
@@ -218,10 +282,7 @@ async def search(q: str = "", session_token: Optional[str] = Cookie(None)):
                 "bio": udata.get("bio", "")
             })
 
-    posts_result = []
-    for post in db.posts:
-        if q_lower in post["content"].lower():
-            posts_result.append(enrich_post(post, current_user))
+    posts_result = [enrich_post(p, current_user) for p in db.posts if q_lower in p["content"].lower()]
 
     comments_result = []
     for comment in db.comments:
@@ -231,7 +292,6 @@ async def search(q: str = "", session_token: Optional[str] = Cookie(None)):
             downvotes = sum(1 for v in votes.values() if v == "down")
             user_vote = votes.get(current_user) if current_user else None
             author_data = db.users.get(comment["author"], {})
-            # Get post author for context
             post_author = ""
             for p in db.posts:
                 if p["id"] == comment["post_id"]:
@@ -246,14 +306,8 @@ async def search(q: str = "", session_token: Optional[str] = Cookie(None)):
                 "user_vote": user_vote
             })
 
-    return {
-        "query": q,
-        "users": users_result,
-        "posts": posts_result,
-        "comments": comments_result
-    }
+    return {"query": q, "users": users_result, "posts": posts_result, "comments": comments_result}
 
-# --- FAVICON SVG ---
 FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#6364ff"/><path d="M11 8v16h10v-3h-7V8z" fill="#fff"/></svg>'''
 
 @app.get("/favicon.svg")
@@ -261,7 +315,6 @@ async def favicon():
     return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 
-# --- MAIN APP HTML ---
 MAIN_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -271,387 +324,224 @@ MAIN_HTML = """<!DOCTYPE html>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
 :root, [data-theme="dark"] {
-    --bg: #191b22;
-    --bg-secondary: #282c37;
-    --bg-hover: #313543;
-    --bg-input: #191b22;
-    --border: #393f4f;
-    --border-light: #2c313d;
-    --text: #d9e1e8;
-    --text-heading: #ffffff;
-    --text-muted: #7d869a;
-    --accent: #6364ff;
-    --accent-hover: #5051db;
-    --accent-text: #ffffff;
-    --danger: #df405a;
-    --upvote: #ff6b35;
-    --downvote: #7193ff;
-    --shadow: 0 4px 16px rgba(0,0,0,0.35);
-    --shadow-sm: 0 2px 6px rgba(0,0,0,0.2);
+    --bg: #191b22; --bg-secondary: #282c37; --bg-hover: #313543; --bg-input: #191b22;
+    --border: #393f4f; --border-light: #2c313d;
+    --text: #d9e1e8; --text-heading: #ffffff; --text-muted: #7d869a;
+    --accent: #6364ff; --accent-hover: #5051db; --accent-text: #ffffff;
+    --danger: #df405a; --danger-hover: #c63550;
+    --upvote: #ff6b35; --downvote: #7193ff;
+    --shadow: 0 4px 16px rgba(0,0,0,0.35); --shadow-sm: 0 2px 6px rgba(0,0,0,0.2);
 }
-
 [data-theme="light"] {
-    --bg: #f4f6f9;
-    --bg-secondary: #ffffff;
-    --bg-hover: #f0f2f5;
-    --bg-input: #ffffff;
-    --border: #d8dee6;
-    --border-light: #e8edf2;
-    --text: #2e3440;
-    --text-heading: #191b22;
-    --text-muted: #6b7381;
-    --accent: #6364ff;
-    --accent-hover: #5051db;
-    --accent-text: #ffffff;
-    --danger: #d93025;
-    --upvote: #e8501a;
-    --downvote: #4267c9;
-    --shadow: 0 4px 16px rgba(0,0,0,0.08);
-    --shadow-sm: 0 2px 6px rgba(0,0,0,0.05);
+    --bg: #f4f6f9; --bg-secondary: #ffffff; --bg-hover: #f0f2f5; --bg-input: #ffffff;
+    --border: #d8dee6; --border-light: #e8edf2;
+    --text: #2e3440; --text-heading: #191b22; --text-muted: #6b7381;
+    --accent: #6364ff; --accent-hover: #5051db; --accent-text: #ffffff;
+    --danger: #d93025; --danger-hover: #b5261d;
+    --upvote: #e8501a; --downvote: #4267c9;
+    --shadow: 0 4px 16px rgba(0,0,0,0.08); --shadow-sm: 0 2px 6px rgba(0,0,0,0.05);
 }
-
 * { box-sizing: border-box; margin: 0; padding: 0; }
-
 html, body {
-    background: var(--bg);
-    color: var(--text);
+    background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    height: 100vh;
-    overflow: hidden;
-    font-size: 15px;
-    line-height: 1.5;
+    height: 100vh; overflow: hidden; font-size: 15px; line-height: 1.5;
     transition: background 0.25s ease, color 0.25s ease;
-    -webkit-user-select: none;
-    -moz-user-select: none;
-    user-select: none;
+    -webkit-user-select: none; -moz-user-select: none; user-select: none;
 }
-
-input, textarea, select {
-    -webkit-user-select: text;
-    -moz-user-select: text;
-    user-select: text;
-}
-
+input, textarea, select { -webkit-user-select: text; -moz-user-select: text; user-select: text; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
-.app {
-    display: grid;
-    grid-template-columns: 260px 1fr 260px;
-    max-width: 1240px;
-    margin: 0 auto;
-    height: 100vh;
-    border-left: 1px solid var(--border);
-    border-right: 1px solid var(--border);
+/* --- Loading overlay --- */
+.loading-overlay {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999;
+    opacity: 1; visibility: visible;
+    transition: opacity 0.35s ease, visibility 0.35s ease;
 }
+.loading-overlay.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+.spinner {
+    width: 44px; height: 44px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
-.col {
-    height: 100%;
-    overflow-y: auto;
-    padding: 20px 16px;
+.app {
+    display: grid; grid-template-columns: 260px 1fr 280px;
+    max-width: 1240px; margin: 0 auto; height: 100vh;
+    border-left: 1px solid var(--border); border-right: 1px solid var(--border);
 }
+.col { height: 100%; overflow-y: auto; padding: 20px 16px; }
 .col.left { border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 .col.center { padding: 0; }
-.col.right { border-left: 1px solid var(--border); }
+.col.right { border-left: 1px solid var(--border); display: flex; flex-direction: column; }
 
-/* --- Brand --- */
-.brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 24px;
-    padding: 4px;
-}
+.brand { display: flex; align-items: center; gap: 10px; margin-bottom: 24px; padding: 4px; }
 .brand-icon {
-    width: 32px; height: 32px;
-    background: var(--accent);
-    border-radius: 7px;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
+    width: 32px; height: 32px; background: var(--accent); border-radius: 7px;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     box-shadow: var(--shadow-sm);
 }
 .brand-icon svg { width: 20px; height: 20px; }
-.brand-name {
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--text-heading);
-    letter-spacing: -0.3px;
-}
+.brand-name { font-size: 20px; font-weight: 700; color: var(--text-heading); letter-spacing: -0.3px; }
 
-/* --- Search --- */
-.search-wrap {
-    position: relative;
-    margin-bottom: 20px;
-}
+.search-wrap { position: relative; margin-bottom: 20px; }
 .search-wrap svg {
-    position: absolute;
-    left: 12px; top: 50%; transform: translateY(-50%);
-    width: 16px; height: 16px;
-    fill: var(--text-muted);
-    pointer-events: none;
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    width: 16px; height: 16px; fill: var(--text-muted); pointer-events: none;
 }
 .search-input {
-    width: 100%;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px 10px 36px;
-    color: var(--text);
-    font-size: 14px;
-    outline: none;
-    transition: border 0.2s, background 0.2s;
-    font-family: inherit;
+    width: 100%; background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px 10px 36px; color: var(--text);
+    font-size: 14px; outline: none; transition: border 0.2s, background 0.2s; font-family: inherit;
 }
-.search-input:focus {
-    border-color: var(--accent);
-    background: var(--bg-input);
-}
+.search-input:focus { border-color: var(--accent); background: var(--bg-input); }
 .search-input::placeholder { color: var(--text-muted); }
 
-/* --- Left footer --- */
-.left-footer {
-    margin-top: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
+.left-footer { margin-top: auto; display: flex; flex-direction: column; gap: 4px; }
 .footer-btn {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    background: transparent;
-    border: none;
-    border-radius: 8px;
-    color: var(--text-muted);
-    font-size: 13px;
-    font-family: inherit;
-    cursor: pointer;
-    text-decoration: none;
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    background: transparent; border: none; border-radius: 8px;
+    color: var(--text-muted); font-size: 13px; font-family: inherit;
+    cursor: pointer; text-decoration: none; text-align: left;
     transition: background 0.15s, color 0.15s;
-    text-align: left;
 }
 .footer-btn:hover { background: var(--bg-secondary); color: var(--text); }
 .footer-btn svg { width: 16px; height: 16px; fill: currentColor; flex-shrink: 0; }
 
 /* --- Right nav --- */
-.right-brand {
-    display: flex; align-items: center; gap: 10px;
-    padding: 4px 8px; margin-bottom: 20px;
-}
-.nav-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 24px; }
+.nav-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
 .nav-btn {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    padding: 11px 14px;
-    background: transparent;
-    border: none;
-    border-radius: 8px;
-    color: var(--text);
-    font-size: 14px;
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    text-align: left;
-    transition: background 0.15s;
-    width: 100%;
+    display: flex; align-items: center; gap: 14px; padding: 11px 14px;
+    background: transparent; border: none; border-radius: 8px;
+    color: var(--text); font-size: 14px; font-weight: 500; font-family: inherit;
+    cursor: pointer; text-align: left; transition: background 0.15s; width: 100%;
+    position: relative;
 }
 .nav-btn:hover { background: var(--bg-secondary); }
 .nav-btn.active { background: var(--bg-secondary); color: var(--accent); }
 .nav-btn svg { width: 20px; height: 20px; fill: currentColor; flex-shrink: 0; }
+.nav-badge {
+    position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+    background: var(--danger); color: white; font-size: 11px; font-weight: 700;
+    padding: 1px 7px; border-radius: 10px; min-width: 20px; text-align: center;
+}
 
 .user-badge {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 12px;
-    background: var(--bg-secondary);
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    margin-top: auto;
+    display: flex; align-items: center; gap: 10px; padding: 12px;
+    background: var(--bg-secondary); border-radius: 8px;
+    border: 1px solid var(--border); margin-bottom: 12px;
+    cursor: pointer; transition: border 0.15s;
+}
+.user-badge:hover { border-color: var(--accent); }
+.user-badge-avatar {
+    width: 36px; height: 36px; background: var(--accent); border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    color: white; font-weight: 700; font-size: 16px; flex-shrink: 0;
 }
 .user-badge-info { flex: 1; min-width: 0; }
 .user-badge-name {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text-heading);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 13px; font-weight: 600; color: var(--text-heading);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .user-badge-handle {
-    font-size: 12px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12px; color: var(--text-muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.logout-btn {
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    padding: 6px;
-    border-radius: 6px;
-    color: var(--text-muted);
-    display: flex;
-    align-items: center;
-    transition: color 0.15s, background 0.15s;
+.logout-full-btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 10px 14px;
+    background: transparent; color: var(--danger);
+    border: 1px solid var(--danger); border-radius: 8px;
+    font-size: 14px; font-weight: 600; font-family: inherit;
+    cursor: pointer; transition: background 0.15s, color 0.15s;
+    margin-top: auto;
 }
-.logout-btn:hover { color: var(--danger); background: rgba(223,64,90,0.1); }
-.logout-btn svg { width: 18px; height: 18px; fill: currentColor; }
+.logout-full-btn:hover { background: var(--danger); color: white; }
+.logout-full-btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+.auth-buttons-right { display: flex; flex-direction: column; gap: 8px; }
+.auth-buttons-right .btn { width: 100%; }
 
 /* --- Center header --- */
 .center-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: var(--bg);
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    backdrop-filter: blur(8px);
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--bg); position: sticky; top: 0; z-index: 10;
 }
-.center-title {
-    font-size: 17px;
-    font-weight: 700;
-    color: var(--text-heading);
-}
+.center-title { font-size: 17px; font-weight: 700; color: var(--text-heading); }
 
 /* --- Buttons --- */
 .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 10px 18px;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    font-family: inherit;
-    cursor: pointer;
-    border: none;
-    transition: background 0.15s, transform 0.05s;
-    text-decoration: none;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 10px 18px; border-radius: 8px;
+    font-size: 14px; font-weight: 600; font-family: inherit;
+    cursor: pointer; border: none;
+    transition: background 0.15s, transform 0.05s; text-decoration: none;
 }
 .btn:active { transform: scale(0.98); }
 .btn-primary { background: var(--accent); color: var(--accent-text); }
 .btn-primary:hover { background: var(--accent-hover); }
-.btn-secondary {
-    background: var(--bg-secondary);
-    color: var(--text);
-    border: 1px solid var(--border);
-}
+.btn-secondary { background: var(--bg-secondary); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--bg-hover); }
-.btn-text {
-    background: transparent;
-    color: var(--text-muted);
-    padding: 6px 10px;
-    font-size: 13px;
-}
+.btn-danger { background: var(--danger); color: white; }
+.btn-danger:hover { background: var(--danger-hover); }
+.btn-text { background: transparent; color: var(--text-muted); padding: 6px 10px; font-size: 13px; }
 .btn-text:hover { color: var(--text); background: var(--bg-secondary); }
 .btn-full { width: 100%; }
 .btn-sm { padding: 6px 12px; font-size: 13px; }
 
 /* --- Inputs --- */
 .form-group { margin-bottom: 16px; }
-.form-label {
-    display: block;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text-muted);
-    margin-bottom: 6px;
-}
+.form-label { display: block; font-size: 13px; font-weight: 500; color: var(--text-muted); margin-bottom: 6px; }
 .form-input, .form-textarea, .form-select {
-    width: 100%;
-    background: var(--bg-input);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 10px 12px;
-    color: var(--text);
-    font-size: 14px;
-    font-family: inherit;
-    outline: none;
-    transition: border 0.15s, box-shadow 0.15s;
-    resize: none;
+    width: 100%; background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; color: var(--text);
+    font-size: 14px; font-family: inherit; outline: none;
+    transition: border 0.15s, box-shadow 0.15s; resize: none;
 }
 .form-input:focus, .form-textarea:focus, .form-select:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(99,100,255,0.15);
+    border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,100,255,0.15);
 }
 .form-input::placeholder, .form-textarea::placeholder { color: var(--text-muted); }
-.form-textarea { resize: none; min-height: 70px; line-height: 1.5; }
+.form-textarea { min-height: 70px; line-height: 1.5; resize: none; }
 
 .error-box {
-    background: rgba(223,64,90,0.1);
-    border: 1px solid var(--danger);
-    color: var(--danger);
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 13px;
-    margin-bottom: 16px;
+    background: rgba(223,64,90,0.1); border: 1px solid var(--danger);
+    color: var(--danger); padding: 10px 12px; border-radius: 8px;
+    font-size: 13px; margin-bottom: 16px;
 }
 
-/* --- Auth screen --- */
-.auth-wrap {
-    max-width: 380px;
-    margin: 40px auto;
-    padding: 0 16px;
-}
-.auth-title {
-    font-size: 24px;
-    font-weight: 700;
-    color: var(--text-heading);
-    margin-bottom: 24px;
-    text-align: center;
-}
-.auth-switch {
-    text-align: center;
-    margin-top: 20px;
-    font-size: 14px;
-    color: var(--text-muted);
-}
-.auth-switch a {
-    color: var(--accent);
-    cursor: pointer;
-    text-decoration: none;
-    font-weight: 500;
-}
+/* --- Auth --- */
+.auth-wrap { max-width: 380px; margin: 40px auto; padding: 0 16px; }
+.auth-title { font-size: 24px; font-weight: 700; color: var(--text-heading); margin-bottom: 24px; text-align: center; }
+.auth-switch { text-align: center; margin-top: 20px; font-size: 14px; color: var(--text-muted); }
+.auth-switch a { color: var(--accent); cursor: pointer; text-decoration: none; font-weight: 500; }
 .auth-switch a:hover { text-decoration: underline; }
 
 /* --- Compose --- */
 .compose {
-    padding: 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    gap: 14px;
-    background: var(--bg-secondary);
+    padding: 20px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 14px; background: var(--bg-secondary);
 }
 .compose-body { flex: 1; display: flex; flex-direction: column; }
 .compose-textarea {
-    width: 100%;
-    background: transparent;
-    border: none;
-    color: var(--text);
-    font-family: inherit;
-    font-size: 15px;
-    resize: none;
-    outline: none;
-    min-height: 60px;
-    padding: 4px 0;
+    width: 100%; background: transparent; border: none; color: var(--text);
+    font-family: inherit; font-size: 15px; resize: none; outline: none;
+    min-height: 60px; padding: 4px 0;
 }
 .compose-textarea::placeholder { color: var(--text-muted); }
 .compose-actions {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-top: 1px solid var(--border-light);
-    padding-top: 12px;
-    margin-top: 8px;
+    display: flex; justify-content: space-between; align-items: center;
+    border-top: 1px solid var(--border-light); padding-top: 12px; margin-top: 8px;
 }
 .compose-icons { display: flex; gap: 14px; color: var(--text-muted); }
 .compose-icons svg { width: 18px; height: 18px; fill: currentColor; cursor: pointer; transition: color 0.15s; }
@@ -659,105 +549,51 @@ input, textarea, select {
 
 /* --- Feed --- */
 .feed { padding: 16px 20px; }
-.empty-state {
-    text-align: center;
-    color: var(--text-muted);
-    padding: 48px 20px;
-    font-size: 14px;
-}
+.empty-state { text-align: center; color: var(--text-muted); padding: 48px 20px; font-size: 14px; }
 
 .post {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
-    display: flex;
-    gap: 12px;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; margin-bottom: 12px;
+    display: flex; gap: 12px;
     transition: border 0.15s, box-shadow 0.15s;
 }
 .post:hover { border-color: var(--text-muted); box-shadow: var(--shadow-sm); }
 
-.vote-col {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    flex-shrink: 0;
-    min-width: 34px;
-}
+.vote-col { display: flex; flex-direction: column; align-items: center; gap: 2px; flex-shrink: 0; min-width: 34px; }
 .vote-btn {
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    color: var(--text-muted);
-    padding: 4px;
-    border-radius: 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    background: transparent; border: none; cursor: pointer; color: var(--text-muted);
+    padding: 4px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
     transition: color 0.15s, background 0.15s;
 }
 .vote-btn:hover { background: var(--bg-hover); color: var(--text); }
 .vote-btn.up:hover, .vote-btn.up.active { color: var(--upvote); }
 .vote-btn.down:hover, .vote-btn.down.active { color: var(--downvote); }
 .vote-btn svg { width: 18px; height: 18px; fill: currentColor; }
-.vote-count {
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--text);
-    line-height: 1;
-    padding: 2px 0;
-}
+.vote-count { font-size: 13px; font-weight: 700; color: var(--text); line-height: 1; padding: 2px 0; }
 .vote-count.up { color: var(--upvote); }
 .vote-count.down { color: var(--downvote); }
 
 .post-body { flex: 1; min-width: 0; }
-.post-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-    flex-wrap: wrap;
-}
+.post-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .post-author {
-    font-size: 14px;
-    font-weight: 700;
-    color: var(--text-heading);
+    font-size: 14px; font-weight: 700; color: var(--text-heading);
+    cursor: pointer; transition: color 0.15s;
 }
-.post-handle { color: var(--text-muted); font-size: 13px; }
-.post-date {
-    color: var(--text-muted);
-    font-size: 12px;
-    margin-left: auto;
-}
+.post-author:hover { color: var(--accent); text-decoration: underline; }
+.post-handle { color: var(--text-muted); font-size: 13px; cursor: pointer; }
+.post-handle:hover { color: var(--accent); }
+.post-date { color: var(--text-muted); font-size: 12px; margin-left: auto; }
 .post-content {
-    font-size: 15px;
-    white-space: pre-wrap;
-    word-break: break-word;
-    margin-bottom: 10px;
-    cursor: pointer;
-    color: var(--text);
+    font-size: 15px; white-space: pre-wrap; word-break: break-word;
+    margin-bottom: 10px; cursor: pointer; color: var(--text);
 }
 .post-content:hover { color: var(--accent); }
-.post-actions {
-    display: flex;
-    gap: 20px;
-    font-size: 13px;
-    color: var(--text-muted);
-}
+.post-actions { display: flex; gap: 20px; font-size: 13px; color: var(--text-muted); }
 .post-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
-    background: none;
-    border: none;
-    color: inherit;
-    font-family: inherit;
-    font-size: 13px;
-    padding: 4px 8px;
-    border-radius: 6px;
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    background: none; border: none; color: inherit; font-family: inherit;
+    font-size: 13px; padding: 4px 8px; border-radius: 6px;
     transition: background 0.15s, color 0.15s;
 }
 .post-action:hover { background: var(--bg-hover); color: var(--accent); }
@@ -765,159 +601,146 @@ input, textarea, select {
 
 /* --- Comment --- */
 .comment {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
-    display: flex;
-    gap: 10px;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 10px;
+    display: flex; gap: 10px;
 }
 .comment-body { flex: 1; min-width: 0; }
-.comment-head {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    margin-bottom: 6px;
-    flex-wrap: wrap;
+.comment-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.comment-author {
+    font-size: 13px; font-weight: 700; color: var(--text-heading);
+    cursor: pointer;
 }
-.comment-author { font-size: 13px; font-weight: 700; color: var(--text-heading); }
-.comment-handle { color: var(--text-muted); font-size: 12px; }
+.comment-author:hover { color: var(--accent); text-decoration: underline; }
+.comment-handle { color: var(--text-muted); font-size: 12px; cursor: pointer; }
+.comment-handle:hover { color: var(--accent); }
 .comment-date { color: var(--text-muted); font-size: 12px; margin-left: auto; }
 .comment-content { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
 
 /* --- Profile --- */
-.profile-head {
-    padding: 24px 20px;
-    border-bottom: 1px solid var(--border);
-}
+.profile-head { padding: 24px 20px; border-bottom: 1px solid var(--border); }
 .profile-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 16px;
-    margin-bottom: 12px;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 16px; margin-bottom: 12px;
 }
-.profile-name {
-    font-size: 22px;
-    font-weight: 700;
-    color: var(--text-heading);
-    line-height: 1.2;
-}
+.profile-name { font-size: 22px; font-weight: 700; color: var(--text-heading); line-height: 1.2; }
 .profile-handle { font-size: 14px; color: var(--text-muted); margin-top: 2px; }
 .profile-bio {
-    font-size: 14px;
-    color: var(--text);
-    white-space: pre-wrap;
-    margin-bottom: 12px;
-    line-height: 1.6;
+    font-size: 14px; color: var(--text); white-space: pre-wrap;
+    margin-bottom: 12px; line-height: 1.6;
 }
-.profile-stats {
-    display: flex;
-    gap: 20px;
-    font-size: 13px;
-    color: var(--text-muted);
-}
+.profile-stats { display: flex; gap: 20px; font-size: 13px; color: var(--text-muted); }
 .profile-stats strong { color: var(--text-heading); }
 
-/* --- Search results --- */
+/* --- Search --- */
 .search-results-wrap { padding: 20px; }
 .search-query-head {
-    font-size: 14px;
-    color: var(--text-muted);
-    margin-bottom: 20px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--border);
+    font-size: 14px; color: var(--text-muted); margin-bottom: 20px;
+    padding-bottom: 16px; border-bottom: 1px solid var(--border);
 }
 .search-query-head strong { color: var(--text-heading); font-size: 16px; }
 .search-section { margin-bottom: 28px; }
 .search-section-title {
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-bottom: 12px;
+    font-size: 13px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;
 }
 .search-user-card {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 12px 14px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 10px; margin-bottom: 8px; cursor: pointer;
+    transition: border 0.15s;
 }
+.search-user-card:hover { border-color: var(--accent); }
 .search-user-avatar {
-    width: 36px; height: 36px;
-    background: var(--accent);
-    border-radius: 8px;
+    width: 36px; height: 36px; background: var(--accent); border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
-    color: white; font-weight: 700; font-size: 16px;
-    flex-shrink: 0;
+    color: white; font-weight: 700; font-size: 16px; flex-shrink: 0;
 }
 .search-user-info { flex: 1; min-width: 0; }
 .search-user-name { font-weight: 700; color: var(--text-heading); font-size: 14px; }
 .search-user-handle { color: var(--text-muted); font-size: 13px; }
 .search-user-bio { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
-.search-comment-context {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-bottom: 4px;
-}
-.search-comment-context a {
-    color: var(--accent);
-    cursor: pointer;
-    text-decoration: none;
-}
+.search-comment-context { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+.search-comment-context a { color: var(--accent); cursor: pointer; text-decoration: none; }
 
 /* --- Back link --- */
 .back-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    color: var(--text-muted);
-    font-size: 13px;
-    cursor: pointer;
-    padding: 6px 10px;
-    border-radius: 6px;
-    background: none;
-    border: none;
-    font-family: inherit;
+    display: inline-flex; align-items: center; gap: 8px;
+    color: var(--text-muted); font-size: 13px; cursor: pointer;
+    padding: 6px 10px; border-radius: 6px;
+    background: none; border: none; font-family: inherit;
     margin-bottom: 16px;
     transition: color 0.15s, background 0.15s;
 }
 .back-link:hover { color: var(--text); background: var(--bg-secondary); }
 .back-link svg { width: 16px; height: 16px; fill: currentColor; }
 
-.comments-section {
-    padding: 20px;
-    border-top: 1px solid var(--border);
-}
-.comments-section-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--text-heading);
-    margin-bottom: 16px;
-}
+.comments-section { padding: 20px; border-top: 1px solid var(--border); }
+.comments-section-title { font-size: 15px; font-weight: 700; color: var(--text-heading); margin-bottom: 16px; }
 .comment-form { margin-bottom: 20px; }
 .comment-form .form-textarea { min-height: 60px; margin-bottom: 8px; }
 
 /* --- Settings --- */
 .settings-wrap { padding: 24px 20px; max-width: 520px; }
 .settings-section {
-    padding-bottom: 24px;
-    margin-bottom: 24px;
+    padding-bottom: 24px; margin-bottom: 24px;
     border-bottom: 1px solid var(--border);
 }
 .settings-section:last-child { border-bottom: none; }
-.settings-section-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: var(--text-heading);
-    margin-bottom: 14px;
+.settings-section-title { font-size: 15px; font-weight: 700; color: var(--text-heading); margin-bottom: 14px; }
+
+/* --- Notifications --- */
+.notifications-wrap { padding: 16px 20px; }
+.notification-card {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 10px;
+    display: flex; gap: 12px; cursor: pointer;
+    transition: border 0.15s, box-shadow 0.15s;
 }
+.notification-card:hover { border-color: var(--accent); box-shadow: var(--shadow-sm); }
+.notification-icon {
+    width: 32px; height: 32px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+}
+.notification-icon.comment { background: rgba(99,100,255,0.15); color: var(--accent); }
+.notification-icon.upvote { background: rgba(255,107,53,0.15); color: var(--upvote); }
+.notification-icon.downvote { background: rgba(113,147,255,0.15); color: var(--downvote); }
+.notification-icon svg { width: 18px; height: 18px; fill: currentColor; }
+.notification-body { flex: 1; min-width: 0; }
+.notification-head { font-size: 13px; color: var(--text); margin-bottom: 4px; line-height: 1.5; }
+.notification-actor {
+    font-weight: 700; color: var(--text-heading); cursor: pointer;
+}
+.notification-actor:hover { color: var(--accent); text-decoration: underline; }
+.notification-time { color: var(--text-muted); font-size: 12px; margin-left: 6px; }
+.notification-preview {
+    font-size: 13px; color: var(--text-muted);
+    padding: 8px 10px; background: var(--bg);
+    border-radius: 6px; margin-top: 6px;
+    border-left: 3px solid var(--border);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* --- Modal --- */
+.modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000; padding: 20px;
+    opacity: 0; visibility: hidden;
+    transition: opacity 0.2s, visibility 0.2s;
+}
+.modal-overlay.visible { opacity: 1; visibility: visible; }
+.modal {
+    background: var(--bg-secondary); border: 1px solid var(--border);
+    border-radius: 10px; width: 100%; max-width: 400px;
+    padding: 24px; box-shadow: var(--shadow);
+    transform: scale(0.95); transition: transform 0.2s;
+}
+.modal-overlay.visible .modal { transform: scale(1); }
+.modal h3 { font-size: 18px; font-weight: 700; color: var(--text-heading); margin-bottom: 8px; }
+.modal p { font-size: 14px; color: var(--text-muted); margin-bottom: 20px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .hidden { display: none !important; }
 
@@ -928,6 +751,11 @@ input, textarea, select {
 </style>
 </head>
 <body>
+
+<div id="loading-overlay" class="loading-overlay">
+    <div class="spinner"></div>
+</div>
+
 <div class="app">
 
     <!-- LEFT COLUMN -->
@@ -941,7 +769,7 @@ input, textarea, select {
 
         <div class="search-wrap">
             <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-            <input type="text" id="search-input" class="search-input" data-t="search_placeholder" placeholder="Поиск">
+            <input type="text" id="search-input" class="search-input" placeholder="Поиск">
         </div>
 
         <div class="left-footer">
@@ -1011,7 +839,7 @@ input, textarea, select {
         <div id="view-home" class="hidden">
             <div class="compose">
                 <div class="compose-body">
-                    <textarea id="post-content" class="compose-textarea" data-t="post_placeholder" placeholder="Что нового?"></textarea>
+                    <textarea id="post-content" class="compose-textarea" placeholder="Что нового?"></textarea>
                     <div class="compose-actions">
                         <div class="compose-icons">
                             <svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
@@ -1027,7 +855,7 @@ input, textarea, select {
         <!-- POST DETAIL VIEW -->
         <div id="view-post" class="hidden">
             <div style="padding: 20px;">
-                <button class="back-link" onclick="renderView('home')">
+                <button class="back-link" onclick="goBack()">
                     <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
                     <span data-t="back">Назад</span>
                 </button>
@@ -1036,17 +864,29 @@ input, textarea, select {
             <div class="comments-section">
                 <div class="comments-section-title" data-t="comments">Комментарии</div>
                 <div class="comment-form">
-                    <textarea id="comment-content" class="form-textarea" data-t="comment_placeholder" placeholder="Написать комментарий..."></textarea>
+                    <textarea id="comment-content" class="form-textarea" placeholder="Написать комментарий..."></textarea>
                     <button class="btn btn-primary btn-sm" onclick="submitComment()" data-t="send_comment">Отправить</button>
                 </div>
                 <div id="comments-list"></div>
             </div>
         </div>
 
-        <!-- PROFILE VIEW -->
+        <!-- OWN PROFILE VIEW -->
         <div id="view-profile" class="hidden">
             <div class="profile-head" id="profile-info"></div>
             <div class="feed" id="profile-feed"></div>
+        </div>
+
+        <!-- OTHER PROFILE VIEW -->
+        <div id="view-other-profile" class="hidden">
+            <div style="padding: 20px;">
+                <button class="back-link" onclick="goBack()">
+                    <svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+                    <span data-t="back">Назад</span>
+                </button>
+            </div>
+            <div class="profile-head" id="other-profile-info"></div>
+            <div class="feed" id="other-profile-feed"></div>
         </div>
 
         <!-- SETTINGS VIEW -->
@@ -1069,21 +909,26 @@ input, textarea, select {
             </div>
         </div>
 
+        <!-- NOTIFICATIONS VIEW -->
+        <div id="view-notifications" class="hidden">
+            <div class="notifications-wrap" id="notifications-list"></div>
+        </div>
+
         <!-- SEARCH VIEW -->
         <div id="view-search" class="hidden">
             <div class="search-results-wrap">
                 <div class="search-query-head">
                     <span data-t="search_results_for">Результаты поиска:</span> <strong id="search-query-display"></strong>
                 </div>
-                <div class="search-section" id="search-users-section">
+                <div class="search-section">
                     <div class="search-section-title" data-t="search_users">Пользователи</div>
                     <div id="search-users-list"></div>
                 </div>
-                <div class="search-section" id="search-posts-section">
+                <div class="search-section">
                     <div class="search-section-title" data-t="search_posts">Посты</div>
                     <div id="search-posts-list"></div>
                 </div>
-                <div class="search-section" id="search-comments-section">
+                <div class="search-section">
                     <div class="search-section-title" data-t="search_comments">Комментарии</div>
                     <div id="search-comments-list"></div>
                 </div>
@@ -1093,38 +938,60 @@ input, textarea, select {
 
     <!-- RIGHT COLUMN -->
     <aside class="col right">
-        <div class="right-brand">
-            <div class="brand-icon">
-                <svg viewBox="0 0 32 32"><path d="M11 8v16h10v-3h-7V8z" fill="#fff"/></svg>
-            </div>
-            <div class="brand-name">Litodon</div>
+        <!-- Guest: only register/login -->
+        <div id="right-guest" class="auth-buttons-right">
+            <button class="btn btn-primary" onclick="switchAuth('register'); renderView('auth')" data-t="register_link">Зарегистрироваться</button>
+            <button class="btn btn-secondary" onclick="switchAuth('login'); renderView('auth')" data-t="login_btn">Войти</button>
         </div>
 
-        <nav class="nav-list" id="nav-list">
-            <button class="nav-btn" onclick="renderView('home')" id="nav-home">
-                <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
-                <span data-t="nav_home">Главная</span>
-            </button>
-            <button class="nav-btn" onclick="renderView('profile')" id="nav-profile">
-                <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-                <span data-t="nav_profile">Профиль</span>
-            </button>
-            <button class="nav-btn" onclick="renderView('settings')" id="nav-settings">
-                <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.04.24.24.41.48.41h3.84c.24 0 .43-.17.47-.41l.36-2.54c.59-.24 1.13-.57 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
-                <span data-t="nav_settings">Настройки</span>
-            </button>
-        </nav>
+        <!-- Logged in: nav + user badge + logout -->
+        <div id="right-user" class="hidden" style="display:flex; flex-direction:column; height:100%;">
+            <nav class="nav-list" id="nav-list">
+                <button class="nav-btn" onclick="renderView('home')" id="nav-home">
+                    <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+                    <span data-t="nav_home">Главная</span>
+                </button>
+                <button class="nav-btn" onclick="renderView('profile')" id="nav-profile">
+                    <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+                    <span data-t="nav_profile">Профиль</span>
+                </button>
+                <button class="nav-btn" onclick="renderView('notifications')" id="nav-notifications">
+                    <svg viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+                    <span data-t="nav_notifications">Уведомления</span>
+                    <span class="nav-badge hidden" id="notif-badge">0</span>
+                </button>
+                <button class="nav-btn" onclick="renderView('settings')" id="nav-settings">
+                    <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.04.24.24.41.48.41h3.84c.24 0 .43-.17.47-.41l.36-2.54c.59-.24 1.13-.57 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                    <span data-t="nav_settings">Настройки</span>
+                </button>
+            </nav>
 
-        <div class="user-badge hidden" id="user-badge">
-            <div class="user-badge-info">
-                <div class="user-badge-name" id="user-badge-name"></div>
-                <div class="user-badge-handle" id="user-badge-handle"></div>
+            <div class="user-badge" onclick="renderView('profile')">
+                <div class="user-badge-avatar" id="user-badge-avatar">U</div>
+                <div class="user-badge-info">
+                    <div class="user-badge-name" id="user-badge-name"></div>
+                    <div class="user-badge-handle" id="user-badge-handle"></div>
+                </div>
             </div>
-            <button class="logout-btn" onclick="logout()" title="logout">
+
+            <button class="logout-full-btn" onclick="openLogoutModal()">
                 <svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+                <span data-t="logout_btn">Выйти</span>
             </button>
         </div>
     </aside>
+</div>
+
+<!-- LOGOUT MODAL -->
+<div id="logout-modal" class="modal-overlay">
+    <div class="modal">
+        <h3 data-t="logout_confirm_title">Выйти из аккаунта?</h3>
+        <p data-t="logout_confirm_text">Вы уверены, что хотите выйти? Вам придётся ввести пароль снова, чтобы войти.</p>
+        <div class="modal-actions">
+            <button class="btn btn-secondary btn-sm" onclick="closeLogoutModal()" data-t="cancel">Отмена</button>
+            <button class="btn btn-danger btn-sm" onclick="confirmLogout()" data-t="logout_btn">Выйти</button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -1158,20 +1025,24 @@ const translations = {
         nav_home: "Главная",
         nav_profile: "Профиль",
         nav_settings: "Настройки",
+        nav_notifications: "Уведомления",
+        logout_btn: "Выйти",
+        logout_confirm_title: "Выйти из аккаунта?",
+        logout_confirm_text: "Вы уверены, что хотите выйти? Вам придётся ввести пароль снова, чтобы войти.",
+        cancel: "Отмена",
         edit_profile: "Редактировать",
         save: "Сохранить",
-        cancel: "Отмена",
         edit_name_label: "Отображаемое имя",
         edit_bio_label: "Описание профиля",
         no_bio: "Нет описания",
         no_posts: "Пока нет постов.",
         no_comments: "Нет комментариев. Будьте первым!",
         no_results: "Ничего не найдено.",
+        no_notifications: "Пока нет уведомлений.",
         search_results_for: "Результаты поиска:",
         search_users: "Пользователи",
         search_posts: "Посты",
         search_comments: "Комментарии",
-        comments_count: "комментариев",
         post_context: "Комментарий к посту от",
         followers: "подписчиков",
         following: "подписок",
@@ -1180,7 +1051,11 @@ const translations = {
         header_settings: "Настройки",
         header_post: "Пост",
         header_search: "Поиск",
-        // errors
+        header_notifications: "Уведомления",
+        header_other_profile: "Профиль",
+        notif_commented: "оставил комментарий под вашим постом",
+        notif_upvoted: "проголосовал за ваш пост",
+        notif_downvoted: "проголосовал против вашего поста",
         ERR_USERNAME_TAKEN: "Этот ник уже занят",
         ERR_FILL_ALL: "Заполните все обязательные поля",
         ERR_PASSWORDS_MISMATCH: "Пароли не совпадают",
@@ -1190,6 +1065,7 @@ const translations = {
         ERR_EMPTY_POST: "Пост не может быть пустым",
         ERR_EMPTY_COMMENT: "Комментарий не может быть пустым",
         ERR_POST_NOT_FOUND: "Пост не найден",
+        ERR_USER_NOT_FOUND: "Пользователь не найден",
         ERR_UNKNOWN: "Произошла ошибка"
     },
     en: {
@@ -1221,20 +1097,24 @@ const translations = {
         nav_home: "Home",
         nav_profile: "Profile",
         nav_settings: "Settings",
+        nav_notifications: "Notifications",
+        logout_btn: "Logout",
+        logout_confirm_title: "Log out?",
+        logout_confirm_text: "Are you sure you want to log out? You'll need to enter your password again to sign in.",
+        cancel: "Cancel",
         edit_profile: "Edit",
         save: "Save",
-        cancel: "Cancel",
         edit_name_label: "Display name",
         edit_bio_label: "Profile bio",
         no_bio: "No bio",
         no_posts: "No posts yet.",
         no_comments: "No comments yet. Be the first!",
         no_results: "Nothing found.",
+        no_notifications: "No notifications yet.",
         search_results_for: "Search results:",
         search_users: "Users",
         search_posts: "Posts",
         search_comments: "Comments",
-        comments_count: "comments",
         post_context: "Comment on post by",
         followers: "followers",
         following: "following",
@@ -1243,7 +1123,11 @@ const translations = {
         header_settings: "Settings",
         header_post: "Post",
         header_search: "Search",
-        // errors
+        header_notifications: "Notifications",
+        header_other_profile: "Profile",
+        notif_commented: "commented on your post",
+        notif_upvoted: "upvoted your post",
+        notif_downvoted: "downvoted your post",
         ERR_USERNAME_TAKEN: "This username is taken",
         ERR_FILL_ALL: "Please fill all required fields",
         ERR_PASSWORDS_MISMATCH: "Passwords do not match",
@@ -1253,6 +1137,7 @@ const translations = {
         ERR_EMPTY_POST: "Post cannot be empty",
         ERR_EMPTY_COMMENT: "Comment cannot be empty",
         ERR_POST_NOT_FOUND: "Post not found",
+        ERR_USER_NOT_FOUND: "User not found",
         ERR_UNKNOWN: "An error occurred"
     }
 };
@@ -1261,26 +1146,28 @@ let currentLang = localStorage.getItem('litodon_lang') || 'ru';
 let currentTheme = localStorage.getItem('litodon_theme') || 'dark';
 let currentUser = null;
 let currentView = 'auth';
+let previousView = 'home';
 let currentPostId = null;
+let currentViewedUser = null;
 let isEditingProfile = false;
 
-function t(key) {
-    return (translations[currentLang] && translations[currentLang][key]) || key;
-}
+function t(key) { return (translations[currentLang] && translations[currentLang][key]) || key; }
 
 function applyTranslations() {
     document.querySelectorAll('[data-t]').forEach(el => {
         const key = el.getAttribute('data-t');
         el.textContent = t(key);
     });
-    document.querySelectorAll('[data-t-placeholder]').forEach(el => {
-        const key = el.getAttribute('data-t-placeholder');
-        el.placeholder = t(key);
-    });
-    const searchInput = document.getElementById('search-input');
-    if (searchInput) searchInput.placeholder = t('search_placeholder');
-    document.getElementById('settings-language').value = currentLang;
-    document.getElementById('settings-theme').value = currentTheme;
+    const si = document.getElementById('search-input');
+    if (si) si.placeholder = t('search_placeholder');
+    const pc = document.getElementById('post-content');
+    if (pc) pc.placeholder = t('post_placeholder');
+    const cc = document.getElementById('comment-content');
+    if (cc) cc.placeholder = t('comment_placeholder');
+    const langSel = document.getElementById('settings-language');
+    if (langSel) langSel.value = currentLang;
+    const themeSel = document.getElementById('settings-theme');
+    if (themeSel) themeSel.value = currentTheme;
 }
 
 function applyTheme() {
@@ -1288,12 +1175,7 @@ function applyTheme() {
     document.body.setAttribute('data-theme', currentTheme);
 }
 
-function changeTheme(theme) {
-    currentTheme = theme;
-    localStorage.setItem('litodon_theme', theme);
-    applyTheme();
-}
-
+function changeTheme(theme) { currentTheme = theme; localStorage.setItem('litodon_theme', theme); applyTheme(); }
 function changeLanguage(lang) {
     currentLang = lang;
     localStorage.setItem('litodon_lang', lang);
@@ -1301,48 +1183,80 @@ function changeLanguage(lang) {
     renderView(currentView, true);
 }
 
-function translateError(code) {
-    return t(code) || t('ERR_UNKNOWN');
+function translateError(code) { return t(code) || t('ERR_UNKNOWN'); }
+
+function hideLoading() {
+    const ov = document.getElementById('loading-overlay');
+    if (ov) ov.classList.add('hidden');
 }
 
 async function init() {
     applyTheme();
     applyTranslations();
-    const res = await fetch('/api/me');
-    const data = await res.json();
-    if (data.username) {
-        currentUser = data;
-        renderView('home');
-    } else {
-        currentUser = null;
+    try {
+        const res = await fetch('/api/me');
+        const data = await res.json();
+        if (data.username) {
+            currentUser = data;
+            renderView('home');
+            loadNotificationsCount();
+        } else {
+            currentUser = null;
+            renderView('auth');
+        }
+    } catch (e) {
         renderView('auth');
     }
+    setTimeout(hideLoading, 150);
+}
+
+async function loadNotificationsCount() {
+    if (!currentUser) return;
+    try {
+        const res = await fetch('/api/notifications');
+        if (!res.ok) return;
+        const data = await res.json();
+        const badge = document.getElementById('notif-badge');
+        if (data.length > 0) {
+            badge.textContent = data.length > 99 ? '99+' : data.length;
+            badge.classList.remove('hidden');
+        } else {
+            badge.classList.add('hidden');
+        }
+    } catch (e) {}
 }
 
 function renderView(view, keepQuery) {
     currentView = view;
-    if (!keepQuery) isEditingProfile = false;
+    if (!keepQuery && view !== 'post' && view !== 'other-profile') {
+        isEditingProfile = false;
+    }
 
-    ['auth','home','post','profile','settings','search'].forEach(v => {
+    ['auth','home','post','profile','other-profile','settings','notifications','search'].forEach(v => {
         const el = document.getElementById('view-' + v);
         if (el) el.classList.add('hidden');
     });
 
     const header = document.getElementById('user-header');
-    const userBadge = document.getElementById('user-badge');
-    const navHome = document.getElementById('nav-home');
-    const navProfile = document.getElementById('nav-profile');
-    const navSettings = document.getElementById('nav-settings');
-    [navHome, navProfile, navSettings].forEach(n => n && n.classList.remove('active'));
+    const rightGuest = document.getElementById('right-guest');
+    const rightUser = document.getElementById('right-user');
+
+    ['nav-home','nav-profile','nav-settings','nav-notifications'].forEach(id => {
+        const n = document.getElementById(id);
+        if (n) n.classList.remove('active');
+    });
 
     if (currentUser) {
         header.classList.remove('hidden');
-        userBadge.classList.remove('hidden');
+        rightGuest.classList.add('hidden');
+        rightUser.classList.remove('hidden');
         document.getElementById('user-badge-name').textContent = currentUser.display_name;
         document.getElementById('user-badge-handle').textContent = '@' + currentUser.username;
+        document.getElementById('user-badge-avatar').textContent = (currentUser.display_name[0] || '?').toUpperCase();
     } else {
         header.classList.add('hidden');
-        userBadge.classList.add('hidden');
+        rightGuest.classList.remove('hidden');
+        rightUser.classList.add('hidden');
     }
 
     const titleEl = document.getElementById('center-title');
@@ -1353,23 +1267,34 @@ function renderView(view, keepQuery) {
     } else if (view === 'home') {
         document.getElementById('view-home').classList.remove('hidden');
         titleEl.textContent = t('header_home');
-        if (navHome) navHome.classList.add('active');
+        const n = document.getElementById('nav-home'); if (n) n.classList.add('active');
+        previousView = 'home';
         loadHomeFeed();
     } else if (view === 'profile') {
         document.getElementById('view-profile').classList.remove('hidden');
         titleEl.textContent = t('header_profile');
-        if (navProfile) navProfile.classList.add('active');
+        const n = document.getElementById('nav-profile'); if (n) n.classList.add('active');
+        previousView = 'profile';
         loadProfile();
+    } else if (view === 'other-profile') {
+        document.getElementById('view-other-profile').classList.remove('hidden');
+        titleEl.textContent = t('header_other_profile');
+        loadOtherProfile();
     } else if (view === 'settings') {
         document.getElementById('view-settings').classList.remove('hidden');
         titleEl.textContent = t('header_settings');
-        if (navSettings) navSettings.classList.add('active');
-        document.getElementById('settings-language').value = currentLang;
-        document.getElementById('settings-theme').value = currentTheme;
+        const n = document.getElementById('nav-settings'); if (n) n.classList.add('active');
+        previousView = 'settings';
     } else if (view === 'post') {
         document.getElementById('view-post').classList.remove('hidden');
         titleEl.textContent = t('header_post');
         loadPostDetail();
+    } else if (view === 'notifications') {
+        document.getElementById('view-notifications').classList.remove('hidden');
+        titleEl.textContent = t('header_notifications');
+        const n = document.getElementById('nav-notifications'); if (n) n.classList.add('active');
+        previousView = 'notifications';
+        loadNotifications();
     } else if (view === 'search') {
         document.getElementById('view-search').classList.remove('hidden');
         titleEl.textContent = t('header_search');
@@ -1393,8 +1318,7 @@ async function submitLogin() {
     const errorDiv = document.getElementById('auth-error');
     try {
         const res = await fetch('/api/login', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({username, password})
         });
         const data = await res.json();
@@ -1402,6 +1326,7 @@ async function submitLogin() {
         document.getElementById('login-username').value = '';
         document.getElementById('login-password').value = '';
         await init();
+        loadNotificationsCount();
     } catch (err) {
         errorDiv.textContent = translateError(err.message);
         errorDiv.classList.remove('hidden');
@@ -1416,8 +1341,7 @@ async function submitRegister() {
     const errorDiv = document.getElementById('auth-error');
     try {
         const res = await fetch('/api/register', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({username, display_name, password, confirm_password})
         });
         const data = await res.json();
@@ -1430,8 +1354,15 @@ async function submitRegister() {
     }
 }
 
-async function logout() {
+function openLogoutModal() {
+    document.getElementById('logout-modal').classList.add('visible');
+}
+function closeLogoutModal() {
+    document.getElementById('logout-modal').classList.remove('visible');
+}
+async function confirmLogout() {
     await fetch('/api/logout', {method: 'POST'});
+    closeLogoutModal();
     currentUser = null;
     renderView('auth');
 }
@@ -1453,14 +1384,10 @@ async function submitPost() {
     const content = ta.value;
     if (!content.trim()) return;
     const res = await fetch('/api/posts', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({content})
     });
-    if (res.ok) {
-        ta.value = '';
-        loadHomeFeed();
-    }
+    if (res.ok) { ta.value = ''; loadHomeFeed(); }
 }
 
 function createPostEl(post) {
@@ -1483,8 +1410,8 @@ function createPostEl(post) {
         </div>
         <div class="post-body">
             <div class="post-head">
-                <span class="post-author">${esc(post.display_name)}</span>
-                <span class="post-handle">@${esc(post.author)}</span>
+                <span class="post-author" onclick="openUser('${esc(post.author)}')">${esc(post.display_name)}</span>
+                <span class="post-handle" onclick="openUser('${esc(post.author)}')">@${esc(post.author)}</span>
                 <span class="post-date">${date}</span>
             </div>
             <div class="post-content" onclick="openPost('${post.id}')">${esc(post.content)}</div>
@@ -1502,6 +1429,10 @@ function createPostEl(post) {
 function openPost(id) {
     currentPostId = id;
     renderView('post');
+}
+
+function goBack() {
+    renderView(previousView || 'home');
 }
 
 async function loadPostDetail() {
@@ -1546,8 +1477,8 @@ function createCommentEl(c) {
         </div>
         <div class="comment-body">
             <div class="comment-head">
-                <span class="comment-author">${esc(c.display_name)}</span>
-                <span class="comment-handle">@${esc(c.author)}</span>
+                <span class="comment-author" onclick="openUser('${esc(c.author)}')">${esc(c.display_name)}</span>
+                <span class="comment-handle" onclick="openUser('${esc(c.author)}')">@${esc(c.author)}</span>
                 <span class="comment-date">${date}</span>
             </div>
             <div class="comment-content">${esc(c.content)}</div>
@@ -1561,35 +1492,38 @@ async function submitComment() {
     const content = ta.value;
     if (!content.trim()) return;
     const res = await fetch('/api/posts/' + currentPostId + '/comments', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({content})
     });
-    if (res.ok) {
-        ta.value = '';
-        loadComments();
-    }
+    if (res.ok) { ta.value = ''; loadComments(); }
 }
 
 async function handleVote(targetId, targetType, voteType) {
     if (!currentUser) return;
     const res = await fetch('/api/vote', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({target_id: targetId, target_type: targetType, vote_type: voteType})
     });
     if (res.ok) {
-        if (currentView === 'post') {
-            loadPostDetail();
-        } else if (currentView === 'home') {
-            loadHomeFeed();
-        } else if (currentView === 'profile') {
-            loadProfile();
-        } else if (currentView === 'search') {
+        if (currentView === 'post') loadPostDetail();
+        else if (currentView === 'home') loadHomeFeed();
+        else if (currentView === 'profile') loadProfile();
+        else if (currentView === 'other-profile') loadOtherProfile();
+        else if (currentView === 'search') {
             const q = document.getElementById('search-query-display').textContent;
             if (q) performSearch(q);
-        }
+        } else if (currentView === 'notifications') loadNotifications();
+        loadNotificationsCount();
     }
+}
+
+async function openUser(username) {
+    if (currentUser && username === currentUser.username) {
+        renderView('profile');
+        return;
+    }
+    currentViewedUser = username;
+    renderView('other-profile');
 }
 
 async function loadProfile() {
@@ -1633,24 +1567,17 @@ async function loadProfile() {
     const mine = all.filter(p => p.author === currentUser.username);
     const feed = document.getElementById('profile-feed');
     feed.innerHTML = '';
-    if (mine.length === 0) {
-        feed.innerHTML = '<div class="empty-state">' + t('no_posts') + '</div>';
-        return;
-    }
+    if (mine.length === 0) { feed.innerHTML = '<div class="empty-state">' + t('no_posts') + '</div>'; return; }
     mine.forEach(p => feed.appendChild(createPostEl(p)));
 }
 
-function toggleProfileEdit() {
-    isEditingProfile = !isEditingProfile;
-    loadProfile();
-}
+function toggleProfileEdit() { isEditingProfile = !isEditingProfile; loadProfile(); }
 
 async function saveProfile() {
     const display_name = document.getElementById('edit-display-name').value;
     const bio = document.getElementById('edit-bio').value;
     const res = await fetch('/api/profile/update', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({display_name, bio})
     });
     if (res.ok) {
@@ -1658,12 +1585,43 @@ async function saveProfile() {
         currentUser.display_name = data.display_name;
         currentUser.bio = data.bio;
         document.getElementById('user-badge-name').textContent = currentUser.display_name;
+        document.getElementById('user-badge-avatar').textContent = (currentUser.display_name[0] || '?').toUpperCase();
         isEditingProfile = false;
         loadProfile();
     }
 }
 
-// --- SEARCH ---
+async function loadOtherProfile() {
+    if (!currentViewedUser) return;
+    const infoDiv = document.getElementById('other-profile-info');
+    const feed = document.getElementById('other-profile-feed');
+    try {
+        const res = await fetch('/api/profile/' + encodeURIComponent(currentViewedUser));
+        if (!res.ok) { infoDiv.innerHTML = '<div class="empty-state">' + t('ERR_USER_NOT_FOUND') + '</div>'; feed.innerHTML = ''; return; }
+        const user = await res.json();
+        infoDiv.innerHTML = `
+            <div class="profile-top">
+                <div>
+                    <div class="profile-name">${esc(user.display_name)}</div>
+                    <div class="profile-handle">@${esc(user.username)}</div>
+                </div>
+            </div>
+            <div class="profile-bio">${esc(user.bio || t('no_bio'))}</div>
+            <div class="profile-stats">
+                <span><strong>0</strong> ${t('followers')}</span>
+                <span><strong>0</strong> ${t('following')}</span>
+            </div>
+        `;
+        const pRes = await fetch('/api/profile/' + encodeURIComponent(currentViewedUser) + '/posts');
+        const posts = await pRes.json();
+        feed.innerHTML = '';
+        if (posts.length === 0) { feed.innerHTML = '<div class="empty-state">' + t('no_posts') + '</div>'; return; }
+        posts.forEach(p => feed.appendChild(createPostEl(p)));
+    } catch (e) {
+        infoDiv.innerHTML = '<div class="empty-state">' + t('ERR_UNKNOWN') + '</div>';
+    }
+}
+
 document.getElementById('search-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') {
         const q = e.target.value.trim();
@@ -1685,8 +1643,9 @@ async function performSearch(query) {
         data.users.forEach(u => {
             const el = document.createElement('div');
             el.className = 'search-user-card';
+            el.onclick = () => openUser(u.username);
             el.innerHTML = `
-                <div class="search-user-avatar">${esc(u.display_name[0] || '?').toUpperCase()}</div>
+                <div class="search-user-avatar">${esc((u.display_name[0] || '?')).toUpperCase()}</div>
                 <div class="search-user-info">
                     <div class="search-user-name">${esc(u.display_name)}</div>
                     <div class="search-user-handle">@${esc(u.username)}</div>
@@ -1726,10 +1685,10 @@ async function performSearch(query) {
                     </button>
                 </div>
                 <div class="comment-body">
-                    <div class="search-comment-context">${t('post_context')} @${esc(c.post_author)} — <a onclick="openPost('${c.post_id}')">${t('back')}</a></div>
+                    <div class="search-comment-context">${t('post_context')} <a onclick="openUser('${esc(c.post_author)}')">@${esc(c.post_author)}</a></div>
                     <div class="comment-head">
-                        <span class="comment-author">${esc(c.display_name)}</span>
-                        <span class="comment-handle">@${esc(c.author)}</span>
+                        <span class="comment-author" onclick="openUser('${esc(c.author)}')">${esc(c.display_name)}</span>
+                        <span class="comment-handle" onclick="openUser('${esc(c.author)}')">@${esc(c.author)}</span>
                     </div>
                     <div class="comment-content">${esc(c.content)}</div>
                 </div>
@@ -1737,6 +1696,64 @@ async function performSearch(query) {
             commentsList.appendChild(el);
         });
     }
+}
+
+async function loadNotifications() {
+    const list = document.getElementById('notifications-list');
+    list.innerHTML = '';
+    try {
+        const res = await fetch('/api/notifications');
+        if (!res.ok) throw new Error('unauth');
+        const notifs = await res.json();
+        if (notifs.length === 0) {
+            list.innerHTML = '<div class="empty-state">' + t('no_notifications') + '</div>';
+            return;
+        }
+        notifs.forEach(n => list.appendChild(createNotificationEl(n)));
+        // Clear badge after viewing
+        const badge = document.getElementById('notif-badge');
+        badge.classList.add('hidden');
+    } catch (e) {
+        list.innerHTML = '<div class="empty-state">' + t('ERR_UNKNOWN') + '</div>';
+    }
+}
+
+function createNotificationEl(n) {
+    const el = document.createElement('div');
+    el.className = 'notification-card';
+    el.onclick = () => openPost(n.post_id);
+    const date = new Date(n.timestamp).toLocaleString(currentLang === 'ru' ? 'ru-RU' : 'en-US');
+
+    let iconSvg = '';
+    let iconClass = '';
+    let textKey = '';
+
+    if (n.kind === 'comment') {
+        iconClass = 'comment';
+        textKey = 'notif_commented';
+        iconSvg = '<svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>';
+    } else if (n.kind === 'vote' && n.vote_type === 'up') {
+        iconClass = 'upvote';
+        textKey = 'notif_upvoted';
+        iconSvg = '<svg viewBox="0 0 24 24"><path d="M12 4l-8 8h6v8h4v-8h6z"/></svg>';
+    } else if (n.kind === 'vote' && n.vote_type === 'down') {
+        iconClass = 'downvote';
+        textKey = 'notif_downvoted';
+        iconSvg = '<svg viewBox="0 0 24 24"><path d="M12 20l8-8h-6V4h-4v8H4z"/></svg>';
+    }
+
+    el.innerHTML = `
+        <div class="notification-icon ${iconClass}">${iconSvg}</div>
+        <div class="notification-body">
+            <div class="notification-head">
+                <span class="notification-actor" onclick="event.stopPropagation(); openUser('${esc(n.actor)}')">${esc(n.actor_display_name)}</span>
+                ${t(textKey)}
+                <span class="notification-time">${date}</span>
+            </div>
+            <div class="notification-preview">${esc(n.kind === 'comment' ? n.content : n.post_preview)}</div>
+        </div>
+    `;
+    return el;
 }
 
 function esc(text) {
@@ -1748,9 +1765,12 @@ function esc(text) {
 
 // Disable right click (except on inputs/textareas)
 document.addEventListener('contextmenu', e => {
-    if (!e.target.closest('input, textarea')) {
-        e.preventDefault();
-    }
+    if (!e.target.closest('input, textarea')) e.preventDefault();
+});
+
+// Close logout modal on overlay click
+document.getElementById('logout-modal').addEventListener('click', e => {
+    if (e.target.id === 'logout-modal') closeLogoutModal();
 });
 
 init();
@@ -1760,7 +1780,6 @@ init();
 """
 
 
-# --- PRIVACY PAGE ---
 PRIVACY_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1781,7 +1800,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 h1 { font-size: 28px; color: var(--text-heading); margin-bottom: 8px; }
 .subtitle { color: var(--text-muted); margin-bottom: 32px; font-size: 14px; }
 h2 { font-size: 18px; color: var(--text-heading); margin: 28px 0 12px; }
-p { margin-bottom: 14px; color: var(--text); }
+p { margin-bottom: 14px; }
 ul { padding-left: 24px; margin-bottom: 14px; }
 li { margin-bottom: 6px; }
 a.back { display: inline-flex; align-items: center; gap: 8px; margin-top: 32px; color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 500; }
@@ -1802,7 +1821,6 @@ a.back:hover { text-decoration: underline; }
         <div class="brand-icon"><svg viewBox="0 0 32 32"><path d="M11 8v16h10v-3h-7V8z" fill="#fff"/></svg></div>
         <div class="brand-name">Litodon</div>
     </div>
-
     <div id="content-ru">
         <h1>Политика конфиденциальности</h1>
         <div class="subtitle">Последнее обновление: 21 сентября 2026</div>
@@ -1825,7 +1843,6 @@ a.back:hover { text-decoration: underline; }
         <h2>6. Контакты</h2>
         <p>По вопросам, связанным с конфиденциальностью, обращайтесь к администрации сервера.</p>
     </div>
-
     <div id="content-en" class="hidden">
         <h1>Privacy Policy</h1>
         <div class="subtitle">Last updated: September 21, 2026</div>
@@ -1848,7 +1865,6 @@ a.back:hover { text-decoration: underline; }
         <h2>6. Contact</h2>
         <p>For privacy-related inquiries, please contact the server administration.</p>
     </div>
-
     <a href="/" class="back">← <span id="back-text">Вернуться на главную</span></a>
 </div>
 <script>
@@ -1872,7 +1888,6 @@ setLang(lang);
 """
 
 
-# --- CHANGELOGS PAGE ---
 CHANGELOGS_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1916,11 +1931,22 @@ a.back:hover { text-decoration: underline; }
         <div class="brand-icon"><svg viewBox="0 0 32 32"><path d="M11 8v16h10v-3h-7V8z" fill="#fff"/></svg></div>
         <div class="brand-name">Litodon</div>
     </div>
-
     <div id="content-ru">
         <h1>История изменений</h1>
         <div class="subtitle">Все обновления Litodon</div>
-
+        <div class="version-block">
+            <div class="version-head">
+                <span class="version-tag">v1.1.0</span>
+                <span class="version-date">21 сентября 2026</span>
+            </div>
+            <ul>
+                <li>Добавлены уведомления (комментарии и голоса под вашими постами)</li>
+                <li>Профили других пользователей доступны по клику</li>
+                <li>Красная кнопка выхода с подтверждением</li>
+                <li>Спиннер загрузки при перезагрузке страницы</li>
+                <li>Убран дубликат логотипа</li>
+            </ul>
+        </div>
         <div class="version-block">
             <div class="version-head">
                 <span class="version-tag">v1.0.0</span>
@@ -1928,21 +1954,29 @@ a.back:hover { text-decoration: underline; }
             </div>
             <ul>
                 <li>Первый публичный релиз Litodon</li>
-                <li>Регистрация и вход по нику и паролю</li>
-                <li>Создание постов и комментариев</li>
-                <li>Система голосования (апвоуты и даунвоуты)</li>
-                <li>Профиль пользователя с возможностью редактирования</li>
-                <li>Поиск по пользователям, постам и комментариям</li>
-                <li>Поддержка русского и английского языков</li>
-                <li>Тёмная и светлая темы оформления</li>
+                <li>Регистрация и вход</li>
+                <li>Посты, комментарии, голосование</li>
+                <li>Поиск и редактирование профиля</li>
+                <li>Русский и английский языки, тёмная и светлая темы</li>
             </ul>
         </div>
     </div>
-
     <div id="content-en" class="hidden">
         <h1>Changelog</h1>
         <div class="subtitle">All Litodon updates</div>
-
+        <div class="version-block">
+            <div class="version-head">
+                <span class="version-tag">v1.1.0</span>
+                <span class="version-date">September 21, 2026</span>
+            </div>
+            <ul>
+                <li>Notifications added (comments and votes on your posts)</li>
+                <li>Other users' profiles accessible by click</li>
+                <li>Red logout button with confirmation</li>
+                <li>Loading spinner on page reload</li>
+                <li>Removed duplicate logo</li>
+            </ul>
+        </div>
         <div class="version-block">
             <div class="version-head">
                 <span class="version-tag">v1.0.0</span>
@@ -1950,17 +1984,13 @@ a.back:hover { text-decoration: underline; }
             </div>
             <ul>
                 <li>First public release of Litodon</li>
-                <li>Sign up and sign in with username and password</li>
-                <li>Create posts and comments</li>
-                <li>Voting system (upvotes and downvotes)</li>
-                <li>User profile with editing capabilities</li>
-                <li>Search across users, posts and comments</li>
-                <li>Russian and English language support</li>
-                <li>Dark and light themes</li>
+                <li>Sign up and sign in</li>
+                <li>Posts, comments, voting</li>
+                <li>Search and profile editing</li>
+                <li>Russian and English languages, dark and light themes</li>
             </ul>
         </div>
     </div>
-
     <a href="/" class="back">← <span id="back-text">Вернуться на главную</span></a>
 </div>
 <script>
