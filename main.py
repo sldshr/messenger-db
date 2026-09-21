@@ -5,7 +5,9 @@
 # Админ:    admin / admin
 
 import hashlib
+import hmac
 import html
+import re
 import secrets
 import time
 from datetime import datetime
@@ -15,15 +17,19 @@ import uvicorn
 from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+app = FastAPI(title="MiniChat")
+
 # ────────────────────────────────────────────────────────────
 #  ХРАНИЛИЩЕ (in-memory)
 # ────────────────────────────────────────────────────────────
 
 USERS: Dict[str, dict] = {}
-SESSIONS: Dict[str, str] = {}            # token -> username
-CHANNELS: Dict[str, dict] = {}           # name -> {topic}
-MESSAGES: Dict[str, List[dict]] = {}     # channel -> [msg]
-WS_CONNECTIONS: Dict[str, Dict[WebSocket, str]] = {}  # channel -> {ws: username}
+SESSIONS: Dict[str, dict] = {}            # token -> {"user": str, "expires": ts}
+CHANNELS: Dict[str, dict] = {}            # name -> {topic}
+MESSAGES: Dict[str, List[dict]] = {}      # channel -> [msg]
+WS_CONNECTIONS: Dict[str, Dict[WebSocket, str]] = {}
+
+LOGIN_ATTEMPTS: Dict[str, List[float]] = {}  # ip -> [timestamps]
 
 CONFIG = {
     "server_name": "MiniChat",
@@ -32,25 +38,92 @@ CONFIG = {
     "allow_registration": True,
 }
 
+SESSION_TTL = 86400 * 7
+LOGIN_WINDOW = 60.0
+LOGIN_MAX = 8
+NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,20}$")
 
-def hash_pw(p: str) -> str:
-    return hashlib.sha256(p.encode("utf-8")).hexdigest()
+
+def hash_pw(password: str, salt: Optional[bytes] = None) -> str:
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return f"{salt.hex()}${dk.hex()}"
+
+
+def verify_pw(password: str, stored: str) -> bool:
+    try:
+        salt_hex, _ = stored.split("$", 1)
+        salt = bytes.fromhex(salt_hex)
+    except (ValueError, AttributeError):
+        return False
+    return hmac.compare_digest(hash_pw(password, salt), stored)
+
+
+def new_session(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {"user": username, "expires": time.time() + SESSION_TTL}
+    return token
+
+
+def get_session(request: Request) -> Optional[str]:
+    token = request.cookies.get("session")
+    if not token:
+        return None
+    s = SESSIONS.get(token)
+    if not s:
+        return None
+    if s["expires"] < time.time():
+        SESSIONS.pop(token, None)
+        return None
+    return s["user"]
+
+
+def get_session_ws(ws: WebSocket) -> Optional[str]:
+    token = ws.cookies.get("session")
+    if not token:
+        return None
+    s = SESSIONS.get(token)
+    if not s or s["expires"] < time.time():
+        SESSIONS.pop(token, None)
+        return None
+    return s["user"]
+
+
+def rate_limited(ip: str) -> bool:
+    now = time.time()
+    bucket = LOGIN_ATTEMPTS.setdefault(ip, [])
+    bucket[:] = [t for t in bucket if now - t < LOGIN_WINDOW]
+    if len(bucket) >= LOGIN_MAX:
+        return True
+    bucket.append(now)
+    return False
+
+
+def check_origin(request_or_ws) -> bool:
+    """Мягкая проверка Origin — для CSRF и WS-хайджекa."""
+    headers = request_or_ws.headers
+    origin = headers.get("origin")
+    if not origin:
+        return True  # не-браузерные клиенты пропускаем
+    host = headers.get("host", "")
+    return origin.endswith("//" + host) or origin.endswith("://" + host)
 
 
 def add_channel(name: str, topic: str = "") -> bool:
     name = name.strip().lower().replace(" ", "-")
     if not name or name in CHANNELS:
         return False
-    CHANNELS[name] = {"topic": topic or "Без описания"}
+    if not re.match(r"^[a-z0-9_\-]{2,30}$", name):
+        return False
+    CHANNELS[name] = {"topic": (topic or "Без описания")[:120]}
     MESSAGES[name] = []
     return True
 
 
-# стартовые каналы
 add_channel("general", "Общий чат")
 add_channel("random", "Всякое")
 
-# админ
 USERS["admin"] = {
     "password": hash_pw("admin"),
     "is_admin": True,
@@ -62,20 +135,6 @@ USERS["admin"] = {
 # ────────────────────────────────────────────────────────────
 #  ХЕЛПЕРЫ
 # ────────────────────────────────────────────────────────────
-
-def current_user(request: Request) -> Optional[str]:
-    token = request.cookies.get("session")
-    if token and token in SESSIONS:
-        return SESSIONS[token]
-    return None
-
-
-def current_user_ws(ws: WebSocket) -> Optional[str]:
-    token = ws.cookies.get("session")
-    if token and token in SESSIONS:
-        return SESSIONS[token]
-    return None
-
 
 async def broadcast(channel: str, payload: dict):
     conns = WS_CONNECTIONS.get(channel, {})
@@ -99,10 +158,6 @@ def redirect(path: str) -> RedirectResponse:
     return RedirectResponse(path, status_code=303)
 
 
-# ────────────────────────────────────────────────────────────
-#  SVG-ИКОНКИ (feather-style)
-# ────────────────────────────────────────────────────────────
-
 def svg(body: str, cls: str = "icon") -> str:
     return (f'<svg class="{cls}" viewBox="0 0 24 24" fill="none" '
             f'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
@@ -110,8 +165,6 @@ def svg(body: str, cls: str = "icon") -> str:
 
 
 ICON_CHAT = svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>')
-ICON_HASH = svg('<line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/>'
-                '<line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/>')
 ICON_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
                  '<circle cx="9" cy="7" r="4"/>'
                  '<path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
@@ -128,13 +181,7 @@ ICON_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/>'
 ICON_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
                  '<path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>'
                  '<path d="M10 11v6M14 11v6"/>')
-ICON_KEY = svg('<path d="M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7 7 5 5 0 0 1 7-7z"/>'
-               '<path d="M15.5 8.5l3 3L22 8l-3-3"/>')
 
-
-# ────────────────────────────────────────────────────────────
-#  CSS (общий, 2015 — плоско и минималистично)
-# ────────────────────────────────────────────────────────────
 
 CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -155,11 +202,8 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
 .btn.danger{background:#e74c3c}
 .btn.danger:hover{background:#c0392b}
 .icon{width:16px;height:16px;vertical-align:-2px}
-.icon-lg{width:22px;height:22px}
 .muted{color:#8891a0}
 .small{font-size:12px}
-
-/* ---------- LOGIN ---------- */
 .auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
 .auth-box{width:100%;max-width:340px;background:#fff;border:1px solid #e1e5eb;
      border-radius:4px;padding:28px 24px 22px;box-shadow:0 1px 3px rgba(20,25,40,.04)}
@@ -173,8 +217,6 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
 .auth-foot{text-align:center;margin-top:14px;font-size:13px}
 .auth-err{background:#fdeceb;color:#c0392b;border:1px solid #f5c6c2;
      border-radius:3px;padding:8px 10px;font-size:13px;margin-bottom:12px}
-
-/* ---------- CHAT ---------- */
 .app{display:flex;height:100vh;background:#fff;overflow:hidden}
 .sidebar{width:230px;flex:0 0 230px;background:#f7f8fa;border-right:1px solid #e1e5eb;
      display:flex;flex-direction:column}
@@ -199,7 +241,6 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
 .user-actions{display:flex;gap:4px;align-items:center}
 .user-actions a{display:inline-flex;padding:5px;border-radius:3px;color:#6b7480}
 .user-actions a:hover{background:#e1e5eb;text-decoration:none;color:#2c2f38}
-
 .chat{flex:1;display:flex;flex-direction:column;min-width:0}
 .chat-head{display:flex;align-items:center;gap:10px;padding:14px 18px;
      border-bottom:1px solid #e1e5eb;background:#fff}
@@ -209,7 +250,6 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 .chat-head .user-count{display:inline-flex;align-items:center;gap:5px;
      color:#6b7480;font-size:12px;background:#f2f4f7;padding:4px 9px;border-radius:12px}
-
 .messages{flex:1;overflow-y:auto;padding:14px 18px;background:#fff}
 .msg{padding:6px 0;font-size:14px}
 .msg-user{font-weight:600;color:#2f66b5}
@@ -217,13 +257,11 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
 .msg-text{margin-top:1px;word-wrap:break-word;overflow-wrap:anywhere}
 .system-msg{font-size:12px;color:#8891a0;padding:5px 0;font-style:italic}
 .system-msg::before{content:"— ";color:#c3cad4}
-
 .composer{display:flex;gap:8px;padding:12px 14px;border-top:1px solid #e1e5eb;background:#fafbfc}
 .composer input{flex:1;padding:10px 12px;border-radius:4px;background:#fff}
 .composer button{background:#3a7bd5;color:#fff;border:none;border-radius:4px;
      padding:0 16px;display:flex;align-items:center;justify-content:center;transition:.15s}
 .composer button:hover{background:#2f66b5}
-
 .users-panel{width:200px;flex:0 0 200px;border-left:1px solid #e1e5eb;
      background:#f7f8fa;display:flex;flex-direction:column}
 .users-panel ul{list-style:none;padding:0 6px 12px;overflow-y:auto;flex:1}
@@ -231,8 +269,6 @@ input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
      white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .users-panel li::before{content:"●";color:#4caf7d;margin-right:7px;font-size:9px;
      vertical-align:2px}
-
-/* ---------- ADMIN ---------- */
 .admin-wrap{max-width:960px;margin:0 auto;padding:26px 20px}
 .admin-head{display:flex;align-items:center;justify-content:space-between;
      margin-bottom:18px;gap:14px}
@@ -262,20 +298,14 @@ tr:last-child td{border-bottom:none}
 .tag.banned{background:#fdeceb;color:#c0392b}
 td form{display:inline}
 td .btn{padding:4px 9px;font-size:12px}
-.flash{background:#eaf4ed;color:#2b7a4b;border:1px solid #c6e3cf;
-     padding:9px 12px;border-radius:3px;margin-bottom:14px;font-size:13px}
 """
 
 
-# ────────────────────────────────────────────────────────────
-#  СТРАНИЦЫ
-# ────────────────────────────────────────────────────────────
-
-def page(title: str, body: str, extra_css: str = "") -> HTMLResponse:
+def page(title: str, body: str) -> HTMLResponse:
     doc = f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)}</title><style>{CSS}{extra_css}</style></head>
+<title>{html.escape(title)}</title><style>{CSS}</style></head>
 <body>{body}</body></html>"""
     return HTMLResponse(doc)
 
@@ -327,7 +357,6 @@ def render_register(err: str = "") -> HTMLResponse:
 def render_chat(username: str, channel: str) -> HTMLResponse:
     user = USERS[username]
     chan = CHANNELS[channel]
-
     channels_html = ""
     for cname in CHANNELS:
         active = " active" if cname == channel else ""
@@ -335,15 +364,12 @@ def render_chat(username: str, channel: str) -> HTMLResponse:
             f'<li><a class="channel{active}" href="/?c={html.escape(cname)}">'
             f'<span class="hash">#</span>{html.escape(cname)}</a></li>'
         )
-
     admin_btn = (
         f'<a href="/admin" title="Админ-панель">{ICON_SETTINGS}</a>'
         if user["is_admin"] else ""
     )
-
     initial = html.escape(username[0].upper())
     role = "admin" if user["is_admin"] else "участник"
-
     body = f"""
 <div class="app">
   <aside class="sidebar">
@@ -362,7 +388,6 @@ def render_chat(username: str, channel: str) -> HTMLResponse:
       </div>
     </div>
   </aside>
-
   <main class="chat">
     <header class="chat-head">
       <span class="hash">#</span>
@@ -377,16 +402,15 @@ def render_chat(username: str, channel: str) -> HTMLResponse:
       <button type="submit" title="Отправить">{ICON_SEND}</button>
     </form>
   </main>
-
   <aside class="users-panel">
     <div class="section-title">Участники</div>
     <ul id="user-list"></ul>
   </aside>
 </div>
-
 <script>
 (function(){{
   const CHANNEL = {channel!r};
+  const MAX = {CONFIG['max_msg_len']};
   const msgBox   = document.getElementById('messages');
   const userList = document.getElementById('user-list');
   const userCnt  = document.getElementById('user-count');
@@ -422,7 +446,6 @@ def render_chat(username: str, channel: str) -> HTMLResponse:
     }});
     userCnt.textContent = list.length;
   }}
-
   function connect(){{
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
     ws = new WebSocket(proto + location.host + '/ws/' + encodeURIComponent(CHANNEL));
@@ -440,15 +463,13 @@ def render_chat(username: str, channel: str) -> HTMLResponse:
       setTimeout(connect, delay);
     }};
   }}
-
   form.addEventListener('submit', e => {{
     e.preventDefault();
-    const text = input.value.trim();
+    const text = input.value.trim().slice(0, MAX);
     if (!text || !ws || ws.readyState !== 1) return;
     ws.send(JSON.stringify({{ type: 'message', text }}));
     input.value = '';
   }});
-
   connect();
 }})();
 </script>"""
@@ -467,7 +488,7 @@ def render_admin(username: str, tab: str = "channels") -> HTMLResponse:
         rows = ""
         for cname, cinfo in CHANNELS.items():
             count = len(MESSAGES.get(cname, []))
-            online = len(set(WS_CONNECTIONS.get(cname, {{}}).values())) if cname in WS_CONNECTIONS else 0
+            online = len(set(WS_CONNECTIONS.get(cname, {}).values())) if cname in WS_CONNECTIONS else 0
             rows += f"""
 <tr>
   <td><b>#{html.escape(cname)}</b></td>
@@ -558,8 +579,7 @@ def render_admin(username: str, tab: str = "channels") -> HTMLResponse:
   <table><thead><tr><th>Пользователь</th><th>Регистрация</th><th>Действия</th></tr></thead>
   <tbody>{rows}</tbody></table>
 </div>"""
-
-    else:  # settings
+    else:
         content = f"""
 <div class="card">
   <h3>Общие настройки сервера</h3>
@@ -590,9 +610,7 @@ def render_admin(username: str, tab: str = "channels") -> HTMLResponse:
 <div class="admin-wrap">
   <div class="admin-head">
     <h1>{ICON_SETTINGS} Админ-панель</h1>
-    <div class="row">
-      <a class="btn secondary" href="/">← К чату</a>
-    </div>
+    <div class="row"><a class="btn secondary" href="/">← К чату</a></div>
   </div>
   <div class="tabs">{tabs_html}</div>
   {content}
@@ -601,59 +619,64 @@ def render_admin(username: str, tab: str = "channels") -> HTMLResponse:
 
 
 # ────────────────────────────────────────────────────────────
-#  AUTH-РОУТЫ
+#  AUTH
 # ────────────────────────────────────────────────────────────
 
 @app.get("/login")
 async def login_page(request: Request):
-    if current_user(request):
+    if get_session(request):
         return redirect("/")
     return render_login()
 
 
 @app.post("/login")
-async def login_post(username: str = Form(...), password: str = Form(...)):
+async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+    ip = request.client.host if request.client else "?"
+    if not check_origin(request) or rate_limited(ip):
+        return render_login("Слишком много попыток. Подожди минуту.")
     uname = username.strip()
     user = USERS.get(uname)
-    if not user or user["password"] != hash_pw(password):
+    if not user or not verify_pw(password, user["password"]):
         return render_login("Неверный логин или пароль")
     if user.get("banned"):
         return render_login("Аккаунт заблокирован")
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = uname
+    token = new_session(uname)
     resp = redirect("/")
-    resp.set_cookie("session", token, httponly=True, max_age=86400 * 7, samesite="lax")
+    resp.set_cookie("session", token, httponly=True, max_age=SESSION_TTL,
+                    samesite="lax", secure=False)
     return resp
 
 
 @app.get("/register")
 async def register_page(request: Request):
-    if current_user(request):
+    if get_session(request):
         return redirect("/")
     return render_register()
 
 
 @app.post("/register")
-async def register_post(username: str = Form(...), password: str = Form(...)):
+async def register_post(request: Request, username: str = Form(...), password: str = Form(...)):
     if not CONFIG["allow_registration"]:
         return render_register("Регистрация закрыта")
+    if not check_origin(request):
+        return render_register("Некорректный запрос")
     uname = username.strip()
-    if not (3 <= len(uname) <= 20) or not all(c.isalnum() or c in "_-" for c in uname):
+    if not NAME_RE.match(uname):
         return render_register("Некорректный логин (3-20: буквы, цифры, _ -)")
     if uname.lower() == "admin" or uname in USERS:
         return render_register("Такой логин уже занят")
-    if len(password) < 3:
-        return render_register("Пароль слишком короткий")
+    if len(password) < 3 or len(password) > 128:
+        return render_register("Пароль слишком короткий или длинный")
     USERS[uname] = {
         "password": hash_pw(password),
         "is_admin": False,
         "joined": time.time(),
         "banned": False,
     }
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = uname
+    token = new_session(uname)
     resp = redirect("/")
-    resp.set_cookie("session", token, httponly=True, max_age=86400 * 7, samesite="lax")
+    resp.set_cookie("session", token, httponly=True, max_age=SESSION_TTL,
+                    samesite="lax", secure=False)
     return resp
 
 
@@ -668,20 +691,18 @@ async def logout(request: Request):
 
 
 # ────────────────────────────────────────────────────────────
-#  ОСНОВНОЙ ЧАТ
+#  ЧАТ
 # ────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def index(request: Request):
-    user = current_user(request)
+    user = get_session(request)
     if not user or user not in USERS or USERS[user].get("banned"):
         return redirect("/login")
-
     ch = request.query_params.get("c")
     if not ch or ch not in CHANNELS:
         ch = next(iter(CHANNELS), None)
     if not ch:
-        # нет ни одного канала — создаём общий
         add_channel("general", "Общий чат")
         ch = "general"
     return render_chat(user, ch)
@@ -689,7 +710,10 @@ async def index(request: Request):
 
 @app.websocket("/ws/{channel}")
 async def ws_route(ws: WebSocket, channel: str):
-    username = current_user_ws(ws)
+    if not check_origin(ws):
+        await ws.close(code=1008)
+        return
+    username = get_session_ws(ws)
     if not username or username not in USERS or USERS[username].get("banned"):
         await ws.close(code=1008)
         return
@@ -703,12 +727,9 @@ async def ws_route(ws: WebSocket, channel: str):
     already_here = username in conns.values()
     conns[ws] = username
 
-    # история
     await ws.send_json({"type": "history", "messages": MESSAGES.get(channel, [])[-100:]})
-    # MOTD
     if CONFIG["motd"]:
         await ws.send_json({"type": "system", "text": CONFIG["motd"]})
-
     if not already_here:
         await broadcast(channel, {"type": "system",
                                   "text": f"{username} присоединился к #{channel}"})
@@ -716,21 +737,28 @@ async def ws_route(ws: WebSocket, channel: str):
 
     try:
         while True:
-            data = await ws.receive_json()
-            if data.get("type") == "message":
-                text = (data.get("text") or "").strip()
-                if not text:
-                    continue
-                text = text[:CONFIG["max_msg_len"]]
-                msg = {
-                    "user": username,
-                    "text": text,
-                    "time": datetime.now().strftime("%H:%M"),
-                }
-                MESSAGES.setdefault(channel, []).append(msg)
-                if len(MESSAGES[channel]) > 500:
-                    MESSAGES[channel] = MESSAGES[channel][-500:]
-                await broadcast(channel, {"type": "message", **msg})
+            raw = await ws.receive_text()
+            if len(raw) > CONFIG["max_msg_len"] * 4:
+                continue
+            try:
+                data = __import__("json").loads(raw)
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get("type") != "message":
+                continue
+            text = (data.get("text") or "").strip()
+            if not text:
+                continue
+            text = text[:CONFIG["max_msg_len"]]
+            msg = {
+                "user": username,
+                "text": text,
+                "time": datetime.now().strftime("%H:%M"),
+            }
+            MESSAGES.setdefault(channel, []).append(msg)
+            if len(MESSAGES[channel]) > 500:
+                MESSAGES[channel] = MESSAGES[channel][-500:]
+            await broadcast(channel, {"type": "message", **msg})
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -744,12 +772,14 @@ async def ws_route(ws: WebSocket, channel: str):
 
 
 # ────────────────────────────────────────────────────────────
-#  АДМИН-ДЕЙСТВИЯ
+#  АДМИН
 # ────────────────────────────────────────────────────────────
 
-def require_admin(request: Request):
-    user = current_user(request)
+def require_admin(request: Request) -> Optional[str]:
+    user = get_session(request)
     if not user or user not in USERS or not USERS[user]["is_admin"]:
+        return None
+    if not check_origin(request):
         return None
     return user
 
@@ -758,10 +788,9 @@ def require_admin(request: Request):
 async def admin_page(request: Request, tab: str = "channels"):
     if not require_admin(request):
         return redirect("/login")
-    user = current_user(request)
     if tab not in ("channels", "users", "settings"):
         tab = "channels"
-    return render_admin(user, tab)
+    return render_admin(request.state.admin if hasattr(request.state, "admin") else get_session(request), tab)
 
 
 @app.post("/admin/channels/create")
@@ -796,7 +825,6 @@ async def admin_channel_delete(request: Request, name: str = Form(...)):
         return redirect("/login")
     CHANNELS.pop(name, None)
     MESSAGES.pop(name, None)
-    # отключаем всех в удалённом канале
     for ws in list(WS_CONNECTIONS.pop(name, {}).keys()):
         try:
             await ws.close(code=1001)
@@ -829,9 +857,8 @@ async def admin_user_ban(request: Request, username: str = Form(...)):
         return redirect("/login")
     if username in USERS and username != "admin":
         USERS[username]["banned"] = True
-        # выкидываем из сессий и WS
-        for tok, un in list(SESSIONS.items()):
-            if un == username:
+        for tok, s in list(SESSIONS.items()):
+            if s["user"] == username:
                 SESSIONS.pop(tok, None)
         for ch, conns in WS_CONNECTIONS.items():
             for ws, un in list(conns.items()):
@@ -860,8 +887,8 @@ async def admin_user_delete(request: Request, username: str = Form(...)):
         return redirect("/login")
     if username in USERS and username != "admin":
         USERS.pop(username, None)
-        for tok, un in list(SESSIONS.items()):
-            if un == username:
+        for tok, s in list(SESSIONS.items()):
+            if s["user"] == username:
                 SESSIONS.pop(tok, None)
         for ch, conns in WS_CONNECTIONS.items():
             for ws, un in list(conns.items()):
@@ -892,14 +919,10 @@ async def admin_settings(
     return redirect("/admin?tab=settings")
 
 
-# ────────────────────────────────────────────────────────────
-#  ТОЧКА ВХОДА
-# ────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     print("=" * 52)
     print("  MiniChat запущен")
-    print("  Открой:   http://127.0.0.1:8000")
-    print("  Админ:    admin / admin")
+    print("  http://127.0.0.1:8000")
+    print("  admin / admin")
     print("=" * 52)
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
