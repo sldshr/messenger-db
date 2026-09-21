@@ -27,7 +27,7 @@ _lang_cache: Dict[str, str] = {}
 
 
 # ------------------------------------------------------------------
-# Определение языка по IP (fallback — Accept-Language)
+# Язык по IP (fallback — Accept-Language)
 # ------------------------------------------------------------------
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
@@ -218,42 +218,38 @@ def api_vote_comment(pid: str, cid: str, v: VoteIn):
 # ------------------------------------------------------------------
 TEXTS = {
     "ru": {
-        "search_ph": "Поиск по постам...",
+        "search_ph": "Поиск по постам",
         "search": "Поиск",
         "theme": "Сменить тему",
-        "post_ph": "Что нового? (до 1000 символов)",
-        "comment_ph": "Написать комментарий...",
+        "back": "В главное меню",
+        "post_ph": "Написать пост (до 1000 символов)",
+        "comment_ph": "Написать комментарий",
         "publish": "Опубликовать",
         "send_comment": "Отправить",
-        "cancel": "Отмена",
-        "back": "В главное меню",
-        "no_posts": "Пока нет постов. Будьте первым!",
+        "no_posts": "Постов пока нет",
         "not_found": "Пост не найден",
-        "open": "Открыть",
         "just_now": "только что",
-        "sec_ago": "с назад",
-        "min_ago": "мин назад",
-        "hour_ago": "ч назад",
-        "day_ago": "дн назад",
+        "sec_ago": "с",
+        "min_ago": "мин",
+        "hour_ago": "ч",
+        "day_ago": "д",
     },
     "en": {
-        "search_ph": "Search posts...",
+        "search_ph": "Search posts",
         "search": "Search",
         "theme": "Toggle theme",
-        "post_ph": "What's new? (up to 1000 chars)",
-        "comment_ph": "Write a comment...",
-        "publish": "Post",
-        "send_comment": "Send",
-        "cancel": "Cancel",
         "back": "Back to main",
-        "no_posts": "No posts yet. Be the first!",
+        "post_ph": "Write a post (up to 1000 chars)",
+        "comment_ph": "Write a comment",
+        "publish": "Publish",
+        "send_comment": "Send",
+        "no_posts": "No posts yet",
         "not_found": "Post not found",
-        "open": "Open",
         "just_now": "just now",
-        "sec_ago": "s ago",
-        "min_ago": "min ago",
-        "hour_ago": "h ago",
-        "day_ago": "d ago",
+        "sec_ago": "s",
+        "min_ago": "min",
+        "hour_ago": "h",
+        "day_ago": "d",
     },
 }
 
@@ -263,107 +259,338 @@ TEXTS = {
 # ------------------------------------------------------------------
 CSS = """
 :root, [data-theme="light"] {
-  --bg:#e9eef3; --card:#fff; --line:#d3dbe3; --muted:#7b8794;
-  --accent:#4a76a8; --accent-dark:#3b6089; --text:#2c3844;
-  --hover:#f3f6f9; --up:#e67e22; --down:#5d6dbb; --comment-bg:#f5f7f9;
+  --bg:#ebebeb;
+  --card:#ffffff;
+  --line:#d4d4d4;
+  --line-strong:#a8a8a8;
+  --text:#101010;
+  --muted:#767676;
+  --hover:#f0f0f0;
+  --accent:#101010;
+  --accent-fg:#ffffff;
+  --up:#1f9d55;
+  --down:#d84343;
+  --comment-bg:#f6f6f6;
 }
 [data-theme="dark"] {
-  --bg:#16181c; --card:#1f2228; --line:#2e333b; --muted:#8b95a1;
-  --accent:#5a87c0; --accent-dark:#4a76a8; --text:#e1e5ea;
-  --hover:#262a31; --up:#e67e22; --down:#7b8bd0; --comment-bg:#262a31;
+  --bg:#0a0a0a;
+  --card:#141414;
+  --line:#282828;
+  --line-strong:#3a3a3a;
+  --text:#ececec;
+  --muted:#888888;
+  --hover:#1e1e1e;
+  --accent:#ececec;
+  --accent-fg:#101010;
+  --up:#2ecc71;
+  --down:#e74c3c;
+  --comment-bg:#1c1c1c;
 }
-*{box-sizing:border-box}
-html,body{height:100%;margin:0}
-body{
-  font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
-  background:var(--bg);color:var(--text);display:flex;justify-content:center;
-  transition:background .15s,color .15s;
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  justify-content: center;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
 }
-.app{width:100%;max-width:620px;height:100vh;display:flex;flex-direction:column;
-  background:var(--card);border-left:1px solid var(--line);border-right:1px solid var(--line);}
-header{padding:10px 14px;border-bottom:1px solid var(--line);background:var(--accent);
-  color:#fff;display:flex;align-items:center;gap:8px;flex:0 0 auto;}
-header input[type=search]{flex:1;padding:8px 12px;border-radius:16px;border:none;
-  outline:none;font-size:14px;background:rgba(255,255,255,.92);color:#222;}
-header input[type=search]:focus{background:#fff;}
-header button,header .back-btn{background:rgba(255,255,255,.15);border:none;color:#fff;
-  border-radius:16px;padding:8px 12px;cursor:pointer;font-size:14px;text-decoration:none;
-  transition:background .15s;}
-header button:hover,header .back-btn:hover{background:rgba(255,255,255,.28);}
-header .spacer{flex:1;}
-main{flex:1 1 auto;overflow-y:auto;padding:12px;background:var(--bg);}
-.empty{text-align:center;color:var(--muted);margin-top:40px;font-size:14px;}
-.post{background:var(--card);border:1px solid var(--line);border-radius:8px;
-  padding:12px 14px;margin-bottom:10px;box-shadow:0 1px 2px rgba(0,0,0,.04);
-  transition:border-color .15s;}
-.post.active-comment{border-color:var(--accent);box-shadow:0 0 0 2px rgba(74,118,168,.15);}
-.post-text{font-size:15px;line-height:1.45;white-space:pre-wrap;
-  word-wrap:break-word;overflow-wrap:anywhere;}
-.post-actions{display:flex;align-items:center;gap:6px;margin-top:10px;
-  font-size:13px;color:var(--muted);}
-.vote{background:transparent;border:none;cursor:pointer;padding:4px 6px;
-  border-radius:4px;color:var(--muted);font-size:13px;
-  transition:background .12s,color .12s;}
-.vote:hover{background:var(--hover);color:var(--text);}
-.vote.active-up{color:var(--up);font-weight:bold;}
-.vote.active-down{color:var(--down);font-weight:bold;}
-.score{min-width:22px;text-align:center;font-weight:600;color:var(--text);font-size:13px;}
-.comment-btn{background:transparent;border:none;cursor:pointer;padding:4px 8px;
-  border-radius:4px;color:var(--muted);font-size:13px;
-  transition:background .12s,color .12s;}
-.comment-btn:hover{background:var(--hover);color:var(--text);}
-.open-link{color:var(--muted);text-decoration:none;padding:4px 8px;
-  border-radius:4px;font-size:13px;transition:background .12s,color .12s;}
-.open-link:hover{background:var(--hover);color:var(--accent);}
-.time{margin-left:auto;font-size:12px;color:var(--muted);}
-.comments{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);}
-.comment{padding:8px 10px;margin-bottom:6px;background:var(--comment-bg);
-  border-radius:6px;font-size:14px;}
-.comment:last-child{margin-bottom:0;}
-.comment-text{line-height:1.4;white-space:pre-wrap;word-wrap:break-word;
-  overflow-wrap:anywhere;}
-.comment-actions{display:flex;align-items:center;gap:4px;margin-top:4px;
-  font-size:12px;color:var(--muted);}
-footer{flex:0 0 auto;border-top:1px solid var(--line);background:var(--card);
-  padding:10px 12px;}
-footer textarea{width:100%;min-height:60px;max-height:160px;resize:vertical;
-  padding:10px 12px;border:1px solid var(--line);border-radius:8px;
-  font-family:inherit;font-size:14px;outline:none;color:var(--text);
-  background:var(--card);transition:border-color .15s;}
-footer textarea:focus{border-color:var(--accent);}
-.row{display:flex;align-items:center;justify-content:space-between;
-  margin-top:8px;gap:8px;}
-.counter{font-size:12px;color:var(--muted);}
-.counter.warn{color:#c0392b;font-weight:600;}
-.btns{display:flex;gap:6px;}
-button.send{background:var(--accent);color:#fff;border:none;padding:8px 18px;
-  border-radius:6px;font-size:14px;cursor:pointer;transition:background .15s;}
-button.send:hover{background:var(--accent-dark);}
-button.send:disabled{background:#a9b6c4;cursor:default;}
-button.cancel{background:transparent;color:var(--muted);border:1px solid var(--line);
-  padding:8px 14px;border-radius:6px;font-size:14px;cursor:pointer;}
-button.cancel:hover{background:var(--hover);color:var(--text);}
+
+.app {
+  width: 100%;
+  max-width: 660px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+}
+
+/* ================= HEADER ================= */
+header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+}
+
+header input[type="search"] {
+  flex: 1;
+  min-width: 0;
+  padding: 0 12px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color .12s;
+}
+header input[type="search"]:focus { border-color: var(--line-strong); }
+
+.icon-btn {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  color: var(--text);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: none;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.icon-btn:hover { background: var(--hover); border-color: var(--line-strong); }
+.icon-btn svg { display: block; }
+
+.spacer { flex: 1; }
+
+/* ================= FEED ================= */
+main {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  background: var(--card);
+}
+
+.empty {
+  padding: 80px 20px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: .3px;
+}
+
+.post {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+}
+
+.post-text {
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.post-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.vote-btn, .comment-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  transition: color .12s, background .12s;
+}
+.vote-btn:hover, .comment-btn:hover { background: var(--hover); }
+.vote-btn svg, .comment-btn svg { display: block; }
+.vote-btn.up:hover { color: var(--up); }
+.vote-btn.down:hover { color: var(--down); }
+.vote-btn.up.active { color: var(--up); }
+.vote-btn.down.active { color: var(--down); }
+.comment-btn:hover { color: var(--text); }
+
+.score {
+  min-width: 18px;
+  padding: 0 2px;
+  text-align: center;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+}
+.score.up { color: var(--up); }
+.score.down { color: var(--down); }
+
+.time {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ================= COMMENTS ================= */
+.comments {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.comment {
+  padding: 10px 12px;
+  margin-top: 8px;
+  background: var(--comment-bg);
+  border-left: 2px solid var(--line-strong);
+}
+.comment-text {
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.comment-actions {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.comment-actions .vote-btn { height: 22px; padding: 0 6px; font-size: 11px; }
+.comment-actions .score { font-size: 11px; min-width: 14px; }
+
+/* ================= FOOTER ================= */
+footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: var(--card);
+  padding: 10px 12px;
+}
+
+footer textarea {
+  display: block;
+  width: 100%;
+  min-height: 62px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.45;
+  outline: none;
+  resize: none;
+  transition: border-color .12s;
+}
+footer textarea:focus { border-color: var(--line-strong); }
+footer textarea::placeholder { color: var(--muted); }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.counter {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.counter.warn { color: var(--down); }
+
+button.send {
+  height: 32px;
+  padding: 0 18px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity .12s;
+}
+button.send:hover { opacity: .82; }
+button.send:disabled { opacity: .28; cursor: default; }
 """
+
+
+# ------------------------------------------------------------------
+# SVG иконки
+# ------------------------------------------------------------------
+ICON_SEARCH = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'
+)
+ICON_MOON = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
+)
+ICON_SUN = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/>'
+    '<line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/>'
+    '<line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/>'
+    '<line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/>'
+    '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>'
+)
+ICON_BACK = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>'
+)
+ICON_UP = (
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
+    '<polyline points="6 15 12 9 18 15"/></svg>'
+)
+ICON_DOWN = (
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
+    '<polyline points="6 9 12 15 18 9"/></svg>'
+)
+ICON_COMMENT = (
+    '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>'
+)
 
 
 # ------------------------------------------------------------------
 # JS
 # ------------------------------------------------------------------
 JS = r"""
-function initTheme(){
-  var theme = localStorage.getItem('sldchat_theme') || 'light';
-  document.documentElement.setAttribute('data-theme', theme);
-  var btn = document.getElementById('themeBtn');
-  if (btn) btn.textContent = theme === 'dark' ? '\u2600' : '\u263E';
-}
-function toggleTheme(){
-  var cur = document.documentElement.getAttribute('data-theme') || 'light';
-  var next = cur === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('sldchat_theme', next);
-  var btn = document.getElementById('themeBtn');
-  if (btn) btn.textContent = next === 'dark' ? '\u2600' : '\u263E';
-}
+var ICON_UP = __ICON_UP__;
+var ICON_DOWN = __ICON_DOWN__;
+var ICON_COMMENT = __ICON_COMMENT__;
+var ICON_MOON = __ICON_MOON__;
+var ICON_SUN = __ICON_SUN__;
+
+var feed = document.getElementById('feed');
+var inputEl = document.getElementById('newPost');
+var sendBtn = document.getElementById('send');
+var counter = document.getElementById('counter');
+var searchEl = document.getElementById('search');
+var searchBtn = document.getElementById('searchBtn');
+var themeBtn = document.getElementById('themeBtn');
+
+var maxLen = (MODE === 'post') ? MAX_COMMENT_LEN : MAX_POST_LEN;
 
 function getClientId(){
   var cid = localStorage.getItem('sldchat_cid');
@@ -396,31 +623,19 @@ function timeAgo(ts){
   return new Date(ts*1000).toLocaleDateString();
 }
 
-var feed = document.getElementById('feed');
-var inputEl = document.getElementById('newPost');
-var sendBtn = document.getElementById('send');
-var counter = document.getElementById('counter');
-var cancelBtn = document.getElementById('cancel');
-var searchEl = document.getElementById('search');
-var searchBtn = document.getElementById('searchBtn');
-
-var maxLen = MAX_POST_LEN;
-var commentTarget = null;
-var postDraft = '';
-
-if (MODE === 'post'){
-  commentTarget = POST_ID;
-  inputEl.placeholder = T.comment_ph;
-  inputEl.maxLength = MAX_COMMENT_LEN;
-  maxLen = MAX_COMMENT_LEN;
-  if (cancelBtn) cancelBtn.style.display = 'none';
-  if (sendBtn) sendBtn.textContent = T.send_comment;
-} else {
-  inputEl.maxLength = MAX_POST_LEN;
-  maxLen = MAX_POST_LEN;
-  if (cancelBtn) cancelBtn.style.display = 'none';
+/* ---------- THEME ---------- */
+function applyTheme(theme){
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('sldchat_theme', theme);
+  if (themeBtn) themeBtn.innerHTML = (theme === 'dark') ? ICON_SUN : ICON_MOON;
 }
+function toggleTheme(){
+  var cur = document.documentElement.getAttribute('data-theme') || 'light';
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+}
+applyTheme(localStorage.getItem('sldchat_theme') || 'light');
 
+/* ---------- COUNTER ---------- */
 function updateCounter(){
   var len = inputEl.value.length;
   counter.textContent = len + ' / ' + maxLen;
@@ -428,60 +643,62 @@ function updateCounter(){
   sendBtn.disabled = len === 0 || len > maxLen;
 }
 
-function renderPosts(posts){
-  if (!posts.length){
-    feed.innerHTML = '<div class="empty">' + escapeHtml(T.no_posts) + '</div>';
-    return;
-  }
-  feed.innerHTML = posts.map(renderPost).join('');
+/* ---------- RENDER ---------- */
+function scoreClass(up, down){
+  var s = up - down;
+  if (s > 0) return 'up';
+  if (s < 0) return 'down';
+  return '';
 }
 
-function renderPost(p){
+function renderPost(p, showComments){
   var score = p.upvotes - p.downvotes;
-  var upCls = p.user_vote === 1 ? 'active-up' : '';
-  var downCls = p.user_vote === -1 ? 'active-down' : '';
-  var commentsHtml = (p.comments || []).map(function(c){ return renderComment(c, p.id); }).join('');
-  var activeCommentCls = (commentTarget === p.id) ? 'active-comment' : '';
-  var openLink = '';
-  if (MODE === 'main'){
-    openLink = '<a class="open-link" href="/p/' + p.id + '" title="' + escapeHtml(T.open) + '">\u2197</a>';
+  var upCls = p.user_vote === 1 ? 'active' : '';
+  var downCls = p.user_vote === -1 ? 'active' : '';
+  var scCls = scoreClass(p.upvotes, p.downvotes);
+
+  var commentBtn = '<button class="comment-btn" data-action="comment" data-post-id="' + p.id + '">'
+    + ICON_COMMENT + '<span>' + p.comments.length + '</span></button>';
+
+  var commentsHtml = '';
+  if (showComments && p.comments.length){
+    commentsHtml = '<div class="comments">'
+      + p.comments.map(function(c){ return renderComment(c, p.id); }).join('')
+      + '</div>';
   }
-  var commentBtn = '';
-  if (MODE === 'main'){
-    commentBtn = '<button class="comment-btn" data-action="comment" data-post-id="' + p.id + '">'
-      + '\uD83D\uDCAC ' + (p.comments ? p.comments.length : 0) + '</button>';
-  }
+
   return ''
-    + '<div class="post ' + activeCommentCls + '" data-post-id="' + p.id + '">'
+    + '<div class="post" data-post-id="' + p.id + '">'
     +   '<div class="post-text">' + escapeHtml(p.text) + '</div>'
     +   '<div class="post-actions">'
-    +     '<button class="vote up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">\u25B2</button>'
-    +     '<span class="score">' + score + '</span>'
-    +     '<button class="vote down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">\u25BC</button>'
+    +     '<button class="vote-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICON_UP + '</button>'
+    +     '<span class="score ' + scCls + '">' + score + '</span>'
+    +     '<button class="vote-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICON_DOWN + '</button>'
     +     commentBtn
-    +     openLink
     +     '<span class="time">' + timeAgo(p.created_at) + '</span>'
     +   '</div>'
-    +   (commentsHtml ? '<div class="comments">' + commentsHtml + '</div>' : '')
+    +   commentsHtml
     + '</div>';
 }
 
 function renderComment(c, postId){
   var score = c.upvotes - c.downvotes;
-  var upCls = c.user_vote === 1 ? 'active-up' : '';
-  var downCls = c.user_vote === -1 ? 'active-down' : '';
+  var upCls = c.user_vote === 1 ? 'active' : '';
+  var downCls = c.user_vote === -1 ? 'active' : '';
+  var scCls = scoreClass(c.upvotes, c.downvotes);
   return ''
     + '<div class="comment" data-comment-id="' + c.id + '">'
     +   '<div class="comment-text">' + escapeHtml(c.text) + '</div>'
     +   '<div class="comment-actions">'
-    +     '<button class="vote up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">\u25B2</button>'
-    +     '<span class="score">' + score + '</span>'
-    +     '<button class="vote down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">\u25BC</button>'
+    +     '<button class="vote-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICON_UP + '</button>'
+    +     '<span class="score ' + scCls + '">' + score + '</span>'
+    +     '<button class="vote-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICON_DOWN + '</button>'
     +     '<span class="time">' + timeAgo(c.created_at) + '</span>'
     +   '</div>'
     + '</div>';
 }
 
+/* ---------- LOAD ---------- */
 async function load(){
   try {
     if (MODE === 'post'){
@@ -490,69 +707,39 @@ async function load(){
         feed.innerHTML = '<div class="empty">' + escapeHtml(T.not_found) + '</div>';
         return;
       }
-      var data = await r.json();
-      renderPosts([data]);
+      var p = await r.json();
+      feed.innerHTML = renderPost(p, true);
     } else {
       var q = (searchEl && searchEl.value || '').trim();
       var url = '/api/posts?q=' + encodeURIComponent(q) + '&client_id=' + encodeURIComponent(CLIENT_ID);
       var r2 = await fetch(url);
       var d2 = await r2.json();
-      renderPosts(d2.posts);
+      if (!d2.posts.length){
+        feed.innerHTML = '<div class="empty">' + escapeHtml(T.no_posts) + '</div>';
+        return;
+      }
+      feed.innerHTML = d2.posts.map(function(p){ return renderPost(p, false); }).join('');
     }
   } catch(e){
-    feed.innerHTML = '<div class="empty">Network error</div>';
+    feed.innerHTML = '<div class="empty">—</div>';
   }
 }
 
-function enterCommentMode(postId){
-  if (MODE !== 'main') return;
-  if (commentTarget === postId){ exitCommentMode(); return; }
-  if (commentTarget === null){ postDraft = inputEl.value; }
-  commentTarget = postId;
-  inputEl.value = '';
-  inputEl.placeholder = T.comment_ph;
-  inputEl.maxLength = MAX_COMMENT_LEN;
-  maxLen = MAX_COMMENT_LEN;
-  cancelBtn.style.display = '';
-  sendBtn.textContent = T.send_comment;
-  updateCounter();
-  var posts = document.querySelectorAll('.post');
-  for (var i=0;i<posts.length;i++){
-    posts[i].classList.toggle('active-comment', posts[i].dataset.postId === postId);
-  }
-  inputEl.focus();
-}
-
-function exitCommentMode(){
-  if (MODE !== 'main') return;
-  commentTarget = null;
-  inputEl.value = postDraft;
-  inputEl.placeholder = T.post_ph;
-  inputEl.maxLength = MAX_POST_LEN;
-  maxLen = MAX_POST_LEN;
-  cancelBtn.style.display = 'none';
-  sendBtn.textContent = T.publish;
-  updateCounter();
-  var posts = document.querySelectorAll('.post');
-  for (var i=0;i<posts.length;i++){
-    posts[i].classList.remove('active-comment');
-  }
-}
-
+/* ---------- SEND ---------- */
 async function send(){
   var text = inputEl.value.trim();
   if (!text) return;
   sendBtn.disabled = true;
   try {
-    if (commentTarget){
-      var r = await fetch('/api/posts/' + commentTarget + '/comments', {
+    if (MODE === 'post'){
+      var r = await fetch('/api/posts/' + POST_ID + '/comments', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({text: text, client_id: CLIENT_ID})
       });
       if (r.ok){
         inputEl.value = '';
-        if (MODE === 'main'){ exitCommentMode(); } else { updateCounter(); }
+        updateCounter();
         await load();
       } else {
         var e1 = await r.json().catch(function(){return {};});
@@ -581,6 +768,7 @@ async function send(){
   }
 }
 
+/* ---------- CLICK HANDLERS ---------- */
 feed.addEventListener('click', async function(e){
   var btn = e.target.closest('[data-action]');
   if (!btn) return;
@@ -605,7 +793,7 @@ feed.addEventListener('click', async function(e){
     });
     load();
   } else if (action === 'comment'){
-    enterCommentMode(postId);
+    window.open('/p/' + postId, '_blank');
   }
 });
 
@@ -617,13 +805,15 @@ inputEl.addEventListener('keydown', function(e){
   }
 });
 sendBtn.addEventListener('click', send);
-if (cancelBtn) cancelBtn.addEventListener('click', exitCommentMode);
 
 if (searchEl){
   var tId;
   searchEl.addEventListener('input', function(){
     clearTimeout(tId);
     tId = setTimeout(load, 250);
+  });
+  searchEl.addEventListener('keydown', function(e){
+    if (e.key === 'Enter'){ e.preventDefault(); load(); }
   });
 }
 if (searchBtn){
@@ -632,9 +822,10 @@ if (searchBtn){
     load();
   });
 }
-document.getElementById('themeBtn').addEventListener('click', toggleTheme);
+if (themeBtn){
+  themeBtn.addEventListener('click', toggleTheme);
+}
 
-initTheme();
 updateCounter();
 load();
 setInterval(function(){ if (!document.hidden) load(); }, 5000);
@@ -651,43 +842,42 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
     if is_post:
         header = (
             '<header>'
-            f'<a href="/" class="back-btn">\u2190 {t["back"]}</a>'
+            f'<a href="/" class="icon-btn" title="{t["back"]}">{ICON_BACK}</a>'
             '<div class="spacer"></div>'
-            f'<button id="themeBtn" title="{t["theme"]}">\u263E</button>'
+            f'<button id="themeBtn" class="icon-btn" title="{t["theme"]}">{ICON_MOON}</button>'
             '</header>'
         )
-        footer = (
-            '<footer>'
-            f'<textarea id="newPost" maxlength="{MAX_COMMENT_LEN}" placeholder="{t["comment_ph"]}"></textarea>'
-            '<div class="row">'
-            f'<div id="counter" class="counter">0 / {MAX_COMMENT_LEN}</div>'
-            '<div class="btns">'
-            f'<button id="cancel" class="cancel" style="display:none">{t["cancel"]}</button>'
-            f'<button id="send" class="send" disabled>{t["send_comment"]}</button>'
-            '</div>'
-            '</div>'
-            '</footer>'
-        )
+        textarea_placeholder = t["comment_ph"]
+        send_label = t["send_comment"]
+        textarea_max = MAX_COMMENT_LEN
     else:
         header = (
             '<header>'
-            f'<input id="search" type="search" placeholder="{t["search_ph"]}" autocomplete="off" />'
-            f'<button id="searchBtn" title="{t["search"]}">\U0001F50D</button>'
-            f'<button id="themeBtn" title="{t["theme"]}">\u263E</button>'
+            f'<input id="search" type="search" placeholder="{t["search_ph"]}" autocomplete="off" spellcheck="false" />'
+            f'<button id="searchBtn" class="icon-btn" title="{t["search"]}">{ICON_SEARCH}</button>'
+            f'<button id="themeBtn" class="icon-btn" title="{t["theme"]}">{ICON_MOON}</button>'
             '</header>'
         )
-        footer = (
-            '<footer>'
-            f'<textarea id="newPost" maxlength="{MAX_POST_LEN}" placeholder="{t["post_ph"]}"></textarea>'
-            '<div class="row">'
-            f'<div id="counter" class="counter">0 / {MAX_POST_LEN}</div>'
-            '<div class="btns">'
-            f'<button id="cancel" class="cancel" style="display:none">{t["cancel"]}</button>'
-            f'<button id="send" class="send" disabled>{t["publish"]}</button>'
-            '</div>'
-            '</div>'
-            '</footer>'
-        )
+        textarea_placeholder = t["post_ph"]
+        send_label = t["publish"]
+        textarea_max = MAX_POST_LEN
+
+    footer = (
+        '<footer>'
+        f'<textarea id="newPost" maxlength="{textarea_max}" placeholder="{textarea_placeholder}"></textarea>'
+        '<div class="row">'
+        f'<div id="counter" class="counter">0 / {textarea_max}</div>'
+        f'<button id="send" class="send" disabled>{send_label}</button>'
+        '</div>'
+        '</footer>'
+    )
+
+    js = (JS
+          .replace("__ICON_UP__", json.dumps(ICON_UP))
+          .replace("__ICON_DOWN__", json.dumps(ICON_DOWN))
+          .replace("__ICON_COMMENT__", json.dumps(ICON_COMMENT))
+          .replace("__ICON_MOON__", json.dumps(ICON_MOON))
+          .replace("__ICON_SUN__", json.dumps(ICON_SUN)))
 
     return (
         '<!DOCTYPE html>\n'
@@ -695,13 +885,14 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
         '<head>\n'
         '<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        '<meta name="color-scheme" content="light dark" />\n'
         '<title>sldChat</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
         '<div class="app">\n'
         + header
-        + '<main id="feed"><div class="empty">...</div></main>\n'
+        + '<main id="feed"><div class="empty">…</div></main>\n'
         + footer
         + '</div>\n'
         '<script>\n'
@@ -711,7 +902,7 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
         f'const MAX_POST_LEN = {MAX_POST_LEN};\n'
         f'const MAX_COMMENT_LEN = {MAX_COMMENT_LEN};\n'
         f'const T = {json.dumps(t, ensure_ascii=False)};\n'
-        + JS +
+        + js +
         '\n</script>\n'
         '</body>\n'
         '</html>'
