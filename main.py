@@ -21,6 +21,7 @@ app = FastAPI(title="sldChat")
 POSTS: Dict[str, dict] = {}
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
+TRUNCATE_LINES = 100
 
 RU_COUNTRIES = {"RU", "BY", "KZ", "UA", "KG", "TJ", "UZ", "AM", "AZ", "MD"}
 _lang_cache: Dict[str, str] = {}
@@ -76,6 +77,7 @@ def detect_lang(ip: str, accept_language: str) -> str:
 # ------------------------------------------------------------------
 class PostIn(BaseModel):
     text: str
+    private: bool = False
 
 
 class VoteIn(BaseModel):
@@ -112,6 +114,7 @@ def serialize_post(p: dict, client_id: str = "") -> dict:
         "id": p["id"],
         "text": p["text"],
         "created_at": p["created_at"],
+        "private": p.get("private", False),
         "upvotes": up,
         "downvotes": down,
         "user_vote": user_vote,
@@ -124,11 +127,13 @@ def serialize_post(p: dict, client_id: str = "") -> dict:
 # ------------------------------------------------------------------
 @app.get("/api/posts")
 def api_list(q: str = "", client_id: str = ""):
-    items = list(POSTS.values())
+    # приватные посты в ленте не видны
+    items = [p for p in POSTS.values() if not p.get("private")]
     if q:
         needle = q.strip().lower()
         if needle:
             items = [p for p in items if needle in p["text"].lower()]
+    # сортировка по новым
     items.sort(key=lambda p: p["created_at"], reverse=True)
     return {"posts": [serialize_post(p, client_id) for p in items]}
 
@@ -153,6 +158,7 @@ def api_create(payload: PostIn):
         "id": pid,
         "text": text,
         "created_at": time.time(),
+        "private": bool(payload.private),
         "votes": {},
         "comments": [],
     }
@@ -233,6 +239,11 @@ TEXTS = {
         "min_ago": "мин",
         "hour_ago": "ч",
         "day_ago": "д",
+        "read_more": "читать дальше",
+        "copy": "Копировать",
+        "copied": "Скопировано",
+        "private": "Приватный",
+        "private_hint": "только по ссылке",
     },
     "en": {
         "search_ph": "Search posts",
@@ -250,6 +261,11 @@ TEXTS = {
         "min_ago": "min",
         "hour_ago": "h",
         "day_ago": "d",
+        "read_more": "read more",
+        "copy": "Copy",
+        "copied": "Copied",
+        "private": "Private",
+        "private_hint": "link only",
     },
 }
 
@@ -271,6 +287,7 @@ CSS = """
   --up:#1f9d55;
   --down:#d84343;
   --comment-bg:#f6f6f6;
+  --private:#7a5cff;
 }
 [data-theme="dark"] {
   --bg:#0a0a0a;
@@ -285,10 +302,12 @@ CSS = """
   --up:#2ecc71;
   --down:#e74c3c;
   --comment-bg:#1c1c1c;
+  --private:#a08cff;
 }
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background: var(--bg);
@@ -297,6 +316,16 @@ body {
   justify-content: center;
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
+
+  /* отключаем выделение текста */
+  user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+}
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
+  -ms-user-select: text;
 }
 
 .app {
@@ -388,6 +417,17 @@ main {
   color: var(--text);
 }
 
+.read-more {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 13px;
+  border-bottom: 1px dashed currentColor;
+  transition: color .12s;
+}
+.read-more:hover { color: var(--text); }
+
 .post-actions {
   display: flex;
   align-items: center;
@@ -397,7 +437,7 @@ main {
   color: var(--muted);
 }
 
-.vote-btn, .comment-btn {
+.vote-btn, .comment-btn, .copy-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -413,13 +453,14 @@ main {
   font-weight: 500;
   transition: color .12s, background .12s;
 }
-.vote-btn:hover, .comment-btn:hover { background: var(--hover); }
-.vote-btn svg, .comment-btn svg { display: block; }
+.vote-btn:hover, .comment-btn:hover, .copy-btn:hover { background: var(--hover); }
+.vote-btn svg, .comment-btn svg, .copy-btn svg { display: block; }
 .vote-btn.up:hover { color: var(--up); }
 .vote-btn.down:hover { color: var(--down); }
 .vote-btn.up.active { color: var(--up); }
 .vote-btn.down.active { color: var(--down); }
-.comment-btn:hover { color: var(--text); }
+.comment-btn:hover, .copy-btn:hover { color: var(--text); }
+.copy-btn.copied { color: var(--up); }
 
 .score {
   min-width: 18px;
@@ -437,6 +478,19 @@ main {
   font-size: 12px;
   color: var(--muted);
 }
+
+.private-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--private);
+  border: 1px solid var(--private);
+  padding: 1px 6px;
+  height: 18px;
+}
+.private-badge svg { display: block; }
 
 /* ================= COMMENTS ================= */
 .comments {
@@ -502,6 +556,12 @@ footer textarea::placeholder { color: var(--muted); }
   gap: 8px;
   margin-top: 8px;
 }
+.row-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
 
 .counter {
   font-size: 12px;
@@ -509,6 +569,30 @@ footer textarea::placeholder { color: var(--muted); }
   font-variant-numeric: tabular-nums;
 }
 .counter.warn { color: var(--down); }
+
+.private-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  transition: border-color .12s, color .12s;
+}
+.private-toggle:hover { border-color: var(--line-strong); color: var(--text); }
+.private-toggle input {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--private);
+}
+.private-toggle.checked {
+  color: var(--private);
+  border-color: var(--private);
+}
+.private-toggle .hint { opacity: .7; }
 
 button.send {
   height: 32px;
@@ -570,6 +654,23 @@ ICON_COMMENT = (
     'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>'
 )
+ICON_COPY = (
+    '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="9" y="9" width="12" height="12"/>'
+    '<path d="M5 15H3V3h12v2"/></svg>'
+)
+ICON_CHECK = (
+    '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
+    '<polyline points="20 6 9 17 4 12"/></svg>'
+)
+ICON_LOCK = (
+    '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" '
+    'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="4" y="11" width="16" height="10"/>'
+    '<path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>'
+)
 
 
 # ------------------------------------------------------------------
@@ -579,6 +680,9 @@ JS = r"""
 var ICON_UP = __ICON_UP__;
 var ICON_DOWN = __ICON_DOWN__;
 var ICON_COMMENT = __ICON_COMMENT__;
+var ICON_COPY = __ICON_COPY__;
+var ICON_CHECK = __ICON_CHECK__;
+var ICON_LOCK = __ICON_LOCK__;
 var ICON_MOON = __ICON_MOON__;
 var ICON_SUN = __ICON_SUN__;
 
@@ -589,7 +693,10 @@ var counter = document.getElementById('counter');
 var searchEl = document.getElementById('search');
 var searchBtn = document.getElementById('searchBtn');
 var themeBtn = document.getElementById('themeBtn');
+var privateCheck = document.getElementById('privateCheck');
+var privateLabel = document.getElementById('privateLabel');
 
+var TRUNCATE_LINES = __TRUNCATE_LINES__;
 var maxLen = (MODE === 'post') ? MAX_COMMENT_LEN : MAX_POST_LEN;
 
 function getClientId(){
@@ -657,8 +764,29 @@ function renderPost(p, showComments){
   var downCls = p.user_vote === -1 ? 'active' : '';
   var scCls = scoreClass(p.upvotes, p.downvotes);
 
+  // Обрезка длинных постов в ленте (не в режиме поста)
+  var truncated = false;
+  var displayText = p.text;
+  if (!showComments){
+    var lines = p.text.split('\n');
+    if (lines.length > TRUNCATE_LINES){
+      truncated = true;
+      displayText = lines.slice(0, TRUNCATE_LINES).join('\n');
+    }
+  }
+  var readMoreHtml = truncated
+    ? '<a class="read-more" href="/p/' + p.id + '">… ' + escapeHtml(T.read_more) + '</a>'
+    : '';
+
   var commentBtn = '<button class="comment-btn" data-action="comment" data-post-id="' + p.id + '">'
     + ICON_COMMENT + '<span>' + p.comments.length + '</span></button>';
+
+  var copyBtn = '<button class="copy-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(T.copy) + '">'
+    + ICON_COPY + '</button>';
+
+  var privateBadge = p.private
+    ? '<span class="private-badge" title="' + escapeHtml(T.private_hint) + '">' + ICON_LOCK + '</span>'
+    : '';
 
   var commentsHtml = '';
   if (showComments && p.comments.length){
@@ -669,12 +797,15 @@ function renderPost(p, showComments){
 
   return ''
     + '<div class="post" data-post-id="' + p.id + '">'
-    +   '<div class="post-text">' + escapeHtml(p.text) + '</div>'
+    +   '<div class="post-text">' + escapeHtml(displayText) + '</div>'
+    +   readMoreHtml
     +   '<div class="post-actions">'
     +     '<button class="vote-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICON_UP + '</button>'
     +     '<span class="score ' + scCls + '">' + score + '</span>'
     +     '<button class="vote-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICON_DOWN + '</button>'
     +     commentBtn
+    +     copyBtn
+    +     privateBadge
     +     '<span class="time">' + timeAgo(p.created_at) + '</span>'
     +   '</div>'
     +   commentsHtml
@@ -725,6 +856,35 @@ async function load(){
   }
 }
 
+/* ---------- COPY ---------- */
+async function copyPost(postId, btn){
+  try {
+    var r = await fetch('/api/posts/' + postId);
+    var p = await r.json();
+    var text = p.text;
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+    } else {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    btn.innerHTML = ICON_CHECK;
+    btn.classList.add('copied');
+    setTimeout(function(){
+      btn.innerHTML = ICON_COPY;
+      btn.classList.remove('copied');
+    }, 1200);
+  } catch(e){
+    alert('Copy failed');
+  }
+}
+
 /* ---------- SEND ---------- */
 async function send(){
   var text = inputEl.value.trim();
@@ -746,15 +906,24 @@ async function send(){
         alert(e1.detail || 'Error');
       }
     } else {
+      var isPrivate = !!(privateCheck && privateCheck.checked);
       var r2 = await fetch('/api/posts', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text: text})
+        body: JSON.stringify({text: text, private: isPrivate})
       });
       if (r2.ok){
+        var created = await r2.json();
         inputEl.value = '';
-        if (searchEl) searchEl.value = '';
+        if (privateCheck) privateCheck.checked = false;
+        updatePrivateLabel();
         updateCounter();
+        if (isPrivate){
+          // сразу открываем созданный приватный пост
+          window.location.href = '/p/' + created.id;
+          return;
+        }
+        if (searchEl) searchEl.value = '';
         await load();
       } else {
         var e2 = await r2.json().catch(function(){return {};});
@@ -766,6 +935,12 @@ async function send(){
   } finally {
     updateCounter();
   }
+}
+
+/* ---------- PRIVATE TOGGLE ---------- */
+function updatePrivateLabel(){
+  if (!privateLabel || !privateCheck) return;
+  privateLabel.classList.toggle('checked', privateCheck.checked);
 }
 
 /* ---------- CLICK HANDLERS ---------- */
@@ -794,6 +969,8 @@ feed.addEventListener('click', async function(e){
     load();
   } else if (action === 'comment'){
     window.open('/p/' + postId, '_blank');
+  } else if (action === 'copy'){
+    copyPost(postId, btn);
   }
 });
 
@@ -805,6 +982,11 @@ inputEl.addEventListener('keydown', function(e){
   }
 });
 sendBtn.addEventListener('click', send);
+
+if (privateCheck){
+  privateCheck.addEventListener('change', updatePrivateLabel);
+  updatePrivateLabel();
+}
 
 if (searchEl){
   var tId;
@@ -850,6 +1032,7 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
         textarea_placeholder = t["comment_ph"]
         send_label = t["send_comment"]
         textarea_max = MAX_COMMENT_LEN
+        private_block = ""
     else:
         header = (
             '<header>'
@@ -861,12 +1044,22 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
         textarea_placeholder = t["post_ph"]
         send_label = t["publish"]
         textarea_max = MAX_POST_LEN
+        private_block = (
+            '<label class="private-toggle" id="privateLabel" title="' + t["private_hint"] + '">'
+            f'<input type="checkbox" id="privateCheck" />'
+            f'<span>{t["private"]}</span>'
+            '<span class="hint">· ' + t["private_hint"] + '</span>'
+            '</label>'
+        )
 
     footer = (
         '<footer>'
         f'<textarea id="newPost" maxlength="{textarea_max}" placeholder="{textarea_placeholder}"></textarea>'
         '<div class="row">'
+        '<div class="row-left">'
         f'<div id="counter" class="counter">0 / {textarea_max}</div>'
+        + private_block +
+        '</div>'
         f'<button id="send" class="send" disabled>{send_label}</button>'
         '</div>'
         '</footer>'
@@ -876,8 +1069,12 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
           .replace("__ICON_UP__", json.dumps(ICON_UP))
           .replace("__ICON_DOWN__", json.dumps(ICON_DOWN))
           .replace("__ICON_COMMENT__", json.dumps(ICON_COMMENT))
+          .replace("__ICON_COPY__", json.dumps(ICON_COPY))
+          .replace("__ICON_CHECK__", json.dumps(ICON_CHECK))
+          .replace("__ICON_LOCK__", json.dumps(ICON_LOCK))
           .replace("__ICON_MOON__", json.dumps(ICON_MOON))
-          .replace("__ICON_SUN__", json.dumps(ICON_SUN)))
+          .replace("__ICON_SUN__", json.dumps(ICON_SUN))
+          .replace("__TRUNCATE_LINES__", str(TRUNCATE_LINES)))
 
     return (
         '<!DOCTYPE html>\n'
