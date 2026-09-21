@@ -22,6 +22,7 @@ POSTS: Dict[str, dict] = {}
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
 TRUNCATE_LINES = 100
+TRUNCATE_CHARS = 500
 
 RU_COUNTRIES = {"RU", "BY", "KZ", "UA", "KG", "TJ", "UZ", "AM", "AZ", "MD"}
 _lang_cache: Dict[str, str] = {}
@@ -127,13 +128,13 @@ def serialize_post(p: dict, client_id: str = "") -> dict:
 # ------------------------------------------------------------------
 @app.get("/api/posts")
 def api_list(q: str = "", client_id: str = ""):
-    # приватные посты в ленте не видны
+    # приватные в ленту не попадают
     items = [p for p in POSTS.values() if not p.get("private")]
     if q:
         needle = q.strip().lower()
         if needle:
             items = [p for p in items if needle in p["text"].lower()]
-    # сортировка по новым
+    # базово — новые сверху (клиент пересортирует под фильтр)
     items.sort(key=lambda p: p["created_at"], reverse=True)
     return {"posts": [serialize_post(p, client_id) for p in items]}
 
@@ -243,7 +244,15 @@ TEXTS = {
         "copy": "Копировать",
         "copied": "Скопировано",
         "private": "Приватный",
-        "private_hint": "только по ссылке",
+        # фильтры
+        "f_new": "Новые",
+        "f_top": "Лучшие",
+        "f_bottom": "Худшие",
+        "f_old": "Старые",
+        "f_all": "Все",
+        "f_many": "Много комм.",
+        "f_some": "Есть комм.",
+        "f_none": "Без комм.",
     },
     "en": {
         "search_ph": "Search posts",
@@ -265,7 +274,14 @@ TEXTS = {
         "copy": "Copy",
         "copied": "Copied",
         "private": "Private",
-        "private_hint": "link only",
+        "f_new": "New",
+        "f_top": "Top",
+        "f_bottom": "Worst",
+        "f_old": "Old",
+        "f_all": "All",
+        "f_many": "Many",
+        "f_some": "Some",
+        "f_none": "None",
     },
 }
 
@@ -317,7 +333,6 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 
-  /* отключаем выделение текста */
   user-select: none;
   -webkit-user-select: none;
   -ms-user-select: none;
@@ -386,6 +401,50 @@ header input[type="search"]:focus { border-color: var(--line-strong); }
 .icon-btn svg { display: block; }
 
 .spacer { flex: 1; }
+
+/* ================= FILTERS ================= */
+.filters {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  overflow-x: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.filters::-webkit-scrollbar { display: none; }
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+}
+.filter-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+  margin: 0 8px;
+  flex-shrink: 0;
+}
+.filter {
+  height: 26px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .12s, background .12s;
+}
+.filter:hover { background: var(--hover); color: var(--text); }
+.filter.active { color: var(--text); background: var(--hover); }
 
 /* ================= FEED ================= */
 main {
@@ -578,7 +637,7 @@ footer textarea::placeholder { color: var(--muted); }
   color: var(--muted);
   cursor: pointer;
   user-select: none;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border: 1px solid var(--line);
   transition: border-color .12s, color .12s;
 }
@@ -592,7 +651,6 @@ footer textarea::placeholder { color: var(--muted); }
   color: var(--private);
   border-color: var(--private);
 }
-.private-toggle .hint { opacity: .7; }
 
 button.send {
   height: 32px;
@@ -672,6 +730,15 @@ ICON_LOCK = (
     '<path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>'
 )
 
+# Favicon — минималистичный чат-пузырь (data URI, без внешних файлов)
+FAVICON = (
+    "data:image/svg+xml,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+    "%3Crect width='64' height='64' fill='%23101010'/%3E"
+    "%3Cpath d='M14 16h36v24H28l-14 12V16z' fill='%23ffffff'/%3E"
+    "%3C/svg%3E"
+)
+
 
 # ------------------------------------------------------------------
 # JS
@@ -695,9 +762,14 @@ var searchBtn = document.getElementById('searchBtn');
 var themeBtn = document.getElementById('themeBtn');
 var privateCheck = document.getElementById('privateCheck');
 var privateLabel = document.getElementById('privateLabel');
+var filtersEl = document.getElementById('filters');
 
 var TRUNCATE_LINES = __TRUNCATE_LINES__;
+var TRUNCATE_CHARS = __TRUNCATE_CHARS__;
 var maxLen = (MODE === 'post') ? MAX_COMMENT_LEN : MAX_POST_LEN;
+
+var sortMode = 'new';        // new | top | bottom | old
+var commentFilter = 'any';   // any | some | many | none
 
 function getClientId(){
   var cid = localStorage.getItem('sldchat_cid');
@@ -758,21 +830,37 @@ function scoreClass(up, down){
   return '';
 }
 
+function truncateText(text){
+  var lines = text.split('\n');
+  var truncated = false;
+  var out = text;
+  if (lines.length > TRUNCATE_LINES){
+    out = lines.slice(0, TRUNCATE_LINES).join('\n');
+    truncated = true;
+  }
+  if (out.length > TRUNCATE_CHARS){
+    out = out.slice(0, TRUNCATE_CHARS);
+    truncated = true;
+  }
+  if (truncated){
+    out = out.replace(/\s+$/, '') + '…';
+  }
+  return { text: out, truncated: truncated };
+}
+
 function renderPost(p, showComments){
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
   var downCls = p.user_vote === -1 ? 'active' : '';
   var scCls = scoreClass(p.upvotes, p.downvotes);
 
-  // Обрезка длинных постов в ленте (не в режиме поста)
-  var truncated = false;
+  // обрезка в ленте (не в режиме поста)
   var displayText = p.text;
+  var truncated = false;
   if (!showComments){
-    var lines = p.text.split('\n');
-    if (lines.length > TRUNCATE_LINES){
-      truncated = true;
-      displayText = lines.slice(0, TRUNCATE_LINES).join('\n');
-    }
+    var res = truncateText(p.text);
+    displayText = res.text;
+    truncated = res.truncated;
   }
   var readMoreHtml = truncated
     ? '<a class="read-more" href="/p/' + p.id + '">… ' + escapeHtml(T.read_more) + '</a>'
@@ -785,7 +873,7 @@ function renderPost(p, showComments){
     + ICON_COPY + '</button>';
 
   var privateBadge = p.private
-    ? '<span class="private-badge" title="' + escapeHtml(T.private_hint) + '">' + ICON_LOCK + '</span>'
+    ? '<span class="private-badge">' + ICON_LOCK + '</span>'
     : '';
 
   var commentsHtml = '';
@@ -829,6 +917,29 @@ function renderComment(c, postId){
     + '</div>';
 }
 
+/* ---------- APPLY FILTERS ---------- */
+function applyFilters(posts){
+  // comment filter
+  if (commentFilter === 'some'){
+    posts = posts.filter(function(p){ return p.comments.length > 0; });
+  } else if (commentFilter === 'many'){
+    posts = posts.filter(function(p){ return p.comments.length >= 3; });
+  } else if (commentFilter === 'none'){
+    posts = posts.filter(function(p){ return p.comments.length === 0; });
+  }
+  // sort
+  posts.sort(function(a, b){
+    var sa = a.upvotes - a.downvotes;
+    var sb = b.upvotes - b.downvotes;
+    if (sortMode === 'new')    return b.created_at - a.created_at;
+    if (sortMode === 'old')    return a.created_at - b.created_at;
+    if (sortMode === 'top')    return (sb - sa) || (b.created_at - a.created_at);
+    if (sortMode === 'bottom') return (sa - sb) || (b.created_at - a.created_at);
+    return 0;
+  });
+  return posts;
+}
+
 /* ---------- LOAD ---------- */
 async function load(){
   try {
@@ -845,11 +956,12 @@ async function load(){
       var url = '/api/posts?q=' + encodeURIComponent(q) + '&client_id=' + encodeURIComponent(CLIENT_ID);
       var r2 = await fetch(url);
       var d2 = await r2.json();
-      if (!d2.posts.length){
+      var posts = applyFilters(d2.posts || []);
+      if (!posts.length){
         feed.innerHTML = '<div class="empty">' + escapeHtml(T.no_posts) + '</div>';
         return;
       }
-      feed.innerHTML = d2.posts.map(function(p){ return renderPost(p, false); }).join('');
+      feed.innerHTML = posts.map(function(p){ return renderPost(p, false); }).join('');
     }
   } catch(e){
     feed.innerHTML = '<div class="empty">—</div>';
@@ -919,7 +1031,6 @@ async function send(){
         updatePrivateLabel();
         updateCounter();
         if (isPrivate){
-          // сразу открываем созданный приватный пост
           window.location.href = '/p/' + created.id;
           return;
         }
@@ -941,6 +1052,24 @@ async function send(){
 function updatePrivateLabel(){
   if (!privateLabel || !privateCheck) return;
   privateLabel.classList.toggle('checked', privateCheck.checked);
+}
+
+/* ---------- FILTERS ---------- */
+if (filtersEl){
+  filtersEl.addEventListener('click', function(e){
+    var btn = e.target.closest('.filter');
+    if (!btn) return;
+    if (btn.dataset.sort){
+      sortMode = btn.dataset.sort;
+      var items = filtersEl.querySelectorAll('[data-sort]');
+      for (var i=0;i<items.length;i++) items[i].classList.toggle('active', items[i] === btn);
+    } else if (btn.dataset.comments){
+      commentFilter = btn.dataset.comments;
+      var items2 = filtersEl.querySelectorAll('[data-comments]');
+      for (var j=0;j<items2.length;j++) items2[j].classList.toggle('active', items2[j] === btn);
+    }
+    load();
+  });
 }
 
 /* ---------- CLICK HANDLERS ---------- */
@@ -968,7 +1097,8 @@ feed.addEventListener('click', async function(e){
     });
     load();
   } else if (action === 'comment'){
-    window.open('/p/' + postId, '_blank');
+    // открываем в текущей вкладке (не создаём новую)
+    window.location.href = '/p/' + postId;
   } else if (action === 'copy'){
     copyPost(postId, btn);
   }
@@ -1029,6 +1159,7 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
             f'<button id="themeBtn" class="icon-btn" title="{t["theme"]}">{ICON_MOON}</button>'
             '</header>'
         )
+        filters = ""
         textarea_placeholder = t["comment_ph"]
         send_label = t["send_comment"]
         textarea_max = MAX_COMMENT_LEN
@@ -1041,14 +1172,30 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
             f'<button id="themeBtn" class="icon-btn" title="{t["theme"]}">{ICON_MOON}</button>'
             '</header>'
         )
+        filters = (
+            '<div class="filters" id="filters">'
+            '<div class="filter-group">'
+            f'<button class="filter active" data-sort="new">{t["f_new"]}</button>'
+            f'<button class="filter" data-sort="top">{t["f_top"]}</button>'
+            f'<button class="filter" data-sort="bottom">{t["f_bottom"]}</button>'
+            f'<button class="filter" data-sort="old">{t["f_old"]}</button>'
+            '</div>'
+            '<div class="filter-sep"></div>'
+            '<div class="filter-group">'
+            f'<button class="filter active" data-comments="any">{t["f_all"]}</button>'
+            f'<button class="filter" data-comments="many">{t["f_many"]}</button>'
+            f'<button class="filter" data-comments="some">{t["f_some"]}</button>'
+            f'<button class="filter" data-comments="none">{t["f_none"]}</button>'
+            '</div>'
+            '</div>'
+        )
         textarea_placeholder = t["post_ph"]
         send_label = t["publish"]
         textarea_max = MAX_POST_LEN
         private_block = (
-            '<label class="private-toggle" id="privateLabel" title="' + t["private_hint"] + '">'
+            '<label class="private-toggle" id="privateLabel">'
             f'<input type="checkbox" id="privateCheck" />'
             f'<span>{t["private"]}</span>'
-            '<span class="hint">· ' + t["private_hint"] + '</span>'
             '</label>'
         )
 
@@ -1074,7 +1221,8 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
           .replace("__ICON_LOCK__", json.dumps(ICON_LOCK))
           .replace("__ICON_MOON__", json.dumps(ICON_MOON))
           .replace("__ICON_SUN__", json.dumps(ICON_SUN))
-          .replace("__TRUNCATE_LINES__", str(TRUNCATE_LINES)))
+          .replace("__TRUNCATE_LINES__", str(TRUNCATE_LINES))
+          .replace("__TRUNCATE_CHARS__", str(TRUNCATE_CHARS)))
 
     return (
         '<!DOCTYPE html>\n'
@@ -1083,12 +1231,14 @@ def render_page(lang: str, mode: str, post_id: str = "") -> str:
         '<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
         '<meta name="color-scheme" content="light dark" />\n'
+        f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
         '<title>sldChat</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
         '<div class="app">\n'
         + header
+        + filters
         + '<main id="feed"><div class="empty">…</div></main>\n'
         + footer
         + '</div>\n'
