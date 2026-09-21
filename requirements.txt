@@ -8,3 +8,4 @@ dnspython
 pydantic
 itsdangerous
 uvloop 
+supabase
