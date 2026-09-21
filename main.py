@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 app = FastAPI(title="litodon")
 
 # ============================================================
-#   ХРАНИЛИЩЕ (В ОПЕРАТИВКЕ) — полная анонимность
+#   ХРАНИЛИЩЕ (В ОПЕРАТИВКЕ)
 # ============================================================
 
 sessions: dict = {}    # sid -> {"id": int}
@@ -66,7 +66,6 @@ def safe_redirect(request: Request) -> str:
 ICON_PATHS = {
     "home":      '<path d="M8 1.5 15 7.5h-2.2V15H9.5v-4.2h-3V15H3.2V7.5H1z"/>',
     "plus":      '<path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/>',
-    "user":      '<circle cx="8" cy="5" r="3"/><path d="M2 15c0-3.3 2.7-6 6-6s6 2.7 6 6z"/>',
     "up":        '<path d="M8 3 13 9H9.5v4h-3V9H3z"/>',
     "down":      '<path d="M8 13 3 7h3.5V3h3v4H13z"/>',
     "comment":   '<path d="M2 3h12v9H8l-3.2 3v-3H2z"/>',
@@ -88,6 +87,12 @@ ICON_PATHS = {
     "ol":        '<text x="3" y="6.8" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">1</text><text x="3" y="10.2" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">2</text><text x="3" y="13.6" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">3</text><path d="M6 5h8M6 8h8M6 11h8" stroke="currentColor" stroke-width="1.3" fill="none"/>',
     "quote":     '<path d="M3 5v4h2.5L4 12M9 5v4h2.5L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
     "hr":        '<path d="M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="4" cy="4" r="0.7"/><circle cx="12" cy="12" r="0.7"/>',
+    "table":     '<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 6h13M1.5 9.5h13M5.5 2.5v11M10.5 2.5v11" stroke="currentColor" stroke-width="1.2" fill="none"/>',
+    "task":      '<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m5 8 2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+    "highlight": '<path d="M3 13h10M4 11 9 6l3 3-5 5H4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+    "spoiler":   '<path d="M1.5 8s2.5-4 6.5-4 6.5 4 6.5 4-2.5 4-6.5 4S1.5 8 1.5 8z" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m2 14 12-12" stroke="currentColor" stroke-width="1.4"/>',
+    "sup":       '<text x="8" y="11" text-anchor="middle" font-size="9" font-family="Arial" fill="currentColor">x</text><text x="12" y="7" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">2</text>',
+    "emoji":     '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="6" cy="6.5" r="0.8" fill="currentColor"/><circle cx="10" cy="6.5" r="0.8" fill="currentColor"/><path d="M5.5 9.5c.7 1 1.5 1.5 2.5 1.5s1.8-.5 2.5-1.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>',
 }
 
 
@@ -100,6 +105,20 @@ def ic(name: str, size: int = 14) -> str:
 # ============================================================
 #   MARKDOWN
 # ============================================================
+
+EMOJI = {
+    "smile": "😊", "grin": "😁", "joy": "😂", "laugh": "😆", "wink": "😉",
+    "heart": "❤️", "thumbsup": "👍", "+1": "👍", "thumbsdown": "👎", "-1": "👎",
+    "fire": "🔥", "star": "⭐", "rocket": "🚀", "check": "✅", "x": "❌",
+    "warning": "⚠️", "info": "ℹ️", "question": "❓", "bulb": "💡", "idea": "💡",
+    "cry": "😢", "angry": "😠", "cool": "😎", "wave": "👋", "clap": "👏",
+    "ok": "👌", "pray": "🙏", "eyes": "👀", "cat": "🐱", "dog": "🐶",
+    "sun": "☀️", "moon": "🌙", "zap": "⚡", "sparkles": "✨", "tada": "🎉",
+    "coffee": "☕", "pizza": "🍕", "beer": "🍺", "gift": "🎁", "lock": "🔒",
+    "key": "🔑", "book": "📖", "pencil": "✏️", "memo": "📝", "chart": "📊",
+    "bug": "🐛", "ghost": "👻", "skull": "💀", "alien": "👽", "robot": "🤖",
+}
+
 
 def safe_url(u: str) -> str:
     u = u.strip()
@@ -116,6 +135,7 @@ def md_inline(text: str) -> str:
         stash.append(html)
         return f"\x00{len(stash) - 1}\x00"
 
+    # 1. stash «защищённые» конструкции, чтобы regexp'ы ниже их не портили
     text = re.sub(r'`([^`\n]+)`', lambda m: put(f'<code>{m.group(1)}</code>'), text)
     text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)',
                   lambda m: put(f'<img src="{safe_url(m.group(2))}" alt="{m.group(1)}" loading="lazy">'),
@@ -126,16 +146,54 @@ def md_inline(text: str) -> str:
     text = re.sub(r'(?<![\w"\'=/>])(https?://[^\s<>"\'()]+)',
                   lambda m: put(f'<a href="{safe_url(m.group(1))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
                   text)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+
+    # 2. emoji shortcodes :smile:
+    text = re.sub(r':([a-z0-9_+\-]+):',
+                  lambda m: EMOJI.get(m.group(1), m.group(0)), text)
+
+    # 3. инлайновые украшения
+    text = re.sub(r'==(.+?)==', r'<mark>\1</mark>', text)              # ==highlight==
+    text = re.sub(r'\|\|(.+?)\|\|', r'<span class="spoiler">\1</span>', text)  # ||spoiler||
+    text = re.sub(r'\^([^\s^][^^\n]*?)\^', r'<sup>\1</sup>', text)     # ^sup^
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)      # **bold**
     text = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', text)
-    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)
+    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)  # *italic*
     text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'<em>\1</em>', text)
-    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)
+    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)                # ~~strike~~
+
+    # 4. вернуть спрятанное
     text = re.sub(r'\x00(\d+)\x00', lambda m: stash[int(m.group(1))], text)
     return text
 
 
 HR_RE = re.compile(r'^((-\s*){3,}|(\*\s*){3,}|(_\s*){3,})$')
+TABLE_SEP_RE = re.compile(r'^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$')
+
+
+def _parse_table(lines, i, n, out, close_list):
+    """Разбирает GitHub-style таблицу начиная со строки i. Возвращает новый i."""
+    header_line = lines[i].strip()
+    headers = [c.strip() for c in header_line.strip("|").split("|")]
+    # i+1 — разделитель, пропускаем
+    i += 2
+    rows = []
+    while i < n and lines[i].strip() and "|" in lines[i]:
+        rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+        i += 1
+    close_list()
+    html = ["<table><thead><tr>"]
+    for h in headers:
+        html.append(f"<th>{md_inline(h)}</th>")
+    html.append("</tr></thead><tbody>")
+    for row in rows:
+        html.append("<tr>")
+        for j in range(len(headers)):
+            cell = row[j] if j < len(row) else ""
+            html.append(f"<td>{md_inline(cell)}</td>")
+        html.append("</tr>")
+    html.append("</tbody></table>")
+    out.append("".join(html))
+    return i
 
 
 def md_block(text: str) -> str:
@@ -156,12 +214,14 @@ def md_block(text: str) -> str:
         if re.match(r'^[-*+]\s', s): return True
         if re.match(r'^\d+\.\s', s): return True
         if HR_RE.match(s): return True
+        if "|" in s: return True
         return False
 
     while i < n:
         raw = lines[i]
         s = raw.strip()
 
+        # код-фенсы
         if s.startswith("```"):
             if not in_code:
                 in_code = True
@@ -180,17 +240,27 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
+        # пустая строка
         if not s:
             close_list()
             i += 1
             continue
 
+        # разделитель ---
         if HR_RE.match(s):
             close_list()
             out.append("<hr>")
             i += 1
             continue
 
+        # таблица: текущая строка с |, следующая — разделитель
+        if "|" in s and i + 1 < n:
+            nxt = lines[i + 1].strip()
+            if TABLE_SEP_RE.match(nxt) and "|" in s:
+                i = _parse_table(lines, i, n, out, close_list)
+                continue
+
+        # заголовки # ## ###
         m = re.match(r'^(#{1,6})\s+(.+)$', s)
         if m:
             close_list()
@@ -199,6 +269,7 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
+        # цитата >
         if s.startswith(">"):
             close_list()
             buf = []
@@ -208,6 +279,17 @@ def md_block(text: str) -> str:
             out.append("<blockquote>" + "<br>".join(md_inline(x) for x in buf) + "</blockquote>")
             continue
 
+        # задача - [ ] / - [x]
+        m = re.match(r'^[-*+]\s+\[([ xX])\]\s+(.+)$', s)
+        if m:
+            if not stack or stack[-1] != "task":
+                close_list(); stack.append("task"); out.append('<ul class="task-list">')
+            checked = " checked" if m.group(1).lower() == "x" else ""
+            out.append(f'<li><input type="checkbox" disabled{checked}><span>{md_inline(m.group(2))}</span></li>')
+            i += 1
+            continue
+
+        # маркированный список - * +
         m = re.match(r'^[-*+]\s+(.+)$', s)
         if m:
             if not stack or stack[-1] != "ul":
@@ -216,6 +298,7 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
+        # нумерованный список 1. 2.
         m = re.match(r'^\d+\.\s+(.+)$', s)
         if m:
             if not stack or stack[-1] != "ol":
@@ -224,6 +307,7 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
+        # обычный абзац
         close_list()
         para = [s]
         i += 1
@@ -260,10 +344,7 @@ a { color: #2e7d32; text-decoration: none; }
 a:hover { color: #1b5e20; text-decoration: underline; }
 
 /* ---------- кастомные скроллбары ---------- */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: #a5cfa5 #eaf6ea;
-}
+* { scrollbar-width: thin; scrollbar-color: #a5cfa5 #eaf6ea; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: #eaf6ea; border-radius: 5px; }
 ::-webkit-scrollbar-thumb {
@@ -283,7 +364,7 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   box-shadow: 0 2px 6px rgba(0,0,0,0.22);
 }
 .header-inner {
-  max-width: 1320px; margin: 0 auto; padding: 10px 18px;
+  max-width: 1760px; margin: 0 auto; padding: 10px 18px;
   display: flex; align-items: center; justify-content: space-between;
 }
 .logo {
@@ -311,7 +392,7 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   width: 1080px; margin: 16px auto 30px;
   display: flex; align-items: flex-start; gap: 14px;
 }
-.layout.wide { width: 1320px; }
+.layout.wide { width: min(1760px, 97vw); }
 .sidebar { width: 220px; flex-shrink: 0; }
 .content { flex: 1; min-width: 0; }
 
@@ -344,7 +425,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   margin-bottom: 12px; box-shadow: 0 1px 2px rgba(27,94,32,0.12);
 }
 .empty { padding: 22px; text-align: center; color: #7a8f7a; font-size: 13px; }
-.notice { padding: 10px 12px; background: #fffbe6; border-color: #e6d98a; color: #6b5b1b; font-size: 12px; }
 .page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
 .back-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; margin-bottom: 8px; }
 
@@ -422,7 +502,7 @@ button, .btn-primary {
 button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
 button:active { background: #2e7d32; }
 
-/* ---------- editor ---------- */
+/* ---------- editor (шире и выше) ---------- */
 .editor { overflow: hidden; }
 .editor-toolbar {
   display: flex; align-items: center; gap: 2px;
@@ -442,7 +522,12 @@ button:active { background: #2e7d32; }
 .tb-sep { width: 1px; height: 20px; background: #a5cfa5; margin: 0 4px; }
 .tb-spacer { flex: 1; }
 
-.editor-body { display: flex; height: 660px; align-items: stretch; }
+.editor-body {
+  display: flex;
+  height: min(780px, 80vh);
+  min-height: 520px;
+  align-items: stretch;
+}
 .editor-pane {
   flex: 1 1 50%; min-width: 0;
   display: flex; flex-direction: column; overflow: hidden;
@@ -450,15 +535,16 @@ button:active { background: #2e7d32; }
 .editor-pane textarea {
   flex: 1 1 auto; height: 100%; min-height: 0;
   border: none; border-radius: 0; background: #fff; resize: none;
-  padding: 12px 14px;
+  padding: 14px 16px;
   font-family: Consolas, Monaco, "Courier New", monospace;
-  font-size: 13px; line-height: 1.5; overflow-y: auto;
+  font-size: 13.5px; line-height: 1.55; overflow-y: auto;
 }
 .editor-pane textarea:focus { background: #fff; }
 .editor-preview {
   border-left: 1px solid #d6ead6; background: #fafdfa;
-  padding: 12px 14px; height: 100%; overflow-y: auto;
-  font-family: Verdana, sans-serif; font-size: 13px;
+  padding: 14px 18px; height: 100%; overflow-y: auto;
+  font-family: Verdana, sans-serif; font-size: 13.5px;
+  line-height: 1.55;
 }
 
 .editor-foot {
@@ -466,7 +552,7 @@ button:active { background: #2e7d32; }
   padding: 8px 10px; background: #f3faf3; border-top: 1px solid #a5cfa5;
   gap: 10px; flex-wrap: wrap;
 }
-.editor-hint { font-size: 11px; color: #6b8a6b; flex: 1; min-width: 200px; }
+.editor-hint { font-size: 11px; color: #6b8a6b; flex: 1; min-width: 200px; line-height: 1.8; }
 .editor-hint code {
   background: #eaf6ea; border: 1px solid #d6ead6; padding: 0 4px;
   border-radius: 2px; font-size: 11px; color: #2e7d32;
@@ -510,6 +596,37 @@ button:active { background: #2e7d32; }
 .md del { color: #9cb89c; }
 .md a { color: #2e7d32; text-decoration: underline; }
 
+/* новые md-фичи */
+.md mark { background: #fff59d; color: #17381a; padding: 0 2px; border-radius: 2px; }
+.md sup { font-size: 0.75em; vertical-align: super; line-height: 0; }
+.md .spoiler {
+  background: #2e7d32; color: #2e7d32; border-radius: 3px;
+  padding: 0 4px; cursor: help;
+  transition: background .15s, color .15s;
+}
+.md .spoiler:hover { background: #eaf6ea; color: #17381a; }
+
+.md table {
+  border-collapse: collapse; margin: 10px 0; font-size: 13px;
+  max-width: 100%;
+}
+.md th, .md td {
+  border: 1px solid #c8e6c9; padding: 5px 10px;
+  text-align: left; vertical-align: top;
+}
+.md th { background: #eaf6ea; color: #1b5e20; font-weight: bold; }
+.md tr:nth-child(even) td { background: #f7fdf7; }
+.md table code { font-size: 11px; }
+
+.md ul.task-list { list-style: none; padding-left: 4px; }
+.md ul.task-list li {
+  display: flex; align-items: flex-start; gap: 8px; margin: 3px 0;
+  padding-left: 0;
+}
+.md ul.task-list li input[type=checkbox] {
+  margin: 3px 0 0; accent-color: #43a047; flex-shrink: 0;
+}
+
 .footer { text-align: center; color: #7d9c7d; font-size: 11px; padding: 6px 0 30px; }
 """
 
@@ -525,7 +642,6 @@ def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> st
 
     nav_items = nav("/", "home", "Лента", "feed")
     nav_items += nav("/create", "plus", "Создать пост", "create")
-    nav_items += nav("/my", "user", "Мои посты", "my")
 
     layout_cls = "layout wide" if wide else "layout"
 
@@ -533,7 +649,7 @@ def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> st
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=1320">
+<meta name="viewport" content="width=1760">
 <title>litodon</title>
 <style>{CSS}</style>
 </head>
@@ -670,18 +786,24 @@ def editor_view(p: dict | None = None, action: str = "/create") -> str:
           <span class="tb-sep"></span>
           {tb("ul",    "Маркированный список", "prefixLine('- ')")}
           {tb("ol",    "Нумерованный список",  "prefixLine('1. ')")}
+          {tb("task",  "Чек-лист",             "prefixLine('- [ ] ')")}
           {tb("quote", "Цитата",               "prefixLine('> ')")}
           {tb("hr",    "Разделитель (---)",    "insertBlock('\\n---\\n')")}
           <span class="tb-sep"></span>
-          {tb("link",  "Ссылка",      "insertMd('[','](https://)','текст ссылки')")}
-          {tb("image", "Изображение", "insertMd('![','](https://)','alt')")}
+          {tb("link",      "Ссылка",         "insertMd('[','](https://)','текст ссылки')")}
+          {tb("image",     "Изображение",    "insertMd('![','](https://)','alt')")}
+          {tb("table",     "Таблица",        "insertBlock('\\n| Столбец 1 | Столбец 2 |\\n|-----------|-----------|\\n| Ячейка    | Ячейка    |\\n')")}
+          {tb("highlight", "Выделение",      "insertMd('==','==','выделенный текст')")}
+          {tb("spoiler",   "Спойлер",        "insertMd('||','||','скрытый текст')")}
+          {tb("sup",       "Верхний индекс", "insertMd('^','^','2')")}
+          {tb("emoji",     "Emoji ( :smile: )", "insertBlock(':smile: ')" )}
           <span class="tb-spacer"></span>
           <button type="button" class="tb tb-text active" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
         </div>
         <div class="editor-body">
           <div class="editor-pane">
             <textarea id="editor" name="text" maxlength="{MAX_POST}" required
-placeholder="Напишите что-нибудь...&#10;&#10;Поддерживается markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`&#10;# Заголовок   - список   1. нумерация   > цитата&#10;--- разделитель   [ссылка](https://)   ![img](https://)">{text_value}</textarea>
+placeholder="Напишите что-нибудь...&#10;&#10;Markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`  ==выделение==  ||спойлер||  ^верхний^&#10;# H1  ## H2  ### H3&#10;- список   1. список   - [ ] задача   &gt; цитата   --- разделитель&#10;[ссылка](https://)  ![img](https://)&#10;| табл | лицо |&#10;|------|------|&#10;| a    | b    |&#10;:smile: :fire: :heart:">{text_value}</textarea>
           </div>
           <div class="editor-pane editor-preview" id="preview-wrap">
             <div class="md" id="preview"></div>
@@ -689,11 +811,16 @@ placeholder="Напишите что-нибудь...&#10;&#10;Поддержив
         </div>
         <div class="editor-foot">
           <div class="editor-hint">
-            <b>Markdown:</b> <code>**жирный**</code> &middot; <code>*курсив*</code> &middot;
-            <code># H1</code> &middot; <code>- список</code> &middot; <code>1. список</code> &middot;
-            <code>&gt; цитата</code> &middot; <code>`код`</code> &middot;
-            <code>```блок```</code> &middot; <code>---</code> разделитель &middot;
-            <code>[текст](url)</code> &middot; <code>![alt](url)</code>
+            <b>Markdown:</b>
+            <code>**жирный**</code> &middot; <code>*курсив*</code> &middot; <code>~~зачёркнутый~~</code> &middot;
+            <code>`код`</code> &middot; <code>```блок```</code> &middot;
+            <code># H1</code>/<code>## H2</code>/<code>### H3</code> &middot;
+            <code>- список</code> &middot; <code>1. список</code> &middot; <code>- [ ] чек-лист</code> &middot;
+            <code>&gt; цитата</code> &middot; <code>---</code> &middot;
+            <code>[текст](url)</code> &middot; <code>![alt](url)</code> &middot;
+            <code>==выделение==</code> &middot; <code>||спойлер||</code> &middot; <code>^верхний^</code> &middot;
+            <code>:smile:</code> &middot;
+            таблицы: <code>| a | b |</code> + <code>|---|---|</code>
           </div>
           <div class="editor-actions">
             <span class="counter" id="counter">0 / {MAX_POST}</span>
@@ -781,7 +908,7 @@ EDITOR_JS = r"""
   window.insertBlock = function(before, after){
     var s = ta.selectionStart, e = ta.selectionEnd;
     var sel = ta.value.substring(s, e);
-    var ins = before + sel + after;
+    var ins = before + sel + (after || '');
     ta.value = ta.value.substring(0, s) + ins + ta.value.substring(e);
     ta.selectionStart = ta.selectionEnd = s + ins.length;
     ta.focus(); updateCounter(); schedulePreview();
@@ -823,8 +950,6 @@ def index(request: Request):
     return layout(anon, '<h1 class="page-title">Лента</h1>' + feed, active="feed")
 
 
-# ---------- создание ----------
-
 @app.get("/create", response_class=HTMLResponse)
 def create_page(request: Request):
     anon = request.state.anon
@@ -852,8 +977,6 @@ def create_post(request: Request, text: str = Form(...)):
     return RedirectResponse("/create", status_code=303)
 
 
-# ---------- просмотр поста ----------
-
 @app.get("/p/{post_id}", response_class=HTMLResponse)
 def post_page(post_id: int, request: Request):
     anon = request.state.anon
@@ -865,8 +988,6 @@ def post_page(post_id: int, request: Request):
     back = f'<a href="/" class="back-link">{ic("arrow-left", 14)} Назад к ленте</a>'
     return layout(anon, back + post_card(p, anon), active="feed")
 
-
-# ---------- редактирование ----------
 
 @app.get("/p/{post_id}/edit", response_class=HTMLResponse)
 def edit_page(post_id: int, request: Request):
@@ -905,22 +1026,6 @@ def delete_post(post_id: int, request: Request):
     return RedirectResponse(f"/p/{post_id}", status_code=303)
 
 
-# ---------- мои посты ----------
-
-@app.get("/my", response_class=HTMLResponse)
-def my_posts(request: Request):
-    anon = request.state.anon
-    mine = sorted([p for p in posts if p["author_id"] == anon["id"]],
-                  key=lambda x: x["created"], reverse=True)
-    if not mine:
-        feed = '<div class="box empty">Здесь пока ничего нет. <a href="/create">Создайте пост.</a></div>'
-    else:
-        feed = "".join(post_card(p, anon) for p in mine)
-    return layout(anon, '<h1 class="page-title">Мои посты</h1>' + feed, active="my")
-
-
-# ---------- голосование ----------
-
 @app.post("/vote/{post_id}")
 def vote(post_id: int, request: Request, value: str = Form(...)):
     aid = request.state.anon["id"]
@@ -939,8 +1044,6 @@ def vote(post_id: int, request: Request, value: str = Form(...)):
     return RedirectResponse(safe_redirect(request), status_code=303)
 
 
-# ---------- комментарии ----------
-
 @app.post("/comment/{post_id}")
 def add_comment(post_id: int, request: Request, text: str = Form(...)):
     p = next((x for x in posts if x["id"] == post_id), None)
@@ -954,8 +1057,6 @@ def add_comment(post_id: int, request: Request, text: str = Form(...)):
         })
     return RedirectResponse(safe_redirect(request), status_code=303)
 
-
-# ---------- markdown preview API ----------
 
 @app.post("/api/preview")
 def api_preview(text: str = Form("")):
