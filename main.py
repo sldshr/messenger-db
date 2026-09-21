@@ -8,21 +8,16 @@ from datetime import datetime
 
 # --- ИНИЦИАЛИЗАЦИЯ IN-MEMORY ХРАНИЛИЩА (В ОПЕРАТИВНОЙ ПАМЯТИ) ---
 class InMemoryStorage:
-    """
-    Класс для хранения данных исключительно в оперативной памяти.
-    При перезапуске сервера все данные будут безвозвратно утеряны.
-    """
     def __init__(self):
         self.users = {}       # {username: password}
         self.posts = []       # [{"id": str, "author": str, "content": str, "timestamp": str}]
         self.sessions = {}    # {session_token: username}
 
-# Создаем единственный экземпляр хранилища при запуске приложения
 db = InMemoryStorage()
 
 app = FastAPI(title="Litodon")
 
-# --- Pydantic модели для валидации данных ---
+# --- Pydantic модели ---
 class UserAuth(BaseModel):
     username: str
     password: str
@@ -39,10 +34,7 @@ async def register(user: UserAuth, response: Response):
     if not user.username or not user.password:
         raise HTTPException(status_code=400, detail="Заполните все поля")
     
-    # Сохраняем пользователя в оперативку
     db.users[user.username] = user.password
-    
-    # Создаем сессию в оперативке
     token = str(uuid.uuid4())
     db.sessions[token] = user.username
     response.set_cookie(key="session_token", value=token, httponly=True, samesite="lax")
@@ -73,7 +65,6 @@ async def get_me(session_token: Optional[str] = Cookie(None)):
 
 @app.get("/api/posts")
 async def get_posts():
-    # Возвращаем посты из оперативки в обратном хронологическом порядке
     return sorted(db.posts, key=lambda x: x["timestamp"], reverse=True)
 
 @app.post("/api/posts")
@@ -91,12 +82,11 @@ async def create_post(post: PostCreate, session_token: Optional[str] = Cookie(No
         "content": post.content,
         "timestamp": datetime.now().isoformat()
     }
-    # Добавляем пост в оперативку
     db.posts.append(new_post)
     return new_post
 
 
-# --- HTML / CSS / JS Интерфейс ---
+# --- HTML / CSS / JS Интерфейс (Material Design) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -104,150 +94,365 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Litodon</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Подключаем шрифты и иконки Google Material Design -->
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
     <style>
-        body { background-color: #191b22; color: #d9e1e8; font-family: sans-serif; }
-        .column-bg { background-color: #282c37; }
-        .border-color { border-color: #393f4f; }
-        .accent-bg { background-color: #6364ff; }
-        .accent-bg:hover { background-color: #5051db; }
-        .text-muted { color: #606984; }
+        /* --- Переменные Material Design (Dark Theme) --- */
+        :root {
+            --md-bg: #121212;
+            --md-surface: #1e1e1e;
+            --md-surface-hover: #2c2c2c;
+            --md-primary: #6364ff;
+            --md-primary-hover: #5051db;
+            --md-on-primary: #ffffff;
+            --md-text: #e0e0e0;
+            --md-text-muted: #a0aec0;
+            --md-border: #333333;
+            --md-elevation-1: 0px 2px 1px -1px rgba(0,0,0,0.2), 0px 1px 1px 0px rgba(0,0,0,0.14), 0px 1px 3px 0px rgba(0,0,0,0.12);
+            --md-elevation-2: 0px 3px 1px -2px rgba(0,0,0,0.2), 0px 2px 2px 0px rgba(0,0,0,0.14), 0px 1px 5px 0px rgba(0,0,0,0.12);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--md-bg);
+            color: var(--md-text);
+            font-family: 'Roboto', sans-serif;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+        }
+
+        /* --- Макет (Grid Layout) --- */
+        .layout-grid {
+            display: grid;
+            grid-template-columns: 1fr 2fr 1fr;
+            width: 100%;
+            max-width: 1400px;
+            margin: 0 auto;
+            height: 100%;
+            border-left: 1px solid var(--md-border);
+            border-right: 1px solid var(--md-border);
+        }
+
+        .column {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            overflow-y: auto;
+            padding: 16px;
+            border-right: 1px solid var(--md-border);
+        }
+        .column:last-child { border-right: none; }
+
+        /* --- Material Input --- */
+        .md-input-wrapper {
+            position: relative;
+            margin-bottom: 24px;
+        }
+        .md-input-wrapper .material-symbols-outlined {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--md-text-muted);
+            font-size: 20px;
+        }
+        .md-input {
+            width: 100%;
+            background-color: var(--md-surface);
+            border: 1px solid var(--md-border);
+            border-radius: 4px 4px 0 0;
+            padding: 12px 12px 12px 40px;
+            color: var(--md-text);
+            font-family: 'Roboto', sans-serif;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .md-input:focus {
+            border-bottom: 2px solid var(--md-primary);
+            box-shadow: 0 1px 0 0 var(--md-primary);
+        }
+
+        /* --- Material Buttons --- */
+        .md-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 24px;
+            border-radius: 4px;
+            font-family: 'Roboto', sans-serif;
+            font-size: 14px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            border: none;
+            transition: background-color 0.2s, box-shadow 0.2s;
+            width: 100%;
+            text-decoration: none;
+        }
+        .md-btn-filled {
+            background-color: var(--md-primary);
+            color: var(--md-on-primary);
+            box-shadow: var(--md-elevation-1);
+        }
+        .md-btn-filled:hover {
+            background-color: var(--md-primary-hover);
+            box-shadow: var(--md-elevation-2);
+        }
+        .md-btn-outlined {
+            background-color: transparent;
+            color: var(--md-text);
+            border: 1px solid var(--md-border);
+        }
+        .md-btn-outlined:hover {
+            background-color: var(--md-surface-hover);
+        }
+        .md-btn-text {
+            background-color: transparent;
+            color: var(--md-primary);
+            padding: 8px 16px;
+            width: auto;
+            text-transform: none;
+            font-weight: 700;
+        }
+        .md-btn-text:hover {
+            background-color: rgba(99, 100, 255, 0.1);
+        }
+
+        /* --- Типографика и контент --- */
+        h1, h2, h3 { font-weight: 500; color: #ffffff; }
+        h1 { font-size: 24px; margin-bottom: 8px; }
+        h2 { font-size: 20px; margin-bottom: 16px; margin-top: 24px; }
+        h3 { font-size: 16px; margin-bottom: 8px; }
+        p, li { font-size: 14px; line-height: 1.5; color: var(--md-text); }
+        .text-muted { color: var(--md-text-muted); font-size: 12px; }
+        
+        ul { list-style-type: disc; padding-left: 20px; margin-bottom: 16px; }
+        ul li { margin-bottom: 4px; }
+
+        /* --- Специфические блоки --- */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin: 24px 0;
+        }
+        .stat-label { font-size: 10px; text-transform: uppercase; color: var(--md-text-muted); margin-bottom: 4px; }
+        .stat-value { font-size: 14px; font-weight: 700; }
+        
+        .placeholder-img {
+            width: 100%;
+            height: 120px;
+            background: linear-gradient(135deg, #fceabb 0%, #f8b500 100%);
+            border-radius: 8px;
+            margin: 16px 0;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .footer-links {
+            margin-top: auto;
+            font-size: 12px;
+            color: var(--md-text-muted);
+            line-height: 1.8;
+        }
+        .footer-links a { color: var(--md-text-muted); text-decoration: none; }
+        .footer-links a:hover { text-decoration: underline; }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 32px;
+        }
+        .logo-icon {
+            width: 32px; height: 32px;
+            background-color: var(--md-primary);
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-weight: bold; font-size: 18px;
+        }
+
+        /* --- Модальное окно --- */
+        .md-modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            display: none; align-items: center; justify-content: center;
+            z-index: 1000;
+        }
+        .md-modal {
+            background: var(--md-surface);
+            padding: 24px;
+            border-radius: 8px;
+            width: 100%; max-width: 400px;
+            box-shadow: var(--md-elevation-2);
+            border: 1px solid var(--md-border);
+        }
+        .md-modal h2 { margin-top: 0; margin-bottom: 16px; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        
+        /* --- Лента --- */
+        .post-card {
+            background: var(--md-surface);
+            border: 1px solid var(--md-border);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: var(--md-elevation-1);
+        }
+        .post-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .avatar {
+            width: 24px; height: 24px; background: var(--md-primary); border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: bold; color: white;
+        }
+        
+        @media (max-width: 900px) {
+            .layout-grid { grid-template-columns: 1fr; }
+            .column { display: none; }
+            .column.main-column { display: flex; }
+        }
     </style>
 </head>
-<body class="h-screen overflow-hidden">
-    <div class="grid grid-cols-1 md:grid-cols-4 h-full max-w-7xl mx-auto border-x border-color">
+<body>
+    <div class="layout-grid">
         
         <!-- Левая колонка -->
-        <div class="hidden md:flex flex-col p-4 border-r border-color overflow-y-auto">
-            <div class="relative mb-6">
-                <input type="text" placeholder="Поиск" class="w-full bg-[#191b22] border border-color rounded-md py-2 px-3 text-sm focus:outline-none focus:border-[#6364ff]">
+        <div class="column">
+            <div class="md-input-wrapper">
+                <span class="material-symbols-outlined">search</span>
+                <input type="text" class="md-input" placeholder="Поиск">
             </div>
             
-            <p class="text-sm mb-4">
-                <span class="font-bold text-white">litodon</span> — это один из многих независимых серверов Mastodon, которые вы можете использовать, чтобы присоединиться к сети Fediverse.
-            </p>
+            <p><span style="font-weight:700; color:white;">litodon</span> — это один из многих независимых серверов Mastodon, которые вы можете использовать, чтобы присоединиться к сети Fediverse.</p>
             
-            <div class="w-full h-32 bg-gradient-to-r from-yellow-200 to-blue-300 rounded-lg mb-6 flex items-center justify-center overflow-hidden relative">
-                <div class="absolute inset-0 opacity-20 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PGNpcmNsZSBjeD0iMjAiIGN5PSIyMCIgcj0iMTAiIGZpbGw9IiMwMDAiIC8+PC9zdmc+')]"></div>
-                <span class="text-4xl z-10">🐘</span>
-            </div>
-
-            <p class="text-sm mb-4">Русскоязычный сервер социальной сети Mastodon. Зона общения, свободная от рекламы и шпионажа, теперь и на русском языке.</p>
-            
-            <div class="grid grid-cols-2 gap-4 text-sm mb-6">
-                <div>
-                    <div class="text-muted text-xs uppercase mb-1">Управляется:</div>
-                    <div class="font-bold">@mo</div>
-                </div>
-                <div>
-                    <div class="text-muted text-xs uppercase mb-1">Статистика сервера:</div>
-                    <div class="font-bold">686 <span class="font-normal text-muted text-xs">активные пользователи</span></div>
-                </div>
+            <div class="placeholder-img">
+                <!-- SVG иллюстрация (замена эмодзи) -->
+                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" fill="rgba(0,0,0,0.2)"/>
+                    <path d="M12 6c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm0 10c-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4-1.79 4-4 4z" fill="rgba(0,0,0,0.4)"/>
+                    <path d="M12 9c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3zm0 4c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1z" fill="rgba(0,0,0,0.6)"/>
+                </svg>
             </div>
 
-            <div class="mt-auto text-xs text-muted space-y-1">
-                <p><a href="#" class="hover:underline">litodon: Об этом сервере</a> · <a href="#" class="hover:underline">Состояние сервера</a> · <a href="#" class="hover:underline">Каталог профилей</a> · <a href="#" class="hover:underline">Политика конфиденциальности</a></p>
-                <p>Litodon: <a href="#" class="hover:underline">О проекте</a> · <a href="#" class="hover:underline">Скачать приложение</a> · v1.0.0</p>
+            <p>Русскоязычный сервер социальной сети Mastodon. Зона общения, свободная от рекламы и шпионажа, теперь и на русском языке.</p>
+            
+            <div class="stats-grid">
+                <div>
+                    <div class="stat-label">Управляется:</div>
+                    <div class="stat-value">@mo</div>
+                </div>
+                <div>
+                    <div class="stat-label">Статистика сервера:</div>
+                    <div class="stat-value">686 <span class="text-muted" style="font-weight:400;">активные пользователи</span></div>
+                </div>
+            </div>
+
+            <div class="footer-links">
+                <p><a href="#">litodon: Об этом сервере</a> · <a href="#">Состояние сервера</a> · <a href="#">Каталог профилей</a> · <a href="#">Политика конфиденциальности</a></p>
+                <p>Litodon: <a href="#">О проекте</a> · <a href="#">Скачать приложение</a> · v1.0.0</p>
             </div>
         </div>
 
         <!-- Центральная колонка -->
-        <div class="col-span-1 md:col-span-2 flex flex-col border-r border-color h-full overflow-hidden">
-            <div class="p-4 border-b border-color flex justify-between items-center column-bg">
-                <h1 class="text-xl font-bold text-white md:hidden">Litodon</h1>
-                <div id="user-info" class="text-sm font-bold text-white ml-auto"></div>
-                <button id="logout-btn" onclick="logout()" class="hidden text-sm text-muted hover:text-white ml-4">Выйти</button>
+        <div class="column main-column">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                <h1 style="display:none;" id="mobile-logo">Litodon</h1>
+                <div style="display:flex; align-items:center; gap:12px; margin-left:auto;">
+                    <div id="user-info" style="font-weight:500; color:white;"></div>
+                    <button id="logout-btn" onclick="logout()" class="md-btn md-btn-text" style="display:none; width:auto;">Выйти</button>
+                </div>
             </div>
 
-            <div class="flex-1 overflow-y-auto p-4" id="main-content">
-                <!-- Форма поста (появляется после входа) -->
-                <div id="post-form-container" class="hidden mb-6 column-bg p-4 rounded-lg border border-color">
-                    <textarea id="post-content" rows="3" class="w-full bg-[#191b22] text-white p-3 rounded border border-color focus:outline-none focus:border-[#6364ff] resize-none" placeholder="Что нового?"></textarea>
-                    <div class="flex justify-end mt-2">
-                        <button onclick="submitPost()" class="accent-bg text-white px-4 py-2 rounded font-bold transition">Отправить</button>
-                    </div>
+            <!-- Форма поста -->
+            <div id="post-form-container" style="display:none; background:var(--md-surface); padding:16px; border-radius:8px; border:1px solid var(--md-border); margin-bottom:24px;">
+                <textarea id="post-content" rows="3" class="md-input" style="padding:12px; border-radius:4px; resize:none; margin-bottom:8px;" placeholder="Что нового?"></textarea>
+                <div style="display:flex; justify-content:flex-end;">
+                    <button onclick="submitPost()" class="md-btn md-btn-filled" style="width:auto;">Отправить</button>
                 </div>
+            </div>
 
-                <!-- Лента постов -->
-                <div id="timeline" class="space-y-4 hidden"></div>
+            <!-- Лента -->
+            <div id="timeline" style="display:none;"></div>
 
-                <!-- Правила сервера (видны только гостям) -->
-                <div id="rules-container" class="space-y-6">
-                    <h2 class="text-xl font-bold text-white">Подробнее</h2>
-                    
-                    <div>
-                        <h3 class="font-bold text-white mb-2">LML — про общение людей</h3>
-                        <ul class="list-disc pl-5 space-y-1 text-sm">
-                            <li>Аккаунты, предназначенные исключительно для коммерческой деятельности запрещены</li>
-                            <li>Для аккаунтов ботов/групп в профиле должен быть указан аккаунт ответственного</li>
-                            <li>Боты, которые просто пересылают контент с других сайтов должны постить вне публичных лент</li>
-                        </ul>
-                    </div>
+            <!-- Правила (для гостей) -->
+            <div id="rules-container">
+                <h2>Подробнее</h2>
+                
+                <h3>LML — про общение людей</h3>
+                <ul>
+                    <li>Аккаунты, предназначенные исключительно для коммерческой деятельности запрещены</li>
+                    <li>Для аккаунтов ботов/групп в профиле должен быть указан аккаунт ответственного</li>
+                    <li>Боты, которые просто пересылают контент с других сайтов должны постить вне публичных лент</li>
+                </ul>
 
-                    <div>
-                        <h3 class="font-bold text-white mb-2">LML — зона безопасного общения</h3>
-                        <h4 class="font-bold text-white text-sm mb-1">Не место для ненависти</h4>
-                        <p class="text-sm mb-2">Разжигание ненависти по признакам, которые люди не выбирали — полностью под запретом</p>
-                        <ul class="list-disc pl-5 space-y-1 text-sm mb-2">
-                            <li>Гомофобия, трансфобия, энифобия, и т.д</li>
-                            <li>Сексизм, расизм, нацизм, и т.д</li>
-                        </ul>
-                        <p class="text-sm">Сюда также входит одобрение/поддержка вышеупомянутых взглядов</p>
-                    </div>
+                <h3>LML — зона безопасного общения</h3>
+                <h4 style="font-size:14px; font-weight:700; margin-bottom:4px;">Не место для ненависти</h4>
+                <p style="margin-bottom:8px;">Разжигание ненависти по признакам, которые люди не выбирали — полностью под запретом</p>
+                <ul>
+                    <li>Гомофобия, трансфобия, энифобия, и т.д</li>
+                    <li>Сексизм, расизм, нацизм, и т.д</li>
+                </ul>
+                <p>Сюда также входит одобрение/поддержка вышеупомянутых взглядов</p>
 
-                    <div>
-                        <h3 class="font-bold text-white mb-2">Не место для травли</h3>
-                        <p class="text-sm mb-2">Полностью запрещено</p>
-                        <ul class="list-disc pl-5 space-y-1 text-sm">
-                            <li>Разглашение чужой конфиденциальной информации</li>
-                            <li>Преследование</li>
-                            <li>Попытки обойти блок</li>
-                            <li>Имперсонация, выдача себя за других</li>
-                        </ul>
-                    </div>
-                    
-                    <p class="text-sm">Даже если вы делаете это вне LML, это может привести к блокировке вашего аккаунта здесь.</p>
-                    <p class="text-sm">Повторяющееся агрессивное поведение, разжигание конфликтов, может занять некоторое время. Мы изучаем все поступающие жалобы.</p>
-                </div>
+                <h3 style="margin-top:24px;">Не место для травли</h3>
+                <p style="margin-bottom:8px;">Полностью запрещено</p>
+                <ul>
+                    <li>Разглашение чужой конфиденциальной информации</li>
+                    <li>Преследование</li>
+                    <li>Попытки обойти блок</li>
+                    <li>Имперсонация, выдача себя за других</li>
+                </ul>
+
+                <p style="margin-top:16px;">Даже если вы делаете это вне LML, это может привести к блокировке вашего аккаунта здесь.</p>
+                <p style="margin-top:8px;">Повторяющееся агрессивное поведение, разжигание конфликтов, может занять некоторое время. Мы изучаем все поступающие жалобы.</p>
             </div>
         </div>
 
         <!-- Правая колонка -->
-        <div class="hidden md:flex flex-col p-4 column-bg overflow-y-auto">
-            <div class="flex items-center gap-2 mb-8">
-                <div class="w-8 h-8 accent-bg rounded-md flex items-center justify-center text-white font-bold">L</div>
-                <h1 class="text-2xl font-bold text-white">litodon</h1>
+        <div class="column">
+            <div class="logo-container">
+                <div class="logo-icon">L</div>
+                <h1 style="margin:0; font-size:24px;">litodon</h1>
             </div>
 
-            <div class="mb-6">
-                <h2 class="text-sm font-bold text-muted uppercase mb-3 flex items-center gap-1">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+            <div style="margin-bottom:24px;">
+                <div style="display:flex; align-items:center; gap:4px; color:var(--md-text-muted); font-size:12px; text-transform:uppercase; font-weight:500; margin-bottom:16px;">
+                    <span class="material-symbols-outlined" style="font-size:16px;">trending_up</span>
                     Актуальное
-                </h2>
+                </div>
             </div>
 
-            <div class="mb-6">
-                <p class="font-bold text-white mb-2">Litodon — лучший способ быть в курсе всего происходящего.</p>
-                <p class="text-sm mb-4">Подписывайтесь на кого угодно в федиверсе и читайте ленту в хронологическом порядке. Никаких алгоритмов, рекламы и кликбейта.</p>
-                
-                <div id="auth-buttons" class="space-y-2">
-                    <button onclick="openModal('register')" class="w-full accent-bg text-white py-2 rounded font-bold transition">Зарегистрироваться</button>
-                    <button onclick="openModal('login')" class="w-full border border-color text-white py-2 rounded font-bold hover:bg-[#393f4f] transition">Войти</button>
-                </div>
+            <p style="font-weight:700; color:white; margin-bottom:8px;">Litodon — лучший способ быть в курсе всего происходящего.</p>
+            <p style="margin-bottom:24px;">Подписывайтесь на кого угодно в федиверсе и читайте ленту в хронологическом порядке. Никаких алгоритмов, рекламы и кликбейта.</p>
+            
+            <div id="auth-buttons" style="display:flex; flex-direction:column; gap:12px;">
+                <button onclick="openModal('register')" class="md-btn md-btn-filled">Зарегистрироваться</button>
+                <button onclick="openModal('login')" class="md-btn md-btn-outlined">Войти</button>
             </div>
         </div>
     </div>
 
     <!-- Модальное окно авторизации -->
-    <div id="auth-modal" class="hidden fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
-        <div class="column-bg p-6 rounded-lg w-full max-w-sm border border-color shadow-xl">
-            <h2 id="auth-title" class="text-xl font-bold text-white mb-4">Войти</h2>
-            <div id="auth-error" class="hidden text-red-500 text-sm mb-4"></div>
-            <input type="text" id="username" placeholder="Имя пользователя" class="w-full bg-[#191b22] text-white p-3 rounded border border-color mb-3 focus:outline-none focus:border-[#6364ff]">
-            <input type="password" id="password" placeholder="Пароль" class="w-full bg-[#191b22] text-white p-3 rounded border border-color mb-4 focus:outline-none focus:border-[#6364ff]">
-            <div class="flex justify-end gap-3">
-                <button onclick="closeModal()" class="px-4 py-2 text-muted hover:text-white transition">Отмена</button>
-                <button id="auth-submit" onclick="submitAuth()" class="accent-bg text-white px-6 py-2 rounded font-bold transition">Войти</button>
+    <div id="auth-modal" class="md-modal-overlay">
+        <div class="md-modal">
+            <h2 id="auth-title">Войти</h2>
+            <div id="auth-error" style="display:none; color:#ff5252; font-size:14px; margin-bottom:16px;"></div>
+            <div class="md-input-wrapper">
+                <input type="text" id="username" class="md-input" placeholder="Имя пользователя" style="padding-left:12px;">
+            </div>
+            <div class="md-input-wrapper">
+                <input type="password" id="password" class="md-input" placeholder="Пароль" style="padding-left:12px;">
+            </div>
+            <div class="modal-actions">
+                <button onclick="closeModal()" class="md-btn md-btn-text">Отмена</button>
+                <button id="auth-submit" onclick="submitAuth()" class="md-btn md-btn-filled" style="width:auto;">Войти</button>
             </div>
         </div>
     </div>
@@ -256,7 +461,6 @@ HTML_TEMPLATE = """
         let currentAuthMode = 'login';
         let currentUser = null;
 
-        // --- Управление интерфейсом ---
         async function checkAuth() {
             const res = await fetch('/api/me');
             const data = await res.json();
@@ -268,37 +472,40 @@ HTML_TEMPLATE = """
             const timeline = document.getElementById('timeline');
             const userInfo = document.getElementById('user-info');
             const logoutBtn = document.getElementById('logout-btn');
+            const mobileLogo = document.getElementById('mobile-logo');
 
             if (currentUser) {
-                authButtons.classList.add('hidden');
-                postForm.classList.remove('hidden');
-                rulesContainer.classList.add('hidden');
-                timeline.classList.remove('hidden');
+                authButtons.style.display = 'none';
+                postForm.style.display = 'block';
+                rulesContainer.style.display = 'none';
+                timeline.style.display = 'block';
                 userInfo.innerText = `@${currentUser}`;
-                logoutBtn.classList.remove('hidden');
+                logoutBtn.style.display = 'block';
+                mobileLogo.style.display = 'block';
                 loadPosts();
             } else {
-                authButtons.classList.remove('hidden');
-                postForm.classList.add('hidden');
-                rulesContainer.classList.remove('hidden');
-                timeline.classList.add('hidden');
+                authButtons.style.display = 'flex';
+                postForm.style.display = 'none';
+                rulesContainer.style.display = 'block';
+                timeline.style.display = 'none';
                 userInfo.innerText = '';
-                logoutBtn.classList.add('hidden');
+                logoutBtn.style.display = 'none';
+                mobileLogo.style.display = 'none';
             }
         }
 
         function openModal(mode) {
             currentAuthMode = mode;
-            document.getElementById('auth-modal').classList.remove('hidden');
+            document.getElementById('auth-modal').style.display = 'flex';
             document.getElementById('auth-title').innerText = mode === 'login' ? 'Войти' : 'Зарегистрироваться';
             document.getElementById('auth-submit').innerText = mode === 'login' ? 'Войти' : 'Создать аккаунт';
-            document.getElementById('auth-error').classList.add('hidden');
+            document.getElementById('auth-error').style.display = 'none';
             document.getElementById('username').value = '';
             document.getElementById('password').value = '';
         }
 
         function closeModal() {
-            document.getElementById('auth-modal').classList.add('hidden');
+            document.getElementById('auth-modal').style.display = 'none';
         }
 
         async function submitAuth() {
@@ -325,7 +532,7 @@ HTML_TEMPLATE = """
                 checkAuth();
             } catch (err) {
                 errorDiv.innerText = err.message;
-                errorDiv.classList.remove('hidden');
+                errorDiv.style.display = 'block';
             }
         }
 
@@ -334,7 +541,6 @@ HTML_TEMPLATE = """
             checkAuth();
         }
 
-        // --- Работа с постами ---
         async function loadPosts() {
             const res = await fetch('/api/posts');
             const posts = await res.json();
@@ -342,21 +548,21 @@ HTML_TEMPLATE = """
             timeline.innerHTML = '';
 
             if (posts.length === 0) {
-                timeline.innerHTML = '<p class="text-muted text-center py-8">Пока нет постов. Будьте первым!</p>';
+                timeline.innerHTML = '<p class="text-muted" style="text-align:center; padding:32px 0;">Пока нет постов. Будьте первым!</p>';
                 return;
             }
 
             posts.forEach(post => {
                 const date = new Date(post.timestamp).toLocaleString('ru-RU');
                 const postEl = document.createElement('div');
-                postEl.className = 'column-bg p-4 rounded-lg border border-color';
+                postEl.className = 'post-card';
                 postEl.innerHTML = `
-                    <div class="flex items-center gap-2 mb-2">
-                        <div class="w-6 h-6 accent-bg rounded-full flex items-center justify-center text-xs text-white font-bold">${post.author[0].toUpperCase()}</div>
-                        <span class="font-bold text-white">@${post.author}</span>
-                        <span class="text-muted text-xs">${date}</span>
+                    <div class="post-header">
+                        <div class="avatar">${post.author[0].toUpperCase()}</div>
+                        <span style="font-weight:700; color:white;">@${post.author}</span>
+                        <span class="text-muted">${date}</span>
                     </div>
-                    <p class="text-sm whitespace-pre-wrap">${escapeHtml(post.content)}</p>
+                    <p style="white-space:pre-wrap;">${escapeHtml(post.content)}</p>
                 `;
                 timeline.appendChild(postEl);
             });
@@ -380,14 +586,12 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Простая защита от XSS
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.innerText = text;
             return div.innerHTML;
         }
 
-        // Инициализация при загрузке
         checkAuth();
     </script>
 </body>
