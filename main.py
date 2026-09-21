@@ -1,254 +1,639 @@
-# main.py
-# litodon — лёгкая соцсеть в стиле 2015 года.
-# Запуск:  pip install fastapi uvicorn python-multipart
-#          python main.py
-#        или:  uvicorn main:app --reload
+# main.py — litodon
+# Запуск:
+#   pip install fastapi uvicorn python-multipart
+#   python main.py
 
 from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from html import escape
-import hashlib
-import secrets
-import time
+import hashlib, secrets, time, re
 from datetime import datetime
 from typing import Optional
-
+from urllib.parse import urlparse, quote
 
 app = FastAPI(title="litodon")
 
-
 # ============================================================
-#   ХРАНИЛИЩЕ (ВСЁ В ОПЕРАТИВКЕ, ПРИ ПЕРЕЗАПУСКЕ ОБНУЛЯЕТСЯ)
+#   ХРАНИЛИЩЕ (ВСЁ В ОПЕРАТИВКЕ)
 # ============================================================
 
 users: dict = {}       # username -> {"salt": str, "pw": str}
 sessions: dict = {}    # token    -> username
-posts: list = []       # список постов
+posts: list = []       # посты
 _counter = {"post": 0, "comment": 0}
+MAX_POST = 4000
 
 
-def hash_pw(password: str, salt: str) -> str:
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+def hash_pw(pw: str, salt: str) -> str:
+    return hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
 
 
 def get_user(request: Request) -> Optional[str]:
-    token = request.cookies.get("session")
-    if token and token in sessions:
-        return sessions[token]
-    return None
+    t = request.cookies.get("session")
+    return sessions.get(t) if t else None
 
 
 def fmt_time(ts: float) -> str:
-    diff = int(time.time() - ts)
-    if diff < 60:
-        return f"{diff} сек. назад"
-    if diff < 3600:
-        return f"{diff // 60} мин. назад"
-    if diff < 86400:
-        return f"{diff // 3600} ч. назад"
-    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+    d = int(time.time() - ts)
+    if d < 60:      return f"{d} сек. назад"
+    if d < 3600:    return f"{d // 60} мин. назад"
+    if d < 86400:   return f"{d // 3600} ч. назад"
+    if d < 604800:  return f"{d // 86400} дн. назад"
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
+
+
+def safe_redirect(request: Request) -> str:
+    ref = request.headers.get("referer", "")
+    if ref:
+        path = urlparse(ref).path or "/"
+        if path.startswith("/"):
+            return path
+    return "/"
 
 
 # ============================================================
-#   ОФОРМЛЕНИЕ (ЗЕЛЁНЫЙ СТИЛЬ 2015)
+#   SVG ИКОНКИ
+# ============================================================
+
+ICON_PATHS = {
+    "home":      '<path d="M8 1.5 15 7.5h-2.2V15H9.5v-4.2h-3V15H3.2V7.5H1z"/>',
+    "plus":      '<path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/>',
+    "user":      '<circle cx="8" cy="5" r="3"/><path d="M2 15c0-3.3 2.7-6 6-6s6 2.7 6 6z"/>',
+    "logout":    '<path d="M10 2h4v12h-4v-1.6h2.4V3.6H10z"/><path d="M2 7h7V4.5L13 8l-4 3.5V9H2z"/>',
+    "login":     '<path d="M6 2H2v12h4v-1.6H3.6V3.6H6z"/><path d="M14 8 10 4.5V7H3v2h7v2.5z"/>',
+    "up":        '<path d="M8 3 13 9H9.5v4h-3V9H3z"/>',
+    "down":      '<path d="M8 13 3 7h3.5V3h3v4H13z"/>',
+    "comment":   '<path d="M2 3h12v9H8l-3.2 3v-3H2z"/>',
+    "edit":      '<path d="m11 2 3 3-9 9H2v-3z"/>',
+    "trash":     '<path d="M6 1h4v1.5h4V4H2V2.5h4z"/><path d="M3.5 5.5h9V15h-9z"/>',
+    "arrow-left":'<path d="M7 3 2 8l5 5V9.5h7v-3H7z"/>',
+    "send":      '<path d="M1.5 8 14.5 1.5 8 14.5l-1.8-5z"/>',
+    "link":      '<path d="M6.5 9.5 9.5 6.5M6 4.5 7.5 3a3 3 0 0 1 4.2 0l1.3 1.3a3 3 0 0 1 0 4.2L11.5 10M10 11.5 8.5 13a3 3 0 0 1-4.2 0L3 11.7a3 3 0 0 1 0-4.2L4.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+    "image":     '<rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="5.5" cy="6.5" r="1.2"/><path d="m2.5 12 3.5-3.5 3 3 2-2 3 3" fill="none" stroke="currentColor" stroke-width="1.5"/>',
+    "code":      '<path d="M5.5 5 2 8l3.5 3M10.5 5 14 8l-3.5 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
+    "codeblock": '<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 6 3.8 8 5 10M11 6l1.2 2L11 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
+    "bold":      '<text x="8" y="12" text-anchor="middle" font-size="11" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">B</text>',
+    "italic":    '<text x="8" y="12" text-anchor="middle" font-size="11" font-style="italic" font-family="Georgia,serif" fill="currentColor">I</text>',
+    "strike":    '<text x="8" y="12" text-anchor="middle" font-size="11" font-family="Arial,sans-serif" fill="currentColor">S</text><path d="M3 8.2h10" stroke="currentColor" stroke-width="1.3"/>',
+    "h1":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H1</text>',
+    "h2":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H2</text>',
+    "h3":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H3</text>',
+    "ul":        '<circle cx="3" cy="5" r="1"/><circle cx="3" cy="8" r="1"/><circle cx="3" cy="11" r="1"/><path d="M6 5h8M6 8h8M6 11h8" stroke="currentColor" stroke-width="1.3" fill="none"/>',
+    "ol":        '<text x="3" y="6.8" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">1</text><text x="3" y="10.2" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">2</text><text x="3" y="13.6" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">3</text><path d="M6 5h8M6 8h8M6 11h8" stroke="currentColor" stroke-width="1.3" fill="none"/>',
+    "quote":     '<path d="M3 5v4h2.5L4 12M9 5v4h2.5L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+    "hr":        '<path d="M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="4" cy="4" r="0.7"/><circle cx="12" cy="12" r="0.7"/>',
+}
+
+
+def ic(name: str, size: int = 14) -> str:
+    p = ICON_PATHS.get(name, "")
+    return (f'<svg class="ic" viewBox="0 0 16 16" width="{size}" height="{size}" '
+            f'fill="currentColor" aria-hidden="true">{p}</svg>')
+
+
+# ============================================================
+#   MARKDOWN
+# ============================================================
+
+def safe_url(u: str) -> str:
+    u = u.strip()
+    if re.match(r'^(javascript|data|vbscript):', u, re.I):
+        return "#"
+    return u
+
+
+def md_inline(text: str) -> str:
+    text = escape(text)
+    stash = []
+
+    def put(html: str) -> str:
+        stash.append(html)
+        return f"\x00{len(stash) - 1}\x00"
+
+    # inline code
+    text = re.sub(r'`([^`\n]+)`', lambda m: put(f'<code>{m.group(1)}</code>'), text)
+    # images
+    text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)',
+                  lambda m: put(f'<img src="{safe_url(m.group(2))}" alt="{m.group(1)}" loading="lazy">'),
+                  text)
+    # links
+    text = re.sub(r'\[([^\]]+)\]\(([^)\s]+)\)',
+                  lambda m: put(f'<a href="{safe_url(m.group(2))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
+                  text)
+    # bare urls
+    text = re.sub(r'(?<![\w"\'=/>])(https?://[^\s<>"\'()]+)',
+                  lambda m: put(f'<a href="{safe_url(m.group(1))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
+                  text)
+
+    # bold
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', text)
+    # italic
+    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)
+    text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'<em>\1</em>', text)
+    # strike
+    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)
+
+    text = re.sub(r'\x00(\d+)\x00', lambda m: stash[int(m.group(1))], text)
+    return text
+
+
+HR_RE = re.compile(r'^((-\s*){3,}|(\*\s*){3,}|(_\s*){3,})$')
+
+
+def md_block(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    i, n = 0, len(lines)
+    in_code = False
+    code_buf, code_lang = [], ""
+    stack = []
+
+    def close_list():
+        while stack:
+            out.append(f"</{stack.pop()}>")
+
+    def is_break(s: str) -> bool:
+        if not s: return True
+        if s.startswith("```") or s.startswith("#") or s.startswith(">"): return True
+        if re.match(r'^[-*+]\s', s): return True
+        if re.match(r'^\d+\.\s', s): return True
+        if HR_RE.match(s): return True
+        return False
+
+    while i < n:
+        raw = lines[i]
+        s = raw.strip()
+
+        if s.startswith("```"):
+            if not in_code:
+                in_code = True
+                code_lang = s[3:].strip()
+                code_buf = []
+            else:
+                in_code = False
+                close_list()
+                cls = f' class="lang-{escape(code_lang)}"' if code_lang else ""
+                out.append(f'<pre><code{cls}>{escape(chr(10).join(code_buf))}</code></pre>')
+            i += 1
+            continue
+
+        if in_code:
+            code_buf.append(raw)
+            i += 1
+            continue
+
+        if not s:
+            close_list()
+            i += 1
+            continue
+
+        if HR_RE.match(s):
+            close_list()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        m = re.match(r'^(#{1,6})\s+(.+)$', s)
+        if m:
+            close_list()
+            lvl = len(m.group(1))
+            out.append(f'<h{lvl}>{md_inline(m.group(2))}</h{lvl}>')
+            i += 1
+            continue
+
+        if s.startswith(">"):
+            close_list()
+            buf = []
+            while i < n and lines[i].strip().startswith(">"):
+                buf.append(lines[i].strip()[1:].lstrip())
+                i += 1
+            out.append("<blockquote>" + "<br>".join(md_inline(x) for x in buf) + "</blockquote>")
+            continue
+
+        m = re.match(r'^[-*+]\s+(.+)$', s)
+        if m:
+            if not stack or stack[-1] != "ul":
+                close_list(); stack.append("ul"); out.append("<ul>")
+            out.append(f'<li>{md_inline(m.group(1))}</li>')
+            i += 1
+            continue
+
+        m = re.match(r'^\d+\.\s+(.+)$', s)
+        if m:
+            if not stack or stack[-1] != "ol":
+                close_list(); stack.append("ol"); out.append("<ol>")
+            out.append(f'<li>{md_inline(m.group(1))}</li>')
+            i += 1
+            continue
+
+        close_list()
+        para = [s]
+        i += 1
+        while i < n and lines[i].strip() and not is_break(lines[i].strip()):
+            para.append(lines[i].strip())
+            i += 1
+        out.append("<p>" + "<br>".join(md_inline(x) for x in para) + "</p>")
+
+    if in_code:
+        close_list()
+        out.append(f'<pre><code>{escape(chr(10).join(code_buf))}</code></pre>')
+    close_list()
+    return "".join(out)
+
+
+render_md = md_block
+
+
+# ============================================================
+#   CSS
 # ============================================================
 
 CSS = """
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
-  background: #dfeedf;
+  background: #e3efe3;
   font-family: Verdana, Geneva, Tahoma, sans-serif;
   font-size: 13px;
   color: #17381a;
   line-height: 1.45;
 }
-a { color: #2e7d32; }
-a:hover { color: #1b5e20; }
+a { color: #2e7d32; text-decoration: none; }
+a:hover { color: #1b5e20; text-decoration: underline; }
 
+.ic { vertical-align: -2px; }
+
+/* ---------- header ---------- */
 .header {
-  background: linear-gradient(#5cb860, #2e7d32);
+  background: linear-gradient(#4aa350, #2e7d32);
   border-bottom: 3px solid #1b5e20;
-  box-shadow: 0 2px 5px rgba(0,0,0,0.25);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.22);
 }
 .header-inner {
-  width: 900px; margin: 0 auto; padding: 10px 12px;
+  width: 1060px; margin: 0 auto; padding: 10px 14px;
   display: flex; align-items: center; justify-content: space-between;
 }
 .logo {
-  font-size: 30px; font-weight: bold; color: #fff; text-decoration: none;
+  font-size: 28px; font-weight: bold; color: #fff; text-decoration: none;
   letter-spacing: -1.5px;
   text-shadow: 1px 1px 0 #1b5e20, 2px 2px 4px rgba(0,0,0,0.35);
 }
+.logo:hover { text-decoration: none; color: #fff; }
 .logo span {
   color: #c8e6c9; font-size: 11px; letter-spacing: 0;
   margin-left: 8px; font-weight: normal; text-shadow: none;
   vertical-align: middle;
 }
-.auth { color: #e8f5e9; font-size: 12px; }
-.auth a { color: #fff; }
-.auth .user { margin-right: 8px; font-weight: bold; }
+.header-right { display: flex; align-items: center; gap: 8px; }
+.header-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(255,255,255,0.18); color: #fff;
+  border: 1px solid rgba(255,255,255,0.4);
+  padding: 5px 12px; border-radius: 3px; font-size: 12px; font-weight: bold;
+}
+.header-btn:hover { background: rgba(255,255,255,0.32); color: #fff; text-decoration: none; }
 
-.container { width: 900px; margin: 16px auto 40px; }
+/* ---------- layout ---------- */
+.layout {
+  width: 1060px; margin: 16px auto 30px;
+  display: flex; align-items: flex-start; gap: 14px;
+}
+.sidebar { width: 220px; flex-shrink: 0; }
+.content { flex: 1; min-width: 0; }
 
+/* ---------- sidebar ---------- */
+.side-card {
+  background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
+  margin-bottom: 10px; padding: 8px;
+  box-shadow: 0 1px 2px rgba(27,94,32,0.10);
+}
+.side-nav { padding: 4px; }
+.side-link {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: 3px;
+  color: #1b5e20; font-weight: bold; font-size: 13px;
+  text-decoration: none; cursor: pointer;
+  width: 100%; border: none; background: none;
+  font-family: inherit; text-align: left;
+}
+.side-link:hover { background: #eaf6ea; text-decoration: none; color: #1b5e20; }
+.side-link.active { background: linear-gradient(#66bb6a, #43a047); color: #fff; }
+.side-link.active .ic { color: #fff; }
+.side-form { margin: 0; padding: 0; }
+.side-link-btn { color: #6b8a6b; }
+.side-link-btn:hover { color: #c62828; background: #fdecea; }
+
+.side-user { display: flex; gap: 9px; align-items: center; }
+.avatar {
+  width: 38px; height: 38px; flex-shrink: 0;
+  background: linear-gradient(#66bb6a, #2e7d32);
+  color: #fff; font-weight: bold; font-size: 17px;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  text-shadow: 0 1px 0 rgba(0,0,0,0.25);
+  box-shadow: inset 0 -2px 4px rgba(0,0,0,0.15);
+}
+.side-username { font-weight: bold; color: #1b5e20; font-size: 14px; }
+.side-sub { font-size: 11px; color: #7a8f7a; }
+.side-btn {
+  display: block; text-align: center; padding: 6px;
+  background: linear-gradient(#66bb6a, #43a047); color: #fff;
+  border: 1px solid #2e7d32; border-radius: 3px;
+  font-weight: bold; font-size: 12px; margin-bottom: 6px;
+  text-shadow: 0 1px 0 rgba(0,0,0,0.2); text-decoration: none;
+}
+.side-btn:hover { background: linear-gradient(#7cc87f, #4caf50); color: #fff; text-decoration: none; }
+.side-btn-2 { background: linear-gradient(#f0f7f0, #dcecdc); color: #2e7d32; text-shadow: none; }
+.side-btn-2:hover { background: #eaf6ea; color: #1b5e20; }
+
+.side-stats { font-size: 12px; color: #4b6b4b; }
+.side-stat { padding: 3px 4px; }
+.side-stat b { color: #1b5e20; }
+
+/* ---------- boxes ---------- */
 .box {
-  background: #fff;
-  border: 1px solid #a5cfa5;
-  border-radius: 4px;
-  margin-bottom: 12px;
-  box-shadow: 0 1px 2px rgba(27,94,32,0.12);
-  overflow: hidden;
+  background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
+  margin-bottom: 12px; box-shadow: 0 1px 2px rgba(27,94,32,0.12);
 }
 .box-title {
   background: linear-gradient(#eaf6ea, #c8e6c9);
   border-bottom: 1px solid #a5cfa5;
-  padding: 6px 10px;
-  font-weight: bold;
-  color: #1b5e20;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
+  padding: 6px 10px; font-weight: bold; color: #1b5e20;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
 }
 .box-body { padding: 10px; }
+.empty { padding: 22px; text-align: center; color: #7a8f7a; font-size: 13px; }
+.notice { padding: 10px 12px; background: #fffbe6; border-color: #e6d98a; color: #6b5b1b; font-size: 12px; }
+.error { background: #fdecea; border: 1px solid #f0b0aa; color: #a02b22; padding: 8px 10px; border-radius: 3px; margin-bottom: 10px; font-size: 12px; }
+.page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
+.back-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; margin-bottom: 8px; }
 
-textarea, input[type=text], input[type=password] {
-  width: 100%;
-  border: 1px solid #a5cfa5;
-  border-radius: 3px;
-  padding: 6px 8px;
-  font-family: inherit;
-  font-size: 13px;
-  background: #f7fdf7;
-  color: #17381a;
-  outline: none;
-}
-textarea:focus, input:focus { border-color: #4caf50; background: #fff; }
-textarea { resize: vertical; min-height: 60px; }
-
-button, .btn {
-  background: linear-gradient(#66bb6a, #43a047);
-  border: 1px solid #2e7d32;
-  color: #fff;
-  padding: 5px 14px;
-  border-radius: 3px;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: bold;
-  text-shadow: 0 1px 0 rgba(0,0,0,0.2);
-}
-button:hover { background: linear-gradient(#7cc87f, #4caf50); }
-button:active { background: #2e7d32; }
-
-.link-btn {
-  background: none; border: none; color: #fff; text-decoration: underline;
-  cursor: pointer; font-size: 12px; padding: 0; font-weight: normal;
-  text-shadow: none;
-}
-.link-btn:hover { color: #c8e6c9; background: none; }
-
-.post { display: flex; }
+/* ---------- post ---------- */
+.post { display: flex; overflow: hidden; }
 .votes {
-  width: 56px; flex-shrink: 0;
-  background: #f3faf3;
-  border-right: 1px solid #d6ead6;
-  padding: 10px 6px;
+  width: 58px; flex-shrink: 0; background: #f3faf3;
+  border-right: 1px solid #d6ead6; padding: 10px 6px;
   display: flex; flex-direction: column; align-items: center; gap: 4px;
 }
+.vote-form { margin: 0; padding: 0; }
 .vote-btn {
-  width: 32px; height: 22px; padding: 0;
+  width: 34px; height: 24px; padding: 0;
   background: #eaf6ea; color: #2e7d32;
-  border: 1px solid #a5cfa5;
-  font-size: 11px; line-height: 1;
-  text-shadow: none;
-  border-radius: 3px;
+  border: 1px solid #a5cfa5; border-radius: 3px;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  font-family: inherit; text-shadow: none;
 }
 .vote-btn:hover { background: #c8e6c9; }
 .vote-btn.active-up { background: #43a047; color: #fff; border-color: #2e7d32; }
 .vote-btn.active-down { background: #e53935; color: #fff; border-color: #c62828; }
-.score { font-weight: bold; font-size: 14px; }
+.score { font-weight: bold; font-size: 15px; }
 .score-pos { color: #2e7d32; }
 .score-neg { color: #c62828; }
 .score-zero { color: #7a8f7a; }
 
 .post-main { flex: 1; padding: 10px 12px; min-width: 0; }
-.post-head { margin-bottom: 4px; }
+.post-head { margin-bottom: 6px; }
 .author { font-weight: bold; color: #1b5e20; }
 .time { color: #8aa38a; font-size: 11px; margin-left: 8px; }
+.edited { color: #a8c0a8; font-size: 11px; }
 .post-text { font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
-.post-foot { margin-top: 6px; font-size: 11px; color: #8aa38a; }
 
-.comments { margin-top: 8px; border-top: 1px dashed #c8e6c9; padding-top: 6px; }
-.comment { padding: 4px 0; border-bottom: 1px dotted #e0f0e0; }
+.post-actions {
+  margin-top: 8px; display: flex; gap: 4px; align-items: center; flex-wrap: wrap;
+}
+.post-act {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #6b8a6b; padding: 3px 7px;
+  border-radius: 3px; background: none; border: none;
+  cursor: pointer; font-family: inherit; text-decoration: none;
+}
+.post-act:hover { background: #eaf6ea; color: #1b5e20; text-decoration: none; }
+.post-act-danger:hover { background: #fdecea; color: #c62828; }
+.inline-form { margin: 0; padding: 0; display: inline; }
+
+/* ---------- comments ---------- */
+.comments { margin-top: 10px; border-top: 1px dashed #c8e6c9; padding-top: 6px; }
+.comments-title {
+  font-size: 11px; color: #6b8a6b; text-transform: uppercase;
+  letter-spacing: 0.5px; font-weight: bold; margin-bottom: 4px;
+  display: flex; align-items: center; gap: 5px;
+}
+.comment { padding: 6px 0; border-bottom: 1px dotted #e0f0e0; }
 .comment:last-child { border-bottom: none; }
 .c-author { font-weight: bold; color: #2e7d32; font-size: 12px; }
 .c-time { color: #9cb89c; font-size: 11px; margin-left: 6px; }
-.c-text { font-size: 12px; }
+.c-text { font-size: 12px; margin-top: 2px; }
 
 .cform { margin-top: 8px; display: flex; gap: 6px; }
-.cform input { flex: 1; }
+.cform input[type=text] { flex: 1; }
 .cform-locked { margin-top: 8px; font-size: 11px; color: #8aa38a; }
 
-.notice {
-  padding: 10px 12px; background: #fffbe6; border-color: #e6d98a;
-  color: #6b5b1b; font-size: 12px;
+/* ---------- forms / inputs ---------- */
+input[type=text], input[type=password], textarea {
+  border: 1px solid #a5cfa5; border-radius: 3px;
+  padding: 6px 8px; font-family: inherit; font-size: 13px;
+  background: #f7fdf7; color: #17381a; outline: none; width: 100%;
 }
-.empty {
-  padding: 20px; text-align: center; color: #8aa38a; font-size: 12px;
+input:focus, textarea:focus { border-color: #4caf50; background: #fff; }
+
+button, .btn-primary {
+  background: linear-gradient(#66bb6a, #43a047);
+  border: 1px solid #2e7d32; color: #fff;
+  padding: 6px 14px; border-radius: 3px; cursor: pointer;
+  font-family: inherit; font-size: 12px; font-weight: bold;
+  text-shadow: 0 1px 0 rgba(0,0,0,0.2);
+  display: inline-flex; align-items: center; gap: 5px;
 }
+button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
+button:active { background: #2e7d32; }
 
 .form-row { margin-bottom: 10px; }
 .form-row label {
   display: block; font-size: 11px; color: #4b6b4b;
   margin-bottom: 3px; font-weight: bold;
 }
-.error {
-  background: #fdecea; border: 1px solid #f0b0aa; color: #a02b22;
-  padding: 8px 10px; border-radius: 3px; margin-bottom: 10px; font-size: 12px;
+
+/* ---------- profile ---------- */
+.profile-header { display: flex; align-items: center; gap: 14px; padding: 14px 16px; }
+.avatar-big {
+  width: 64px; height: 64px; flex-shrink: 0;
+  background: linear-gradient(#66bb6a, #2e7d32);
+  color: #fff; font-weight: bold; font-size: 28px;
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  text-shadow: 0 2px 0 rgba(0,0,0,0.25);
+  box-shadow: inset 0 -3px 6px rgba(0,0,0,0.15), 0 2px 4px rgba(27,94,32,0.25);
+}
+.profile-info h2 { margin: 0 0 4px; color: #1b5e20; font-size: 20px; }
+.profile-stats { display: flex; gap: 18px; font-size: 12px; color: #4b6b4b; }
+.profile-stats b { color: #1b5e20; font-size: 14px; }
+
+/* ---------- editor ---------- */
+.editor { overflow: hidden; }
+.editor-toolbar {
+  display: flex; align-items: center; gap: 2px;
+  padding: 6px 8px; background: linear-gradient(#eaf6ea, #d9ecd9);
+  border-bottom: 1px solid #a5cfa5; flex-wrap: wrap;
+}
+.tb {
+  background: transparent; border: 1px solid transparent; color: #2e5233;
+  padding: 5px 7px; border-radius: 3px; cursor: pointer;
+  font-family: inherit; font-size: 12px; text-shadow: none;
+  display: inline-flex; align-items: center; gap: 4px;
+  min-width: 28px; justify-content: center;
+}
+.tb:hover { background: #fff; border-color: #a5cfa5; }
+.tb.active { background: #43a047; color: #fff; border-color: #2e7d32; }
+.tb-text { font-weight: bold; padding: 5px 10px; }
+.tb-sep { width: 1px; height: 20px; background: #a5cfa5; margin: 0 4px; }
+.tb-spacer { flex: 1; }
+
+.editor-body { display: flex; }
+.editor-pane { flex: 1; min-width: 0; }
+.editor-pane textarea {
+  border: none; border-radius: 0; background: #fff;
+  min-height: 320px; resize: vertical; padding: 12px 14px;
+  font-family: Consolas, Monaco, "Courier New", monospace;
+  font-size: 13px; line-height: 1.5;
+}
+.editor-pane textarea:focus { background: #fff; }
+.editor-preview {
+  border-left: 1px solid #d6ead6; background: #fafdfa;
+  padding: 12px 14px; min-height: 320px; max-height: 640px; overflow-y: auto;
+  font-family: Verdana, sans-serif; font-size: 13px;
 }
 
-.footer { text-align: center; color: #7d9c7d; font-size: 11px; padding: 20px 0 30px; }
+.editor-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; background: #f3faf3; border-top: 1px solid #a5cfa5;
+  gap: 10px; flex-wrap: wrap;
+}
+.editor-hint { font-size: 11px; color: #6b8a6b; flex: 1; min-width: 200px; }
+.editor-hint code {
+  background: #eaf6ea; border: 1px solid #d6ead6; padding: 0 4px;
+  border-radius: 2px; font-size: 11px; color: #2e7d32;
+}
+.editor-actions { display: flex; align-items: center; gap: 12px; }
+.counter { font-size: 11px; color: #7a8f7a; font-variant-numeric: tabular-nums; }
+.counter.warn { color: #c62828; font-weight: bold; }
+
+/* ---------- markdown rendered ---------- */
+.md { line-height: 1.55; }
+.md > *:first-child { margin-top: 0; }
+.md > *:last-child { margin-bottom: 0; }
+.md p { margin: 0 0 9px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  margin: 14px 0 6px; color: #1b5e20; line-height: 1.25;
+}
+.md h1 { font-size: 20px; border-bottom: 1px solid #c8e6c9; padding-bottom: 4px; }
+.md h2 { font-size: 17px; }
+.md h3 { font-size: 15px; }
+.md h4, .md h5, .md h6 { font-size: 13px; color: #2e5233; }
+.md ul, .md ol { margin: 8px 0; padding-left: 24px; }
+.md li { margin: 2px 0; }
+.md blockquote {
+  margin: 10px 0; padding: 8px 12px;
+  border-left: 3px solid #66bb6a; background: #f3faf3; color: #2e5233;
+  border-radius: 0 3px 3px 0;
+}
+.md code {
+  background: #eef6ee; border: 1px solid #d6ead6;
+  padding: 1px 5px; border-radius: 3px;
+  font-family: Consolas, Monaco, monospace; font-size: 12px; color: #1b5e20;
+}
+.md pre {
+  background: #f3faf3; border: 1px solid #d6ead6;
+  padding: 10px 12px; border-radius: 3px;
+  overflow-x: auto; margin: 10px 0;
+}
+.md pre code { background: none; border: none; padding: 0; font-size: 12px; }
+.md hr { border: none; border-top: 1px solid #c8e6c9; margin: 14px 0; }
+.md img { max-width: 100%; border-radius: 3px; margin: 6px 0; display: block; }
+.md del { color: #9cb89c; }
+.md a { color: #2e7d32; text-decoration: underline; }
+
+.footer { text-align: center; color: #7d9c7d; font-size: 11px; padding: 6px 0 30px; }
 """
 
 
-def render_page(user: Optional[str], content: str) -> str:
-    if user:
-        auth_block = (
-            f'<span class="user">&#128100; {escape(user)}</span>'
-            f'<form method="post" action="/logout" style="display:inline">'
-            f'<button class="link-btn" type="submit">Выход</button></form>'
-        )
-    else:
-        auth_block = '<a href="/login">Вход</a> &nbsp;|&nbsp; <a href="/register">Регистрация</a>'
+# ============================================================
+#   LAYOUT
+# ============================================================
 
-    return f"""<!DOCTYPE html>
+def layout(user: Optional[str], content: str, active: str = "") -> str:
+    def nav(href, icon_name, label, key):
+        cls = "side-link active" if active == key else "side-link"
+        return f'<a href="{href}" class="{cls}">{ic(icon_name, 14)}<span>{label}</span></a>'
+
+    nav_items = nav("/", "home", "Лента", "feed")
+    if user:
+        nav_items += nav("/create", "plus", "Создать пост", "create")
+        nav_items += nav(f"/u/{quote(user)}", "user", "Мой профиль", "profile")
+        nav_items += (f'<form method="post" action="/logout" class="side-form">'
+                      f'<button type="submit" class="side-link side-link-btn">'
+                      f'{ic("logout", 14)}<span>Выход</span></button></form>')
+    else:
+        nav_items += nav("/login", "login", "Вход", "login")
+        nav_items += nav("/register", "user", "Регистрация", "register")
+
+    if user:
+        my_posts = sum(1 for p in posts if p["author"] == user)
+        user_card = f'''
+        <div class="side-card">
+          <div class="side-user">
+            <div class="avatar">{escape(user[0].upper())}</div>
+            <div style="min-width:0">
+              <a href="/u/{quote(user)}" class="side-username">{escape(user)}</a>
+              <div class="side-sub">{my_posts} постов</div>
+            </div>
+          </div>
+        </div>'''
+    else:
+        user_card = '''<div class="side-card">
+          <div class="side-sub" style="margin-bottom:8px">Читать можно без входа.<br>Писать — после регистрации.</div>
+          <a href="/login" class="side-btn">Вход</a>
+          <a href="/register" class="side-btn side-btn-2">Регистрация</a>
+        </div>'''
+
+    return f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=900">
+<meta name="viewport" content="width=1060">
 <title>litodon</title>
 <style>{CSS}</style>
 </head>
 <body>
-<div class="header">
+<header class="header">
   <div class="header-inner">
     <a href="/" class="logo">litodon<span>лёгкая соцсеть</span></a>
-    <div class="auth">{auth_block}</div>
+    <div class="header-right">
+      <a href="/create" class="header-btn">{ic("plus", 14)} Новый пост</a>
+    </div>
   </div>
-</div>
-<div class="container">
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="side-card side-nav">{nav_items}</div>
+    {user_card}
+    <div class="side-card side-stats">
+      <div class="side-stat"><b>{len(posts)}</b> постов</div>
+      <div class="side-stat"><b>{len(users)}</b> участников</div>
+    </div>
+  </aside>
+  <main class="content">
 {content}
+  </main>
 </div>
-<div class="footer">litodon &copy; 2015 &middot; всё хранится в оперативной памяти</div>
+<div class="footer">litodon &copy; 2026 &middot; всё хранится в оперативной памяти</div>
 </body>
-</html>"""
+</html>'''
 
 
 # ============================================================
-#   РЕНДЕР ПОСТОВ И ЛЕНТЫ
+#   КОМПОНЕНТЫ
 # ============================================================
 
-def render_post(p: dict, user: Optional[str]) -> str:
+def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
     pid = p["id"]
     score = len(p["up"]) - len(p["down"])
     score_cls = "score-pos" if score > 0 else ("score-neg" if score < 0 else "score-zero")
@@ -256,146 +641,475 @@ def render_post(p: dict, user: Optional[str]) -> str:
     if user:
         up_cls = "vote-btn active-up" if user in p["up"] else "vote-btn"
         down_cls = "vote-btn active-down" if user in p["down"] else "vote-btn"
-        votes = f"""
-          <form method="post" action="/vote/{pid}">
-            <input type="hidden" name="value" value="up">
-            <button class="{up_cls}" title="Плюс">&#9650;</button>
-          </form>
-          <div class="score {score_cls}">{score}</div>
-          <form method="post" action="/vote/{pid}">
-            <input type="hidden" name="value" value="down">
-            <button class="{down_cls}" title="Минус">&#9660;</button>
-          </form>
-        """
+        votes = f'''
+        <form method="post" action="/vote/{pid}" class="vote-form">
+          <input type="hidden" name="value" value="up">
+          <button class="{up_cls}" title="Плюс">{ic("up", 12)}</button>
+        </form>
+        <div class="score {score_cls}">{score}</div>
+        <form method="post" action="/vote/{pid}" class="vote-form">
+          <input type="hidden" name="value" value="down">
+          <button class="{down_cls}" title="Минус">{ic("down", 12)}</button>
+        </form>'''
     else:
         votes = f'<div class="score {score_cls}">{score}</div>'
 
-    # комментарии
+    edited = ' <span class="edited">(изменено)</span>' if p.get("edited") else ""
+    body = f'<div class="post-text md">{render_md(p["text"])}</div>'
+
+    actions = []
+    if link_back:
+        actions.append(f'<a href="/p/{pid}" class="post-act">{ic("comment", 12)} {len(p["comments"])}</a>')
+    if user == p["author"]:
+        actions.append(f'<a href="/p/{pid}/edit" class="post-act">{ic("edit", 12)} Редактировать</a>')
+        actions.append(
+            f'<form method="post" action="/p/{pid}/delete" class="inline-form" '
+            f'onsubmit="return confirm(\'Удалить этот пост?\')">'
+            f'<button type="submit" class="post-act post-act-danger">'
+            f'{ic("trash", 12)} Удалить</button></form>'
+        )
+    actions_html = '<div class="post-actions">' + "".join(actions) + '</div>' if actions else ""
+
     comments_html = ""
-    if p["comments"]:
+    if link_back and p["comments"]:
         items = "".join(
             f'<div class="comment">'
-            f'<span class="c-author">{escape(c["author"])}</span>'
+            f'<a href="/u/{quote(c["author"])}" class="c-author">{escape(c["author"])}</a>'
             f'<span class="c-time">{fmt_time(c["created"])}</span>'
-            f'<div class="c-text">{escape(c["text"])}</div>'
+            f'<div class="c-text md">{render_md(c["text"])}</div>'
             f'</div>'
             for c in p["comments"]
         )
-        comments_html = f'<div class="comments">{items}</div>'
+        comments_html = (f'<div class="comments">'
+                         f'<div class="comments-title">{ic("comment", 12)} Комментарии ({len(p["comments"])})</div>'
+                         f'{items}</div>')
 
-    if user:
-        cform = (
-            f'<form method="post" action="/comment/{pid}" class="cform">'
-            f'<input type="text" name="text" maxlength="300" placeholder="Ваш комментарий..." required>'
-            f'<button type="submit">Отправить</button></form>'
-        )
-    else:
-        cform = '<div class="cform-locked"><a href="/login">Войдите</a>, чтобы оставить комментарий.</div>'
+    cform = ""
+    if link_back:
+        if user:
+            cform = (
+                f'<form method="post" action="/comment/{pid}" class="cform">'
+                f'<input type="text" name="text" maxlength="1000" '
+                f'placeholder="Ваш комментарий (markdown)..." required>'
+                f'<button type="submit" title="Отправить">{ic("send", 12)}</button></form>'
+            )
+        else:
+            cform = ('<div class="cform-locked">'
+                     '<a href="/login">Войдите</a>, чтобы оставить комментарий.</div>')
 
-    body = escape(p["text"]).replace("\n", "<br>")
-
-    return f"""
-    <div class="box post">
+    return f'''
+    <article class="box post" id="p{pid}">
       <div class="votes">{votes}</div>
       <div class="post-main">
         <div class="post-head">
-          <span class="author">{escape(p["author"])}</span>
-          <span class="time">{fmt_time(p["created"])}</span>
+          <a href="/u/{quote(p["author"])}" class="author">{escape(p["author"])}</a>
+          <span class="time">{fmt_time(p["created"])}{edited}</span>
         </div>
-        <div class="post-text">{body}</div>
-        <div class="post-foot">комментариев: {len(p["comments"])}</div>
+        {body}
+        {actions_html}
         {comments_html}
         {cform}
       </div>
-    </div>"""
+    </article>'''
 
 
-def render_feed(user: Optional[str]) -> str:
-    if user:
-        form = """
-        <div class="box">
-          <div class="box-title">Новый пост</div>
-          <div class="box-body">
-            <form method="post" action="/post">
-              <textarea name="text" maxlength="500" placeholder="Что нового?" required></textarea>
-              <div style="margin-top:8px">
-                <button type="submit">Опубликовать</button>
-              </div>
-            </form>
+def editor_view(p: Optional[dict] = None, action: str = "/create") -> str:
+    if p:
+        text_value = escape(p["text"])
+        heading = "Редактировать пост"
+        submit_label = "Сохранить"
+    else:
+        text_value = ""
+        heading = "Новый пост"
+        submit_label = "Опубликовать"
+
+    tb = lambda name, title, js: (
+        f'<button type="button" class="tb" title="{title}" onclick="{js}">{ic(name, 14)}</button>'
+    )
+
+    return f'''
+    <h1 class="page-title">{heading}</h1>
+    <div class="box editor">
+      <form method="post" action="{action}" id="post-form">
+        <div class="editor-toolbar">
+          {tb("bold",   "Жирный (Ctrl+B)",   "insertMd('**','**','жирный текст')")}
+          {tb("italic", "Курсив (Ctrl+I)",   "insertMd('*','*','курсив')")}
+          {tb("strike", "Зачёркнутый",       "insertMd('~~','~~','текст')")}
+          {tb("code",   "Код в строке",      "insertMd('`','`','код')")}
+          {tb("codeblock", "Блок кода",      "insertBlock('```\\n','\\n```')")}
+          <span class="tb-sep"></span>
+          {tb("h1", "Заголовок 1", "prefixLine('# ')")}
+          {tb("h2", "Заголовок 2", "prefixLine('## ')")}
+          {tb("h3", "Заголовок 3", "prefixLine('### ')")}
+          <span class="tb-sep"></span>
+          {tb("ul",    "Маркированный список", "prefixLine('- ')")}
+          {tb("ol",    "Нумерованный список",  "prefixLine('1. ')")}
+          {tb("quote", "Цитата",               "prefixLine('> ')")}
+          {tb("hr",    "Разделитель (---)",    "insertBlock('\\n---\\n')")}
+          <span class="tb-sep"></span>
+          {tb("link",  "Ссылка",      "insertMd('[','](https://)','текст ссылки')")}
+          {tb("image", "Изображение", "insertMd('![','](https://)','alt')")}
+          <span class="tb-spacer"></span>
+          <button type="button" class="tb tb-text" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
+        </div>
+        <div class="editor-body">
+          <div class="editor-pane">
+            <textarea id="editor" name="text" maxlength="{MAX_POST}" required
+placeholder="Напишите что-нибудь...&#10;&#10;Поддерживается markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`&#10;# Заголовок   - список   1. нумерация   > цитата&#10;--- разделитель   [ссылка](https://)   ![img](https://)">{text_value}</textarea>
           </div>
-        </div>"""
-    else:
-        form = ('<div class="box notice">'
-                'Чтобы писать посты, голосовать и комментировать — '
-                '<a href="/login">войдите</a> или <a href="/register">зарегистрируйтесь</a>. '
-                'Ленту можно читать без регистрации.'
-                '</div>')
+          <div class="editor-pane editor-preview" id="preview-wrap" style="display:none">
+            <div class="md" id="preview"></div>
+          </div>
+        </div>
+        <div class="editor-foot">
+          <div class="editor-hint">
+            <b>Markdown:</b> <code>**жирный**</code> &middot; <code>*курсив*</code> &middot;
+            <code># H1</code> &middot; <code>- список</code> &middot; <code>1. список</code> &middot;
+            <code>&gt; цитата</code> &middot; <code>`код`</code> &middot;
+            <code>```блок```</code> &middot; <code>---</code> разделитель &middot;
+            <code>[текст](url)</code> &middot; <code>![alt](url)</code>
+          </div>
+          <div class="editor-actions">
+            <span class="counter" id="counter">0 / {MAX_POST}</span>
+            <button type="submit" class="btn-primary">{ic("send", 14)} {submit_label}</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <script>{EDITOR_JS.replace("__MAX__", str(MAX_POST))}</script>'''
 
-    if not posts:
-        feed = '<div class="box empty">Пока постов нет. Будьте первым!</div>'
-    else:
-        ordered = sorted(posts, key=lambda x: x["created"], reverse=True)
-        feed = "".join(render_post(p, user) for p in ordered)
 
-    return form + feed
+EDITOR_JS = r"""
+(function(){
+  var ta = document.getElementById('editor');
+  var counter = document.getElementById('counter');
+  var previewEl = document.getElementById('preview');
+  var previewWrap = document.getElementById('preview-wrap');
+  var previewBtn = document.getElementById('preview-btn');
+  var previewOn = false;
+  var previewTimer = null;
+  var MAX = __MAX__;
+
+  function updateCounter(){
+    var n = ta.value.length;
+    counter.textContent = n + ' / ' + MAX;
+    if (n > MAX * 0.9) counter.classList.add('warn');
+    else counter.classList.remove('warn');
+  }
+
+  function schedulePreview(){
+    if (!previewOn) return;
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(runPreview, 220);
+  }
+
+  function runPreview(){
+    if (!previewOn) return;
+    var fd = new FormData();
+    fd.append('text', ta.value);
+    fetch('/api/preview', { method: 'POST', body: fd })
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        previewEl.innerHTML = j.html || '<p style="color:#8aa38a">Пусто</p>';
+      })
+      .catch(function(){});
+  }
+
+  window.togglePreview = function(){
+    previewOn = !previewOn;
+    previewWrap.style.display = previewOn ? 'block' : 'none';
+    previewBtn.classList.toggle('active', previewOn);
+    if (previewOn) runPreview();
+  };
+
+  window.insertMd = function(before, after, ph){
+    var s = ta.selectionStart, e = ta.selectionEnd;
+    var sel = ta.value.substring(s, e);
+    var ins = sel || ph || '';
+    ta.value = ta.value.substring(0, s) + before + ins + after + ta.value.substring(e);
+    if (sel){
+      ta.selectionStart = s + before.length;
+      ta.selectionEnd = s + before.length + ins.length;
+    } else {
+      ta.selectionStart = ta.selectionEnd = s + before.length + ins.length;
+    }
+    ta.focus(); updateCounter(); schedulePreview();
+  };
+
+  window.prefixLine = function(prefix){
+    var s = ta.selectionStart, e = ta.selectionEnd;
+    var before = ta.value.substring(0, s);
+    var lineStart = before.lastIndexOf('\n') + 1;
+    var afterSel = ta.value.substring(e);
+    var nl = afterSel.indexOf('\n');
+    var lineEnd = nl === -1 ? ta.value.length : e + nl;
+    var block = ta.value.substring(lineStart, lineEnd);
+    var lines = block.split('\n');
+    var nb = lines.map(function(l){ return prefix + l; }).join('\n');
+    ta.value = ta.value.substring(0, lineStart) + nb + ta.value.substring(lineEnd);
+    ta.selectionStart = lineStart;
+    ta.selectionEnd = lineStart + nb.length;
+    ta.focus(); updateCounter(); schedulePreview();
+  };
+
+  window.insertBlock = function(before, after){
+    var s = ta.selectionStart, e = ta.selectionEnd;
+    var sel = ta.value.substring(s, e);
+    var ins = before + sel + after;
+    ta.value = ta.value.substring(0, s) + ins + ta.value.substring(e);
+    ta.selectionStart = ta.selectionEnd = s + ins.length;
+    ta.focus(); updateCounter(); schedulePreview();
+  };
+
+  ta.addEventListener('input', function(){ updateCounter(); schedulePreview(); });
+  ta.addEventListener('keydown', function(ev){
+    if (ev.key === 'Tab'){
+      ev.preventDefault();
+      window.insertMd('  ', '', '');
+      return;
+    }
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'b'){
+      ev.preventDefault(); window.insertMd('**','**','жирный текст'); return;
+    }
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'i'){
+      ev.preventDefault(); window.insertMd('*','*','курсив'); return;
+    }
+  });
+
+  updateCounter();
+})();
+"""
 
 
-def render_login(err: Optional[str] = None) -> str:
+def login_view(err: Optional[str] = None) -> str:
     err_html = f'<div class="error">{escape(err)}</div>' if err else ""
-    return f"""
-    <div class="box" style="width:400px;margin:0 auto;">
+    return f'''
+    <div class="box" style="max-width:420px;margin:0 auto;">
       <div class="box-title">Вход</div>
       <div class="box-body">
         {err_html}
         <form method="post" action="/login">
           <div class="form-row"><label>Имя пользователя</label>
-            <input type="text" name="username" required autofocus></div>
+            <input type="text" name="username" required autofocus maxlength="20"></div>
           <div class="form-row"><label>Пароль</label>
             <input type="password" name="password" required></div>
-          <button type="submit">Войти</button>
+          <button type="submit">{ic("login", 14)} Войти</button>
         </form>
         <p style="font-size:12px;margin-bottom:0">Нет аккаунта? <a href="/register">Зарегистрироваться</a></p>
       </div>
-    </div>"""
+    </div>'''
 
 
-def render_register(err: Optional[str] = None) -> str:
+def register_view(err: Optional[str] = None) -> str:
     err_html = f'<div class="error">{escape(err)}</div>' if err else ""
-    return f"""
-    <div class="box" style="width:400px;margin:0 auto;">
+    return f'''
+    <div class="box" style="max-width:420px;margin:0 auto;">
       <div class="box-title">Регистрация</div>
       <div class="box-body">
         {err_html}
         <form method="post" action="/register">
-          <div class="form-row"><label>Имя пользователя (от 3 символов)</label>
+          <div class="form-row"><label>Имя пользователя (3–20 символов)</label>
             <input type="text" name="username" required autofocus maxlength="20"></div>
           <div class="form-row"><label>Пароль (от 4 символов)</label>
             <input type="password" name="password" required></div>
-          <button type="submit">Создать аккаунт</button>
+          <button type="submit">{ic("user", 14)} Создать аккаунт</button>
         </form>
         <p style="font-size:12px;margin-bottom:0">Уже есть аккаунт? <a href="/login">Войти</a></p>
       </div>
-    </div>"""
+    </div>'''
 
 
 # ============================================================
-#   МАРШРУТЫ
+#   РОУТЫ
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     user = get_user(request)
-    return render_page(user, render_feed(user))
+    if not posts:
+        feed = ('<div class="box empty">Постов пока нет. '
+                + ('<a href="/create">Создайте первый!</a>' if user else 'Загляните позже.')
+                + '</div>')
+    else:
+        ordered = sorted(posts, key=lambda x: x["created"], reverse=True)
+        feed = "".join(post_card(p, user) for p in ordered)
+
+    hint = ""
+    if not user:
+        hint = ('<div class="box notice">Читать можно без регистрации. '
+                '<a href="/login">Войдите</a> или <a href="/register">зарегистрируйтесь</a>, '
+                'чтобы писать посты, голосовать и комментировать.</div>')
+
+    return layout(user, '<h1 class="page-title">Лента</h1>' + hint + feed, active="feed")
 
 
-# ---------- регистрация ----------
+# ---------- создание ----------
+
+@app.get("/create", response_class=HTMLResponse)
+def create_page(request: Request):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    return layout(user, editor_view(), active="create")
+
+
+@app.post("/create")
+def create_post(request: Request, text: str = Form(...)):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    text = text.strip()
+    if text:
+        _counter["post"] += 1
+        pid = _counter["post"]
+        posts.append({
+            "id": pid, "author": user, "text": text[:MAX_POST],
+            "created": time.time(), "edited": None,
+            "up": set(), "down": set(), "comments": [],
+        })
+        return RedirectResponse(f"/p/{pid}", status_code=303)
+    return RedirectResponse("/create", status_code=303)
+
+
+# ---------- просмотр поста ----------
+
+@app.get("/p/{post_id}", response_class=HTMLResponse)
+def post_page(post_id: int, request: Request):
+    user = get_user(request)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    if not p:
+        return HTMLResponse(layout(user, '<div class="box empty">Пост не найден. <a href="/">На главную</a></div>'),
+                            status_code=404)
+    back = f'<a href="/" class="back-link">{ic("arrow-left", 14)} Назад к ленте</a>'
+    return layout(user, back + post_card(p, user), active="feed")
+
+
+# ---------- редактирование ----------
+
+@app.get("/p/{post_id}/edit", response_class=HTMLResponse)
+def edit_page(post_id: int, request: Request):
+    user = get_user(request)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    if not p:
+        return HTMLResponse(layout(user, '<div class="box empty">Пост не найден.</div>'), status_code=404)
+    if user != p["author"]:
+        return RedirectResponse(f"/p/{post_id}", status_code=303)
+    back = f'<a href="/p/{post_id}" class="back-link">{ic("arrow-left", 14)} Назад к посту</a>'
+    return layout(user, back + editor_view(p, action=f"/p/{post_id}/edit"), active="feed")
+
+
+@app.post("/p/{post_id}/edit")
+def edit_post(post_id: int, request: Request, text: str = Form(...)):
+    user = get_user(request)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    if not p or user != p["author"]:
+        return RedirectResponse("/", status_code=303)
+    text = text.strip()
+    if text:
+        p["text"] = text[:MAX_POST]
+        p["edited"] = time.time()
+    return RedirectResponse(f"/p/{post_id}", status_code=303)
+
+
+@app.post("/p/{post_id}/delete")
+def delete_post(post_id: int, request: Request):
+    user = get_user(request)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    if p and user == p["author"]:
+        posts.remove(p)
+        return RedirectResponse("/", status_code=303)
+    return RedirectResponse(f"/p/{post_id}", status_code=303)
+
+
+# ---------- профиль ----------
+
+@app.get("/u/{username}", response_class=HTMLResponse)
+def profile(username: str, request: Request):
+    user = get_user(request)
+    if username not in users:
+        return HTMLResponse(
+            layout(user, f'<div class="box empty">Пользователь «{escape(username)}» не найден. '
+                         f'<a href="/">На главную</a></div>'),
+            status_code=404)
+    user_posts = sorted([p for p in posts if p["author"] == username],
+                        key=lambda x: x["created"], reverse=True)
+    karma = sum(len(p["up"]) - len(p["down"]) for p in user_posts)
+
+    header = f'''
+    <div class="box profile-header">
+      <div class="avatar-big">{escape(username[0].upper())}</div>
+      <div class="profile-info">
+        <h2>{escape(username)}</h2>
+        <div class="profile-stats">
+          <span><b>{len(user_posts)}</b> постов</span>
+          <span><b>{karma}</b> кармы</span>
+        </div>
+      </div>
+    </div>'''
+
+    if not user_posts:
+        feed = '<div class="box empty">Постов пока нет.</div>'
+    else:
+        feed = "".join(post_card(p, user) for p in user_posts)
+    return layout(user, header + feed, active="profile")
+
+
+# ---------- голосование ----------
+
+@app.post("/vote/{post_id}")
+def vote(post_id: int, request: Request, value: str = Form(...)):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    if p:
+        if value == "up":
+            if user in p["up"]:
+                p["up"].discard(user)
+            else:
+                p["up"].add(user); p["down"].discard(user)
+        elif value == "down":
+            if user in p["down"]:
+                p["down"].discard(user)
+            else:
+                p["down"].add(user); p["up"].discard(user)
+    return RedirectResponse(safe_redirect(request), status_code=303)
+
+
+# ---------- комментарии ----------
+
+@app.post("/comment/{post_id}")
+def add_comment(post_id: int, request: Request, text: str = Form(...)):
+    user = get_user(request)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    p = next((x for x in posts if x["id"] == post_id), None)
+    text = text.strip()
+    if p and text:
+        _counter["comment"] += 1
+        p["comments"].append({
+            "id": _counter["comment"],
+            "author": user,
+            "text": text[:1000],
+            "created": time.time(),
+        })
+    return RedirectResponse(safe_redirect(request), status_code=303)
+
+
+# ---------- markdown preview API ----------
+
+@app.post("/api/preview")
+def api_preview(text: str = Form("")):
+    return JSONResponse({"html": render_md(text[:MAX_POST])})
+
+
+# ---------- auth ----------
 
 @app.get("/register", response_class=HTMLResponse)
 def register_page(request: Request):
-    user = get_user(request)
-    if user:
+    if get_user(request):
         return RedirectResponse("/", status_code=303)
-    return render_page(None, render_register())
+    return layout(None, register_view(), active="register")
 
 
 @app.post("/register")
@@ -408,34 +1122,32 @@ def register_post(request: Request,
         err = "Имя пользователя — минимум 3 символа."
     elif len(username) > 20:
         err = "Имя пользователя — максимум 20 символов."
-    elif " " in username:
-        err = "Имя пользователя не должно содержать пробелов."
+    elif " " in username or "/" in username:
+        err = "Имя пользователя не должно содержать пробелов и слэшей."
+    elif not re.match(r'^[A-Za-z0-9_\-\.\u0400-\u04FF]+$', username):
+        err = "Разрешены буквы, цифры, _, -, ."
     elif len(password) < 4:
         err = "Пароль — минимум 4 символа."
     elif username in users:
         err = "Такое имя уже занято."
 
     if err:
-        return render_page(None, render_register(err))
+        return layout(None, register_view(err), active="register")
 
     salt = secrets.token_hex(8)
     users[username] = {"salt": salt, "pw": hash_pw(password, salt)}
-
     token = secrets.token_hex(24)
     sessions[token] = username
     resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30)
+    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30, samesite="lax")
     return resp
 
 
-# ---------- вход / выход ----------
-
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
-    user = get_user(request)
-    if user:
+    if get_user(request):
         return RedirectResponse("/", status_code=303)
-    return render_page(None, render_login())
+    return layout(None, login_view(), active="login")
 
 
 @app.post("/login")
@@ -445,12 +1157,11 @@ def login_post(request: Request,
     username = username.strip()
     acc = users.get(username)
     if not acc or acc["pw"] != hash_pw(password, acc["salt"]):
-        return render_page(None, render_login("Неверное имя пользователя или пароль."))
-
+        return layout(None, login_view("Неверное имя пользователя или пароль."), active="login")
     token = secrets.token_hex(24)
     sessions[token] = username
     resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30)
+    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30, samesite="lax")
     return resp
 
 
@@ -462,77 +1173,6 @@ def logout(request: Request):
     resp = RedirectResponse("/", status_code=303)
     resp.delete_cookie("session")
     return resp
-
-
-# ---------- создание поста ----------
-
-@app.post("/post")
-def create_post(request: Request, text: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    text = text.strip()
-    if text:
-        _counter["post"] += 1
-        posts.append({
-            "id": _counter["post"],
-            "author": user,
-            "text": text[:500],
-            "created": time.time(),
-            "up": set(),
-            "down": set(),
-            "comments": [],
-        })
-    return RedirectResponse("/", status_code=303)
-
-
-# ---------- голосование ----------
-
-@app.post("/vote/{post_id}")
-def vote(post_id: int, request: Request, value: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    post = next((p for p in posts if p["id"] == post_id), None)
-    if post:
-        if value == "up":
-            if user in post["up"]:
-                post["up"].discard(user)
-            else:
-                post["up"].add(user)
-                post["down"].discard(user)
-        elif value == "down":
-            if user in post["down"]:
-                post["down"].discard(user)
-            else:
-                post["down"].add(user)
-                post["up"].discard(user)
-
-    return RedirectResponse("/", status_code=303)
-
-
-# ---------- комментарии ----------
-
-@app.post("/comment/{post_id}")
-def add_comment(post_id: int, request: Request, text: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    post = next((p for p in posts if p["id"] == post_id), None)
-    text = text.strip()
-    if post and text:
-        _counter["comment"] += 1
-        post["comments"].append({
-            "id": _counter["comment"],
-            "author": user,
-            "text": text[:300],
-            "created": time.time(),
-        })
-
-    return RedirectResponse("/", status_code=303)
 
 
 # ============================================================
