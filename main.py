@@ -1,1158 +1,905 @@
-# main.py — litodon
-# Запуск:
-#   pip install fastapi uvicorn python-multipart
-#   python main.py
+# main.py
+# Мини-чат в стиле IRC на FastAPI + WebSocket.
+# Всё в памяти, ничего не создаёт на диске.
+# Запуск:  python main.py
+# Админ:    admin / admin
 
-import secrets, time, re
+import hashlib
+import html
+import secrets
+import time
 from datetime import datetime
-from html import escape
-from urllib.parse import urlparse
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+import uvicorn
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-app = FastAPI(title="litodon")
+# ────────────────────────────────────────────────────────────
+#  ХРАНИЛИЩЕ (in-memory)
+# ────────────────────────────────────────────────────────────
 
-# ============================================================
-#   ХРАНИЛИЩЕ (В ОПЕРАТИВКЕ)
-# ============================================================
+USERS: Dict[str, dict] = {}
+SESSIONS: Dict[str, str] = {}            # token -> username
+CHANNELS: Dict[str, dict] = {}           # name -> {topic}
+MESSAGES: Dict[str, List[dict]] = {}     # channel -> [msg]
+WS_CONNECTIONS: Dict[str, Dict[WebSocket, str]] = {}  # channel -> {ws: username}
 
-sessions: dict = {}    # sid -> {"id": int}
-posts: list = []
-_counter = {"post": 0, "comment": 0, "anon": 0}
-MAX_POST = 4000            # лимит «осмысленного» текста
-MAX_RAW  = 8_000_000       # жёсткий потолок сырой длины (≈6 МБ картинки в base64)
-
-
-@app.middleware("http")
-async def anon_middleware(request: Request, call_next):
-    token = request.cookies.get("sid")
-    created = False
-    if not token or token not in sessions:
-        token = secrets.token_hex(16)
-        _counter["anon"] += 1
-        sessions[token] = {"id": _counter["anon"]}
-        created = True
-    request.state.anon = sessions[token]
-    request.state.token = token
-    response = await call_next(request)
-    if created:
-        response.set_cookie("sid", token, httponly=True,
-                            max_age=60 * 60 * 24 * 365, samesite="lax")
-    return response
-
-
-def fmt_time(ts: float) -> str:
-    d = int(time.time() - ts)
-    if d < 60:      return f"{d} сек. назад"
-    if d < 3600:    return f"{d // 60} мин. назад"
-    if d < 86400:   return f"{d // 3600} ч. назад"
-    if d < 604800:  return f"{d // 86400} дн. назад"
-    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
-
-
-def safe_redirect(request: Request) -> str:
-    ref = request.headers.get("referer", "")
-    if ref:
-        path = urlparse(ref).path or "/"
-        if path.startswith("/"):
-            return path
-    return "/"
-
-
-# ============================================================
-#   BASE64 КАРТИНКИ
-# ============================================================
-
-# полный payload data:image/...;base64,....
-B64_PAYLOAD_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+')
-# строгая проверка URL (без пробелов)
-B64_URL_RE = re.compile(r'^data:image/(png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=]+$', re.I)
-
-
-def effective_length(text: str) -> int:
-    """Длина текста без учёта base64-картинок."""
-    return len(B64_PAYLOAD_RE.sub('data:image/...;base64,...', text))
-
-
-def clean_data_url(u: str) -> str:
-    return re.sub(r'\s+', '', u)
-
-
-# ============================================================
-#   SVG ИКОНКИ
-# ============================================================
-
-ICON_PATHS = {
-    "home":      '<path d="M8 1.5 15 7.5h-2.2V15H9.5v-4.2h-3V15H3.2V7.5H1z"/>',
-    "plus":      '<path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/>',
-    "up":        '<path d="M8 3 13 9H9.5v4h-3V9H3z"/>',
-    "down":      '<path d="M8 13 3 7h3.5V3h3v4H13z"/>',
-    "comment":   '<path d="M2 3h12v9H8l-3.2 3v-3H2z"/>',
-    "edit":      '<path d="m11 2 3 3-9 9H2v-3z"/>',
-    "trash":     '<path d="M6 1h4v1.5h4V4H2V2.5h4z"/><path d="M3.5 5.5h9V15h-9z"/>',
-    "arrow-left":'<path d="M7 3 2 8l5 5V9.5h7v-3H7z"/>',
-    "send":      '<path d="M1.5 8 14.5 1.5 8 14.5l-1.8-5z"/>',
-    "link":      '<path d="M6.5 9.5 9.5 6.5M6 4.5 7.5 3a3 3 0 0 1 4.2 0l1.3 1.3a3 3 0 0 1 0 4.2L11.5 10M10 11.5 8.5 13a3 3 0 0 1-4.2 0L3 11.7a3 3 0 0 1 0-4.2L4.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
-    "image":     '<rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="5.5" cy="6.5" r="1.2"/><path d="m2.5 12 3.5-3.5 3 3 2-2 3 3" fill="none" stroke="currentColor" stroke-width="1.5"/>',
-    "upload":    '<path d="M8 11V3M4.5 6.5 8 3l3.5 3.5M2 13h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
-    "code":      '<path d="M5.5 5 2 8l3.5 3M10.5 5 14 8l-3.5 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
-    "codeblock": '<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 6 3.8 8 5 10M11 6l1.2 2L11 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
-    "bold":      '<text x="8" y="12" text-anchor="middle" font-size="11" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">B</text>',
-    "italic":    '<text x="8" y="12" text-anchor="middle" font-size="11" font-style="italic" font-family="Georgia,serif" fill="currentColor">I</text>',
-    "strike":    '<text x="8" y="12" text-anchor="middle" font-size="11" font-family="Arial,sans-serif" fill="currentColor">S</text><path d="M3 8.2h10" stroke="currentColor" stroke-width="1.3"/>',
-    "h1":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H1</text>',
-    "h2":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H2</text>',
-    "h3":        '<text x="8" y="12" text-anchor="middle" font-size="9" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">H3</text>',
-    "ul":        '<circle cx="3" cy="5" r="1"/><circle cx="3" cy="8" r="1"/><circle cx="3" cy="11" r="1"/><path d="M6 5h8M6 8h8M6 11h8" stroke="currentColor" stroke-width="1.3" fill="none"/>',
-    "ol":        '<text x="3" y="6.8" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">1</text><text x="3" y="10.2" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">2</text><text x="3" y="13.6" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">3</text><path d="M6 5h8M6 8h8M6 11h8" stroke="currentColor" stroke-width="1.3" fill="none"/>',
-    "quote":     '<path d="M3 5v4h2.5L4 12M9 5v4h2.5L10 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-    "hr":        '<path d="M2 8h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="4" cy="4" r="0.7"/><circle cx="12" cy="12" r="0.7"/>',
-    "table":     '<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M1.5 6h13M1.5 9.5h13M5.5 2.5v11M10.5 2.5v11" stroke="currentColor" stroke-width="1.2" fill="none"/>',
-    "task":      '<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m5 8 2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
-    "highlight": '<path d="M3 13h10M4 11 9 6l3 3-5 5H4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-    "spoiler":   '<path d="M1.5 8s2.5-4 6.5-4 6.5 4 6.5 4-2.5 4-6.5 4S1.5 8 1.5 8z" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="m2 14 12-12" stroke="currentColor" stroke-width="1.4"/>',
-    "sup":       '<text x="8" y="11" text-anchor="middle" font-size="9" font-family="Arial" fill="currentColor">x</text><text x="12" y="7" text-anchor="middle" font-size="6" font-family="Arial" fill="currentColor">2</text>',
-    "emoji":     '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="6" cy="6.5" r="0.8" fill="currentColor"/><circle cx="10" cy="6.5" r="0.8" fill="currentColor"/><path d="M5.5 9.5c.7 1 1.5 1.5 2.5 1.5s1.8-.5 2.5-1.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>',
+CONFIG = {
+    "server_name": "MiniChat",
+    "motd": "Добро пожаловать в MiniChat!",
+    "max_msg_len": 500,
+    "allow_registration": True,
 }
 
 
-def ic(name: str, size: int = 14) -> str:
-    p = ICON_PATHS.get(name, "")
-    return (f'<svg class="ic" viewBox="0 0 16 16" width="{size}" height="{size}" '
-            f'fill="currentColor" aria-hidden="true">{p}</svg>')
+def hash_pw(p: str) -> str:
+    return hashlib.sha256(p.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-#   MARKDOWN
-# ============================================================
-
-EMOJI = {
-    "smile": "😊", "grin": "😁", "joy": "😂", "laugh": "😆", "wink": "😉",
-    "heart": "❤️", "thumbsup": "👍", "+1": "👍", "thumbsdown": "👎", "-1": "👎",
-    "fire": "🔥", "star": "⭐", "rocket": "🚀", "check": "✅", "x": "❌",
-    "warning": "⚠️", "info": "ℹ️", "question": "❓", "bulb": "💡", "idea": "💡",
-    "cry": "😢", "angry": "😠", "cool": "😎", "wave": "👋", "clap": "👏",
-    "ok": "👌", "pray": "🙏", "eyes": "👀", "cat": "🐱", "dog": "🐶",
-    "sun": "☀️", "moon": "🌙", "zap": "⚡", "sparkles": "✨", "tada": "🎉",
-    "coffee": "☕", "pizza": "🍕", "beer": "🍺", "gift": "🎁", "lock": "🔒",
-    "key": "🔑", "book": "📖", "pencil": "✏️", "memo": "📝", "chart": "📊",
-    "bug": "🐛", "ghost": "👻", "skull": "💀", "alien": "👽", "robot": "🤖",
-}
-
-
-def safe_url(u: str) -> str:
-    u = u.strip()
-    # разрешаем data:image/* (только растровые, без svg — там может быть JS)
-    if B64_URL_RE.match(u):
-        return u
-    if re.match(r'^(javascript|data|vbscript):', u, re.I):
-        return "#"
-    return u
-
-
-def md_inline(text: str) -> str:
-    text = escape(text)
-    stash = []
-
-    def put(html: str) -> str:
-        stash.append(html)
-        return f"\x00{len(stash) - 1}\x00"
-
-    # 1) код
-    text = re.sub(r'`([^`\n]+)`', lambda m: put(f'<code>{m.group(1)}</code>'), text)
-
-    # 2) base64-изображения — обрабатываем ДО обычного image, т.к. payload длинный и может содержать переносы
-    text = re.sub(
-        r'!\[([^\]]*)\]\(\s*(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+)\s*\)',
-        lambda m: put(f'<img src="{safe_url(clean_data_url(m.group(2)))}" alt="{m.group(1)}" loading="lazy">'),
-        text)
-
-    # 3) обычные изображения и ссылки
-    text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)',
-                  lambda m: put(f'<img src="{safe_url(m.group(2))}" alt="{m.group(1)}" loading="lazy">'),
-                  text)
-    text = re.sub(r'\[([^\]]+)\]\(([^)\s]+)\)',
-                  lambda m: put(f'<a href="{safe_url(m.group(2))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
-                  text)
-    text = re.sub(r'(?<![\w"\'=/>])(https?://[^\s<>"\'()]+)',
-                  lambda m: put(f'<a href="{safe_url(m.group(1))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
-                  text)
-
-    # 4) emoji
-    text = re.sub(r':([a-z0-9_+\-]+):',
-                  lambda m: EMOJI.get(m.group(1), m.group(0)), text)
-
-    # 5) оформление
-    text = re.sub(r'==(.+?)==', r'<mark>\1</mark>', text)
-    text = re.sub(r'\|\|(.+?)\|\|', r'<span class="spoiler">\1</span>', text)
-    text = re.sub(r'\^([^\s^][^^\n]*?)\^', r'<sup>\1</sup>', text)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
-    text = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', text)
-    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)
-    text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'<em>\1</em>', text)
-    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)
-
-    text = re.sub(r'\x00(\d+)\x00', lambda m: stash[int(m.group(1))], text)
-    return text
-
-
-HR_RE = re.compile(r'^((-\s*){3,}|(\*\s*){3,}|(_\s*){3,})$')
-TABLE_SEP_RE = re.compile(r'^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$')
-
-
-def _parse_table(lines, i, n, out, close_list):
-    header_line = lines[i].strip()
-    headers = [c.strip() for c in header_line.strip("|").split("|")]
-    i += 2
-    rows = []
-    while i < n and lines[i].strip() and "|" in lines[i]:
-        rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
-        i += 1
-    close_list()
-    html = ["<table><thead><tr>"]
-    for h in headers:
-        html.append(f"<th>{md_inline(h)}</th>")
-    html.append("</tr></thead><tbody>")
-    for row in rows:
-        html.append("<tr>")
-        for j in range(len(headers)):
-            cell = row[j] if j < len(row) else ""
-            html.append(f"<td>{md_inline(cell)}</td>")
-        html.append("</tr>")
-    html.append("</tbody></table>")
-    out.append("".join(html))
-    return i
-
-
-def md_block(text: str) -> str:
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    out = []
-    i, n = 0, len(lines)
-    in_code = False
-    code_buf, code_lang = [], ""
-    stack = []
-
-    def close_list():
-        while stack:
-            out.append(f"</{stack.pop()}>")
-
-    def is_break(s: str) -> bool:
-        if not s: return True
-        if s.startswith("```") or s.startswith("#") or s.startswith(">"): return True
-        if re.match(r'^[-*+]\s', s): return True
-        if re.match(r'^\d+\.\s', s): return True
-        if HR_RE.match(s): return True
-        if "|" in s: return True
+def add_channel(name: str, topic: str = "") -> bool:
+    name = name.strip().lower().replace(" ", "-")
+    if not name or name in CHANNELS:
         return False
-
-    while i < n:
-        raw = lines[i]
-        s = raw.strip()
-
-        if s.startswith("```"):
-            if not in_code:
-                in_code = True
-                code_lang = s[3:].strip()
-                code_buf = []
-            else:
-                in_code = False
-                close_list()
-                cls = f' class="lang-{escape(code_lang)}"' if code_lang else ""
-                out.append(f'<pre><code{cls}>{escape(chr(10).join(code_buf))}</code></pre>')
-            i += 1
-            continue
-
-        if in_code:
-            code_buf.append(raw)
-            i += 1
-            continue
-
-        if not s:
-            close_list()
-            i += 1
-            continue
-
-        if HR_RE.match(s):
-            close_list()
-            out.append("<hr>")
-            i += 1
-            continue
-
-        if "|" in s and i + 1 < n:
-            nxt = lines[i + 1].strip()
-            if TABLE_SEP_RE.match(nxt):
-                i = _parse_table(lines, i, n, out, close_list)
-                continue
-
-        m = re.match(r'^(#{1,6})\s+(.+)$', s)
-        if m:
-            close_list()
-            lvl = len(m.group(1))
-            out.append(f'<h{lvl}>{md_inline(m.group(2))}</h{lvl}>')
-            i += 1
-            continue
-
-        if s.startswith(">"):
-            close_list()
-            buf = []
-            while i < n and lines[i].strip().startswith(">"):
-                buf.append(lines[i].strip()[1:].lstrip())
-                i += 1
-            out.append("<blockquote>" + "<br>".join(md_inline(x) for x in buf) + "</blockquote>")
-            continue
-
-        m = re.match(r'^[-*+]\s+\[([ xX])\]\s+(.+)$', s)
-        if m:
-            if not stack or stack[-1] != "task":
-                close_list(); stack.append("task"); out.append('<ul class="task-list">')
-            checked = " checked" if m.group(1).lower() == "x" else ""
-            out.append(f'<li><input type="checkbox" disabled{checked}><span>{md_inline(m.group(2))}</span></li>')
-            i += 1
-            continue
-
-        m = re.match(r'^[-*+]\s+(.+)$', s)
-        if m:
-            if not stack or stack[-1] != "ul":
-                close_list(); stack.append("ul"); out.append("<ul>")
-            out.append(f'<li>{md_inline(m.group(1))}</li>')
-            i += 1
-            continue
-
-        m = re.match(r'^\d+\.\s+(.+)$', s)
-        if m:
-            if not stack or stack[-1] != "ol":
-                close_list(); stack.append("ol"); out.append("<ol>")
-            out.append(f'<li>{md_inline(m.group(1))}</li>')
-            i += 1
-            continue
-
-        close_list()
-        para = [s]
-        i += 1
-        while i < n and lines[i].strip() and not is_break(lines[i].strip()):
-            para.append(lines[i].strip())
-            i += 1
-        out.append("<p>" + "<br>".join(md_inline(x) for x in para) + "</p>")
-
-    if in_code:
-        close_list()
-        out.append(f'<pre><code>{escape(chr(10).join(code_buf))}</code></pre>')
-    close_list()
-    return "".join(out)
+    CHANNELS[name] = {"topic": topic or "Без описания"}
+    MESSAGES[name] = []
+    return True
 
 
-render_md = md_block
+# стартовые каналы
+add_channel("general", "Общий чат")
+add_channel("random", "Всякое")
+
+# админ
+USERS["admin"] = {
+    "password": hash_pw("admin"),
+    "is_admin": True,
+    "joined": time.time(),
+    "banned": False,
+}
 
 
-# ============================================================
-#   CSS
-# ============================================================
+# ────────────────────────────────────────────────────────────
+#  ХЕЛПЕРЫ
+# ────────────────────────────────────────────────────────────
+
+def current_user(request: Request) -> Optional[str]:
+    token = request.cookies.get("session")
+    if token and token in SESSIONS:
+        return SESSIONS[token]
+    return None
+
+
+def current_user_ws(ws: WebSocket) -> Optional[str]:
+    token = ws.cookies.get("session")
+    if token and token in SESSIONS:
+        return SESSIONS[token]
+    return None
+
+
+async def broadcast(channel: str, payload: dict):
+    conns = WS_CONNECTIONS.get(channel, {})
+    dead = []
+    for ws in list(conns.keys()):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        conns.pop(ws, None)
+
+
+async def send_users(channel: str):
+    conns = WS_CONNECTIONS.get(channel, {})
+    users = sorted(set(conns.values()))
+    await broadcast(channel, {"type": "users", "users": users})
+
+
+def redirect(path: str) -> RedirectResponse:
+    return RedirectResponse(path, status_code=303)
+
+
+# ────────────────────────────────────────────────────────────
+#  SVG-ИКОНКИ (feather-style)
+# ────────────────────────────────────────────────────────────
+
+def svg(body: str, cls: str = "icon") -> str:
+    return (f'<svg class="{cls}" viewBox="0 0 24 24" fill="none" '
+            f'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+            f'stroke-linejoin="round">{body}</svg>')
+
+
+ICON_CHAT = svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>')
+ICON_HASH = svg('<line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/>'
+                '<line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/>')
+ICON_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
+                 '<circle cx="9" cy="7" r="4"/>'
+                 '<path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
+                 '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
+ICON_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
+                  '<polyline points="16 17 21 12 16 7"/>'
+                  '<line x1="21" y1="12" x2="9" y2="12"/>')
+ICON_SETTINGS = svg('<circle cx="12" cy="12" r="3"/>'
+                    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>')
+ICON_SEND = svg('<line x1="22" y1="2" x2="11" y2="13"/>'
+                '<polygon points="22 2 15 22 11 13 2 9 22 2"/>')
+ICON_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/>'
+                '<line x1="5" y1="12" x2="19" y2="12"/>')
+ICON_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
+                 '<path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>'
+                 '<path d="M10 11v6M14 11v6"/>')
+ICON_KEY = svg('<path d="M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7 7 5 5 0 0 1 7-7z"/>'
+               '<path d="M15.5 8.5l3 3L22 8l-3-3"/>')
+
+
+# ────────────────────────────────────────────────────────────
+#  CSS (общий, 2015 — плоско и минималистично)
+# ────────────────────────────────────────────────────────────
 
 CSS = """
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body {
-  background: #e3efe3;
-  font-family: Verdana, Geneva, Tahoma, sans-serif;
-  font-size: 13px;
-  color: #17381a;
-  line-height: 1.45;
-}
-a { color: #2e7d32; text-decoration: none; }
-a:hover { color: #1b5e20; text-decoration: underline; }
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+     background:#eef1f5;color:#2c2f38;-webkit-font-smoothing:antialiased}
+a{color:#3a7bd5;text-decoration:none}
+a:hover{text-decoration:underline}
+button{font:inherit;cursor:pointer}
+input,select,textarea{font:inherit;padding:8px 10px;border:1px solid #d5dae0;
+     border-radius:3px;background:#fff;outline:none;width:100%;color:inherit}
+input:focus,select:focus,textarea:focus{border-color:#3a7bd5}
+.btn{padding:8px 14px;border:1px solid transparent;border-radius:3px;
+     background:#3a7bd5;color:#fff;transition:background .15s}
+.btn:hover{background:#2f66b5}
+.btn.secondary{background:#fff;border-color:#d5dae0;color:#2c2f38}
+.btn.secondary:hover{background:#f2f4f7}
+.btn.danger{background:#e74c3c}
+.btn.danger:hover{background:#c0392b}
+.icon{width:16px;height:16px;vertical-align:-2px}
+.icon-lg{width:22px;height:22px}
+.muted{color:#8891a0}
+.small{font-size:12px}
 
-* { scrollbar-width: thin; scrollbar-color: #a5cfa5 #eaf6ea; }
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: #eaf6ea; border-radius: 5px; }
-::-webkit-scrollbar-thumb {
-  background: #a5cfa5; border-radius: 5px;
-  border: 2px solid #eaf6ea; background-clip: padding-box;
-}
-::-webkit-scrollbar-thumb:hover { background: #66bb6a; border: 2px solid #eaf6ea; background-clip: padding-box; }
-::-webkit-scrollbar-corner { background: #eaf6ea; }
-::-webkit-scrollbar-button { display: none; }
+/* ---------- LOGIN ---------- */
+.auth-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.auth-box{width:100%;max-width:340px;background:#fff;border:1px solid #e1e5eb;
+     border-radius:4px;padding:28px 24px 22px;box-shadow:0 1px 3px rgba(20,25,40,.04)}
+.auth-logo{display:flex;align-items:center;gap:8px;justify-content:center;
+     margin-bottom:6px;color:#3a7bd5}
+.auth-logo .icon{width:28px;height:28px}
+.auth-title{text-align:center;font-size:20px;font-weight:600;margin-bottom:4px}
+.auth-sub{text-align:center;font-size:12px;color:#8891a0;margin-bottom:20px}
+.auth-box input{margin-bottom:10px}
+.auth-box .btn{width:100%;padding:10px}
+.auth-foot{text-align:center;margin-top:14px;font-size:13px}
+.auth-err{background:#fdeceb;color:#c0392b;border:1px solid #f5c6c2;
+     border-radius:3px;padding:8px 10px;font-size:13px;margin-bottom:12px}
 
-.ic { vertical-align: -2px; }
+/* ---------- CHAT ---------- */
+.app{display:flex;height:100vh;background:#fff;overflow:hidden}
+.sidebar{width:230px;flex:0 0 230px;background:#f7f8fa;border-right:1px solid #e1e5eb;
+     display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:8px;padding:16px;font-weight:600;
+     font-size:15px;border-bottom:1px solid #e1e5eb;color:#2c2f38}
+.brand .icon{color:#3a7bd5;width:18px;height:18px}
+.section-title{padding:14px 16px 6px;font-size:11px;text-transform:uppercase;
+     letter-spacing:.6px;color:#8891a0;font-weight:600}
+.channels{list-style:none;flex:1;overflow-y:auto;padding-bottom:8px}
+.channels a{display:flex;align-items:center;gap:8px;padding:7px 16px;color:#4b5563;font-size:13px}
+.channels a:hover{background:#eef1f5;text-decoration:none}
+.channels a.active{background:#e4ecfa;color:#2f66b5;font-weight:600}
+.channels .hash{color:#a3acbb;font-weight:400}
+.channels a.active .hash{color:#3a7bd5}
+.user-box{display:flex;align-items:center;gap:10px;padding:10px 12px;
+     border-top:1px solid #e1e5eb;background:#f0f2f5}
+.avatar{width:30px;height:30px;border-radius:50%;background:#3a7bd5;color:#fff;
+     display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px}
+.user-meta{flex:1;min-width:0}
+.user-name{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.user-role{font-size:11px;color:#8891a0}
+.user-actions{display:flex;gap:4px;align-items:center}
+.user-actions a{display:inline-flex;padding:5px;border-radius:3px;color:#6b7480}
+.user-actions a:hover{background:#e1e5eb;text-decoration:none;color:#2c2f38}
 
-.header {
-  background: linear-gradient(#4aa350, #2e7d32);
-  border-bottom: 3px solid #1b5e20;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.22);
-}
-.header-inner {
-  max-width: 1760px; margin: 0 auto; padding: 10px 18px;
-  display: flex; align-items: center; justify-content: space-between;
-}
-.logo {
-  font-size: 28px; font-weight: bold; color: #fff; text-decoration: none;
-  letter-spacing: -1.5px;
-  text-shadow: 1px 1px 0 #1b5e20, 2px 2px 4px rgba(0,0,0,0.35);
-}
-.logo:hover { text-decoration: none; color: #fff; }
-.logo span {
-  color: #c8e6c9; font-size: 11px; letter-spacing: 0;
-  margin-left: 8px; font-weight: normal; text-shadow: none;
-  vertical-align: middle;
-}
-.header-right { display: flex; align-items: center; gap: 8px; }
-.header-btn {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: rgba(255,255,255,0.18); color: #fff;
-  border: 1px solid rgba(255,255,255,0.4);
-  padding: 5px 12px; border-radius: 3px; font-size: 12px; font-weight: bold;
-}
-.header-btn:hover { background: rgba(255,255,255,0.32); color: #fff; text-decoration: none; }
+.chat{flex:1;display:flex;flex-direction:column;min-width:0}
+.chat-head{display:flex;align-items:center;gap:10px;padding:14px 18px;
+     border-bottom:1px solid #e1e5eb;background:#fff}
+.chat-head h2{font-size:16px;font-weight:600}
+.chat-head .hash{color:#a3acbb;font-size:18px}
+.chat-head .topic{color:#8891a0;font-size:13px;margin-left:6px;
+     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.chat-head .user-count{display:inline-flex;align-items:center;gap:5px;
+     color:#6b7480;font-size:12px;background:#f2f4f7;padding:4px 9px;border-radius:12px}
 
-.layout {
-  width: 1080px; margin: 16px auto 30px;
-  display: flex; align-items: flex-start; gap: 14px;
-}
-.layout.wide { width: min(1760px, 97vw); }
-.sidebar { width: 220px; flex-shrink: 0; }
-.content { flex: 1; min-width: 0; }
+.messages{flex:1;overflow-y:auto;padding:14px 18px;background:#fff}
+.msg{padding:6px 0;font-size:14px}
+.msg-user{font-weight:600;color:#2f66b5}
+.msg-time{font-size:11px;color:#a3acbb;margin-left:6px}
+.msg-text{margin-top:1px;word-wrap:break-word;overflow-wrap:anywhere}
+.system-msg{font-size:12px;color:#8891a0;padding:5px 0;font-style:italic}
+.system-msg::before{content:"— ";color:#c3cad4}
 
-.side-card {
-  background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
-  margin-bottom: 10px; padding: 8px;
-  box-shadow: 0 1px 2px rgba(27,94,32,0.10);
-}
-.side-nav { padding: 4px; }
-.side-link {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; border-radius: 3px;
-  color: #1b5e20; font-weight: bold; font-size: 13px;
-  text-decoration: none; cursor: pointer;
-  width: 100%; border: none; background: none;
-  font-family: inherit; text-align: left;
-}
-.side-link:hover { background: #eaf6ea; text-decoration: none; color: #1b5e20; }
-.side-link.active { background: linear-gradient(#66bb6a, #43a047); color: #fff; }
-.side-link.active .ic { color: #fff; }
+.composer{display:flex;gap:8px;padding:12px 14px;border-top:1px solid #e1e5eb;background:#fafbfc}
+.composer input{flex:1;padding:10px 12px;border-radius:4px;background:#fff}
+.composer button{background:#3a7bd5;color:#fff;border:none;border-radius:4px;
+     padding:0 16px;display:flex;align-items:center;justify-content:center;transition:.15s}
+.composer button:hover{background:#2f66b5}
 
-.side-stats { font-size: 12px; color: #4b6b4b; }
-.side-stat { padding: 3px 4px; display: flex; align-items: center; gap: 6px; }
-.side-stat b { color: #1b5e20; }
+.users-panel{width:200px;flex:0 0 200px;border-left:1px solid #e1e5eb;
+     background:#f7f8fa;display:flex;flex-direction:column}
+.users-panel ul{list-style:none;padding:0 6px 12px;overflow-y:auto;flex:1}
+.users-panel li{padding:6px 10px;font-size:13px;color:#4b5563;border-radius:3px;
+     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.users-panel li::before{content:"●";color:#4caf7d;margin-right:7px;font-size:9px;
+     vertical-align:2px}
 
-.box {
-  background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
-  margin-bottom: 12px; box-shadow: 0 1px 2px rgba(27,94,32,0.12);
-}
-.empty { padding: 22px; text-align: center; color: #7a8f7a; font-size: 13px; }
-.page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
-.back-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; margin-bottom: 8px; }
-
-.post { display: flex; overflow: hidden; }
-.votes {
-  width: 58px; flex-shrink: 0; background: #f3faf3;
-  border-right: 1px solid #d6ead6; padding: 10px 6px;
-  display: flex; flex-direction: column; align-items: center; gap: 4px;
-}
-.vote-form { margin: 0; padding: 0; }
-.vote-btn {
-  width: 34px; height: 24px; padding: 0;
-  background: #eaf6ea; color: #2e7d32;
-  border: 1px solid #a5cfa5; border-radius: 3px;
-  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
-  font-family: inherit; text-shadow: none;
-}
-.vote-btn:hover { background: #c8e6c9; }
-.vote-btn.active-up { background: #43a047; color: #fff; border-color: #2e7d32; }
-.vote-btn.active-down { background: #e53935; color: #fff; border-color: #c62828; }
-.score { font-weight: bold; font-size: 15px; }
-.score-pos { color: #2e7d32; }
-.score-neg { color: #c62828; }
-.score-zero { color: #7a8f7a; }
-
-.post-main { flex: 1; padding: 10px 12px; min-width: 0; }
-.post-head { margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
-.time { color: #8aa38a; font-size: 11px; }
-.edited { color: #a8c0a8; font-size: 11px; }
-.post-text { font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
-
-.post-actions { margin-top: 8px; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
-.post-act {
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 11px; color: #6b8a6b; padding: 3px 7px;
-  border-radius: 3px; background: none; border: none;
-  cursor: pointer; font-family: inherit; text-decoration: none;
-}
-.post-act:hover { background: #eaf6ea; color: #1b5e20; text-decoration: none; }
-.post-act-danger:hover { background: #fdecea; color: #c62828; }
-.inline-form { margin: 0; padding: 0; display: inline; }
-
-.comments { margin-top: 10px; border-top: 1px dashed #c8e6c9; padding-top: 6px; }
-.comments-title {
-  font-size: 11px; color: #6b8a6b; text-transform: uppercase;
-  letter-spacing: 0.5px; font-weight: bold; margin-bottom: 4px;
-  display: flex; align-items: center; gap: 5px;
-}
-.comment { padding: 6px 0; border-bottom: 1px dotted #e0f0e0; }
-.comment:last-child { border-bottom: none; }
-.c-time { color: #9cb89c; font-size: 11px; }
-.c-text { font-size: 12px; margin-top: 2px; }
-
-.cform { margin-top: 8px; display: flex; gap: 6px; }
-.cform input[type=text] { flex: 1; }
-
-input[type=text], textarea {
-  border: 1px solid #a5cfa5; border-radius: 3px;
-  padding: 6px 8px; font-family: inherit; font-size: 13px;
-  background: #f7fdf7; color: #17381a; outline: none; width: 100%;
-}
-input:focus, textarea:focus { border-color: #4caf50; background: #fff; }
-
-button, .btn-primary {
-  background: linear-gradient(#66bb6a, #43a047);
-  border: 1px solid #2e7d32; color: #fff;
-  padding: 6px 14px; border-radius: 3px; cursor: pointer;
-  font-family: inherit; font-size: 12px; font-weight: bold;
-  text-shadow: 0 1px 0 rgba(0,0,0,0.2);
-  display: inline-flex; align-items: center; gap: 5px;
-}
-button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
-button:active { background: #2e7d32; }
-
-.editor { overflow: hidden; }
-.editor-toolbar {
-  display: flex; align-items: center; gap: 2px;
-  padding: 6px 8px; background: linear-gradient(#eaf6ea, #d9ecd9);
-  border-bottom: 1px solid #a5cfa5; flex-wrap: wrap;
-}
-.tb {
-  background: transparent; border: 1px solid transparent; color: #2e5233;
-  padding: 5px 7px; border-radius: 3px; cursor: pointer;
-  font-family: inherit; font-size: 12px; text-shadow: none;
-  display: inline-flex; align-items: center; gap: 4px;
-  min-width: 28px; justify-content: center;
-}
-.tb:hover { background: #fff; border-color: #a5cfa5; }
-.tb.active { background: #43a047; color: #fff; border-color: #2e7d32; }
-.tb-text { font-weight: bold; padding: 5px 10px; }
-.tb-sep { width: 1px; height: 20px; background: #a5cfa5; margin: 0 4px; }
-.tb-spacer { flex: 1; }
-
-.editor-body {
-  display: flex;
-  height: min(780px, 80vh);
-  min-height: 520px;
-  align-items: stretch;
-}
-.editor-pane {
-  flex: 1 1 50%; min-width: 0;
-  display: flex; flex-direction: column; overflow: hidden;
-}
-.editor-pane textarea {
-  flex: 1 1 auto; height: 100%; min-height: 0;
-  border: none; border-radius: 0; background: #fff; resize: none;
-  padding: 14px 16px;
-  font-family: Consolas, Monaco, "Courier New", monospace;
-  font-size: 13.5px; line-height: 1.55; overflow-y: auto;
-}
-.editor-pane textarea:focus { background: #fff; }
-.editor-preview {
-  border-left: 1px solid #d6ead6; background: #fafdfa;
-  padding: 14px 18px; height: 100%; overflow-y: auto;
-  font-family: Verdana, sans-serif; font-size: 13.5px;
-  line-height: 1.55;
-}
-.editor-preview img,
-.post-text img { max-width: 100%; height: auto; }
-
-.editor-foot {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 10px; background: #f3faf3; border-top: 1px solid #a5cfa5;
-  gap: 10px; flex-wrap: wrap;
-}
-.editor-hint { font-size: 11px; color: #6b8a6b; flex: 1; min-width: 200px; line-height: 1.8; }
-.editor-hint code {
-  background: #eaf6ea; border: 1px solid #d6ead6; padding: 0 4px;
-  border-radius: 2px; font-size: 11px; color: #2e7d32;
-}
-.editor-actions { display: flex; align-items: center; gap: 12px; }
-.counter { font-size: 11px; color: #7a8f7a; font-variant-numeric: tabular-nums; }
-.counter.warn { color: #c62828; font-weight: bold; }
-.counter .b64hint { color: #9cb89c; }
-
-.md { line-height: 1.55; }
-.md > *:first-child { margin-top: 0; }
-.md > *:last-child { margin-bottom: 0; }
-.md p { margin: 0 0 9px; }
-.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
-  margin: 14px 0 6px; color: #1b5e20; line-height: 1.25;
-}
-.md h1 { font-size: 20px; border-bottom: 1px solid #c8e6c9; padding-bottom: 4px; }
-.md h2 { font-size: 17px; }
-.md h3 { font-size: 15px; }
-.md h4, .md h5, .md h6 { font-size: 13px; color: #2e5233; }
-.md ul, .md ol { margin: 8px 0; padding-left: 24px; }
-.md li { margin: 2px 0; }
-.md blockquote {
-  margin: 10px 0; padding: 8px 12px;
-  border-left: 3px solid #66bb6a; background: #f3faf3; color: #2e5233;
-  border-radius: 0 3px 3px 0;
-}
-.md code {
-  background: #eef6ee; border: 1px solid #d6ead6;
-  padding: 1px 5px; border-radius: 3px;
-  font-family: Consolas, Monaco, monospace; font-size: 12px; color: #1b5e20;
-}
-.md pre {
-  background: #f3faf3; border: 1px solid #d6ead6;
-  padding: 10px 12px; border-radius: 3px;
-  overflow-x: auto; margin: 10px 0;
-}
-.md pre code { background: none; border: none; padding: 0; font-size: 12px; }
-.md hr { border: none; border-top: 1px solid #c8e6c9; margin: 14px 0; }
-.md img { max-width: 100%; border-radius: 3px; margin: 6px 0; display: block; }
-.md del { color: #9cb89c; }
-.md a { color: #2e7d32; text-decoration: underline; }
-
-.md mark { background: #fff59d; color: #17381a; padding: 0 2px; border-radius: 2px; }
-.md sup { font-size: 0.75em; vertical-align: super; line-height: 0; }
-.md .spoiler {
-  background: #2e7d32; color: #2e7d32; border-radius: 3px;
-  padding: 0 4px; cursor: help;
-  transition: background .15s, color .15s;
-}
-.md .spoiler:hover { background: #eaf6ea; color: #17381a; }
-
-.md table {
-  border-collapse: collapse; margin: 10px 0; font-size: 13px;
-  max-width: 100%;
-}
-.md th, .md td {
-  border: 1px solid #c8e6c9; padding: 5px 10px;
-  text-align: left; vertical-align: top;
-}
-.md th { background: #eaf6ea; color: #1b5e20; font-weight: bold; }
-.md tr:nth-child(even) td { background: #f7fdf7; }
-.md table code { font-size: 11px; }
-
-.md ul.task-list { list-style: none; padding-left: 4px; }
-.md ul.task-list li {
-  display: flex; align-items: flex-start; gap: 8px; margin: 3px 0;
-  padding-left: 0;
-}
-.md ul.task-list li input[type=checkbox] {
-  margin: 3px 0 0; accent-color: #43a047; flex-shrink: 0;
-}
-
-.footer { text-align: center; color: #7d9c7d; font-size: 11px; padding: 6px 0 30px; }
+/* ---------- ADMIN ---------- */
+.admin-wrap{max-width:960px;margin:0 auto;padding:26px 20px}
+.admin-head{display:flex;align-items:center;justify-content:space-between;
+     margin-bottom:18px;gap:14px}
+.admin-head h1{font-size:20px;font-weight:600;display:flex;align-items:center;gap:8px}
+.admin-head h1 .icon{color:#3a7bd5}
+.tabs{display:flex;gap:4px;border-bottom:1px solid #d5dae0;margin-bottom:18px}
+.tabs a{padding:9px 14px;color:#6b7480;font-size:13px;border-bottom:2px solid transparent;
+     margin-bottom:-1px}
+.tabs a:hover{color:#2c2f38;text-decoration:none}
+.tabs a.active{color:#3a7bd5;border-bottom-color:#3a7bd5;font-weight:600}
+.card{background:#fff;border:1px solid #e1e5eb;border-radius:4px;padding:18px;margin-bottom:16px;
+     box-shadow:0 1px 2px rgba(20,25,40,.03)}
+.card h3{font-size:14px;font-weight:600;margin-bottom:12px}
+.row{display:flex;gap:8px;align-items:center}
+.row input{flex:1}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:720px){.grid{grid-template-columns:1fr}}
+label.fld{display:block;margin-bottom:10px}
+label.fld span{display:block;font-size:12px;color:#6b7480;margin-bottom:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #eef1f5}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8891a0;font-weight:600}
+tr:last-child td{border-bottom:none}
+.tag{display:inline-block;padding:2px 7px;font-size:11px;border-radius:10px;
+     background:#e4ecfa;color:#2f66b5}
+.tag.admin{background:#fbeecf;color:#a37506}
+.tag.banned{background:#fdeceb;color:#c0392b}
+td form{display:inline}
+td .btn{padding:4px 9px;font-size:12px}
+.flash{background:#eaf4ed;color:#2b7a4b;border:1px solid #c6e3cf;
+     padding:9px 12px;border-radius:3px;margin-bottom:14px;font-size:13px}
 """
 
 
-# ============================================================
-#   LAYOUT
-# ============================================================
+# ────────────────────────────────────────────────────────────
+#  СТРАНИЦЫ
+# ────────────────────────────────────────────────────────────
 
-def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> str:
-    def nav(href, icon_name, label, key):
-        cls = "side-link active" if active == key else "side-link"
-        return f'<a href="{href}" class="{cls}">{ic(icon_name, 14)}<span>{label}</span></a>'
-
-    nav_items = nav("/", "home", "Лента", "feed")
-    nav_items += nav("/create", "plus", "Создать пост", "create")
-
-    layout_cls = "layout wide" if wide else "layout"
-
-    return f'''<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=1760">
-<title>litodon</title>
-<style>{CSS}</style>
-</head>
-<body>
-<header class="header">
-  <div class="header-inner">
-    <a href="/" class="logo">litodon<span>анонимная соцсеть</span></a>
-    <div class="header-right">
-      <a href="/create" class="header-btn">{ic("plus", 14)} Новый пост</a>
-    </div>
-  </div>
-</header>
-<div class="{layout_cls}">
-  <aside class="sidebar">
-    <div class="side-card side-nav">{nav_items}</div>
-    <div class="side-card side-stats">
-      <div class="side-stat">{ic("home", 12)} <b>{len(posts)}</b> постов</div>
-      <div class="side-stat">{ic("comment", 12)} <b>{_counter['comment']}</b> комментариев</div>
-    </div>
-  </aside>
-  <main class="content">
-{content}
-  </main>
-</div>
-<div class="footer">litodon &copy; 2026 &middot; полностью анонимно &middot; всё хранится в оперативной памяти</div>
-</body>
-</html>'''
+def page(title: str, body: str, extra_css: str = "") -> HTMLResponse:
+    doc = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title><style>{CSS}{extra_css}</style></head>
+<body>{body}</body></html>"""
+    return HTMLResponse(doc)
 
 
-# ============================================================
-#   КОМПОНЕНТЫ
-# ============================================================
+def render_login(err: str = "") -> HTMLResponse:
+    err_html = f'<div class="auth-err">{html.escape(err)}</div>' if err else ""
+    body = f"""
+<div class="auth-wrap"><div class="auth-box">
+  <div class="auth-logo">{ICON_CHAT}<span style="font-size:20px;font-weight:600;color:#2c2f38">MiniChat</span></div>
+  <div class="auth-sub">{html.escape(CONFIG['server_name'])}</div>
+  {err_html}
+  <form method="post" action="/login">
+    <input name="username" placeholder="Логин" required autofocus>
+    <input name="password" type="password" placeholder="Пароль" required>
+    <button class="btn" type="submit">Войти</button>
+  </form>
+  <div class="auth-foot">Нет аккаунта? <a href="/register">Зарегистрироваться</a></div>
+</div></div>"""
+    return page("Вход — MiniChat", body)
 
-def post_card(p: dict, anon: dict, link_back: bool = True) -> str:
-    pid = p["id"]
-    aid = anon["id"]
-    score = len(p["up"]) - len(p["down"])
-    score_cls = "score-pos" if score > 0 else ("score-neg" if score < 0 else "score-zero")
 
-    up_cls = "vote-btn active-up" if aid in p["up"] else "vote-btn"
-    down_cls = "vote-btn active-down" if aid in p["down"] else "vote-btn"
-    votes = f'''
-    <form method="post" action="/vote/{pid}" class="vote-form">
-      <input type="hidden" name="value" value="up">
-      <button class="{up_cls}" title="Плюс">{ic("up", 12)}</button>
-    </form>
-    <div class="score {score_cls}">{score}</div>
-    <form method="post" action="/vote/{pid}" class="vote-form">
-      <input type="hidden" name="value" value="down">
-      <button class="{down_cls}" title="Минус">{ic("down", 12)}</button>
-    </form>'''
+def render_register(err: str = "") -> HTMLResponse:
+    err_html = f'<div class="auth-err">{html.escape(err)}</div>' if err else ""
+    if not CONFIG["allow_registration"]:
+        body = f"""
+<div class="auth-wrap"><div class="auth-box">
+  <div class="auth-logo">{ICON_CHAT}</div>
+  <div class="auth-title">Регистрация закрыта</div>
+  <div class="auth-sub">Администратор отключил регистрацию.</div>
+  <div class="auth-foot"><a href="/login">← Вернуться ко входу</a></div>
+</div></div>"""
+        return page("Регистрация — MiniChat", body)
+    body = f"""
+<div class="auth-wrap"><div class="auth-box">
+  <div class="auth-logo">{ICON_CHAT}<span style="font-size:20px;font-weight:600;color:#2c2f38">MiniChat</span></div>
+  <div class="auth-sub">Создание аккаунта</div>
+  {err_html}
+  <form method="post" action="/register">
+    <input name="username" placeholder="Логин" required autofocus pattern="[A-Za-z0-9_\\-]{{3,20}}"
+           title="3-20 символов: буквы, цифры, _ и -">
+    <input name="password" type="password" placeholder="Пароль" required minlength="3">
+    <button class="btn" type="submit">Зарегистрироваться</button>
+  </form>
+  <div class="auth-foot">Уже есть аккаунт? <a href="/login">Войти</a></div>
+</div></div>"""
+    return page("Регистрация — MiniChat", body)
 
-    edited = ' <span class="edited">(изменено)</span>' if p.get("edited") else ""
-    body = f'<div class="post-text md">{render_md(p["text"])}</div>'
 
-    actions = []
-    if link_back:
-        actions.append(f'<a href="/p/{pid}" class="post-act">{ic("comment", 12)} {len(p["comments"])}</a>')
-    if aid == p["author_id"]:
-        actions.append(f'<a href="/p/{pid}/edit" class="post-act">{ic("edit", 12)} Редактировать</a>')
-        actions.append(
-            f'<form method="post" action="/p/{pid}/delete" class="inline-form" '
-            f'onsubmit="return confirm(\'Удалить этот пост?\')">'
-            f'<button type="submit" class="post-act post-act-danger">'
-            f'{ic("trash", 12)} Удалить</button></form>'
-        )
-    actions_html = '<div class="post-actions">' + "".join(actions) + '</div>' if actions else ""
+def render_chat(username: str, channel: str) -> HTMLResponse:
+    user = USERS[username]
+    chan = CHANNELS[channel]
 
-    comments_html = ""
-    if link_back and p["comments"]:
-        items = "".join(
-            f'<div class="comment">'
-            f'<div class="c-time">{fmt_time(c["created"])}</div>'
-            f'<div class="c-text md">{render_md(c["text"])}</div>'
-            f'</div>'
-            for c in p["comments"]
-        )
-        comments_html = (f'<div class="comments">'
-                         f'<div class="comments-title">{ic("comment", 12)} Комментарии ({len(p["comments"])})</div>'
-                         f'{items}</div>')
-
-    cform = ""
-    if link_back:
-        cform = (
-            f'<form method="post" action="/comment/{pid}" class="cform">'
-            f'<input type="text" name="text" maxlength="1000" '
-            f'placeholder="Анонимный комментарий (markdown)..." required>'
-            f'<button type="submit" title="Отправить">{ic("send", 12)}</button></form>'
+    channels_html = ""
+    for cname in CHANNELS:
+        active = " active" if cname == channel else ""
+        channels_html += (
+            f'<li><a class="channel{active}" href="/?c={html.escape(cname)}">'
+            f'<span class="hash">#</span>{html.escape(cname)}</a></li>'
         )
 
-    return f'''
-    <article class="box post" id="p{pid}">
-      <div class="votes">{votes}</div>
-      <div class="post-main">
-        <div class="post-head">
-          <span class="time">{fmt_time(p["created"])}{edited}</span>
-        </div>
-        {body}
-        {actions_html}
-        {comments_html}
-        {cform}
-      </div>
-    </article>'''
-
-
-def editor_view(p: dict | None = None, action: str = "/create") -> str:
-    if p:
-        text_value = escape(p["text"])
-        heading = "Редактировать пост"
-        submit_label = "Сохранить"
-    else:
-        text_value = ""
-        heading = "Новый пост"
-        submit_label = "Опубликовать"
-
-    tb = lambda name, title, js: (
-        f'<button type="button" class="tb" title="{title}" onclick="{js}">{ic(name, 14)}</button>'
+    admin_btn = (
+        f'<a href="/admin" title="Админ-панель">{ICON_SETTINGS}</a>'
+        if user["is_admin"] else ""
     )
 
-    return f'''
-    <h1 class="page-title">{heading}</h1>
-    <div class="box editor">
-      <form method="post" action="{action}" id="post-form">
-        <div class="editor-toolbar">
-          {tb("bold",   "Жирный (Ctrl+B)",   "insertMd('**','**','жирный текст')")}
-          {tb("italic", "Курсив (Ctrl+I)",   "insertMd('*','*','курсив')")}
-          {tb("strike", "Зачёркнутый",       "insertMd('~~','~~','текст')")}
-          {tb("code",   "Код в строке",      "insertMd('`','`','код')")}
-          {tb("codeblock", "Блок кода",      "insertBlock('```\\n','\\n```')")}
-          <span class="tb-sep"></span>
-          {tb("h1", "Заголовок 1", "prefixLine('# ')")}
-          {tb("h2", "Заголовок 2", "prefixLine('## ')")}
-          {tb("h3", "Заголовок 3", "prefixLine('### ')")}
-          <span class="tb-sep"></span>
-          {tb("ul",    "Маркированный список", "prefixLine('- ')")}
-          {tb("ol",    "Нумерованный список",  "prefixLine('1. ')")}
-          {tb("task",  "Чек-лист",             "prefixLine('- [ ] ')")}
-          {tb("quote", "Цитата",               "prefixLine('> ')")}
-          {tb("hr",    "Разделитель (---)",    "insertBlock('\\n---\\n')")}
-          <span class="tb-sep"></span>
-          {tb("link",      "Ссылка",         "insertMd('[','](https://)','текст ссылки')")}
-          {tb("image",     "Вставить как markdown по ссылке", "insertMd('![','](https://)','alt')")}
-          {tb("upload",    "Загрузить картинку с ПК",        "document.getElementById('file-input').click()")}
-          {tb("table",     "Таблица",        "insertBlock('\\n| Столбец 1 | Столбец 2 |\\n|-----------|-----------|\\n| Ячейка    | Ячейка    |\\n')")}
-          {tb("highlight", "Выделение",      "insertMd('==','==','выделенный текст')")}
-          {tb("spoiler",   "Спойлер",        "insertMd('||','||','скрытый текст')")}
-          {tb("sup",       "Верхний индекс", "insertMd('^','^','2')")}
-          {tb("emoji",     "Emoji ( :smile: )", "insertBlock(':smile: ')" )}
-          <span class="tb-spacer"></span>
-          <button type="button" class="tb tb-text active" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
-        </div>
-        <input type="file" id="file-input" accept="image/*" style="display:none">
-        <div class="editor-body">
-          <div class="editor-pane">
-            <textarea id="editor" name="text" required
-placeholder="Напишите что-нибудь...&#10;&#10;Markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`  ==выделение==  ||спойлер||  ^верхний^&#10;# H1  ## H2  ### H3&#10;- список   1. список   - [ ] задача   &gt; цитата   --- разделитель&#10;[ссылка](https://)  ![img](https://)&#10;| табл | лицо |&#10;|------|------|&#10;| a    | b    |&#10;:smile: :fire: :heart:&#10;&#10;Картинки: жми иконку загрузки или просто Ctrl+V из буфера — вставится как base64.">{text_value}</textarea>
-          </div>
-          <div class="editor-pane editor-preview" id="preview-wrap">
-            <div class="md" id="preview"></div>
-          </div>
-        </div>
-        <div class="editor-foot">
-          <div class="editor-hint">
-            <b>Markdown:</b>
-            <code>**жирный**</code> &middot; <code>*курсив*</code> &middot; <code>~~зачёркнутый~~</code> &middot;
-            <code>`код`</code> &middot; <code>```блок```</code> &middot;
-            <code># H1</code>/<code>## H2</code>/<code>### H3</code> &middot;
-            <code>- список</code> &middot; <code>1. список</code> &middot; <code>- [ ] чек-лист</code> &middot;
-            <code>&gt; цитата</code> &middot; <code>---</code> &middot;
-            <code>[текст](url)</code> &middot; <code>![alt](url)</code> &middot;
-            <code>==выделение==</code> &middot; <code>||спойлер||</code> &middot; <code>^верхний^</code> &middot;
-            <code>:smile:</code> &middot;
-            таблицы: <code>| a | b |</code> + <code>|---|---|</code> &middot;
-            <b>картинки</b>: кнопка {ic("upload", 12)} или Ctrl+V (base64 не считается за символы)
-          </div>
-          <div class="editor-actions">
-            <span class="counter" id="counter">0 / {MAX_POST}</span>
-            <button type="submit" class="btn-primary">{ic("send", 14)} {submit_label}</button>
-          </div>
-        </div>
-      </form>
+    initial = html.escape(username[0].upper())
+    role = "admin" if user["is_admin"] else "участник"
+
+    body = f"""
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">{ICON_CHAT}<span>{html.escape(CONFIG['server_name'])}</span></div>
+    <div class="section-title">Каналы</div>
+    <ul class="channels">{channels_html}</ul>
+    <div class="user-box">
+      <div class="avatar">{initial}</div>
+      <div class="user-meta">
+        <div class="user-name">{html.escape(username)}</div>
+        <div class="user-role">{role}</div>
+      </div>
+      <div class="user-actions">
+        {admin_btn}
+        <a href="/logout" title="Выйти">{ICON_LOGOUT}</a>
+      </div>
     </div>
-    <script>{EDITOR_JS.replace("__MAX__", str(MAX_POST))}</script>'''
+  </aside>
+
+  <main class="chat">
+    <header class="chat-head">
+      <span class="hash">#</span>
+      <h2>{html.escape(channel)}</h2>
+      <span class="topic">{html.escape(chan['topic'])}</span>
+      <span class="user-count">{ICON_USERS}<span id="user-count">0</span></span>
+    </header>
+    <div class="messages" id="messages"></div>
+    <form class="composer" id="composer" autocomplete="off">
+      <input id="msg-input" placeholder="Написать сообщение..."
+             maxlength="{CONFIG['max_msg_len']}" autofocus>
+      <button type="submit" title="Отправить">{ICON_SEND}</button>
+    </form>
+  </main>
+
+  <aside class="users-panel">
+    <div class="section-title">Участники</div>
+    <ul id="user-list"></ul>
+  </aside>
+</div>
+
+<script>
+(function(){{
+  const CHANNEL = {channel!r};
+  const msgBox   = document.getElementById('messages');
+  const userList = document.getElementById('user-list');
+  const userCnt  = document.getElementById('user-count');
+  const input    = document.getElementById('msg-input');
+  const form     = document.getElementById('composer');
+  let ws = null, retry = 0;
+
+  const esc = s => String(s).replace(/[&<>"']/g,
+    c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
+
+  function addMessage(m){{
+    const d = document.createElement('div');
+    d.className = 'msg';
+    d.innerHTML = '<span class="msg-user">' + esc(m.user) + '</span>' +
+                  '<span class="msg-time">' + esc(m.time) + '</span>' +
+                  '<div class="msg-text">' + esc(m.text) + '</div>';
+    msgBox.appendChild(d);
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }}
+  function addSystem(t){{
+    const d = document.createElement('div');
+    d.className = 'system-msg';
+    d.textContent = t;
+    msgBox.appendChild(d);
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }}
+  function setUsers(list){{
+    userList.innerHTML = '';
+    list.forEach(u => {{
+      const li = document.createElement('li');
+      li.textContent = u;
+      userList.appendChild(li);
+    }});
+    userCnt.textContent = list.length;
+  }}
+
+  function connect(){{
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws/' + encodeURIComponent(CHANNEL));
+    ws.onopen = () => {{ retry = 0; }};
+    ws.onmessage = e => {{
+      let d; try {{ d = JSON.parse(e.data); }} catch(_) {{ return; }}
+      if (d.type === 'history') {{ msgBox.innerHTML=''; d.messages.forEach(addMessage); }}
+      else if (d.type === 'message') addMessage(d);
+      else if (d.type === 'system') addSystem(d.text);
+      else if (d.type === 'users') setUsers(d.users);
+    }};
+    ws.onclose = () => {{
+      addSystem('Соединение потеряно, переподключение...');
+      const delay = Math.min(5000, 800 * Math.pow(1.6, retry++));
+      setTimeout(connect, delay);
+    }};
+  }}
+
+  form.addEventListener('submit', e => {{
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text || !ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({{ type: 'message', text }}));
+    input.value = '';
+  }});
+
+  connect();
+}})();
+</script>"""
+    return page(f"#{channel} — {CONFIG['server_name']}", body)
 
 
-EDITOR_JS = r"""
-(function(){
-  var ta = document.getElementById('editor');
-  var counter = document.getElementById('counter');
-  var previewEl = document.getElementById('preview');
-  var previewWrap = document.getElementById('preview-wrap');
-  var previewBtn = document.getElementById('preview-btn');
-  var form = document.getElementById('post-form');
-  var fileInput = document.getElementById('file-input');
-  var previewOn = true;
-  var previewTimer = null;
-  var MAX = __MAX__;
-  var MAX_IMG_BYTES = 5 * 1024 * 1024;   // 5 МБ на одну картинку
+def render_admin(username: str, tab: str = "channels") -> HTMLResponse:
+    tabs = [("channels", "Каналы"), ("users", "Пользователи"), ("settings", "Настройки")]
+    tabs_html = ""
+    for key, label in tabs:
+        cls = " active" if key == tab else ""
+        tabs_html += f'<a class="{cls}" href="/admin?tab={key}">{label}</a>'
 
-  // тот же regex, что и в Python: заменяем payload на заглушку для подсчёта
-  var B64_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g;
+    content = ""
+    if tab == "channels":
+        rows = ""
+        for cname, cinfo in CHANNELS.items():
+            count = len(MESSAGES.get(cname, []))
+            online = len(set(WS_CONNECTIONS.get(cname, {{}}).values())) if cname in WS_CONNECTIONS else 0
+            rows += f"""
+<tr>
+  <td><b>#{html.escape(cname)}</b></td>
+  <td>
+    <form method="post" action="/admin/channels/topic" class="row">
+      <input type="hidden" name="name" value="{html.escape(cname)}">
+      <input name="topic" value="{html.escape(cinfo['topic'])}" maxlength="120">
+      <button class="btn secondary" type="submit">OK</button>
+    </form>
+  </td>
+  <td class="muted small">{count} сообщ.<br>{online} online</td>
+  <td>
+    <form method="post" action="/admin/channels/clear" onsubmit="return confirm('Очистить #{html.escape(cname)}?')">
+      <input type="hidden" name="name" value="{html.escape(cname)}">
+      <button class="btn secondary" type="submit">Очистить</button>
+    </form>
+    <form method="post" action="/admin/channels/delete" onsubmit="return confirm('Удалить #{html.escape(cname)}?')">
+      <input type="hidden" name="name" value="{html.escape(cname)}">
+      <button class="btn danger" type="submit">{ICON_TRASH}</button>
+    </form>
+  </td>
+</tr>"""
+        content = f"""
+<div class="card">
+  <h3>Создать канал</h3>
+  <form method="post" action="/admin/channels/create" class="row">
+    <input name="name" placeholder="название (a-z, 0-9, -)" required pattern="[A-Za-z0-9_\\-]{{2,30}}">
+    <input name="topic" placeholder="описание" maxlength="120">
+    <button class="btn" type="submit">{ICON_PLUS} Создать</button>
+  </form>
+</div>
+<div class="card">
+  <h3>Существующие каналы ({len(CHANNELS)})</h3>
+  <table><thead><tr><th>Канал</th><th>Описание</th><th>Статистика</th><th></th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</div>"""
 
-  function effectiveLength(s){
-    return s.replace(B64_RE, 'data:image/...;base64,...').length;
-  }
+    elif tab == "users":
+        rows = ""
+        for uname, udata in sorted(USERS.items(), key=lambda kv: kv[0].lower()):
+            tags = ""
+            if udata["is_admin"]: tags += ' <span class="tag admin">admin</span>'
+            if udata.get("banned"): tags += ' <span class="tag banned">бан</span>'
+            joined = datetime.fromtimestamp(udata["joined"]).strftime("%d.%m.%Y")
+            admin_btn = (
+                f'<form method="post" action="/admin/users/demote">'
+                f'<input type="hidden" name="username" value="{html.escape(uname)}">'
+                f'<button class="btn secondary" type="submit">Снять админа</button></form>'
+                if udata["is_admin"] and uname != "admin" else ""
+            )
+            promote_btn = (
+                f'<form method="post" action="/admin/users/promote">'
+                f'<input type="hidden" name="username" value="{html.escape(uname)}">'
+                f'<button class="btn secondary" type="submit">Сделать админом</button></form>'
+                if not udata["is_admin"] else ""
+            )
+            ban_btn = ""
+            if uname != "admin":
+                if udata.get("banned"):
+                    ban_btn = (
+                        f'<form method="post" action="/admin/users/unban">'
+                        f'<input type="hidden" name="username" value="{html.escape(uname)}">'
+                        f'<button class="btn secondary" type="submit">Разбанить</button></form>'
+                    )
+                else:
+                    ban_btn = (
+                        f'<form method="post" action="/admin/users/ban" '
+                        f'onsubmit="return confirm(\'Забанить {html.escape(uname)}?\')">'
+                        f'<input type="hidden" name="username" value="{html.escape(uname)}">'
+                        f'<button class="btn danger" type="submit">Забанить</button></form>'
+                    )
+            delete_btn = ""
+            if uname != "admin":
+                delete_btn = (
+                    f'<form method="post" action="/admin/users/delete" '
+                    f'onsubmit="return confirm(\'Удалить {html.escape(uname)} навсегда?\')">'
+                    f'<input type="hidden" name="username" value="{html.escape(uname)}">'
+                    f'<button class="btn danger" type="submit">{ICON_TRASH}</button></form>'
+                )
+            rows += f"""<tr>
+  <td><b>{html.escape(uname)}</b>{tags}</td>
+  <td class="muted small">{joined}</td>
+  <td>{admin_btn} {promote_btn} {ban_btn} {delete_btn}</td>
+</tr>"""
+        content = f"""
+<div class="card">
+  <h3>Все пользователи ({len(USERS)})</h3>
+  <table><thead><tr><th>Пользователь</th><th>Регистрация</th><th>Действия</th></tr></thead>
+  <tbody>{rows}</tbody></table>
+</div>"""
 
-  function updateCounter(){
-    var raw = ta.value;
-    var eff = effectiveLength(raw);
-    var imgs = (raw.match(/data:image\/[a-zA-Z0-9.+-]+;base64,/g) || []).length;
-    var suffix = imgs ? ' <span class="b64hint">(+' + imgs + ' img)</span>' : '';
-    counter.innerHTML = eff + ' / ' + MAX + suffix;
-    if (eff > MAX) counter.classList.add('warn');
-    else counter.classList.remove('warn');
-  }
+    else:  # settings
+        content = f"""
+<div class="card">
+  <h3>Общие настройки сервера</h3>
+  <form method="post" action="/admin/settings">
+    <label class="fld"><span>Название сервера</span>
+      <input name="server_name" value="{html.escape(CONFIG['server_name'])}" maxlength="60" required>
+    </label>
+    <label class="fld"><span>Приветствие (MOTD)</span>
+      <input name="motd" value="{html.escape(CONFIG['motd'])}" maxlength="200">
+    </label>
+    <div class="grid">
+      <label class="fld"><span>Максимум символов в сообщении</span>
+        <input type="number" name="max_msg_len" min="50" max="5000"
+               value="{CONFIG['max_msg_len']}" required>
+      </label>
+      <label class="fld"><span>Регистрация новых пользователей</span>
+        <select name="allow_registration">
+          <option value="1" {"selected" if CONFIG['allow_registration'] else ""}>Разрешена</option>
+          <option value="0" {"" if CONFIG['allow_registration'] else "selected"}>Запрещена</option>
+        </select>
+      </label>
+    </div>
+    <button class="btn" type="submit">Сохранить настройки</button>
+  </form>
+</div>"""
 
-  function schedulePreview(){
-    if (!previewOn) return;
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(runPreview, 220);
-  }
+    body = f"""
+<div class="admin-wrap">
+  <div class="admin-head">
+    <h1>{ICON_SETTINGS} Админ-панель</h1>
+    <div class="row">
+      <a class="btn secondary" href="/">← К чату</a>
+    </div>
+  </div>
+  <div class="tabs">{tabs_html}</div>
+  {content}
+</div>"""
+    return page("Админ — MiniChat", body)
 
-  function runPreview(){
-    if (!previewOn) return;
-    var fd = new FormData();
-    fd.append('text', ta.value);
-    fetch('/api/preview', { method: 'POST', body: fd })
-      .then(function(r){ return r.json(); })
-      .then(function(j){
-        previewEl.innerHTML = j.html || '<p style="color:#8aa38a">Пусто</p>';
-      })
-      .catch(function(){});
-  }
 
-  window.togglePreview = function(){
-    previewOn = !previewOn;
-    previewWrap.style.display = previewOn ? 'flex' : 'none';
-    previewBtn.classList.toggle('active', previewOn);
-    if (previewOn) runPreview();
-  };
+# ────────────────────────────────────────────────────────────
+#  AUTH-РОУТЫ
+# ────────────────────────────────────────────────────────────
 
-  window.insertMd = function(before, after, ph){
-    var s = ta.selectionStart, e = ta.selectionEnd;
-    var sel = ta.value.substring(s, e);
-    var ins = sel || ph || '';
-    ta.value = ta.value.substring(0, s) + before + ins + after + ta.value.substring(e);
-    if (sel){
-      ta.selectionStart = s + before.length;
-      ta.selectionEnd = s + before.length + ins.length;
-    } else {
-      ta.selectionStart = ta.selectionEnd = s + before.length + ins.length;
+@app.get("/login")
+async def login_page(request: Request):
+    if current_user(request):
+        return redirect("/")
+    return render_login()
+
+
+@app.post("/login")
+async def login_post(username: str = Form(...), password: str = Form(...)):
+    uname = username.strip()
+    user = USERS.get(uname)
+    if not user or user["password"] != hash_pw(password):
+        return render_login("Неверный логин или пароль")
+    if user.get("banned"):
+        return render_login("Аккаунт заблокирован")
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = uname
+    resp = redirect("/")
+    resp.set_cookie("session", token, httponly=True, max_age=86400 * 7, samesite="lax")
+    return resp
+
+
+@app.get("/register")
+async def register_page(request: Request):
+    if current_user(request):
+        return redirect("/")
+    return render_register()
+
+
+@app.post("/register")
+async def register_post(username: str = Form(...), password: str = Form(...)):
+    if not CONFIG["allow_registration"]:
+        return render_register("Регистрация закрыта")
+    uname = username.strip()
+    if not (3 <= len(uname) <= 20) or not all(c.isalnum() or c in "_-" for c in uname):
+        return render_register("Некорректный логин (3-20: буквы, цифры, _ -)")
+    if uname.lower() == "admin" or uname in USERS:
+        return render_register("Такой логин уже занят")
+    if len(password) < 3:
+        return render_register("Пароль слишком короткий")
+    USERS[uname] = {
+        "password": hash_pw(password),
+        "is_admin": False,
+        "joined": time.time(),
+        "banned": False,
     }
-    ta.focus(); updateCounter(); schedulePreview();
-  };
-
-  window.prefixLine = function(prefix){
-    var s = ta.selectionStart, e = ta.selectionEnd;
-    var before = ta.value.substring(0, s);
-    var lineStart = before.lastIndexOf('\n') + 1;
-    var afterSel = ta.value.substring(e);
-    var nl = afterSel.indexOf('\n');
-    var lineEnd = nl === -1 ? ta.value.length : e + nl;
-    var block = ta.value.substring(lineStart, lineEnd);
-    var lines = block.split('\n');
-    var nb = lines.map(function(l){ return prefix + l; }).join('\n');
-    ta.value = ta.value.substring(0, lineStart) + nb + ta.value.substring(lineEnd);
-    ta.selectionStart = lineStart;
-    ta.selectionEnd = lineStart + nb.length;
-    ta.focus(); updateCounter(); schedulePreview();
-  };
-
-  window.insertBlock = function(before, after){
-    var s = ta.selectionStart, e = ta.selectionEnd;
-    var sel = ta.value.substring(s, e);
-    var ins = before + sel + (after || '');
-    ta.value = ta.value.substring(0, s) + ins + ta.value.substring(e);
-    ta.selectionStart = ta.selectionEnd = s + ins.length;
-    ta.focus(); updateCounter(); schedulePreview();
-  };
-
-  function insertImageFile(file, altText){
-    if (!file) return;
-    if (file.size > MAX_IMG_BYTES){
-      alert('Картинка слишком большая (макс 5 МБ). Текущий размер: ' +
-            (file.size/1024/1024).toFixed(2) + ' МБ.');
-      return;
-    }
-    var reader = new FileReader();
-    reader.onload = function(ev){
-      var dataUrl = ev.target.result;
-      var alt = (altText || file.name || 'image').replace(/[\[\]()]/g, '');
-      // вставляем на новой строке, чтобы не склеивалось с текстом
-      var prefix = ta.selectionStart > 0 && ta.value[ta.selectionStart - 1] !== '\n' ? '\n' : '';
-      window.insertBlock(prefix + '![' + alt + '](' + dataUrl + ')\n', '');
-    };
-    reader.readAsDataURL(file);
-  }
-
-  // --- загрузка через файловый пикер ---
-  if (fileInput){
-    fileInput.addEventListener('change', function(e){
-      var f = e.target.files && e.target.files[0];
-      insertImageFile(f);
-      e.target.value = '';   // позволяем выбрать тот же файл повторно
-    });
-  }
-
-  // --- вставка из буфера (Ctrl+V со скриншотом) ---
-  ta.addEventListener('paste', function(e){
-    if (!e.clipboardData || !e.clipboardData.items) return;
-    var items = e.clipboardData.items;
-    for (var i = 0; i < items.length; i++){
-      var it = items[i];
-      if (it.kind === 'file' && it.type.indexOf('image/') === 0){
-        e.preventDefault();
-        insertImageFile(it.getAsFile(), 'вставленная картинка');
-        return;
-      }
-    }
-    // если вставили просто текст с data:image — тоже перехватываем, чтобы не сломать счётчик
-    var txt = e.clipboardData.getData('text/plain');
-    if (txt && /data:image\/[a-zA-Z0-9.+-]+;base64,/.test(txt)){
-      e.preventDefault();
-      window.insertBlock(txt, '');
-      return;
-    }
-  });
-
-  // --- Ctrl+B / Ctrl+I / Tab ---
-  ta.addEventListener('keydown', function(ev){
-    if (ev.key === 'Tab'){
-      ev.preventDefault();
-      window.insertMd('  ', '', '');
-      return;
-    }
-    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'b'){
-      ev.preventDefault(); window.insertMd('**','**','жирный текст'); return;
-    }
-    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'i'){
-      ev.preventDefault(); window.insertMd('*','*','курсив'); return;
-    }
-  });
-
-  // --- не отправляем, если по эффективной длине перебор ---
-  form.addEventListener('submit', function(e){
-    var eff = effectiveLength(ta.value);
-    if (eff > MAX){
-      e.preventDefault();
-      alert('Слишком длинный текст: ' + eff + ' / ' + MAX + ' символов.\n' +
-            'Картинки в base64 не считаются, значит превышение по самому тексту.');
-    }
-  });
-
-  ta.addEventListener('input', function(){ updateCounter(); schedulePreview(); });
-
-  updateCounter();
-  runPreview();
-})();
-"""
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = uname
+    resp = redirect("/")
+    resp.set_cookie("session", token, httponly=True, max_age=86400 * 7, samesite="lax")
+    return resp
 
 
-# ============================================================
-#   РОУТЫ
-# ============================================================
-
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    anon = request.state.anon
-    if not posts:
-        feed = '<div class="box empty">Постов пока нет. <a href="/create">Создайте первый!</a></div>'
-    else:
-        ordered = sorted(posts, key=lambda x: x["created"], reverse=True)
-        feed = "".join(post_card(p, anon) for p in ordered)
-    return layout(anon, '<h1 class="page-title">Лента</h1>' + feed, active="feed")
+@app.get("/logout")
+async def logout(request: Request):
+    token = request.cookies.get("session")
+    if token:
+        SESSIONS.pop(token, None)
+    resp = redirect("/login")
+    resp.delete_cookie("session")
+    return resp
 
 
-@app.get("/create", response_class=HTMLResponse)
-def create_page(request: Request):
-    anon = request.state.anon
-    return layout(anon, editor_view(), active="create", wide=True)
+# ────────────────────────────────────────────────────────────
+#  ОСНОВНОЙ ЧАТ
+# ────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def index(request: Request):
+    user = current_user(request)
+    if not user or user not in USERS or USERS[user].get("banned"):
+        return redirect("/login")
+
+    ch = request.query_params.get("c")
+    if not ch or ch not in CHANNELS:
+        ch = next(iter(CHANNELS), None)
+    if not ch:
+        # нет ни одного канала — создаём общий
+        add_channel("general", "Общий чат")
+        ch = "general"
+    return render_chat(user, ch)
 
 
-@app.post("/create")
-def create_post(request: Request, text: str = Form(...)):
-    anon = request.state.anon
-    text = text.strip()
-    # валидация: эффективная длина (без base64) ≤ MAX_POST, сырая ≤ MAX_RAW
-    if text and effective_length(text) <= MAX_POST and len(text) <= MAX_RAW:
-        _counter["post"] += 1
-        pid = _counter["post"]
-        posts.append({
-            "id": pid,
-            "author_id": anon["id"],
-            "text": text,              # НЕ обрезаем по MAX_POST — base64 может быть длинным
-            "created": time.time(),
-            "edited": None,
-            "up": set(),
-            "down": set(),
-            "comments": [],
-        })
-        return RedirectResponse(f"/p/{pid}", status_code=303)
-    return RedirectResponse("/create", status_code=303)
+@app.websocket("/ws/{channel}")
+async def ws_route(ws: WebSocket, channel: str):
+    username = current_user_ws(ws)
+    if not username or username not in USERS or USERS[username].get("banned"):
+        await ws.close(code=1008)
+        return
+    if channel not in CHANNELS:
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+    WS_CONNECTIONS.setdefault(channel, {})
+    conns = WS_CONNECTIONS[channel]
+    already_here = username in conns.values()
+    conns[ws] = username
+
+    # история
+    await ws.send_json({"type": "history", "messages": MESSAGES.get(channel, [])[-100:]})
+    # MOTD
+    if CONFIG["motd"]:
+        await ws.send_json({"type": "system", "text": CONFIG["motd"]})
+
+    if not already_here:
+        await broadcast(channel, {"type": "system",
+                                  "text": f"{username} присоединился к #{channel}"})
+    await send_users(channel)
+
+    try:
+        while True:
+            data = await ws.receive_json()
+            if data.get("type") == "message":
+                text = (data.get("text") or "").strip()
+                if not text:
+                    continue
+                text = text[:CONFIG["max_msg_len"]]
+                msg = {
+                    "user": username,
+                    "text": text,
+                    "time": datetime.now().strftime("%H:%M"),
+                }
+                MESSAGES.setdefault(channel, []).append(msg)
+                if len(MESSAGES[channel]) > 500:
+                    MESSAGES[channel] = MESSAGES[channel][-500:]
+                await broadcast(channel, {"type": "message", **msg})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        conns.pop(ws, None)
+        if username not in conns.values():
+            await broadcast(channel, {"type": "system",
+                                      "text": f"{username} покинул #{channel}"})
+        await send_users(channel)
 
 
-@app.get("/p/{post_id}", response_class=HTMLResponse)
-def post_page(post_id: int, request: Request):
-    anon = request.state.anon
-    p = next((x for x in posts if x["id"] == post_id), None)
-    if not p:
-        return HTMLResponse(
-            layout(anon, '<div class="box empty">Пост не найден. <a href="/">На главную</a></div>'),
-            status_code=404)
-    back = f'<a href="/" class="back-link">{ic("arrow-left", 14)} Назад к ленте</a>'
-    return layout(anon, back + post_card(p, anon), active="feed")
+# ────────────────────────────────────────────────────────────
+#  АДМИН-ДЕЙСТВИЯ
+# ────────────────────────────────────────────────────────────
+
+def require_admin(request: Request):
+    user = current_user(request)
+    if not user or user not in USERS or not USERS[user]["is_admin"]:
+        return None
+    return user
 
 
-@app.get("/p/{post_id}/edit", response_class=HTMLResponse)
-def edit_page(post_id: int, request: Request):
-    anon = request.state.anon
-    p = next((x for x in posts if x["id"] == post_id), None)
-    if not p:
-        return HTMLResponse(layout(anon, '<div class="box empty">Пост не найден.</div>'),
-                            status_code=404)
-    if anon["id"] != p["author_id"]:
-        return RedirectResponse(f"/p/{post_id}", status_code=303)
-    back = f'<a href="/p/{post_id}" class="back-link">{ic("arrow-left", 14)} Назад к посту</a>'
-    return layout(anon, back + editor_view(p, action=f"/p/{post_id}/edit"),
-                  active="feed", wide=True)
+@app.get("/admin")
+async def admin_page(request: Request, tab: str = "channels"):
+    if not require_admin(request):
+        return redirect("/login")
+    user = current_user(request)
+    if tab not in ("channels", "users", "settings"):
+        tab = "channels"
+    return render_admin(user, tab)
 
 
-@app.post("/p/{post_id}/edit")
-def edit_post(post_id: int, request: Request, text: str = Form(...)):
-    anon = request.state.anon
-    p = next((x for x in posts if x["id"] == post_id), None)
-    if not p or anon["id"] != p["author_id"]:
-        return RedirectResponse("/", status_code=303)
-    text = text.strip()
-    if text and effective_length(text) <= MAX_POST and len(text) <= MAX_RAW:
-        p["text"] = text
-        p["edited"] = time.time()
-        return RedirectResponse(f"/p/{post_id}", status_code=303)
-    return RedirectResponse(f"/p/{post_id}/edit", status_code=303)
+@app.post("/admin/channels/create")
+async def admin_channel_create(request: Request, name: str = Form(...), topic: str = Form("")):
+    if not require_admin(request):
+        return redirect("/login")
+    add_channel(name, topic.strip())
+    return redirect("/admin?tab=channels")
 
 
-@app.post("/p/{post_id}/delete")
-def delete_post(post_id: int, request: Request):
-    anon = request.state.anon
-    p = next((x for x in posts if x["id"] == post_id), None)
-    if p and anon["id"] == p["author_id"]:
-        posts.remove(p)
-        return RedirectResponse("/", status_code=303)
-    return RedirectResponse(f"/p/{post_id}", status_code=303)
+@app.post("/admin/channels/topic")
+async def admin_channel_topic(request: Request, name: str = Form(...), topic: str = Form("")):
+    if not require_admin(request):
+        return redirect("/login")
+    if name in CHANNELS:
+        CHANNELS[name]["topic"] = topic.strip()[:120] or "Без описания"
+    return redirect("/admin?tab=channels")
 
 
-@app.post("/vote/{post_id}")
-def vote(post_id: int, request: Request, value: str = Form(...)):
-    aid = request.state.anon["id"]
-    p = next((x for x in posts if x["id"] == post_id), None)
-    if p:
-        if value == "up":
-            if aid in p["up"]:
-                p["up"].discard(aid)
-            else:
-                p["up"].add(aid); p["down"].discard(aid)
-        elif value == "down":
-            if aid in p["down"]:
-                p["down"].discard(aid)
-            else:
-                p["down"].add(aid); p["up"].discard(aid)
-    return RedirectResponse(safe_redirect(request), status_code=303)
+@app.post("/admin/channels/clear")
+async def admin_channel_clear(request: Request, name: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if name in MESSAGES:
+        MESSAGES[name] = []
+    return redirect("/admin?tab=channels")
 
 
-@app.post("/comment/{post_id}")
-def add_comment(post_id: int, request: Request, text: str = Form(...)):
-    p = next((x for x in posts if x["id"] == post_id), None)
-    text = text.strip()
-    if p and text:
-        _counter["comment"] += 1
-        p["comments"].append({
-            "id": _counter["comment"],
-            "text": text[:1000],
-            "created": time.time(),
-        })
-    return RedirectResponse(safe_redirect(request), status_code=303)
+@app.post("/admin/channels/delete")
+async def admin_channel_delete(request: Request, name: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    CHANNELS.pop(name, None)
+    MESSAGES.pop(name, None)
+    # отключаем всех в удалённом канале
+    for ws in list(WS_CONNECTIONS.pop(name, {}).keys()):
+        try:
+            await ws.close(code=1001)
+        except Exception:
+            pass
+    return redirect("/admin?tab=channels")
 
 
-@app.post("/api/preview")
-def api_preview(text: str = Form("")):
-    return JSONResponse({"html": render_md(text[:MAX_RAW])})
+@app.post("/admin/users/promote")
+async def admin_user_promote(request: Request, username: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if username in USERS:
+        USERS[username]["is_admin"] = True
+    return redirect("/admin?tab=users")
 
 
-# ============================================================
+@app.post("/admin/users/demote")
+async def admin_user_demote(request: Request, username: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if username in USERS and username != "admin":
+        USERS[username]["is_admin"] = False
+    return redirect("/admin?tab=users")
+
+
+@app.post("/admin/users/ban")
+async def admin_user_ban(request: Request, username: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if username in USERS and username != "admin":
+        USERS[username]["banned"] = True
+        # выкидываем из сессий и WS
+        for tok, un in list(SESSIONS.items()):
+            if un == username:
+                SESSIONS.pop(tok, None)
+        for ch, conns in WS_CONNECTIONS.items():
+            for ws, un in list(conns.items()):
+                if un == username:
+                    conns.pop(ws, None)
+                    try:
+                        await ws.close(code=1008)
+                    except Exception:
+                        pass
+            await send_users(ch)
+    return redirect("/admin?tab=users")
+
+
+@app.post("/admin/users/unban")
+async def admin_user_unban(request: Request, username: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if username in USERS:
+        USERS[username]["banned"] = False
+    return redirect("/admin?tab=users")
+
+
+@app.post("/admin/users/delete")
+async def admin_user_delete(request: Request, username: str = Form(...)):
+    if not require_admin(request):
+        return redirect("/login")
+    if username in USERS and username != "admin":
+        USERS.pop(username, None)
+        for tok, un in list(SESSIONS.items()):
+            if un == username:
+                SESSIONS.pop(tok, None)
+        for ch, conns in WS_CONNECTIONS.items():
+            for ws, un in list(conns.items()):
+                if un == username:
+                    conns.pop(ws, None)
+                    try:
+                        await ws.close(code=1001)
+                    except Exception:
+                        pass
+            await send_users(ch)
+    return redirect("/admin?tab=users")
+
+
+@app.post("/admin/settings")
+async def admin_settings(
+    request: Request,
+    server_name: str = Form(...),
+    motd: str = Form(""),
+    max_msg_len: int = Form(...),
+    allow_registration: str = Form("1"),
+):
+    if not require_admin(request):
+        return redirect("/login")
+    CONFIG["server_name"] = server_name.strip()[:60] or "MiniChat"
+    CONFIG["motd"] = motd.strip()[:200]
+    CONFIG["max_msg_len"] = max(50, min(5000, int(max_msg_len)))
+    CONFIG["allow_registration"] = allow_registration == "1"
+    return redirect("/admin?tab=settings")
+
+
+# ────────────────────────────────────────────────────────────
+#  ТОЧКА ВХОДА
+# ────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("=" * 52)
+    print("  MiniChat запущен")
+    print("  Открой:   http://127.0.0.1:8000")
+    print("  Админ:    admin / admin")
+    print("=" * 52)
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
