@@ -1,3 +1,7 @@
+# main.py
+# pip install fastapi uvicorn supabase
+# uvicorn main:app --reload
+
 import os
 import time
 import uuid
@@ -5,7 +9,8 @@ import json
 import hashlib
 import re
 import urllib.request
-from typing import Dict, List, Optional, Set
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -25,9 +30,10 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print("[sldChat] Supabase init error:", e)
 
-
-USERS: Dict[str, dict] = {}          # nick -> user
-SESSIONS: Dict[str, str] = {}        # token -> nick
+USERS: Dict[str, dict] = {}
+SESSIONS: Dict[str, str] = {}
+POSTS_MEM: Dict[str, dict] = {}
+NOTIFS_MEM: Dict[str, List[dict]] = {}
 
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
@@ -53,6 +59,28 @@ def check_password(password: str, stored: str) -> bool:
     except Exception:
         return False
     return hashlib.sha256((salt + password).encode()).hexdigest() == h
+
+
+def ts_to_iso(ts) -> str:
+    if isinstance(ts, str):
+        return ts
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return datetime.now(tz=timezone.utc).isoformat()
+
+
+def iso_to_ts(s) -> float:
+    if isinstance(s, (int, float)):
+        return float(s)
+    if not s:
+        return time.time()
+    try:
+        if isinstance(s, str) and s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return time.time()
 
 
 def get_client_ip(request: Request) -> str:
@@ -114,15 +142,7 @@ def get_current_user(request: Request) -> Optional[dict]:
     return db_load_user(nick)
 
 
-def get_voter_id(request: Request) -> str:
-    u = get_current_user(request)
-    if u:
-        return "u:" + u["nick"]
-    return "c:anon"
-
-
 def db_load_user(nick: str) -> Optional[dict]:
-    """Читает пользователя. Сначала Supabase, потом память."""
     if supabase:
         try:
             r = supabase.table("users").select("*").ilike("nick", nick).limit(1).execute()
@@ -131,6 +151,7 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["following"] = set(row.get("following") or [])
                 row["followers"] = set(row.get("followers") or [])
                 row["bio"] = row.get("bio") or ""
+                row["created_at"] = iso_to_ts(row.get("created_at"))
                 return row
         except Exception as e:
             print("[sldChat] db_load_user error:", e)
@@ -142,7 +163,6 @@ def db_load_user(nick: str) -> Optional[dict]:
 
 
 def db_save_user(u: dict) -> None:
-    """Пишет в память → в Supabase → выкидывает из памяти."""
     USERS[u["nick"]] = u
     if not supabase:
         return
@@ -152,7 +172,7 @@ def db_save_user(u: dict) -> None:
             "name": u["name"],
             "bio": u.get("bio", ""),
             "password": u["password"],
-            "created_at": u["created_at"],
+            "created_at": ts_to_iso(u["created_at"]),
             "following": list(u.get("following") or []),
             "followers": list(u.get("followers") or []),
         }).execute()
@@ -172,26 +192,6 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
         print("[sldChat] db_update_user_fields error:", e)
 
 
-def db_all_users() -> List[dict]:
-    if supabase:
-        try:
-            r = supabase.table("users").select("*").execute()
-            out = []
-            for row in r.data or []:
-                row["following"] = set(row.get("following") or [])
-                row["followers"] = set(row.get("followers") or [])
-                row["bio"] = row.get("bio") or ""
-                out.append(row)
-            return out
-        except Exception as e:
-            print("[sldChat] db_all_users error:", e)
-            return []
-    return list(USERS.values())
-
-
-# ==================================================================
-# DB СЛОЙ: posts + votes + comments + votes + notifications
-# ==================================================================
 def db_create_post(p: dict) -> None:
     if not supabase:
         POSTS_MEM[p["id"]] = p
@@ -201,7 +201,7 @@ def db_create_post(p: dict) -> None:
             "id": p["id"],
             "text": p["text"],
             "author": p["author"],
-            "created_at": p["created_at"],
+            "created_at": ts_to_iso(p["created_at"]),
         }).execute()
     except Exception as e:
         print("[sldChat] db_create_post error:", e)
@@ -213,7 +213,9 @@ def db_get_post(pid: str) -> Optional[dict]:
             r = supabase.table("posts").select("*").eq("id", pid).limit(1).execute()
             if not r.data:
                 return None
-            return r.data[0]
+            row = r.data[0]
+            row["created_at"] = iso_to_ts(row.get("created_at"))
+            return row
         except Exception as e:
             print("[sldChat] db_get_post error:", e)
             return None
@@ -229,7 +231,10 @@ def db_list_posts(q: str = "", author: str = "") -> List[dict]:
             if q:
                 query = query.ilike("text", f"%{q}%")
             query = query.order("created_at", desc=True).limit(300)
-            return query.execute().data or []
+            rows = query.execute().data or []
+            for row in rows:
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
         except Exception as e:
             print("[sldChat] db_list_posts error:", e)
             return []
@@ -262,7 +267,6 @@ def db_post_votes(post_ids: List[str]) -> List[dict]:
 
 
 def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
-    """direction = 0 → удалить голос."""
     if supabase:
         try:
             if direction == 0:
@@ -288,7 +292,13 @@ def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
         return []
     if supabase:
         try:
-            return supabase.table("comments").select("*").in_("post_id", post_ids).order("created_at").execute().data or []
+            rows = (supabase.table("comments").select("*")
+                    .in_("post_id", post_ids)
+                    .order("created_at")
+                    .execute().data or [])
+            for row in rows:
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
         except Exception as e:
             print("[sldChat] db_comments_for_posts error:", e)
             return []
@@ -336,7 +346,7 @@ def db_create_comment(c: dict) -> None:
         supabase.table("comments").insert({
             "id": c["id"], "post_id": c["post_id"], "author": c["author"],
             "parent_id": c.get("parent_id"),
-            "text": c["text"], "created_at": c["created_at"],
+            "text": c["text"], "created_at": ts_to_iso(c["created_at"]),
         }).execute()
     except Exception as e:
         print("[sldChat] db_create_comment error:", e)
@@ -346,7 +356,11 @@ def db_get_comment(cid: str) -> Optional[dict]:
     if supabase:
         try:
             r = supabase.table("comments").select("*").eq("id", cid).limit(1).execute()
-            return r.data[0] if r.data else None
+            if not r.data:
+                return None
+            row = r.data[0]
+            row["created_at"] = iso_to_ts(row.get("created_at"))
+            return row
         except Exception as e:
             print("[sldChat] db_get_comment error:", e)
             return None
@@ -400,7 +414,17 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
     }
     if supabase:
         try:
-            supabase.table("notifications").insert(n).execute()
+            supabase.table("notifications").insert({
+                "id": n["id"],
+                "to_nick": n["to_nick"],
+                "type": n["type"],
+                "from_nick": n["from_nick"],
+                "post_id": n["post_id"],
+                "comment_id": n["comment_id"] or None,
+                "text": n["text"],
+                "read": n["read"],
+                "created_at": ts_to_iso(n["created_at"]),
+            }).execute()
         except Exception as e:
             print("[sldChat] db_notify error:", e)
         return
@@ -412,7 +436,10 @@ def db_notifications(nick: str) -> List[dict]:
         try:
             r = (supabase.table("notifications").select("*")
                  .eq("to_nick", nick).order("created_at", desc=True).limit(100).execute())
-            return r.data or []
+            rows = r.data or []
+            for row in rows:
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
         except Exception as e:
             print("[sldChat] db_notifications error:", e)
             return []
@@ -442,11 +469,7 @@ def db_notifications_clear(nick: str) -> None:
     NOTIFS_MEM[nick] = []
 
 
-# ==================================================================
-# СЕРИАЛИЗАЦИЯ
-# ==================================================================
 def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
-    """Собирает посты с голосами и комментариями (батчами)."""
     if not posts:
         return []
     post_ids = [p["id"] for p in posts]
@@ -475,10 +498,10 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
         uv = pvotes.get(voter_id, 0)
         clist = []
         for c in cmap.get(p["id"], []):
-            cvotes = cvmap.get(c["id"], {})
-            cup = sum(1 for d in cvotes.values() if d == 1)
-            cdown = sum(1 for d in cvotes.values() if d == -1)
-            cuv = cvotes.get(voter_id, 0)
+            cv = cvmap.get(c["id"], {})
+            cup = sum(1 for d in cv.values() if d == 1)
+            cdown = sum(1 for d in cv.values() if d == -1)
+            cuv = cv.get(voter_id, 0)
             clist.append({
                 "id": c["id"], "text": c["text"], "created_at": c["created_at"],
                 "author": c.get("author"), "parent_id": c.get("parent_id"),
@@ -509,14 +532,6 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
     }
 
 
-# фолбэк-память (используется только если supabase = None)
-POSTS_MEM: Dict[str, dict] = {}
-NOTIFS_MEM: Dict[str, List[dict]] = {}
-
-
-# ==================================================================
-# МОДЕЛИ
-# ==================================================================
 class PostIn(BaseModel):
     text: str
 
@@ -546,9 +561,6 @@ class BioIn(BaseModel):
     bio: str
 
 
-# ==================================================================
-# API: АВТОРИЗАЦИЯ
-# ==================================================================
 @app.post("/api/register")
 def api_register(data: RegisterIn):
     name = data.name.strip()
@@ -603,9 +615,6 @@ def api_me(request: Request):
     return serialize_user(u, u["nick"])
 
 
-# ==================================================================
-# API: ПОСТЫ
-# ==================================================================
 @app.get("/api/posts")
 def api_list(request: Request, q: str = "", author: str = ""):
     posts = db_list_posts(q=q, author=author)
@@ -651,7 +660,6 @@ def api_vote_post(pid: str, v: VoteIn, request: Request):
         raise HTTPException(401, "unauthorized")
     vid = "u:" + u["nick"]
 
-    # узнать текущий голос
     existing = db_post_votes([pid])
     cur = 0
     for row in existing:
@@ -684,7 +692,6 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
         parent = db_get_comment(parent_id)
         if not parent or parent["post_id"] != pid:
             raise HTTPException(400, "bad parent")
-        # только 1 уровень: у родителя не должно быть своего родителя
         if parent.get("parent_id"):
             raise HTTPException(400, "reply_only_one_level")
 
@@ -694,9 +701,7 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
         "parent_id": parent_id, "text": text, "created_at": time.time(),
     })
 
-    # уведомление автору поста (если не он сам пишет)
     db_notify(post["author"], "comment", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
-    # если это ответ — уведомим автора родительского коммента
     if parent_id:
         p2 = db_get_comment(parent_id)
         if p2 and p2["author"] != u["nick"]:
@@ -729,9 +734,6 @@ def api_vote_comment(pid: str, cid: str, v: VoteIn, request: Request):
     return build_posts_full([p], vid)[0]
 
 
-# ==================================================================
-# API: ПОЛЬЗОВАТЕЛИ / ФОЛЛОВЕРЫ
-# ==================================================================
 @app.get("/api/users/{nick}")
 def api_user(nick: str, request: Request):
     u = db_load_user(nick)
@@ -783,13 +785,13 @@ def api_follow(nick: str, request: Request):
         raise HTTPException(400, "self")
 
     if target["nick"] not in (me.get("following") or set()):
-        new_following = set(me.get("following") or set())
-        new_following.add(target["nick"])
-        db_update_user_fields(me["nick"], {"following": list(new_following)})
+        nf = set(me.get("following") or set())
+        nf.add(target["nick"])
+        db_update_user_fields(me["nick"], {"following": list(nf)})
 
-        new_followers = set(target.get("followers") or set())
-        new_followers.add(me["nick"])
-        db_update_user_fields(target["nick"], {"followers": list(new_followers)})
+        nfw = set(target.get("followers") or set())
+        nfw.add(me["nick"])
+        db_update_user_fields(target["nick"], {"followers": list(nfw)})
 
         db_notify(target["nick"], "follow", me["nick"])
 
@@ -835,9 +837,6 @@ def api_set_bio(data: BioIn, request: Request):
     return {"ok": True, "bio": bio}
 
 
-# ==================================================================
-# API: УВЕДОМЛЕНИЯ
-# ==================================================================
 @app.get("/api/notifications")
 def api_notifications(request: Request):
     me = get_current_user(request)
@@ -866,27 +865,16 @@ def api_notifications_clear(request: Request):
     return {"ok": True}
 
 
-# ==================================================================
-# ТЕКСТЫ
-# ==================================================================
 TEXTS = {
     "ru": {
-        "search_ph": "Поиск по постам",
-        "search": "Поиск",
-        "theme": "Сменить тему",
+        "search_ph": "Поиск по постам", "search": "Поиск", "theme": "Сменить тему",
         "post_ph": "Написать пост (до 1000 символов)",
-        "comment_ph": "Написать комментарий",
-        "reply_ph": "Ответить на комментарий",
-        "publish": "Опубликовать",
-        "send_comment": "Отправить",
-        "reply": "Ответить",
-        "cancel_reply": "Отмена",
-        "no_posts": "Постов пока нет",
-        "not_found": "Не найдено",
-        "just_now": "только что",
-        "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
-        "read_more": "читать дальше",
-        "copy": "Копировать", "copied": "Скопировано",
+        "comment_ph": "Написать комментарий", "reply_ph": "Ответить на комментарий",
+        "publish": "Опубликовать", "send_comment": "Отправить",
+        "reply": "Ответить", "cancel_reply": "Отмена",
+        "no_posts": "Постов пока нет", "not_found": "Не найдено",
+        "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
+        "read_more": "читать дальше", "copy": "Копировать", "copied": "Скопировано",
         "author_badge": "автор",
         "f_new": "Новые", "f_top": "Лучшие", "f_bottom": "Худшие", "f_old": "Старые",
         "f_all": "Все", "f_many": "Много комм.", "f_some": "Есть комм.", "f_none": "Без комм.",
@@ -897,8 +885,7 @@ TEXTS = {
         "name_ph": "Имя", "nick_ph": "Ник (@nick)",
         "pass_ph": "Пароль", "pass2_ph": "Повтор пароля",
         "reg_btn": "Создать аккаунт", "log_btn": "Войти",
-        "to_login": "Уже есть аккаунт? Войти",
-        "to_reg": "Нет аккаунта? Регистрация",
+        "to_login": "Уже есть аккаунт? Войти", "to_reg": "Нет аккаунта? Регистрация",
         "err_bad_nick": "Ник: 3-20 символов, латиница, цифры, _",
         "err_bad_name": "Имя: от 1 до 50 символов",
         "err_short_pass": "Пароль: минимум 6 символов",
@@ -909,43 +896,30 @@ TEXTS = {
         "login_to_post": "Войдите, чтобы писать посты",
         "login_to_comment": "Войдите, чтобы писать комментарии",
         "go_login": "Войти", "go_register": "Регистрация",
-        "profile_followers": "подписчиков",
-        "profile_following": "подписок",
+        "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
-        "own_profile": "Это ваш профиль",
-        "no_user_posts": "Постов пока нет",
-        "settings_title": "Настройки",
-        "settings_theme": "Тема", "settings_lang": "Язык",
+        "own_profile": "Это ваш профиль", "no_user_posts": "Постов пока нет",
+        "settings_title": "Настройки", "settings_theme": "Тема", "settings_lang": "Язык",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
-        "notif_title": "Уведомления",
-        "notif_empty": "Уведомлений нет",
+        "notif_title": "Уведомления", "notif_empty": "Уведомлений нет",
         "notif_follow": "подписался(-ась) на вас",
         "notif_comment": "оставил(а) комментарий",
         "notif_reply": "ответил(а) на ваш комментарий",
-        "notif_clear": "Очистить все",
-        "back_to_main": "В главное меню",
-        "bio_ph": "Описание профиля...",
-        "bio_save": "Сохранить",
-        "bio_saved": "Сохранено",
-        "bio_empty": "Описание пока не заполнено",
-        "edit_bio": "Редактировать",
-        "followers_title": "Подписчики",
-        "following_title": "Подписки",
-        "no_followers": "Подписчиков пока нет",
-        "no_following": "Подписок пока нет",
+        "notif_clear": "Очистить все", "back_to_main": "В главное меню",
+        "bio_ph": "Описание профиля...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
+        "bio_empty": "Описание пока не заполнено", "edit_bio": "Редактировать",
+        "followers_title": "Подписчики", "following_title": "Подписки",
+        "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
     },
     "en": {
         "search_ph": "Search posts", "search": "Search", "theme": "Toggle theme",
         "post_ph": "Write a post (up to 1000 chars)",
-        "comment_ph": "Write a comment",
-        "reply_ph": "Reply to comment",
+        "comment_ph": "Write a comment", "reply_ph": "Reply to comment",
         "publish": "Publish", "send_comment": "Send",
         "reply": "Reply", "cancel_reply": "Cancel",
         "no_posts": "No posts yet", "not_found": "Not found",
-        "just_now": "just now",
-        "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
-        "read_more": "read more",
-        "copy": "Copy", "copied": "Copied",
+        "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
+        "read_more": "read more", "copy": "Copy", "copied": "Copied",
         "author_badge": "author",
         "f_new": "New", "f_top": "Top", "f_bottom": "Worst", "f_old": "Old",
         "f_all": "All", "f_many": "Many", "f_some": "Some", "f_none": "None",
@@ -956,8 +930,7 @@ TEXTS = {
         "name_ph": "Name", "nick_ph": "Nick (@nick)",
         "pass_ph": "Password", "pass2_ph": "Confirm password",
         "reg_btn": "Create account", "log_btn": "Log in",
-        "to_login": "Already have an account? Log in",
-        "to_reg": "No account? Sign up",
+        "to_login": "Already have an account? Log in", "to_reg": "No account? Sign up",
         "err_bad_nick": "Nick: 3-20 chars, letters/digits/_",
         "err_bad_name": "Name: 1-50 chars",
         "err_short_pass": "Password: min 6 chars",
@@ -970,16 +943,14 @@ TEXTS = {
         "go_login": "Log in", "go_register": "Sign up",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
-        "own_profile": "This is your profile",
-        "no_user_posts": "No posts yet",
+        "own_profile": "This is your profile", "no_user_posts": "No posts yet",
         "settings_title": "Settings", "settings_theme": "Theme", "settings_lang": "Language",
         "theme_light": "Light", "theme_dark": "Dark",
         "notif_title": "Notifications", "notif_empty": "No notifications",
         "notif_follow": "followed you",
         "notif_comment": "commented",
         "notif_reply": "replied to your comment",
-        "notif_clear": "Clear all",
-        "back_to_main": "Back to main",
+        "notif_clear": "Clear all", "back_to_main": "Back to main",
         "bio_ph": "Profile bio...", "bio_save": "Save", "bio_saved": "Saved",
         "bio_empty": "No bio yet", "edit_bio": "Edit",
         "followers_title": "Followers", "following_title": "Following",
@@ -988,9 +959,6 @@ TEXTS = {
 }
 
 
-# ==================================================================
-# SVG-ИКОНКИ
-# ==================================================================
 def svg(paths: str, size: int = 16, sw: float = 2) -> str:
     return (
         f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
@@ -1045,9 +1013,6 @@ FAVICON = (
 )
 
 
-# ==================================================================
-# CSS
-# ==================================================================
 CSS = """
 :root, [data-theme="light"] {
   --bg:#ebebeb; --card:#ffffff; --line:#d4d4d4; --line-strong:#a8a8a8;
@@ -1064,9 +1029,7 @@ CSS = """
   --danger:#e74c3c;
 }
 * { box-sizing: border-box; }
-html, body {
-  height: 100vh; margin: 0; padding: 0; overflow: hidden;
-}
+html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background: var(--bg); color: var(--text); font-size: 14px;
@@ -1075,26 +1038,15 @@ body {
   display: flex;
 }
 input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select: text; }
-
-/* ============ Кастомные скроллбары ============ */
 * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: var(--line-strong); border: 2px solid var(--card);
-}
+::-webkit-scrollbar-thumb { background: var(--line-strong); border: 2px solid var(--card); }
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
-.layout {
-  display: flex; width: 100%; height: 100vh;
-  background: var(--card);
-}
-.main {
-  flex: 1 1 auto; min-width: 0;
-  display: flex; flex-direction: column;
-  background: var(--card);
-}
+.layout { display: flex; width: 100%; height: 100vh; background: var(--card); }
+.main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--card); }
 .main-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
   padding: 10px 12px; border-bottom: 1px solid var(--line);
@@ -1105,26 +1057,17 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
 }
 .main-body { flex: 1 1 auto; overflow-y: auto; }
 
-/* ============ Sidebar ============ */
 .sidebar {
-  flex: 0 0 260px; width: 260px;
-  border-left: 1px solid var(--line);
-  background: var(--card);
-  display: flex; flex-direction: column;
-  padding: 16px 12px;
+  flex: 0 0 260px; width: 260px; border-left: 1px solid var(--line);
+  background: var(--card); display: flex; flex-direction: column; padding: 16px 12px;
 }
-.sidebar .logo {
-  font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
-  padding: 4px 12px 20px;
-}
+.sidebar .logo { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; padding: 4px 12px 20px; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
   display: flex; align-items: center; gap: 10px;
-  width: 100%; padding: 9px 12px;
-  border: none; background: transparent;
+  width: 100%; padding: 9px 12px; border: none; background: transparent;
   color: var(--text); font: inherit; font-size: 14px;
-  cursor: pointer; text-align: left;
-  transition: background .12s;
+  cursor: pointer; text-align: left; transition: background .12s;
 }
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--hover); font-weight: 600; }
@@ -1137,19 +1080,15 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* ============ Icon btn ============ */
 .icon-btn {
-  width: 32px; height: 32px;
-  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
   background: transparent; border: 1px solid var(--line);
   color: var(--text); cursor: pointer; padding: 0; text-decoration: none;
-  transition: background .12s, border-color .12s;
-  flex-shrink: 0;
+  transition: background .12s, border-color .12s; flex-shrink: 0;
 }
 .icon-btn:hover { background: var(--hover); border-color: var(--line-strong); }
 .icon-btn svg { display: block; }
 
-/* ============ Search & filters ============ */
 header.search-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
   padding: 10px 12px; border-bottom: 1px solid var(--line);
@@ -1178,7 +1117,6 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .filter:hover { background: var(--hover); color: var(--text); }
 .filter.active { color: var(--text); background: var(--hover); }
 
-/* ============ Posts ============ */
 .empty { padding: 80px 20px; text-align: center; color: var(--muted); font-size: 13px; }
 .post { padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--card); }
 .post-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
@@ -1216,7 +1154,6 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .score.up { color: var(--up); }
 .score.down { color: var(--down); }
 
-/* ============ Comments ============ */
 .comments { margin-top: 12px; border-top: 1px solid var(--line); }
 .comment {
   padding: 10px 12px; margin-top: 8px;
@@ -1235,8 +1172,7 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .comment-author:hover { text-decoration: underline; }
 .comment-author-badge {
   font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .5px; padding: 1px 6px; border: 1px solid currentColor;
-  color: var(--text);
+  letter-spacing: .5px; padding: 1px 6px; border: 1px solid currentColor; color: var(--text);
 }
 .comment-time { font-size: 11px; color: var(--muted); margin-left: auto; }
 .comment-text { font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); }
@@ -1250,7 +1186,6 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 }
 .comment-reply-btn:hover { color: var(--text); background: var(--hover); }
 
-/* ============ Composer ============ */
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 10px 12px; }
 .composer textarea {
   display: block; width: 100%; min-height: 160px; padding: 12px 14px;
@@ -1291,20 +1226,17 @@ button.send:disabled { opacity: .28; cursor: default; }
 .login-prompt { padding: 14px; text-align: center; color: var(--muted); font-size: 13px; }
 .login-prompt a { color: var(--text); }
 
-/* ============ Auth ============ */
 .auth-wrap { max-width: 380px; margin: 0 auto; padding: 40px 20px; }
 .auth-title { font-size: 22px; font-weight: 700; margin: 0 0 24px; letter-spacing: -0.5px; }
 .auth-form { display: flex; flex-direction: column; gap: 10px; }
 .auth-form input {
-  width: 100%; padding: 11px 12px;
-  border: 1px solid var(--line); background: transparent;
+  width: 100%; padding: 11px 12px; border: 1px solid var(--line); background: transparent;
   color: var(--text); font-family: inherit; font-size: 14px;
   outline: none; transition: border-color .12s;
 }
 .auth-form input:focus { border-color: var(--line-strong); }
 .auth-form button {
-  margin-top: 6px; height: 40px;
-  background: var(--accent); color: var(--accent-fg);
+  margin-top: 6px; height: 40px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
   font-family: inherit; font-size: 14px; font-weight: 600;
   cursor: pointer; transition: opacity .12s;
@@ -1315,7 +1247,6 @@ button.send:disabled { opacity: .28; cursor: default; }
 .auth-switch { margin-top: 20px; font-size: 13px; color: var(--muted); text-align: center; }
 .auth-switch a { color: var(--text); cursor: pointer; text-decoration: underline; }
 
-/* ============ Profile ============ */
 .profile-header { padding: 24px 18px; border-bottom: 1px solid var(--line); }
 .profile-name-big { font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
 .profile-nick-small { color: var(--muted); font-size: 14px; margin-top: 2px; }
@@ -1332,8 +1263,7 @@ button.send:disabled { opacity: .28; cursor: default; }
 .profile-stats b:hover { text-decoration: underline; }
 .profile-actions { margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
 .follow-btn {
-  height: 32px; padding: 0 20px;
-  background: var(--accent); color: var(--accent-fg);
+  height: 32px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
   font-family: inherit; font-size: 13px; font-weight: 600;
   cursor: pointer; transition: opacity .12s;
@@ -1352,8 +1282,7 @@ button.send:disabled { opacity: .28; cursor: default; }
 .bio-editor textarea:focus { border-color: var(--line-strong); }
 .bio-editor-row { display: flex; gap: 8px; margin-top: 6px; align-items: center; }
 .btn-secondary {
-  height: 32px; padding: 0 16px;
-  background: transparent; color: var(--text);
+  height: 32px; padding: 0 16px; background: transparent; color: var(--text);
   border: 1px solid var(--line);
   font-family: inherit; font-size: 13px; cursor: pointer;
   transition: background .12s, border-color .12s;
@@ -1361,12 +1290,8 @@ button.send:disabled { opacity: .28; cursor: default; }
 .btn-secondary:hover { background: var(--hover); border-color: var(--line-strong); }
 .bio-saved-msg { font-size: 12px; color: var(--up); }
 
-/* ============ Followers lists ============ */
 .user-list { padding: 6px 0; }
-.user-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 12px 18px; border-bottom: 1px solid var(--line);
-}
+.user-item { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
 .user-item .user-info { flex: 1; min-width: 0; }
 .user-item .user-nick {
   font-weight: 600; color: var(--text); text-decoration: none;
@@ -1374,9 +1299,7 @@ button.send:disabled { opacity: .28; cursor: default; }
 }
 .user-item .user-nick:hover { text-decoration: underline; }
 .user-item .user-name { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.user-item .follow-btn { height: 28px; padding: 0 14px; font-size: 12px; }
 
-/* ============ Notifications ============ */
 .notif-list { padding: 6px 0; }
 .notif {
   display: block; padding: 12px 18px; border-bottom: 1px solid var(--line);
@@ -1387,19 +1310,14 @@ button.send:disabled { opacity: .28; cursor: default; }
 .notif-author { font-weight: 600; color: var(--text); }
 .notif-text { color: var(--muted); font-size: 13px; }
 .notif-snippet {
-  margin-top: 6px; padding: 8px 10px;
-  background: var(--comment-bg); border-left: 2px solid var(--line-strong);
+  margin-top: 6px; padding: 8px 10px; background: var(--comment-bg); border-left: 2px solid var(--line-strong);
   font-size: 13px; color: var(--text);
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
 }
 .notif-time { font-size: 11px; color: var(--muted); margin-top: 4px; }
-.notif-actions {
-  padding: 12px 18px; border-bottom: 1px solid var(--line);
-  display: flex; justify-content: flex-end;
-}
+.notif-actions { padding: 12px 18px; border-bottom: 1px solid var(--line); display: flex; justify-content: flex-end; }
 .btn-danger {
-  height: 30px; padding: 0 14px;
-  background: transparent; color: var(--danger);
+  height: 30px; padding: 0 14px; background: transparent; color: var(--danger);
   border: 1px solid var(--danger);
   font-family: inherit; font-size: 12px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 6px;
@@ -1407,7 +1325,6 @@ button.send:disabled { opacity: .28; cursor: default; }
 }
 .btn-danger:hover { background: var(--danger); color: var(--card); }
 
-/* ============ Settings ============ */
 .settings { padding: 24px 18px; }
 .settings h2 {
   font-size: 13px; font-weight: 600; text-transform: uppercase;
@@ -1423,7 +1340,6 @@ button.send:disabled { opacity: .28; cursor: default; }
 .opt:hover { background: var(--hover); }
 .opt.active { background: var(--hover); border-color: var(--line-strong); font-weight: 600; }
 
-/* ============ Highlight comment ============ */
 .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash {
   0% { background: var(--up); color: #fff; }
@@ -1432,9 +1348,6 @@ button.send:disabled { opacity: .28; cursor: default; }
 """
 
 
-# ==================================================================
-# JS
-# ==================================================================
 JS = r"""
 var ICONS = {
   up: __ICON_UP__, down: __ICON_DOWN__, comment: __ICON_COMMENT__,
@@ -1455,11 +1368,10 @@ var state = {
   commentFilter: 'any',
   searchQuery: '',
   composerDraft: '',
-  replyTo: null,       // {id, author, text}
+  replyTo: null,
   highlightComment: null
 };
 
-// ============ HTTP ============
 async function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
@@ -1482,7 +1394,6 @@ async function api(path, opts) {
   return r.json();
 }
 
-// ============ Utils ============
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
@@ -1513,7 +1424,6 @@ function truncateText(text) {
   return { text: out, truncated: truncated };
 }
 
-// ============ Theme ============
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('sldchat_theme', theme);
@@ -1526,7 +1436,6 @@ function toggleTheme() {
 }
 applyTheme(localStorage.getItem('sldchat_theme') || 'light');
 
-// ============ Navigation ============
 function navigate(url) {
   history.pushState({}, '', url);
   handleRoute();
@@ -1559,7 +1468,6 @@ function handleRoute() {
 }
 window.addEventListener('popstate', handleRoute);
 
-// ============ Auth ============
 async function loadMe() {
   if (!state.token) return;
   try { state.user = await api('/api/me'); } catch(e) { state.user = null; }
@@ -1585,7 +1493,6 @@ async function doLogout() {
   navigate('/');
 }
 
-// ============ Sidebar ============
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
   var labelWithCount = (count && count > 0) ? (label + ' (' + count + ')') : label;
@@ -1625,7 +1532,6 @@ function renderSidebar() {
   });
 }
 
-// ============ Main dispatcher ============
 function renderMain() {
   var el = document.getElementById('main');
   if (state.view === 'feed') renderFeedView(el);
@@ -1656,7 +1562,6 @@ function bindLinks(root) {
   });
 }
 
-// ============ Feed ============
 function renderFeedView(el) {
   var html = '';
   html += '<header class="search-header">';
@@ -1781,7 +1686,6 @@ function applyFilters(posts) {
   return posts;
 }
 
-// ============ Post view ============
 function renderPostView(el) {
   var html = '';
   html += '<header class="main-header">';
@@ -1873,7 +1777,6 @@ async function loadPostView() {
   } catch(e) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>'; }
 }
 
-// ============ Profile ============
 function renderProfileView(el) {
   var nick = state.viewData.nick || '';
   var html = '';
@@ -1897,11 +1800,9 @@ async function loadProfile(nick) {
     var isMe = state.user && state.user.nick === u.nick;
 
     var h = '<div class="profile-header">';
-    // имя сверху, ник снизу
     h += '<div class="profile-name-big">' + escapeHtml(u.name) + '</div>';
     h += '<div class="profile-nick-small">@' + escapeHtml(u.nick) + '</div>';
 
-    // bio
     if (isMe) {
       h += '<div class="bio-editor">';
       h += '<textarea id="bioInput" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '">' + escapeHtml(u.bio || '') + '</textarea>';
@@ -1972,7 +1873,6 @@ async function loadProfile(nick) {
   }
 }
 
-// ============ Followers / Following ============
 function renderFollowListView(el) {
   var nick = state.viewData.nick;
   var isFollowers = state.view === 'followers';
@@ -2010,12 +1910,9 @@ async function loadFollowList(nick, isFollowers) {
         + '</div></div>';
     }).join('') + '</div>';
     bindLinks(wrap);
-  } catch(e) {
-    wrap.innerHTML = '<div class="empty">—</div>';
-  }
+  } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
-// ============ Notifications ============
 function renderNotificationsView(el) {
   var html = '';
   html += '<header class="main-header">';
@@ -2079,13 +1976,10 @@ function renderNotifHtml(n) {
     text = '<div class="notif-text">' + author + '</div>';
   }
   var inner = text + '<div class="notif-time">' + timeAgo(n.created_at) + '</div>';
-  if (link) {
-    return '<a class="' + cls + '" href="' + link + '" data-link>' + inner + '</a>';
-  }
+  if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + inner + '</a>';
   return '<div class="' + cls + '">' + inner + '</div>';
 }
 
-// ============ Settings ============
 function renderSettingsView(el) {
   var theme = document.documentElement.getAttribute('data-theme') || 'light';
   var lang = LANG;
@@ -2119,7 +2013,6 @@ function renderSettingsView(el) {
   });
 }
 
-// ============ Register ============
 function renderRegisterView(el) {
   var html = '';
   html += '<header class="main-header">';
@@ -2158,7 +2051,6 @@ function renderRegisterView(el) {
   });
 }
 
-// ============ Login ============
 function renderLoginView(el) {
   var html = '';
   html += '<header class="main-header">';
@@ -2191,7 +2083,6 @@ function renderLoginView(el) {
   });
 }
 
-// ============ Post HTML ============
 function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
@@ -2239,22 +2130,17 @@ function renderPostHtml(p, showComments) {
 }
 
 function renderCommentsTree(comments, postAuthor, postId) {
-  // top-level
   var tops = comments.filter(function(c){ return !c.parent_id; }).sort(function(a,b){ return a.created_at - b.created_at; });
   var repliesBy = {};
   comments.forEach(function(c){
-    if (c.parent_id) {
-      (repliesBy[c.parent_id] = repliesBy[c.parent_id] || []).push(c);
-    }
+    if (c.parent_id) (repliesBy[c.parent_id] = repliesBy[c.parent_id] || []).push(c);
   });
   var html = '';
   tops.forEach(function(c){
     html += renderCommentHtml(c, postAuthor, postId, false);
     var reps = repliesBy[c.id] || [];
     reps.sort(function(a,b){ return a.created_at - b.created_at; });
-    reps.forEach(function(r){
-      html += renderCommentHtml(r, postAuthor, postId, true);
-    });
+    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true); });
   });
   return html;
 }
@@ -2269,15 +2155,11 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
   var authorHtml = c.author
     ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>'
     : '';
-  var badge = isAuthor
-    ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>'
-    : '';
-  // Кнопка "Ответить" — только для топ-уровневых комментариев и только для залогиненных
+  var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
   var replyBtn = '';
   if (!isReply && state.user) {
     replyBtn = '<button class="comment-reply-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
   }
-
   return ''
     + '<div class="' + cls + '" data-comment-id="' + c.id + '">'
     +   '<div class="comment-meta">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
@@ -2357,7 +2239,6 @@ async function copyPost(postId, btn) {
   } catch(e) { alert('Copy failed'); }
 }
 
-// ============ Notifications polling ============
 async function pollNotifications() {
   if (!state.user) return;
   try {
@@ -2369,7 +2250,6 @@ async function pollNotifications() {
   } catch(e) {}
 }
 
-// ============ Init ============
 (async function init() {
   await loadMe();
   if (state.user && (state.view === 'login' || state.view === 'register')) {
@@ -2391,9 +2271,6 @@ async function pollNotifications() {
 """
 
 
-# ==================================================================
-# РЕНДЕР СТРАНИЦЫ
-# ==================================================================
 def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     t = TEXTS[lang]
     view_data = view_data or {}
@@ -2450,9 +2327,6 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     )
 
 
-# ==================================================================
-# РОУТЫ
-# ==================================================================
 @app.get("/", response_class=HTMLResponse)
 def page_index(request: Request):
     return render_page(get_lang(request), "feed")
