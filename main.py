@@ -2,7 +2,7 @@
 # pip install fastapi uvicorn supabase
 # uvicorn main:app --reload
 
-import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request
+import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
@@ -30,6 +30,7 @@ POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
 DM_THREADS_MEM: Dict[str, dict] = {}
 DM_MSGS_MEM: Dict[str, List[dict]] = {}
+_TRANSLATE_CACHE: Dict[str, str] = {}
 
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
@@ -140,23 +141,18 @@ def check_password(password: str, stored: str) -> bool:
         salt, expected = stored.split("$", 1)
         h = hashlib.sha256((salt + password).encode()).hexdigest()
         return hmac.compare_digest(h, expected)
-    except Exception:
-        return False
+    except Exception: return False
 
 
-def new_token() -> str:
-    return secrets.token_urlsafe(32)
+def new_token() -> str: return secrets.token_urlsafe(32)
 
 
 def rate_limit(key: str, max_req: int, window: float = RATE_WINDOW) -> bool:
     now = time.time()
     arr = [t for t in _RATE.get(key, []) if now - t < window]
     if len(arr) >= max_req:
-        _RATE[key] = arr
-        return False
-    arr.append(now)
-    _RATE[key] = arr
-    return True
+        _RATE[key] = arr; return False
+    arr.append(now); _RATE[key] = arr; return True
 
 
 def ts_to_iso(ts) -> str:
@@ -919,6 +915,10 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
         d["allow_wall_posts"] = u.get("allow_wall_posts", True)
     else:
         d["allow_wall_posts"] = u.get("allow_wall_posts", True)
+        if viewer_nick:
+            d["i_follow"] = viewer_nick in (u.get("followers") or set())
+        else:
+            d["i_follow"] = False
     return d
 
 
@@ -937,14 +937,46 @@ class SettingsIn(BaseModel):
     allow_wall_posts: Optional[bool] = None
 class DMSendIn(BaseModel): to: str; text: str
 class BlacklistIn(BaseModel): nick: str
+class TranslateIn(BaseModel): text: str
+
+
+def _translate_text(text: str, target: str) -> str:
+    text = (text or "").strip()
+    if not text: return ""
+    cache_key = f"{target}:{hashlib.md5(text.encode()).hexdigest()}"
+    if cache_key in _TRANSLATE_CACHE: return _TRANSLATE_CACHE[cache_key]
+    src = text[:500]
+    try:
+        url = "https://api.mymemory.translated.net/get?" + urllib.parse.urlencode({
+            "q": src, "langpair": f"autodetect|{target}"})
+        req = urllib.request.Request(url, headers={"User-Agent": "sldChat/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode())
+        translated = (data.get("responseData") or {}).get("translatedText") or ""
+        if translated:
+            _TRANSLATE_CACHE[cache_key] = translated
+            return translated
+    except Exception as e: print("[sldChat] translate error:", e)
+    return ""
+
+
+@app.post("/api/translate")
+def api_translate(data: TranslateIn, request: Request):
+    require_user(request)
+    if not rate_limit("tr:" + get_client_ip(request), 60, 60):
+        raise HTTPException(429, "err_rate_limit")
+    target = get_lang(request)
+    if target not in ("ru", "en"): target = "en"
+    res = _translate_text(data.text, target)
+    if not res: raise HTTPException(502, "translate_failed")
+    return {"text": res, "to": target}
 
 
 @app.post("/api/register")
 def api_register(data: RegisterIn, request: Request):
     ip = get_client_ip(request)
     if not rate_limit("reg:" + ip, 5, 3600): raise HTTPException(429, "err_rate_limit")
-    name = data.name.strip()
-    nick = data.nick.strip().lstrip("@")
+    name = data.name.strip(); nick = data.nick.strip().lstrip("@")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
     if len(data.password) < 6: raise HTTPException(400, "err_short_pass")
@@ -991,9 +1023,7 @@ def api_me(request: Request):
 @app.put("/api/users/me")
 def api_update_me(data: ProfileUpdateIn, request: Request):
     me = require_user(request)
-    name = data.name.strip()
-    nick = data.nick.strip().lstrip("@")
-    bio = data.bio.strip()
+    name = data.name.strip(); nick = data.nick.strip().lstrip("@"); bio = data.bio.strip()
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
     if len(bio) > MAX_BIO_LEN: raise HTTPException(400, "err_bio_too_long")
@@ -1146,9 +1176,12 @@ def api_unfollow(nick: str, request: Request):
 
 
 @app.get("/api/posts")
-def api_list(request: Request, q: str = "", author: str = ""):
+def api_list(request: Request, q: str = "", author: str = "", only_following: int = 0):
     posts = db_list_posts(q=q, author=author)
     u = get_current_user(request)
+    if only_following and u:
+        following = u.get("following") or set()
+        posts = [p for p in posts if p.get("author") in following]
     vid = "u:" + u["nick"] if u else "c:anon"
     return {"posts": build_posts_full(posts, vid)}
 
@@ -1160,21 +1193,38 @@ def api_wall(nick: str, request: Request):
     posts = db_list_wall_posts(u["nick"])
     viewer = get_current_user(request)
     vid = "u:" + viewer["nick"] if viewer else "c:anon"
+    can_post = False
+    reason = ""
+    if viewer:
+        if viewer["nick"] == u["nick"]:
+            can_post = True
+        elif viewer["nick"] in (u.get("blacklist") or []):
+            can_post = False; reason = "err_user_blocked"
+        elif not u.get("allow_wall_posts", True):
+            can_post = False; reason = "err_wall_disabled"
+        elif viewer["nick"] not in (u.get("followers") or set()):
+            can_post = False; reason = "err_follow_to_wall"
+        else:
+            can_post = True
     return {"posts": build_posts_full(posts, vid),
-            "allow_wall_posts": u.get("allow_wall_posts", True)}
+            "allow_wall_posts": u.get("allow_wall_posts", True),
+            "can_post": can_post,
+            "reason": reason}
 
 
 @app.post("/api/users/{nick}/wall")
 def api_wall_post(nick: str, payload: PostIn, request: Request):
     me = require_user(request)
-    ip = get_client_ip(request)
-    if not rate_limit("wall:" + ip, 20, 60): raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("wall:" + me["nick"], 20, 60): raise HTTPException(429, "err_rate_limit")
     owner = db_load_user(nick)
     if not owner: raise HTTPException(404, "not found")
-    if owner["nick"] != me["nick"] and not owner.get("allow_wall_posts", True):
-        raise HTTPException(403, "err_wall_disabled")
-    if me["nick"] in (owner.get("blacklist") or []):
-        raise HTTPException(403, "err_user_blocked")
+    if owner["nick"] != me["nick"]:
+        if me["nick"] in (owner.get("blacklist") or []):
+            raise HTTPException(403, "err_user_blocked")
+        if not owner.get("allow_wall_posts", True):
+            raise HTTPException(403, "err_wall_disabled")
+        if me["nick"] not in (owner.get("followers") or set()):
+            raise HTTPException(403, "err_follow_to_wall")
     text = payload.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
@@ -1238,10 +1288,7 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     u = require_user(request)
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
-    if p["author"] != u["nick"] and p.get("wall_owner") != u["nick"]:
-        raise HTTPException(403, "forbidden")
-    if p["author"] != u["nick"]:
-        raise HTTPException(403, "forbidden")
+    if p["author"] != u["nick"]: raise HTTPException(403, "forbidden")
     text = payload.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
@@ -1530,7 +1577,7 @@ async def api_events(request: Request, token: str = ""):
 TEXTS = {
     "ru": {
         "search_ph": "Поиск по постам", "search": "Поиск", "theme": "Сменить тему",
-        "post_ph": "Написать пост (до 1000 символов)",
+        "post_ph": "Напишите пост... (до 1000 символов)",
         "comment_ph": "Написать комментарий", "reply_ph": "Ответить на комментарий",
         "publish": "Опубликовать", "send_comment": "Отправить",
         "reply": "Ответить", "cancel_reply": "Отмена",
@@ -1548,9 +1595,10 @@ TEXTS = {
         "author_badge": "автор",
         "f_new": "Новые", "f_top": "Лучшие", "f_bottom": "Худшие", "f_old": "Старые",
         "f_all": "Все", "f_many": "Много комм.", "f_some": "Есть комм.", "f_none": "Без комм.",
+        "f_following": "Подписки",
         "nav_home": "Главная", "nav_users": "Люди", "nav_messages": "Сообщения",
         "nav_profile": "Профиль", "nav_notifications": "Уведомления",
-        "nav_settings": "Настройки", "nav_logout": "Выйти",
+        "nav_settings": "Настройки", "nav_logout": "Выйти", "nav_help": "Помощь",
         "nav_register": "Регистрация", "nav_login": "Вход",
         "reg_title": "Регистрация", "log_title": "Вход",
         "name_ph": "Имя", "nick_ph": "Ник (@nick)",
@@ -1569,7 +1617,9 @@ TEXTS = {
         "err_private_following": "Пользователь скрыл свои подписки",
         "err_user_blocked": "Пользователь недоступен",
         "err_bio_too_long": "Описание слишком длинное",
-        "err_wall_disabled": "Стена этого пользователя закрыта",
+        "err_wall_disabled": "Стена закрыта",
+        "err_follow_to_wall": "Подпишитесь, чтобы писать на стене",
+        "translate_failed": "Не удалось перевести",
         "login_to_post": "Войдите, чтобы писать посты",
         "login_to_comment": "Войдите, чтобы писать комментарии",
         "login_to_dm": "Войдите, чтобы писать сообщения",
@@ -1582,8 +1632,13 @@ TEXTS = {
         "own_profile": "Это ваш профиль", "no_user_posts": "Постов пока нет",
         "wall_title": "Стена", "wall_empty": "На стене пока ничего нет",
         "wall_ph": "Написать на стене...", "wall_post": "Отправить",
-        "wall_disabled": "Стена закрыта — только владелец может писать на ней",
-        "wall_owner_badge": "на стене",
+        "wall_disabled": "Стена закрыта — только владелец может писать",
+        "wall_follow_hint": "Подпишитесь на пользователя, чтобы писать на его стене",
+        "wall_posted_by_you_hint": "Публикация появится на стене пользователя",
+        "profile_tab_posts": "Посты", "profile_tab_wall": "Стена",
+        "users_tab_all": "Все люди", "users_tab_following": "Подписки",
+        "users_no_following": "Вы пока ни на кого не подписаны",
+        "users_login_for_following": "Войдите, чтобы увидеть подписки",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Конфиденциальность",
@@ -1595,14 +1650,14 @@ TEXTS = {
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_notify_new_post_hint": "Получать уведомления, когда люди, на которых вы подписаны, публикуют пост",
         "settings_allow_wall": "Разрешить посты на моей стене",
-        "settings_allow_wall_hint": "Другие пользователи смогут писать на вашей стене",
+        "settings_allow_wall_hint": "Только подписчики смогут писать на вашей стене",
         "settings_blacklist": "Блеклист",
-        "settings_blacklist_hint": "От людей в блеклисте не приходят уведомления и сообщения",
+        "settings_blacklist_hint": "От людей в блеклисте не приходят уведомления и сообщения, они не могут писать на вашей стене",
         "settings_blacklist_add_ph": "@ник",
         "settings_blacklist_add": "Добавить",
         "settings_blacklist_empty": "Блеклист пуст",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldChat — минималистичная соцсеть: посты, комментарии, стены, апвоуты, подписки и личные сообщения в реальном времени.",
+        "settings_desc": "sldChat — простая соцсеть: посты, стена, подписки и личные сообщения.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти из аккаунта",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1615,24 +1670,25 @@ TEXTS = {
         "notif_new_post": "опубликовал(а) новый пост",
         "notif_wall_post": "написал(а) на вашей стене",
         "back_to_main": "В главное меню",
-        "bio_ph": "Описание профиля...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
+        "bio_ph": "Опишите себя...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
         "bio_empty": "Описание пока не заполнено",
         "followers_title": "Подписчики", "following_title": "Подписки",
         "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
-        "limited_list": "Пользователь скрыл этот список. Вам виден только ваш аккаунт.",
-        "users_title": "Пользователи", "users_search_ph": "Поиск по нику или имени",
+        "limited_list": "Пользователь скрыл этот список.",
+        "users_title": "Люди", "users_search_ph": "Поиск по нику или имени",
         "no_users": "Никого не найдено",
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "1. Мы храним минимум данных: имя, ник, пароль (pbkdf2-хеш), посты, комментарии, "
             "стену, голоса, подписки, блеклист, сообщения и уведомления.\n\n"
             "2. Пароль хранится только в виде pbkdf2-hmac-sha256 (100 000 итераций) с солью.\n\n"
-            "3. Данные хранятся на серверах Supabase (Postgres). Мы не продаём и не передаём их третьим лицам.\n\n"
-            "4. Приватность профиля управляется в Настройках: можно скрыть подписчиков, подписки и закрыть стену.\n\n"
-            "5. Редактировать и удалять можно только свои посты и комментарии. Владелец стены может удалять любые посты и комментарии на своей стене.\n\n"
-            "6. Личные сообщения доступны только участникам диалога. Блеклист полностью блокирует уведомления и сообщения.\n\n"
+            "3. Данные хранятся на Supabase (Postgres). Мы не продаём их третьим лицам.\n\n"
+            "4. Приватность профиля управляется в Настройках.\n\n"
+            "5. Редактировать и удалять можно только свои посты. Владелец стены может удалять любые посты и комментарии на своей стене.\n\n"
+            "6. Личные сообщения доступны только участникам диалога. Блеклист полностью блокирует уведомления, сообщения и посты на стене.\n\n"
             "7. IP используется только для определения языка (не сохраняется).\n\n"
-            "8. Сервис предоставляется as-is."
+            "8. Перевод постов выполняется сторонним сервисом MyMemory.\n\n"
+            "9. Сервис предоставляется as-is."
         ),
         "spinner": "Загрузка…",
         "dm_title": "Сообщения",
@@ -1645,10 +1701,30 @@ TEXTS = {
         "dm_delete_confirm": "Удалить переписку? Сообщения исчезнут у обоих участников.",
         "dm_typing": "печатает…", "dm_online": "в сети", "dm_offline": "не в сети",
         "err_dm_self": "Нельзя написать самому себе",
+        "translate": "Перевести",
+        "show_original": "Оригинал",
+        "translating": "Перевод…",
+        "help_title": "Помощь",
+        "help_nav": "Помощь",
+        "help_intro_title": "Что это?",
+        "help_intro_text": "sldChat — простая соцсеть. Здесь можно публиковать посты, писать на стенах у других, подписываться на людей и обмениваться личными сообщениями.",
+        "help_post_title": "Как писать посты?",
+        "help_post_text": "На главной странице внизу есть поле. Напишите текст и нажмите «Опубликовать». Пост появится в ленте у всех.",
+        "help_wall_title": "Стена",
+        "help_wall_text": "У каждого пользователя есть стена. Чтобы оставить пост на чужой стене, нужно быть подписанным на него. Владелец стены может удалять любые посты и комментарии на ней.",
+        "help_dm_title": "Личные сообщения",
+        "help_dm_text": "Откройте профиль человека и нажмите «Написать», либо перейдите в раздел «Сообщения». Здесь работает realtime: собеседник видит, что вы печатаете.",
+        "help_settings_title": "Настройки",
+        "help_settings_text": "В настройках можно сменить тему, язык, закрыть стену, скрыть подписки/подписчиков и добавить людей в блеклист.",
+        "help_translate_title": "Перевод постов",
+        "help_translate_text": "У постов есть кнопка «Перевести» — она переводит текст на язык интерфейса.",
+        "help_got_it": "Понятно",
+        "onboarding_hint": "👋 Это ваша лента. Внизу — поле для постов. Справа — разделы: главная, люди, сообщения, уведомления, профиль.",
+        "onboarding_dismiss": "Скрыть",
     },
     "en": {
         "search_ph": "Search posts", "search": "Search", "theme": "Toggle theme",
-        "post_ph": "Write a post (up to 1000 chars)",
+        "post_ph": "Write a post... (up to 1000 chars)",
         "comment_ph": "Write a comment", "reply_ph": "Reply to comment",
         "publish": "Publish", "send_comment": "Send",
         "reply": "Reply", "cancel_reply": "Cancel",
@@ -1666,9 +1742,10 @@ TEXTS = {
         "author_badge": "author",
         "f_new": "New", "f_top": "Top", "f_bottom": "Worst", "f_old": "Old",
         "f_all": "All", "f_many": "Many", "f_some": "Some", "f_none": "None",
+        "f_following": "Following",
         "nav_home": "Home", "nav_users": "People", "nav_messages": "Messages",
         "nav_profile": "Profile", "nav_notifications": "Notifications",
-        "nav_settings": "Settings", "nav_logout": "Log out",
+        "nav_settings": "Settings", "nav_logout": "Log out", "nav_help": "Help",
         "nav_register": "Sign up", "nav_login": "Log in",
         "reg_title": "Sign up", "log_title": "Log in",
         "name_ph": "Name", "nick_ph": "Nick (@nick)",
@@ -1687,7 +1764,9 @@ TEXTS = {
         "err_private_following": "User hid their following",
         "err_user_blocked": "User is unavailable",
         "err_bio_too_long": "Bio is too long",
-        "err_wall_disabled": "This user's wall is closed",
+        "err_wall_disabled": "The wall is closed",
+        "err_follow_to_wall": "Follow the user to post on their wall",
+        "translate_failed": "Translation failed",
         "login_to_post": "Log in to write posts",
         "login_to_comment": "Log in to write comments",
         "login_to_dm": "Log in to send messages",
@@ -1700,8 +1779,13 @@ TEXTS = {
         "own_profile": "This is your profile", "no_user_posts": "No posts yet",
         "wall_title": "Wall", "wall_empty": "Nothing on the wall yet",
         "wall_ph": "Write on the wall...", "wall_post": "Post",
-        "wall_disabled": "Wall is closed — only owner can post here",
-        "wall_owner_badge": "on wall",
+        "wall_disabled": "Wall is closed — only the owner can post",
+        "wall_follow_hint": "Follow this user to write on their wall",
+        "wall_posted_by_you_hint": "Post will appear on this user's wall",
+        "profile_tab_posts": "Posts", "profile_tab_wall": "Wall",
+        "users_tab_all": "All people", "users_tab_following": "Following",
+        "users_no_following": "You don't follow anyone yet",
+        "users_login_for_following": "Log in to see your following",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1713,14 +1797,14 @@ TEXTS = {
         "settings_notify_new_post": "New post notifications",
         "settings_notify_new_post_hint": "Get notified when people you follow publish a post",
         "settings_allow_wall": "Allow posts on my wall",
-        "settings_allow_wall_hint": "Other users can post on your wall",
+        "settings_allow_wall_hint": "Only followers can post on your wall",
         "settings_blacklist": "Blacklist",
-        "settings_blacklist_hint": "People in the blacklist cannot send you notifications or messages",
+        "settings_blacklist_hint": "People in the blacklist cannot send you notifications, messages, or post on your wall",
         "settings_blacklist_add_ph": "@nick",
         "settings_blacklist_add": "Add",
         "settings_blacklist_empty": "Blacklist is empty",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldChat is a minimalist social network: posts, comments, walls, upvotes, follows and realtime direct messages.",
+        "settings_desc": "sldChat — a simple social network: posts, wall, follows and direct messages.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -1733,24 +1817,24 @@ TEXTS = {
         "notif_new_post": "published a new post",
         "notif_wall_post": "posted on your wall",
         "back_to_main": "Back to main",
-        "bio_ph": "Profile bio...", "bio_save": "Save", "bio_saved": "Saved",
+        "bio_ph": "Describe yourself...", "bio_save": "Save", "bio_saved": "Saved",
         "bio_empty": "No bio yet",
         "followers_title": "Followers", "following_title": "Following",
         "no_followers": "No followers yet", "no_following": "No following yet",
-        "limited_list": "User hid this list. You can only see your own account.",
-        "users_title": "Users", "users_search_ph": "Search by nick or name",
+        "limited_list": "User hid this list.",
+        "users_title": "People", "users_search_ph": "Search by nick or name",
         "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
-            "1. We store minimum data: name, nick, password (pbkdf2 hash), posts, comments, "
-            "wall, votes, follows, blacklist, messages and notifications.\n\n"
+            "1. We store minimum data: name, nick, password (pbkdf2 hash), posts, comments, wall, votes, follows, blacklist, messages and notifications.\n\n"
             "2. Password is stored only as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
-            "3. Data is stored on Supabase (Postgres). We do not sell or share it.\n\n"
-            "4. Profile privacy is controlled in Settings: you can hide followers/following and close your wall.\n\n"
-            "5. You can only edit or delete your own posts and comments. Wall owner can delete anything on their wall.\n\n"
-            "6. Direct messages are visible only to conversation participants. Blacklist fully blocks notifications and messages.\n\n"
+            "3. Data is stored on Supabase (Postgres). We do not sell it to third parties.\n\n"
+            "4. Profile privacy is controlled in Settings.\n\n"
+            "5. You can edit or delete only your own posts. Wall owner can delete any posts and comments on their wall.\n\n"
+            "6. Direct messages are visible only to conversation participants. Blacklist fully blocks notifications, messages and wall posts.\n\n"
             "7. IP is used only to detect language (not stored).\n\n"
-            "8. Service is provided as-is."
+            "8. Post translation is performed by a third-party service MyMemory.\n\n"
+            "9. Service is provided as-is."
         ),
         "spinner": "Loading…",
         "dm_title": "Messages",
@@ -1763,6 +1847,26 @@ TEXTS = {
         "dm_delete_confirm": "Delete conversation? Messages will disappear for both.",
         "dm_typing": "typing…", "dm_online": "online", "dm_offline": "offline",
         "err_dm_self": "Cannot message yourself",
+        "translate": "Translate",
+        "show_original": "Original",
+        "translating": "Translating…",
+        "help_title": "Help",
+        "help_nav": "Help",
+        "help_intro_title": "What is this?",
+        "help_intro_text": "sldChat is a simple social network. You can publish posts, write on other people's walls, follow users and exchange direct messages.",
+        "help_post_title": "How to post?",
+        "help_post_text": "On the main page there's a field at the bottom. Type your text and press Publish. The post will appear in everyone's feed.",
+        "help_wall_title": "Wall",
+        "help_wall_text": "Every user has a wall. To post on someone else's wall, you must follow them. The wall owner can delete any post or comment on their wall.",
+        "help_dm_title": "Direct messages",
+        "help_dm_text": "Open someone's profile and click Message, or go to the Messages section. Realtime is on — your partner sees when you're typing.",
+        "help_settings_title": "Settings",
+        "help_settings_text": "In settings you can change the theme and language, close your wall, hide follows/followers and add people to the blacklist.",
+        "help_translate_title": "Post translation",
+        "help_translate_text": "Each post has a Translate button — it translates the text into your interface language.",
+        "help_got_it": "Got it",
+        "onboarding_hint": "👋 This is your feed. The field at the bottom is for new posts. Sections are on the right: home, people, messages, notifications, profile.",
+        "onboarding_dismiss": "Hide",
     },
 }
 
@@ -1805,6 +1909,12 @@ ICON_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
 ICON_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
     '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
     '<path d="M10 11v6M14 11v6"/>', size=15)
+ICON_HELP = svg('<circle cx="12" cy="12" r="10"/>'
+    '<path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>'
+    '<line x1="12" y1="17" x2="12.01" y2="17"/>', size=15)
+ICON_TRANSLATE = svg('<path d="M4 5h7M9 3v2c0 4-3 8-6 9"/>'
+    '<path d="M5 9c0 3 3 6 6 6"/>'
+    '<path d="M14 19l3-8 3 8"/><path d="M15 15h4"/>', size=13)
 
 FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
            "%3Crect width='64' height='64' fill='%230866ff'/%3E"
@@ -1821,6 +1931,7 @@ CSS = """
   --bubble-mine:#0866ff; --bubble-mine-fg:#fff;
   --bubble-theirs:#f0f2f5; --bubble-theirs-fg:#1a1d21;
   --online:#22c55e; --shadow:0 1px 2px rgba(0,0,0,.04);
+  --hint-bg:#e7f0ff; --hint-border:#bcd4ff; --hint-text:#0b3d91;
 }
 [data-theme="dark"] {
   --bg:#0b0d10; --card:#161a1f; --line:#272c33; --line-strong:#3a4149;
@@ -1831,6 +1942,7 @@ CSS = """
   --bubble-mine:#4a90ff; --bubble-mine-fg:#fff;
   --bubble-theirs:#1e232a; --bubble-theirs-fg:#e7eaee;
   --online:#34d058; --shadow:0 1px 2px rgba(0,0,0,.4);
+  --hint-bg:#1a2740; --hint-border:#2d4a7a; --hint-text:#b8d2ff;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
@@ -1911,12 +2023,21 @@ header.search-header input:focus { border-color: var(--accent); background: var(
 .filter:hover { background: var(--hover); color: var(--text); }
 .filter.active { color: #fff; background: var(--accent); }
 
-.empty { padding: 80px 20px; text-align: center; color: var(--muted); font-size: 13px; }
+.empty { padding: 60px 20px; text-align: center; color: var(--muted); font-size: 13px; }
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner { display: inline-block; width: 26px; height: 26px;
   border: 2px solid var(--line); border-top-color: var(--accent);
   animation: spin .7s linear infinite; border-radius: 50%; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.hint-banner { background: var(--hint-bg); border: 1px solid var(--hint-border);
+  color: var(--hint-text); padding: 12px 14px; border-radius: 10px;
+  margin: 12px 14px; font-size: 13px; display: flex; align-items: center; gap: 10px; }
+.hint-banner .hint-close {
+  margin-left: auto; background: transparent; border: none;
+  color: var(--hint-text); font-family: inherit; font-size: 12px;
+  cursor: pointer; padding: 4px 10px; border-radius: 6px; font-weight: 600; }
+.hint-banner .hint-close:hover { background: rgba(255,255,255,.3); }
 
 .post { padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .post-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
@@ -1948,6 +2069,8 @@ header.search-header input:focus { border-color: var(--accent); background: var(
 .action-btn:hover { color: var(--text); }
 .action-btn.copied { color: var(--up); }
 .action-btn.danger:hover { color: var(--danger); }
+.action-btn.translate-btn { color: var(--accent); }
+.action-btn.translate-btn:hover { color: var(--accent); background: var(--hover); }
 .score { min-width: 24px; padding: 0 4px; text-align: center;
   font-weight: 600; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .score.up { color: var(--up); }
@@ -1993,7 +2116,7 @@ header.search-header input:focus { border-color: var(--accent); background: var(
   color: var(--accent-fg); border-color: var(--accent); }
 
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 12px 14px; }
-.composer textarea { display: block; width: 100%; min-height: 140px; padding: 12px 14px;
+.composer textarea { display: block; width: 100%; min-height: 100px; padding: 12px 14px;
   border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
   outline: none; resize: none; transition: border-color .12s; border-radius: 10px; }
@@ -2067,9 +2190,22 @@ button.send:disabled { opacity: .4; cursor: default; }
 .follow-btn.secondary:hover { background: var(--hover); border-color: var(--accent); color: var(--accent); }
 .own-note { font-size: 13px; color: var(--muted); }
 
-.wall-section { padding: 16px 20px 0; border-bottom: 1px solid var(--line); }
-.wall-title { font-size: 12px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .5px; color: var(--muted); margin: 0 0 12px; }
+.profile-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); }
+.profile-tab { flex: 1; padding: 14px 8px; background: transparent; border: none;
+  color: var(--muted); font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: color .12s, border-color .12s;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.profile-tab:hover { color: var(--text); }
+.profile-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.users-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); }
+.users-tab { flex: 1; padding: 14px 8px; background: transparent; border: none;
+  color: var(--muted); font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: color .12s, border-color .12s;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.users-tab:hover { color: var(--text); }
+.users-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
 .wall-composer { padding: 12px 20px; border-bottom: 1px solid var(--line); }
 .wall-composer textarea { display: block; width: 100%; min-height: 60px; padding: 10px 12px;
   border: 1px solid var(--line); background: var(--card); color: var(--text);
@@ -2078,15 +2214,9 @@ button.send:disabled { opacity: .4; cursor: default; }
 .wall-composer textarea:focus { border-color: var(--accent); }
 .wall-composer-row { display: flex; justify-content: space-between; align-items: center;
   gap: 8px; margin-top: 8px; }
-.wall-notice { padding: 10px 20px; font-size: 12px; color: var(--muted);
-  border-bottom: 1px solid var(--line); font-style: italic; }
-.profile-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--line); }
-.profile-tab { flex: 1; padding: 12px 8px; background: transparent; border: none;
-  color: var(--muted); font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer; transition: color .12s, border-color .12s;
-  border-bottom: 2px solid transparent; margin-bottom: -1px; }
-.profile-tab:hover { color: var(--text); }
-.profile-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.wall-notice { padding: 12px 20px; font-size: 13px; color: var(--muted);
+  border-bottom: 1px solid var(--line); }
+.wall-notice a { color: var(--accent); }
 
 .user-list { padding: 6px 0; }
 .user-item { display: flex; align-items: center; gap: 12px; padding: 14px 20px;
@@ -2183,6 +2313,14 @@ button.send:disabled { opacity: .4; cursor: default; }
 .policy p { font-size: 14px; line-height: 1.7; color: var(--text);
   white-space: pre-wrap; margin: 0; }
 
+.help-page { padding: 24px; max-width: 720px; }
+.help-page h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; }
+.help-item { padding: 16px 18px; background: var(--hover); border-radius: 12px; margin-bottom: 12px; }
+.help-item h3 { font-size: 14px; margin: 0 0 6px; font-weight: 700; color: var(--text); }
+.help-item p { font-size: 14px; line-height: 1.55; color: var(--muted); margin: 0; }
+.help-back { display: inline-flex; align-items: center; gap: 6px; color: var(--accent);
+  text-decoration: none; font-size: 13px; margin-top: 12px; cursor: pointer; }
+
 .dm-list { padding: 6px 0; }
 .dm-thread { display: flex; gap: 12px; padding: 14px 20px;
   border-bottom: 1px solid var(--line); text-decoration: none;
@@ -2261,6 +2399,17 @@ button.send:disabled { opacity: .4; cursor: default; }
   100% { background: var(--comment-bg); }
 }
 
+@media (min-width: 901px) and (max-width: 1200px) {
+  .sidebar { flex: 0 0 200px; width: 200px; padding: 14px 8px 10px; }
+  .sidebar .logo { font-size: 18px; padding: 4px 10px 18px; }
+  .nav-btn { padding: 9px 10px; font-size: 13px; gap: 10px; }
+  .nav-btn svg { width: 16px; height: 16px; }
+  .post { padding: 14px 18px; }
+  .chat-msg { max-width: 78%; }
+  .settings-nav { flex: 0 0 180px; }
+  .settings-content { padding: 20px 22px; }
+}
+
 @media (max-width: 900px) {
   body { font-size: 15px; }
   .layout { flex-direction: column; }
@@ -2278,6 +2427,7 @@ button.send:disabled { opacity: .4; cursor: default; }
     flex: 1; justify-content: center; align-items: center;
     text-align: center; border-radius: 0; min-height: 56px; }
   .nav-btn[data-nav="logout"] { display: none; }
+  .nav-btn[data-nav="help"] { display: none; }
   .nav-btn span { font-size: 10px; line-height: 1; }
   .nav-btn svg { width: 22px; height: 22px; }
   .nav-btn.active { background: transparent; }
@@ -2294,7 +2444,7 @@ button.send:disabled { opacity: .4; cursor: default; }
   .vote-btn, .action-btn { height: 36px; padding: 0 12px; }
   .composer { padding: 10px 12px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom, 0)); }
-  .composer textarea { min-height: 96px; }
+  .composer textarea { min-height: 84px; }
   .composer.composer-comment textarea { min-height: 72px; }
   .profile-header { padding: 20px 16px; }
   .profile-name-big { font-size: 20px; }
@@ -2319,6 +2469,7 @@ button.send:disabled { opacity: .4; cursor: default; }
   .blacklist-add input { font-size: 16px; }
   .auth-form input, .auth-form textarea { font-size: 16px; }
   .composer textarea, .chat-composer textarea, .wall-composer textarea { font-size: 16px; }
+  .help-page { padding: 18px 16px; }
 }
 """
 
@@ -2331,7 +2482,8 @@ var ICONS = {
   home: __ICON_HOME__, users: __ICON_USERS__, user: __ICON_USER__,
   mail: __ICON_MAIL__, bell: __ICON_BELL__, gear: __ICON_GEAR__,
   logout: __ICON_LOGOUT__, plus: __ICON_PLUS__, login: __ICON_LOGIN__,
-  trash: __ICON_TRASH__, search: __ICON_SEARCH__
+  trash: __ICON_TRASH__, search: __ICON_SEARCH__, help: __ICON_HELP__,
+  translate: __ICON_TRANSLATE__
 };
 
 var cachedUser = null;
@@ -2346,8 +2498,10 @@ var state = {
   unreadDM: parseInt(localStorage.getItem('sldchat_dm') || '0', 10) || 0,
   sortMode: 'new',
   commentFilter: 'any',
+  onlyFollowing: false,
   searchQuery: '',
   usersQuery: '',
+  usersTab: 'all',
   dmQuery: '',
   composerDraft: '',
   wallDraft: '',
@@ -2360,7 +2514,8 @@ var state = {
   es: null,
   typingTimer: null,
   lastTypingSent: 0,
-  presenceTimer: null
+  presenceTimer: null,
+  onboardingDismissed: localStorage.getItem('sldchat_onboard') === '1'
 };
 
 function setUser(u) {
@@ -2494,6 +2649,7 @@ function handleRoute() {
   else if (path === '/notifications') { state.view = 'notifications'; state.viewData = {}; }
   else if (path === '/settings') { state.view = 'settings'; state.viewData = {}; }
   else if (path === '/settings/profile') { state.view = 'edit_profile'; state.viewData = {}; }
+  else if (path === '/help') { state.view = 'help'; state.viewData = {}; }
   else if (path === '/policy') { state.view = 'policy'; state.viewData = {}; }
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
@@ -2630,10 +2786,12 @@ function renderSidebar() {
       state.view === 'notifications', 'notifications', state.unreadNotif);
     html += navBtn(ICONS.user, tr('nav_profile'),
       state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
+    html += navBtn(ICONS.help, tr('nav_help'), state.view === 'help', 'help');
     html += navBtn(ICONS.gear, tr('nav_settings'),
       state.view === 'settings' || state.view === 'edit_profile', 'settings');
     html += navBtn(ICONS.logout, tr('nav_logout'), false, 'logout');
   } else {
+    html += navBtn(ICONS.help, tr('nav_help'), state.view === 'help', 'help');
     html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
     html += navBtn(ICONS.plus, tr('nav_register'), state.view === 'register', 'register');
     html += navBtn(ICONS.login, tr('nav_login'), state.view === 'login', 'login');
@@ -2649,6 +2807,7 @@ function renderSidebar() {
       else if (nav === 'messages') navigate('/messages');
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
+      else if (nav === 'help') navigate('/help');
       else if (nav === 'settings') navigate('/settings');
       else if (nav === 'register') navigate('/register');
       else if (nav === 'login') navigate('/login');
@@ -2669,6 +2828,7 @@ function renderMain() {
   else if (state.view === 'notifications') renderNotificationsView(el);
   else if (state.view === 'settings') renderSettingsView(el);
   else if (state.view === 'edit_profile') renderEditProfileView(el);
+  else if (state.view === 'help') renderHelpView(el);
   else if (state.view === 'policy') renderPolicyView(el);
   else if (state.view === 'register') renderRegisterView(el);
   else if (state.view === 'login') renderLoginView(el);
@@ -2695,6 +2855,7 @@ function renderFeedView(el) {
   html += '<header class="search-header">';
   html += '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" autocomplete="off" spellcheck="false" value="' + escapeHtml(state.searchQuery) + '" />';
   html += '<button class="icon-btn" id="searchBtn" title="' + escapeHtml(tr('search')) + '">' + ICONS.search + '</button>';
+  html += '<button class="icon-btn" id="helpBtn" title="' + escapeHtml(tr('help_title')) + '">' + ICONS.help + '</button>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
   html += '<div class="filters" id="filters">';
@@ -2704,12 +2865,17 @@ function renderFeedView(el) {
   html += '<button class="filter' + (state.sortMode==='bottom'?' active':'') + '" data-sort="bottom">' + tr('f_bottom') + '</button>';
   html += '<button class="filter' + (state.sortMode==='old'?' active':'') + '" data-sort="old">' + tr('f_old') + '</button>';
   html += '</div><div class="filter-sep"></div><div class="filter-group">';
-  html += '<button class="filter' + (state.commentFilter==='any'?' active':'') + '" data-comments="any">' + tr('f_all') + '</button>';
-  html += '<button class="filter' + (state.commentFilter==='many'?' active':'') + '" data-comments="many">' + tr('f_many') + '</button>';
-  html += '<button class="filter' + (state.commentFilter==='some'?' active':'') + '" data-comments="some">' + tr('f_some') + '</button>';
-  html += '<button class="filter' + (state.commentFilter==='none'?' active':'') + '" data-comments="none">' + tr('f_none') + '</button>';
+  html += '<button class="filter' + (!state.onlyFollowing?' active':'') + '" data-scope="all">' + tr('f_all') + '</button>';
+  html += '<button class="filter' + (state.onlyFollowing?' active':'') + '" data-scope="following">' + tr('f_following') + '</button>';
   html += '</div></div>';
-  html += '<div class="main-body"><div id="feed">' + spinner() + '</div></div>';
+  html += '<div class="main-body">';
+  if (state.user && !state.onboardingDismissed) {
+    html += '<div class="hint-banner" id="onbBanner">'
+      + '<span>' + escapeHtml(tr('onboarding_hint')) + '</span>'
+      + '<button class="hint-close" data-dismiss-onb>' + escapeHtml(tr('onboarding_dismiss')) + '</button>'
+      + '</div>';
+  }
+  html += '<div id="feed">' + spinner() + '</div></div>';
   if (state.user) {
     html += '<div class="composer">';
     html += '<textarea id="newPost" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('post_ph')) + '"></textarea>';
@@ -2725,6 +2891,15 @@ function renderFeedView(el) {
   el.innerHTML = html;
   attachThemeBtn();
   bindLinks(el);
+  var hb = document.getElementById('helpBtn');
+  if (hb) hb.addEventListener('click', function(){ navigate('/help'); });
+  var dis = el.querySelector('[data-dismiss-onb]');
+  if (dis) dis.addEventListener('click', function(){
+    state.onboardingDismissed = true;
+    localStorage.setItem('sldchat_onboard', '1');
+    var b = document.getElementById('onbBanner');
+    if (b) b.remove();
+  });
 
   var filtersEl = document.getElementById('filters');
   filtersEl.addEventListener('click', function(e){
@@ -2733,9 +2908,9 @@ function renderFeedView(el) {
     if (b.dataset.sort) {
       state.sortMode = b.dataset.sort;
       filtersEl.querySelectorAll('[data-sort]').forEach(function(x){ x.classList.toggle('active', x === b); });
-    } else if (b.dataset.comments) {
-      state.commentFilter = b.dataset.comments;
-      filtersEl.querySelectorAll('[data-comments]').forEach(function(x){ x.classList.toggle('active', x === b); });
+    } else if (b.dataset.scope) {
+      state.onlyFollowing = (b.dataset.scope === 'following');
+      filtersEl.querySelectorAll('[data-scope]').forEach(function(x){ x.classList.toggle('active', x === b); });
     }
     loadFeed();
   });
@@ -2790,9 +2965,15 @@ async function loadFeed() {
   if (!feedEl) return;
   try {
     var q = state.searchQuery.trim();
-    var data = await api('/api/posts?q=' + encodeURIComponent(q));
+    var url = '/api/posts?q=' + encodeURIComponent(q);
+    if (state.onlyFollowing) url += '&only_following=1';
+    var data = await api(url);
     var posts = applyFilters(data.posts || []);
-    if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
+    if (!posts.length) {
+      var msg = state.onlyFollowing ? (LANG === 'ru' ? 'У ваших подписок пока нет постов' : 'No posts from people you follow yet') : tr('no_posts');
+      feedEl.innerHTML = '<div class="empty">' + escapeHtml(msg) + '</div>';
+      return;
+    }
     feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     bindPostActions(feedEl); bindLinks(feedEl);
   } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
@@ -2835,7 +3016,6 @@ function renderPostView(el) {
   }
   el.innerHTML = html;
   attachThemeBtn(); bindLinks(el);
-
   if (state.user) {
     var inputEl = document.getElementById('newComment');
     var sendBtn = document.getElementById('send');
@@ -2944,7 +3124,6 @@ async function loadProfile(nick) {
     h += '</div></div>';
     headerEl.innerHTML = h;
     bindLinks(headerEl);
-
     document.getElementById('followersLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/followers');
     });
@@ -2970,21 +3149,9 @@ async function loadProfile(nick) {
       navigate('/messages/' + encodeURIComponent(u.nick));
     });
 
-    // Tabs
-    var wallVisible = u.allow_wall_posts !== false || isMe;
     tabsEl.innerHTML = '<div class="profile-tabs">'
-      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('own_profile') === tr('own_profile') ? '' : '' + '</button>'
-      + '</div>';
-    // simpler: build manually
-    var tabsHtml = '<div class="profile-tabs">';
-    tabsHtml += '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + escapeHtml(state.profileTab === 'posts' ? 'Посты' : 'Посты') + '</button>';
-    tabsHtml += '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + escapeHtml(tr('wall_title')) + '</button>';
-    tabsHtml += '</div>';
-    // Set proper labels
-    var labelPosts = (LANG === 'ru' ? 'Посты' : 'Posts');
-    tabsEl.innerHTML = '<div class="profile-tabs">'
-      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + labelPosts + '</button>'
-      + '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_title') + '</button>'
+      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + escapeHtml(tr('profile_tab_posts')) + '</button>'
+      + '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + escapeHtml(tr('profile_tab_wall')) + '</button>'
       + '</div>';
     tabsEl.querySelectorAll('.profile-tab').forEach(function(t){
       t.addEventListener('click', function(){
@@ -2993,7 +3160,6 @@ async function loadProfile(nick) {
         loadProfileTab(u, isMe);
       });
     });
-
     loadProfileTab(u, isMe);
   } catch(e) {
     headerEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
@@ -3006,23 +3172,28 @@ async function loadProfileTab(u, isMe) {
   if (!feedEl) return;
   feedEl.innerHTML = spinner();
   if (state.profileTab === 'wall') {
-    var wallAllowed = u.allow_wall_posts !== false || isMe;
     var wallComposer = '';
-    if (state.user && wallAllowed) {
-      wallComposer = '<div class="wall-composer">'
-        + '<textarea id="wallInput" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('wall_ph')) + '">' + escapeHtml(state.wallDraft || '') + '</textarea>'
-        + '<div class="wall-composer-row">'
-        + '<div id="wallCounter" class="counter">0 / ' + MAX_POST_LEN + '</div>'
-        + '<button class="send" id="wallSend" disabled>' + tr('wall_post') + '</button>'
-        + '</div></div>';
-    } else if (state.user && !wallAllowed) {
-      wallComposer = '<div class="wall-notice">' + escapeHtml(tr('wall_disabled')) + '</div>';
-    } else {
-      wallComposer = '<div class="wall-notice">' + escapeHtml(tr('login_to_wall')) + '</div>';
-    }
     try {
       var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
       var posts = data.posts || [];
+      var canPost = data.can_post;
+      var reason = data.reason;
+      if (state.user) {
+        if (canPost) {
+          wallComposer = '<div class="wall-composer">'
+            + '<textarea id="wallInput" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('wall_ph')) + '">' + escapeHtml(state.wallDraft || '') + '</textarea>'
+            + '<div class="wall-composer-row">'
+            + '<div id="wallCounter" class="counter">0 / ' + MAX_POST_LEN + '</div>'
+            + '<button class="send" id="wallSend" disabled>' + escapeHtml(tr('wall_post')) + '</button>'
+            + '</div></div>';
+        } else {
+          var notice = tr(reason) || tr('wall_disabled');
+          if (reason === 'err_follow_to_wall') notice = tr('wall_follow_hint');
+          wallComposer = '<div class="wall-notice">' + escapeHtml(notice) + '</div>';
+        }
+      } else {
+        wallComposer = '<div class="wall-notice">' + escapeHtml(tr('login_to_wall')) + ' · <a href="/login" data-link>' + escapeHtml(tr('go_login')) + '</a></div>';
+      }
       var bodyHtml = posts.length
         ? posts.map(function(p){ return renderPostHtml(p, false); }).join('')
         : '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
@@ -3093,24 +3264,19 @@ function renderEditProfileView(el) {
   var form = document.getElementById('editForm');
   var errEl = document.getElementById('editError');
   form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
+    e.preventDefault(); errEl.textContent = '';
     var fd = new FormData(form);
     var body = {
       name: (fd.get('name') || '').toString().trim(),
       nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
-      bio: (fd.get('bio') || '').toString().trim(),
-    };
+      bio: (fd.get('bio') || '').toString().trim() };
     var btn = form.querySelector('button[type="submit"]');
     btn.disabled = true;
     try {
       var r = await api('/api/users/me', { method: 'PUT', body: body });
       setUser(r.user); renderSidebar();
       navigate('/u/' + encodeURIComponent(r.user.nick));
-    } catch(err) {
-      errEl.textContent = tr(err.message) || err.message;
-      btn.disabled = false;
-    }
+    } catch(err) { errEl.textContent = tr(err.message) || err.message; btn.disabled = false; }
   });
 }
 
@@ -3150,15 +3316,27 @@ async function loadFollowList(nick, isFollowers) {
     bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
 }
+
 function renderUsersView(el) {
   var html = '';
   html += '<header class="search-header">';
   html += '<input id="usersSearch" type="text" placeholder="' + escapeHtml(tr('users_search_ph')) + '" autocomplete="off" spellcheck="false" value="' + escapeHtml(state.usersQuery) + '" />';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
+  html += '<div class="users-tabs">';
+  html += '<button class="users-tab' + (state.usersTab==='all'?' active':'') + '" data-utab="all">' + escapeHtml(tr('users_tab_all')) + '</button>';
+  html += '<button class="users-tab' + (state.usersTab==='following'?' active':'') + '" data-utab="following">' + escapeHtml(tr('users_tab_following')) + '</button>';
+  html += '</div>';
   html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
   el.innerHTML = html;
   attachThemeBtn(); bindLinks(el);
+  el.querySelectorAll('.users-tab').forEach(function(t){
+    t.addEventListener('click', function(){
+      state.usersTab = t.dataset.utab;
+      el.querySelectorAll('.users-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+      loadUsers();
+    });
+  });
   var searchEl = document.getElementById('usersSearch');
   var tId;
   searchEl.addEventListener('input', function(){
@@ -3170,12 +3348,29 @@ function renderUsersView(el) {
 async function loadUsers() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
+  if (state.usersTab === 'following') {
+    if (!state.user) {
+      wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('users_login_for_following')) + ' · <a class="settings-link" href="/login" data-link>' + escapeHtml(tr('go_login')) + '</a></div>';
+      bindLinks(wrap);
+      return;
+    }
+    wrap.innerHTML = spinner();
+    try {
+      var data = await api('/api/users/' + encodeURIComponent(state.user.nick) + '/following');
+      var users = data.users || [];
+      if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('users_no_following')) + '</div>'; return; }
+      wrap.innerHTML = '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
+      bindLinks(wrap);
+    } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
+    return;
+  }
+  wrap.innerHTML = spinner();
   try {
     var q = (state.usersQuery || '').trim();
-    var data = await api('/api/users?q=' + encodeURIComponent(q));
-    var users = data.users || [];
-    if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
-    wrap.innerHTML = '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
+    var data2 = await api('/api/users?q=' + encodeURIComponent(q));
+    var users2 = data2.users || [];
+    if (!users2.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
+    wrap.innerHTML = '<div class="user-list">' + users2.map(userItemHtml).join('') + '</div>';
     bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
@@ -3403,7 +3598,6 @@ function renderNotifHtml(n) {
   return '<div class="' + cls + '">' + inner + '</div>';
 }
 
-// ============ Settings ============
 function renderSettingsView(el) {
   var theme = document.documentElement.getAttribute('data-theme') || 'light';
   var lang = LANG;
@@ -3429,7 +3623,6 @@ function renderSettingsView(el) {
   html += '</nav>';
   html += '<div class="settings-content">';
 
-  // Account
   html += '<div class="settings-section" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">';
@@ -3446,7 +3639,6 @@ function renderSettingsView(el) {
   }
   html += '</div>';
 
-  // Privacy
   html += '<div class="settings-section" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   if (state.user) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_followers') + '</span>'
@@ -3479,7 +3671,6 @@ function renderSettingsView(el) {
   }
   html += '</div>';
 
-  // Appearance
   html += '<div class="settings-section" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div style="margin-bottom:16px"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_theme') + '</div><div class="opt-row">';
   html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
@@ -3490,9 +3681,9 @@ function renderSettingsView(el) {
   html += '<button class="opt' + (lang==='en'?' active':'') + '" data-set-lang="en">English</button>';
   html += '</div></div></div>';
 
-  // Info
   html += '<div class="settings-section" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
+  html += '<p style="margin:0 0 8px"><a class="settings-link" href="/help" data-link>' + tr('help_title') + '</a></p>';
   html += '<p style="margin:0 0 14px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
   html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_authors') + '</div>';
   html += '<div class="settings-authors">SldShr, DeepSeek</div></div>';
@@ -3585,6 +3776,31 @@ function renderSettingsView(el) {
   if (lo) lo.addEventListener('click', doLogoutConfirm);
   var ep = document.getElementById('editProfileBtn2');
   if (ep) ep.addEventListener('click', function(){ navigate('/settings/profile'); });
+}
+
+function renderHelpView(el) {
+  var html = '';
+  html += '<header class="main-header">';
+  html += '<a href="/" class="icon-btn" data-link title="' + escapeHtml(tr('back_to_main')) + '">' + ICONS.back + '</a>';
+  html += '<div class="title">' + tr('help_title') + '</div>';
+  html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
+  html += '</header>';
+  html += '<div class="main-body"><div class="help-page">';
+  var items = [
+    ['help_intro_title', 'help_intro_text'],
+    ['help_post_title', 'help_post_text'],
+    ['help_wall_title', 'help_wall_text'],
+    ['help_dm_title', 'help_dm_text'],
+    ['help_translate_title', 'help_translate_text'],
+    ['help_settings_title', 'help_settings_text']
+  ];
+  items.forEach(function(pair){
+    html += '<div class="help-item"><h3>' + escapeHtml(tr(pair[0])) + '</h3>'
+      + '<p>' + escapeHtml(tr(pair[1])) + '</p></div>';
+  });
+  html += '</div></div>';
+  el.innerHTML = html;
+  attachThemeBtn(); bindLinks(el);
 }
 
 function renderPolicyView(el) {
@@ -3694,6 +3910,8 @@ function renderPostHtml(p, showComments) {
     + ICONS.comment + '<span>' + (p.comments ? p.comments.length : 0) + '</span></button>';
   var copyBtn = '<button class="action-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">'
     + ICONS.copy + '</button>';
+  var translateBtn = '<button class="action-btn translate-btn" data-action="translate" data-post-id="' + p.id + '" title="' + escapeHtml(tr('translate')) + '">'
+    + ICONS.translate + ' ' + escapeHtml(tr('translate')) + '</button>';
   var editBtn = isMine
     ? '<button class="action-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
     : '';
@@ -3707,13 +3925,13 @@ function renderPostHtml(p, showComments) {
   return ''
     + '<div class="post" data-post-id="' + p.id + '">'
     +   '<div class="post-meta">' + authorLink + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
-    +   '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>'
+    +   '<div class="post-text" data-raw="' + escapeHtml(p.text) + '" data-translated="0">' + bodyHtml + '</div>'
     +   readMore
     +   '<div class="post-actions">'
     +     '<button class="vote-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '</button>'
     +     '<span class="score ' + scCls + '">' + score + '</span>'
     +     '<button class="vote-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
-    +     commentBtn + copyBtn + editBtn + delBtn
+    +     commentBtn + translateBtn + copyBtn + editBtn + delBtn
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -3864,6 +4082,35 @@ function bindPostActions(root) {
       }
       if (action === 'comment') { navigate('/p/' + postId); return; }
       if (action === 'copy') { await copyPost(postId, btn); return; }
+      if (action === 'translate') {
+        var postEl = btn.closest('.post');
+        if (!postEl) return;
+        var textEl = postEl.querySelector('.post-text');
+        if (!textEl) return;
+        var isTranslated = textEl.dataset.translated === '1';
+        if (isTranslated) {
+          var orig = textEl.dataset.raw || '';
+          textEl.innerHTML = linkifyMentions(escapeHtml(orig));
+          textEl.dataset.translated = '0';
+          btn.innerHTML = ICONS.translate + ' ' + escapeHtml(tr('translate'));
+          return;
+        }
+        var raw = textEl.dataset.raw || textEl.textContent;
+        if (!raw || !raw.trim()) return;
+        btn.disabled = true;
+        var oldLabel = btn.innerHTML;
+        btn.innerHTML = ICONS.translate + ' ' + escapeHtml(tr('translating'));
+        try {
+          var r = await api('/api/translate', { method: 'POST', body: { text: raw } });
+          textEl.innerHTML = linkifyMentions(escapeHtml(r.text));
+          textEl.dataset.translated = '1';
+          btn.innerHTML = ICONS.translate + ' ' + escapeHtml(tr('show_original'));
+        } catch(err) {
+          alert(tr(err.message) || tr('translate_failed'));
+          btn.innerHTML = oldLabel;
+        } finally { btn.disabled = false; }
+        return;
+      }
       if (action === 'reply') {
         state.replyTo = { id: commentId, author: btn.dataset.author || '' };
         if (state.view !== 'post') { navigate('/p/' + postId); return; }
@@ -3873,10 +4120,10 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'edit-post') {
-        var postEl = btn.closest('.post');
-        var textEl = postEl.querySelector('.post-text');
-        var raw = textEl.getAttribute('data-raw') || '';
-        startInlineEdit(postEl, textEl, raw, async function(newText){
+        var postEl2 = btn.closest('.post');
+        var textEl2 = postEl2.querySelector('.post-text');
+        var raw2 = textEl2.getAttribute('data-raw') || '';
+        startInlineEdit(postEl2, textEl2, raw2, async function(newText){
           await api('/api/posts/' + postId, { method: 'PUT', body: { text: newText } });
           refreshCurrentView();
         });
@@ -4001,7 +4248,9 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__ICON_PLUS__", json.dumps(ICON_PLUS))
           .replace("__ICON_LOGIN__", json.dumps(ICON_LOGIN))
           .replace("__ICON_TRASH__", json.dumps(ICON_TRASH))
-          .replace("__ICON_SEARCH__", json.dumps(ICON_SEARCH)))
+          .replace("__ICON_SEARCH__", json.dumps(ICON_SEARCH))
+          .replace("__ICON_HELP__", json.dumps(ICON_HELP))
+          .replace("__ICON_TRANSLATE__", json.dumps(ICON_TRANSLATE)))
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="light">\n'
         '<head>\n'
@@ -4069,6 +4318,9 @@ def page_settings(request: Request): return render_page(get_lang(request), "sett
 
 @app.get("/settings/profile", response_class=HTMLResponse)
 def page_edit_profile(request: Request): return render_page(get_lang(request), "edit_profile")
+
+@app.get("/help", response_class=HTMLResponse)
+def page_help(request: Request): return render_page(get_lang(request), "help")
 
 @app.get("/policy", response_class=HTMLResponse)
 def page_policy(request: Request): return render_page(get_lang(request), "policy")
