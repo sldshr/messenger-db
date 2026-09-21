@@ -3,34 +3,52 @@
 #   pip install fastapi uvicorn python-multipart
 #   python main.py
 
+import random, secrets, time, re
+from datetime import datetime
+from html import escape
+from urllib.parse import urlparse, quote
+
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from html import escape
-import hashlib, secrets, time, re
-from datetime import datetime
-from typing import Optional
-from urllib.parse import urlparse, quote
 
 app = FastAPI(title="litodon")
 
 # ============================================================
-#   ХРАНИЛИЩЕ (ВСЁ В ОПЕРАТИВКЕ)
+#   ХРАНИЛИЩЕ (В ОПЕРАТИВКЕ) — полная анонимность
 # ============================================================
 
-users: dict = {}       # username -> {"salt": str, "pw": str}
-sessions: dict = {}    # token    -> username
-posts: list = []       # посты
-_counter = {"post": 0, "comment": 0}
+sessions: dict = {}    # sid  -> {"id": int, "name": str}
+posts: list = []
+_counter = {"post": 0, "comment": 0, "anon": 0}
 MAX_POST = 4000
 
+ADJ = ["Тихий", "Быстрый", "Хитрый", "Смелый", "Умный", "Дикий", "Лёгкий",
+       "Тёмный", "Светлый", "Добрый", "Рыжий", "Белый", "Серый", "Зелёный",
+       "Ночной", "Вольный", "Гордый", "Ясный", "Резвый", "Мягкий"]
+NOUN = ["Лис", "Кот", "Ёж", "Волк", "Барс", "Крот", "Сокол", "Дрозд",
+        "Олень", "Заяц", "Медведь", "Орёл", "Тигр", "Филин", "Выдра", "Хорёк"]
 
-def hash_pw(pw: str, salt: str) -> str:
-    return hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
+
+def generate_name() -> str:
+    return f"{random.choice(ADJ)} {random.choice(NOUN)}"
 
 
-def get_user(request: Request) -> Optional[str]:
-    t = request.cookies.get("session")
-    return sessions.get(t) if t else None
+@app.middleware("http")
+async def anon_middleware(request: Request, call_next):
+    token = request.cookies.get("sid")
+    created = False
+    if not token or token not in sessions:
+        token = secrets.token_hex(16)
+        _counter["anon"] += 1
+        sessions[token] = {"id": _counter["anon"], "name": generate_name()}
+        created = True
+    request.state.anon = sessions[token]
+    request.state.token = token
+    response = await call_next(request)
+    if created:
+        response.set_cookie("sid", token, httponly=True,
+                            max_age=60 * 60 * 24 * 365, samesite="lax")
+    return response
 
 
 def fmt_time(ts: float) -> str:
@@ -59,8 +77,6 @@ ICON_PATHS = {
     "home":      '<path d="M8 1.5 15 7.5h-2.2V15H9.5v-4.2h-3V15H3.2V7.5H1z"/>',
     "plus":      '<path d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/>',
     "user":      '<circle cx="8" cy="5" r="3"/><path d="M2 15c0-3.3 2.7-6 6-6s6 2.7 6 6z"/>',
-    "logout":    '<path d="M10 2h4v12h-4v-1.6h2.4V3.6H10z"/><path d="M2 7h7V4.5L13 8l-4 3.5V9H2z"/>',
-    "login":     '<path d="M6 2H2v12h4v-1.6H3.6V3.6H6z"/><path d="M14 8 10 4.5V7H3v2h7v2.5z"/>',
     "up":        '<path d="M8 3 13 9H9.5v4h-3V9H3z"/>',
     "down":      '<path d="M8 13 3 7h3.5V3h3v4H13z"/>',
     "comment":   '<path d="M2 3h12v9H8l-3.2 3v-3H2z"/>',
@@ -110,30 +126,21 @@ def md_inline(text: str) -> str:
         stash.append(html)
         return f"\x00{len(stash) - 1}\x00"
 
-    # inline code
     text = re.sub(r'`([^`\n]+)`', lambda m: put(f'<code>{m.group(1)}</code>'), text)
-    # images
     text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)',
                   lambda m: put(f'<img src="{safe_url(m.group(2))}" alt="{m.group(1)}" loading="lazy">'),
                   text)
-    # links
     text = re.sub(r'\[([^\]]+)\]\(([^)\s]+)\)',
                   lambda m: put(f'<a href="{safe_url(m.group(2))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
                   text)
-    # bare urls
     text = re.sub(r'(?<![\w"\'=/>])(https?://[^\s<>"\'()]+)',
                   lambda m: put(f'<a href="{safe_url(m.group(1))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
                   text)
-
-    # bold
     text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', text)
-    # italic
     text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)
     text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'<em>\1</em>', text)
-    # strike
     text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)
-
     text = re.sub(r'\x00(\d+)\x00', lambda m: stash[int(m.group(1))], text)
     return text
 
@@ -262,6 +269,27 @@ body {
 a { color: #2e7d32; text-decoration: none; }
 a:hover { color: #1b5e20; text-decoration: underline; }
 
+/* ---------- кастомные скроллбары ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #a5cfa5 #eaf6ea;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track {
+  background: #eaf6ea;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb {
+  background: #a5cfa5;
+  border-radius: 5px;
+  border: 2px solid #eaf6ea;
+  background-clip: padding-box;
+  transition: background 0.15s;
+}
+::-webkit-scrollbar-thumb:hover { background: #66bb6a; background-clip: padding-box; border: 2px solid #eaf6ea; }
+::-webkit-scrollbar-corner { background: #eaf6ea; }
+::-webkit-scrollbar-button { display: none; }
+
 .ic { vertical-align: -2px; }
 
 /* ---------- header ---------- */
@@ -271,7 +299,7 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   box-shadow: 0 2px 6px rgba(0,0,0,0.22);
 }
 .header-inner {
-  width: 1060px; margin: 0 auto; padding: 10px 14px;
+  max-width: 1320px; margin: 0 auto; padding: 10px 18px;
   display: flex; align-items: center; justify-content: space-between;
 }
 .logo {
@@ -296,9 +324,11 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 
 /* ---------- layout ---------- */
 .layout {
-  width: 1060px; margin: 16px auto 30px;
+  width: 1080px; margin: 16px auto 30px;
   display: flex; align-items: flex-start; gap: 14px;
+  transition: width 0.15s;
 }
+.layout.wide { width: 1320px; }
 .sidebar { width: 220px; flex-shrink: 0; }
 .content { flex: 1; min-width: 0; }
 
@@ -320,9 +350,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .side-link:hover { background: #eaf6ea; text-decoration: none; color: #1b5e20; }
 .side-link.active { background: linear-gradient(#66bb6a, #43a047); color: #fff; }
 .side-link.active .ic { color: #fff; }
-.side-form { margin: 0; padding: 0; }
-.side-link-btn { color: #6b8a6b; }
-.side-link-btn:hover { color: #c62828; background: #fdecea; }
 
 .side-user { display: flex; gap: 9px; align-items: center; }
 .avatar {
@@ -333,18 +360,8 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   text-shadow: 0 1px 0 rgba(0,0,0,0.25);
   box-shadow: inset 0 -2px 4px rgba(0,0,0,0.15);
 }
-.side-username { font-weight: bold; color: #1b5e20; font-size: 14px; }
+.side-username { font-weight: bold; color: #1b5e20; font-size: 13px; line-height: 1.2; }
 .side-sub { font-size: 11px; color: #7a8f7a; }
-.side-btn {
-  display: block; text-align: center; padding: 6px;
-  background: linear-gradient(#66bb6a, #43a047); color: #fff;
-  border: 1px solid #2e7d32; border-radius: 3px;
-  font-weight: bold; font-size: 12px; margin-bottom: 6px;
-  text-shadow: 0 1px 0 rgba(0,0,0,0.2); text-decoration: none;
-}
-.side-btn:hover { background: linear-gradient(#7cc87f, #4caf50); color: #fff; text-decoration: none; }
-.side-btn-2 { background: linear-gradient(#f0f7f0, #dcecdc); color: #2e7d32; text-shadow: none; }
-.side-btn-2:hover { background: #eaf6ea; color: #1b5e20; }
 
 .side-stats { font-size: 12px; color: #4b6b4b; }
 .side-stat { padding: 3px 4px; }
@@ -364,7 +381,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .box-body { padding: 10px; }
 .empty { padding: 22px; text-align: center; color: #7a8f7a; font-size: 13px; }
 .notice { padding: 10px 12px; background: #fffbe6; border-color: #e6d98a; color: #6b5b1b; font-size: 12px; }
-.error { background: #fdecea; border: 1px solid #f0b0aa; color: #a02b22; padding: 8px 10px; border-radius: 3px; margin-bottom: 10px; font-size: 12px; }
 .page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
 .back-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; margin-bottom: 8px; }
 
@@ -398,9 +414,7 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .edited { color: #a8c0a8; font-size: 11px; }
 .post-text { font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
 
-.post-actions {
-  margin-top: 8px; display: flex; gap: 4px; align-items: center; flex-wrap: wrap;
-}
+.post-actions { margin-top: 8px; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
 .post-act {
   display: inline-flex; align-items: center; gap: 4px;
   font-size: 11px; color: #6b8a6b; padding: 3px 7px;
@@ -426,9 +440,8 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 
 .cform { margin-top: 8px; display: flex; gap: 6px; }
 .cform input[type=text] { flex: 1; }
-.cform-locked { margin-top: 8px; font-size: 11px; color: #8aa38a; }
 
-/* ---------- forms / inputs ---------- */
+/* ---------- forms ---------- */
 input[type=text], input[type=password], textarea {
   border: 1px solid #a5cfa5; border-radius: 3px;
   padding: 6px 8px; font-family: inherit; font-size: 13px;
@@ -446,12 +459,6 @@ button, .btn-primary {
 }
 button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
 button:active { background: #2e7d32; }
-
-.form-row { margin-bottom: 10px; }
-.form-row label {
-  display: block; font-size: 11px; color: #4b6b4b;
-  margin-bottom: 3px; font-weight: bold;
-}
 
 /* ---------- profile ---------- */
 .profile-header { display: flex; align-items: center; gap: 14px; padding: 14px 16px; }
@@ -487,19 +494,42 @@ button:active { background: #2e7d32; }
 .tb-sep { width: 1px; height: 20px; background: #a5cfa5; margin: 0 4px; }
 .tb-spacer { flex: 1; }
 
-.editor-body { display: flex; }
-.editor-pane { flex: 1; min-width: 0; }
+/* равные по высоте и ширине панели редактора */
+.editor-body {
+  display: flex;
+  height: 660px;                 /* одинаковая высота обеих панелей */
+  align-items: stretch;
+}
+.editor-pane {
+  flex: 1 1 50%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 .editor-pane textarea {
-  border: none; border-radius: 0; background: #fff;
-  min-height: 320px; resize: vertical; padding: 12px 14px;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+  background: #fff;
+  resize: none;                   /* фиксируем — панель не «уезжает» */
+  padding: 12px 14px;
   font-family: Consolas, Monaco, "Courier New", monospace;
-  font-size: 13px; line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-y: auto;
 }
 .editor-pane textarea:focus { background: #fff; }
 .editor-preview {
-  border-left: 1px solid #d6ead6; background: #fafdfa;
-  padding: 12px 14px; min-height: 320px; max-height: 640px; overflow-y: auto;
-  font-family: Verdana, sans-serif; font-size: 13px;
+  border-left: 1px solid #d6ead6;
+  background: #fafdfa;
+  padding: 12px 14px;
+  height: 100%;
+  overflow-y: auto;
+  font-family: Verdana, sans-serif;
+  font-size: 13px;
 }
 
 .editor-foot {
@@ -559,72 +589,63 @@ button:active { background: #2e7d32; }
 #   LAYOUT
 # ============================================================
 
-def layout(user: Optional[str], content: str, active: str = "") -> str:
+def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> str:
     def nav(href, icon_name, label, key):
         cls = "side-link active" if active == key else "side-link"
         return f'<a href="{href}" class="{cls}">{ic(icon_name, 14)}<span>{label}</span></a>'
 
     nav_items = nav("/", "home", "Лента", "feed")
-    if user:
-        nav_items += nav("/create", "plus", "Создать пост", "create")
-        nav_items += nav(f"/u/{quote(user)}", "user", "Мой профиль", "profile")
-        nav_items += (f'<form method="post" action="/logout" class="side-form">'
-                      f'<button type="submit" class="side-link side-link-btn">'
-                      f'{ic("logout", 14)}<span>Выход</span></button></form>')
-    else:
-        nav_items += nav("/login", "login", "Вход", "login")
-        nav_items += nav("/register", "user", "Регистрация", "register")
+    nav_items += nav("/create", "plus", "Создать пост", "create")
+    nav_items += nav(f"/u/{anon['id']}", "user", "Мои посты", "profile")
 
-    if user:
-        my_posts = sum(1 for p in posts if p["author"] == user)
-        user_card = f'''
-        <div class="side-card">
-          <div class="side-user">
-            <div class="avatar">{escape(user[0].upper())}</div>
-            <div style="min-width:0">
-              <a href="/u/{quote(user)}" class="side-username">{escape(user)}</a>
-              <div class="side-sub">{my_posts} постов</div>
-            </div>
-          </div>
-        </div>'''
-    else:
-        user_card = '''<div class="side-card">
-          <div class="side-sub" style="margin-bottom:8px">Читать можно без входа.<br>Писать — после регистрации.</div>
-          <a href="/login" class="side-btn">Вход</a>
-          <a href="/register" class="side-btn side-btn-2">Регистрация</a>
-        </div>'''
+    posts_count = sum(1 for p in posts if p["author_id"] == anon["id"])
+    active_users = len({p["author_id"] for p in posts}) or 1
+
+    user_card = f'''
+    <div class="side-card">
+      <div class="side-user">
+        <div class="avatar">{escape(anon['name'][0].upper())}</div>
+        <div style="min-width:0">
+          <div class="side-username">{escape(anon['name'])}</div>
+          <div class="side-sub">{posts_count} постов · {ic("user", 10)} #{anon['id']}</div>
+        </div>
+      </div>
+    </div>'''
+
+    layout_cls = "layout wide" if wide else "layout"
 
     return f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=1060">
+<meta name="viewport" content="width=1320">
 <title>litodon</title>
 <style>{CSS}</style>
 </head>
 <body>
 <header class="header">
   <div class="header-inner">
-    <a href="/" class="logo">litodon<span>лёгкая соцсеть</span></a>
+    <a href="/" class="logo">litodon<span>анонимная соцсеть</span></a>
     <div class="header-right">
       <a href="/create" class="header-btn">{ic("plus", 14)} Новый пост</a>
     </div>
   </div>
 </header>
-<div class="layout">
+<div class="{layout_cls}">
   <aside class="sidebar">
     <div class="side-card side-nav">{nav_items}</div>
     {user_card}
     <div class="side-card side-stats">
       <div class="side-stat"><b>{len(posts)}</b> постов</div>
-      <div class="side-stat"><b>{len(users)}</b> участников</div>
+      <div class="side-stat"><b>{active_users}</b> авторов</div>
+      <div class="side-stat"><b>{_counter['comment']}</b> комментариев</div>
     </div>
   </aside>
   <main class="content">
 {content}
   </main>
 </div>
-<div class="footer">litodon &copy; 2026 &middot; всё хранится в оперативной памяти</div>
+<div class="footer">litodon &copy; 2026 &middot; полностью анонимно &middot; всё хранится в оперативной памяти</div>
 </body>
 </html>'''
 
@@ -633,26 +654,24 @@ def layout(user: Optional[str], content: str, active: str = "") -> str:
 #   КОМПОНЕНТЫ
 # ============================================================
 
-def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
+def post_card(p: dict, anon: dict, link_back: bool = True) -> str:
     pid = p["id"]
+    aid = anon["id"]
     score = len(p["up"]) - len(p["down"])
     score_cls = "score-pos" if score > 0 else ("score-neg" if score < 0 else "score-zero")
 
-    if user:
-        up_cls = "vote-btn active-up" if user in p["up"] else "vote-btn"
-        down_cls = "vote-btn active-down" if user in p["down"] else "vote-btn"
-        votes = f'''
-        <form method="post" action="/vote/{pid}" class="vote-form">
-          <input type="hidden" name="value" value="up">
-          <button class="{up_cls}" title="Плюс">{ic("up", 12)}</button>
-        </form>
-        <div class="score {score_cls}">{score}</div>
-        <form method="post" action="/vote/{pid}" class="vote-form">
-          <input type="hidden" name="value" value="down">
-          <button class="{down_cls}" title="Минус">{ic("down", 12)}</button>
-        </form>'''
-    else:
-        votes = f'<div class="score {score_cls}">{score}</div>'
+    up_cls = "vote-btn active-up" if aid in p["up"] else "vote-btn"
+    down_cls = "vote-btn active-down" if aid in p["down"] else "vote-btn"
+    votes = f'''
+    <form method="post" action="/vote/{pid}" class="vote-form">
+      <input type="hidden" name="value" value="up">
+      <button class="{up_cls}" title="Плюс">{ic("up", 12)}</button>
+    </form>
+    <div class="score {score_cls}">{score}</div>
+    <form method="post" action="/vote/{pid}" class="vote-form">
+      <input type="hidden" name="value" value="down">
+      <button class="{down_cls}" title="Минус">{ic("down", 12)}</button>
+    </form>'''
 
     edited = ' <span class="edited">(изменено)</span>' if p.get("edited") else ""
     body = f'<div class="post-text md">{render_md(p["text"])}</div>'
@@ -660,7 +679,7 @@ def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
     actions = []
     if link_back:
         actions.append(f'<a href="/p/{pid}" class="post-act">{ic("comment", 12)} {len(p["comments"])}</a>')
-    if user == p["author"]:
+    if aid == p["author_id"]:
         actions.append(f'<a href="/p/{pid}/edit" class="post-act">{ic("edit", 12)} Редактировать</a>')
         actions.append(
             f'<form method="post" action="/p/{pid}/delete" class="inline-form" '
@@ -674,7 +693,7 @@ def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
     if link_back and p["comments"]:
         items = "".join(
             f'<div class="comment">'
-            f'<a href="/u/{quote(c["author"])}" class="c-author">{escape(c["author"])}</a>'
+            f'<a href="/u/{c["author_id"]}" class="c-author">{escape(c["author_name"])}</a>'
             f'<span class="c-time">{fmt_time(c["created"])}</span>'
             f'<div class="c-text md">{render_md(c["text"])}</div>'
             f'</div>'
@@ -686,23 +705,19 @@ def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
 
     cform = ""
     if link_back:
-        if user:
-            cform = (
-                f'<form method="post" action="/comment/{pid}" class="cform">'
-                f'<input type="text" name="text" maxlength="1000" '
-                f'placeholder="Ваш комментарий (markdown)..." required>'
-                f'<button type="submit" title="Отправить">{ic("send", 12)}</button></form>'
-            )
-        else:
-            cform = ('<div class="cform-locked">'
-                     '<a href="/login">Войдите</a>, чтобы оставить комментарий.</div>')
+        cform = (
+            f'<form method="post" action="/comment/{pid}" class="cform">'
+            f'<input type="text" name="text" maxlength="1000" '
+            f'placeholder="Ваш комментарий (markdown)..." required>'
+            f'<button type="submit" title="Отправить">{ic("send", 12)}</button></form>'
+        )
 
     return f'''
     <article class="box post" id="p{pid}">
       <div class="votes">{votes}</div>
       <div class="post-main">
         <div class="post-head">
-          <a href="/u/{quote(p["author"])}" class="author">{escape(p["author"])}</a>
+          <a href="/u/{p["author_id"]}" class="author">{escape(p["author_name"])}</a>
           <span class="time">{fmt_time(p["created"])}{edited}</span>
         </div>
         {body}
@@ -713,7 +728,7 @@ def post_card(p: dict, user: Optional[str], link_back: bool = True) -> str:
     </article>'''
 
 
-def editor_view(p: Optional[dict] = None, action: str = "/create") -> str:
+def editor_view(p: dict | None = None, action: str = "/create") -> str:
     if p:
         text_value = escape(p["text"])
         heading = "Редактировать пост"
@@ -750,14 +765,14 @@ def editor_view(p: Optional[dict] = None, action: str = "/create") -> str:
           {tb("link",  "Ссылка",      "insertMd('[','](https://)','текст ссылки')")}
           {tb("image", "Изображение", "insertMd('![','](https://)','alt')")}
           <span class="tb-spacer"></span>
-          <button type="button" class="tb tb-text" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
+          <button type="button" class="tb tb-text active" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
         </div>
         <div class="editor-body">
           <div class="editor-pane">
             <textarea id="editor" name="text" maxlength="{MAX_POST}" required
 placeholder="Напишите что-нибудь...&#10;&#10;Поддерживается markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`&#10;# Заголовок   - список   1. нумерация   > цитата&#10;--- разделитель   [ссылка](https://)   ![img](https://)">{text_value}</textarea>
           </div>
-          <div class="editor-pane editor-preview" id="preview-wrap" style="display:none">
+          <div class="editor-pane editor-preview" id="preview-wrap">
             <div class="md" id="preview"></div>
           </div>
         </div>
@@ -786,7 +801,7 @@ EDITOR_JS = r"""
   var previewEl = document.getElementById('preview');
   var previewWrap = document.getElementById('preview-wrap');
   var previewBtn = document.getElementById('preview-btn');
-  var previewOn = false;
+  var previewOn = true;                 // предпросмотр включён по умолчанию
   var previewTimer = null;
   var MAX = __MAX__;
 
@@ -817,7 +832,7 @@ EDITOR_JS = r"""
 
   window.togglePreview = function(){
     previewOn = !previewOn;
-    previewWrap.style.display = previewOn ? 'block' : 'none';
+    previewWrap.style.display = previewOn ? 'flex' : 'none';
     previewBtn.classList.toggle('active', previewOn);
     if (previewOn) runPreview();
   };
@@ -877,46 +892,9 @@ EDITOR_JS = r"""
   });
 
   updateCounter();
+  runPreview();
 })();
 """
-
-
-def login_view(err: Optional[str] = None) -> str:
-    err_html = f'<div class="error">{escape(err)}</div>' if err else ""
-    return f'''
-    <div class="box" style="max-width:420px;margin:0 auto;">
-      <div class="box-title">Вход</div>
-      <div class="box-body">
-        {err_html}
-        <form method="post" action="/login">
-          <div class="form-row"><label>Имя пользователя</label>
-            <input type="text" name="username" required autofocus maxlength="20"></div>
-          <div class="form-row"><label>Пароль</label>
-            <input type="password" name="password" required></div>
-          <button type="submit">{ic("login", 14)} Войти</button>
-        </form>
-        <p style="font-size:12px;margin-bottom:0">Нет аккаунта? <a href="/register">Зарегистрироваться</a></p>
-      </div>
-    </div>'''
-
-
-def register_view(err: Optional[str] = None) -> str:
-    err_html = f'<div class="error">{escape(err)}</div>' if err else ""
-    return f'''
-    <div class="box" style="max-width:420px;margin:0 auto;">
-      <div class="box-title">Регистрация</div>
-      <div class="box-body">
-        {err_html}
-        <form method="post" action="/register">
-          <div class="form-row"><label>Имя пользователя (3–20 символов)</label>
-            <input type="text" name="username" required autofocus maxlength="20"></div>
-          <div class="form-row"><label>Пароль (от 4 символов)</label>
-            <input type="password" name="password" required></div>
-          <button type="submit">{ic("user", 14)} Создать аккаунт</button>
-        </form>
-        <p style="font-size:12px;margin-bottom:0">Уже есть аккаунт? <a href="/login">Войти</a></p>
-      </div>
-    </div>'''
 
 
 # ============================================================
@@ -925,47 +903,40 @@ def register_view(err: Optional[str] = None) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    user = get_user(request)
+    anon = request.state.anon
     if not posts:
-        feed = ('<div class="box empty">Постов пока нет. '
-                + ('<a href="/create">Создайте первый!</a>' if user else 'Загляните позже.')
-                + '</div>')
+        feed = '<div class="box empty">Постов пока нет. <a href="/create">Создайте первый!</a></div>'
     else:
         ordered = sorted(posts, key=lambda x: x["created"], reverse=True)
-        feed = "".join(post_card(p, user) for p in ordered)
-
-    hint = ""
-    if not user:
-        hint = ('<div class="box notice">Читать можно без регистрации. '
-                '<a href="/login">Войдите</a> или <a href="/register">зарегистрируйтесь</a>, '
-                'чтобы писать посты, голосовать и комментировать.</div>')
-
-    return layout(user, '<h1 class="page-title">Лента</h1>' + hint + feed, active="feed")
+        feed = "".join(post_card(p, anon) for p in ordered)
+    return layout(anon, '<h1 class="page-title">Лента</h1>' + feed, active="feed")
 
 
 # ---------- создание ----------
 
 @app.get("/create", response_class=HTMLResponse)
 def create_page(request: Request):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-    return layout(user, editor_view(), active="create")
+    anon = request.state.anon
+    return layout(anon, editor_view(), active="create", wide=True)
 
 
 @app.post("/create")
 def create_post(request: Request, text: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
+    anon = request.state.anon
     text = text.strip()
     if text:
         _counter["post"] += 1
         pid = _counter["post"]
         posts.append({
-            "id": pid, "author": user, "text": text[:MAX_POST],
-            "created": time.time(), "edited": None,
-            "up": set(), "down": set(), "comments": [],
+            "id": pid,
+            "author_id": anon["id"],
+            "author_name": anon["name"],
+            "text": text[:MAX_POST],
+            "created": time.time(),
+            "edited": None,
+            "up": set(),
+            "down": set(),
+            "comments": [],
         })
         return RedirectResponse(f"/p/{pid}", status_code=303)
     return RedirectResponse("/create", status_code=303)
@@ -975,34 +946,37 @@ def create_post(request: Request, text: str = Form(...)):
 
 @app.get("/p/{post_id}", response_class=HTMLResponse)
 def post_page(post_id: int, request: Request):
-    user = get_user(request)
+    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
     if not p:
-        return HTMLResponse(layout(user, '<div class="box empty">Пост не найден. <a href="/">На главную</a></div>'),
-                            status_code=404)
+        return HTMLResponse(
+            layout(anon, '<div class="box empty">Пост не найден. <a href="/">На главную</a></div>'),
+            status_code=404)
     back = f'<a href="/" class="back-link">{ic("arrow-left", 14)} Назад к ленте</a>'
-    return layout(user, back + post_card(p, user), active="feed")
+    return layout(anon, back + post_card(p, anon), active="feed")
 
 
 # ---------- редактирование ----------
 
 @app.get("/p/{post_id}/edit", response_class=HTMLResponse)
 def edit_page(post_id: int, request: Request):
-    user = get_user(request)
+    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
     if not p:
-        return HTMLResponse(layout(user, '<div class="box empty">Пост не найден.</div>'), status_code=404)
-    if user != p["author"]:
+        return HTMLResponse(layout(anon, '<div class="box empty">Пост не найден.</div>'),
+                            status_code=404)
+    if anon["id"] != p["author_id"]:
         return RedirectResponse(f"/p/{post_id}", status_code=303)
     back = f'<a href="/p/{post_id}" class="back-link">{ic("arrow-left", 14)} Назад к посту</a>'
-    return layout(user, back + editor_view(p, action=f"/p/{post_id}/edit"), active="feed")
+    return layout(anon, back + editor_view(p, action=f"/p/{post_id}/edit"),
+                  active="feed", wide=True)
 
 
 @app.post("/p/{post_id}/edit")
 def edit_post(post_id: int, request: Request, text: str = Form(...)):
-    user = get_user(request)
+    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
-    if not p or user != p["author"]:
+    if not p or anon["id"] != p["author_id"]:
         return RedirectResponse("/", status_code=303)
     text = text.strip()
     if text:
@@ -1013,66 +987,64 @@ def edit_post(post_id: int, request: Request, text: str = Form(...)):
 
 @app.post("/p/{post_id}/delete")
 def delete_post(post_id: int, request: Request):
-    user = get_user(request)
+    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
-    if p and user == p["author"]:
+    if p and anon["id"] == p["author_id"]:
         posts.remove(p)
         return RedirectResponse("/", status_code=303)
     return RedirectResponse(f"/p/{post_id}", status_code=303)
 
 
-# ---------- профиль ----------
+# ---------- профиль автора ----------
 
-@app.get("/u/{username}", response_class=HTMLResponse)
-def profile(username: str, request: Request):
-    user = get_user(request)
-    if username not in users:
-        return HTMLResponse(
-            layout(user, f'<div class="box empty">Пользователь «{escape(username)}» не найден. '
-                         f'<a href="/">На главную</a></div>'),
-            status_code=404)
-    user_posts = sorted([p for p in posts if p["author"] == username],
+@app.get("/u/{anon_id}", response_class=HTMLResponse)
+def profile(anon_id: int, request: Request):
+    anon = request.state.anon
+    user_posts = sorted([p for p in posts if p["author_id"] == anon_id],
                         key=lambda x: x["created"], reverse=True)
+    if not user_posts:
+        return HTMLResponse(
+            layout(anon, '<div class="box empty">Здесь пока ничего нет. '
+                         '<a href="/">На главную</a></div>'),
+            status_code=404)
+
+    display_name = user_posts[0]["author_name"]
     karma = sum(len(p["up"]) - len(p["down"]) for p in user_posts)
 
     header = f'''
     <div class="box profile-header">
-      <div class="avatar-big">{escape(username[0].upper())}</div>
+      <div class="avatar-big">{escape(display_name[0].upper())}</div>
       <div class="profile-info">
-        <h2>{escape(username)}</h2>
+        <h2>{escape(display_name)}</h2>
         <div class="profile-stats">
           <span><b>{len(user_posts)}</b> постов</span>
           <span><b>{karma}</b> кармы</span>
+          <span>#{anon_id}</span>
         </div>
       </div>
     </div>'''
 
-    if not user_posts:
-        feed = '<div class="box empty">Постов пока нет.</div>'
-    else:
-        feed = "".join(post_card(p, user) for p in user_posts)
-    return layout(user, header + feed, active="profile")
+    feed = "".join(post_card(p, anon) for p in user_posts)
+    return layout(anon, header + feed, active="profile")
 
 
 # ---------- голосование ----------
 
 @app.post("/vote/{post_id}")
 def vote(post_id: int, request: Request, value: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
+    aid = request.state.anon["id"]
     p = next((x for x in posts if x["id"] == post_id), None)
     if p:
         if value == "up":
-            if user in p["up"]:
-                p["up"].discard(user)
+            if aid in p["up"]:
+                p["up"].discard(aid)
             else:
-                p["up"].add(user); p["down"].discard(user)
+                p["up"].add(aid); p["down"].discard(aid)
         elif value == "down":
-            if user in p["down"]:
-                p["down"].discard(user)
+            if aid in p["down"]:
+                p["down"].discard(aid)
             else:
-                p["down"].add(user); p["up"].discard(user)
+                p["down"].add(aid); p["up"].discard(aid)
     return RedirectResponse(safe_redirect(request), status_code=303)
 
 
@@ -1080,16 +1052,15 @@ def vote(post_id: int, request: Request, value: str = Form(...)):
 
 @app.post("/comment/{post_id}")
 def add_comment(post_id: int, request: Request, text: str = Form(...)):
-    user = get_user(request)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
+    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
     text = text.strip()
     if p and text:
         _counter["comment"] += 1
         p["comments"].append({
             "id": _counter["comment"],
-            "author": user,
+            "author_id": anon["id"],
+            "author_name": anon["name"],
             "text": text[:1000],
             "created": time.time(),
         })
@@ -1101,78 +1072,6 @@ def add_comment(post_id: int, request: Request, text: str = Form(...)):
 @app.post("/api/preview")
 def api_preview(text: str = Form("")):
     return JSONResponse({"html": render_md(text[:MAX_POST])})
-
-
-# ---------- auth ----------
-
-@app.get("/register", response_class=HTMLResponse)
-def register_page(request: Request):
-    if get_user(request):
-        return RedirectResponse("/", status_code=303)
-    return layout(None, register_view(), active="register")
-
-
-@app.post("/register")
-def register_post(request: Request,
-                  username: str = Form(...),
-                  password: str = Form(...)):
-    username = username.strip()
-    err = None
-    if len(username) < 3:
-        err = "Имя пользователя — минимум 3 символа."
-    elif len(username) > 20:
-        err = "Имя пользователя — максимум 20 символов."
-    elif " " in username or "/" in username:
-        err = "Имя пользователя не должно содержать пробелов и слэшей."
-    elif not re.match(r'^[A-Za-z0-9_\-\.\u0400-\u04FF]+$', username):
-        err = "Разрешены буквы, цифры, _, -, ."
-    elif len(password) < 4:
-        err = "Пароль — минимум 4 символа."
-    elif username in users:
-        err = "Такое имя уже занято."
-
-    if err:
-        return layout(None, register_view(err), active="register")
-
-    salt = secrets.token_hex(8)
-    users[username] = {"salt": salt, "pw": hash_pw(password, salt)}
-    token = secrets.token_hex(24)
-    sessions[token] = username
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30, samesite="lax")
-    return resp
-
-
-@app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    if get_user(request):
-        return RedirectResponse("/", status_code=303)
-    return layout(None, login_view(), active="login")
-
-
-@app.post("/login")
-def login_post(request: Request,
-               username: str = Form(...),
-               password: str = Form(...)):
-    username = username.strip()
-    acc = users.get(username)
-    if not acc or acc["pw"] != hash_pw(password, acc["salt"]):
-        return layout(None, login_view("Неверное имя пользователя или пароль."), active="login")
-    token = secrets.token_hex(24)
-    sessions[token] = username
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True, max_age=60 * 60 * 24 * 30, samesite="lax")
-    return resp
-
-
-@app.post("/logout")
-def logout(request: Request):
-    token = request.cookies.get("session")
-    if token:
-        sessions.pop(token, None)
-    resp = RedirectResponse("/", status_code=303)
-    resp.delete_cookie("session")
-    return resp
 
 
 # ============================================================
