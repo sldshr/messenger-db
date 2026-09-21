@@ -190,6 +190,7 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row = r.data[0]
                 row["following"] = set(row.get("following") or [])
                 row["followers"] = set(row.get("followers") or [])
+                row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 return row
@@ -215,6 +216,7 @@ def db_save_user(u: dict) -> None:
             "created_at": ts_to_iso(u["created_at"]),
             "following": list(u.get("following") or []),
             "followers": list(u.get("followers") or []),
+            "blacklist": list(u.get("blacklist") or []),
             "allow_followers_view": u.get("allow_followers_view", True),
             "allow_following_view": u.get("allow_following_view", True),
         }).execute()
@@ -242,6 +244,7 @@ def db_all_users() -> List[dict]:
             for row in r.data or []:
                 row["following"] = set(row.get("following") or [])
                 row["followers"] = set(row.get("followers") or [])
+                row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 out.append(row)
@@ -507,6 +510,11 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
               post_id: str = "", comment_id: str = "", text: str = "") -> None:
     if not to_nick or to_nick == from_nick:
         return
+    to_user = db_load_user(to_nick)
+    if to_user:
+        bl = to_user.get("blacklist") or []
+        if from_nick in bl:
+            return
     n = {
         "id": uuid.uuid4().hex[:10],
         "to_nick": to_nick, "type": ntype, "from_nick": from_nick,
@@ -611,11 +619,24 @@ def db_dm_create_thread(a: str, b: str) -> dict:
     return row
 
 
-def db_dm_get_or_create_thread(a: str, b: str) -> dict:
+def db_dm_get_or_create_thread(a: str, b: str) -> Tuple[dict, bool]:
     t = db_dm_find_thread(a, b)
     if t:
-        return t
-    return db_dm_create_thread(a, b)
+        return t, False
+    return db_dm_create_thread(a, b), True
+
+
+def db_dm_delete_thread(tid: str) -> None:
+    if supabase:
+        try:
+            supabase.table("dm_threads").delete().eq("id", tid).execute()
+        except Exception as e:
+            print("[sldChat] db_dm_delete_thread error:", e)
+        return
+    for k in list(DM_THREADS_MEM.keys()):
+        if DM_THREADS_MEM[k]["id"] == tid:
+            del DM_THREADS_MEM[k]
+    DM_MSGS_MEM.pop(tid, None)
 
 
 def db_dm_update_thread_last_message(tid: str, ts: float) -> None:
@@ -797,6 +818,7 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
+        d["blacklist"] = list(u.get("blacklist") or [])
     return d
 
 
@@ -847,6 +869,10 @@ class DMSendIn(BaseModel):
     text: str
 
 
+class BlacklistIn(BaseModel):
+    nick: str
+
+
 @app.post("/api/register")
 def api_register(data: RegisterIn):
     name = data.name.strip()
@@ -866,7 +892,7 @@ def api_register(data: RegisterIn):
         "nick": nick, "name": name, "bio": "",
         "password": hash_password(data.password),
         "created_at": time.time(),
-        "following": set(), "followers": set(),
+        "following": set(), "followers": set(), "blacklist": [],
         "allow_followers_view": True, "allow_following_view": True,
     }
     db_save_user(u)
@@ -925,6 +951,33 @@ def api_set_settings(data: SettingsIn, request: Request):
     return {"ok": True}
 
 
+@app.post("/api/users/me/blacklist")
+def api_bl_add(data: BlacklistIn, request: Request):
+    me = require_user(request)
+    nick = data.nick.strip().lstrip("@")
+    if not nick:
+        raise HTTPException(400, "empty")
+    target = db_load_user(nick)
+    if not target:
+        raise HTTPException(404, "not found")
+    if target["nick"] == me["nick"]:
+        raise HTTPException(400, "self")
+    bl = list(me.get("blacklist") or [])
+    if target["nick"] not in bl:
+        bl.append(target["nick"])
+        db_update_user_fields(me["nick"], {"blacklist": bl})
+    return {"ok": True, "blacklist": bl}
+
+
+@app.delete("/api/users/me/blacklist/{nick}")
+def api_bl_remove(nick: str, request: Request):
+    me = require_user(request)
+    bl = list(me.get("blacklist") or [])
+    bl = [n for n in bl if n.lower() != nick.lower()]
+    db_update_user_fields(me["nick"], {"blacklist": bl})
+    return {"ok": True, "blacklist": bl}
+
+
 @app.get("/api/users")
 def api_users_list(request: Request, q: str = ""):
     users = db_all_users()
@@ -955,15 +1008,23 @@ def api_followers(nick: str, request: Request):
         raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     vn = viewer["nick"] if viewer else None
-    if vn != u["nick"] and not u.get("allow_followers_view", True):
+    is_owner = vn == u["nick"]
+    allow = u.get("allow_followers_view", True)
+    followers = list(u.get("followers") or [])
+
+    if not allow and not is_owner:
+        if vn and vn in followers:
+            me_u = db_load_user(vn)
+            return {"users": [serialize_user(me_u, vn)], "limited": True}
         raise HTTPException(403, "err_private_followers")
+
     out = []
-    for n in (u.get("followers") or []):
+    for n in followers:
         fu = db_load_user(n)
         if fu:
             out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
-    return {"users": out}
+    return {"users": out, "limited": False}
 
 
 @app.get("/api/users/{nick}/following")
@@ -973,15 +1034,23 @@ def api_following(nick: str, request: Request):
         raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     vn = viewer["nick"] if viewer else None
-    if vn != u["nick"] and not u.get("allow_following_view", True):
+    is_owner = vn == u["nick"]
+    allow = u.get("allow_following_view", True)
+    following = list(u.get("following") or [])
+
+    if not allow and not is_owner:
+        if vn and vn in following:
+            me_u = db_load_user(vn)
+            return {"users": [serialize_user(me_u, vn)], "limited": True}
         raise HTTPException(403, "err_private_following")
+
     out = []
-    for n in (u.get("following") or []):
+    for n in following:
         fu = db_load_user(n)
         if fu:
             out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
-    return {"users": out}
+    return {"users": out, "limited": False}
 
 
 @app.post("/api/users/{nick}/follow")
@@ -1238,6 +1307,14 @@ def api_notifications(request: Request):
     return {"items": items, "unread": unread}
 
 
+@app.get("/api/notifications/unread")
+def api_notifications_unread(request: Request):
+    me = require_user(request)
+    items = db_notifications(me["nick"])
+    unread = sum(1 for n in items if not n.get("read"))
+    return {"unread": unread}
+
+
 @app.post("/api/notifications/read")
 def api_notifications_read(request: Request):
     me = require_user(request)
@@ -1342,6 +1419,18 @@ def api_dm_thread(tid: str, request: Request):
     }
 
 
+@app.delete("/api/dm/thread/{tid}")
+def api_dm_delete_thread(tid: str, request: Request):
+    me = require_user(request)
+    t = db_dm_get_thread_by_id(tid)
+    if not t:
+        raise HTTPException(404, "not found")
+    if me["nick"] != t["user_a"] and me["nick"] != t["user_b"]:
+        raise HTTPException(403, "forbidden")
+    db_dm_delete_thread(tid)
+    return {"ok": True}
+
+
 @app.post("/api/dm/send")
 def api_dm_send(data: DMSendIn, request: Request):
     me = require_user(request)
@@ -1350,17 +1439,30 @@ def api_dm_send(data: DMSendIn, request: Request):
         raise HTTPException(404, "not found")
     if other["nick"] == me["nick"]:
         raise HTTPException(400, "self")
+
+    # проверка блеклиста получателя
+    if me["nick"] in (other.get("blacklist") or []):
+        raise HTTPException(403, "err_user_blocked")
+    # если отправитель заблокировал получателя — тоже нельзя
+    if other["nick"] in (me.get("blacklist") or []):
+        raise HTTPException(403, "err_user_blocked")
+
     text = data.text.strip()
     if not text:
         raise HTTPException(400, "empty")
     if len(text) > MAX_DM_LEN:
         raise HTTPException(400, "too long")
 
-    t = db_dm_get_or_create_thread(me["nick"], other["nick"])
+    t, is_new = db_dm_get_or_create_thread(me["nick"], other["nick"])
     msg = db_dm_create_message(t["id"], me["nick"], text)
     db_dm_update_thread_last_message(t["id"], msg["created_at"])
+
+    if is_new:
+        db_notify(other["nick"], "dm_start", me["nick"], text=text[:140])
+
     return {
         "thread_id": t["id"],
+        "is_new": is_new,
         "message": {
             "id": msg["id"], "from_nick": msg["from_nick"],
             "text": msg["text"], "created_at": msg["created_at"], "mine": True,
@@ -1380,6 +1482,8 @@ TEXTS = {
         "read_more": "читать дальше", "copy": "Копировать", "copied": "Скопировано",
         "edit": "Редактировать", "delete": "Удалить", "save": "Сохранить",
         "cancel": "Отмена", "confirm_delete": "Удалить без возможности восстановления?",
+        "confirm_logout": "Вы действительно хотите выйти из аккаунта?",
+        "confirm_yes": "Да, выйти", "confirm_no": "Отмена",
         "author_badge": "автор",
         "f_new": "Новые", "f_top": "Лучшие", "f_bottom": "Худшие", "f_old": "Старые",
         "f_all": "Все", "f_many": "Много комм.", "f_some": "Есть комм.", "f_none": "Без комм.",
@@ -1401,6 +1505,7 @@ TEXTS = {
         "err_auth_required": "Требуется вход",
         "err_private_followers": "Пользователь скрыл своих подписчиков",
         "err_private_following": "Пользователь скрыл свои подписки",
+        "err_user_blocked": "Пользователь недоступен",
         "login_to_post": "Войдите, чтобы писать посты",
         "login_to_comment": "Войдите, чтобы писать комментарии",
         "login_to_dm": "Войдите, чтобы писать сообщения",
@@ -1414,48 +1519,55 @@ TEXTS = {
         "settings_privacy": "Конфиденциальность",
         "settings_allow_followers": "Разрешить просматривать подписчиков",
         "settings_allow_following": "Разрешить просматривать подписки",
+        "settings_blacklist": "Блеклист",
+        "settings_blacklist_hint": "От людей в блеклисте не приходят уведомления и сообщения",
+        "settings_blacklist_add_ph": "@ник",
+        "settings_blacklist_add": "Добавить",
+        "settings_blacklist_empty": "Блеклист пуст",
         "settings_info": "Инфо",
         "settings_policy": "Политика конфиденциальности",
         "settings_desc": "sldChat — минималистичная соцсеть: посты, комментарии, апвоуты, подписки и личные сообщения.",
         "settings_authors": "Авторы",
+        "settings_account": "Аккаунт",
+        "settings_logout": "Выйти из аккаунта",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
         "notif_title": "Уведомления", "notif_empty": "Уведомлений нет",
         "notif_follow": "подписался(-ась) на вас",
         "notif_comment": "оставил(а) комментарий",
         "notif_reply": "ответил(а) на ваш комментарий",
         "notif_mention": "упомянул(а) вас",
+        "notif_dm": "начал(а) переписку с вами",
         "notif_clear": "Очистить все", "back_to_main": "В главное меню",
         "bio_ph": "Описание профиля...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
         "bio_empty": "Описание пока не заполнено", "edit_bio": "Редактировать",
         "followers_title": "Подписчики", "following_title": "Подписки",
         "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
+        "limited_list": "Пользователь скрыл этот список. Вам виден только ваш аккаунт.",
         "users_title": "Пользователи", "users_search_ph": "Поиск по нику или имени",
         "no_users": "Никого не найдено",
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
-            "1. Мы храним минимум данных: имя, ник, пароль (в виде pbkdf2-хеша), посты, "
-            "комментарии, голоса, подписки, сообщения и уведомления.\n\n"
-            "2. Пароль хранится только в виде хеша pbkdf2-hmac-sha256 (100 000 итераций) с солью. "
-            "Мы не можем его восстановить.\n\n"
+            "1. Мы храним минимум данных: имя, ник, пароль (pbkdf2-хеш), посты, комментарии, "
+            "голоса, подписки, блеклист, сообщения и уведомления.\n\n"
+            "2. Пароль хранится только в виде pbkdf2-hmac-sha256 (100 000 итераций) с солью.\n\n"
             "3. Данные хранятся на серверах Supabase (Postgres). Мы не продаём и не передаём "
             "их третьим лицам.\n\n"
-            "4. Приватность профиля управляется пользователем в Настройках: можно скрыть список "
-            "подписчиков и подписок.\n\n"
-            "5. Вы можете в любой момент удалить свои посты и комментарии — они исчезают из базы. "
-            "Редактировать и удалять чужие посты и комментарии невозможно.\n\n"
-            "6. Личные сообщения доступны только участникам диалога.\n\n"
-            "7. Для определения языка интерфейса используется IP-геолокация (IP не сохраняется).\n\n"
-            "8. Сервис предоставляется as-is без гарантий."
+            "4. Приватность профиля управляется в Настройках: можно скрыть подписчиков и подписки.\n\n"
+            "5. Редактировать и удалять можно только свои посты и комментарии.\n\n"
+            "6. Личные сообщения доступны только участникам диалога. Блеклист полностью "
+            "блокирует уведомления и сообщения.\n\n"
+            "7. IP используется только для определения языка (не сохраняется).\n\n"
+            "8. Сервис предоставляется as-is."
         ),
         "spinner": "Загрузка…",
         "dm_title": "Сообщения",
         "dm_empty": "Здесь будут ваши переписки",
         "dm_search_ph": "Поиск по перепискам",
-        "dm_with": "Чат с",
         "dm_send_ph": "Написать сообщение...",
         "dm_send": "Отправить",
         "dm_no_messages": "Напишите первое сообщение",
-        "dm_send_first": "Написать сообщение",
+        "dm_delete": "Удалить переписку",
+        "dm_delete_confirm": "Удалить переписку? Сообщения исчезнут у обоих участников.",
         "err_dm_self": "Нельзя написать самому себе",
     },
     "en": {
@@ -1469,6 +1581,8 @@ TEXTS = {
         "read_more": "read more", "copy": "Copy", "copied": "Copied",
         "edit": "Edit", "delete": "Delete", "save": "Save",
         "cancel": "Cancel", "confirm_delete": "Delete permanently?",
+        "confirm_logout": "Are you sure you want to log out?",
+        "confirm_yes": "Yes, log out", "confirm_no": "Cancel",
         "author_badge": "author",
         "f_new": "New", "f_top": "Top", "f_bottom": "Worst", "f_old": "Old",
         "f_all": "All", "f_many": "Many", "f_some": "Some", "f_none": "None",
@@ -1490,6 +1604,7 @@ TEXTS = {
         "err_auth_required": "Login required",
         "err_private_followers": "User hid their followers",
         "err_private_following": "User hid their following",
+        "err_user_blocked": "User is unavailable",
         "login_to_post": "Log in to write posts",
         "login_to_comment": "Log in to write comments",
         "login_to_dm": "Log in to send messages",
@@ -1503,46 +1618,54 @@ TEXTS = {
         "settings_privacy": "Privacy",
         "settings_allow_followers": "Allow viewing followers",
         "settings_allow_following": "Allow viewing following",
+        "settings_blacklist": "Blacklist",
+        "settings_blacklist_hint": "People in the blacklist cannot send you notifications or messages",
+        "settings_blacklist_add_ph": "@nick",
+        "settings_blacklist_add": "Add",
+        "settings_blacklist_empty": "Blacklist is empty",
         "settings_info": "Info",
         "settings_policy": "Privacy policy",
         "settings_desc": "sldChat is a minimalist social network: posts, comments, upvotes, follows and direct messages.",
         "settings_authors": "Authors",
+        "settings_account": "Account",
+        "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
         "notif_title": "Notifications", "notif_empty": "No notifications",
         "notif_follow": "followed you",
         "notif_comment": "commented",
         "notif_reply": "replied to your comment",
         "notif_mention": "mentioned you",
+        "notif_dm": "started a chat with you",
         "notif_clear": "Clear all", "back_to_main": "Back to main",
         "bio_ph": "Profile bio...", "bio_save": "Save", "bio_saved": "Saved",
         "bio_empty": "No bio yet", "edit_bio": "Edit",
         "followers_title": "Followers", "following_title": "Following",
         "no_followers": "No followers yet", "no_following": "No following yet",
+        "limited_list": "User hid this list. You can only see your own account.",
         "users_title": "Users", "users_search_ph": "Search by nick or name",
         "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
             "1. We store minimum data: name, nick, password (pbkdf2 hash), posts, comments, "
-            "votes, follows, messages and notifications.\n\n"
-            "2. Password is stored only as a pbkdf2-hmac-sha256 hash (100 000 iterations) with a salt. "
-            "We cannot recover it.\n\n"
-            "3. Data is stored on Supabase (Postgres) servers. We do not sell or share it with third parties.\n\n"
-            "4. Profile privacy is controlled by the user in Settings: you can hide followers and following.\n\n"
-            "5. You can delete your posts and comments at any time — they are removed from the database. "
-            "You cannot edit or delete other users' posts and comments.\n\n"
-            "6. Direct messages are visible only to conversation participants.\n\n"
-            "7. IP geolocation is used to determine the interface language (IP is not stored).\n\n"
-            "8. The service is provided as-is without warranty."
+            "votes, follows, blacklist, messages and notifications.\n\n"
+            "2. Password is stored only as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
+            "3. Data is stored on Supabase (Postgres). We do not sell or share it.\n\n"
+            "4. Profile privacy is controlled in Settings: you can hide followers and following.\n\n"
+            "5. You can only edit or delete your own posts and comments.\n\n"
+            "6. Direct messages are visible only to conversation participants. Blacklist "
+            "fully blocks notifications and messages.\n\n"
+            "7. IP is used only to detect language (not stored).\n\n"
+            "8. Service is provided as-is."
         ),
         "spinner": "Loading…",
         "dm_title": "Messages",
         "dm_empty": "Your conversations will appear here",
         "dm_search_ph": "Search conversations",
-        "dm_with": "Chat with",
         "dm_send_ph": "Write a message...",
         "dm_send": "Send",
         "dm_no_messages": "Send the first message",
-        "dm_send_first": "Send a message",
+        "dm_delete": "Delete conversation",
+        "dm_delete_confirm": "Delete conversation? Messages will disappear for both.",
         "err_dm_self": "Cannot message yourself",
     },
 }
@@ -1606,7 +1729,7 @@ ICON_TRASH = svg(
 FAVICON = (
     "data:image/svg+xml,"
     "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-    "%3Crect width='64' height='64' fill='%23101010'/%3E"
+    "%3Crect width='64' height='64' fill='%230866ff'/%3E"
     "%3Cpath d='M14 16h36v24H28l-14 12V16z' fill='%23ffffff'/%3E"
     "%3C/svg%3E"
 )
@@ -1614,22 +1737,46 @@ FAVICON = (
 
 CSS = """
 :root, [data-theme="light"] {
-  --bg:#ebebeb; --card:#ffffff; --line:#d4d4d4; --line-strong:#a8a8a8;
-  --text:#101010; --muted:#767676; --hover:#f0f0f0;
-  --accent:#101010; --accent-fg:#ffffff;
-  --up:#1f9d55; --down:#d84343; --comment-bg:#f6f6f6;
-  --danger:#d84343; --mention:#3b7dd8;
-  --bubble-mine:#101010; --bubble-mine-fg:#ffffff;
-  --bubble-theirs:#f0f0f0; --bubble-theirs-fg:#101010;
+  --bg:#f4f5f7;
+  --card:#ffffff;
+  --line:#e4e6eb;
+  --line-strong:#bcc0c4;
+  --text:#1a1d21;
+  --muted:#65676b;
+  --hover:#f0f2f5;
+  --accent:#0866ff;
+  --accent-fg:#ffffff;
+  --up:#16a34a;
+  --down:#dc2626;
+  --comment-bg:#f0f2f5;
+  --danger:#dc2626;
+  --mention:#0866ff;
+  --bubble-mine:#0866ff;
+  --bubble-mine-fg:#ffffff;
+  --bubble-theirs:#f0f2f5;
+  --bubble-theirs-fg:#1a1d21;
+  --shadow:0 1px 2px rgba(0,0,0,.04);
 }
 [data-theme="dark"] {
-  --bg:#0a0a0a; --card:#141414; --line:#282828; --line-strong:#3a3a3a;
-  --text:#ececec; --muted:#888888; --hover:#1e1e1e;
-  --accent:#ececec; --accent-fg:#101010;
-  --up:#2ecc71; --down:#e74c3c; --comment-bg:#1c1c1c;
-  --danger:#e74c3c; --mention:#6aa9ff;
-  --bubble-mine:#ececec; --bubble-mine-fg:#101010;
-  --bubble-theirs:#1e1e1e; --bubble-theirs-fg:#ececec;
+  --bg:#0b0d10;
+  --card:#161a1f;
+  --line:#272c33;
+  --line-strong:#3a4149;
+  --text:#e7eaee;
+  --muted:#8a929c;
+  --hover:#1e232a;
+  --accent:#4a90ff;
+  --accent-fg:#ffffff;
+  --up:#34d058;
+  --down:#ff5c5c;
+  --comment-bg:#1e232a;
+  --danger:#ff5c5c;
+  --mention:#6aa9ff;
+  --bubble-mine:#4a90ff;
+  --bubble-mine-fg:#ffffff;
+  --bubble-theirs:#1e232a;
+  --bubble-theirs-fg:#e7eaee;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
 }
 * { box-sizing: border-box; }
 html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
@@ -1648,7 +1795,7 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
 ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
-.layout { display: flex; width: 100%; height: 100vh; background: var(--card); }
+.layout { display: flex; width: 100%; height: 100vh; background: var(--bg); }
 .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--card); }
 .main-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
@@ -1659,6 +1806,8 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
   flex: 1; font-size: 15px; font-weight: 600; padding: 0 6px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.main-header .title a { color: var(--text); text-decoration: none; }
+.main-header .title a:hover { color: var(--accent); }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
 
 .sidebar {
@@ -1668,7 +1817,7 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
 }
 .sidebar .logo {
   font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
-  padding: 4px 12px 22px; user-select: none;
+  padding: 4px 12px 22px; user-select: none; color: var(--accent);
 }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
@@ -1680,13 +1829,15 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
 }
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--hover); font-weight: 600; }
+.nav-btn.active { color: var(--accent); }
+.nav-btn.active svg { color: var(--accent); }
 .nav-btn svg { flex-shrink: 0; color: var(--muted); }
-.nav-btn.active svg { color: var(--text); }
 .nav-btn .badge {
-  margin-left: auto; min-width: 18px; height: 18px;
+  margin-left: auto; min-width: 20px; height: 20px;
   background: var(--danger); color: #fff;
-  font-size: 11px; font-weight: 700; line-height: 18px;
-  text-align: center; padding: 0 5px;
+  font-size: 11px; font-weight: 700; line-height: 20px;
+  text-align: center; padding: 0 6px;
+  border-radius: 10px;
 }
 .sidebar .spacer { flex: 1; }
 .sidebar-user {
@@ -1697,59 +1848,64 @@ input, textarea { user-select: text; -webkit-user-select: text; -ms-user-select:
 }
 .sidebar-user .dot {
   width: 8px; height: 8px; background: var(--up); flex-shrink: 0;
+  border-radius: 50%;
 }
 
 .icon-btn {
-  width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center;
   background: transparent; border: 1px solid var(--line);
   color: var(--text); cursor: pointer; padding: 0; text-decoration: none;
-  transition: background .12s, border-color .12s; flex-shrink: 0;
+  transition: background .12s, border-color .12s, color .12s; flex-shrink: 0;
+  border-radius: 6px;
 }
-.icon-btn:hover { background: var(--hover); border-color: var(--line-strong); }
+.icon-btn:hover { background: var(--hover); border-color: var(--line-strong); color: var(--accent); }
 .icon-btn svg { display: block; }
 
 header.search-header {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
   padding: 10px 14px; border-bottom: 1px solid var(--line);
 }
 header.search-header input[type="search"], header.search-header input[type="text"] {
-  flex: 1; min-width: 0; padding: 0 12px; height: 32px;
-  border: 1px solid var(--line); background: transparent;
+  flex: 1; min-width: 0; padding: 0 14px; height: 36px;
+  border: 1px solid var(--line); background: var(--hover);
   color: var(--text); font-size: 14px; font-family: inherit;
-  outline: none; transition: border-color .12s;
+  outline: none; transition: border-color .12s, background .12s;
+  border-radius: 8px;
 }
-header.search-header input:focus { border-color: var(--line-strong); }
+header.search-header input:focus { border-color: var(--accent); background: var(--card); }
 
 .filters {
   flex: 0 0 auto; display: flex; align-items: center;
-  padding: 6px 10px; border-bottom: 1px solid var(--line);
+  padding: 8px 10px; border-bottom: 1px solid var(--line);
   overflow-x: auto; scrollbar-width: none;
 }
 .filters::-webkit-scrollbar { display: none; }
-.filter-group { display: flex; align-items: center; gap: 1px; flex-shrink: 0; }
+.filter-group { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .filter-sep { width: 1px; height: 16px; background: var(--line); margin: 0 8px; flex-shrink: 0; }
 .filter {
-  height: 26px; padding: 0 10px; border: none; background: transparent;
+  height: 28px; padding: 0 12px; border: none; background: transparent;
   color: var(--muted); font-family: inherit; font-size: 12px; font-weight: 500;
   cursor: pointer; white-space: nowrap; transition: color .12s, background .12s;
+  border-radius: 6px;
 }
 .filter:hover { background: var(--hover); color: var(--text); }
-.filter.active { color: var(--text); background: var(--hover); }
+.filter.active { color: #fff; background: var(--accent); }
 
 .empty { padding: 80px 20px; text-align: center; color: var(--muted); font-size: 13px; }
 
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner {
-  display: inline-block; width: 24px; height: 24px;
-  border: 2px solid var(--line); border-top-color: var(--text);
+  display: inline-block; width: 26px; height: 26px;
+  border: 2px solid var(--line); border-top-color: var(--accent);
   animation: spin .7s linear infinite;
+  border-radius: 50%;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .post { padding: 16px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .post-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; }
 .post-author { font-weight: 600; color: var(--text); text-decoration: none; font-size: 13px; }
-.post-author:hover { text-decoration: underline; }
+.post-author:hover { color: var(--accent); }
 .post-time { color: var(--muted); font-size: 12px; margin-left: auto; }
 .post-text {
   font-size: 15px; line-height: 1.55; white-space: pre-wrap;
@@ -1758,19 +1914,20 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .mention { color: var(--mention); text-decoration: none; font-weight: 500; }
 .mention:hover { text-decoration: underline; }
 .read-more {
-  display: inline-block; margin-top: 8px; color: var(--muted);
-  text-decoration: none; font-size: 13px; border-bottom: 1px dashed currentColor;
+  display: inline-block; margin-top: 8px; color: var(--accent);
+  text-decoration: none; font-size: 13px;
 }
-.read-more:hover { color: var(--text); }
+.read-more:hover { text-decoration: underline; }
 .post-actions {
   display: flex; align-items: center; gap: 2px;
   margin-top: 12px; font-size: 12px; color: var(--muted);
 }
 .vote-btn, .action-btn {
   display: inline-flex; align-items: center; gap: 5px;
-  height: 28px; padding: 0 9px; background: transparent; border: none;
+  height: 30px; padding: 0 10px; background: transparent; border: none;
   color: var(--muted); cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 500;
   transition: color .12s, background .12s;
+  border-radius: 6px;
 }
 .vote-btn:hover, .action-btn:hover { background: var(--hover); }
 .vote-btn svg, .action-btn svg { display: block; }
@@ -1782,7 +1939,7 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .action-btn.copied { color: var(--up); }
 .action-btn.danger:hover { color: var(--danger); }
 .score {
-  min-width: 20px; padding: 0 3px; text-align: center;
+  min-width: 22px; padding: 0 3px; text-align: center;
   font-weight: 600; font-size: 12px; color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1792,33 +1949,33 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .comments { margin-top: 14px; border-top: 1px solid var(--line); }
 .comment {
   padding: 12px 14px; margin-top: 10px;
-  background: var(--comment-bg); border-left: 2px solid var(--line-strong);
+  background: var(--comment-bg); border-left: 3px solid var(--line-strong);
+  border-radius: 6px;
 }
 .comment.reply {
   margin-left: 32px; border-left-color: var(--muted);
-  background: transparent; border: 1px solid var(--line); border-left-width: 2px;
+  background: transparent; border: 1px solid var(--line); border-left-width: 3px;
 }
-.comment.is-author { border-left-color: #fff; box-shadow: 0 0 0 1px #fff inset; }
-[data-theme="light"] .comment.is-author {
-  border-left-color: #101010; box-shadow: 0 0 0 1px #101010 inset;
-}
+.comment.is-author { border-left-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .comment-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }
 .comment-author { font-size: 12px; font-weight: 600; color: var(--text); text-decoration: none; }
-.comment-author:hover { text-decoration: underline; }
+.comment-author:hover { color: var(--accent); }
 .comment-author-badge {
   font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .5px; padding: 1px 6px; border: 1px solid currentColor; color: var(--text);
+  letter-spacing: .5px; padding: 1px 6px; border: 1px solid var(--accent);
+  color: var(--accent);
 }
 .comment-time { font-size: 11px; color: var(--muted); margin-left: auto; }
 .comment-text { font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); }
 .comment-actions { display: flex; align-items: center; gap: 2px; margin-top: 8px; font-size: 11px; color: var(--muted); }
-.comment-actions .vote-btn { height: 22px; padding: 0 6px; font-size: 11px; }
-.comment-actions .score { font-size: 11px; min-width: 14px; }
+.comment-actions .vote-btn { height: 24px; padding: 0 7px; font-size: 11px; }
+.comment-actions .score { font-size: 11px; min-width: 16px; }
 .comment-reply-btn, .comment-edit-btn {
   background: transparent; border: none; color: var(--muted);
   font-family: inherit; font-size: 11px; cursor: pointer;
-  padding: 4px 8px; height: 22px; display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; height: 24px; display: inline-flex; align-items: center; gap: 4px;
   transition: color .12s, background .12s;
+  border-radius: 4px;
 }
 .comment-reply-btn:hover, .comment-edit-btn:hover { color: var(--text); background: var(--hover); }
 .comment-edit-btn.danger:hover { color: var(--danger); }
@@ -1829,7 +1986,7 @@ header.search-header input:focus { border-color: var(--line-strong); }
   display: block; width: 100%; padding: 10px 12px; min-height: 80px;
   border: 1px solid var(--line-strong); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
-  outline: none; resize: none;
+  outline: none; resize: none; border-radius: 6px;
 }
 .inline-editor .edit-actions {
   display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px;
@@ -1837,6 +1994,7 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .inline-editor .edit-actions button {
   height: 30px; padding: 0 14px; font-family: inherit; font-size: 13px; cursor: pointer;
   border: 1px solid var(--line); background: transparent; color: var(--text);
+  border-radius: 6px;
 }
 .inline-editor .edit-actions button:hover { background: var(--hover); }
 .inline-editor .edit-actions button.edit-save {
@@ -1846,12 +2004,13 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 12px 14px; }
 .composer textarea {
   display: block; width: 100%; min-height: 140px; padding: 12px 14px;
-  border: 1px solid var(--line); background: transparent;
+  border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
   outline: none; resize: none; transition: border-color .12s;
+  border-radius: 8px;
 }
 .composer.composer-comment textarea { min-height: 84px; }
-.composer textarea:focus { border-color: var(--line-strong); }
+.composer textarea:focus { border-color: var(--accent); }
 .composer textarea::placeholder { color: var(--muted); }
 .composer textarea:disabled { opacity: .5; cursor: not-allowed; }
 .composer-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
@@ -1859,53 +2018,58 @@ header.search-header input:focus { border-color: var(--line-strong); }
 .counter { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .counter.warn { color: var(--danger); }
 .reply-banner {
-  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
-  background: var(--comment-bg); border: 1px solid var(--line);
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  background: var(--hover); border: 1px solid var(--line);
   font-size: 12px; color: var(--muted); margin-bottom: 8px;
+  border-radius: 6px;
 }
 .reply-banner b { color: var(--text); font-weight: 600; }
 .reply-banner button {
   margin-left: auto; background: transparent; border: none;
   color: var(--text); font-family: inherit; font-size: 12px;
   cursor: pointer; padding: 2px 8px;
+  border-radius: 4px;
 }
-.reply-banner button:hover { background: var(--hover); }
+.reply-banner button:hover { background: var(--hover); color: var(--accent); }
 
 button.send {
-  height: 34px; padding: 0 20px;
+  height: 36px; padding: 0 20px;
   background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
-  font-family: inherit; font-size: 13px; font-weight: 500;
-  cursor: pointer; transition: opacity .12s;
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: opacity .12s, background .12s;
+  border-radius: 8px;
 }
-button.send:hover { opacity: .85; }
-button.send:disabled { opacity: .3; cursor: default; }
+button.send:hover { opacity: .9; }
+button.send:disabled { opacity: .4; cursor: default; }
 .login-prompt { padding: 16px; text-align: center; color: var(--muted); font-size: 13px; }
-.login-prompt a { color: var(--text); }
+.login-prompt a { color: var(--accent); }
 
-.auth-wrap { max-width: 380px; margin: 0 auto; padding: 40px 20px; }
-.auth-title { font-size: 22px; font-weight: 700; margin: 0 0 24px; letter-spacing: -0.5px; }
+.auth-wrap { max-width: 400px; margin: 0 auto; padding: 40px 20px; }
+.auth-title { font-size: 24px; font-weight: 700; margin: 0 0 24px; letter-spacing: -0.5px; }
 .auth-form { display: flex; flex-direction: column; gap: 10px; }
 .auth-form input {
-  width: 100%; padding: 12px 14px; border: 1px solid var(--line); background: transparent;
+  width: 100%; padding: 12px 14px; border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px;
   outline: none; transition: border-color .12s;
+  border-radius: 8px;
 }
-.auth-form input:focus { border-color: var(--line-strong); }
+.auth-form input:focus { border-color: var(--accent); }
 .auth-form button {
-  margin-top: 6px; height: 42px; background: var(--accent); color: var(--accent-fg);
+  margin-top: 6px; height: 44px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
   font-family: inherit; font-size: 14px; font-weight: 600;
   cursor: pointer; transition: opacity .12s;
+  border-radius: 8px;
 }
-.auth-form button:hover { opacity: .85; }
+.auth-form button:hover { opacity: .9; }
 .auth-form button:disabled { opacity: .5; cursor: default; }
 .auth-error { color: var(--danger); font-size: 13px; min-height: 18px; }
 .auth-switch { margin-top: 20px; font-size: 13px; color: var(--muted); text-align: center; }
-.auth-switch a { color: var(--text); cursor: pointer; text-decoration: underline; }
+.auth-switch a { color: var(--accent); cursor: pointer; text-decoration: underline; }
 
 .profile-header { padding: 24px 20px; border-bottom: 1px solid var(--line); }
-.profile-name-big { font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
+.profile-name-big { font-size: 24px; font-weight: 700; letter-spacing: -0.4px; }
 .profile-nick-small { color: var(--muted); font-size: 14px; margin-top: 3px; }
 .profile-bio {
   margin-top: 14px; font-size: 14px; color: var(--text); line-height: 1.55;
@@ -1917,34 +2081,38 @@ button.send:disabled { opacity: .3; cursor: default; }
   user-select: none;
 }
 .profile-stats b { color: var(--text); font-weight: 600; cursor: pointer; }
-.profile-stats b:hover { text-decoration: underline; }
+.profile-stats b:hover { color: var(--accent); }
 .profile-actions { margin-top: 18px; display: flex; gap: 8px; flex-wrap: wrap; }
 .follow-btn {
-  height: 34px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
+  height: 36px; padding: 0 20px; background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
   font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer; transition: opacity .12s;
+  cursor: pointer; transition: opacity .12s, background .12s;
   display: inline-flex; align-items: center; gap: 8px;
+  border-radius: 8px;
 }
-.follow-btn:hover { opacity: .85; }
+.follow-btn:hover { opacity: .9; }
 .follow-btn.following { background: transparent; color: var(--text); border-color: var(--line-strong); }
+.follow-btn.following:hover { background: var(--hover); }
 .follow-btn.secondary { background: transparent; color: var(--text); border-color: var(--line-strong); }
+.follow-btn.secondary:hover { background: var(--hover); border-color: var(--accent); color: var(--accent); }
 .own-note { font-size: 13px; color: var(--muted); }
 
 .bio-editor { margin-top: 14px; }
 .bio-editor textarea {
   width: 100%; padding: 12px; min-height: 72px;
-  border: 1px solid var(--line); background: transparent;
+  border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
-  outline: none; resize: none;
+  outline: none; resize: none; border-radius: 8px;
 }
-.bio-editor textarea:focus { border-color: var(--line-strong); }
+.bio-editor textarea:focus { border-color: var(--accent); }
 .bio-editor-row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
 .btn-secondary {
-  height: 34px; padding: 0 16px; background: transparent; color: var(--text);
+  height: 36px; padding: 0 16px; background: transparent; color: var(--text);
   border: 1px solid var(--line);
   font-family: inherit; font-size: 13px; cursor: pointer;
-  transition: background .12s, border-color .12s;
+  transition: background .12s, border-color .12s, color .12s;
+  border-radius: 8px;
 }
 .btn-secondary:hover { background: var(--hover); border-color: var(--line-strong); }
 .bio-saved-msg { font-size: 12px; color: var(--up); }
@@ -1956,7 +2124,7 @@ button.send:disabled { opacity: .3; cursor: default; }
   font-weight: 600; color: var(--text); text-decoration: none;
   font-size: 14px; display: block;
 }
-.user-item .user-nick:hover { text-decoration: underline; }
+.user-item .user-nick:hover { color: var(--accent); }
 .user-item .user-name { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
 .notif-list { padding: 6px 0; }
@@ -1965,39 +2133,43 @@ button.send:disabled { opacity: .3; cursor: default; }
   font-size: 14px; line-height: 1.5; text-decoration: none; color: inherit;
 }
 .notif.unread { background: var(--hover); }
+.notif:hover { background: var(--hover); }
 .notif-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .notif-author { font-weight: 600; color: var(--text); }
 .notif-text { color: var(--muted); font-size: 13px; }
 .notif-snippet {
-  margin-top: 6px; padding: 8px 10px; background: var(--comment-bg); border-left: 2px solid var(--line-strong);
+  margin-top: 6px; padding: 8px 12px; background: var(--comment-bg); border-left: 3px solid var(--line-strong);
   font-size: 13px; color: var(--text);
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  border-radius: 4px;
 }
 .notif-time { font-size: 11px; color: var(--muted); margin-top: 4px; }
 .notif-actions { padding: 12px 20px; border-bottom: 1px solid var(--line); display: flex; justify-content: flex-end; }
 .btn-danger {
-  height: 32px; padding: 0 14px; background: transparent; color: var(--danger);
+  height: 34px; padding: 0 16px; background: transparent; color: var(--danger);
   border: 1px solid var(--danger);
   font-family: inherit; font-size: 12px; cursor: pointer;
   display: inline-flex; align-items: center; gap: 6px;
-  transition: background .12s;
+  transition: background .12s, color .12s;
+  border-radius: 8px;
 }
-.btn-danger:hover { background: var(--danger); color: var(--card); }
+.btn-danger:hover { background: var(--danger); color: #fff; }
 
 .settings { padding: 24px 20px; max-width: 640px; }
 .settings h2 {
-  font-size: 12px; font-weight: 600; text-transform: uppercase;
+  font-size: 12px; font-weight: 700; text-transform: uppercase;
   letter-spacing: .6px; color: var(--muted); margin: 0 0 12px;
 }
 .settings-section { margin-bottom: 36px; }
 .opt-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .opt {
-  height: 34px; padding: 0 18px; background: transparent; color: var(--text);
+  height: 36px; padding: 0 18px; background: transparent; color: var(--text);
   border: 1px solid var(--line); font-family: inherit; font-size: 13px;
-  cursor: pointer; transition: border-color .12s, background .12s;
+  cursor: pointer; transition: border-color .12s, background .12s, color .12s;
+  border-radius: 8px;
 }
 .opt:hover { background: var(--hover); }
-.opt.active { background: var(--hover); border-color: var(--line-strong); font-weight: 600; }
+.opt.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 
 .toggle-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -2006,37 +2178,69 @@ button.send:disabled { opacity: .3; cursor: default; }
 }
 .toggle-row:last-child { border-bottom: none; }
 .toggle {
-  position: relative; width: 40px; height: 22px;
+  position: relative; width: 44px; height: 24px;
   background: var(--line); cursor: pointer; transition: background .15s;
-  border: 1px solid var(--line); flex-shrink: 0;
+  border: none; flex-shrink: 0;
+  border-radius: 12px;
 }
 .toggle::after {
-  content: ''; position: absolute; left: 1px; top: 1px;
-  width: 16px; height: 16px; background: var(--card);
+  content: ''; position: absolute; left: 2px; top: 2px;
+  width: 20px; height: 20px; background: #fff;
   transition: transform .15s;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0,0,0,.2);
 }
-.toggle.on { background: var(--up); border-color: var(--up); }
-.toggle.on::after { transform: translateX(18px); background: #fff; }
+.toggle.on { background: var(--up); }
+.toggle.on::after { transform: translateX(20px); }
 
 .settings-desc { font-size: 13px; line-height: 1.65; color: var(--muted); margin: 0 0 14px; }
 .settings-link {
-  display: inline-block; color: var(--text); text-decoration: underline;
+  display: inline-block; color: var(--accent); text-decoration: none;
   font-size: 13px; cursor: pointer;
 }
+.settings-link:hover { text-decoration: underline; }
 .settings-authors { font-size: 14px; color: var(--text); }
 
+.blacklist-add {
+  display: flex; gap: 8px; margin-bottom: 12px;
+}
+.blacklist-add input {
+  flex: 1; padding: 10px 14px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); font-family: inherit; font-size: 14px;
+  outline: none; border-radius: 8px;
+}
+.blacklist-add input:focus { border-color: var(--accent); }
+.blacklist-list { display: flex; flex-direction: column; gap: 6px; }
+.blacklist-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; background: var(--hover);
+  border-radius: 8px; font-size: 14px;
+}
+.blacklist-item .bl-nick { flex: 1; font-weight: 600; }
+.blacklist-item .bl-nick a { color: var(--text); text-decoration: none; }
+.blacklist-item .bl-nick a:hover { color: var(--accent); }
+.blacklist-item button {
+  height: 28px; padding: 0 12px; background: transparent;
+  border: 1px solid var(--danger); color: var(--danger);
+  font-family: inherit; font-size: 12px; cursor: pointer;
+  border-radius: 6px;
+  transition: background .12s, color .12s;
+}
+.blacklist-item button:hover { background: var(--danger); color: #fff; }
+
 .policy { padding: 24px; max-width: 720px; }
-.policy h1 { font-size: 20px; margin: 0 0 18px; font-weight: 700; }
+.policy h1 { font-size: 22px; margin: 0 0 18px; font-weight: 700; }
 .policy p { font-size: 14px; line-height: 1.7; color: var(--text); white-space: pre-wrap; margin: 0; }
 
 .dm-list { padding: 6px 0; }
 .dm-thread {
   display: flex; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--line);
   text-decoration: none; color: inherit; transition: background .12s;
+  align-items: center;
 }
 .dm-thread:hover { background: var(--hover); }
 .dm-thread .info { flex: 1; min-width: 0; }
-.dm-thread .who { font-weight: 600; font-size: 14px; display: flex; gap: 8px; align-items: baseline; }
+.dm-thread .who { font-weight: 600; font-size: 14px; }
 .dm-thread .preview { font-size: 13px; color: var(--muted); margin-top: 3px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dm-thread .meta { flex-shrink: 0; display: flex; flex-direction: column;
@@ -2046,55 +2250,115 @@ button.send:disabled { opacity: .3; cursor: default; }
   min-width: 20px; height: 20px; line-height: 20px;
   background: var(--danger); color: #fff;
   font-size: 11px; font-weight: 700; text-align: center; padding: 0 6px;
+  border-radius: 10px;
 }
-.dm-thread .mine-label { font-size: 11px; color: var(--muted); }
+.dm-thread .mine-label { color: var(--muted); }
+.dm-del-btn {
+  width: 32px; height: 32px; flex-shrink: 0;
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  transition: color .12s, background .12s, border-color .12s;
+  border-radius: 6px;
+}
+.dm-del-btn:hover { color: var(--danger); border-color: var(--danger); background: rgba(220,38,38,.08); }
 
 .chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .chat-body {
   flex: 1; overflow-y: auto; overflow-x: hidden;
-  padding: 18px 20px; background: var(--card);
+  padding: 18px 20px; background: var(--bg);
 }
 .chat-intro {
   text-align: center; color: var(--muted); font-size: 13px;
   padding: 20px 0;
 }
-.chat-msg { max-width: 72%; margin-bottom: 10px; padding: 9px 13px;
-  word-wrap: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
-  font-size: 14px; line-height: 1.45; }
-.chat-msg.mine { margin-left: auto; background: var(--bubble-mine); color: var(--bubble-mine-fg); }
-.chat-msg.theirs { margin-right: auto; background: var(--bubble-theirs); color: var(--bubble-theirs-fg); }
-.chat-msg .chat-time { font-size: 10px; opacity: .65; margin-top: 4px; }
+.chat-msg {
+  width: fit-content;
+  max-width: 70%;
+  margin-bottom: 10px;
+  padding: 10px 14px;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 14px;
+  line-height: 1.45;
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+.chat-msg.mine {
+  margin-left: auto;
+  background: var(--bubble-mine);
+  color: var(--bubble-mine-fg);
+  border-bottom-right-radius: 4px;
+}
+.chat-msg.theirs {
+  margin-right: auto;
+  background: var(--bubble-theirs);
+  color: var(--bubble-theirs-fg);
+  border-bottom-left-radius: 4px;
+}
+.chat-msg .chat-time { font-size: 10px; opacity: .7; margin-top: 4px; }
 .chat-composer {
   flex: 0 0 auto; border-top: 1px solid var(--line); padding: 10px 14px;
   display: flex; gap: 10px; align-items: flex-end; background: var(--card);
 }
 .chat-composer textarea {
-  flex: 1; min-height: 40px; max-height: 160px; padding: 10px 12px;
-  border: 1px solid var(--line); background: transparent;
+  flex: 1; min-height: 42px; max-height: 160px; padding: 10px 14px;
+  border: 1px solid var(--line); background: var(--hover);
   color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.4;
-  outline: none; resize: none; transition: border-color .12s;
+  outline: none; resize: none; transition: border-color .12s, background .12s;
+  border-radius: 10px;
 }
-.chat-composer textarea:focus { border-color: var(--line-strong); }
+.chat-composer textarea:focus { border-color: var(--accent); background: var(--card); }
 .chat-composer button {
-  height: 40px; padding: 0 18px;
+  height: 42px; padding: 0 20px;
   background: var(--accent); color: var(--accent-fg);
   border: 1px solid var(--accent);
-  font-family: inherit; font-size: 13px; font-weight: 500;
+  font-family: inherit; font-size: 13px; font-weight: 600;
   cursor: pointer; transition: opacity .12s;
+  border-radius: 10px;
 }
-.chat-composer button:hover { opacity: .85; }
-.chat-composer button:disabled { opacity: .3; cursor: default; }
+.chat-composer button:hover { opacity: .9; }
+.chat-composer button:disabled { opacity: .4; cursor: default; }
+
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.5);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000; padding: 20px;
+  animation: fadeIn .15s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  background: var(--card); border: 1px solid var(--line);
+  padding: 24px; max-width: 380px; width: 100%;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.2);
+}
+.modal-text { font-size: 15px; line-height: 1.5; color: var(--text); margin-bottom: 20px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.modal-btn {
+  height: 36px; padding: 0 18px;
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: opacity .12s, background .12s;
+  border-radius: 8px;
+}
+.modal-btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+.modal-btn.secondary:hover { background: var(--hover); }
+.modal-btn.danger { background: var(--danger); color: #fff; border: 1px solid var(--danger); }
+.modal-btn.danger:hover { opacity: .9; }
+.modal-btn.primary { background: var(--accent); color: var(--accent-fg); border: 1px solid var(--accent); }
+.modal-btn.primary:hover { opacity: .9; }
 
 @media (max-width: 900px) {
   body { font-size: 15px; }
   .layout { flex-direction: column; }
-  .main { order: 1; height: calc(100vh - 58px); }
+  .main { order: 1; height: calc(100vh - 62px); }
   .sidebar {
-    order: 2; width: 100%; height: 58px;
+    order: 2; width: 100%; height: 62px;
     flex-direction: row; border-left: none;
     border-top: 1px solid var(--line);
     padding: 0;
-    flex: 0 0 58px;
+    flex: 0 0 62px;
+    box-shadow: 0 -1px 3px rgba(0,0,0,.04);
   }
   .sidebar .logo { display: none; }
   .sidebar .spacer { display: none; }
@@ -2108,15 +2372,21 @@ button.send:disabled { opacity: .3; cursor: default; }
     flex-direction: column; gap: 3px; padding: 6px 4px;
     flex: 1; justify-content: center; align-items: center;
     text-align: center;
+    border-radius: 0;
   }
+  .nav-btn[data-nav="logout"] { display: none; }
   .nav-btn span { font-size: 10px; line-height: 1; }
   .nav-btn svg { width: 20px; height: 20px; }
+  .nav-btn.active { background: transparent; }
+  .nav-btn.active svg { color: var(--accent); }
+  .nav-btn.active span { color: var(--accent); }
   .nav-btn .badge {
-    position: absolute; top: 4px; right: 20%;
+    position: absolute; top: 2px; right: 18%;
     margin: 0; min-width: 16px; height: 16px;
     line-height: 16px; font-size: 10px; padding: 0 4px;
+    border-radius: 8px;
   }
-  .main-header { min-height: 46px; padding: 8px 12px; }
+  .main-header { min-height: 48px; padding: 8px 12px; }
   .main-header .title { font-size: 14px; }
   .post { padding: 14px 16px; }
   .post-text { font-size: 15px; }
@@ -2124,9 +2394,9 @@ button.send:disabled { opacity: .3; cursor: default; }
   .composer textarea { min-height: 90px; }
   .composer.composer-comment textarea { min-height: 70px; }
   .profile-header { padding: 20px 16px; }
-  .chat-body { padding: 14px 14px; }
-  .chat-msg { max-width: 85%; }
-  .chat-composer { padding: 8px 12px; gap: 8px; }
+  .chat-body { padding: 14px 12px; }
+  .chat-msg { max-width: 82%; font-size: 14px; }
+  .chat-composer { padding: 8px 10px; gap: 8px; }
   .chat-composer button { padding: 0 14px; }
   .user-item { padding: 12px 16px; }
   .notif { padding: 12px 16px; }
@@ -2165,7 +2435,8 @@ var state = {
   composerDraft: '',
   replyTo: null,
   highlightComment: null,
-  suppressRefresh: 0
+  suppressRefresh: 0,
+  lastChatLen: 0
 };
 
 function setUser(u) {
@@ -2232,6 +2503,22 @@ function truncateText(text) {
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
 
+function showConfirm(text, onConfirm) {
+  var modal = document.createElement('div');
+  modal.className = 'modal-overlay';
+  modal.innerHTML = '<div class="modal">'
+    + '<div class="modal-text">' + escapeHtml(text) + '</div>'
+    + '<div class="modal-actions">'
+    + '<button class="modal-btn secondary" data-modal-cancel>' + escapeHtml(tr('confirm_no')) + '</button>'
+    + '<button class="modal-btn danger" data-modal-confirm>' + escapeHtml(tr('confirm_yes')) + '</button>'
+    + '</div></div>';
+  document.body.appendChild(modal);
+  function close() { if (modal.parentNode) modal.parentNode.removeChild(modal); }
+  modal.querySelector('[data-modal-cancel]').addEventListener('click', close);
+  modal.querySelector('[data-modal-confirm]').addEventListener('click', function(){ close(); onConfirm(); });
+  modal.addEventListener('click', function(e){ if (e.target === modal) close(); });
+}
+
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('sldchat_theme', theme);
@@ -2268,6 +2555,7 @@ function handleRoute() {
   }
   else if ((m = path.match(/^\/messages\/(.+)$/))) {
     state.view = 'chat'; state.viewData = { nick: decodeURIComponent(m[1]) };
+    state.lastChatLen = 0;
   }
   else if (path === '/messages') { state.view = 'messages'; state.viewData = {}; }
   else if (path === '/users') { state.view = 'users'; state.viewData = {}; }
@@ -2304,12 +2592,14 @@ async function doLogin(data) {
   setUser(res.user);
   navigate('/');
 }
-async function doLogout() {
-  try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
-  setUser(null);
-  state.token = null;
-  localStorage.removeItem('sldchat_token');
-  navigate('/');
+function doLogoutConfirm() {
+  showConfirm(tr('confirm_logout'), async function(){
+    try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
+    setUser(null);
+    state.token = null;
+    localStorage.removeItem('sldchat_token');
+    navigate('/');
+  });
 }
 
 function navBtn(icon, label, active, action, count) {
@@ -2351,7 +2641,7 @@ function renderSidebar() {
       else if (nav === 'settings') navigate('/settings');
       else if (nav === 'register') navigate('/register');
       else if (nav === 'login') navigate('/login');
-      else if (nav === 'logout') doLogout();
+      else if (nav === 'logout') doLogoutConfirm();
     });
   });
 }
@@ -2738,11 +3028,12 @@ async function loadFollowList(nick, isFollowers) {
       : ('/api/users/' + encodeURIComponent(nick) + '/following');
     var data = await api(path);
     var users = data.users || [];
+    var limitedNote = data.limited ? '<div class="empty" style="padding:14px 20px;text-align:left">' + escapeHtml(tr('limited_list')) + '</div>' : '';
     if (!users.length) {
       wrap.innerHTML = '<div class="empty">' + escapeHtml(isFollowers ? tr('no_followers') : tr('no_following')) + '</div>';
       return;
     }
-    wrap.innerHTML = '<div class="user-list">' + users.map(function(u){
+    wrap.innerHTML = limitedNote + '<div class="user-list">' + users.map(function(u){
       return '<div class="user-item">'
         + '<div class="user-info">'
         + '<a class="user-nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
@@ -2838,18 +3129,32 @@ async function loadDMs() {
     }
     wrap.innerHTML = '<div class="dm-list">' + threads.map(function(t){
       var badge = t.unread > 0 ? '<span class="unread-badge">' + t.unread + '</span>' : '';
-      var mineLabel = t.last_from_me ? '<span class="mine-label">вы: </span>' : '';
-      return '<a class="dm-thread" href="/messages/' + encodeURIComponent(t.other_nick) + '" data-link>'
-        + '<div class="info">'
+      var mineLabel = t.last_from_me ? '<span class="mine-label">' + escapeHtml(LANG === 'ru' ? 'вы: ' : 'you: ') + '</span>' : '';
+      return '<div class="dm-thread">'
+        + '<a class="info" href="/messages/' + encodeURIComponent(t.other_nick) + '" data-link style="text-decoration:none;color:inherit;display:block">'
         + '<div class="who">@' + escapeHtml(t.other_nick) + '</div>'
         + '<div class="preview">' + mineLabel + escapeHtml(t.last_message || '') + '</div>'
-        + '</div>'
+        + '</a>'
         + '<div class="meta">'
         + '<span class="time">' + timeAgo(t.last_message_at) + '</span>'
         + badge
-        + '</div></a>';
+        + '</div>'
+        + '<button class="dm-del-btn" data-del-thread="' + t.id + '" title="' + escapeHtml(tr('dm_delete')) + '">' + ICONS.trash + '</button>'
+        + '</div>';
     }).join('') + '</div>';
     bindLinks(wrap);
+    wrap.querySelectorAll('[data-del-thread]').forEach(function(b){
+      b.addEventListener('click', function(e){
+        e.preventDefault();
+        var tid = b.dataset.delThread;
+        showConfirm(tr('dm_delete_confirm'), async function(){
+          try {
+            await api('/api/dm/thread/' + tid, { method: 'DELETE' });
+            loadDMs();
+          } catch(err) { alert(tr(err.message) || err.message); }
+        });
+      });
+    });
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
@@ -2864,7 +3169,7 @@ function renderChatView(el) {
   var html = '';
   html += '<header class="main-header">';
   html += '<a href="/messages" class="icon-btn" data-link title="' + escapeHtml(tr('back_to_main')) + '">' + ICONS.back + '</a>';
-  html += '<div class="title">@' + escapeHtml(nick) + '</div>';
+  html += '<div class="title"><a href="/u/' + encodeURIComponent(nick) + '" data-link>@' + escapeHtml(nick) + '</a></div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
   html += '<div class="main-body"><div class="chat">';
@@ -2882,8 +3187,7 @@ function renderChatView(el) {
   var sendBtn = document.getElementById('dmSend');
 
   function updateCounter() {
-    var v = inputEl.value;
-    sendBtn.disabled = v.trim().length === 0;
+    sendBtn.disabled = inputEl.value.trim().length === 0;
   }
   inputEl.addEventListener('input', updateCounter);
   inputEl.addEventListener('keydown', function(e){
@@ -2899,37 +3203,53 @@ function renderChatView(el) {
     var text = inputEl.value.trim();
     if (!text) return;
     sendBtn.disabled = true;
+    // оптимистично вставляем
+    var bodyEl = document.getElementById('chatBody');
+    if (bodyEl) {
+      var intro = bodyEl.querySelector('.chat-intro');
+      if (intro) intro.remove();
+      var optimistic = document.createElement('div');
+      optimistic.className = 'chat-msg mine';
+      optimistic.innerHTML = escapeHtml(text) + '<div class="chat-time">' + tr('just_now') + '</div>';
+      bodyEl.appendChild(optimistic);
+      bodyEl.scrollTop = bodyEl.scrollHeight;
+    }
+    inputEl.value = '';
+    updateCounter();
     try {
       await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } });
-      inputEl.value = '';
-      updateCounter();
-      await loadChat();
+      await loadChat(true);
     } catch(e) {
       alert(tr(e.message) || e.message);
-      updateCounter();
+      await loadChat(true);
     }
   }
 
   loadChat();
 }
 
-async function loadChat() {
+async function loadChat(silent) {
   var body = document.getElementById('chatBody');
   if (!body) return;
   var nick = state.viewData.nick;
   try {
     var data = await api('/api/dm/with/' + encodeURIComponent(nick));
-    if (!data.messages || !data.messages.length) {
+    var msgs = data.messages || [];
+    // если количество совпадает и не silent — пропускаем полный рендер
+    if (silent && msgs.length === state.lastChatLen) return;
+    state.lastChatLen = msgs.length;
+    if (!msgs.length) {
       body.innerHTML = '<div class="chat-intro">' + escapeHtml(tr('dm_no_messages')) + '</div>';
       return;
     }
-    body.innerHTML = data.messages.map(function(m){
+    var wasAtBottom = (body.scrollHeight - body.scrollTop - body.clientHeight) < 60;
+    body.innerHTML = msgs.map(function(m){
       return '<div class="chat-msg ' + (m.mine ? 'mine' : 'theirs') + '">'
         + escapeHtml(m.text)
         + '<div class="chat-time">' + timeAgo(m.created_at) + '</div>'
         + '</div>';
     }).join('');
-    body.scrollTop = body.scrollHeight;
+    if (!silent || wasAtBottom) body.scrollTop = body.scrollHeight;
   } catch(e) {
     body.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
   }
@@ -2969,12 +3289,13 @@ async function loadNotifications() {
     html += '<div class="notif-list">' + items.map(renderNotifHtml).join('') + '</div>';
     wrap.innerHTML = html;
     bindLinks(wrap);
-    document.getElementById('clearNotifsBtn').addEventListener('click', async function(){
-      if (!confirm(tr('notif_clear') + '?')) return;
-      try {
-        await api('/api/notifications/clear', { method: 'POST' });
-        loadNotifications();
-      } catch(e) { alert(tr(e.message) || e.message); }
+    document.getElementById('clearNotifsBtn').addEventListener('click', function(){
+      showConfirm(tr('notif_clear') + '?', async function(){
+        try {
+          await api('/api/notifications/clear', { method: 'POST' });
+          loadNotifications();
+        } catch(e) { alert(tr(e.message) || e.message); }
+      });
     });
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
@@ -2999,6 +3320,10 @@ function renderNotifHtml(n) {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_mention') + '</span></div>';
     if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
+  } else if (n.type === 'dm_start') {
+    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_dm') + '</span></div>';
+    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    link = '/messages/' + encodeURIComponent(n.from_nick);
   } else {
     text = '<div class="notif-text">' + author + '</div>';
   }
@@ -3013,6 +3338,7 @@ function renderSettingsView(el) {
   var me = state.user || {};
   var allowF = me.allow_followers_view !== false;
   var allowG = me.allow_following_view !== false;
+  var bl = me.blacklist || [];
 
   var html = '';
   html += '<header class="main-header">';
@@ -3023,7 +3349,7 @@ function renderSettingsView(el) {
   html += '<div class="main-body"><div class="settings">';
 
   html += '<div class="settings-section"><h2>' + tr('settings_appearance') + '</h2>';
-  html += '<div style="margin-bottom:14px"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_theme') + '</div><div class="opt-row">';
+  html += '<div style="margin-bottom:16px"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_theme') + '</div><div class="opt-row">';
   html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
   html += '<button class="opt' + (theme==='dark'?' active':'') + '" data-set-theme="dark">' + tr('theme_dark') + '</button>';
   html += '</div></div>';
@@ -3040,6 +3366,26 @@ function renderSettingsView(el) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_following') + '</span>'
       + '<div class="toggle' + (allowG ? ' on' : '') + '" data-toggle="allow_following_view"></div></div>';
     html += '</div>';
+
+    html += '<div class="settings-section"><h2>' + tr('settings_blacklist') + '</h2>';
+    html += '<p class="settings-desc">' + escapeHtml(tr('settings_blacklist_hint')) + '</p>';
+    html += '<div class="blacklist-add">';
+    html += '<input type="text" id="blInput" placeholder="' + escapeHtml(tr('settings_blacklist_add_ph')) + '" autocomplete="off" spellcheck="false" />';
+    html += '<button class="btn-secondary" id="blAdd">' + tr('settings_blacklist_add') + '</button>';
+    html += '</div>';
+    if (bl.length) {
+      html += '<div class="blacklist-list" id="blList">';
+      html += bl.map(function(n){
+        return '<div class="blacklist-item">'
+          + '<span class="bl-nick"><a href="/u/' + encodeURIComponent(n) + '" data-link>@' + escapeHtml(n) + '</a></span>'
+          + '<button data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button>'
+          + '</div>';
+      }).join('');
+      html += '</div>';
+    } else {
+      html += '<div class="empty" style="padding:14px 0;text-align:left">' + escapeHtml(tr('settings_blacklist_empty')) + '</div>';
+    }
+    html += '</div>';
   }
 
   html += '<div class="settings-section"><h2>' + tr('settings_info') + '</h2>';
@@ -3048,6 +3394,12 @@ function renderSettingsView(el) {
   html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_authors') + '</div>';
   html += '<div class="settings-authors">SldShr, DeepSeek</div>';
   html += '</div>';
+
+  if (state.user) {
+    html += '<div class="settings-section"><h2>' + tr('settings_account') + '</h2>';
+    html += '<button class="btn-danger" id="settingsLogout">' + ICONS.logout + ' ' + tr('settings_logout') + '</button>';
+    html += '</div>';
+  }
 
   html += '</div></div>';
   el.innerHTML = html;
@@ -3083,6 +3435,42 @@ function renderSettingsView(el) {
       }
     });
   });
+
+  var blAdd = document.getElementById('blAdd');
+  if (blAdd) {
+    var blInput = document.getElementById('blInput');
+    async function addBL() {
+      var v = blInput.value.trim().replace(/^@/, '');
+      if (!v) return;
+      try {
+        var r = await api('/api/users/me/blacklist', { method: 'POST', body: { nick: v } });
+        var meNow = state.user || {};
+        meNow.blacklist = r.blacklist || [];
+        setUser(meNow);
+        renderSettingsView(el);
+      } catch(err) { alert(tr(err.message) || err.message); }
+    }
+    blAdd.addEventListener('click', addBL);
+    blInput.addEventListener('keydown', function(e){
+      if (e.key === 'Enter') { e.preventDefault(); addBL(); }
+    });
+  }
+
+  el.querySelectorAll('[data-bl-remove]').forEach(function(b){
+    b.addEventListener('click', async function(){
+      var nick = b.dataset.blRemove;
+      try {
+        var r = await api('/api/users/me/blacklist/' + encodeURIComponent(nick), { method: 'DELETE' });
+        var meNow = state.user || {};
+        meNow.blacklist = r.blacklist || [];
+        setUser(meNow);
+        renderSettingsView(el);
+      } catch(err) { alert(tr(err.message) || err.message); }
+    });
+  });
+
+  var lo = document.getElementById('settingsLogout');
+  if (lo) lo.addEventListener('click', doLogoutConfirm);
 }
 
 function renderPolicyView(el) {
@@ -3186,7 +3574,7 @@ function renderPostHtml(p, showComments) {
   }
   var bodyHtml = linkifyMentions(escapeHtml(displayText));
   var readMore = truncated
-    ? '<a class="read-more" href="/p/' + p.id + '" data-link>… ' + escapeHtml(tr('read_more')) + '</a>'
+    ? '<a class="read-more" href="/p/' + p.id + '" data-link>' + escapeHtml(tr('read_more')) + ' →</a>'
     : '';
 
   var authorLink = p.author
@@ -3417,12 +3805,13 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'delete-post') {
-        if (!confirm(tr('confirm_delete'))) return;
-        try {
-          await api('/api/posts/' + postId, { method: 'DELETE' });
-          if (state.view === 'post') navigate('/');
-          else refreshCurrentView();
-        } catch(err) { alert(tr(err.message) || err.message); }
+        showConfirm(tr('confirm_delete'), async function(){
+          try {
+            await api('/api/posts/' + postId, { method: 'DELETE' });
+            if (state.view === 'post') navigate('/');
+            else refreshCurrentView();
+          } catch(err) { alert(tr(err.message) || err.message); }
+        });
         return;
       }
       if (action === 'edit-comment') {
@@ -3436,11 +3825,12 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'delete-comment') {
-        if (!confirm(tr('confirm_delete'))) return;
-        try {
-          await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
-          refreshCurrentView();
-        } catch(err) { alert(tr(err.message) || err.message); }
+        showConfirm(tr('confirm_delete'), async function(){
+          try {
+            await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
+            refreshCurrentView();
+          } catch(err) { alert(tr(err.message) || err.message); }
+        });
         return;
       }
     });
@@ -3482,7 +3872,7 @@ async function pollCounters() {
   if (!state.user) return;
   try {
     var r = await Promise.all([
-      api('/api/notifications').catch(function(){ return null; }),
+      api('/api/notifications/unread').catch(function(){ return null; }),
       api('/api/dm/unread').catch(function(){ return null; }),
     ]);
     var changed = false;
@@ -3496,6 +3886,24 @@ async function pollCounters() {
     }
     if (changed) renderSidebar();
   } catch(e) {}
+}
+
+// "realtime" - частое обновление для активного экрана
+function pollActive() {
+  if (document.hidden) return;
+  if (!state.user) return;
+  if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
+  if (state.view === 'chat') {
+    loadChat(true);
+  } else if (state.view === 'messages') {
+    loadDMs();
+  } else if (state.view === 'notifications') {
+    // очень мягкое обновление — раз в 15с
+  } else if (state.view === 'feed') {
+    loadFeed();
+  } else if (state.view === 'post') {
+    loadPostView();
+  }
 }
 
 (function init() {
@@ -3515,17 +3923,10 @@ async function pollCounters() {
     renderMain();
     if (state.user) {
       pollCounters();
-      setInterval(pollCounters, 15000);
+      setInterval(pollCounters, 4000);
+      setInterval(pollActive, 2500);
     }
   });
-
-  setInterval(function(){
-    if (document.hidden) return;
-    if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
-    if (state.view === 'feed') loadFeed();
-    else if (state.view === 'post') loadPostView();
-    else if (state.view === 'chat') loadChat();
-  }, 5000);
 })();
 """
 
