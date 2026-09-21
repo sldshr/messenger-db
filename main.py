@@ -86,7 +86,7 @@ async def create_post(post: PostCreate, session_token: Optional[str] = Cookie(No
     return new_post
 
 
-# --- HTML / CSS / JS Интерфейс (Чистый CSS, без Tailwind) ---
+# --- HTML / CSS / JS Интерфейс (Чистый CSS, стиль Mastodon) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -104,6 +104,7 @@ HTML_TEMPLATE = """
             --text-muted: #606984;
             --accent: #6364ff;
             --accent-hover: #5051db;
+            --danger: #df405a;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -137,8 +138,8 @@ HTML_TEMPLATE = """
         .column::-webkit-scrollbar { width: 8px; }
         .column::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
 
-        .left-col { border-right: 1px solid var(--border-color); }
-        .center-col { padding: 16px 24px; }
+        .left-col { border-right: 1px solid var(--border-color); display: flex; flex-direction: column; }
+        .center-col { padding: 0; }
         .right-col { border-left: 1px solid var(--border-color); }
 
         /* --- Левая колонка --- */
@@ -169,18 +170,6 @@ HTML_TEMPLATE = """
 
         .left-col p { margin-bottom: 16px; font-size: 14px; }
         
-        .illustration {
-            width: 100%;
-            height: 140px;
-            background: linear-gradient(135deg, #fceabb 0%, #f8b500 100%);
-            border-radius: 6px;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: hidden;
-        }
-
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -200,7 +189,131 @@ HTML_TEMPLATE = """
         .footer-links a { color: var(--text-muted); text-decoration: none; }
         .footer-links a:hover { text-decoration: underline; }
 
-        /* --- Центральная колонка --- */
+        /* --- Центральная колонка: Шапка --- */
+        .center-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            background: var(--bg-color);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .center-header h1 { font-size: 18px; color: white; margin: 0; }
+        .user-controls { display: flex; align-items: center; gap: 12px; }
+        .user-controls span { font-weight: bold; color: white; font-size: 14px; }
+        .logout-btn {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            color: var(--text-muted);
+            padding: 4px;
+            border-radius: 4px;
+        }
+        .logout-btn:hover { color: var(--danger); background: rgba(223, 64, 90, 0.1); }
+        .logout-btn svg { width: 20px; height: 20px; fill: currentColor; }
+
+        /* --- Центральная колонка: Форма поста (Mastodon style) --- */
+        .compose-box {
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 12px;
+        }
+        .compose-avatar {
+            width: 40px;
+            height: 40px;
+            background: var(--accent);
+            border-radius: 4px; /* В Mastodon аватары квадратные со скруглением */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+        .compose-main {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .compose-textarea {
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: white;
+            font-family: inherit;
+            font-size: 15px;
+            resize: none;
+            outline: none;
+            min-height: 80px;
+            margin-bottom: 8px;
+        }
+        .compose-textarea::placeholder { color: var(--text-muted); }
+        .compose-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-top: 1px solid var(--border-color);
+            padding-top: 12px;
+        }
+        .compose-icons {
+            display: flex;
+            gap: 16px;
+            color: var(--text-muted);
+        }
+        .compose-icons svg {
+            width: 20px;
+            height: 20px;
+            fill: currentColor;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+        .compose-icons svg:hover { color: var(--accent); }
+        .btn-publish {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 8px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-publish:hover { background: var(--accent-hover); }
+
+        /* --- Центральная колонка: Лента --- */
+        .feed-container { padding: 16px; }
+        .post-card {
+            background: var(--col-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 16px;
+            margin-bottom: 10px;
+        }
+        .post-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+        .post-avatar {
+            width: 40px; height: 40px; background: var(--accent); border-radius: 4px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 16px; font-weight: bold; color: white;
+        }
+        .post-author-info { display: flex; flex-direction: column; }
+        .post-author-name { font-weight: bold; color: white; font-size: 15px; line-height: 1.2; }
+        .post-author-handle { color: var(--text-muted); font-size: 13px; }
+        .post-date { color: var(--text-muted); font-size: 12px; margin-left: auto; }
+        .post-content { white-space: pre-wrap; word-break: break-word; font-size: 15px; margin-bottom: 12px; }
+        .post-actions { display: flex; gap: 24px; color: var(--text-muted); }
+        .post-actions svg { width: 18px; height: 18px; fill: currentColor; cursor: pointer; }
+        .post-actions svg:hover { color: var(--accent); }
+
+        /* --- Центральная колонка: Правила (Гость) --- */
+        .rules-container { padding: 16px; }
         .rules-container h2 { font-size: 20px; color: white; margin-bottom: 16px; }
         .rules-container h3 { font-size: 16px; color: white; margin: 20px 0 8px 0; }
         .rules-container p { margin-bottom: 12px; }
@@ -208,21 +321,8 @@ HTML_TEMPLATE = """
         .rules-container li { margin-bottom: 4px; }
 
         /* --- Правая колонка --- */
-        .logo-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 24px;
-        }
-        .logo-icon {
-            width: 32px; height: 32px;
-            background: var(--accent);
-            border-radius: 6px;
-            display: flex; align-items: center; justify-content: center;
-            color: white; font-weight: bold; font-size: 18px;
-        }
-        .logo-header h1 { font-size: 22px; color: white; margin: 0; }
-
+        .right-col h1 { font-size: 22px; color: white; margin-bottom: 24px; }
+        
         .trending-header {
             display: flex; align-items: center; gap: 4px;
             color: var(--text-muted); font-size: 11px; text-transform: uppercase; font-weight: 600;
@@ -253,48 +353,6 @@ HTML_TEMPLATE = """
         .btn-text { background: transparent; color: var(--text-muted); border: none; padding: 4px 8px; width: auto; font-size: 13px; }
         .btn-text:hover { color: white; }
 
-        /* --- Лента и посты --- */
-        .post-form {
-            background: var(--col-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            padding: 16px;
-            margin-bottom: 24px;
-        }
-        .post-form textarea {
-            width: 100%;
-            background: transparent;
-            border: none;
-            color: white;
-            font-family: inherit;
-            font-size: 15px;
-            resize: none;
-            outline: none;
-            min-height: 60px;
-        }
-        .post-form textarea::placeholder { color: var(--text-muted); }
-        .post-form .actions {
-            display: flex; justify-content: flex-end; margin-top: 8px;
-            border-top: 1px solid var(--border-color); padding-top: 12px;
-        }
-
-        .post-card {
-            background: var(--col-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            padding: 16px;
-            margin-bottom: 16px;
-        }
-        .post-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-        .avatar {
-            width: 28px; height: 28px; background: var(--accent); border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 12px; font-weight: bold; color: white;
-        }
-        .post-author { font-weight: bold; color: white; }
-        .post-date { color: var(--text-muted); font-size: 12px; }
-        .post-content { white-space: pre-wrap; word-break: break-word; }
-
         /* --- Модальное окно --- */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
@@ -323,7 +381,7 @@ HTML_TEMPLATE = """
             outline: none;
         }
         .form-group input:focus { border-color: var(--accent); }
-        .error-msg { color: #ff5252; font-size: 13px; margin-bottom: 16px; display: none; }
+        .error-msg { color: var(--danger); font-size: 13px; margin-bottom: 16px; display: none; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
         @media (max-width: 900px) {
@@ -344,15 +402,6 @@ HTML_TEMPLATE = """
             
             <p><span style="font-weight:700; color:white;">mastodon.ml</span> — это один из многих независимых серверов Mastodon, которые вы можете использовать, чтобы присоединиться к сети Fediverse.</p>
             
-            <div class="illustration">
-                <!-- Векторная иллюстрация вместо эмодзи -->
-                <svg width="100" height="100" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <circle cx="50" cy="50" r="40" fill="rgba(255,255,255,0.2)"/>
-                    <path d="M50 20C33.4 20 20 33.4 20 50s13.4 30 30 30 30-13.4 30-30-13.4-30-30-30zm0 50c-11 0-20-9-20-20s9-20 20-20 20 9 20 20-9 20-20 20z" fill="rgba(0,0,0,0.3)"/>
-                    <path d="M50 35c-8.3 0-15 6.7-15 15s6.7 15 15 15 15-6.7 15-15-6.7-15-15-15zm0 20c-2.8 0-5-2.2-5-5s2.2-5 5-5 5 2.2 5 5-2.2 5-5 5z" fill="rgba(0,0,0,0.5)"/>
-                </svg>
-            </div>
-
             <p>Русскоязычный сервер социальной сети Mastodon. Зона общения, свободная от рекламы и шпионажа, теперь и на русском языке.</p>
             
             <div class="stats-grid">
@@ -376,11 +425,14 @@ HTML_TEMPLATE = """
         <div class="column center-col">
             
             <!-- Шапка (видна только авторизованным) -->
-            <div id="user-header" style="display:none; justify-content:space-between; align-items:center; margin-bottom:24px; padding-bottom:16px; border-bottom:1px solid var(--border-color);">
-                <h1 style="font-size:20px; color:white; margin:0;">Litodon</h1>
-                <div style="display:flex; align-items:center; gap:16px;">
-                    <span id="user-info" style="font-weight:bold; color:white;"></span>
-                    <button onclick="logout()" class="btn btn-text">Выйти</button>
+            <div id="user-header" class="center-header" style="display:none;">
+                <h1>Litodon</h1>
+                <div class="user-controls">
+                    <span id="user-info"></span>
+                    <button onclick="logout()" class="logout-btn" title="Выйти">
+                        <!-- SVG иконка выхода (дверь со стрелкой) -->
+                        <svg viewBox="0 0 24 24"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+                    </button>
                 </div>
             </div>
 
@@ -419,23 +471,29 @@ HTML_TEMPLATE = """
 
             <!-- Форма поста и лента (видны только авторизованным) -->
             <div id="user-feed-container" style="display:none;">
-                <div class="post-form">
-                    <textarea id="post-content" placeholder="Что нового?"></textarea>
-                    <div class="actions">
-                        <button onclick="submitPost()" class="btn btn-primary" style="width:auto;">Отправить</button>
+                <div class="compose-box">
+                    <div class="compose-avatar" id="compose-avatar">U</div>
+                    <div class="compose-main">
+                        <textarea id="post-content" class="compose-textarea" placeholder="Что у вас нового?"></textarea>
+                        <div class="compose-actions">
+                            <div class="compose-icons">
+                                <!-- Иконка изображения -->
+                                <svg viewBox="0 0 24 24"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+                                <!-- Иконка глобуса (видимость) -->
+                                <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                            </div>
+                            <button class="btn-publish" onclick="submitPost()">Опубликовать</button>
+                        </div>
                     </div>
                 </div>
-                <div id="timeline"></div>
+                <div class="feed-container" id="timeline"></div>
             </div>
 
         </div>
 
         <!-- Правая колонка -->
         <div class="column right-col">
-            <div class="logo-header">
-                <div class="logo-icon">L</div>
-                <h1>Litodon</h1>
-            </div>
+            <h1>Litodon</h1>
 
             <div class="trending-header">
                 <svg viewBox="0 0 24 24"><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>
@@ -485,6 +543,7 @@ HTML_TEMPLATE = """
             const userHeader = document.getElementById('user-header');
             const userInfo = document.getElementById('user-info');
             const authButtons = document.getElementById('auth-buttons');
+            const composeAvatar = document.getElementById('compose-avatar');
 
             if (currentUser) {
                 // Пользователь авторизован
@@ -492,6 +551,7 @@ HTML_TEMPLATE = """
                 userFeedContainer.style.display = 'block';
                 userHeader.style.display = 'flex';
                 userInfo.innerText = `@${currentUser}`;
+                composeAvatar.innerText = currentUser[0].toUpperCase();
                 authButtons.style.display = 'none';
                 loadPosts();
             } else {
@@ -568,11 +628,22 @@ HTML_TEMPLATE = """
                 postEl.className = 'post-card';
                 postEl.innerHTML = `
                     <div class="post-header">
-                        <div class="avatar">${post.author[0].toUpperCase()}</div>
-                        <span class="post-author">@${post.author}</span>
+                        <div class="post-avatar">${post.author[0].toUpperCase()}</div>
+                        <div class="post-author-info">
+                            <span class="post-author-name">${post.author}</span>
+                            <span class="post-author-handle">@${post.author}</span>
+                        </div>
                         <span class="post-date">${date}</span>
                     </div>
                     <div class="post-content">${escapeHtml(post.content)}</div>
+                    <div class="post-actions">
+                        <!-- Иконка ответа -->
+                        <svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg>
+                        <!-- Иконка буста -->
+                        <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+                        <!-- Иконка избранного -->
+                        <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                    </div>
                 `;
                 timeline.appendChild(postEl);
             });
