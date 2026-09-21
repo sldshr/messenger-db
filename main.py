@@ -15,8 +15,6 @@ from pydantic import BaseModel
 # ============================================================
 #                    ЗАЩИТА / "ШИФРОВАНИЕ"
 # ============================================================
-# Все POST-тела приходят зашифрованными (XOR + base64).
-# Для реального продакшена используйте HTTPS + TLS.
 
 XK = b"DirectSecret2024"
 
@@ -37,9 +35,9 @@ def dec_str(s: str) -> str:
 #                    ХРАНИЛИЩЕ (ОПЕРАТИВКА)
 # ============================================================
 
-USERS: Dict[str, dict] = {}      # nick -> {name, password, avatar, contacts, blacklist}
-SESSIONS: Dict[str, str] = {}    # token -> nick
-CHATS: Dict[str, list] = {}      # "a|b" -> [ {from, to, text, ts} ]
+USERS: Dict[str, dict] = {}
+SESSIONS: Dict[str, str] = {}
+CHATS: Dict[str, list] = {}
 
 
 def chat_key(a: str, b: str) -> str:
@@ -87,8 +85,6 @@ def user_public(nick: str) -> dict:
     u = USERS[nick]
     return {"nick": nick, "name": u["name"], "avatar": u["avatar"]}
 
-
-# ---------------------------- AUTH ----------------------------
 
 @app.post("/api/register")
 def register(body: EncBody):
@@ -156,8 +152,6 @@ def me(x_token: Optional[str] = Header(None)):
     }
 
 
-# --------------------------- ПОИСК ----------------------------
-
 @app.post("/api/search")
 def search(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
@@ -175,8 +169,6 @@ def search(body: EncBody, x_token: Optional[str] = Header(None)):
         raise HTTPException(403, "Пользователь в вашем чёрном списке")
     return {"user": user_public(q)}
 
-
-# --------------------------- ЧАТЫ -----------------------------
 
 @app.post("/api/chat/start")
 def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
@@ -226,8 +218,6 @@ def messages(body: EncBody, x_token: Optional[str] = Header(None)):
     return {"messages": CHATS.get(k, []), "peer": user_public(peer)}
 
 
-# ------------------------- ЧЁРНЫЙ СПИСОК ----------------------
-
 @app.post("/api/blacklist/add")
 def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
@@ -262,7 +252,7 @@ PAGE = r"""<!DOCTYPE html>
 <title>Direct</title>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;overscroll-behavior:none}
+html,body{margin:0;padding:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;overscroll-behavior:none}
 :root{
   --bg:#f2f2f7;--fg:#111;--card:#fff;--muted:#8a8a8e;--border:#e3e3e8;
   --accent:#0a84ff;--accent-fg:#fff;--danger:#ff3b30;
@@ -273,19 +263,45 @@ body.dark{
   --accent:#0a84ff;--accent-fg:#fff;--danger:#ff453a;
   --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;--overlay:rgba(0,0,0,.65);
 }
-body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s}
+body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s;overflow:hidden}
+
+/* ------- Оболочка приложения (мобильная = весь экран) ------- */
 #app{
-  max-width:480px;margin:0 auto;height:100vh;height:100dvh;
-  display:flex;flex-direction:column;position:relative;overflow:hidden;
+  width:100%;
+  height:100vh;
+  height:100dvh;
+  display:flex;flex-direction:column;
+  position:relative;overflow:hidden;
   background:var(--bg);
+  margin:0 auto;
 }
-@media(min-width:700px){
-  body{display:flex;justify-content:center;align-items:center;background:#000}
+
+/* ------- ПК: центрированное окно с рамкой ------- */
+@media (min-width: 700px){
+  body{
+    display:grid;
+    place-items:center;
+    background:#18181b;
+    min-height:100vh;
+    padding:20px;
+  }
   body.dark{background:#000}
-  #app{height:88vh;max-height:820px;border-radius:22px;box-shadow:0 25px 80px rgba(0,0,0,.55);border:1px solid var(--border)}
+  #app{
+    width:420px;
+    height:min(86vh, 820px);
+    border-radius:24px;
+    box-shadow:0 30px 90px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.06);
+    border:1px solid var(--border);
+  }
 }
+
 .screen{position:absolute;inset:0;display:none;flex-direction:column;background:var(--bg)}
 .screen.active{display:flex}
+
+/* ------- SVG иконки ------- */
+.icon{width:22px;height:22px;display:block;flex-shrink:0;color:currentColor}
+.icon-sm{width:18px;height:18px}
+.icon-lg{width:26px;height:26px}
 
 /* ---------- AUTH ---------- */
 #screen-auth{overflow-y:auto}
@@ -304,12 +320,14 @@ input:focus{border-color:var(--accent)}
 .btn{
   padding:13px 16px;border-radius:12px;border:1px solid var(--border);
   background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;transition:.15s;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
 }
 .btn:active{transform:scale(.97)}
 .btn.primary{background:var(--accent);color:#fff;border-color:transparent}
 .btn.danger{background:var(--danger);color:#fff;border-color:transparent}
 .btn.full{width:100%}
 .btn.small{padding:8px 12px;font-size:13px}
+.btn.icon-only{padding:0;width:46px;height:46px;flex-shrink:0}
 .row{display:flex;gap:8px}
 .row input{flex:1}
 .err{color:var(--danger);font-size:14px;text-align:center;min-height:18px}
@@ -338,8 +356,8 @@ input:focus{border-color:var(--accent)}
 .me-nick{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .icon-btn{
   width:40px;height:40px;border-radius:50%;border:0;background:transparent;color:var(--fg);
-  font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  transition:.15s;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:.15s;padding:0;
 }
 .icon-btn:active{background:var(--border)}
 .icon-btn.danger{color:var(--danger)}
@@ -357,10 +375,11 @@ input:focus{border-color:var(--accent)}
 .fab{
   position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
   width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:#fff;
-  font-size:34px;font-weight:300;line-height:1;cursor:pointer;box-shadow:0 8px 28px rgba(10,132,255,.45);
-  transition:.15s;display:flex;align-items:center;justify-content:center;padding-bottom:4px;
+  cursor:pointer;box-shadow:0 8px 28px rgba(10,132,255,.45);
+  transition:.15s;display:flex;align-items:center;justify-content:center;
 }
 .fab:active{transform:translateX(-50%) scale(.92)}
+.fab .icon{width:30px;height:30px}
 
 /* ---------- CHAT ---------- */
 .messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
@@ -373,10 +392,10 @@ input:focus{border-color:var(--accent)}
 .bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);border-bottom-left-radius:6px;border:1px solid var(--border)}
 .composer{
   display:flex;gap:8px;padding:10px;padding-bottom:max(10px,env(safe-area-inset-bottom));
-  background:var(--card);border-top:1px solid var(--border);
+  background:var(--card);border-top:1px solid var(--border);align-items:center;
 }
 .composer input{border-radius:20px}
-.composer .btn{border-radius:50%;width:46px;height:46px;padding:0;font-size:19px;flex-shrink:0}
+.composer .btn{border-radius:50%;width:46px;height:46px;padding:0;flex-shrink:0}
 
 /* ---------- MODALS ---------- */
 .overlay{
@@ -409,10 +428,53 @@ input:focus{border-color:var(--accent)}
 .bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);border-radius:12px;margin-bottom:6px}
 .bl-item canvas{width:32px;height:32px;border-radius:50%;image-rendering:pixelated;flex-shrink:0}
 .bl-item .me-info{flex:1}
-.bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);color:#fff;font-size:16px;cursor:pointer;flex-shrink:0}
+.bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
+.bl-item button .icon{width:16px;height:16px}
+
+/* SVG-символы спрятаны */
+#svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
 </style>
 </head>
 <body>
+
+<!-- ================= SVG ИКОНКИ ================= -->
+<svg id="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+  </symbol>
+  <symbol id="i-arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="19" y1="12" x2="5" y2="12"/>
+    <polyline points="12 19 5 12 12 5"/>
+  </symbol>
+  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="10"/>
+    <line x1="12" y1="16" x2="12" y2="12"/>
+    <line x1="12" y1="8" x2="12.01" y2="8"/>
+  </symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18"/>
+    <line x1="6" y1="6" x2="18" y2="18"/>
+  </symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+    <path d="M3.4 20.4l17.45-7.48a1 1 0 0 0 0-1.84L3.4 3.6a.99.99 0 0 0-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z"/>
+  </symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="12" y1="5" x2="12" y2="19"/>
+    <line x1="5" y1="12" x2="19" y2="12"/>
+  </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="11" cy="11" r="7"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="3 6 5 6 21 6"/>
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+    <path d="M10 11v6M14 11v6"/>
+    <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
+  </symbol>
+</svg>
+
 <div id="app">
 
   <!-- ================= AUTH ================= -->
@@ -459,28 +521,40 @@ input:focus{border-color:var(--accent)}
         <div class="me-name" id="meName">—</div>
         <div class="me-nick" id="meNick">@—</div>
       </div>
-      <button class="icon-btn" onclick="openSettings()" title="Настройки">⚙</button>
+      <button class="icon-btn" onclick="openSettings()" title="Настройки" aria-label="Settings">
+        <svg class="icon"><use href="#i-gear"/></svg>
+      </button>
     </header>
     <div class="list" id="contactsList"></div>
-    <button class="fab" onclick="openSearch()" title="Найти">+</button>
+    <button class="fab" onclick="openSearch()" title="Найти" aria-label="Find">
+      <svg class="icon"><use href="#i-plus"/></svg>
+    </button>
   </div>
 
   <!-- ================= CHAT ================= -->
   <div class="screen" id="screen-chat">
     <header class="topbar">
-      <button class="icon-btn" onclick="closeChat()" title="Назад">←</button>
+      <button class="icon-btn" onclick="closeChat()" title="Назад" aria-label="Back">
+        <svg class="icon"><use href="#i-arrow-left"/></svg>
+      </button>
       <canvas class="ava-small" id="peerAva" width="40" height="40"></canvas>
       <div class="me-info">
         <div class="me-name" id="peerName">—</div>
         <div class="me-nick" id="peerNick">@—</div>
       </div>
-      <button class="icon-btn" onclick="openInfo()" title="Информация">i</button>
-      <button class="icon-btn danger" onclick="endChat()" title="Завершить">✕</button>
+      <button class="icon-btn" onclick="openInfo()" title="Информация" aria-label="Info">
+        <svg class="icon"><use href="#i-info"/></svg>
+      </button>
+      <button class="icon-btn danger" onclick="endChat()" title="Завершить" aria-label="End">
+        <svg class="icon"><use href="#i-x"/></svg>
+      </button>
     </header>
     <div class="messages" id="messages"></div>
     <form class="composer" onsubmit="sendMsg(event)">
       <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off">
-      <button class="btn primary" type="submit">→</button>
+      <button class="btn primary" type="submit" aria-label="Send">
+        <svg class="icon"><use href="#i-send"/></svg>
+      </button>
     </form>
   </div>
 
@@ -489,12 +563,17 @@ input:focus{border-color:var(--accent)}
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
         <span data-i18n="find_user">Найти пользователя</span>
-        <button class="icon-btn" onclick="closeModal('modal-search')">✕</button>
+        <button class="icon-btn" onclick="closeModal('modal-search')" aria-label="Close">
+          <svg class="icon"><use href="#i-x"/></svg>
+        </button>
       </div>
       <div class="modal-body">
         <div class="row">
           <input id="searchNick" data-i18n-ph="ph_nick" placeholder="Ник">
-          <button class="btn primary" onclick="doSearch()" data-i18n="find">Найти</button>
+          <button class="btn primary" onclick="doSearch()">
+            <svg class="icon icon-sm"><use href="#i-search"/></svg>
+            <span data-i18n="find">Найти</span>
+          </button>
         </div>
         <div id="searchResult"></div>
       </div>
@@ -506,7 +585,9 @@ input:focus{border-color:var(--accent)}
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
         <span data-i18n="settings">Настройки</span>
-        <button class="icon-btn" onclick="closeModal('modal-settings')">✕</button>
+        <button class="icon-btn" onclick="closeModal('modal-settings')" aria-label="Close">
+          <svg class="icon"><use href="#i-x"/></svg>
+        </button>
       </div>
       <div class="modal-body">
         <div class="setting">
@@ -528,7 +609,9 @@ input:focus{border-color:var(--accent)}
           <div id="blacklistBox"></div>
           <div class="row">
             <input id="blNick" data-i18n-ph="ph_nick" placeholder="Ник">
-            <button class="btn" onclick="blAdd()" data-i18n="add">+</button>
+            <button class="btn icon-only" onclick="blAdd()" aria-label="Add">
+              <svg class="icon"><use href="#i-plus"/></svg>
+            </button>
           </div>
         </div>
         <button class="btn danger full" onclick="logout()" data-i18n="logout">Выйти</button>
@@ -541,7 +624,9 @@ input:focus{border-color:var(--accent)}
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
         <span data-i18n="about_user">О человеке</span>
-        <button class="icon-btn" onclick="closeModal('modal-info')">✕</button>
+        <button class="icon-btn" onclick="closeModal('modal-info')" aria-label="Close">
+          <svg class="icon"><use href="#i-x"/></svg>
+        </button>
       </div>
       <div class="modal-body center">
         <canvas id="infoAva" width="160" height="160"></canvas>
@@ -670,7 +755,6 @@ const avaCtx = avaCanvas.getContext('2d');
 
 function renderEditor(){
   paintAva(avaCanvas, avatarData);
-  // сетка
   const cell = avaCanvas.width / GRID;
   avaCtx.strokeStyle = 'rgba(0,0,0,.14)';
   avaCtx.lineWidth = 1;
@@ -685,7 +769,7 @@ function buildPalette(){
   box.innerHTML = '';
   PALETTE.forEach((c,i) => {
     const b = document.createElement('div');
-    b.className = 'swatch' + (i===0 ? '' : '');
+    b.className = 'swatch';
     b.style.background = c;
     b.onclick = () => {
       currentColor = c;
@@ -694,7 +778,6 @@ function buildPalette(){
     };
     box.appendChild(b);
   });
-  // по умолчанию чёрный
   const first = box.children[0];
   if (first) first.classList.add('active');
 }
@@ -723,8 +806,8 @@ avaCanvas.addEventListener('pointermove', e => {
   if (!drawing) return;
   paintAt(e.clientX, e.clientY);
 });
-avaCanvas.addEventListener('pointerup', e => { drawing = false; });
-avaCanvas.addEventListener('pointercancel', e => { drawing = false; });
+avaCanvas.addEventListener('pointerup', () => { drawing = false; });
+avaCanvas.addEventListener('pointercancel', () => { drawing = false; });
 
 function clearAvatar(){
   avatarData = new Array(64).fill('#ffffff');
@@ -739,7 +822,6 @@ function randomAvatar(){
   const c1 = cols[Math.floor(Math.random()*cols.length)];
   const c2 = cols[Math.floor(Math.random()*cols.length)];
   const c3 = cols[Math.floor(Math.random()*cols.length)];
-  // симметричный случайный узор
   const half = [];
   for (let y=0;y<8;y++){
     const row = [];
@@ -802,7 +884,6 @@ function applyLang(l){
   });
   document.querySelectorAll('[data-lang]').forEach(b =>
     b.classList.toggle('active', b.dataset.lang === l));
-  // перерендер списков, чтобы обновить тексты
   renderContacts();
   renderBlacklist();
 }
@@ -1069,11 +1150,14 @@ function renderBlacklist(){
     nk.className = 'me-nick'; nk.textContent = '@' + u.nick;
     info.appendChild(nm); info.appendChild(nk);
     el.appendChild(info);
+
     const btn = document.createElement('button');
-    btn.textContent = '✕';
     btn.title = t('remove');
+    btn.setAttribute('aria-label', t('remove'));
+    btn.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
     btn.onclick = () => blRemove(u.nick);
     el.appendChild(btn);
+
     box.appendChild(el);
   });
 }
@@ -1105,7 +1189,6 @@ async function blRemove(nick){
   buildPalette();
   randomAvatar();
 
-  // попытка авто-входа
   if (token){
     api('/api/me', null, 'GET')
       .then(r => {
@@ -1123,7 +1206,6 @@ async function blRemove(nick){
       });
   }
 
-  // Enter для поиска
   document.getElementById('searchNick').addEventListener('keydown', e => {
     if (e.key === 'Enter'){ e.preventDefault(); doSearch(); }
   });
@@ -1138,10 +1220,6 @@ async function blRemove(nick){
 def index():
     return PAGE
 
-
-# ============================================================
-#                        ЗАПУСК
-# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
