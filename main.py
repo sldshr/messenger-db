@@ -20,7 +20,8 @@ app = FastAPI(title="litodon")
 sessions: dict = {}    # sid -> {"id": int}
 posts: list = []
 _counter = {"post": 0, "comment": 0, "anon": 0}
-MAX_POST = 4000
+MAX_POST = 4000            # лимит «осмысленного» текста
+MAX_RAW  = 8_000_000       # жёсткий потолок сырой длины (≈6 МБ картинки в base64)
 
 
 @app.middleware("http")
@@ -60,6 +61,25 @@ def safe_redirect(request: Request) -> str:
 
 
 # ============================================================
+#   BASE64 КАРТИНКИ
+# ============================================================
+
+# полный payload data:image/...;base64,....
+B64_PAYLOAD_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+')
+# строгая проверка URL (без пробелов)
+B64_URL_RE = re.compile(r'^data:image/(png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=]+$', re.I)
+
+
+def effective_length(text: str) -> int:
+    """Длина текста без учёта base64-картинок."""
+    return len(B64_PAYLOAD_RE.sub('data:image/...;base64,...', text))
+
+
+def clean_data_url(u: str) -> str:
+    return re.sub(r'\s+', '', u)
+
+
+# ============================================================
 #   SVG ИКОНКИ
 # ============================================================
 
@@ -75,6 +95,7 @@ ICON_PATHS = {
     "send":      '<path d="M1.5 8 14.5 1.5 8 14.5l-1.8-5z"/>',
     "link":      '<path d="M6.5 9.5 9.5 6.5M6 4.5 7.5 3a3 3 0 0 1 4.2 0l1.3 1.3a3 3 0 0 1 0 4.2L11.5 10M10 11.5 8.5 13a3 3 0 0 1-4.2 0L3 11.7a3 3 0 0 1 0-4.2L4.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
     "image":     '<rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="5.5" cy="6.5" r="1.2"/><path d="m2.5 12 3.5-3.5 3 3 2-2 3 3" fill="none" stroke="currentColor" stroke-width="1.5"/>',
+    "upload":    '<path d="M8 11V3M4.5 6.5 8 3l3.5 3.5M2 13h12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
     "code":      '<path d="M5.5 5 2 8l3.5 3M10.5 5 14 8l-3.5 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
     "codeblock": '<rect x="1.5" y="2.5" width="13" height="11" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 6 3.8 8 5 10M11 6l1.2 2L11 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
     "bold":      '<text x="8" y="12" text-anchor="middle" font-size="11" font-weight="700" font-family="Arial,sans-serif" fill="currentColor">B</text>',
@@ -122,6 +143,9 @@ EMOJI = {
 
 def safe_url(u: str) -> str:
     u = u.strip()
+    # разрешаем data:image/* (только растровые, без svg — там может быть JS)
+    if B64_URL_RE.match(u):
+        return u
     if re.match(r'^(javascript|data|vbscript):', u, re.I):
         return "#"
     return u
@@ -135,8 +159,16 @@ def md_inline(text: str) -> str:
         stash.append(html)
         return f"\x00{len(stash) - 1}\x00"
 
-    # 1. stash «защищённые» конструкции, чтобы regexp'ы ниже их не портили
+    # 1) код
     text = re.sub(r'`([^`\n]+)`', lambda m: put(f'<code>{m.group(1)}</code>'), text)
+
+    # 2) base64-изображения — обрабатываем ДО обычного image, т.к. payload длинный и может содержать переносы
+    text = re.sub(
+        r'!\[([^\]]*)\]\(\s*(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+)\s*\)',
+        lambda m: put(f'<img src="{safe_url(clean_data_url(m.group(2)))}" alt="{m.group(1)}" loading="lazy">'),
+        text)
+
+    # 3) обычные изображения и ссылки
     text = re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)',
                   lambda m: put(f'<img src="{safe_url(m.group(2))}" alt="{m.group(1)}" loading="lazy">'),
                   text)
@@ -147,21 +179,20 @@ def md_inline(text: str) -> str:
                   lambda m: put(f'<a href="{safe_url(m.group(1))}" target="_blank" rel="noopener nofollow">{m.group(1)}</a>'),
                   text)
 
-    # 2. emoji shortcodes :smile:
+    # 4) emoji
     text = re.sub(r':([a-z0-9_+\-]+):',
                   lambda m: EMOJI.get(m.group(1), m.group(0)), text)
 
-    # 3. инлайновые украшения
-    text = re.sub(r'==(.+?)==', r'<mark>\1</mark>', text)              # ==highlight==
-    text = re.sub(r'\|\|(.+?)\|\|', r'<span class="spoiler">\1</span>', text)  # ||spoiler||
-    text = re.sub(r'\^([^\s^][^^\n]*?)\^', r'<sup>\1</sup>', text)     # ^sup^
-    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)      # **bold**
+    # 5) оформление
+    text = re.sub(r'==(.+?)==', r'<mark>\1</mark>', text)
+    text = re.sub(r'\|\|(.+?)\|\|', r'<span class="spoiler">\1</span>', text)
+    text = re.sub(r'\^([^\s^][^^\n]*?)\^', r'<sup>\1</sup>', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
     text = re.sub(r'(?<!\w)__(.+?)__(?!\w)', r'<strong>\1</strong>', text)
-    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)  # *italic*
+    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'<em>\1</em>', text)
     text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'<em>\1</em>', text)
-    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)                # ~~strike~~
+    text = re.sub(r'~~(.+?)~~', r'<del>\1</del>', text)
 
-    # 4. вернуть спрятанное
     text = re.sub(r'\x00(\d+)\x00', lambda m: stash[int(m.group(1))], text)
     return text
 
@@ -171,10 +202,8 @@ TABLE_SEP_RE = re.compile(r'^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$')
 
 
 def _parse_table(lines, i, n, out, close_list):
-    """Разбирает GitHub-style таблицу начиная со строки i. Возвращает новый i."""
     header_line = lines[i].strip()
     headers = [c.strip() for c in header_line.strip("|").split("|")]
-    # i+1 — разделитель, пропускаем
     i += 2
     rows = []
     while i < n and lines[i].strip() and "|" in lines[i]:
@@ -221,7 +250,6 @@ def md_block(text: str) -> str:
         raw = lines[i]
         s = raw.strip()
 
-        # код-фенсы
         if s.startswith("```"):
             if not in_code:
                 in_code = True
@@ -240,27 +268,23 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
-        # пустая строка
         if not s:
             close_list()
             i += 1
             continue
 
-        # разделитель ---
         if HR_RE.match(s):
             close_list()
             out.append("<hr>")
             i += 1
             continue
 
-        # таблица: текущая строка с |, следующая — разделитель
         if "|" in s and i + 1 < n:
             nxt = lines[i + 1].strip()
-            if TABLE_SEP_RE.match(nxt) and "|" in s:
+            if TABLE_SEP_RE.match(nxt):
                 i = _parse_table(lines, i, n, out, close_list)
                 continue
 
-        # заголовки # ## ###
         m = re.match(r'^(#{1,6})\s+(.+)$', s)
         if m:
             close_list()
@@ -269,7 +293,6 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
-        # цитата >
         if s.startswith(">"):
             close_list()
             buf = []
@@ -279,7 +302,6 @@ def md_block(text: str) -> str:
             out.append("<blockquote>" + "<br>".join(md_inline(x) for x in buf) + "</blockquote>")
             continue
 
-        # задача - [ ] / - [x]
         m = re.match(r'^[-*+]\s+\[([ xX])\]\s+(.+)$', s)
         if m:
             if not stack or stack[-1] != "task":
@@ -289,7 +311,6 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
-        # маркированный список - * +
         m = re.match(r'^[-*+]\s+(.+)$', s)
         if m:
             if not stack or stack[-1] != "ul":
@@ -298,7 +319,6 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
-        # нумерованный список 1. 2.
         m = re.match(r'^\d+\.\s+(.+)$', s)
         if m:
             if not stack or stack[-1] != "ol":
@@ -307,7 +327,6 @@ def md_block(text: str) -> str:
             i += 1
             continue
 
-        # обычный абзац
         close_list()
         para = [s]
         i += 1
@@ -343,7 +362,6 @@ body {
 a { color: #2e7d32; text-decoration: none; }
 a:hover { color: #1b5e20; text-decoration: underline; }
 
-/* ---------- кастомные скроллбары ---------- */
 * { scrollbar-width: thin; scrollbar-color: #a5cfa5 #eaf6ea; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: #eaf6ea; border-radius: 5px; }
@@ -357,7 +375,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 
 .ic { vertical-align: -2px; }
 
-/* ---------- header ---------- */
 .header {
   background: linear-gradient(#4aa350, #2e7d32);
   border-bottom: 3px solid #1b5e20;
@@ -387,7 +404,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 }
 .header-btn:hover { background: rgba(255,255,255,0.32); color: #fff; text-decoration: none; }
 
-/* ---------- layout ---------- */
 .layout {
   width: 1080px; margin: 16px auto 30px;
   display: flex; align-items: flex-start; gap: 14px;
@@ -396,7 +412,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .sidebar { width: 220px; flex-shrink: 0; }
 .content { flex: 1; min-width: 0; }
 
-/* ---------- sidebar ---------- */
 .side-card {
   background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
   margin-bottom: 10px; padding: 8px;
@@ -419,7 +434,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .side-stat { padding: 3px 4px; display: flex; align-items: center; gap: 6px; }
 .side-stat b { color: #1b5e20; }
 
-/* ---------- boxes ---------- */
 .box {
   background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
   margin-bottom: 12px; box-shadow: 0 1px 2px rgba(27,94,32,0.12);
@@ -428,7 +442,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
 .back-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; margin-bottom: 8px; }
 
-/* ---------- post ---------- */
 .post { display: flex; overflow: hidden; }
 .votes {
   width: 58px; flex-shrink: 0; background: #f3faf3;
@@ -468,7 +481,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .post-act-danger:hover { background: #fdecea; color: #c62828; }
 .inline-form { margin: 0; padding: 0; display: inline; }
 
-/* ---------- comments ---------- */
 .comments { margin-top: 10px; border-top: 1px dashed #c8e6c9; padding-top: 6px; }
 .comments-title {
   font-size: 11px; color: #6b8a6b; text-transform: uppercase;
@@ -483,7 +495,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .cform { margin-top: 8px; display: flex; gap: 6px; }
 .cform input[type=text] { flex: 1; }
 
-/* ---------- forms ---------- */
 input[type=text], textarea {
   border: 1px solid #a5cfa5; border-radius: 3px;
   padding: 6px 8px; font-family: inherit; font-size: 13px;
@@ -502,7 +513,6 @@ button, .btn-primary {
 button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
 button:active { background: #2e7d32; }
 
-/* ---------- editor (шире и выше) ---------- */
 .editor { overflow: hidden; }
 .editor-toolbar {
   display: flex; align-items: center; gap: 2px;
@@ -546,6 +556,8 @@ button:active { background: #2e7d32; }
   font-family: Verdana, sans-serif; font-size: 13.5px;
   line-height: 1.55;
 }
+.editor-preview img,
+.post-text img { max-width: 100%; height: auto; }
 
 .editor-foot {
   display: flex; align-items: center; justify-content: space-between;
@@ -560,8 +572,8 @@ button:active { background: #2e7d32; }
 .editor-actions { display: flex; align-items: center; gap: 12px; }
 .counter { font-size: 11px; color: #7a8f7a; font-variant-numeric: tabular-nums; }
 .counter.warn { color: #c62828; font-weight: bold; }
+.counter .b64hint { color: #9cb89c; }
 
-/* ---------- markdown rendered ---------- */
 .md { line-height: 1.55; }
 .md > *:first-child { margin-top: 0; }
 .md > *:last-child { margin-bottom: 0; }
@@ -596,7 +608,6 @@ button:active { background: #2e7d32; }
 .md del { color: #9cb89c; }
 .md a { color: #2e7d32; text-decoration: underline; }
 
-/* новые md-фичи */
 .md mark { background: #fff59d; color: #17381a; padding: 0 2px; border-radius: 2px; }
 .md sup { font-size: 0.75em; vertical-align: super; line-height: 0; }
 .md .spoiler {
@@ -791,7 +802,8 @@ def editor_view(p: dict | None = None, action: str = "/create") -> str:
           {tb("hr",    "Разделитель (---)",    "insertBlock('\\n---\\n')")}
           <span class="tb-sep"></span>
           {tb("link",      "Ссылка",         "insertMd('[','](https://)','текст ссылки')")}
-          {tb("image",     "Изображение",    "insertMd('![','](https://)','alt')")}
+          {tb("image",     "Вставить как markdown по ссылке", "insertMd('![','](https://)','alt')")}
+          {tb("upload",    "Загрузить картинку с ПК",        "document.getElementById('file-input').click()")}
           {tb("table",     "Таблица",        "insertBlock('\\n| Столбец 1 | Столбец 2 |\\n|-----------|-----------|\\n| Ячейка    | Ячейка    |\\n')")}
           {tb("highlight", "Выделение",      "insertMd('==','==','выделенный текст')")}
           {tb("spoiler",   "Спойлер",        "insertMd('||','||','скрытый текст')")}
@@ -800,10 +812,11 @@ def editor_view(p: dict | None = None, action: str = "/create") -> str:
           <span class="tb-spacer"></span>
           <button type="button" class="tb tb-text active" id="preview-btn" onclick="togglePreview()">Предпросмотр</button>
         </div>
+        <input type="file" id="file-input" accept="image/*" style="display:none">
         <div class="editor-body">
           <div class="editor-pane">
-            <textarea id="editor" name="text" maxlength="{MAX_POST}" required
-placeholder="Напишите что-нибудь...&#10;&#10;Markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`  ==выделение==  ||спойлер||  ^верхний^&#10;# H1  ## H2  ### H3&#10;- список   1. список   - [ ] задача   &gt; цитата   --- разделитель&#10;[ссылка](https://)  ![img](https://)&#10;| табл | лицо |&#10;|------|------|&#10;| a    | b    |&#10;:smile: :fire: :heart:">{text_value}</textarea>
+            <textarea id="editor" name="text" required
+placeholder="Напишите что-нибудь...&#10;&#10;Markdown:&#10;**жирный**  *курсив*  ~~зачёркнутый~~  `код`  ==выделение==  ||спойлер||  ^верхний^&#10;# H1  ## H2  ### H3&#10;- список   1. список   - [ ] задача   &gt; цитата   --- разделитель&#10;[ссылка](https://)  ![img](https://)&#10;| табл | лицо |&#10;|------|------|&#10;| a    | b    |&#10;:smile: :fire: :heart:&#10;&#10;Картинки: жми иконку загрузки или просто Ctrl+V из буфера — вставится как base64.">{text_value}</textarea>
           </div>
           <div class="editor-pane editor-preview" id="preview-wrap">
             <div class="md" id="preview"></div>
@@ -820,7 +833,8 @@ placeholder="Напишите что-нибудь...&#10;&#10;Markdown:&#10;**ж
             <code>[текст](url)</code> &middot; <code>![alt](url)</code> &middot;
             <code>==выделение==</code> &middot; <code>||спойлер||</code> &middot; <code>^верхний^</code> &middot;
             <code>:smile:</code> &middot;
-            таблицы: <code>| a | b |</code> + <code>|---|---|</code>
+            таблицы: <code>| a | b |</code> + <code>|---|---|</code> &middot;
+            <b>картинки</b>: кнопка {ic("upload", 12)} или Ctrl+V (base64 не считается за символы)
           </div>
           <div class="editor-actions">
             <span class="counter" id="counter">0 / {MAX_POST}</span>
@@ -839,14 +853,27 @@ EDITOR_JS = r"""
   var previewEl = document.getElementById('preview');
   var previewWrap = document.getElementById('preview-wrap');
   var previewBtn = document.getElementById('preview-btn');
+  var form = document.getElementById('post-form');
+  var fileInput = document.getElementById('file-input');
   var previewOn = true;
   var previewTimer = null;
   var MAX = __MAX__;
+  var MAX_IMG_BYTES = 5 * 1024 * 1024;   // 5 МБ на одну картинку
+
+  // тот же regex, что и в Python: заменяем payload на заглушку для подсчёта
+  var B64_RE = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g;
+
+  function effectiveLength(s){
+    return s.replace(B64_RE, 'data:image/...;base64,...').length;
+  }
 
   function updateCounter(){
-    var n = ta.value.length;
-    counter.textContent = n + ' / ' + MAX;
-    if (n > MAX * 0.9) counter.classList.add('warn');
+    var raw = ta.value;
+    var eff = effectiveLength(raw);
+    var imgs = (raw.match(/data:image\/[a-zA-Z0-9.+-]+;base64,/g) || []).length;
+    var suffix = imgs ? ' <span class="b64hint">(+' + imgs + ' img)</span>' : '';
+    counter.innerHTML = eff + ' / ' + MAX + suffix;
+    if (eff > MAX) counter.classList.add('warn');
     else counter.classList.remove('warn');
   }
 
@@ -914,7 +941,55 @@ EDITOR_JS = r"""
     ta.focus(); updateCounter(); schedulePreview();
   };
 
-  ta.addEventListener('input', function(){ updateCounter(); schedulePreview(); });
+  function insertImageFile(file, altText){
+    if (!file) return;
+    if (file.size > MAX_IMG_BYTES){
+      alert('Картинка слишком большая (макс 5 МБ). Текущий размер: ' +
+            (file.size/1024/1024).toFixed(2) + ' МБ.');
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      var dataUrl = ev.target.result;
+      var alt = (altText || file.name || 'image').replace(/[\[\]()]/g, '');
+      // вставляем на новой строке, чтобы не склеивалось с текстом
+      var prefix = ta.selectionStart > 0 && ta.value[ta.selectionStart - 1] !== '\n' ? '\n' : '';
+      window.insertBlock(prefix + '![' + alt + '](' + dataUrl + ')\n', '');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // --- загрузка через файловый пикер ---
+  if (fileInput){
+    fileInput.addEventListener('change', function(e){
+      var f = e.target.files && e.target.files[0];
+      insertImageFile(f);
+      e.target.value = '';   // позволяем выбрать тот же файл повторно
+    });
+  }
+
+  // --- вставка из буфера (Ctrl+V со скриншотом) ---
+  ta.addEventListener('paste', function(e){
+    if (!e.clipboardData || !e.clipboardData.items) return;
+    var items = e.clipboardData.items;
+    for (var i = 0; i < items.length; i++){
+      var it = items[i];
+      if (it.kind === 'file' && it.type.indexOf('image/') === 0){
+        e.preventDefault();
+        insertImageFile(it.getAsFile(), 'вставленная картинка');
+        return;
+      }
+    }
+    // если вставили просто текст с data:image — тоже перехватываем, чтобы не сломать счётчик
+    var txt = e.clipboardData.getData('text/plain');
+    if (txt && /data:image\/[a-zA-Z0-9.+-]+;base64,/.test(txt)){
+      e.preventDefault();
+      window.insertBlock(txt, '');
+      return;
+    }
+  });
+
+  // --- Ctrl+B / Ctrl+I / Tab ---
   ta.addEventListener('keydown', function(ev){
     if (ev.key === 'Tab'){
       ev.preventDefault();
@@ -928,6 +1003,18 @@ EDITOR_JS = r"""
       ev.preventDefault(); window.insertMd('*','*','курсив'); return;
     }
   });
+
+  // --- не отправляем, если по эффективной длине перебор ---
+  form.addEventListener('submit', function(e){
+    var eff = effectiveLength(ta.value);
+    if (eff > MAX){
+      e.preventDefault();
+      alert('Слишком длинный текст: ' + eff + ' / ' + MAX + ' символов.\n' +
+            'Картинки в base64 не считаются, значит превышение по самому тексту.');
+    }
+  });
+
+  ta.addEventListener('input', function(){ updateCounter(); schedulePreview(); });
 
   updateCounter();
   runPreview();
@@ -960,13 +1047,14 @@ def create_page(request: Request):
 def create_post(request: Request, text: str = Form(...)):
     anon = request.state.anon
     text = text.strip()
-    if text:
+    # валидация: эффективная длина (без base64) ≤ MAX_POST, сырая ≤ MAX_RAW
+    if text and effective_length(text) <= MAX_POST and len(text) <= MAX_RAW:
         _counter["post"] += 1
         pid = _counter["post"]
         posts.append({
             "id": pid,
             "author_id": anon["id"],
-            "text": text[:MAX_POST],
+            "text": text,              # НЕ обрезаем по MAX_POST — base64 может быть длинным
             "created": time.time(),
             "edited": None,
             "up": set(),
@@ -1010,10 +1098,11 @@ def edit_post(post_id: int, request: Request, text: str = Form(...)):
     if not p or anon["id"] != p["author_id"]:
         return RedirectResponse("/", status_code=303)
     text = text.strip()
-    if text:
-        p["text"] = text[:MAX_POST]
+    if text and effective_length(text) <= MAX_POST and len(text) <= MAX_RAW:
+        p["text"] = text
         p["edited"] = time.time()
-    return RedirectResponse(f"/p/{post_id}", status_code=303)
+        return RedirectResponse(f"/p/{post_id}", status_code=303)
+    return RedirectResponse(f"/p/{post_id}/edit", status_code=303)
 
 
 @app.post("/p/{post_id}/delete")
@@ -1060,7 +1149,7 @@ def add_comment(post_id: int, request: Request, text: str = Form(...)):
 
 @app.post("/api/preview")
 def api_preview(text: str = Form("")):
-    return JSONResponse({"html": render_md(text[:MAX_POST])})
+    return JSONResponse({"html": render_md(text[:MAX_RAW])})
 
 
 # ============================================================
