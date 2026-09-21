@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ============================================================
-#                    ЗАЩИТА / "ШИФРОВАНИЕ"
+#                    ШИФРОВАНИЕ ЗАПРОСОВ
 # ============================================================
 
 XK = b"DirectSecret2024"
@@ -38,7 +38,7 @@ def dec_str(s: str) -> str:
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, str] = {}
 CHATS: Dict[str, list] = {}
-CONNECTIONS: Dict[str, list] = {}   # nick -> [WebSocket, ...]
+CONNECTIONS: Dict[str, list] = {}
 
 
 def chat_key(a: str, b: str) -> str:
@@ -87,10 +87,7 @@ def user_public(nick: str) -> dict:
     return {"nick": nick, "name": u["name"], "avatar": u["avatar"]}
 
 
-# --------------- WebSocket: доставка событий ---------------
-
 async def push_to(nick: str, event: dict):
-    """Отправить событие всем активным сокетам пользователя."""
     conns = CONNECTIONS.get(nick)
     if not conns:
         return
@@ -121,7 +118,6 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     CONNECTIONS.setdefault(nick, []).append(websocket)
     try:
         while True:
-            # клиент шлёт ping — мы просто принимаем
             await websocket.receive_text()
     except WebSocketDisconnect:
         pass
@@ -242,7 +238,6 @@ async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
     USERS[nick]["contacts"].add(peer)
     USERS[peer]["contacts"].add(nick)
 
-    # уведомим собеседника: у него появился контакт
     await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
     await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
     return {"ok": True}
@@ -263,14 +258,17 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     if nick in USERS[peer]["blacklist"]:
         raise HTTPException(403, "Пользователь добавил вас в чёрный список")
 
-    k = chat_key(nick, peer)
-    msg = {"from": nick, "to": peer, "text": text, "ts": time.time()}
-    CHATS.setdefault(k, []).append(msg)
+    msg = {
+        "id": secrets.token_hex(8),
+        "from": nick,
+        "to": peer,
+        "text": text,
+        "ts": time.time(),
+    }
+    CHATS.setdefault(chat_key(nick, peer), []).append(msg)
 
-    # realtime: получателю
-    await push_to(peer, {"type": "message", "from": nick, "msg": msg})
-    # и другим вкладкам отправителя
-    await push_to(nick, {"type": "message", "from": nick, "msg": msg, "self": True})
+    await push_to(peer, {"type": "message", "msg": msg})
+    await push_to(nick, {"type": "message", "msg": msg, "self": True})
     return {"ok": True, "msg": msg}
 
 
@@ -325,49 +323,39 @@ PAGE = r"""<!DOCTYPE html>
 <title>Direct</title>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;padding:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;overscroll-behavior:none}
+html,body{
+  margin:0;padding:0;height:100%;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  overscroll-behavior:none;
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+}
+input,textarea{user-select:text;-webkit-user-select:text}
+
 :root{
   --bg:#f2f2f7;--fg:#111;--card:#fff;--muted:#8a8a8e;--border:#e3e3e8;
   --accent:#0a84ff;--danger:#ff3b30;
-  --in-bub:#fff;--in-fg:#111;--out-bub:#0a84ff;--out-fg:#fff;--overlay:rgba(0,0,0,.45);
-  --sidebar:#f7f7fa;
+  --in-bub:#fff;--in-fg:#111;--out-bub:#0a84ff;--out-fg:#fff;
+  --overlay:rgba(0,0,0,.45);--sidebar:#f7f7fa;
 }
 body.dark{
   --bg:#0d0d0f;--fg:#f2f2f7;--card:#1c1c1e;--muted:#8e8e93;--border:#2c2c2e;
   --accent:#0a84ff;--danger:#ff453a;
-  --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;--overlay:rgba(0,0,0,.65);
-  --sidebar:#141416;
+  --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;
+  --overlay:rgba(0,0,0,.65);--sidebar:#141416;
 }
-body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s;overflow:hidden}
+body{background:var(--bg);color:var(--fg);overflow:hidden}
 
-/* ====== ОБОЛОЧКА ПРИЛОЖЕНИЯ (mobile-first) ====== */
 #app{
   width:100%;height:100vh;height:100dvh;
   display:flex;flex-direction:column;
   position:relative;overflow:hidden;
-  background:var(--bg);margin:0 auto;
-}
-
-/* ====== ПК: окно-карточка по центру ====== */
-@media (min-width: 900px){
-  body{
-    display:grid;place-items:center;
-    background:#18181b;min-height:100vh;padding:20px;
-  }
-  body.dark{background:#000}
-  #app{
-    width:min(1100px, 96vw);
-    height:min(820px, 90vh);
-    border-radius:22px;
-    box-shadow:0 30px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
-    border:1px solid var(--border);
-  }
+  background:var(--bg);
 }
 
 .screen{display:none;flex:1;overflow:hidden;position:relative}
 .screen.active{display:flex}
 
-/* ---- AUTH ---- */
+/* ---------- AUTH ---------- */
 #screen-auth.active{flex-direction:column;align-items:center;overflow-y:auto}
 .auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%;
   width:100%;max-width:440px}
@@ -404,12 +392,11 @@ input:focus{border-color:var(--accent)}
 .big-name{font-size:20px;font-weight:700;margin-top:6px}
 .center{text-align:center;align-items:center}
 
-/* ---- SVG иконки ---- */
 .icon{width:22px;height:22px;display:block;flex-shrink:0;color:currentColor}
 .icon-sm{width:18px;height:18px}
 #svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
 
-/* ---- AVATAR EDITOR ---- */
+/* ---------- AVATAR EDITOR ---------- */
 .ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);
   padding:14px;border-radius:16px;border:1px solid var(--border)}
 #avaCanvas{width:220px;height:220px;border-radius:12px;background:#fff;touch-action:none;
@@ -420,16 +407,34 @@ input:focus{border-color:var(--accent)}
 .ava-tools{display:flex;gap:8px;width:100%}
 .ava-tools .btn{flex:1}
 
-/* ====== APP SHELL (sidebar + chat-pane) ====== */
-#screen-app.active{flex-direction:column}
-.sidebar{display:flex;flex-direction:column;flex:1;overflow:hidden;background:var(--sidebar)}
-.chat-pane{display:none;flex-direction:column;flex:1;overflow:hidden;background:var(--bg)}
+/* ---------- APP SHELL ---------- */
+#screen-app.active{flex-direction:row}
+.sidebar{display:flex;flex-direction:column;overflow:hidden;background:var(--sidebar);
+  border-right:1px solid var(--border)}
+.chat-pane{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);flex:1;min-width:0}
 
-/* mobile: показываем либо список, либо чат */
-#screen-app.chat-open .sidebar{display:none}
-#screen-app.chat-open .chat-pane{display:flex}
+/* mobile: одна колонка, переключение по .chat-open */
+@media (max-width: 899px){
+  #screen-app.active{flex-direction:column}
+  .sidebar{flex:1;border-right:0}
+  .chat-pane{display:none;flex:1}
+  #screen-app.chat-open .sidebar{display:none}
+  #screen-app.chat-open .chat-pane{display:flex}
+  .back-mobile{display:flex !important}
+  .fab{display:flex !important}
+  .search-inline{display:none}
+}
 
-/* topbar (общий для sidebar и chat) */
+/* desktop: во весь экран */
+@media (min-width: 900px){
+  body{background:var(--bg)}
+  .sidebar{flex:0 0 340px;width:340px}
+  .back-mobile{display:none !important}
+  .fab{display:none !important}
+  .search-inline{display:block}
+}
+
+/* ---------- TOPBAR ---------- */
 .topbar{
   display:flex;align-items:center;gap:10px;padding:10px 12px;
   background:var(--card);border-bottom:1px solid var(--border);
@@ -444,22 +449,25 @@ input:focus{border-color:var(--accent)}
   cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
   transition:.15s;padding:0;
 }
-.icon-btn:active{background:var(--border)}
-.icon-btn:hover{background:var(--border)}
+.icon-btn:active,.icon-btn:hover{background:var(--border)}
 .icon-btn.danger{color:var(--danger)}
 
-/* список контактов */
-.list{flex:1;overflow-y:auto;padding:10px;background:var(--sidebar)}
+/* ---------- CONTACTS ---------- */
+.list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
 .contact{
   display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
-  background:transparent;margin-bottom:2px;cursor:pointer;transition:.12s;border:1px solid transparent;
+  background:transparent;margin-bottom:2px;cursor:pointer;transition:.12s;
+  border:1px solid transparent;position:relative;
 }
-.contact:active{transform:scale(.99);background:var(--card)}
 .contact:hover{background:var(--card);border-color:var(--border)}
 .contact.selected{background:var(--card);border-color:var(--border)}
+.contact .badge{
+  min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;
+  font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
+  padding:0 6px;flex-shrink:0;
+}
 .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5}
 
-/* FAB — только на мобиле */
 .fab{
   position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
   width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:#fff;
@@ -469,26 +477,27 @@ input:focus{border-color:var(--accent)}
 .fab:active{transform:translateX(-50%) scale(.92)}
 .fab .icon{width:30px;height:30px}
 
-/* Инлайн кнопка "Новый чат" — только на ПК */
-.search-inline{display:none;padding:10px 12px 4px}
+.search-inline{padding:10px 12px 4px;display:none}
 
-/* пустая правая панель — только на ПК */
 .empty-pane{
   display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;
   color:var(--muted);gap:14px;font-size:15px;padding:30px;text-align:center;
 }
 .empty-pane .empty-icon{width:72px;height:72px;opacity:.25}
 .empty-pane.hidden{display:none !important}
+@media (min-width: 900px){
+  .empty-pane{display:flex}
+}
 
-/* чат */
-.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden}
+.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden;min-width:0}
 .chat-content.hidden{display:none}
+
+/* ---------- MESSAGES ---------- */
 .messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px}
 .bubble{
   max-width:78%;padding:9px 13px;border-radius:18px;font-size:15px;line-height:1.35;
-  word-wrap:break-word;white-space:pre-wrap;animation:pop .15s ease;
+  word-wrap:break-word;white-space:pre-wrap;
 }
-@keyframes pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .bubble.out{align-self:flex-end;background:var(--out-bub);color:var(--out-fg);border-bottom-right-radius:6px}
 .bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
   border-bottom-left-radius:6px;border:1px solid var(--border)}
@@ -499,44 +508,16 @@ input:focus{border-color:var(--accent)}
 .composer input{border-radius:20px}
 .composer .btn{border-radius:50%;width:46px;height:46px;padding:0;flex-shrink:0}
 
-/* =================== MOBILE =================== */
-@media (max-width: 899px){
-  .back-mobile{display:flex}
-  .fab{display:flex}
-  .search-inline{display:none}
-  .empty-pane{display:none !important}
-  .sidebar{position:relative}
-  .chat-pane{position:relative}
-}
-
-/* =================== DESKTOP =================== */
-@media (min-width: 900px){
-  #screen-app.active{flex-direction:row}
-  .sidebar{
-    display:flex !important;flex:0 0 340px;width:340px;
-    border-right:1px solid var(--border);
-  }
-  .chat-pane{display:flex !important;position:relative}
-  .back-mobile{display:none !important}
-  .fab{display:none !important}
-  .search-inline{display:block}
-  .empty-pane{display:flex}
-  .empty-pane.hidden{display:none}
-}
-
-/* ---- MODALS ---- */
+/* ---------- MODALS ---------- */
 .overlay{
   position:absolute;inset:0;background:var(--overlay);display:flex;align-items:flex-end;
-  justify-content:center;z-index:50;animation:fade .15s ease;
+  justify-content:center;z-index:50;
 }
-@keyframes fade{from{opacity:0}to{opacity:1}}
 .overlay.hidden{display:none}
 .modal{
   background:var(--card);width:100%;max-height:88%;border-radius:22px 22px 0 0;
-  display:flex;flex-direction:column;animation:slideUp .22s cubic-bezier(.2,.8,.3,1);
-  padding-bottom:env(safe-area-inset-bottom);
+  display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom);
 }
-@keyframes slideUp{from{transform:translateY(100%)}to{transform:none}}
 @media(min-width:700px){
   .overlay{align-items:center}
   .modal{max-width:440px;border-radius:20px;max-height:80%}
@@ -566,7 +547,6 @@ input:focus{border-color:var(--accent)}
 </head>
 <body>
 
-<!-- ================= SVG ИКОНКИ ================= -->
 <svg id="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
     <circle cx="12" cy="12" r="3"/>
@@ -609,7 +589,6 @@ input:focus{border-color:var(--accent)}
 
 <div id="app">
 
-  <!-- ================= AUTH ================= -->
   <div class="screen active" id="screen-auth">
     <div class="auth-wrap">
       <h1 class="logo">Direct</h1>
@@ -645,10 +624,8 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
-  <!-- ================= APP SHELL ================= -->
   <div class="screen" id="screen-app">
 
-    <!-- ========== SIDEBAR (список + профиль) ========== -->
     <aside class="sidebar">
       <header class="topbar">
         <canvas class="ava-small" id="meAva" width="40" height="40"></canvas>
@@ -675,7 +652,6 @@ input:focus{border-color:var(--accent)}
       </button>
     </aside>
 
-    <!-- ========== CHAT PANE ========== -->
     <section class="chat-pane" id="chatPane">
 
       <div class="empty-pane" id="emptyPane">
@@ -711,7 +687,6 @@ input:focus{border-color:var(--accent)}
     </section>
   </div>
 
-  <!-- ================= MODAL: SEARCH ================= -->
   <div class="overlay hidden" id="modal-search" onclick="backdropClose(event,'modal-search')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -733,7 +708,6 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
-  <!-- ================= MODAL: SETTINGS ================= -->
   <div class="overlay hidden" id="modal-settings" onclick="backdropClose(event,'modal-settings')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -772,7 +746,6 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
-  <!-- ================= MODAL: INFO ================= -->
   <div class="overlay hidden" id="modal-info" onclick="backdropClose(event,'modal-info')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -793,6 +766,15 @@ input:focus{border-color:var(--accent)}
 </div>
 
 <script>
+/* ============================================================
+                        ЗАПРЕТ ПКМ
+   ============================================================ */
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('selectstart', e => {
+  if (e.target.closest('input,textarea')) return;
+  e.preventDefault();
+});
+
 /* ============================================================
                         ШИФРОВАНИЕ
    ============================================================ */
@@ -858,6 +840,9 @@ let blacklist = [];
 let currentPeer = null;
 let currentPeerData = null;
 let ws = null;
+let unread = {};           // nick -> count
+let renderedIds = new Set();
+let renderedPeer = null;
 
 /* ============================================================
                        API
@@ -888,16 +873,15 @@ function connectWS(){
     ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
   } catch(e){ ws = null; return; }
 
-  ws.onmessage = (ev) => {
+  ws.onmessage = ev => {
     try { handleWsEvent(JSON.parse(ev.data)); } catch(_){}
   };
   ws.onclose = () => {
     ws = null;
-    if (token) setTimeout(connectWS, 1500);   // авто-реконнект
+    if (token) setTimeout(connectWS, 1500);
   };
   ws.onerror = () => { try { ws && ws.close(); } catch(_){} };
 
-  // heartbeat
   clearInterval(window.__hb);
   window.__hb = setInterval(() => {
     try { if (ws && ws.readyState === 1) ws.send('ping'); } catch(_){}
@@ -913,19 +897,99 @@ function handleWsEvent(ev){
   if (!ev || !ev.type) return;
 
   if (ev.type === 'message'){
-    // сообщение для открытого чата → перечитаем и отрисуем
-    if (currentPeer && (ev.from === currentPeer || (ev.msg && ev.msg.from === currentPeer))){
-      refreshChat();
+    const m = ev.msg;
+    const isMine = m.from === me?.nick;
+
+    // если открыт чат с отправителем/получателем — просто добавим баббл
+    if (currentPeer && (m.from === currentPeer || m.to === currentPeer)){
+      appendMessage(m);
     }
-    // входящее от нового человека — обновим список контактов
-    if (!ev.self && ev.from !== me?.nick){
-      refreshMe().catch(()=>{});
+
+    if (!isMine){
+      const isCurrentChat = currentPeer === m.from;
+      const isFocused = document.hasFocus();
+      if (!isCurrentChat || !isFocused){
+        playBeep();
+        showDesktopNotification(m.from, m.text);
+      }
+      if (!isCurrentChat){
+        addUnread(m.from);
+      }
+      if (!contacts.find(c => c.nick === m.from)){
+        refreshMe().catch(()=>{});
+      }
     }
   } else if (ev.type === 'contact_added'){
     refreshMe().catch(()=>{});
   } else if (ev.type === 'blacklist_changed'){
     refreshMe().catch(()=>{});
   }
+}
+
+/* ============================================================
+                     ЗВУК / УВЕДОМЛЕНИЯ
+   ============================================================ */
+let audioCtx = null;
+function playBeep(){
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const now = audioCtx.currentTime;
+    const tone = (freq, start, dur) => {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.type = 'sine';
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, now + start);
+      g.gain.exponentialRampToValueAtTime(0.14, now + start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      o.start(now + start);
+      o.stop(now + start + dur + 0.02);
+    };
+    tone(880, 0, 0.12);
+    tone(1320, 0.09, 0.14);
+  } catch(_){}
+}
+
+function requestNotifPermission(){
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default'){
+    try { Notification.requestPermission(); } catch(_){}
+  }
+}
+
+function showDesktopNotification(fromNick, text){
+  if (!('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+  if (document.hasFocus()) return;
+  const u = contacts.find(c => c.nick === fromNick);
+  const title = u ? u.name : fromNick;
+  try {
+    const n = new Notification(title, {
+      body: text.length > 80 ? text.slice(0, 80) + '…' : text,
+      tag: 'direct-' + fromNick,
+      silent: true
+    });
+    n.onclick = () => { window.focus(); openChat(fromNick); };
+  } catch(_){}
+}
+
+function addUnread(nick){
+  unread[nick] = (unread[nick] || 0) + 1;
+  renderContacts();
+  updateTitle();
+}
+function clearUnread(nick){
+  if (unread[nick]){
+    delete unread[nick];
+    renderContacts();
+    updateTitle();
+  }
+}
+function updateTitle(){
+  const total = Object.values(unread).reduce((a,b)=>a+b, 0);
+  document.title = total > 0 ? `(${total}) Direct` : 'Direct';
 }
 
 /* ============================================================
@@ -1106,6 +1170,7 @@ async function doLogin(){
     const r = await api('/api/login', { nick, password });
     token = r.token; me = r.me;
     localStorage.setItem('direct_token', token);
+    requestNotifPermission();
     await refreshMe();
     showScreen('screen-app');
     connectWS();
@@ -1121,6 +1186,7 @@ async function doRegister(){
     const r = await api('/api/register', { name, nick, password, password2, avatar: avatarData });
     token = r.token; me = r.me;
     localStorage.setItem('direct_token', token);
+    requestNotifPermission();
     await refreshMe();
     showScreen('screen-app');
     connectWS();
@@ -1130,12 +1196,13 @@ async function doRegister(){
 function logout(){
   if (!confirm(t('confirm_logout'))) return;
   disconnectWS();
-  token = null; me = null; contacts = []; blacklist = [];
+  token = null; me = null; contacts = []; blacklist = []; unread = {};
   localStorage.removeItem('direct_token');
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
   closeModal('modal-settings');
   closeChat(true);
+  updateTitle();
   showScreen('screen-auth');
 }
 
@@ -1168,11 +1235,13 @@ function renderContacts(){
     const el = document.createElement('div');
     el.className = 'contact' + (currentPeer === c.nick ? ' selected' : '');
     el.onclick = () => openChat(c.nick);
+
     const cv = document.createElement('canvas');
     cv.width = 44; cv.height = 44;
     cv.className = 'ava-small';
     paintAva(cv, c.avatar);
     el.appendChild(cv);
+
     const info = document.createElement('div');
     info.className = 'me-info';
     const nm = document.createElement('div');
@@ -1181,6 +1250,13 @@ function renderContacts(){
     nk.className = 'me-nick'; nk.textContent = '@' + c.nick;
     info.appendChild(nm); info.appendChild(nk);
     el.appendChild(info);
+
+    if (unread[c.nick] > 0){
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = unread[c.nick] > 99 ? '99+' : unread[c.nick];
+      el.appendChild(b);
+    }
     box.appendChild(el);
   });
 }
@@ -1240,6 +1316,28 @@ async function startChat(peerNick){
   } catch(e){ alert(e.message); }
 }
 
+function resetMessages(peer){
+  document.getElementById('messages').innerHTML = '';
+  renderedIds = new Set();
+  renderedPeer = peer;
+}
+
+function appendMessage(m, scroll = true){
+  if (!m || !m.id) return;
+  if (renderedIds.has(m.id)) return;
+  renderedIds.add(m.id);
+
+  const box = document.getElementById('messages');
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+
+  const el = document.createElement('div');
+  el.className = 'bubble ' + (m.from === me.nick ? 'out' : 'in');
+  el.textContent = m.text;
+  box.appendChild(el);
+
+  if (scroll && nearBottom) box.scrollTop = box.scrollHeight;
+}
+
 async function openChat(peerNick){
   try {
     const r = await api('/api/chat/messages', { peer: peerNick });
@@ -1248,36 +1346,20 @@ async function openChat(peerNick){
     paintAva(document.getElementById('peerAva'), r.peer.avatar);
     document.getElementById('peerName').textContent = r.peer.name;
     document.getElementById('peerNick').textContent = '@' + r.peer.nick;
-    renderMessages(r.messages);
+
+    resetMessages(peerNick);
+    r.messages.forEach(m => appendMessage(m, false));
+    const box = document.getElementById('messages');
+    box.scrollTop = box.scrollHeight;
+
     document.getElementById('chatContent').classList.remove('hidden');
     document.getElementById('emptyPane').classList.add('hidden');
     document.getElementById('screen-app').classList.add('chat-open');
-    renderContacts();     // чтобы выделился выбранный
+    clearUnread(peerNick);
+    renderContacts();
+
     setTimeout(()=>document.getElementById('msgInput').focus(), 100);
   } catch(e){ alert(e.message); }
-}
-
-async function refreshChat(){
-  if (!currentPeer) return;
-  try {
-    const r = await api('/api/chat/messages', { peer: currentPeer });
-    currentPeerData = r.peer;
-    renderMessages(r.messages);
-  } catch(_){}
-}
-
-function renderMessages(msgs){
-  const box = document.getElementById('messages');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
-  box.innerHTML = '';
-  msgs.forEach(m => {
-    const el = document.createElement('div');
-    el.className = 'bubble ' + (m.from === me.nick ? 'out' : 'in');
-    el.textContent = m.text;
-    box.appendChild(el);
-  });
-  if (atBottom) box.scrollTop = box.scrollHeight;
-  else box.scrollTop = box.scrollHeight;
 }
 
 async function sendMsg(e){
@@ -1287,8 +1369,10 @@ async function sendMsg(e){
   if (!text || !currentPeer) return;
   inp.value = '';
   try {
-    await api('/api/chat/send', { to: currentPeer, text });
-    await refreshChat();
+    const r = await api('/api/chat/send', { to: currentPeer, text });
+    // сразу показываем у себя (WS-эхо дедуплицируется по id)
+    appendMessage(r.msg);
+    try { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); } catch(_){}
   } catch(err){
     alert(err.message);
     inp.value = text;
@@ -1298,6 +1382,9 @@ async function sendMsg(e){
 function closeChat(silent){
   currentPeer = null;
   currentPeerData = null;
+  renderedPeer = null;
+  renderedIds = new Set();
+  document.getElementById('messages').innerHTML = '';
   document.getElementById('chatContent').classList.add('hidden');
   document.getElementById('emptyPane').classList.remove('hidden');
   document.getElementById('screen-app').classList.remove('chat-open');
@@ -1402,6 +1489,7 @@ async function blRemove(nick){
         renderContacts();
         renderBlacklist();
         showScreen('screen-app');
+        requestNotifPermission();
         connectWS();
       })
       .catch(() => {
@@ -1413,9 +1501,6 @@ async function blRemove(nick){
   document.getElementById('searchNick').addEventListener('keydown', e => {
     if (e.key === 'Enter'){ e.preventDefault(); doSearch(); }
   });
-
-  // страховочный поллинг открытого чата на случай, если WS отвалился
-  setInterval(() => { if (currentPeer) refreshChat(); }, 15000);
 })();
 </script>
 </body>
