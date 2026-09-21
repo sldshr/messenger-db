@@ -3,14 +3,23 @@
 
 import base64
 import hashlib
+import html as html_module
+import ipaddress
 import json
+import re
 import secrets
+import struct
 import time
+import zlib
 from typing import Dict, Optional
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import (FastAPI, Header, HTTPException, Query, Request,
+                     WebSocket, WebSocketDisconnect)
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # ============================================================
 #                    ШИФРОВАНИЕ ЗАПРОСОВ
@@ -39,6 +48,7 @@ USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, str] = {}
 CHATS: Dict[str, list] = {}
 CONNECTIONS: Dict[str, list] = {}
+OG_CACHE: Dict[str, dict] = {}
 
 
 def chat_key(a: str, b: str) -> str:
@@ -56,6 +66,143 @@ def verify_pw(pw: str, stored: str) -> bool:
     except ValueError:
         return False
     return hashlib.sha256((salt + pw).encode()).hexdigest() == h
+
+
+def normalize_avatar(avatar):
+    if not isinstance(avatar, list) or len(avatar) != 64:
+        return ["#ffffff"] * 64
+    return [
+        a if isinstance(a, str) and a.startswith("#") and len(a) == 7 else "#ffffff"
+        for a in avatar
+    ]
+
+
+# ============================================================
+#                    PNG-ГЕНЕРАТОР АВАТАРА
+# ============================================================
+
+def make_png(colors, scale: int = 32) -> bytes:
+    """Рендерит 8×8 палитру в PNG (RGB, без внешних зависимостей)."""
+    GRID = 8
+    W = H = GRID * scale
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)  # filter: none
+        gy = y // scale
+        row_base = gy * GRID
+        for x in range(W):
+            gx = x // scale
+            c = colors[row_base + gx]
+            raw.append(int(c[1:3], 16))
+            raw.append(int(c[3:5], 16))
+            raw.append(int(c[5:7], 16))
+
+    def chunk(ctype: bytes, data: bytes) -> bytes:
+        body = ctype + data
+        return struct.pack(">I", len(data)) + body + \
+               struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    idat = chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    iend = chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+# ============================================================
+#                    OPENGRAPH ПАРСЕР
+# ============================================================
+
+_OG_PATTERNS = [
+    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
+    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
+]
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_WS_RE = re.compile(r"\s+")
+
+
+def is_safe_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").strip()
+    if not host:
+        return False
+    if host.lower() in ("localhost", "localhost.localdomain"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False
+    except ValueError:
+        pass
+    return True
+
+
+def fetch_og(url: str) -> dict:
+    if url in OG_CACHE:
+        return OG_CACHE[url]
+    try:
+        req = UrlRequest(url, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
+        })
+        with urlopen(req, timeout=6) as r:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "html" not in ct and "xml" not in ct:
+                out = {"error": "not_html"}
+                OG_CACHE[url] = out
+                return out
+            body = r.read(300_000)
+        text = body.decode("utf-8", errors="ignore")
+    except Exception as e:
+        out = {"error": str(e)[:120]}
+        OG_CACHE[url] = out
+        return out
+
+    data: Dict[str, str] = {}
+    for pat in _OG_PATTERNS:
+        for m in pat.finditer(text):
+            key = m.group(1).lower()
+            if key not in data:
+                data[key] = m.group(2)
+
+    # twitter fallback
+    if "og:title" not in data and "twitter:title" in data:
+        data["og:title"] = data["twitter:title"]
+    if "og:description" not in data and "twitter:description" in data:
+        data["og:description"] = data["twitter:description"]
+    if "og:image" not in data and "twitter:image" in data:
+        data["og:image"] = data["twitter:image"]
+
+    # <title> fallback
+    if "og:title" not in data:
+        tm = _TITLE_RE.search(text)
+        if tm:
+            data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
+
+    image = (data.get("og:image") or "").strip()
+    if image and not image.startswith(("http://", "https://")):
+        image = urljoin(url, image)
+
+    out = {
+        "url": url,
+        "title": html_module.unescape((data.get("og:title") or "").strip())[:200],
+        "description": html_module.unescape((data.get("og:description") or "").strip())[:400],
+        "image": image[:1500],
+        "site_name": html_module.unescape((data.get("og:site_name") or "").strip())[:80],
+        "type": (data.get("og:type") or "").strip()[:40],
+    }
+    OG_CACHE[url] = out
+    return out
 
 
 # ============================================================
@@ -114,7 +261,6 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     if not nick:
         await websocket.close(code=4001)
         return
-
     CONNECTIONS.setdefault(nick, []).append(websocket)
     try:
         while True:
@@ -136,20 +282,19 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
 # ============================================================
 
 @app.post("/api/register")
-def register(body: EncBody):
+async def register(body: EncBody):
     d = parse(body)
     nick = (d.get("nick") or "").strip()
     name = (d.get("name") or "").strip()
     pw = d.get("password") or ""
     pw2 = d.get("password2") or ""
-    avatar = d.get("avatar") or []
 
     if not nick or not name or not pw:
         raise HTTPException(400, "Заполните все поля")
     if len(nick) < 3:
         raise HTTPException(400, "Ник минимум 3 символа")
-    if any(c in nick for c in " |"):
-        raise HTTPException(400, "Ник не должен содержать пробелы и |")
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", nick):
+        raise HTTPException(400, "Ник: только буквы, цифры, _ . -")
     if pw != pw2:
         raise HTTPException(400, "Пароли не совпадают")
     if len(pw) < 4:
@@ -157,16 +302,10 @@ def register(body: EncBody):
     if nick in USERS:
         raise HTTPException(400, "Такой ник уже занят")
 
-    if not isinstance(avatar, list) or len(avatar) != 64:
-        avatar = ["#ffffff"] * 64
-    avatar = [
-        a if isinstance(a, str) and a.startswith("#") and len(a) == 7 else "#ffffff"
-        for a in avatar
-    ]
-
     USERS[nick] = {
         "name": name, "nick": nick, "password": hash_pw(pw),
-        "avatar": avatar, "contacts": set(), "blacklist": set(),
+        "avatar": normalize_avatar(d.get("avatar")),
+        "contacts": set(), "blacklist": set(),
     }
     token = secrets.token_urlsafe(24)
     SESSIONS[token] = nick
@@ -197,6 +336,27 @@ def me(x_token: Optional[str] = Header(None)):
     }
 
 
+@app.post("/api/profile/update")
+async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
+    nick = auth(x_token)
+    d = parse(body)
+    name = (d.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "Имя не может быть пустым")
+    if len(name) > 60:
+        raise HTTPException(400, "Имя слишком длинное")
+    USERS[nick]["name"] = name
+    if "avatar" in d:
+        USERS[nick]["avatar"] = normalize_avatar(d.get("avatar"))
+
+    # оповестим контакты
+    payload = {"type": "contact_updated", "user": user_public(nick)}
+    for c in list(USERS[nick]["contacts"]):
+        if c in USERS:
+            await push_to(c, payload)
+    return {"ok": True, "me": user_public(nick)}
+
+
 # ============================================================
 #                          SEARCH
 # ============================================================
@@ -205,7 +365,7 @@ def me(x_token: Optional[str] = Header(None)):
 def search(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
-    q = (d.get("nick") or "").strip()
+    q = (d.get("nick") or "").strip().lstrip("@")
     if not q:
         raise HTTPException(400, "Введите ник")
     if q == nick:
@@ -227,7 +387,7 @@ def search(body: EncBody, x_token: Optional[str] = Header(None)):
 async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
-    peer = d.get("nick")
+    peer = (d.get("nick") or "").strip().lstrip("@")
     if peer not in USERS or peer == nick:
         raise HTTPException(400, "Некорректный пользователь")
     if peer in USERS[nick]["blacklist"]:
@@ -240,7 +400,7 @@ async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
 
     await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
     await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
-    return {"ok": True}
+    return {"ok": True, "peer": user_public(peer)}
 
 
 @app.post("/api/chat/send")
@@ -279,8 +439,10 @@ def messages(body: EncBody, x_token: Optional[str] = Header(None)):
     peer = d.get("peer")
     if peer not in USERS:
         raise HTTPException(400, "Пользователь не найден")
-    k = chat_key(nick, peer)
-    return {"messages": CHATS.get(k, []), "peer": user_public(peer)}
+    return {
+        "messages": CHATS.get(chat_key(nick, peer), []),
+        "peer": user_public(peer),
+    }
 
 
 # ============================================================
@@ -291,7 +453,7 @@ def messages(body: EncBody, x_token: Optional[str] = Header(None)):
 async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
-    peer = d.get("nick")
+    peer = (d.get("nick") or "").strip().lstrip("@")
     if peer not in USERS or peer == nick:
         raise HTTPException(400, "Некорректный пользователь")
     USERS[nick]["blacklist"].add(peer)
@@ -304,30 +466,56 @@ async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
 async def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
-    peer = d.get("nick")
+    peer = (d.get("nick") or "").strip().lstrip("@")
     USERS[nick]["blacklist"].discard(peer)
     await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
 
 # ============================================================
+#                       OPENGRAPH
+# ============================================================
+
+@app.post("/api/og")
+async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
+    auth(x_token)
+    d = parse(body)
+    url = (d.get("url") or "").strip()
+    if not is_safe_url(url):
+        raise HTTPException(400, "Invalid URL")
+    return await run_in_threadpool(fetch_og, url)
+
+
+@app.get("/avatar/{nick}.png")
+def avatar_png(nick: str):
+    u = USERS.get(nick)
+    colors = u["avatar"] if u else ["#cfd8dc"] * 64
+    png = make_png(colors, scale=32)
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=600"})
+
+
+# ============================================================
 #                          FRONTEND
 # ============================================================
 
-PAGE = r"""<!DOCTYPE html>
+PAGE_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-content">
 <meta name="theme-color" content="#0a84ff">
-<title>Direct</title>
+<meta name="color-scheme" content="light dark">
+__OG_TAGS__
+<title>__TITLE__</title>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{
-  margin:0;padding:0;height:100%;
+  margin:0;padding:0;height:100%;width:100%;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
   overscroll-behavior:none;
   user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+  overflow:hidden;
 }
 input,textarea{user-select:text;-webkit-user-select:text}
 
@@ -343,20 +531,45 @@ body.dark{
   --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;
   --overlay:rgba(0,0,0,.65);--sidebar:#141416;
 }
-body{background:var(--bg);color:var(--fg);overflow:hidden}
+body{background:var(--bg);color:var(--fg)}
 
 #app{
-  width:100%;height:100vh;height:100dvh;
+  position:fixed;
+  top:var(--app-top,0px);
+  left:0;right:0;
+  height:var(--app-h,100dvh);
   display:flex;flex-direction:column;
-  position:relative;overflow:hidden;
+  overflow:hidden;
   background:var(--bg);
+  transition:height .18s ease-out;
+}
+@media (min-width:900px){
+  #app{position:fixed;top:0;left:0;right:0;height:100vh;height:100dvh}
 }
 
-.screen{display:none;flex:1;overflow:hidden;position:relative}
-.screen.active{display:flex}
+/* ---------- SCREENS with fade ---------- */
+.screen{
+  position:absolute;inset:0;
+  display:flex;flex-direction:column;
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .28s ease,visibility .28s ease;
+}
+.screen.active{opacity:1;visibility:visible;pointer-events:auto}
+
+/* ---------- LOADING ---------- */
+#screen-loading{align-items:center;justify-content:center;background:var(--bg)}
+.spinner{
+  width:40px;height:40px;
+  border:3px solid var(--border);
+  border-top-color:var(--accent);
+  border-radius:50%;
+  animation:spin .9s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-label{margin-top:14px;color:var(--muted);font-size:14px;letter-spacing:.5px}
 
 /* ---------- AUTH ---------- */
-#screen-auth.active{flex-direction:column;align-items:center;overflow-y:auto}
+#screen-auth{flex-direction:column;align-items:center;overflow-y:auto}
 .auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%;
   width:100%;max-width:440px}
 .logo{font-size:38px;font-weight:800;letter-spacing:-1px;text-align:center;margin:14px 0 4px;
@@ -364,23 +577,27 @@ body{background:var(--bg);color:var(--fg);overflow:hidden}
   background-clip:text;-webkit-text-fill-color:transparent}
 .tabs{display:flex;background:var(--card);border-radius:12px;padding:4px;gap:4px;border:1px solid var(--border)}
 .tab{flex:1;padding:10px;border:0;background:transparent;color:var(--fg);border-radius:9px;
-  font-size:15px;font-weight:600;cursor:pointer;transition:.15s}
+  font-size:15px;font-weight:600;cursor:pointer;transition:.2s}
 .tab.active{background:var(--accent);color:#fff}
-.tabpane{display:flex;flex-direction:column;gap:10px}
+.tabpane{display:flex;flex-direction:column;gap:10px;animation:fadeIn .25s ease}
 .tabpane.hidden{display:none}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
 input{
   width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--border);
-  background:var(--card);color:var(--fg);font-size:16px;outline:none;transition:.15s;
+  background:var(--card);color:var(--fg);font-size:16px;outline:none;
+  transition:border-color .15s,box-shadow .15s;
 }
-input:focus{border-color:var(--accent)}
+input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)}
 .btn{
   padding:13px 16px;border-radius:12px;border:1px solid var(--border);
   background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;
-  transition:.15s;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  transition:transform .1s,background .15s,border-color .15s,color .15s;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
 }
 .btn:active{transform:scale(.97)}
 .btn.primary{background:var(--accent);color:#fff;border-color:transparent}
+.btn.primary:hover{filter:brightness(1.06)}
 .btn.danger{background:var(--danger);color:#fff;border-color:transparent}
 .btn.full{width:100%}
 .btn.small{padding:8px 12px;font-size:13px}
@@ -399,10 +616,11 @@ input:focus{border-color:var(--accent)}
 /* ---------- AVATAR EDITOR ---------- */
 .ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);
   padding:14px;border-radius:16px;border:1px solid var(--border)}
-#avaCanvas{width:220px;height:220px;border-radius:12px;background:#fff;touch-action:none;
-  cursor:crosshair;image-rendering:pixelated}
+.ava-editor canvas{width:220px;height:220px;border-radius:12px;background:#fff;
+  touch-action:none;cursor:crosshair;image-rendering:pixelated}
 .palette{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;width:100%}
-.swatch{width:100%;aspect-ratio:1;border-radius:8px;border:2px solid transparent;cursor:pointer;transition:.1s}
+.swatch{width:100%;aspect-ratio:1;border-radius:8px;border:2px solid transparent;
+  cursor:pointer;transition:.15s}
 .swatch.active{border-color:var(--accent);transform:scale(1.12)}
 .ava-tools{display:flex;gap:8px;width:100%}
 .ava-tools .btn{flex:1}
@@ -413,9 +631,8 @@ input:focus{border-color:var(--accent)}
   border-right:1px solid var(--border)}
 .chat-pane{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);flex:1;min-width:0}
 
-/* mobile: одна колонка, переключение по .chat-open */
 @media (max-width: 899px){
-  #screen-app.active{flex-direction:column}
+  #screen-app.active{flex-direction:row}
   .sidebar{flex:1;border-right:0}
   .chat-pane{display:none;flex:1}
   #screen-app.chat-open .sidebar{display:none}
@@ -424,10 +641,7 @@ input:focus{border-color:var(--accent)}
   .fab{display:flex !important}
   .search-inline{display:none}
 }
-
-/* desktop: во весь экран */
 @media (min-width: 900px){
-  body{background:var(--bg)}
   .sidebar{flex:0 0 340px;width:340px}
   .back-mobile{display:none !important}
   .fab{display:none !important}
@@ -439,6 +653,7 @@ input:focus{border-color:var(--accent)}
   display:flex;align-items:center;gap:10px;padding:10px 12px;
   background:var(--card);border-bottom:1px solid var(--border);
   padding-top:max(10px,env(safe-area-inset-top));
+  flex-shrink:0;
 }
 .ava-small{width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#ddd;image-rendering:pixelated}
 .me-info{flex:1;min-width:0;overflow:hidden}
@@ -447,34 +662,38 @@ input:focus{border-color:var(--accent)}
 .icon-btn{
   width:40px;height:40px;border-radius:50%;border:0;background:transparent;color:var(--fg);
   cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  transition:.15s;padding:0;
+  transition:background .15s,transform .1s;padding:0;
 }
-.icon-btn:active,.icon-btn:hover{background:var(--border)}
+.icon-btn:active{background:var(--border);transform:scale(.94)}
+.icon-btn:hover{background:var(--border)}
 .icon-btn.danger{color:var(--danger)}
 
 /* ---------- CONTACTS ---------- */
 .list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
 .contact{
   display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
-  background:transparent;margin-bottom:2px;cursor:pointer;transition:.12s;
+  background:transparent;margin-bottom:2px;cursor:pointer;transition:background .15s,border-color .15s;
   border:1px solid transparent;position:relative;
+  animation:contactIn .25s ease backwards;
 }
+@keyframes contactIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .contact:hover{background:var(--card);border-color:var(--border)}
 .contact.selected{background:var(--card);border-color:var(--border)}
 .contact .badge{
   min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;
   font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
-  padding:0 6px;flex-shrink:0;
+  padding:0 6px;flex-shrink:0;animation:pop .25s ease;
 }
 .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5}
 
 .fab{
-  position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
+  position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;
+  transform:translateX(-50%);
   width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:#fff;
   cursor:pointer;box-shadow:0 8px 28px rgba(10,132,255,.45);
-  transition:.15s;display:flex;align-items:center;justify-content:center;z-index:5;
+  transition:transform .15s,box-shadow .15s;display:flex;align-items:center;justify-content:center;z-index:5;
 }
-.fab:active{transform:translateX(-50%) scale(.92)}
+.fab:active{transform:translateX(-50%) scale(.9)}
 .fab .icon{width:30px;height:30px}
 
 .search-inline{padding:10px 12px 4px;display:none}
@@ -485,22 +704,46 @@ input:focus{border-color:var(--accent)}
 }
 .empty-pane .empty-icon{width:72px;height:72px;opacity:.25}
 .empty-pane.hidden{display:none !important}
-@media (min-width: 900px){
-  .empty-pane{display:flex}
-}
+@media (min-width: 900px){ .empty-pane{display:flex} }
 
-.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden;min-width:0}
+.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden;min-width:0;animation:fadeIn .25s ease}
 .chat-content.hidden{display:none}
 
 /* ---------- MESSAGES ---------- */
-.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px}
+.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px;
+  scroll-behavior:smooth}
 .bubble{
   max-width:78%;padding:9px 13px;border-radius:18px;font-size:15px;line-height:1.35;
   word-wrap:break-word;white-space:pre-wrap;
+  animation:bubbleIn .22s cubic-bezier(.2,.8,.3,1);
 }
+@keyframes bubbleIn{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
 .bubble.out{align-self:flex-end;background:var(--out-bub);color:var(--out-fg);border-bottom-right-radius:6px}
 .bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
   border-bottom-left-radius:6px;border:1px solid var(--border)}
+.bubble .msg-link{color:inherit;text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);
+  cursor:pointer}
+.bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.25)}
+
+/* ---------- OG CARD ---------- */
+.og-card{
+  display:block;margin-top:8px;padding:0;
+  background:rgba(0,0,0,.06);
+  border-radius:12px;overflow:hidden;
+  text-decoration:none;color:inherit;cursor:pointer;
+  border:1px solid rgba(0,0,0,.08);
+  animation:fadeIn .25s ease;
+  max-width:320px;
+}
+.bubble.out .og-card{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.18)}
+.og-card img{display:block;width:100%;height:auto;max-height:180px;object-fit:cover;background:rgba(0,0,0,.06)}
+.og-body{padding:10px 12px}
+.og-site{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;opacity:.7;margin-bottom:3px}
+.og-title{font-size:14px;font-weight:700;line-height:1.3;margin-bottom:3px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.og-desc{font-size:12px;line-height:1.35;opacity:.8;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+
 .composer{
   display:flex;gap:8px;padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom));
   background:var(--card);border-top:1px solid var(--border);align-items:center;
@@ -512,15 +755,21 @@ input:focus{border-color:var(--accent)}
 .overlay{
   position:absolute;inset:0;background:var(--overlay);display:flex;align-items:flex-end;
   justify-content:center;z-index:50;
+  opacity:1;visibility:visible;
+  transition:opacity .22s ease,visibility .22s ease;
 }
-.overlay.hidden{display:none}
+.overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}
 .modal{
   background:var(--card);width:100%;max-height:88%;border-radius:22px 22px 0 0;
   display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom);
+  transform:translateY(0);
+  transition:transform .28s cubic-bezier(.2,.8,.3,1);
 }
+.overlay.hidden .modal{transform:translateY(30px)}
 @media(min-width:700px){
   .overlay{align-items:center}
   .modal{max-width:440px;border-radius:20px;max-height:80%}
+  .overlay.hidden .modal{transform:translateY(20px) scale(.98)}
 }
 .modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;
   border-bottom:1px solid var(--border);font-size:17px;font-weight:700}
@@ -533,7 +782,8 @@ input:focus{border-color:var(--accent)}
   cursor:pointer;font-size:14px;font-weight:600;transition:.15s}
 .seg-btn.active{background:var(--accent);color:#fff}
 .search-card{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;
-  background:var(--bg);border-radius:16px;border:1px solid var(--border)}
+  background:var(--bg);border-radius:16px;border:1px solid var(--border);
+  animation:fadeIn .25s ease}
 .ava-mid{width:96px;height:96px;border-radius:50%;image-rendering:pixelated;background:#ddd}
 #infoAva{width:140px;height:140px;border-radius:50%;image-rendering:pixelated;background:#ddd;margin:0 auto}
 .bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);
@@ -543,6 +793,18 @@ input:focus{border-color:var(--accent)}
 .bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);
   color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
 .bl-item button .icon{width:16px;height:16px}
+
+/* ---------- TOAST ---------- */
+.toast{
+  position:fixed;bottom:40px;left:50%;
+  transform:translateX(-50%) translateY(20px);
+  background:rgba(0,0,0,.88);color:#fff;
+  padding:10px 18px;border-radius:20px;font-size:14px;font-weight:500;
+  opacity:0;transition:opacity .25s,transform .25s;
+  z-index:9999;pointer-events:none;
+  box-shadow:0 8px 24px rgba(0,0,0,.3);
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
 </head>
 <body>
@@ -585,11 +847,26 @@ input:focus{border-color:var(--accent)}
   <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
   </symbol>
+  <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+    <circle cx="12" cy="7" r="4"/>
+  </symbol>
+  <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+  </symbol>
 </svg>
 
 <div id="app">
 
-  <div class="screen active" id="screen-auth">
+  <!-- ============== LOADING ============== -->
+  <div class="screen active" id="screen-loading">
+    <div class="spinner"></div>
+    <div class="loading-label">Direct</div>
+  </div>
+
+  <!-- ============== AUTH ============== -->
+  <div class="screen" id="screen-auth">
     <div class="auth-wrap">
       <h1 class="logo">Direct</h1>
       <div class="tabs">
@@ -608,9 +885,9 @@ input:focus{border-color:var(--accent)}
           <canvas id="avaCanvas" width="256" height="256"></canvas>
           <div class="palette" id="palette"></div>
           <div class="ava-tools">
-            <button class="btn small" onclick="clearAvatar()" data-i18n="clear">Очистить</button>
-            <button class="btn small" onclick="randomAvatar()" data-i18n="random">Случайно</button>
-            <button class="btn small" onclick="fillAvatar()" data-i18n="fill">Залить</button>
+            <button class="btn small" onclick="regEditor.clear()" data-i18n="clear">Очистить</button>
+            <button class="btn small" onclick="regEditor.random()" data-i18n="random">Случайно</button>
+            <button class="btn small" onclick="regEditor.fill()" data-i18n="fill">Залить</button>
           </div>
         </div>
         <input id="rg-name" data-i18n-ph="ph_name" placeholder="Имя">
@@ -624,6 +901,7 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
+  <!-- ============== APP ============== -->
   <div class="screen" id="screen-app">
 
     <aside class="sidebar">
@@ -678,7 +956,7 @@ input:focus{border-color:var(--accent)}
         </header>
         <div class="messages" id="messages"></div>
         <form class="composer" onsubmit="sendMsg(event)">
-          <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off">
+          <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off" enterkeyhint="send">
           <button class="btn primary" type="submit" aria-label="Send">
             <svg class="icon"><use href="#i-send"/></svg>
           </button>
@@ -687,6 +965,7 @@ input:focus{border-color:var(--accent)}
     </section>
   </div>
 
+  <!-- SEARCH MODAL -->
   <div class="overlay hidden" id="modal-search" onclick="backdropClose(event,'modal-search')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -708,6 +987,7 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
+  <!-- SETTINGS MODAL -->
   <div class="overlay hidden" id="modal-settings" onclick="backdropClose(event,'modal-settings')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -717,6 +997,14 @@ input:focus{border-color:var(--accent)}
         </button>
       </div>
       <div class="modal-body">
+        <button class="btn full" onclick="openEditProfile()">
+          <svg class="icon icon-sm"><use href="#i-user"/></svg>
+          <span data-i18n="edit_profile">Редактировать профиль</span>
+        </button>
+        <button class="btn full" onclick="copyMyLink()">
+          <svg class="icon icon-sm"><use href="#i-link"/></svg>
+          <span data-i18n="copy_my_link">Скопировать ссылку на профиль</span>
+        </button>
         <div class="setting">
           <span data-i18n="theme">Тема</span>
           <div class="seg">
@@ -746,6 +1034,33 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
+  <!-- EDIT PROFILE MODAL -->
+  <div class="overlay hidden" id="modal-edit" onclick="backdropClose(event,'modal-edit')">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head">
+        <span data-i18n="edit_profile">Редактировать профиль</span>
+        <button class="icon-btn" onclick="closeModal('modal-edit')" aria-label="Close">
+          <svg class="icon"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="ava-editor">
+          <canvas id="editAvaCanvas" width="256" height="256"></canvas>
+          <div class="palette" id="editPalette"></div>
+          <div class="ava-tools">
+            <button class="btn small" onclick="editEditor.clear()" data-i18n="clear">Очистить</button>
+            <button class="btn small" onclick="editEditor.random()" data-i18n="random">Случайно</button>
+            <button class="btn small" onclick="editEditor.fill()" data-i18n="fill">Залить</button>
+          </div>
+        </div>
+        <input id="editName" data-i18n-ph="ph_name" placeholder="Имя">
+        <div class="muted" style="text-align:center">@<span id="editNick"></span></div>
+        <button class="btn primary full" onclick="saveProfile()" data-i18n="save">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- INFO MODAL -->
   <div class="overlay hidden" id="modal-info" onclick="backdropClose(event,'modal-info')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -809,7 +1124,11 @@ const I18N = {
     no_bl:"Список пуст",
     confirm_logout:"Выйти из аккаунта?",
     remove:"Убрать",
-    new_chat:"Новый чат", select_chat:"Выберите чат слева"
+    new_chat:"Новый чат", select_chat:"Выберите чат слева",
+    edit_profile:"Редактировать профиль", save:"Сохранить",
+    copy_my_link:"Скопировать ссылку на профиль",
+    link_copied:"Ссылка скопирована",
+    profile_updated:"Профиль обновлён"
   },
   en: {
     login:"Sign in", register:"Sign up", create:"Create account",
@@ -824,7 +1143,11 @@ const I18N = {
     no_bl:"List is empty",
     confirm_logout:"Log out?",
     remove:"Remove",
-    new_chat:"New chat", select_chat:"Select a chat on the left"
+    new_chat:"New chat", select_chat:"Select a chat on the left",
+    edit_profile:"Edit profile", save:"Save",
+    copy_my_link:"Copy profile link",
+    link_copied:"Link copied",
+    profile_updated:"Profile updated"
   }
 };
 let LANG = localStorage.getItem('direct_lang') || 'ru';
@@ -840,9 +1163,11 @@ let blacklist = [];
 let currentPeer = null;
 let currentPeerData = null;
 let ws = null;
-let unread = {};           // nick -> count
+let unread = {};
 let renderedIds = new Set();
-let renderedPeer = null;
+const ogClientCache = {};
+const profileMatch = location.pathname.match(/^\/@([^/]+)$/);
+let pendingTarget = profileMatch ? decodeURIComponent(profileMatch[1]) : null;
 
 /* ============================================================
                        API
@@ -900,7 +1225,6 @@ function handleWsEvent(ev){
     const m = ev.msg;
     const isMine = m.from === me?.nick;
 
-    // если открыт чат с отправителем/получателем — просто добавим баббл
     if (currentPeer && (m.from === currentPeer || m.to === currentPeer)){
       appendMessage(m);
     }
@@ -912,15 +1236,22 @@ function handleWsEvent(ev){
         playBeep();
         showDesktopNotification(m.from, m.text);
       }
-      if (!isCurrentChat){
-        addUnread(m.from);
-      }
+      if (!isCurrentChat) addUnread(m.from);
       if (!contacts.find(c => c.nick === m.from)){
         refreshMe().catch(()=>{});
       }
     }
   } else if (ev.type === 'contact_added'){
     refreshMe().catch(()=>{});
+  } else if (ev.type === 'contact_updated'){
+    const u = ev.user;
+    const c = contacts.find(x => x.nick === u.nick);
+    if (c){ c.name = u.name; c.avatar = u.avatar; renderContacts(); }
+    if (currentPeer === u.nick){
+      currentPeerData = u;
+      document.getElementById('peerName').textContent = u.name;
+      paintAva(document.getElementById('peerAva'), u.avatar);
+    }
   } else if (ev.type === 'blacklist_changed'){
     refreshMe().catch(()=>{});
   }
@@ -993,117 +1324,152 @@ function updateTitle(){
 }
 
 /* ============================================================
-                     AVATAR (8x8)
+                       TOAST
    ============================================================ */
-const GRID = 8;
-let avatarData = new Array(GRID*GRID).fill('#ffffff');
-let currentColor = '#000000';
+let toastEl = null;
+function toast(msg){
+  if (toastEl) toastEl.remove();
+  toastEl = document.createElement('div');
+  toastEl.className = 'toast';
+  toastEl.textContent = msg;
+  document.body.appendChild(toastEl);
+  requestAnimationFrame(() => toastEl.classList.add('show'));
+  setTimeout(() => {
+    if (toastEl) {
+      toastEl.classList.remove('show');
+      setTimeout(() => { if (toastEl) { toastEl.remove(); toastEl = null; } }, 300);
+    }
+  }, 2000);
+}
 
+async function copyText(txt){
+  try {
+    await navigator.clipboard.writeText(txt);
+    return true;
+  } catch(_){
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = txt;
+      ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      return true;
+    } catch(_){ return false; }
+  }
+}
+
+/* ============================================================
+                     AVATAR (8x8) — редактор
+   ============================================================ */
 const PALETTE = [
   '#000000','#ffffff','#8e8e93','#c7c7cc',
   '#ff3b30','#ff9500','#ffcc00','#34c759',
   '#00c7be','#0a84ff','#5856d6','#af52de',
   '#ff2d55','#5c3b1e','#f5c6a5','#b3e5fc'
 ];
+const GRID = 8;
+
+function makeAvatarEditor(canvasEl, paletteEl){
+  let data = new Array(64).fill('#ffffff');
+  let color = '#000000';
+  let drawing = false;
+
+  function render(){
+    const ctx = canvasEl.getContext('2d');
+    const W = canvasEl.width;
+    const cell = W / GRID;
+    ctx.clearRect(0, 0, W, W);
+    for (let i = 0; i < 64; i++){
+      ctx.fillStyle = data[i];
+      ctx.fillRect((i % GRID) * cell, Math.floor(i / GRID) * cell, cell, cell);
+    }
+    ctx.strokeStyle = 'rgba(0,0,0,.14)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < GRID; i++){
+      ctx.beginPath(); ctx.moveTo(i*cell,0); ctx.lineTo(i*cell,W); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0,i*cell); ctx.lineTo(W,i*cell); ctx.stroke();
+    }
+  }
+
+  function buildPalette(){
+    paletteEl.innerHTML = '';
+    PALETTE.forEach((c, i) => {
+      const b = document.createElement('div');
+      b.className = 'swatch' + (i === 0 ? ' active' : '');
+      b.style.background = c;
+      b.onclick = () => {
+        color = c;
+        paletteEl.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
+        b.classList.add('active');
+      };
+      paletteEl.appendChild(b);
+    });
+  }
+
+  function paintAt(cx, cy){
+    const r = canvasEl.getBoundingClientRect();
+    const x = Math.floor((cx - r.left) / (r.width / GRID));
+    const y = Math.floor((cy - r.top) / (r.height / GRID));
+    if (x < 0 || x > 7 || y < 0 || y > 7) return;
+    data[y*GRID + x] = color;
+    render();
+  }
+
+  canvasEl.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    drawing = true;
+    try { canvasEl.setPointerCapture(e.pointerId); } catch(_){}
+    paintAt(e.clientX, e.clientY);
+  });
+  canvasEl.addEventListener('pointermove', e => { if (drawing) paintAt(e.clientX, e.clientY); });
+  canvasEl.addEventListener('pointerup', () => drawing = false);
+  canvasEl.addEventListener('pointercancel', () => drawing = false);
+
+  buildPalette();
+  render();
+
+  return {
+    getData: () => data.slice(),
+    setData: (d) => { if (Array.isArray(d) && d.length === 64){ data = d.slice(); render(); } },
+    clear: () => { data = new Array(64).fill('#ffffff'); render(); },
+    fill:  () => { data = new Array(64).fill(color); render(); },
+    random: () => {
+      const cols = PALETTE.slice(2);
+      const pick = () => cols[Math.floor(Math.random() * cols.length)];
+      const c1 = pick(), c2 = pick(), c3 = pick();
+      const half = [];
+      for (let y = 0; y < 8; y++){
+        const row = [];
+        for (let x = 0; x < 4; x++){
+          const r = Math.random();
+          row.push(r < 0.4 ? c1 : r < 0.7 ? c2 : r < 0.9 ? c3 : '#ffffff');
+        }
+        half.push(row);
+      }
+      data = [];
+      for (let y = 0; y < 8; y++){
+        for (let x = 0; x < 4; x++) data.push(half[y][x]);
+        for (let x = 3; x >= 0; x--) data.push(half[y][x]);
+      }
+      render();
+    }
+  };
+}
 
 function paintAva(canvas, data){
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
   const cell = W / GRID;
-  ctx.clearRect(0,0,W,W);
-  for (let i=0;i<GRID*GRID;i++){
+  ctx.clearRect(0, 0, W, W);
+  for (let i = 0; i < 64; i++){
     ctx.fillStyle = (data && data[i]) || '#ffffff';
-    const x = (i % GRID) * cell;
-    const y = Math.floor(i / GRID) * cell;
-    ctx.fillRect(x, y, cell, cell);
+    ctx.fillRect((i % GRID) * cell, Math.floor(i / GRID) * cell, cell, cell);
   }
 }
 
-const avaCanvas = document.getElementById('avaCanvas');
-const avaCtx = avaCanvas.getContext('2d');
-
-function renderEditor(){
-  paintAva(avaCanvas, avatarData);
-  const cell = avaCanvas.width / GRID;
-  avaCtx.strokeStyle = 'rgba(0,0,0,.14)';
-  avaCtx.lineWidth = 1;
-  for (let i=1;i<GRID;i++){
-    avaCtx.beginPath(); avaCtx.moveTo(i*cell,0); avaCtx.lineTo(i*cell,avaCanvas.height); avaCtx.stroke();
-    avaCtx.beginPath(); avaCtx.moveTo(0,i*cell); avaCtx.lineTo(avaCanvas.width,i*cell); avaCtx.stroke();
-  }
-}
-
-function buildPalette(){
-  const box = document.getElementById('palette');
-  box.innerHTML = '';
-  PALETTE.forEach((c) => {
-    const b = document.createElement('div');
-    b.className = 'swatch';
-    b.style.background = c;
-    b.onclick = () => {
-      currentColor = c;
-      document.querySelectorAll('.swatch').forEach(s=>s.classList.remove('active'));
-      b.classList.add('active');
-    };
-    box.appendChild(b);
-  });
-  const first = box.children[0];
-  if (first) first.classList.add('active');
-}
-
-let drawing = false;
-function posToCell(clientX, clientY){
-  const r = avaCanvas.getBoundingClientRect();
-  const x = Math.floor((clientX - r.left) / (r.width/GRID));
-  const y = Math.floor((clientY - r.top) / (r.height/GRID));
-  if (x < 0 || x > 7 || y < 0 || y > 7) return null;
-  return [x,y];
-}
-function paintAt(clientX, clientY){
-  const p = posToCell(clientX, clientY);
-  if (!p) return;
-  avatarData[p[1]*GRID + p[0]] = currentColor;
-  renderEditor();
-}
-avaCanvas.addEventListener('pointerdown', e => {
-  e.preventDefault();
-  drawing = true;
-  try { avaCanvas.setPointerCapture(e.pointerId); } catch(_){}
-  paintAt(e.clientX, e.clientY);
-});
-avaCanvas.addEventListener('pointermove', e => { if (drawing) paintAt(e.clientX, e.clientY); });
-avaCanvas.addEventListener('pointerup', () => { drawing = false; });
-avaCanvas.addEventListener('pointercancel', () => { drawing = false; });
-
-function clearAvatar(){
-  avatarData = new Array(64).fill('#ffffff');
-  renderEditor();
-}
-function fillAvatar(){
-  avatarData = new Array(64).fill(currentColor);
-  renderEditor();
-}
-function randomAvatar(){
-  const cols = PALETTE.slice(2);
-  const c1 = cols[Math.floor(Math.random()*cols.length)];
-  const c2 = cols[Math.floor(Math.random()*cols.length)];
-  const c3 = cols[Math.floor(Math.random()*cols.length)];
-  const half = [];
-  for (let y=0;y<8;y++){
-    const row = [];
-    for (let x=0;x<4;x++){
-      const r = Math.random();
-      row.push(r < 0.4 ? c1 : r < 0.7 ? c2 : r < 0.9 ? c3 : '#ffffff');
-    }
-    half.push(row);
-  }
-  avatarData = [];
-  for (let y=0;y<8;y++){
-    for (let x=0;x<4;x++) avatarData.push(half[y][x]);
-    for (let x=3;x>=0;x--) avatarData.push(half[y][x]);
-  }
-  renderEditor();
-}
+let regEditor, editEditor;
 
 /* ============================================================
                        UI
@@ -1116,7 +1482,7 @@ function showErr(id, msg){
   const el = document.getElementById(id);
   el.textContent = msg;
   clearTimeout(el._t);
-  el._t = setTimeout(()=>{ el.textContent = ''; }, 4000);
+  el._t = setTimeout(() => { el.textContent = ''; }, 4000);
 }
 function openModal(id){ document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
@@ -1174,6 +1540,7 @@ async function doLogin(){
     await refreshMe();
     showScreen('screen-app');
     connectWS();
+    await handlePendingTarget();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
@@ -1183,13 +1550,17 @@ async function doRegister(){
   const password = document.getElementById('rg-pass').value;
   const password2 = document.getElementById('rg-pass2').value;
   try {
-    const r = await api('/api/register', { name, nick, password, password2, avatar: avatarData });
+    const r = await api('/api/register', {
+      name, nick, password, password2,
+      avatar: regEditor.getData()
+    });
     token = r.token; me = r.me;
     localStorage.setItem('direct_token', token);
     requestNotifPermission();
     await refreshMe();
     showScreen('screen-app');
     connectWS();
+    await handlePendingTarget();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
@@ -1201,9 +1572,24 @@ function logout(){
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
   closeModal('modal-settings');
+  closeModal('modal-edit');
   closeChat(true);
   updateTitle();
   showScreen('screen-auth');
+}
+
+async function handlePendingTarget(){
+  if (!pendingTarget) return;
+  const target = pendingTarget;
+  pendingTarget = null;
+  try { history.replaceState({}, '', '/'); } catch(_){}
+  if (!me || target === me.nick) return;
+  try {
+    const r = await api('/api/search', { nick: target });
+    await startChat(r.user.nick);
+  } catch(e){
+    toast(e.message || 'Не удалось открыть чат');
+  }
 }
 
 /* ============================================================
@@ -1268,7 +1654,7 @@ function openSearch(){
   document.getElementById('searchNick').value = '';
   document.getElementById('searchResult').innerHTML = '';
   openModal('modal-search');
-  setTimeout(()=>document.getElementById('searchNick').focus(), 250);
+  setTimeout(() => document.getElementById('searchNick').focus(), 250);
 }
 
 async function doSearch(){
@@ -1313,13 +1699,33 @@ async function startChat(peerNick){
     await api('/api/chat/start', { nick: peerNick });
     await refreshMe();
     openChat(peerNick);
-  } catch(e){ alert(e.message); }
+  } catch(e){ toast(e.message); }
 }
 
 function resetMessages(peer){
   document.getElementById('messages').innerHTML = '';
   renderedIds = new Set();
-  renderedPeer = peer;
+}
+
+function linkifyInto(container, text){
+  const re = /(https?:\/\/[^\s<>"']+)/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null){
+    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const a = document.createElement('a');
+    a.className = 'msg-link';
+    a.href = m[0];
+    a.textContent = m[0];
+    a.onclick = async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const ok = await copyText(m[0]);
+      toast(ok ? t('link_copied') : 'Copy failed');
+    };
+    container.appendChild(a);
+    last = re.lastIndex;
+  }
+  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
 }
 
 function appendMessage(m, scroll = true){
@@ -1328,14 +1734,78 @@ function appendMessage(m, scroll = true){
   renderedIds.add(m.id);
 
   const box = document.getElementById('messages');
-  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
 
   const el = document.createElement('div');
   el.className = 'bubble ' + (m.from === me.nick ? 'out' : 'in');
-  el.textContent = m.text;
+  linkifyInto(el, m.text);
   box.appendChild(el);
 
   if (scroll && nearBottom) box.scrollTop = box.scrollHeight;
+
+  const urls = m.text.match(/https?:\/\/[^\s<>"']+/g);
+  if (urls && urls[0]) maybeRenderOg(el, urls[0]);
+}
+
+async function maybeRenderOg(bubbleEl, url){
+  let data = ogClientCache[url];
+  if (!data){
+    try {
+      data = await api('/api/og', { url });
+      ogClientCache[url] = data;
+    } catch(e){
+      ogClientCache[url] = { error: true };
+      return;
+    }
+  }
+  if (!data || data.error || !data.title) return;
+  // защита от повторного рендера
+  if (bubbleEl.querySelector('.og-card')) return;
+
+  const card = document.createElement('a');
+  card.className = 'og-card';
+  card.href = url;
+  card.onclick = async (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const ok = await copyText(url);
+    toast(ok ? t('link_copied') : 'Copy failed');
+  };
+
+  if (data.image){
+    const img = document.createElement('img');
+    img.src = data.image;
+    img.loading = 'lazy';
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => img.remove();
+    card.appendChild(img);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'og-body';
+  if (data.site_name){
+    const s = document.createElement('div');
+    s.className = 'og-site';
+    s.textContent = data.site_name;
+    body.appendChild(s);
+  }
+  const ttl = document.createElement('div');
+  ttl.className = 'og-title';
+  ttl.textContent = data.title;
+  body.appendChild(ttl);
+  if (data.description){
+    const d = document.createElement('div');
+    d.className = 'og-desc';
+    d.textContent = data.description;
+    body.appendChild(d);
+  }
+  card.appendChild(body);
+  bubbleEl.appendChild(card);
+
+  const box = document.getElementById('messages');
+  if (box.scrollHeight - box.scrollTop - box.clientHeight < 500){
+    box.scrollTop = box.scrollHeight;
+  }
 }
 
 async function openChat(peerNick){
@@ -1357,9 +1827,8 @@ async function openChat(peerNick){
     document.getElementById('screen-app').classList.add('chat-open');
     clearUnread(peerNick);
     renderContacts();
-
-    setTimeout(()=>document.getElementById('msgInput').focus(), 100);
-  } catch(e){ alert(e.message); }
+    setTimeout(() => document.getElementById('msgInput').focus(), 120);
+  } catch(e){ toast(e.message); }
 }
 
 async function sendMsg(e){
@@ -1370,11 +1839,10 @@ async function sendMsg(e){
   inp.value = '';
   try {
     const r = await api('/api/chat/send', { to: currentPeer, text });
-    // сразу показываем у себя (WS-эхо дедуплицируется по id)
     appendMessage(r.msg);
     try { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); } catch(_){}
   } catch(err){
-    alert(err.message);
+    toast(err.message);
     inp.value = text;
   }
 }
@@ -1382,7 +1850,6 @@ async function sendMsg(e){
 function closeChat(silent){
   currentPeer = null;
   currentPeerData = null;
-  renderedPeer = null;
   renderedIds = new Set();
   document.getElementById('messages').innerHTML = '';
   document.getElementById('chatContent').classList.add('hidden');
@@ -1414,6 +1881,40 @@ function openInfo(){
 function openSettings(){
   renderBlacklist();
   openModal('modal-settings');
+}
+
+function openEditProfile(){
+  if (!me) return;
+  document.getElementById('editName').value = me.name;
+  document.getElementById('editNick').textContent = me.nick;
+  editEditor.setData(me.avatar);
+  closeModal('modal-settings');
+  openModal('modal-edit');
+}
+
+async function saveProfile(){
+  const name = document.getElementById('editName').value.trim();
+  if (!name){ toast('Введите имя'); return; }
+  try {
+    const r = await api('/api/profile/update', {
+      name,
+      avatar: editEditor.getData()
+    });
+    me = r.me;
+    paintAva(document.getElementById('meAva'), me.avatar);
+    document.getElementById('meName').textContent = me.name;
+    document.getElementById('meNick').textContent = '@' + me.nick;
+    // обновим себя в списке контактов других — не нужно, они получат WS
+    closeModal('modal-edit');
+    toast(t('profile_updated'));
+  } catch(e){ toast(e.message); }
+}
+
+async function copyMyLink(){
+  if (!me) return;
+  const url = location.origin + '/@' + me.nick;
+  const ok = await copyText(url);
+  toast(ok ? t('link_copied') : 'Copy failed');
 }
 
 function renderBlacklist(){
@@ -1460,47 +1961,111 @@ async function blAdd(){
     await api('/api/blacklist/add', { nick });
     inp.value = '';
     await refreshMe();
-  } catch(e){ alert(e.message); }
+  } catch(e){ toast(e.message); }
 }
 
 async function blRemove(nick){
   try {
     await api('/api/blacklist/remove', { nick });
     await refreshMe();
-  } catch(e){ alert(e.message); }
+  } catch(e){ toast(e.message); }
 }
 
 /* ============================================================
-                       INIT
+                 KEYBOARD / VIEWPORT
    ============================================================ */
+function updateViewport(){
+  const vv = window.visualViewport;
+  if (!vv){
+    document.documentElement.style.setProperty('--app-h', window.innerHeight + 'px');
+    document.documentElement.style.setProperty('--app-top', '0px');
+    return;
+  }
+  document.documentElement.style.setProperty('--app-h', vv.height + 'px');
+  document.documentElement.style.setProperty('--app-top', vv.offsetTop + 'px');
+}
+
+if (window.visualViewport){
+  window.visualViewport.addEventListener('resize', updateViewport);
+  window.visualViewport.addEventListener('scroll', updateViewport);
+}
+window.addEventListener('resize', updateViewport);
+window.addEventListener('orientationchange', () => setTimeout(updateViewport, 100));
+
+/* iOS/Android: инпут не должен "убегать" — фиксируем позицию после фокуса */
+function pinViewportAfterFocus(){
+  setTimeout(() => {
+    try { window.scrollTo(0, 0); } catch(_){}
+    updateViewport();
+    const box = document.getElementById('messages');
+    if (box) box.scrollTop = box.scrollHeight;
+  }, 80);
+}
+
+/* ============================================================
+                       INIT / BOOT
+   ============================================================ */
+function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function boot(){
+  showScreen('screen-loading');
+  const t0 = Date.now();
+  const MIN = 350;
+
+  if (token){
+    try {
+      const r = await api('/api/me', null, 'GET');
+      me = r.me; contacts = r.contacts; blacklist = r.blacklist;
+      paintAva(document.getElementById('meAva'), me.avatar);
+      document.getElementById('meName').textContent = me.name;
+      document.getElementById('meNick').textContent = '@' + me.nick;
+      renderContacts();
+      renderBlacklist();
+      const wait = MIN - (Date.now() - t0);
+      if (wait > 0) await delay(wait);
+      showScreen('screen-app');
+      requestNotifPermission();
+      connectWS();
+      updateViewport();
+      await handlePendingTarget();
+      return;
+    } catch(_){
+      token = null;
+      localStorage.removeItem('direct_token');
+    }
+  }
+
+  const wait = MIN - (Date.now() - t0);
+  if (wait > 0) await delay(wait);
+  showScreen('screen-auth');
+}
+
 (function init(){
   applyTheme(localStorage.getItem('direct_theme') || 'light');
   applyLang(LANG);
-  buildPalette();
-  randomAvatar();
 
-  if (token){
-    api('/api/me', null, 'GET')
-      .then(r => {
-        me = r.me; contacts = r.contacts; blacklist = r.blacklist;
-        paintAva(document.getElementById('meAva'), me.avatar);
-        document.getElementById('meName').textContent = me.name;
-        document.getElementById('meNick').textContent = '@' + me.nick;
-        renderContacts();
-        renderBlacklist();
-        showScreen('screen-app');
-        requestNotifPermission();
-        connectWS();
-      })
-      .catch(() => {
-        token = null;
-        localStorage.removeItem('direct_token');
-      });
-  }
+  regEditor = makeAvatarEditor(
+    document.getElementById('avaCanvas'),
+    document.getElementById('palette')
+  );
+  editEditor = makeAvatarEditor(
+    document.getElementById('editAvaCanvas'),
+    document.getElementById('editPalette')
+  );
+
+  regEditor.random();
+  updateViewport();
 
   document.getElementById('searchNick').addEventListener('keydown', e => {
     if (e.key === 'Enter'){ e.preventDefault(); doSearch(); }
   });
+  document.getElementById('msgInput').addEventListener('focus', pinViewportAfterFocus);
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && token && (!ws || ws.readyState > 1)) connectWS();
+  });
+
+  boot();
 })();
 </script>
 </body>
@@ -1508,10 +2073,62 @@ async function blRemove(nick){
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return PAGE
+# ============================================================
+#                       HTML-СТРАНИЦЫ
+# ============================================================
 
+def render_page(og_tags: str, title: str) -> str:
+    return (PAGE_TEMPLATE
+            .replace("__OG_TAGS__", og_tags)
+            .replace("__TITLE__", html_module.escape(title)))
+
+
+def _default_og(base: str) -> str:
+    return (
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:title" content="Direct — простой мессенджер">\n'
+        '<meta property="og:description" content="Приватный мессенджер с шифрованием и обменом сообщениями в реальном времени">\n'
+        f'<meta property="og:url" content="{base}/">\n'
+        '<meta name="twitter:card" content="summary">\n'
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return render_page(_default_og(base), "Direct — мессенджер")
+
+
+@app.get("/@{nick}", response_class=HTMLResponse)
+def profile_page(nick: str, request: Request):
+    base = str(request.base_url).rstrip("/")
+    safe_nick = html_module.escape(nick)
+    if nick in USERS:
+        u = USERS[nick]
+        name = html_module.escape(u["name"])
+        og = (
+            '<meta property="og:type" content="profile">\n'
+            f'<meta property="og:title" content="{name} (@{safe_nick}) — Direct">\n'
+            f'<meta property="og:description" content="Напишите мне в Direct → @{safe_nick}">\n'
+            f'<meta property="og:image" content="{base}/avatar/{safe_nick}.png">\n'
+            f'<meta property="og:image:width" content="256">\n'
+            f'<meta property="og:image:height" content="256">\n'
+            f'<meta property="og:url" content="{base}/@{safe_nick}">\n'
+            '<meta name="twitter:card" content="summary">\n'
+        )
+        return render_page(og, f"{name} (@{nick}) — Direct")
+    og = (
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:title" content="Direct">\n'
+        f'<meta property="og:description" content="Пользователь @{safe_nick} не найден">\n'
+        f'<meta property="og:url" content="{base}/@{safe_nick}">\n'
+    )
+    return render_page(og, "Direct")
+
+
+# ============================================================
+#                        ЗАПУСК
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
