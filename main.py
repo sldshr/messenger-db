@@ -86,7 +86,7 @@ async def create_post(post: PostCreate, session_token: Optional[str] = Cookie(No
     return new_post
 
 
-# --- HTML / CSS / JS Интерфейс (Material Design) ---
+# --- HTML / CSS / JS Интерфейс (Чистый CSS, без Tailwind) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -94,250 +94,262 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Litodon</title>
-    <!-- Подключаем шрифты и иконки Google Material Design -->
-    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
     <style>
-        /* --- Переменные Material Design (Dark Theme) --- */
+        /* --- Точные цвета Mastodon Dark Theme --- */
         :root {
-            --md-bg: #121212;
-            --md-surface: #1e1e1e;
-            --md-surface-hover: #2c2c2c;
-            --md-primary: #6364ff;
-            --md-primary-hover: #5051db;
-            --md-on-primary: #ffffff;
-            --md-text: #e0e0e0;
-            --md-text-muted: #a0aec0;
-            --md-border: #333333;
-            --md-elevation-1: 0px 2px 1px -1px rgba(0,0,0,0.2), 0px 1px 1px 0px rgba(0,0,0,0.14), 0px 1px 3px 0px rgba(0,0,0,0.12);
-            --md-elevation-2: 0px 3px 1px -2px rgba(0,0,0,0.2), 0px 2px 2px 0px rgba(0,0,0,0.14), 0px 1px 5px 0px rgba(0,0,0,0.12);
+            --bg-color: #191b22;
+            --col-bg: #282c37;
+            --border-color: #393f4f;
+            --text-main: #d9e1e8;
+            --text-muted: #606984;
+            --accent: #6364ff;
+            --accent-hover: #5051db;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
+        
         body {
-            background-color: var(--md-bg);
-            color: var(--md-text);
-            font-family: 'Roboto', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             height: 100vh;
             overflow: hidden;
-            display: flex;
+            font-size: 15px;
+            line-height: 1.5;
         }
 
-        /* --- Макет (Grid Layout) --- */
-        .layout-grid {
+        /* --- Сетка макета --- */
+        .app-container {
             display: grid;
-            grid-template-columns: 1fr 2fr 1fr;
-            width: 100%;
-            max-width: 1400px;
+            grid-template-columns: 285px 1fr 285px;
+            max-width: 1200px;
             margin: 0 auto;
-            height: 100%;
-            border-left: 1px solid var(--md-border);
-            border-right: 1px solid var(--md-border);
+            height: 100vh;
+            border-left: 1px solid var(--border-color);
+            border-right: 1px solid var(--border-color);
         }
 
         .column {
-            display: flex;
-            flex-direction: column;
             height: 100%;
             overflow-y: auto;
             padding: 16px;
-            border-right: 1px solid var(--md-border);
         }
-        .column:last-child { border-right: none; }
+        .column::-webkit-scrollbar { width: 8px; }
+        .column::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
 
-        /* --- Material Input --- */
-        .md-input-wrapper {
+        .left-col { border-right: 1px solid var(--border-color); }
+        .center-col { padding: 16px 24px; }
+        .right-col { border-left: 1px solid var(--border-color); }
+
+        /* --- Левая колонка --- */
+        .search-box {
             position: relative;
             margin-bottom: 24px;
         }
-        .md-input-wrapper .material-symbols-outlined {
-            position: absolute;
-            left: 12px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--md-text-muted);
-            font-size: 20px;
-        }
-        .md-input {
+        .search-box input {
             width: 100%;
-            background-color: var(--md-surface);
-            border: 1px solid var(--md-border);
-            border-radius: 4px 4px 0 0;
-            padding: 12px 12px 12px 40px;
-            color: var(--md-text);
-            font-family: 'Roboto', sans-serif;
+            background: var(--col-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 8px 12px 8px 36px;
+            color: var(--text-main);
             font-size: 14px;
             outline: none;
-            transition: border-color 0.2s, box-shadow 0.2s;
         }
-        .md-input:focus {
-            border-bottom: 2px solid var(--md-primary);
-            box-shadow: 0 1px 0 0 var(--md-primary);
+        .search-box input:focus { border-color: var(--accent); }
+        .search-box svg {
+            position: absolute;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 16px;
+            height: 16px;
+            fill: var(--text-muted);
         }
 
-        /* --- Material Buttons --- */
-        .md-btn {
-            display: inline-flex;
+        .left-col p { margin-bottom: 16px; font-size: 14px; }
+        
+        .illustration {
+            width: 100%;
+            height: 140px;
+            background: linear-gradient(135deg, #fceabb 0%, #f8b500 100%);
+            border-radius: 6px;
+            margin-bottom: 16px;
+            display: flex;
             align-items: center;
             justify-content: center;
-            padding: 10px 24px;
-            border-radius: 4px;
-            font-family: 'Roboto', sans-serif;
-            font-size: 14px;
-            font-weight: 500;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            cursor: pointer;
-            border: none;
-            transition: background-color 0.2s, box-shadow 0.2s;
-            width: 100%;
-            text-decoration: none;
-        }
-        .md-btn-filled {
-            background-color: var(--md-primary);
-            color: var(--md-on-primary);
-            box-shadow: var(--md-elevation-1);
-        }
-        .md-btn-filled:hover {
-            background-color: var(--md-primary-hover);
-            box-shadow: var(--md-elevation-2);
-        }
-        .md-btn-outlined {
-            background-color: transparent;
-            color: var(--md-text);
-            border: 1px solid var(--md-border);
-        }
-        .md-btn-outlined:hover {
-            background-color: var(--md-surface-hover);
-        }
-        .md-btn-text {
-            background-color: transparent;
-            color: var(--md-primary);
-            padding: 8px 16px;
-            width: auto;
-            text-transform: none;
-            font-weight: 700;
-        }
-        .md-btn-text:hover {
-            background-color: rgba(99, 100, 255, 0.1);
+            overflow: hidden;
         }
 
-        /* --- Типографика и контент --- */
-        h1, h2, h3 { font-weight: 500; color: #ffffff; }
-        h1 { font-size: 24px; margin-bottom: 8px; }
-        h2 { font-size: 20px; margin-bottom: 16px; margin-top: 24px; }
-        h3 { font-size: 16px; margin-bottom: 8px; }
-        p, li { font-size: 14px; line-height: 1.5; color: var(--md-text); }
-        .text-muted { color: var(--md-text-muted); font-size: 12px; }
-        
-        ul { list-style-type: disc; padding-left: 20px; margin-bottom: 16px; }
-        ul li { margin-bottom: 4px; }
-
-        /* --- Специфические блоки --- */
         .stats-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
             margin: 24px 0;
+            font-size: 13px;
         }
-        .stat-label { font-size: 10px; text-transform: uppercase; color: var(--md-text-muted); margin-bottom: 4px; }
-        .stat-value { font-size: 14px; font-weight: 700; }
-        
-        .placeholder-img {
-            width: 100%;
-            height: 120px;
-            background: linear-gradient(135deg, #fceabb 0%, #f8b500 100%);
-            border-radius: 8px;
-            margin: 16px 0;
-            position: relative;
-            overflow: hidden;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
+        .stat-label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }
+        .stat-value { font-weight: bold; color: white; }
 
         .footer-links {
             margin-top: auto;
             font-size: 12px;
-            color: var(--md-text-muted);
+            color: var(--text-muted);
             line-height: 1.8;
         }
-        .footer-links a { color: var(--md-text-muted); text-decoration: none; }
+        .footer-links a { color: var(--text-muted); text-decoration: none; }
         .footer-links a:hover { text-decoration: underline; }
 
-        .logo-container {
+        /* --- Центральная колонка --- */
+        .rules-container h2 { font-size: 20px; color: white; margin-bottom: 16px; }
+        .rules-container h3 { font-size: 16px; color: white; margin: 20px 0 8px 0; }
+        .rules-container p { margin-bottom: 12px; }
+        .rules-container ul { padding-left: 20px; margin-bottom: 16px; }
+        .rules-container li { margin-bottom: 4px; }
+
+        /* --- Правая колонка --- */
+        .logo-header {
             display: flex;
             align-items: center;
-            gap: 12px;
-            margin-bottom: 32px;
+            gap: 10px;
+            margin-bottom: 24px;
         }
         .logo-icon {
             width: 32px; height: 32px;
-            background-color: var(--md-primary);
-            border-radius: 8px;
+            background: var(--accent);
+            border-radius: 6px;
             display: flex; align-items: center; justify-content: center;
             color: white; font-weight: bold; font-size: 18px;
         }
+        .logo-header h1 { font-size: 22px; color: white; margin: 0; }
+
+        .trending-header {
+            display: flex; align-items: center; gap: 4px;
+            color: var(--text-muted); font-size: 11px; text-transform: uppercase; font-weight: 600;
+            margin-bottom: 16px;
+        }
+        .trending-header svg { width: 14px; height: 14px; fill: var(--text-muted); }
+
+        .right-col p { font-size: 14px; margin-bottom: 16px; }
+        .right-col .highlight { font-weight: bold; color: white; }
+
+        .auth-buttons { display: flex; flex-direction: column; gap: 12px; margin-top: 24px; }
+        
+        .btn {
+            width: 100%;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            text-align: center;
+            border: none;
+            transition: background 0.2s;
+        }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-secondary { background: transparent; color: white; border: 1px solid var(--border-color); }
+        .btn-secondary:hover { background: var(--col-bg); }
+        .btn-text { background: transparent; color: var(--text-muted); border: none; padding: 4px 8px; width: auto; font-size: 13px; }
+        .btn-text:hover { color: white; }
+
+        /* --- Лента и посты --- */
+        .post-form {
+            background: var(--col-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 24px;
+        }
+        .post-form textarea {
+            width: 100%;
+            background: transparent;
+            border: none;
+            color: white;
+            font-family: inherit;
+            font-size: 15px;
+            resize: none;
+            outline: none;
+            min-height: 60px;
+        }
+        .post-form textarea::placeholder { color: var(--text-muted); }
+        .post-form .actions {
+            display: flex; justify-content: flex-end; margin-top: 8px;
+            border-top: 1px solid var(--border-color); padding-top: 12px;
+        }
+
+        .post-card {
+            background: var(--col-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .post-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .avatar {
+            width: 28px; height: 28px; background: var(--accent); border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: bold; color: white;
+        }
+        .post-author { font-weight: bold; color: white; }
+        .post-date { color: var(--text-muted); font-size: 12px; }
+        .post-content { white-space: pre-wrap; word-break: break-word; }
 
         /* --- Модальное окно --- */
-        .md-modal-overlay {
+        .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(0,0,0,0.7);
             display: none; align-items: center; justify-content: center;
             z-index: 1000;
         }
-        .md-modal {
-            background: var(--md-surface);
-            padding: 24px;
-            border-radius: 8px;
+        .modal {
+            background: var(--col-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
             width: 100%; max-width: 400px;
-            box-shadow: var(--md-elevation-2);
-            border: 1px solid var(--md-border);
+            padding: 24px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
         }
-        .md-modal h2 { margin-top: 0; margin-bottom: 16px; }
-        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-        
-        /* --- Лента --- */
-        .post-card {
-            background: var(--md-surface);
-            border: 1px solid var(--md-border);
-            border-radius: 8px;
-            padding: 16px;
-            margin-bottom: 16px;
-            box-shadow: var(--md-elevation-1);
+        .modal h2 { font-size: 18px; color: white; margin-bottom: 16px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group input {
+            width: 100%;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 10px;
+            color: white;
+            font-size: 14px;
+            outline: none;
         }
-        .post-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-        .avatar {
-            width: 24px; height: 24px; background: var(--md-primary); border-radius: 50%;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 12px; font-weight: bold; color: white;
-        }
-        
+        .form-group input:focus { border-color: var(--accent); }
+        .error-msg { color: #ff5252; font-size: 13px; margin-bottom: 16px; display: none; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+
         @media (max-width: 900px) {
-            .layout-grid { grid-template-columns: 1fr; }
-            .column { display: none; }
-            .column.main-column { display: flex; }
+            .app-container { grid-template-columns: 1fr; }
+            .left-col, .right-col { display: none; }
         }
     </style>
 </head>
 <body>
-    <div class="layout-grid">
+    <div class="app-container">
         
         <!-- Левая колонка -->
-        <div class="column">
-            <div class="md-input-wrapper">
-                <span class="material-symbols-outlined">search</span>
-                <input type="text" class="md-input" placeholder="Поиск">
+        <div class="column left-col">
+            <div class="search-box">
+                <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+                <input type="text" placeholder="Поиск">
             </div>
             
-            <p><span style="font-weight:700; color:white;">litodon</span> — это один из многих независимых серверов Mastodon, которые вы можете использовать, чтобы присоединиться к сети Fediverse.</p>
+            <p><span style="font-weight:700; color:white;">mastodon.ml</span> — это один из многих независимых серверов Mastodon, которые вы можете использовать, чтобы присоединиться к сети Fediverse.</p>
             
-            <div class="placeholder-img">
-                <!-- SVG иллюстрация (замена эмодзи) -->
-                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z" fill="rgba(0,0,0,0.2)"/>
-                    <path d="M12 6c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm0 10c-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4-1.79 4-4 4z" fill="rgba(0,0,0,0.4)"/>
-                    <path d="M12 9c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3zm0 4c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1z" fill="rgba(0,0,0,0.6)"/>
+            <div class="illustration">
+                <!-- Векторная иллюстрация вместо эмодзи -->
+                <svg width="100" height="100" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="50" cy="50" r="40" fill="rgba(255,255,255,0.2)"/>
+                    <path d="M50 20C33.4 20 20 33.4 20 50s13.4 30 30 30 30-13.4 30-30-13.4-30-30-30zm0 50c-11 0-20-9-20-20s9-20 20-20 20 9 20 20-9 20-20 20z" fill="rgba(0,0,0,0.3)"/>
+                    <path d="M50 35c-8.3 0-15 6.7-15 15s6.7 15 15 15 15-6.7 15-15-6.7-15-15-15zm0 20c-2.8 0-5-2.2-5-5s2.2-5 5-5 5 2.2 5 5-2.2 5-5 5z" fill="rgba(0,0,0,0.5)"/>
                 </svg>
             </div>
 
@@ -350,39 +362,30 @@ HTML_TEMPLATE = """
                 </div>
                 <div>
                     <div class="stat-label">Статистика сервера:</div>
-                    <div class="stat-value">686 <span class="text-muted" style="font-weight:400;">активные пользователи</span></div>
+                    <div class="stat-value">686 <span style="font-weight:400; color:var(--text-muted); font-size:12px;">активные пользователи</span></div>
                 </div>
             </div>
 
             <div class="footer-links">
-                <p><a href="#">litodon: Об этом сервере</a> · <a href="#">Состояние сервера</a> · <a href="#">Каталог профилей</a> · <a href="#">Политика конфиденциальности</a></p>
-                <p>Litodon: <a href="#">О проекте</a> · <a href="#">Скачать приложение</a> · v1.0.0</p>
+                <p><a href="#">mastodon.ml: Об этом сервере</a> · <a href="#">Состояние сервера</a> · <a href="#">Каталог профилей</a> · <a href="#">Политика конфиденциальности</a></p>
+                <p>Mastodon: <a href="#">О проекте</a> · <a href="#">Скачать приложение</a> · <a href="#">Сочетания клавиш</a> · <a href="#">Исходный код</a> · v4.7.2</p>
             </div>
         </div>
 
         <!-- Центральная колонка -->
-        <div class="column main-column">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-                <h1 style="display:none;" id="mobile-logo">Litodon</h1>
-                <div style="display:flex; align-items:center; gap:12px; margin-left:auto;">
-                    <div id="user-info" style="font-weight:500; color:white;"></div>
-                    <button id="logout-btn" onclick="logout()" class="md-btn md-btn-text" style="display:none; width:auto;">Выйти</button>
+        <div class="column center-col">
+            
+            <!-- Шапка (видна только авторизованным) -->
+            <div id="user-header" style="display:none; justify-content:space-between; align-items:center; margin-bottom:24px; padding-bottom:16px; border-bottom:1px solid var(--border-color);">
+                <h1 style="font-size:20px; color:white; margin:0;">Litodon</h1>
+                <div style="display:flex; align-items:center; gap:16px;">
+                    <span id="user-info" style="font-weight:bold; color:white;"></span>
+                    <button onclick="logout()" class="btn btn-text">Выйти</button>
                 </div>
             </div>
 
-            <!-- Форма поста -->
-            <div id="post-form-container" style="display:none; background:var(--md-surface); padding:16px; border-radius:8px; border:1px solid var(--md-border); margin-bottom:24px;">
-                <textarea id="post-content" rows="3" class="md-input" style="padding:12px; border-radius:4px; resize:none; margin-bottom:8px;" placeholder="Что нового?"></textarea>
-                <div style="display:flex; justify-content:flex-end;">
-                    <button onclick="submitPost()" class="md-btn md-btn-filled" style="width:auto;">Отправить</button>
-                </div>
-            </div>
-
-            <!-- Лента -->
-            <div id="timeline" style="display:none;"></div>
-
-            <!-- Правила (для гостей) -->
-            <div id="rules-container">
+            <!-- Блок правил (виден только гостям) -->
+            <div id="rules-container" class="rules-container">
                 <h2>Подробнее</h2>
                 
                 <h3>LML — про общение людей</h3>
@@ -393,16 +396,16 @@ HTML_TEMPLATE = """
                 </ul>
 
                 <h3>LML — зона безопасного общения</h3>
-                <h4 style="font-size:14px; font-weight:700; margin-bottom:4px;">Не место для ненависти</h4>
-                <p style="margin-bottom:8px;">Разжигание ненависти по признакам, которые люди не выбирали — полностью под запретом</p>
+                <h4 style="font-weight:bold; margin-bottom:4px;">Не место для ненависти</h4>
+                <p>Разжигание ненависти по признакам, которые люди не выбирали — полностью под запретом</p>
                 <ul>
                     <li>Гомофобия, трансфобия, энифобия, и т.д</li>
                     <li>Сексизм, расизм, нацизм, и т.д</li>
                 </ul>
                 <p>Сюда также входит одобрение/поддержка вышеупомянутых взглядов</p>
 
-                <h3 style="margin-top:24px;">Не место для травли</h3>
-                <p style="margin-bottom:8px;">Полностью запрещено</p>
+                <h3>Не место для травли</h3>
+                <p>Полностью запрещено</p>
                 <ul>
                     <li>Разглашение чужой конфиденциальной информации</li>
                     <li>Преследование</li>
@@ -411,48 +414,58 @@ HTML_TEMPLATE = """
                 </ul>
 
                 <p style="margin-top:16px;">Даже если вы делаете это вне LML, это может привести к блокировке вашего аккаунта здесь.</p>
-                <p style="margin-top:8px;">Повторяющееся агрессивное поведение, разжигание конфликтов, может занять некоторое время. Мы изучаем все поступающие жалобы.</p>
+                <p>Повторяющееся агрессивное поведение, разжигание конфликтов, может занять некоторое время. Мы изучаем все поступающие жалобы.</p>
             </div>
+
+            <!-- Форма поста и лента (видны только авторизованным) -->
+            <div id="user-feed-container" style="display:none;">
+                <div class="post-form">
+                    <textarea id="post-content" placeholder="Что нового?"></textarea>
+                    <div class="actions">
+                        <button onclick="submitPost()" class="btn btn-primary" style="width:auto;">Отправить</button>
+                    </div>
+                </div>
+                <div id="timeline"></div>
+            </div>
+
         </div>
 
         <!-- Правая колонка -->
-        <div class="column">
-            <div class="logo-container">
+        <div class="column right-col">
+            <div class="logo-header">
                 <div class="logo-icon">L</div>
-                <h1 style="margin:0; font-size:24px;">litodon</h1>
+                <h1>Litodon</h1>
             </div>
 
-            <div style="margin-bottom:24px;">
-                <div style="display:flex; align-items:center; gap:4px; color:var(--md-text-muted); font-size:12px; text-transform:uppercase; font-weight:500; margin-bottom:16px;">
-                    <span class="material-symbols-outlined" style="font-size:16px;">trending_up</span>
-                    Актуальное
-                </div>
+            <div class="trending-header">
+                <svg viewBox="0 0 24 24"><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>
+                Актуальное
             </div>
 
-            <p style="font-weight:700; color:white; margin-bottom:8px;">Litodon — лучший способ быть в курсе всего происходящего.</p>
-            <p style="margin-bottom:24px;">Подписывайтесь на кого угодно в федиверсе и читайте ленту в хронологическом порядке. Никаких алгоритмов, рекламы и кликбейта.</p>
+            <p class="highlight">Mastodon — лучший способ быть в курсе всего происходящего.</p>
+            <p>Подписывайтесь на кого угодно в федиверсе и читайте ленту в хронологическом порядке. Никаких алгоритмов, рекламы и кликбейта.</p>
             
-            <div id="auth-buttons" style="display:flex; flex-direction:column; gap:12px;">
-                <button onclick="openModal('register')" class="md-btn md-btn-filled">Зарегистрироваться</button>
-                <button onclick="openModal('login')" class="md-btn md-btn-outlined">Войти</button>
+            <div id="auth-buttons" class="auth-buttons">
+                <button onclick="openModal('register')" class="btn btn-primary">Зарегистрироваться</button>
+                <button onclick="openModal('login')" class="btn btn-secondary">Войти</button>
             </div>
         </div>
     </div>
 
     <!-- Модальное окно авторизации -->
-    <div id="auth-modal" class="md-modal-overlay">
-        <div class="md-modal">
+    <div id="auth-modal" class="modal-overlay">
+        <div class="modal">
             <h2 id="auth-title">Войти</h2>
-            <div id="auth-error" style="display:none; color:#ff5252; font-size:14px; margin-bottom:16px;"></div>
-            <div class="md-input-wrapper">
-                <input type="text" id="username" class="md-input" placeholder="Имя пользователя" style="padding-left:12px;">
+            <div id="auth-error" class="error-msg"></div>
+            <div class="form-group">
+                <input type="text" id="username" placeholder="Имя пользователя">
             </div>
-            <div class="md-input-wrapper">
-                <input type="password" id="password" class="md-input" placeholder="Пароль" style="padding-left:12px;">
+            <div class="form-group">
+                <input type="password" id="password" placeholder="Пароль">
             </div>
             <div class="modal-actions">
-                <button onclick="closeModal()" class="md-btn md-btn-text">Отмена</button>
-                <button id="auth-submit" onclick="submitAuth()" class="md-btn md-btn-filled" style="width:auto;">Войти</button>
+                <button onclick="closeModal()" class="btn btn-text">Отмена</button>
+                <button id="auth-submit" onclick="submitAuth()" class="btn btn-primary" style="width:auto;">Войти</button>
             </div>
         </div>
     </div>
@@ -461,36 +474,32 @@ HTML_TEMPLATE = """
         let currentAuthMode = 'login';
         let currentUser = null;
 
+        // --- Управление интерфейсом ---
         async function checkAuth() {
             const res = await fetch('/api/me');
             const data = await res.json();
             currentUser = data.username;
 
-            const authButtons = document.getElementById('auth-buttons');
-            const postForm = document.getElementById('post-form-container');
             const rulesContainer = document.getElementById('rules-container');
-            const timeline = document.getElementById('timeline');
+            const userFeedContainer = document.getElementById('user-feed-container');
+            const userHeader = document.getElementById('user-header');
             const userInfo = document.getElementById('user-info');
-            const logoutBtn = document.getElementById('logout-btn');
-            const mobileLogo = document.getElementById('mobile-logo');
+            const authButtons = document.getElementById('auth-buttons');
 
             if (currentUser) {
-                authButtons.style.display = 'none';
-                postForm.style.display = 'block';
+                // Пользователь авторизован
                 rulesContainer.style.display = 'none';
-                timeline.style.display = 'block';
+                userFeedContainer.style.display = 'block';
+                userHeader.style.display = 'flex';
                 userInfo.innerText = `@${currentUser}`;
-                logoutBtn.style.display = 'block';
-                mobileLogo.style.display = 'block';
+                authButtons.style.display = 'none';
                 loadPosts();
             } else {
-                authButtons.style.display = 'flex';
-                postForm.style.display = 'none';
+                // Гость
                 rulesContainer.style.display = 'block';
-                timeline.style.display = 'none';
-                userInfo.innerText = '';
-                logoutBtn.style.display = 'none';
-                mobileLogo.style.display = 'none';
+                userFeedContainer.style.display = 'none';
+                userHeader.style.display = 'none';
+                authButtons.style.display = 'flex';
             }
         }
 
@@ -541,6 +550,7 @@ HTML_TEMPLATE = """
             checkAuth();
         }
 
+        // --- Работа с постами ---
         async function loadPosts() {
             const res = await fetch('/api/posts');
             const posts = await res.json();
@@ -548,7 +558,7 @@ HTML_TEMPLATE = """
             timeline.innerHTML = '';
 
             if (posts.length === 0) {
-                timeline.innerHTML = '<p class="text-muted" style="text-align:center; padding:32px 0;">Пока нет постов. Будьте первым!</p>';
+                timeline.innerHTML = '<p style="text-align:center; color:var(--text-muted); padding:32px 0;">Пока нет постов. Будьте первым!</p>';
                 return;
             }
 
@@ -559,10 +569,10 @@ HTML_TEMPLATE = """
                 postEl.innerHTML = `
                     <div class="post-header">
                         <div class="avatar">${post.author[0].toUpperCase()}</div>
-                        <span style="font-weight:700; color:white;">@${post.author}</span>
-                        <span class="text-muted">${date}</span>
+                        <span class="post-author">@${post.author}</span>
+                        <span class="post-date">${date}</span>
                     </div>
-                    <p style="white-space:pre-wrap;">${escapeHtml(post.content)}</p>
+                    <div class="post-content">${escapeHtml(post.content)}</div>
                 `;
                 timeline.appendChild(postEl);
             });
@@ -586,12 +596,14 @@ HTML_TEMPLATE = """
             }
         }
 
+        // Защита от XSS
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.innerText = text;
             return div.innerHTML;
         }
 
+        // Инициализация
         checkAuth();
     </script>
 </body>
