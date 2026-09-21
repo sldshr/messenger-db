@@ -42,6 +42,7 @@ TRUNCATE_LINES = 100
 TRUNCATE_CHARS = 500
 
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
+MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 
 RU_COUNTRIES = {"RU", "BY", "KZ", "UA", "KG", "TJ", "UZ", "AM", "AZ", "MD"}
 _lang_cache: Dict[str, str] = {}
@@ -81,6 +82,17 @@ def iso_to_ts(s) -> float:
         return datetime.fromisoformat(s).timestamp()
     except Exception:
         return time.time()
+
+
+def extract_mentions(text: str) -> List[str]:
+    out, seen = [], set()
+    for m in MENTION_RE.finditer(text):
+        n = m.group(1)
+        if n.lower() in seen:
+            continue
+        seen.add(n.lower())
+        out.append(n)
+    return out
 
 
 def get_client_ip(request: Request) -> str:
@@ -175,6 +187,8 @@ def db_save_user(u: dict) -> None:
             "created_at": ts_to_iso(u["created_at"]),
             "following": list(u.get("following") or []),
             "followers": list(u.get("followers") or []),
+            "allow_followers_view": u.get("allow_followers_view", True),
+            "allow_following_view": u.get("allow_following_view", True),
         }).execute()
     except Exception as e:
         print("[sldChat] db_save_user error:", e)
@@ -192,19 +206,57 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
         print("[sldChat] db_update_user_fields error:", e)
 
 
+def db_all_users() -> List[dict]:
+    if supabase:
+        try:
+            r = supabase.table("users").select("*").execute()
+            out = []
+            for row in r.data or []:
+                row["following"] = set(row.get("following") or [])
+                row["followers"] = set(row.get("followers") or [])
+                row["bio"] = row.get("bio") or ""
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+                out.append(row)
+            return out
+        except Exception as e:
+            print("[sldChat] db_all_users error:", e)
+            return []
+    return list(USERS.values())
+
+
 def db_create_post(p: dict) -> None:
     if not supabase:
         POSTS_MEM[p["id"]] = p
         return
     try:
         supabase.table("posts").insert({
-            "id": p["id"],
-            "text": p["text"],
-            "author": p["author"],
+            "id": p["id"], "text": p["text"], "author": p["author"],
             "created_at": ts_to_iso(p["created_at"]),
         }).execute()
     except Exception as e:
         print("[sldChat] db_create_post error:", e)
+
+
+def db_update_post_text(pid: str, text: str) -> None:
+    if not supabase:
+        if pid in POSTS_MEM:
+            POSTS_MEM[pid]["text"] = text
+        return
+    try:
+        supabase.table("posts").update({"text": text}).eq("id", pid).execute()
+    except Exception as e:
+        print("[sldChat] db_update_post error:", e)
+
+
+def db_delete_post(pid: str) -> None:
+    if not supabase:
+        POSTS_MEM.pop(pid, None)
+        return
+    try:
+        supabase.table("notifications").delete().eq("post_id", pid).execute()
+        supabase.table("posts").delete().eq("id", pid).execute()
+    except Exception as e:
+        print("[sldChat] db_delete_post error:", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
@@ -352,6 +404,32 @@ def db_create_comment(c: dict) -> None:
         print("[sldChat] db_create_comment error:", e)
 
 
+def db_update_comment_text(cid: str, text: str) -> None:
+    if not supabase:
+        for p in POSTS_MEM.values():
+            for c in p.get("comments", []):
+                if c["id"] == cid:
+                    c["text"] = text
+                    return
+        return
+    try:
+        supabase.table("comments").update({"text": text}).eq("id", cid).execute()
+    except Exception as e:
+        print("[sldChat] db_update_comment error:", e)
+
+
+def db_delete_comment(cid: str) -> None:
+    if not supabase:
+        for p in POSTS_MEM.values():
+            p["comments"] = [c for c in p.get("comments", []) if c["id"] != cid]
+        return
+    try:
+        supabase.table("notifications").delete().eq("comment_id", cid).execute()
+        supabase.table("comments").delete().eq("id", cid).execute()
+    except Exception as e:
+        print("[sldChat] db_delete_comment error:", e)
+
+
 def db_get_comment(cid: str) -> Optional[dict]:
     if supabase:
         try:
@@ -415,14 +493,10 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
     if supabase:
         try:
             supabase.table("notifications").insert({
-                "id": n["id"],
-                "to_nick": n["to_nick"],
-                "type": n["type"],
-                "from_nick": n["from_nick"],
-                "post_id": n["post_id"],
+                "id": n["id"], "to_nick": n["to_nick"], "type": n["type"],
+                "from_nick": n["from_nick"], "post_id": n["post_id"],
                 "comment_id": n["comment_id"] or None,
-                "text": n["text"],
-                "read": n["read"],
+                "text": n["text"], "read": n["read"],
                 "created_at": ts_to_iso(n["created_at"]),
             }).execute()
         except Exception as e:
@@ -508,20 +582,16 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
                 "upvotes": cup, "downvotes": cdown, "user_vote": cuv,
             })
         out.append({
-            "id": p["id"],
-            "text": p["text"],
-            "created_at": p["created_at"],
+            "id": p["id"], "text": p["text"], "created_at": p["created_at"],
             "author": p.get("author"),
-            "upvotes": up,
-            "downvotes": down,
-            "user_vote": uv,
+            "upvotes": up, "downvotes": down, "user_vote": uv,
             "comments": clist,
         })
     return out
 
 
 def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
-    return {
+    d = {
         "nick": u["nick"],
         "name": u["name"],
         "bio": u.get("bio") or "",
@@ -530,9 +600,17 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
         "following": len(u.get("following") or []),
         "is_me": viewer_nick == u["nick"],
     }
+    if viewer_nick == u["nick"]:
+        d["allow_followers_view"] = u.get("allow_followers_view", True)
+        d["allow_following_view"] = u.get("allow_following_view", True)
+    return d
 
 
 class PostIn(BaseModel):
+    text: str
+
+
+class PostEditIn(BaseModel):
     text: str
 
 
@@ -543,6 +621,10 @@ class VoteIn(BaseModel):
 class CommentIn(BaseModel):
     text: str
     parent_id: Optional[str] = None
+
+
+class CommentEditIn(BaseModel):
+    text: str
 
 
 class RegisterIn(BaseModel):
@@ -559,6 +641,11 @@ class LoginIn(BaseModel):
 
 class BioIn(BaseModel):
     bio: str
+
+
+class SettingsIn(BaseModel):
+    allow_followers_view: Optional[bool] = None
+    allow_following_view: Optional[bool] = None
 
 
 @app.post("/api/register")
@@ -581,6 +668,7 @@ def api_register(data: RegisterIn):
         "password": hash_password(data.password),
         "created_at": time.time(),
         "following": set(), "followers": set(),
+        "allow_followers_view": True, "allow_following_view": True,
     }
     db_save_user(u)
     token = uuid.uuid4().hex
@@ -615,123 +703,43 @@ def api_me(request: Request):
     return serialize_user(u, u["nick"])
 
 
-@app.get("/api/posts")
-def api_list(request: Request, q: str = "", author: str = ""):
-    posts = db_list_posts(q=q, author=author)
-    u = get_current_user(request)
-    vid = "u:" + u["nick"] if u else "c:anon"
-    return {"posts": build_posts_full(posts, vid)}
-
-
-@app.get("/api/posts/{pid}")
-def api_get(pid: str, request: Request):
-    p = db_get_post(pid)
-    if not p:
-        raise HTTPException(404, "not found")
-    u = get_current_user(request)
-    vid = "u:" + u["nick"] if u else "c:anon"
-    return build_posts_full([p], vid)[0]
-
-
-@app.post("/api/posts")
-def api_create(payload: PostIn, request: Request):
-    u = get_current_user(request)
-    if not u:
+@app.post("/api/users/me/bio")
+def api_set_bio(data: BioIn, request: Request):
+    me = get_current_user(request)
+    if not me:
         raise HTTPException(401, "unauthorized")
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_POST_LEN:
+    bio = data.bio.strip()
+    if len(bio) > MAX_BIO_LEN:
         raise HTTPException(400, "too long")
-    pid = uuid.uuid4().hex[:10]
-    p = {"id": pid, "text": text, "author": u["nick"], "created_at": time.time()}
-    db_create_post(p)
-    return build_posts_full([p], "u:" + u["nick"])[0]
+    db_update_user_fields(me["nick"], {"bio": bio})
+    return {"ok": True, "bio": bio}
 
 
-@app.post("/api/posts/{pid}/vote")
-def api_vote_post(pid: str, v: VoteIn, request: Request):
-    if not db_get_post(pid):
-        raise HTTPException(404, "not found")
-    if v.direction not in (-1, 1):
-        raise HTTPException(400, "bad request")
-    u = get_current_user(request)
-    if not u:
+@app.post("/api/users/me/settings")
+def api_set_settings(data: SettingsIn, request: Request):
+    me = get_current_user(request)
+    if not me:
         raise HTTPException(401, "unauthorized")
-    vid = "u:" + u["nick"]
-
-    existing = db_post_votes([pid])
-    cur = 0
-    for row in existing:
-        if row["voter_id"] == vid:
-            cur = row["direction"]
-            break
-    new = 0 if cur == v.direction else v.direction
-    db_set_post_vote(pid, vid, new)
-
-    p = db_get_post(pid)
-    return build_posts_full([p], vid)[0]
+    patch = {}
+    if data.allow_followers_view is not None:
+        patch["allow_followers_view"] = bool(data.allow_followers_view)
+    if data.allow_following_view is not None:
+        patch["allow_following_view"] = bool(data.allow_following_view)
+    if patch:
+        db_update_user_fields(me["nick"], patch)
+    return {"ok": True}
 
 
-@app.post("/api/posts/{pid}/comments")
-def api_add_comment(pid: str, c: CommentIn, request: Request):
-    u = get_current_user(request)
-    if not u:
-        raise HTTPException(401, "unauthorized")
-    post = db_get_post(pid)
-    if not post:
-        raise HTTPException(404, "not found")
-    text = c.text.strip()
-    if not text:
-        raise HTTPException(400, "empty")
-    if len(text) > MAX_COMMENT_LEN:
-        raise HTTPException(400, "too long")
-
-    parent_id = c.parent_id or None
-    if parent_id:
-        parent = db_get_comment(parent_id)
-        if not parent or parent["post_id"] != pid:
-            raise HTTPException(400, "bad parent")
-        if parent.get("parent_id"):
-            raise HTTPException(400, "reply_only_one_level")
-
-    cid = uuid.uuid4().hex[:10]
-    db_create_comment({
-        "id": cid, "post_id": pid, "author": u["nick"],
-        "parent_id": parent_id, "text": text, "created_at": time.time(),
-    })
-
-    db_notify(post["author"], "comment", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
-    if parent_id:
-        p2 = db_get_comment(parent_id)
-        if p2 and p2["author"] != u["nick"]:
-            db_notify(p2["author"], "reply", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
-
-    return build_posts_full([post], "u:" + u["nick"])[0]
-
-
-@app.post("/api/posts/{pid}/comments/{cid}/vote")
-def api_vote_comment(pid: str, cid: str, v: VoteIn, request: Request):
-    if not db_get_post(pid):
-        raise HTTPException(404, "not found")
-    if v.direction not in (-1, 1):
-        raise HTTPException(400, "bad request")
-    u = get_current_user(request)
-    if not u:
-        raise HTTPException(401, "unauthorized")
-    vid = "u:" + u["nick"]
-
-    existing = db_comment_votes([cid])
-    cur = 0
-    for row in existing:
-        if row["voter_id"] == vid:
-            cur = row["direction"]
-            break
-    new = 0 if cur == v.direction else v.direction
-    db_set_comment_vote(cid, vid, new)
-
-    p = db_get_post(pid)
-    return build_posts_full([p], vid)[0]
+@app.get("/api/users")
+def api_users_list(request: Request, q: str = ""):
+    users = db_all_users()
+    if q:
+        n = q.lower().strip().lstrip("@")
+        users = [u for u in users if n in u["nick"].lower() or n in (u.get("name") or "").lower()]
+    users.sort(key=lambda u: u["nick"].lower())
+    viewer = get_current_user(request)
+    vn = viewer["nick"] if viewer else None
+    return {"users": [serialize_user(u, vn) for u in users[:200]]}
 
 
 @app.get("/api/users/{nick}")
@@ -750,11 +758,15 @@ def api_followers(nick: str, request: Request):
     u = db_load_user(nick)
     if not u:
         raise HTTPException(404, "not found")
+    viewer = get_current_user(request)
+    vn = viewer["nick"] if viewer else None
+    if vn != u["nick"] and not u.get("allow_followers_view", True):
+        raise HTTPException(403, "err_private_followers")
     out = []
     for n in (u.get("followers") or []):
         fu = db_load_user(n)
         if fu:
-            out.append(serialize_user(fu))
+            out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out}
 
@@ -764,11 +776,15 @@ def api_following(nick: str, request: Request):
     u = db_load_user(nick)
     if not u:
         raise HTTPException(404, "not found")
+    viewer = get_current_user(request)
+    vn = viewer["nick"] if viewer else None
+    if vn != u["nick"] and not u.get("allow_following_view", True):
+        raise HTTPException(403, "err_private_following")
     out = []
     for n in (u.get("following") or []):
         fu = db_load_user(n)
         if fu:
-            out.append(serialize_user(fu))
+            out.append(serialize_user(fu, vn))
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out}
 
@@ -825,16 +841,221 @@ def api_unfollow(nick: str, request: Request):
     return data
 
 
-@app.post("/api/users/me/bio")
-def api_set_bio(data: BioIn, request: Request):
-    me = get_current_user(request)
-    if not me:
+@app.get("/api/posts")
+def api_list(request: Request, q: str = "", author: str = ""):
+    posts = db_list_posts(q=q, author=author)
+    u = get_current_user(request)
+    vid = "u:" + u["nick"] if u else "c:anon"
+    return {"posts": build_posts_full(posts, vid)}
+
+
+@app.get("/api/posts/{pid}")
+def api_get(pid: str, request: Request):
+    p = db_get_post(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    u = get_current_user(request)
+    vid = "u:" + u["nick"] if u else "c:anon"
+    return build_posts_full([p], vid)[0]
+
+
+@app.post("/api/posts")
+def api_create(payload: PostIn, request: Request):
+    u = get_current_user(request)
+    if not u:
         raise HTTPException(401, "unauthorized")
-    bio = data.bio.strip()
-    if len(bio) > MAX_BIO_LEN:
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(400, "empty")
+    if len(text) > MAX_POST_LEN:
         raise HTTPException(400, "too long")
-    db_update_user_fields(me["nick"], {"bio": bio})
-    return {"ok": True, "bio": bio}
+    pid = uuid.uuid4().hex[:10]
+    p = {"id": pid, "text": text, "author": u["nick"], "created_at": time.time()}
+    db_create_post(p)
+
+    notified = set()
+    for nick in extract_mentions(text):
+        if nick == u["nick"]:
+            continue
+        key = nick.lower()
+        if key in notified:
+            continue
+        if not db_load_user(nick):
+            continue
+        db_notify(nick, "mention", u["nick"], post_id=pid, text=text[:140])
+        notified.add(key)
+
+    return build_posts_full([p], "u:" + u["nick"])[0]
+
+
+@app.put("/api/posts/{pid}")
+def api_edit_post(pid: str, payload: PostEditIn, request: Request):
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    p = db_get_post(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    if p["author"] != u["nick"]:
+        raise HTTPException(403, "forbidden")
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(400, "empty")
+    if len(text) > MAX_POST_LEN:
+        raise HTTPException(400, "too long")
+    db_update_post_text(pid, text)
+    p = db_get_post(pid)
+    return build_posts_full([p], "u:" + u["nick"])[0]
+
+
+@app.delete("/api/posts/{pid}")
+def api_delete_post(pid: str, request: Request):
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    p = db_get_post(pid)
+    if not p:
+        raise HTTPException(404, "not found")
+    if p["author"] != u["nick"]:
+        raise HTTPException(403, "forbidden")
+    db_delete_post(pid)
+    return {"ok": True}
+
+
+@app.post("/api/posts/{pid}/vote")
+def api_vote_post(pid: str, v: VoteIn, request: Request):
+    if not db_get_post(pid):
+        raise HTTPException(404, "not found")
+    if v.direction not in (-1, 1):
+        raise HTTPException(400, "bad request")
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    vid = "u:" + u["nick"]
+
+    existing = db_post_votes([pid])
+    cur = 0
+    for row in existing:
+        if row["voter_id"] == vid:
+            cur = row["direction"]
+            break
+    new = 0 if cur == v.direction else v.direction
+    db_set_post_vote(pid, vid, new)
+
+    p = db_get_post(pid)
+    return build_posts_full([p], vid)[0]
+
+
+@app.post("/api/posts/{pid}/comments")
+def api_add_comment(pid: str, c: CommentIn, request: Request):
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    post = db_get_post(pid)
+    if not post:
+        raise HTTPException(404, "not found")
+    text = c.text.strip()
+    if not text:
+        raise HTTPException(400, "empty")
+    if len(text) > MAX_COMMENT_LEN:
+        raise HTTPException(400, "too long")
+
+    parent_id = c.parent_id or None
+    parent = None
+    if parent_id:
+        parent = db_get_comment(parent_id)
+        if not parent or parent["post_id"] != pid:
+            raise HTTPException(400, "bad parent")
+        if parent.get("parent_id"):
+            raise HTTPException(400, "reply_only_one_level")
+
+    cid = uuid.uuid4().hex[:10]
+    db_create_comment({
+        "id": cid, "post_id": pid, "author": u["nick"],
+        "parent_id": parent_id, "text": text, "created_at": time.time(),
+    })
+
+    notified = set()
+    if parent_id and parent:
+        if parent["author"] != u["nick"]:
+            db_notify(parent["author"], "reply", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
+            notified.add(parent["author"].lower())
+    else:
+        if post["author"] != u["nick"]:
+            db_notify(post["author"], "comment", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
+            notified.add(post["author"].lower())
+
+    for nick in extract_mentions(text):
+        if nick == u["nick"]:
+            continue
+        key = nick.lower()
+        if key in notified:
+            continue
+        if not db_load_user(nick):
+            continue
+        db_notify(nick, "mention", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
+        notified.add(key)
+
+    return build_posts_full([post], "u:" + u["nick"])[0]
+
+
+@app.put("/api/posts/{pid}/comments/{cid}")
+def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Request):
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    c = db_get_comment(cid)
+    if not c or c["post_id"] != pid:
+        raise HTTPException(404, "not found")
+    if c["author"] != u["nick"]:
+        raise HTTPException(403, "forbidden")
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(400, "empty")
+    if len(text) > MAX_COMMENT_LEN:
+        raise HTTPException(400, "too long")
+    db_update_comment_text(cid, text)
+    post = db_get_post(pid)
+    return build_posts_full([post], "u:" + u["nick"])[0]
+
+
+@app.delete("/api/posts/{pid}/comments/{cid}")
+def api_delete_comment(pid: str, cid: str, request: Request):
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    c = db_get_comment(cid)
+    if not c or c["post_id"] != pid:
+        raise HTTPException(404, "not found")
+    if c["author"] != u["nick"]:
+        raise HTTPException(403, "forbidden")
+    db_delete_comment(cid)
+    post = db_get_post(pid)
+    return build_posts_full([post], "u:" + u["nick"])[0]
+
+
+@app.post("/api/posts/{pid}/comments/{cid}/vote")
+def api_vote_comment(pid: str, cid: str, v: VoteIn, request: Request):
+    if not db_get_post(pid):
+        raise HTTPException(404, "not found")
+    if v.direction not in (-1, 1):
+        raise HTTPException(400, "bad request")
+    u = get_current_user(request)
+    if not u:
+        raise HTTPException(401, "unauthorized")
+    vid = "u:" + u["nick"]
+
+    existing = db_comment_votes([cid])
+    cur = 0
+    for row in existing:
+        if row["voter_id"] == vid:
+            cur = row["direction"]
+            break
+    new = 0 if cur == v.direction else v.direction
+    db_set_comment_vote(cid, vid, new)
+
+    p = db_get_post(pid)
+    return build_posts_full([p], vid)[0]
 
 
 @app.get("/api/notifications")
@@ -875,10 +1096,12 @@ TEXTS = {
         "no_posts": "Постов пока нет", "not_found": "Не найдено",
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
         "read_more": "читать дальше", "copy": "Копировать", "copied": "Скопировано",
+        "edit": "Редактировать", "delete": "Удалить", "save": "Сохранить",
+        "cancel": "Отмена", "confirm_delete": "Удалить без возможности восстановления?",
         "author_badge": "автор",
         "f_new": "Новые", "f_top": "Лучшие", "f_bottom": "Худшие", "f_old": "Старые",
         "f_all": "Все", "f_many": "Много комм.", "f_some": "Есть комм.", "f_none": "Без комм.",
-        "nav_home": "Главная", "nav_profile": "Профиль",
+        "nav_home": "Главная", "nav_users": "Пользователи", "nav_profile": "Профиль",
         "nav_notifications": "Уведомления", "nav_settings": "Настройки",
         "nav_logout": "Выйти", "nav_register": "Регистрация", "nav_login": "Вход",
         "reg_title": "Регистрация", "log_title": "Вход",
@@ -893,23 +1116,48 @@ TEXTS = {
         "err_nick_taken": "Ник уже занят",
         "err_bad_login": "Неверный ник или пароль",
         "err_auth_required": "Требуется вход",
+        "err_private_followers": "Пользователь скрыл своих подписчиков",
+        "err_private_following": "Пользователь скрыл свои подписки",
         "login_to_post": "Войдите, чтобы писать посты",
         "login_to_comment": "Войдите, чтобы писать комментарии",
         "go_login": "Войти", "go_register": "Регистрация",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
         "own_profile": "Это ваш профиль", "no_user_posts": "Постов пока нет",
-        "settings_title": "Настройки", "settings_theme": "Тема", "settings_lang": "Язык",
+        "settings_title": "Настройки",
+        "settings_appearance": "Оформление", "settings_theme": "Тема", "settings_lang": "Язык",
+        "settings_privacy": "Конфиденциальность",
+        "settings_allow_followers": "Разрешить просматривать подписчиков",
+        "settings_allow_following": "Разрешить просматривать подписки",
+        "settings_info": "Инфо",
+        "settings_policy": "Политика конфиденциальности",
+        "settings_desc": "sldChat — минималистичная анонимная соцсеть: посты, комментарии, апвоуты, подписки.",
+        "settings_authors": "Авторы",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
         "notif_title": "Уведомления", "notif_empty": "Уведомлений нет",
         "notif_follow": "подписался(-ась) на вас",
         "notif_comment": "оставил(а) комментарий",
         "notif_reply": "ответил(а) на ваш комментарий",
+        "notif_mention": "упомянул(а) вас",
         "notif_clear": "Очистить все", "back_to_main": "В главное меню",
         "bio_ph": "Описание профиля...", "bio_save": "Сохранить", "bio_saved": "Сохранено",
         "bio_empty": "Описание пока не заполнено", "edit_bio": "Редактировать",
         "followers_title": "Подписчики", "following_title": "Подписки",
         "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
+        "users_title": "Пользователи", "users_search_ph": "Поиск по нику или имени",
+        "no_users": "Никого не найдено",
+        "policy_title": "Политика конфиденциальности",
+        "policy_content": (
+            "1. Мы храним минимум данных: имя, ник, пароль (в виде хеша), посты, комментарии, "
+            "голоса, подписки и уведомления.\n\n"
+            "2. Пароль хранится только в виде sha256-хеша с солью. Мы не можем его восстановить.\n\n"
+            "3. Данные хранятся на серверах Supabase (Postgres). Мы не продаём и не передаём их третьим лицам.\n\n"
+            "4. Приватность профиля управляется пользователем в Настройках: можно скрыть список подписчиков и подписок.\n\n"
+            "5. Вы можете в любой момент удалить свои посты и комментарии — они исчезают из базы.\n\n"
+            "6. Для определения языка интерфейса используется IP-геолокация (без сохранения IP).\n\n"
+            "7. Сервис предоставляется as-is без гарантий."
+        ),
+        "spinner": "Загрузка…",
     },
     "en": {
         "search_ph": "Search posts", "search": "Search", "theme": "Toggle theme",
@@ -920,10 +1168,12 @@ TEXTS = {
         "no_posts": "No posts yet", "not_found": "Not found",
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
         "read_more": "read more", "copy": "Copy", "copied": "Copied",
+        "edit": "Edit", "delete": "Delete", "save": "Save",
+        "cancel": "Cancel", "confirm_delete": "Delete permanently?",
         "author_badge": "author",
         "f_new": "New", "f_top": "Top", "f_bottom": "Worst", "f_old": "Old",
         "f_all": "All", "f_many": "Many", "f_some": "Some", "f_none": "None",
-        "nav_home": "Home", "nav_profile": "Profile",
+        "nav_home": "Home", "nav_users": "Users", "nav_profile": "Profile",
         "nav_notifications": "Notifications", "nav_settings": "Settings",
         "nav_logout": "Log out", "nav_register": "Sign up", "nav_login": "Log in",
         "reg_title": "Sign up", "log_title": "Log in",
@@ -938,23 +1188,48 @@ TEXTS = {
         "err_nick_taken": "Nick already taken",
         "err_bad_login": "Wrong nick or password",
         "err_auth_required": "Login required",
+        "err_private_followers": "User hid their followers",
+        "err_private_following": "User hid their following",
         "login_to_post": "Log in to write posts",
         "login_to_comment": "Log in to write comments",
         "go_login": "Log in", "go_register": "Sign up",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
         "own_profile": "This is your profile", "no_user_posts": "No posts yet",
-        "settings_title": "Settings", "settings_theme": "Theme", "settings_lang": "Language",
+        "settings_title": "Settings",
+        "settings_appearance": "Appearance", "settings_theme": "Theme", "settings_lang": "Language",
+        "settings_privacy": "Privacy",
+        "settings_allow_followers": "Allow viewing followers",
+        "settings_allow_following": "Allow viewing following",
+        "settings_info": "Info",
+        "settings_policy": "Privacy policy",
+        "settings_desc": "sldChat — a minimalist anonymous social network: posts, comments, upvotes, follows.",
+        "settings_authors": "Authors",
         "theme_light": "Light", "theme_dark": "Dark",
         "notif_title": "Notifications", "notif_empty": "No notifications",
         "notif_follow": "followed you",
         "notif_comment": "commented",
         "notif_reply": "replied to your comment",
+        "notif_mention": "mentioned you",
         "notif_clear": "Clear all", "back_to_main": "Back to main",
         "bio_ph": "Profile bio...", "bio_save": "Save", "bio_saved": "Saved",
         "bio_empty": "No bio yet", "edit_bio": "Edit",
         "followers_title": "Followers", "following_title": "Following",
         "no_followers": "No followers yet", "no_following": "No following yet",
+        "users_title": "Users", "users_search_ph": "Search by nick or name",
+        "no_users": "No users found",
+        "policy_title": "Privacy Policy",
+        "policy_content": (
+            "1. We store minimum data: name, nick, password (hashed), posts, comments, "
+            "votes, follows and notifications.\n\n"
+            "2. Password is stored only as a salted sha256 hash. We cannot recover it.\n\n"
+            "3. Data is stored on Supabase (Postgres) servers. We do not sell or share it with third parties.\n\n"
+            "4. Profile privacy is controlled by the user in Settings: you can hide followers and following.\n\n"
+            "5. You can delete your posts and comments at any time — they are removed from the database.\n\n"
+            "6. IP geolocation is used to determine the interface language (IP is not stored).\n\n"
+            "7. The service is provided as-is without warranty."
+        ),
+        "spinner": "Loading…",
     },
 }
 
@@ -983,7 +1258,14 @@ ICON_COMMENT = svg(
     size=13)
 ICON_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=13)
 ICON_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=13, sw=2.5)
+ICON_EDIT = svg(
+    '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=13)
 ICON_HOME = svg('<path d="M3 10l9-7 9 7v11a2 2 0 0 1-2 2h-4v-8h-6v8H5a2 2 0 0 1-2-2z"/>', size=15)
+ICON_USERS = svg(
+    '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
+    '<circle cx="9" cy="7" r="4"/>'
+    '<path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
+    '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>', size=15)
 ICON_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>', size=15)
 ICON_BELL = svg(
     '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
@@ -1019,14 +1301,14 @@ CSS = """
   --text:#101010; --muted:#767676; --hover:#f0f0f0;
   --accent:#101010; --accent-fg:#ffffff;
   --up:#1f9d55; --down:#d84343; --comment-bg:#f6f6f6;
-  --danger:#d84343;
+  --danger:#d84343; --mention:#3b7dd8;
 }
 [data-theme="dark"] {
   --bg:#0a0a0a; --card:#141414; --line:#282828; --line-strong:#3a3a3a;
   --text:#ececec; --muted:#888888; --hover:#1e1e1e;
   --accent:#ececec; --accent-fg:#101010;
   --up:#2ecc71; --down:#e74c3c; --comment-bg:#1c1c1c;
-  --danger:#e74c3c;
+  --danger:#e74c3c; --mention:#6aa9ff;
 }
 * { box-sizing: border-box; }
 html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
@@ -1093,13 +1375,13 @@ header.search-header {
   flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
   padding: 10px 12px; border-bottom: 1px solid var(--line);
 }
-header.search-header input[type="search"] {
+header.search-header input[type="search"], header.search-header input[type="text"] {
   flex: 1; min-width: 0; padding: 0 12px; height: 32px;
   border: 1px solid var(--line); background: transparent;
   color: var(--text); font-size: 14px; font-family: inherit;
   outline: none; transition: border-color .12s;
 }
-header.search-header input[type="search"]:focus { border-color: var(--line-strong); }
+header.search-header input:focus { border-color: var(--line-strong); }
 
 .filters {
   flex: 0 0 auto; display: flex; align-items: center;
@@ -1118,6 +1400,15 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .filter.active { color: var(--text); background: var(--hover); }
 
 .empty { padding: 80px 20px; text-align: center; color: var(--muted); font-size: 13px; }
+
+.spinner-wrap { padding: 60px 0; text-align: center; }
+.spinner {
+  display: inline-block; width: 24px; height: 24px;
+  border: 2px solid var(--line); border-top-color: var(--text);
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .post { padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--card); }
 .post-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
 .post-author { font-weight: 600; color: var(--text); text-decoration: none; font-size: 13px; }
@@ -1127,6 +1418,10 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
   font-size: 15px; line-height: 1.5; white-space: pre-wrap;
   word-wrap: break-word; overflow-wrap: anywhere; color: var(--text);
 }
+.mention {
+  color: var(--mention); text-decoration: none; font-weight: 500;
+}
+.mention:hover { text-decoration: underline; }
 .read-more {
   display: inline-block; margin-top: 6px; color: var(--muted);
   text-decoration: none; font-size: 13px; border-bottom: 1px dashed currentColor;
@@ -1147,9 +1442,11 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .vote-btn.down.active { color: var(--down); }
 .action-btn:hover { color: var(--text); }
 .action-btn.copied { color: var(--up); }
+.action-btn.danger:hover { color: var(--danger); }
 .score {
   min-width: 18px; padding: 0 2px; text-align: center;
   font-weight: 600; font-size: 12px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 .score.up { color: var(--up); }
 .score.down { color: var(--down); }
@@ -1179,12 +1476,35 @@ header.search-header input[type="search"]:focus { border-color: var(--line-stron
 .comment-actions { display: flex; align-items: center; gap: 1px; margin-top: 6px; font-size: 11px; color: var(--muted); }
 .comment-actions .vote-btn { height: 22px; padding: 0 6px; font-size: 11px; }
 .comment-actions .score { font-size: 11px; min-width: 14px; }
-.comment-reply-btn {
+.comment-reply-btn, .comment-edit-btn {
   background: transparent; border: none; color: var(--muted);
   font-family: inherit; font-size: 11px; cursor: pointer;
-  padding: 4px 8px; height: 22px; transition: color .12s, background .12s;
+  padding: 4px 8px; height: 22px; display: inline-flex; align-items: center; gap: 4px;
+  transition: color .12s, background .12s;
 }
-.comment-reply-btn:hover { color: var(--text); background: var(--hover); }
+.comment-reply-btn:hover, .comment-edit-btn:hover { color: var(--text); background: var(--hover); }
+.comment-edit-btn.danger:hover { color: var(--danger); }
+.comment-edit-btn svg { display: block; }
+
+.inline-editor { margin-top: 8px; }
+.inline-editor textarea {
+  display: block; width: 100%; padding: 10px 12px; min-height: 80px;
+  border: 1px solid var(--line-strong); background: var(--card);
+  color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
+  outline: none; resize: none;
+}
+.inline-editor .edit-actions {
+  display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px;
+}
+.inline-editor .edit-actions button {
+  height: 30px; padding: 0 14px; font-family: inherit; font-size: 13px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent; color: var(--text);
+}
+.inline-editor .edit-actions button:hover { background: var(--hover); }
+.inline-editor .edit-actions button.edit-save {
+  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
+}
+.inline-editor .edit-actions button.edit-save:hover { opacity: .85; background: var(--accent); }
 
 .composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 10px 12px; }
 .composer textarea {
@@ -1330,7 +1650,7 @@ button.send:disabled { opacity: .28; cursor: default; }
   font-size: 13px; font-weight: 600; text-transform: uppercase;
   letter-spacing: .5px; color: var(--muted); margin: 0 0 12px;
 }
-.settings-section { margin-bottom: 28px; }
+.settings-section { margin-bottom: 32px; }
 .opt-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .opt {
   height: 32px; padding: 0 16px; background: transparent; color: var(--text);
@@ -1339,6 +1659,39 @@ button.send:disabled { opacity: .28; cursor: default; }
 }
 .opt:hover { background: var(--hover); }
 .opt.active { background: var(--hover); border-color: var(--line-strong); font-weight: 600; }
+
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 0; border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+.toggle-row:last-child { border-bottom: none; }
+.toggle {
+  position: relative; width: 40px; height: 22px;
+  background: var(--line); cursor: pointer; transition: background .15s;
+  border: 1px solid var(--line);
+}
+.toggle::after {
+  content: ''; position: absolute; left: 1px; top: 1px;
+  width: 16px; height: 16px; background: var(--card);
+  transition: transform .15s;
+}
+.toggle.on { background: var(--up); border-color: var(--up); }
+.toggle.on::after { transform: translateX(18px); background: #fff; }
+
+.settings-desc { font-size: 13px; line-height: 1.6; color: var(--muted); margin: 0 0 12px; }
+.settings-link {
+  display: inline-block; color: var(--text); text-decoration: underline;
+  font-size: 13px; cursor: pointer;
+}
+.settings-authors { font-size: 14px; color: var(--text); }
+
+.policy { padding: 24px 24px; }
+.policy h1 { font-size: 20px; margin: 0 0 16px; font-weight: 700; }
+.policy p {
+  font-size: 14px; line-height: 1.7; color: var(--text);
+  white-space: pre-wrap; margin: 0;
+}
 
 .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash {
@@ -1351,15 +1704,19 @@ button.send:disabled { opacity: .28; cursor: default; }
 JS = r"""
 var ICONS = {
   up: __ICON_UP__, down: __ICON_DOWN__, comment: __ICON_COMMENT__,
-  copy: __ICON_COPY__, check: __ICON_CHECK__,
+  copy: __ICON_COPY__, check: __ICON_CHECK__, edit: __ICON_EDIT__,
   moon: __ICON_MOON__, sun: __ICON_SUN__, back: __ICON_BACK__,
-  home: __ICON_HOME__, user: __ICON_USER__, bell: __ICON_BELL__,
-  gear: __ICON_GEAR__, logout: __ICON_LOGOUT__, plus: __ICON_PLUS__,
-  login: __ICON_LOGIN__, trash: __ICON_TRASH__, search: __ICON_SEARCH__
+  home: __ICON_HOME__, users: __ICON_USERS__, user: __ICON_USER__,
+  bell: __ICON_BELL__, gear: __ICON_GEAR__, logout: __ICON_LOGOUT__,
+  plus: __ICON_PLUS__, login: __ICON_LOGIN__, trash: __ICON_TRASH__,
+  search: __ICON_SEARCH__
 };
 
+var cachedUser = null;
+try { cachedUser = JSON.parse(localStorage.getItem('sldchat_user') || 'null'); } catch(e) { cachedUser = null; }
+
 var state = {
-  user: null,
+  user: cachedUser,
   token: localStorage.getItem('sldchat_token') || null,
   view: VIEW,
   viewData: VIEW_DATA || {},
@@ -1367,10 +1724,18 @@ var state = {
   sortMode: 'new',
   commentFilter: 'any',
   searchQuery: '',
+  usersQuery: '',
   composerDraft: '',
   replyTo: null,
-  highlightComment: null
+  highlightComment: null,
+  suppressRefresh: 0
 };
+
+function setUser(u) {
+  state.user = u;
+  if (u) localStorage.setItem('sldchat_user', JSON.stringify(u));
+  else localStorage.removeItem('sldchat_user');
+}
 
 async function api(path, opts) {
   opts = opts || {};
@@ -1382,7 +1747,7 @@ async function api(path, opts) {
   }
   var r = await fetch(path, opts);
   if (r.status === 401) {
-    state.user = null; state.token = null;
+    setUser(null); state.token = null;
     localStorage.removeItem('sldchat_token');
     throw new Error('unauthorized');
   }
@@ -1397,6 +1762,11 @@ async function api(path, opts) {
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function linkifyMentions(escaped) {
+  return escaped.replace(/(^|[^a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})/g, function(_, pre, nick){
+    return pre + '<a class="mention" href="/u/' + encodeURIComponent(nick) + '" data-link>@' + nick + '</a>';
   });
 }
 function tr(k) { return T[k] || k; }
@@ -1422,6 +1792,9 @@ function truncateText(text) {
   if (out.length > TRUNCATE_CHARS) { out = out.slice(0, TRUNCATE_CHARS); truncated = true; }
   if (truncated) out = out.replace(/\s+$/, '') + '…';
   return { text: out, truncated: truncated };
+}
+function spinner() {
+  return '<div class="spinner-wrap"><div class="spinner"></div></div>';
 }
 
 function applyTheme(theme) {
@@ -1458,8 +1831,10 @@ function handleRoute() {
   else if ((m = path.match(/^\/u\/(.+)$/))) {
     state.view = 'profile'; state.viewData = { nick: decodeURIComponent(m[1]) };
   }
+  else if (path === '/users') { state.view = 'users'; state.viewData = {}; }
   else if (path === '/notifications') { state.view = 'notifications'; state.viewData = {}; }
   else if (path === '/settings') { state.view = 'settings'; state.viewData = {}; }
+  else if (path === '/policy') { state.view = 'policy'; state.viewData = {}; }
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'feed'; state.viewData = {}; }
@@ -1470,25 +1845,30 @@ window.addEventListener('popstate', handleRoute);
 
 async function loadMe() {
   if (!state.token) return;
-  try { state.user = await api('/api/me'); } catch(e) { state.user = null; }
+  try {
+    var u = await api('/api/me');
+    setUser(u);
+  } catch(e) { setUser(null); }
 }
+
 async function doRegister(data) {
   var res = await api('/api/register', { method: 'POST', body: data });
   state.token = res.token;
   localStorage.setItem('sldchat_token', res.token);
-  state.user = res.user;
+  setUser(res.user);
   navigate('/');
 }
 async function doLogin(data) {
   var res = await api('/api/login', { method: 'POST', body: data });
   state.token = res.token;
   localStorage.setItem('sldchat_token', res.token);
-  state.user = res.user;
+  setUser(res.user);
   navigate('/');
 }
 async function doLogout() {
   try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
-  state.user = null; state.token = null;
+  setUser(null);
+  state.token = null;
   localStorage.removeItem('sldchat_token');
   navigate('/');
 }
@@ -1503,6 +1883,7 @@ function renderSidebar() {
   var el = document.getElementById('sidebar');
   var html = '<div class="logo">sldchat</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
+  html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
     html += navBtn(ICONS.user, tr('nav_profile'),
       state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
@@ -1522,6 +1903,7 @@ function renderSidebar() {
     b.addEventListener('click', function(){
       var nav = b.dataset.nav;
       if (nav === 'home') navigate('/');
+      else if (nav === 'users') navigate('/users');
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
       else if (nav === 'settings') navigate('/settings');
@@ -1538,8 +1920,10 @@ function renderMain() {
   else if (state.view === 'post') renderPostView(el);
   else if (state.view === 'profile') renderProfileView(el);
   else if (state.view === 'followers' || state.view === 'following') renderFollowListView(el);
+  else if (state.view === 'users') renderUsersView(el);
   else if (state.view === 'notifications') renderNotificationsView(el);
   else if (state.view === 'settings') renderSettingsView(el);
+  else if (state.view === 'policy') renderPolicyView(el);
   else if (state.view === 'register') renderRegisterView(el);
   else if (state.view === 'login') renderLoginView(el);
   else renderFeedView(el);
@@ -1581,7 +1965,7 @@ function renderFeedView(el) {
   html += '<button class="filter' + (state.commentFilter==='some'?' active':'') + '" data-comments="some">' + tr('f_some') + '</button>';
   html += '<button class="filter' + (state.commentFilter==='none'?' active':'') + '" data-comments="none">' + tr('f_none') + '</button>';
   html += '</div></div>';
-  html += '<div class="main-body"><div id="feed"><div class="empty">…</div></div></div>';
+  html += '<div class="main-body"><div id="feed">' + spinner() + '</div></div>';
 
   if (state.user) {
     html += '<div class="composer">';
@@ -1669,6 +2053,7 @@ async function loadFeed() {
     if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
     feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     bindPostActions(feedEl);
+    bindLinks(feedEl);
   } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
 }
 function applyFilters(posts) {
@@ -1693,7 +2078,7 @@ function renderPostView(el) {
   html += '<div class="title"></div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
-  html += '<div class="main-body"><div id="feed"><div class="empty">…</div></div></div>';
+  html += '<div class="main-body"><div id="feed">' + spinner() + '</div></div>';
   if (state.user) {
     html += '<div class="composer composer-comment" id="composer">';
     html += '<div id="replyBanner"></div>';
@@ -1766,6 +2151,7 @@ async function loadPostView() {
     var p = await api('/api/posts/' + state.viewData.post_id);
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl);
+    bindLinks(feedEl);
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -1785,7 +2171,7 @@ function renderProfileView(el) {
   html += '<div class="title">@' + escapeHtml(nick) + '</div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
-  html += '<div class="main-body"><div id="profileHeader"></div><div id="feed"><div class="empty">…</div></div></div>';
+  html += '<div class="main-body"><div id="profileHeader">' + spinner() + '</div><div id="feed"></div></div>';
   el.innerHTML = html;
   attachThemeBtn();
   bindLinks(el);
@@ -1866,7 +2252,11 @@ async function loadProfile(nick) {
     var posts = (data.posts || []).slice();
     posts.sort(function(a, b){ return b.created_at - a.created_at; });
     if (!posts.length) feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
-    else { feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join(''); bindPostActions(feedEl); }
+    else {
+      feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+      bindPostActions(feedEl);
+      bindLinks(feedEl);
+    }
   } catch(e) {
     headerEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
     feedEl.innerHTML = '';
@@ -1883,7 +2273,7 @@ function renderFollowListView(el) {
   html += '<div class="title">@' + escapeHtml(nick) + ' · ' + escapeHtml(title) + '</div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
-  html += '<div class="main-body"><div id="list"><div class="empty">…</div></div></div>';
+  html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
   el.innerHTML = html;
   attachThemeBtn();
   bindLinks(el);
@@ -1910,6 +2300,54 @@ async function loadFollowList(nick, isFollowers) {
         + '</div></div>';
     }).join('') + '</div>';
     bindLinks(wrap);
+  } catch(e) {
+    var msg = tr(e.message) || '—';
+    wrap.innerHTML = '<div class="empty">' + escapeHtml(msg) + '</div>';
+  }
+}
+
+function renderUsersView(el) {
+  var html = '';
+  html += '<header class="search-header">';
+  html += '<input id="usersSearch" type="text" placeholder="' + escapeHtml(tr('users_search_ph')) + '" autocomplete="off" spellcheck="false" value="' + escapeHtml(state.usersQuery) + '" />';
+  html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
+  html += '</header>';
+  html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
+  el.innerHTML = html;
+  attachThemeBtn();
+  bindLinks(el);
+
+  var searchEl = document.getElementById('usersSearch');
+  var tId;
+  searchEl.addEventListener('input', function(){
+    state.usersQuery = searchEl.value;
+    clearTimeout(tId); tId = setTimeout(loadUsers, 250);
+  });
+  searchEl.addEventListener('keydown', function(e){
+    if (e.key === 'Enter') { e.preventDefault(); loadUsers(); }
+  });
+  loadUsers();
+}
+
+async function loadUsers() {
+  var wrap = document.getElementById('list');
+  if (!wrap) return;
+  try {
+    var q = (state.usersQuery || '').trim();
+    var data = await api('/api/users?q=' + encodeURIComponent(q));
+    var users = data.users || [];
+    if (!users.length) {
+      wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>';
+      return;
+    }
+    wrap.innerHTML = '<div class="user-list">' + users.map(function(u){
+      return '<div class="user-item">'
+        + '<div class="user-info">'
+        + '<a class="user-nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
+        + '<div class="user-name">' + escapeHtml(u.name) + '</div>'
+        + '</div></div>';
+    }).join('') + '</div>';
+    bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
@@ -1920,7 +2358,7 @@ function renderNotificationsView(el) {
   html += '<div class="title">' + tr('notif_title') + '</div>';
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
-  html += '<div class="main-body"><div id="notifList"><div class="empty">…</div></div></div>';
+  html += '<div class="main-body"><div id="notifList">' + spinner() + '</div></div>';
   el.innerHTML = html;
   attachThemeBtn();
   bindLinks(el);
@@ -1958,7 +2396,7 @@ async function loadNotifications() {
 
 function renderNotifHtml(n) {
   var cls = 'notif' + (n.read ? '' : ' unread');
-  var author = '<a class="notif-author" href="/u/' + encodeURIComponent(n.from_nick) + '" data-link>@' + escapeHtml(n.from_nick) + '</a>';
+  var author = '<span class="notif-author">@' + escapeHtml(n.from_nick || '?') + '</span>';
   var text = '';
   var link = null;
   if (n.type === 'follow') {
@@ -1972,6 +2410,10 @@ function renderNotifHtml(n) {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_reply') + '</span></div>';
     if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
+  } else if (n.type === 'mention') {
+    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_mention') + '</span></div>';
+    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
   } else {
     text = '<div class="notif-text">' + author + '</div>';
   }
@@ -1983,6 +2425,10 @@ function renderNotifHtml(n) {
 function renderSettingsView(el) {
   var theme = document.documentElement.getAttribute('data-theme') || 'light';
   var lang = LANG;
+  var me = state.user || {};
+  var allowF = me.allow_followers_view !== false;
+  var allowG = me.allow_following_view !== false;
+
   var html = '';
   html += '<header class="main-header">';
   html += '<a href="/" class="icon-btn" data-link title="' + escapeHtml(tr('back_to_main')) + '">' + ICONS.back + '</a>';
@@ -1990,18 +2436,39 @@ function renderSettingsView(el) {
   html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
   html += '</header>';
   html += '<div class="main-body"><div class="settings">';
-  html += '<div class="settings-section"><h2>' + tr('settings_theme') + '</h2><div class="opt-row">';
+
+  html += '<div class="settings-section"><h2>' + tr('settings_appearance') + '</h2>';
+  html += '<div style="margin-bottom:12px"><div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + tr('settings_theme') + '</div><div class="opt-row">';
   html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
   html += '<button class="opt' + (theme==='dark'?' active':'') + '" data-set-theme="dark">' + tr('theme_dark') + '</button>';
   html += '</div></div>';
-  html += '<div class="settings-section"><h2>' + tr('settings_lang') + '</h2><div class="opt-row">';
+  html += '<div><div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + tr('settings_lang') + '</div><div class="opt-row">';
   html += '<button class="opt' + (lang==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
   html += '<button class="opt' + (lang==='en'?' active':'') + '" data-set-lang="en">English</button>';
   html += '</div></div>';
+  html += '</div>';
+
+  if (state.user) {
+    html += '<div class="settings-section"><h2>' + tr('settings_privacy') + '</h2>';
+    html += '<div class="toggle-row"><span>' + tr('settings_allow_followers') + '</span>'
+      + '<div class="toggle' + (allowF ? ' on' : '') + '" data-toggle="allow_followers_view"></div></div>';
+    html += '<div class="toggle-row"><span>' + tr('settings_allow_following') + '</span>'
+      + '<div class="toggle' + (allowG ? ' on' : '') + '" data-toggle="allow_following_view"></div></div>';
+    html += '</div>';
+  }
+
+  html += '<div class="settings-section"><h2>' + tr('settings_info') + '</h2>';
+  html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
+  html += '<p style="margin:0 0 8px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
+  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:4px">' + tr('settings_authors') + '</div>';
+  html += '<div class="settings-authors">SldShr, DeepSeek</div>';
+  html += '</div>';
+
   html += '</div></div>';
   el.innerHTML = html;
   attachThemeBtn();
   bindLinks(el);
+
   el.querySelectorAll('[data-set-theme]').forEach(function(b){
     b.addEventListener('click', function(){ applyTheme(b.dataset.setTheme); renderSettingsView(el); });
   });
@@ -2011,6 +2478,42 @@ function renderSettingsView(el) {
       location.reload();
     });
   });
+  el.querySelectorAll('[data-toggle]').forEach(function(t){
+    t.addEventListener('click', async function(){
+      var key = t.dataset.toggle;
+      var newVal = !t.classList.contains('on');
+      t.classList.toggle('on', newVal);
+      var patch = {};
+      patch[key] = newVal;
+      var meNow = state.user || {};
+      meNow[key] = newVal;
+      setUser(meNow);
+      try {
+        await api('/api/users/me/settings', { method: 'POST', body: patch });
+      } catch(e) {
+        t.classList.toggle('on', !newVal);
+        meNow[key] = !newVal;
+        setUser(meNow);
+        alert(tr(e.message) || e.message);
+      }
+    });
+  });
+}
+
+function renderPolicyView(el) {
+  var html = '';
+  html += '<header class="main-header">';
+  html += '<a href="/settings" class="icon-btn" data-link title="' + escapeHtml(tr('back_to_main')) + '">' + ICONS.back + '</a>';
+  html += '<div class="title">' + tr('policy_title') + '</div>';
+  html += '<button class="icon-btn" id="mainThemeBtn" title="' + escapeHtml(tr('theme')) + '">' + ICONS.moon + '</button>';
+  html += '</header>';
+  html += '<div class="main-body"><div class="policy">';
+  html += '<h1>' + tr('policy_title') + '</h1>';
+  html += '<p>' + escapeHtml(tr('policy_content')) + '</p>';
+  html += '</div></div>';
+  el.innerHTML = html;
+  attachThemeBtn();
+  bindLinks(el);
 }
 
 function renderRegisterView(el) {
@@ -2096,6 +2599,7 @@ function renderPostHtml(p, showComments) {
     displayText = res.text;
     truncated = res.truncated;
   }
+  var bodyHtml = linkifyMentions(escapeHtml(displayText));
   var readMore = truncated
     ? '<a class="read-more" href="/p/' + p.id + '" data-link>… ' + escapeHtml(tr('read_more')) + '</a>'
     : '';
@@ -2104,10 +2608,18 @@ function renderPostHtml(p, showComments) {
     ? '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>'
     : '';
 
+  var isMine = state.user && p.author === state.user.nick;
+
   var commentBtn = '<button class="action-btn" data-action="comment" data-post-id="' + p.id + '">'
     + ICONS.comment + '<span>' + (p.comments ? p.comments.length : 0) + '</span></button>';
   var copyBtn = '<button class="action-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">'
     + ICONS.copy + '</button>';
+  var editBtn = isMine
+    ? '<button class="action-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
+    : '';
+  var delBtn = isMine
+    ? '<button class="action-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
+    : '';
 
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
@@ -2117,13 +2629,13 @@ function renderPostHtml(p, showComments) {
   return ''
     + '<div class="post" data-post-id="' + p.id + '">'
     +   '<div class="post-meta">' + authorLink + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
-    +   '<div class="post-text">' + escapeHtml(displayText) + '</div>'
+    +   '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>'
     +   readMore
     +   '<div class="post-actions">'
     +     '<button class="vote-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '</button>'
     +     '<span class="score ' + scCls + '">' + score + '</span>'
     +     '<button class="vote-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
-    +     commentBtn + copyBtn
+    +     commentBtn + copyBtn + editBtn + delBtn
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -2151,26 +2663,123 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
   var downCls = c.user_vote === -1 ? 'active' : '';
   var scCls = scoreClass(c.upvotes, c.downvotes);
   var isAuthor = postAuthor && c.author === postAuthor;
+  var isMine = state.user && c.author === state.user.nick;
   var cls = 'comment' + (isReply ? ' reply' : '') + (isAuthor ? ' is-author' : '');
   var authorHtml = c.author
     ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>'
     : '';
   var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
+
   var replyBtn = '';
   if (!isReply && state.user) {
     replyBtn = '<button class="comment-reply-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
   }
+  var editBtn = isMine
+    ? '<button class="comment-edit-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
+    : '';
+  var delBtn = isMine
+    ? '<button class="comment-edit-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
+    : '';
+
+  var bodyHtml = linkifyMentions(escapeHtml(c.text));
+
   return ''
     + '<div class="' + cls + '" data-comment-id="' + c.id + '">'
     +   '<div class="comment-meta">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
-    +   '<div class="comment-text">' + escapeHtml(c.text) + '</div>'
+    +   '<div class="comment-text" data-raw="' + escapeHtml(c.text) + '">' + bodyHtml + '</div>'
     +   '<div class="comment-actions">'
     +     '<button class="vote-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICONS.up + '</button>'
     +     '<span class="score ' + scCls + '">' + score + '</span>'
     +     '<button class="vote-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICONS.down + '</button>'
-    +     replyBtn
+    +     replyBtn + editBtn + delBtn
     +   '</div>'
     + '</div>';
+}
+
+/* ========== Optimistic voting ========== */
+function applyVoteUI(container, targetBtn, dir, initial) {
+  var row = targetBtn.closest('.post-actions, .comment-actions');
+  if (!row) return null;
+  var upBtn = row.querySelector('.vote-btn.up');
+  var downBtn = row.querySelector('.vote-btn.down');
+  var scoreEl = row.querySelector('.score');
+  if (!upBtn || !downBtn || !scoreEl) return null;
+
+  var oldScore = parseInt(scoreEl.textContent, 10) || 0;
+  var wasUp = upBtn.classList.contains('active');
+  var wasDown = downBtn.classList.contains('active');
+
+  if (initial) {
+    return { upBtn: upBtn, downBtn: downBtn, scoreEl: scoreEl, oldScore: oldScore, wasUp: wasUp, wasDown: wasDown };
+  }
+
+  var newUp = wasUp, newDown = wasDown, newScore = oldScore;
+  if (dir === 1) {
+    if (wasUp) { newUp = false; newScore = oldScore - 1; }
+    else if (wasDown) { newUp = true; newDown = false; newScore = oldScore + 2; }
+    else { newUp = true; newScore = oldScore + 1; }
+  } else {
+    if (wasDown) { newDown = false; newScore = oldScore + 1; }
+    else if (wasUp) { newDown = true; newUp = false; newScore = oldScore - 2; }
+    else { newDown = true; newScore = oldScore - 1; }
+  }
+  scoreEl.textContent = newScore;
+  scoreEl.classList.remove('up','down');
+  if (newScore > 0) scoreEl.classList.add('up');
+  else if (newScore < 0) scoreEl.classList.add('down');
+  upBtn.classList.toggle('active', newUp);
+  downBtn.classList.toggle('active', newDown);
+
+  return { upBtn: upBtn, downBtn: downBtn, scoreEl: scoreEl, oldScore: oldScore, wasUp: wasUp, wasDown: wasDown };
+}
+
+function revertVote(snap) {
+  if (!snap) return;
+  snap.scoreEl.textContent = snap.oldScore;
+  snap.scoreEl.classList.remove('up','down');
+  if (snap.oldScore > 0) snap.scoreEl.classList.add('up');
+  else if (snap.oldScore < 0) snap.scoreEl.classList.add('down');
+  snap.upBtn.classList.toggle('active', snap.wasUp);
+  snap.downBtn.classList.toggle('active', snap.wasDown);
+}
+
+/* ========== Inline edit ========== */
+function startInlineEdit(container, textEl, initialText, onSave) {
+  var editor = document.createElement('div');
+  editor.className = 'inline-editor';
+  editor.innerHTML = '<textarea></textarea>'
+    + '<div class="edit-actions">'
+    + '<button class="edit-cancel">' + escapeHtml(tr('cancel')) + '</button>'
+    + '<button class="edit-save">' + escapeHtml(tr('save')) + '</button>'
+    + '</div>';
+  textEl.style.display = 'none';
+  container.insertBefore(editor, textEl);
+
+  var ta = editor.querySelector('textarea');
+  ta.value = initialText;
+  ta.focus();
+  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch(e) {}
+
+  var cancelBtn = editor.querySelector('.edit-cancel');
+  var saveBtn = editor.querySelector('.edit-save');
+
+  function close() {
+    if (editor.parentNode) editor.parentNode.removeChild(editor);
+    textEl.style.display = '';
+  }
+  cancelBtn.addEventListener('click', close);
+  saveBtn.addEventListener('click', async function(){
+    var v = ta.value.trim();
+    if (!v) return;
+    saveBtn.disabled = true;
+    try {
+      await onSave(v);
+      close();
+    } catch(e) {
+      alert(tr(e.message) || e.message);
+      saveBtn.disabled = false;
+    }
+  });
 }
 
 function bindPostActions(root) {
@@ -2183,27 +2792,84 @@ function bindPostActions(root) {
       var postId = btn.dataset.postId;
       var commentId = btn.dataset.commentId;
       var dir = parseInt(btn.dataset.dir || '0', 10);
-      try {
-        if (action === 'vote') {
-          if (!state.user) { navigate('/login'); return; }
+
+      if (action === 'vote') {
+        if (!state.user) { navigate('/login'); return; }
+        var snap = applyVoteUI(root, btn, dir, false);
+        state.suppressRefresh = Date.now() + 3000;
+        try {
           await api('/api/posts/' + postId + '/vote', { method: 'POST', body: { direction: dir } });
-          refreshCurrentView();
-        } else if (action === 'vote-comment') {
-          if (!state.user) { navigate('/login'); return; }
-          await api('/api/posts/' + postId + '/comments/' + commentId + '/vote', { method: 'POST', body: { direction: dir } });
-          refreshCurrentView();
-        } else if (action === 'comment') {
-          navigate('/p/' + postId);
-        } else if (action === 'copy') {
-          await copyPost(postId, btn);
-        } else if (action === 'reply') {
-          state.replyTo = { id: commentId, author: btn.dataset.author || '' };
-          if (state.view !== 'post') { navigate('/p/' + postId); return; }
-          if (state._renderReplyBanner) state._renderReplyBanner();
-          var ta = document.getElementById('newComment');
-          if (ta) ta.focus();
+        } catch(err) {
+          revertVote(snap);
+          alert(tr(err.message) || err.message);
         }
-      } catch(err) { alert(tr(err.message) || err.message); }
+        return;
+      }
+      if (action === 'vote-comment') {
+        if (!state.user) { navigate('/login'); return; }
+        var snap2 = applyVoteUI(root, btn, dir, false);
+        state.suppressRefresh = Date.now() + 3000;
+        try {
+          await api('/api/posts/' + postId + '/comments/' + commentId + '/vote', { method: 'POST', body: { direction: dir } });
+        } catch(err) {
+          revertVote(snap2);
+          alert(tr(err.message) || err.message);
+        }
+        return;
+      }
+      if (action === 'comment') {
+        navigate('/p/' + postId);
+        return;
+      }
+      if (action === 'copy') {
+        await copyPost(postId, btn);
+        return;
+      }
+      if (action === 'reply') {
+        state.replyTo = { id: commentId, author: btn.dataset.author || '' };
+        if (state.view !== 'post') { navigate('/p/' + postId); return; }
+        if (state._renderReplyBanner) state._renderReplyBanner();
+        var ta = document.getElementById('newComment');
+        if (ta) ta.focus();
+        return;
+      }
+      if (action === 'edit-post') {
+        var postEl = btn.closest('.post');
+        var textEl = postEl.querySelector('.post-text');
+        var raw = textEl.getAttribute('data-raw') || '';
+        startInlineEdit(postEl, textEl, raw, async function(newText){
+          await api('/api/posts/' + postId, { method: 'PUT', body: { text: newText } });
+          refreshCurrentView();
+        });
+        return;
+      }
+      if (action === 'delete-post') {
+        if (!confirm(tr('confirm_delete'))) return;
+        try {
+          await api('/api/posts/' + postId, { method: 'DELETE' });
+          if (state.view === 'post') navigate('/');
+          else refreshCurrentView();
+        } catch(err) { alert(tr(err.message) || err.message); }
+        return;
+      }
+      if (action === 'edit-comment') {
+        var cEl = btn.closest('.comment');
+        var cTextEl = cEl.querySelector('.comment-text');
+        var cRaw = cTextEl.getAttribute('data-raw') || '';
+        startInlineEdit(cEl, cTextEl, cRaw, async function(newText){
+          await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'PUT', body: { text: newText } });
+          refreshCurrentView();
+        });
+        return;
+      }
+      if (action === 'delete-comment') {
+        if (!confirm(tr('confirm_delete'))) return;
+        try {
+          await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
+          refreshCurrentView();
+        } catch(err) { alert(tr(err.message) || err.message); }
+        return;
+      }
     });
   });
   root.querySelectorAll('[data-link]').forEach(function(a){
@@ -2250,20 +2916,32 @@ async function pollNotifications() {
   } catch(e) {}
 }
 
-(async function init() {
-  await loadMe();
+(function init() {
+  // Мгновенная отрисовка: рендерим из кэша сразу
   if (state.user && (state.view === 'login' || state.view === 'register')) {
     history.replaceState({}, '', '/');
     state.view = 'feed'; state.viewData = {};
   }
   renderSidebar();
   renderMain();
-  if (state.user) {
-    pollNotifications();
-    setInterval(pollNotifications, 15000);
-  }
+
+  // Затем подтягиваем свежие данные пользователя
+  loadMe().then(function(){
+    if (state.user && (state.view === 'login' || state.view === 'register')) {
+      history.replaceState({}, '', '/');
+      state.view = 'feed'; state.viewData = {};
+    }
+    renderSidebar();
+    renderMain();
+    if (state.user) {
+      pollNotifications();
+      setInterval(pollNotifications, 15000);
+    }
+  });
+
   setInterval(function(){
     if (document.hidden) return;
+    if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
     if (state.view === 'feed') loadFeed();
     else if (state.view === 'post') loadPostView();
   }, 5000);
@@ -2281,10 +2959,12 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__ICON_COMMENT__", json.dumps(ICON_COMMENT))
           .replace("__ICON_COPY__", json.dumps(ICON_COPY))
           .replace("__ICON_CHECK__", json.dumps(ICON_CHECK))
+          .replace("__ICON_EDIT__", json.dumps(ICON_EDIT))
           .replace("__ICON_MOON__", json.dumps(ICON_MOON))
           .replace("__ICON_SUN__", json.dumps(ICON_SUN))
           .replace("__ICON_BACK__", json.dumps(ICON_BACK))
           .replace("__ICON_HOME__", json.dumps(ICON_HOME))
+          .replace("__ICON_USERS__", json.dumps(ICON_USERS))
           .replace("__ICON_USER__", json.dumps(ICON_USER))
           .replace("__ICON_BELL__", json.dumps(ICON_BELL))
           .replace("__ICON_GEAR__", json.dumps(ICON_GEAR))
@@ -2354,6 +3034,11 @@ def page_following(nick: str, request: Request):
     return render_page(get_lang(request), "following", {"nick": nick})
 
 
+@app.get("/users", response_class=HTMLResponse)
+def page_users(request: Request):
+    return render_page(get_lang(request), "users")
+
+
 @app.get("/notifications", response_class=HTMLResponse)
 def page_notifications(request: Request):
     return render_page(get_lang(request), "notifications")
@@ -2362,6 +3047,11 @@ def page_notifications(request: Request):
 @app.get("/settings", response_class=HTMLResponse)
 def page_settings(request: Request):
     return render_page(get_lang(request), "settings")
+
+
+@app.get("/policy", response_class=HTMLResponse)
+def page_policy(request: Request):
+    return render_page(get_lang(request), "policy")
 
 
 @app.get("/register", response_class=HTMLResponse)
