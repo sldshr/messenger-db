@@ -8,7 +8,7 @@ import secrets
 import time
 from typing import Dict, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -38,6 +38,7 @@ def dec_str(s: str) -> str:
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, str] = {}
 CHATS: Dict[str, list] = {}
+CONNECTIONS: Dict[str, list] = {}   # nick -> [WebSocket, ...]
 
 
 def chat_key(a: str, b: str) -> str:
@@ -86,6 +87,58 @@ def user_public(nick: str) -> dict:
     return {"nick": nick, "name": u["name"], "avatar": u["avatar"]}
 
 
+# --------------- WebSocket: доставка событий ---------------
+
+async def push_to(nick: str, event: dict):
+    """Отправить событие всем активным сокетам пользователя."""
+    conns = CONNECTIONS.get(nick)
+    if not conns:
+        return
+    payload = json.dumps(event, ensure_ascii=False)
+    dead = []
+    for ws in list(conns):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            conns.remove(ws)
+        except ValueError:
+            pass
+    if not conns:
+        CONNECTIONS.pop(nick, None)
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
+    await websocket.accept()
+    nick = SESSIONS.get(token)
+    if not nick:
+        await websocket.close(code=4001)
+        return
+
+    CONNECTIONS.setdefault(nick, []).append(websocket)
+    try:
+        while True:
+            # клиент шлёт ping — мы просто принимаем
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        conns = CONNECTIONS.get(nick)
+        if conns and websocket in conns:
+            conns.remove(websocket)
+            if not conns:
+                CONNECTIONS.pop(nick, None)
+
+
+# ============================================================
+#                          AUTH API
+# ============================================================
+
 @app.post("/api/register")
 def register(body: EncBody):
     d = parse(body)
@@ -116,12 +169,8 @@ def register(body: EncBody):
     ]
 
     USERS[nick] = {
-        "name": name,
-        "nick": nick,
-        "password": hash_pw(pw),
-        "avatar": avatar,
-        "contacts": set(),
-        "blacklist": set(),
+        "name": name, "nick": nick, "password": hash_pw(pw),
+        "avatar": avatar, "contacts": set(), "blacklist": set(),
     }
     token = secrets.token_urlsafe(24)
     SESSIONS[token] = nick
@@ -152,6 +201,10 @@ def me(x_token: Optional[str] = Header(None)):
     }
 
 
+# ============================================================
+#                          SEARCH
+# ============================================================
+
 @app.post("/api/search")
 def search(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
@@ -170,8 +223,12 @@ def search(body: EncBody, x_token: Optional[str] = Header(None)):
     return {"user": user_public(q)}
 
 
+# ============================================================
+#                           CHAT
+# ============================================================
+
 @app.post("/api/chat/start")
-def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
+async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
     peer = d.get("nick")
@@ -181,13 +238,18 @@ def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
         raise HTTPException(403, "Пользователь в чёрном списке")
     if nick in USERS[peer]["blacklist"]:
         raise HTTPException(403, "Пользователь недоступен")
+
     USERS[nick]["contacts"].add(peer)
     USERS[peer]["contacts"].add(nick)
+
+    # уведомим собеседника: у него появился контакт
+    await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
+    await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
     return {"ok": True}
 
 
 @app.post("/api/chat/send")
-def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
+async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
     peer = d.get("to")
@@ -204,6 +266,11 @@ def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     k = chat_key(nick, peer)
     msg = {"from": nick, "to": peer, "text": text, "ts": time.time()}
     CHATS.setdefault(k, []).append(msg)
+
+    # realtime: получателю
+    await push_to(peer, {"type": "message", "from": nick, "msg": msg})
+    # и другим вкладкам отправителя
+    await push_to(nick, {"type": "message", "from": nick, "msg": msg, "self": True})
     return {"ok": True, "msg": msg}
 
 
@@ -218,8 +285,12 @@ def messages(body: EncBody, x_token: Optional[str] = Header(None)):
     return {"messages": CHATS.get(k, []), "peer": user_public(peer)}
 
 
+# ============================================================
+#                        BLACKLIST
+# ============================================================
+
 @app.post("/api/blacklist/add")
-def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
+async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
     peer = d.get("nick")
@@ -227,15 +298,17 @@ def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
         raise HTTPException(400, "Некорректный пользователь")
     USERS[nick]["blacklist"].add(peer)
     USERS[nick]["contacts"].discard(peer)
+    await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
 
 @app.post("/api/blacklist/remove")
-def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
+async def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
     nick = auth(x_token)
     d = parse(body)
     peer = d.get("nick")
     USERS[nick]["blacklist"].discard(peer)
+    await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
 
@@ -255,63 +328,59 @@ PAGE = r"""<!DOCTYPE html>
 html,body{margin:0;padding:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;overscroll-behavior:none}
 :root{
   --bg:#f2f2f7;--fg:#111;--card:#fff;--muted:#8a8a8e;--border:#e3e3e8;
-  --accent:#0a84ff;--accent-fg:#fff;--danger:#ff3b30;
+  --accent:#0a84ff;--danger:#ff3b30;
   --in-bub:#fff;--in-fg:#111;--out-bub:#0a84ff;--out-fg:#fff;--overlay:rgba(0,0,0,.45);
+  --sidebar:#f7f7fa;
 }
 body.dark{
   --bg:#0d0d0f;--fg:#f2f2f7;--card:#1c1c1e;--muted:#8e8e93;--border:#2c2c2e;
-  --accent:#0a84ff;--accent-fg:#fff;--danger:#ff453a;
+  --accent:#0a84ff;--danger:#ff453a;
   --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;--overlay:rgba(0,0,0,.65);
+  --sidebar:#141416;
 }
 body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s;overflow:hidden}
 
-/* ------- Оболочка приложения (мобильная = весь экран) ------- */
+/* ====== ОБОЛОЧКА ПРИЛОЖЕНИЯ (mobile-first) ====== */
 #app{
-  width:100%;
-  height:100vh;
-  height:100dvh;
+  width:100%;height:100vh;height:100dvh;
   display:flex;flex-direction:column;
   position:relative;overflow:hidden;
-  background:var(--bg);
-  margin:0 auto;
+  background:var(--bg);margin:0 auto;
 }
 
-/* ------- ПК: центрированное окно с рамкой ------- */
-@media (min-width: 700px){
+/* ====== ПК: окно-карточка по центру ====== */
+@media (min-width: 900px){
   body{
-    display:grid;
-    place-items:center;
-    background:#18181b;
-    min-height:100vh;
-    padding:20px;
+    display:grid;place-items:center;
+    background:#18181b;min-height:100vh;padding:20px;
   }
   body.dark{background:#000}
   #app{
-    width:420px;
-    height:min(86vh, 820px);
-    border-radius:24px;
-    box-shadow:0 30px 90px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.06);
+    width:min(1100px, 96vw);
+    height:min(820px, 90vh);
+    border-radius:22px;
+    box-shadow:0 30px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
     border:1px solid var(--border);
   }
 }
 
-.screen{position:absolute;inset:0;display:none;flex-direction:column;background:var(--bg)}
+.screen{display:none;flex:1;overflow:hidden;position:relative}
 .screen.active{display:flex}
 
-/* ------- SVG иконки ------- */
-.icon{width:22px;height:22px;display:block;flex-shrink:0;color:currentColor}
-.icon-sm{width:18px;height:18px}
-.icon-lg{width:26px;height:26px}
-
-/* ---------- AUTH ---------- */
-#screen-auth{overflow-y:auto}
-.auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%}
-.logo{font-size:38px;font-weight:800;letter-spacing:-1px;text-align:center;margin:14px 0 4px;background:linear-gradient(135deg,#0a84ff,#5856d6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+/* ---- AUTH ---- */
+#screen-auth.active{flex-direction:column;align-items:center;overflow-y:auto}
+.auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%;
+  width:100%;max-width:440px}
+.logo{font-size:38px;font-weight:800;letter-spacing:-1px;text-align:center;margin:14px 0 4px;
+  background:linear-gradient(135deg,#0a84ff,#5856d6);-webkit-background-clip:text;
+  background-clip:text;-webkit-text-fill-color:transparent}
 .tabs{display:flex;background:var(--card);border-radius:12px;padding:4px;gap:4px;border:1px solid var(--border)}
-.tab{flex:1;padding:10px;border:0;background:transparent;color:var(--fg);border-radius:9px;font-size:15px;font-weight:600;cursor:pointer;transition:.15s}
+.tab{flex:1;padding:10px;border:0;background:transparent;color:var(--fg);border-radius:9px;
+  font-size:15px;font-weight:600;cursor:pointer;transition:.15s}
 .tab.active{background:var(--accent);color:#fff}
 .tabpane{display:flex;flex-direction:column;gap:10px}
 .tabpane.hidden{display:none}
+
 input{
   width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--border);
   background:var(--card);color:var(--fg);font-size:16px;outline:none;transition:.15s;
@@ -319,8 +388,8 @@ input{
 input:focus{border-color:var(--accent)}
 .btn{
   padding:13px 16px;border-radius:12px;border:1px solid var(--border);
-  background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;transition:.15s;
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;
+  transition:.15s;display:inline-flex;align-items:center;justify-content:center;gap:8px;
 }
 .btn:active{transform:scale(.97)}
 .btn.primary{background:var(--accent);color:#fff;border-color:transparent}
@@ -335,16 +404,32 @@ input:focus{border-color:var(--accent)}
 .big-name{font-size:20px;font-weight:700;margin-top:6px}
 .center{text-align:center;align-items:center}
 
-/* ---------- AVATAR EDITOR ---------- */
-.ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);padding:14px;border-radius:16px;border:1px solid var(--border)}
-#avaCanvas{width:220px;height:220px;border-radius:12px;background:#fff;touch-action:none;cursor:crosshair;image-rendering:pixelated}
+/* ---- SVG иконки ---- */
+.icon{width:22px;height:22px;display:block;flex-shrink:0;color:currentColor}
+.icon-sm{width:18px;height:18px}
+#svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
+
+/* ---- AVATAR EDITOR ---- */
+.ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);
+  padding:14px;border-radius:16px;border:1px solid var(--border)}
+#avaCanvas{width:220px;height:220px;border-radius:12px;background:#fff;touch-action:none;
+  cursor:crosshair;image-rendering:pixelated}
 .palette{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;width:100%}
 .swatch{width:100%;aspect-ratio:1;border-radius:8px;border:2px solid transparent;cursor:pointer;transition:.1s}
 .swatch.active{border-color:var(--accent);transform:scale(1.12)}
 .ava-tools{display:flex;gap:8px;width:100%}
 .ava-tools .btn{flex:1}
 
-/* ---------- TOP BAR ---------- */
+/* ====== APP SHELL (sidebar + chat-pane) ====== */
+#screen-app.active{flex-direction:column}
+.sidebar{display:flex;flex-direction:column;flex:1;overflow:hidden;background:var(--sidebar)}
+.chat-pane{display:none;flex-direction:column;flex:1;overflow:hidden;background:var(--bg)}
+
+/* mobile: показываем либо список, либо чат */
+#screen-app.chat-open .sidebar{display:none}
+#screen-app.chat-open .chat-pane{display:flex}
+
+/* topbar (общий для sidebar и chat) */
 .topbar{
   display:flex;align-items:center;gap:10px;padding:10px 12px;
   background:var(--card);border-bottom:1px solid var(--border);
@@ -360,44 +445,86 @@ input:focus{border-color:var(--accent)}
   transition:.15s;padding:0;
 }
 .icon-btn:active{background:var(--border)}
+.icon-btn:hover{background:var(--border)}
 .icon-btn.danger{color:var(--danger)}
 
-/* ---------- CONTACTS ---------- */
-.list{flex:1;overflow-y:auto;padding:10px}
+/* список контактов */
+.list{flex:1;overflow-y:auto;padding:10px;background:var(--sidebar)}
 .contact{
-  display:flex;align-items:center;gap:12px;padding:12px;border-radius:14px;
-  background:var(--card);margin-bottom:8px;cursor:pointer;transition:.15s;border:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
+  background:transparent;margin-bottom:2px;cursor:pointer;transition:.12s;border:1px solid transparent;
 }
-.contact:active{transform:scale(.98);background:var(--border)}
+.contact:active{transform:scale(.99);background:var(--card)}
+.contact:hover{background:var(--card);border-color:var(--border)}
+.contact.selected{background:var(--card);border-color:var(--border)}
 .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5}
 
-/* ---------- FAB ---------- */
+/* FAB — только на мобиле */
 .fab{
   position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);
   width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:#fff;
   cursor:pointer;box-shadow:0 8px 28px rgba(10,132,255,.45);
-  transition:.15s;display:flex;align-items:center;justify-content:center;
+  transition:.15s;display:flex;align-items:center;justify-content:center;z-index:5;
 }
 .fab:active{transform:translateX(-50%) scale(.92)}
 .fab .icon{width:30px;height:30px}
 
-/* ---------- CHAT ---------- */
-.messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:6px}
+/* Инлайн кнопка "Новый чат" — только на ПК */
+.search-inline{display:none;padding:10px 12px 4px}
+
+/* пустая правая панель — только на ПК */
+.empty-pane{
+  display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;
+  color:var(--muted);gap:14px;font-size:15px;padding:30px;text-align:center;
+}
+.empty-pane .empty-icon{width:72px;height:72px;opacity:.25}
+.empty-pane.hidden{display:none !important}
+
+/* чат */
+.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden}
+.chat-content.hidden{display:none}
+.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px}
 .bubble{
   max-width:78%;padding:9px 13px;border-radius:18px;font-size:15px;line-height:1.35;
   word-wrap:break-word;white-space:pre-wrap;animation:pop .15s ease;
 }
 @keyframes pop{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .bubble.out{align-self:flex-end;background:var(--out-bub);color:var(--out-fg);border-bottom-right-radius:6px}
-.bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);border-bottom-left-radius:6px;border:1px solid var(--border)}
+.bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
+  border-bottom-left-radius:6px;border:1px solid var(--border)}
 .composer{
-  display:flex;gap:8px;padding:10px;padding-bottom:max(10px,env(safe-area-inset-bottom));
+  display:flex;gap:8px;padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom));
   background:var(--card);border-top:1px solid var(--border);align-items:center;
 }
 .composer input{border-radius:20px}
 .composer .btn{border-radius:50%;width:46px;height:46px;padding:0;flex-shrink:0}
 
-/* ---------- MODALS ---------- */
+/* =================== MOBILE =================== */
+@media (max-width: 899px){
+  .back-mobile{display:flex}
+  .fab{display:flex}
+  .search-inline{display:none}
+  .empty-pane{display:none !important}
+  .sidebar{position:relative}
+  .chat-pane{position:relative}
+}
+
+/* =================== DESKTOP =================== */
+@media (min-width: 900px){
+  #screen-app.active{flex-direction:row}
+  .sidebar{
+    display:flex !important;flex:0 0 340px;width:340px;
+    border-right:1px solid var(--border);
+  }
+  .chat-pane{display:flex !important;position:relative}
+  .back-mobile{display:none !important}
+  .fab{display:none !important}
+  .search-inline{display:block}
+  .empty-pane{display:flex}
+  .empty-pane.hidden{display:none}
+}
+
+/* ---- MODALS ---- */
 .overlay{
   position:absolute;inset:0;background:var(--overlay);display:flex;align-items:flex-end;
   justify-content:center;z-index:50;animation:fade .15s ease;
@@ -414,25 +541,27 @@ input:focus{border-color:var(--accent)}
   .overlay{align-items:center}
   .modal{max-width:440px;border-radius:20px;max-height:80%}
 }
-.modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);font-size:17px;font-weight:700}
+.modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;
+  border-bottom:1px solid var(--border);font-size:17px;font-weight:700}
 .modal-body{padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
 .setting{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .setting-col{display:flex;flex-direction:column;gap:8px}
 .setting-title{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
 .seg{display:flex;background:var(--bg);border-radius:10px;padding:3px;gap:3px;border:1px solid var(--border)}
-.seg-btn{padding:7px 14px;border:0;background:transparent;color:var(--fg);border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;transition:.15s}
+.seg-btn{padding:7px 14px;border:0;background:transparent;color:var(--fg);border-radius:8px;
+  cursor:pointer;font-size:14px;font-weight:600;transition:.15s}
 .seg-btn.active{background:var(--accent);color:#fff}
-.search-card{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;background:var(--bg);border-radius:16px;border:1px solid var(--border)}
+.search-card{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;
+  background:var(--bg);border-radius:16px;border:1px solid var(--border)}
 .ava-mid{width:96px;height:96px;border-radius:50%;image-rendering:pixelated;background:#ddd}
 #infoAva{width:140px;height:140px;border-radius:50%;image-rendering:pixelated;background:#ddd;margin:0 auto}
-.bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);border-radius:12px;margin-bottom:6px}
+.bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);
+  border-radius:12px;margin-bottom:6px}
 .bl-item canvas{width:32px;height:32px;border-radius:50%;image-rendering:pixelated;flex-shrink:0}
 .bl-item .me-info{flex:1}
-.bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
+.bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);
+  color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
 .bl-item button .icon{width:16px;height:16px}
-
-/* SVG-символы спрятаны */
-#svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
 </style>
 </head>
 <body>
@@ -472,6 +601,9 @@ input:focus{border-color:var(--accent)}
     <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
     <path d="M10 11v6M14 11v6"/>
     <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
+  </symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
   </symbol>
 </svg>
 
@@ -513,49 +645,70 @@ input:focus{border-color:var(--accent)}
     </div>
   </div>
 
-  <!-- ================= MAIN ================= -->
-  <div class="screen" id="screen-main">
-    <header class="topbar">
-      <canvas class="ava-small" id="meAva" width="40" height="40"></canvas>
-      <div class="me-info">
-        <div class="me-name" id="meName">—</div>
-        <div class="me-nick" id="meNick">@—</div>
-      </div>
-      <button class="icon-btn" onclick="openSettings()" title="Настройки" aria-label="Settings">
-        <svg class="icon"><use href="#i-gear"/></svg>
-      </button>
-    </header>
-    <div class="list" id="contactsList"></div>
-    <button class="fab" onclick="openSearch()" title="Найти" aria-label="Find">
-      <svg class="icon"><use href="#i-plus"/></svg>
-    </button>
-  </div>
+  <!-- ================= APP SHELL ================= -->
+  <div class="screen" id="screen-app">
 
-  <!-- ================= CHAT ================= -->
-  <div class="screen" id="screen-chat">
-    <header class="topbar">
-      <button class="icon-btn" onclick="closeChat()" title="Назад" aria-label="Back">
-        <svg class="icon"><use href="#i-arrow-left"/></svg>
-      </button>
-      <canvas class="ava-small" id="peerAva" width="40" height="40"></canvas>
-      <div class="me-info">
-        <div class="me-name" id="peerName">—</div>
-        <div class="me-nick" id="peerNick">@—</div>
+    <!-- ========== SIDEBAR (список + профиль) ========== -->
+    <aside class="sidebar">
+      <header class="topbar">
+        <canvas class="ava-small" id="meAva" width="40" height="40"></canvas>
+        <div class="me-info">
+          <div class="me-name" id="meName">—</div>
+          <div class="me-nick" id="meNick">@—</div>
+        </div>
+        <button class="icon-btn" onclick="openSettings()" aria-label="Settings">
+          <svg class="icon"><use href="#i-gear"/></svg>
+        </button>
+      </header>
+
+      <div class="search-inline">
+        <button class="btn primary full" onclick="openSearch()">
+          <svg class="icon icon-sm"><use href="#i-plus"/></svg>
+          <span data-i18n="new_chat">Новый чат</span>
+        </button>
       </div>
-      <button class="icon-btn" onclick="openInfo()" title="Информация" aria-label="Info">
-        <svg class="icon"><use href="#i-info"/></svg>
+
+      <div class="list" id="contactsList"></div>
+
+      <button class="fab" onclick="openSearch()" aria-label="New chat">
+        <svg class="icon"><use href="#i-plus"/></svg>
       </button>
-      <button class="icon-btn danger" onclick="endChat()" title="Завершить" aria-label="End">
-        <svg class="icon"><use href="#i-x"/></svg>
-      </button>
-    </header>
-    <div class="messages" id="messages"></div>
-    <form class="composer" onsubmit="sendMsg(event)">
-      <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off">
-      <button class="btn primary" type="submit" aria-label="Send">
-        <svg class="icon"><use href="#i-send"/></svg>
-      </button>
-    </form>
+    </aside>
+
+    <!-- ========== CHAT PANE ========== -->
+    <section class="chat-pane" id="chatPane">
+
+      <div class="empty-pane" id="emptyPane">
+        <svg class="empty-icon"><use href="#i-chat"/></svg>
+        <div data-i18n="select_chat">Выберите чат слева</div>
+      </div>
+
+      <div class="chat-content hidden" id="chatContent">
+        <header class="topbar">
+          <button class="icon-btn back-mobile" onclick="closeChat()" aria-label="Back">
+            <svg class="icon"><use href="#i-arrow-left"/></svg>
+          </button>
+          <canvas class="ava-small" id="peerAva" width="40" height="40"></canvas>
+          <div class="me-info">
+            <div class="me-name" id="peerName">—</div>
+            <div class="me-nick" id="peerNick">@—</div>
+          </div>
+          <button class="icon-btn" onclick="openInfo()" aria-label="Info">
+            <svg class="icon"><use href="#i-info"/></svg>
+          </button>
+          <button class="icon-btn danger" onclick="endChat()" aria-label="End">
+            <svg class="icon"><use href="#i-x"/></svg>
+          </button>
+        </header>
+        <div class="messages" id="messages"></div>
+        <form class="composer" onsubmit="sendMsg(event)">
+          <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off">
+          <button class="btn primary" type="submit" aria-label="Send">
+            <svg class="icon"><use href="#i-send"/></svg>
+          </button>
+        </form>
+      </div>
+    </section>
   </div>
 
   <!-- ================= MODAL: SEARCH ================= -->
@@ -673,7 +826,8 @@ const I18N = {
     no_contacts:"Пока нет контактов.\nНажмите + чтобы найти друзей.",
     no_bl:"Список пуст",
     confirm_logout:"Выйти из аккаунта?",
-    remove:"Убрать"
+    remove:"Убрать",
+    new_chat:"Новый чат", select_chat:"Выберите чат слева"
   },
   en: {
     login:"Sign in", register:"Sign up", create:"Create account",
@@ -687,7 +841,8 @@ const I18N = {
     no_contacts:"No contacts yet.\nTap + to find friends.",
     no_bl:"List is empty",
     confirm_logout:"Log out?",
-    remove:"Remove"
+    remove:"Remove",
+    new_chat:"New chat", select_chat:"Select a chat on the left"
   }
 };
 let LANG = localStorage.getItem('direct_lang') || 'ru';
@@ -702,10 +857,10 @@ let contacts = [];
 let blacklist = [];
 let currentPeer = null;
 let currentPeerData = null;
-let pollTimer = null;
+let ws = null;
 
 /* ============================================================
-                       API HELPER
+                       API
    ============================================================ */
 async function api(path, payload, method='POST'){
   const headers = {'Content-Type':'application/json'};
@@ -724,6 +879,56 @@ async function api(path, payload, method='POST'){
 }
 
 /* ============================================================
+                     WebSocket
+   ============================================================ */
+function connectWS(){
+  if (!token || ws) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  try {
+    ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+  } catch(e){ ws = null; return; }
+
+  ws.onmessage = (ev) => {
+    try { handleWsEvent(JSON.parse(ev.data)); } catch(_){}
+  };
+  ws.onclose = () => {
+    ws = null;
+    if (token) setTimeout(connectWS, 1500);   // авто-реконнект
+  };
+  ws.onerror = () => { try { ws && ws.close(); } catch(_){} };
+
+  // heartbeat
+  clearInterval(window.__hb);
+  window.__hb = setInterval(() => {
+    try { if (ws && ws.readyState === 1) ws.send('ping'); } catch(_){}
+  }, 25000);
+}
+
+function disconnectWS(){
+  clearInterval(window.__hb);
+  if (ws){ try { ws.close(); } catch(_){} ws = null; }
+}
+
+function handleWsEvent(ev){
+  if (!ev || !ev.type) return;
+
+  if (ev.type === 'message'){
+    // сообщение для открытого чата → перечитаем и отрисуем
+    if (currentPeer && (ev.from === currentPeer || (ev.msg && ev.msg.from === currentPeer))){
+      refreshChat();
+    }
+    // входящее от нового человека — обновим список контактов
+    if (!ev.self && ev.from !== me?.nick){
+      refreshMe().catch(()=>{});
+    }
+  } else if (ev.type === 'contact_added'){
+    refreshMe().catch(()=>{});
+  } else if (ev.type === 'blacklist_changed'){
+    refreshMe().catch(()=>{});
+  }
+}
+
+/* ============================================================
                      AVATAR (8x8)
    ============================================================ */
 const GRID = 8;
@@ -739,9 +944,9 @@ const PALETTE = [
 
 function paintAva(canvas, data){
   const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
+  const W = canvas.width;
   const cell = W / GRID;
-  ctx.clearRect(0,0,W,H);
+  ctx.clearRect(0,0,W,W);
   for (let i=0;i<GRID*GRID;i++){
     ctx.fillStyle = (data && data[i]) || '#ffffff';
     const x = (i % GRID) * cell;
@@ -767,7 +972,7 @@ function renderEditor(){
 function buildPalette(){
   const box = document.getElementById('palette');
   box.innerHTML = '';
-  PALETTE.forEach((c,i) => {
+  PALETTE.forEach((c) => {
     const b = document.createElement('div');
     b.className = 'swatch';
     b.style.background = c;
@@ -799,13 +1004,10 @@ function paintAt(clientX, clientY){
 avaCanvas.addEventListener('pointerdown', e => {
   e.preventDefault();
   drawing = true;
-  avaCanvas.setPointerCapture(e.pointerId);
+  try { avaCanvas.setPointerCapture(e.pointerId); } catch(_){}
   paintAt(e.clientX, e.clientY);
 });
-avaCanvas.addEventListener('pointermove', e => {
-  if (!drawing) return;
-  paintAt(e.clientX, e.clientY);
-});
+avaCanvas.addEventListener('pointermove', e => { if (drawing) paintAt(e.clientX, e.clientY); });
 avaCanvas.addEventListener('pointerup', () => { drawing = false; });
 avaCanvas.addEventListener('pointercancel', () => { drawing = false; });
 
@@ -840,7 +1042,7 @@ function randomAvatar(){
 }
 
 /* ============================================================
-                       UI HELPERS
+                       UI
    ============================================================ */
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -852,15 +1054,9 @@ function showErr(id, msg){
   clearTimeout(el._t);
   el._t = setTimeout(()=>{ el.textContent = ''; }, 4000);
 }
-function openModal(id){
-  document.getElementById(id).classList.remove('hidden');
-}
-function closeModal(id){
-  document.getElementById(id).classList.add('hidden');
-}
-function backdropClose(e, id){
-  if (e.target.id === id) closeModal(id);
-}
+function openModal(id){ document.getElementById(id).classList.remove('hidden'); }
+function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
+function backdropClose(e, id){ if (e.target.id === id) closeModal(id); }
 
 /* ============================================================
                        THEME / LANG
@@ -889,7 +1085,7 @@ function applyLang(l){
 }
 
 /* ============================================================
-                         AUTH
+                       AUTH
    ============================================================ */
 document.querySelectorAll('.tab').forEach(tab => {
   tab.onclick = () => {
@@ -911,7 +1107,8 @@ async function doLogin(){
     token = r.token; me = r.me;
     localStorage.setItem('direct_token', token);
     await refreshMe();
-    showScreen('screen-main');
+    showScreen('screen-app');
+    connectWS();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
@@ -925,23 +1122,25 @@ async function doRegister(){
     token = r.token; me = r.me;
     localStorage.setItem('direct_token', token);
     await refreshMe();
-    showScreen('screen-main');
+    showScreen('screen-app');
+    connectWS();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
 function logout(){
   if (!confirm(t('confirm_logout'))) return;
+  disconnectWS();
   token = null; me = null; contacts = []; blacklist = [];
   localStorage.removeItem('direct_token');
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
   closeModal('modal-settings');
-  clearInterval(pollTimer);
+  closeChat(true);
   showScreen('screen-auth');
 }
 
 /* ============================================================
-                        ME / CONTACTS
+                       ME / CONTACTS
    ============================================================ */
 async function refreshMe(){
   const r = await api('/api/me', null, 'GET');
@@ -967,10 +1166,10 @@ function renderContacts(){
   }
   contacts.forEach(c => {
     const el = document.createElement('div');
-    el.className = 'contact';
+    el.className = 'contact' + (currentPeer === c.nick ? ' selected' : '');
     el.onclick = () => openChat(c.nick);
     const cv = document.createElement('canvas');
-    cv.width = 48; cv.height = 48;
+    cv.width = 44; cv.height = 44;
     cv.className = 'ava-small';
     paintAva(cv, c.avatar);
     el.appendChild(cv);
@@ -987,7 +1186,7 @@ function renderContacts(){
 }
 
 /* ============================================================
-                       ПОИСК / ЧАТ
+                       SEARCH
    ============================================================ */
 function openSearch(){
   document.getElementById('searchNick').value = '';
@@ -1030,6 +1229,9 @@ async function doSearch(){
   }
 }
 
+/* ============================================================
+                       CHAT
+   ============================================================ */
 async function startChat(peerNick){
   try {
     await api('/api/chat/start', { nick: peerNick });
@@ -1047,25 +1249,26 @@ async function openChat(peerNick){
     document.getElementById('peerName').textContent = r.peer.name;
     document.getElementById('peerNick').textContent = '@' + r.peer.nick;
     renderMessages(r.messages);
-    showScreen('screen-chat');
-    clearInterval(pollTimer);
-    pollTimer = setInterval(pollMessages, 1500);
+    document.getElementById('chatContent').classList.remove('hidden');
+    document.getElementById('emptyPane').classList.add('hidden');
+    document.getElementById('screen-app').classList.add('chat-open');
+    renderContacts();     // чтобы выделился выбранный
     setTimeout(()=>document.getElementById('msgInput').focus(), 100);
   } catch(e){ alert(e.message); }
 }
 
-async function pollMessages(){
+async function refreshChat(){
   if (!currentPeer) return;
   try {
     const r = await api('/api/chat/messages', { peer: currentPeer });
     currentPeerData = r.peer;
     renderMessages(r.messages);
-  } catch(e){}
+  } catch(_){}
 }
 
 function renderMessages(msgs){
   const box = document.getElementById('messages');
-  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
   box.innerHTML = '';
   msgs.forEach(m => {
     const el = document.createElement('div');
@@ -1074,6 +1277,7 @@ function renderMessages(msgs){
     box.appendChild(el);
   });
   if (atBottom) box.scrollTop = box.scrollHeight;
+  else box.scrollTop = box.scrollHeight;
 }
 
 async function sendMsg(e){
@@ -1084,20 +1288,21 @@ async function sendMsg(e){
   inp.value = '';
   try {
     await api('/api/chat/send', { to: currentPeer, text });
-    await pollMessages();
+    await refreshChat();
   } catch(err){
     alert(err.message);
     inp.value = text;
   }
 }
 
-function closeChat(){
-  clearInterval(pollTimer);
-  pollTimer = null;
+function closeChat(silent){
   currentPeer = null;
   currentPeerData = null;
-  showScreen('screen-main');
-  refreshMe();
+  document.getElementById('chatContent').classList.add('hidden');
+  document.getElementById('emptyPane').classList.remove('hidden');
+  document.getElementById('screen-app').classList.remove('chat-open');
+  renderContacts();
+  if (!silent) refreshMe().catch(()=>{});
 }
 
 function endChat(){
@@ -1150,14 +1355,12 @@ function renderBlacklist(){
     nk.className = 'me-nick'; nk.textContent = '@' + u.nick;
     info.appendChild(nm); info.appendChild(nk);
     el.appendChild(info);
-
     const btn = document.createElement('button');
     btn.title = t('remove');
     btn.setAttribute('aria-label', t('remove'));
     btn.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
     btn.onclick = () => blRemove(u.nick);
     el.appendChild(btn);
-
     box.appendChild(el);
   });
 }
@@ -1198,7 +1401,8 @@ async function blRemove(nick){
         document.getElementById('meNick').textContent = '@' + me.nick;
         renderContacts();
         renderBlacklist();
-        showScreen('screen-main');
+        showScreen('screen-app');
+        connectWS();
       })
       .catch(() => {
         token = null;
@@ -1209,6 +1413,9 @@ async function blRemove(nick){
   document.getElementById('searchNick').addEventListener('keydown', e => {
     if (e.key === 'Enter'){ e.preventDefault(); doSearch(); }
   });
+
+  // страховочный поллинг открытого чата на случай, если WS отвалился
+  setInterval(() => { if (currentPeer) refreshChat(); }, 15000);
 })();
 </script>
 </body>
