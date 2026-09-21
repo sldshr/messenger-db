@@ -3,10 +3,10 @@
 #   pip install fastapi uvicorn python-multipart
 #   python main.py
 
-import random, secrets, time, re
+import secrets, time, re
 from datetime import datetime
 from html import escape
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -17,20 +17,10 @@ app = FastAPI(title="litodon")
 #   ХРАНИЛИЩЕ (В ОПЕРАТИВКЕ) — полная анонимность
 # ============================================================
 
-sessions: dict = {}    # sid  -> {"id": int, "name": str}
+sessions: dict = {}    # sid -> {"id": int}
 posts: list = []
 _counter = {"post": 0, "comment": 0, "anon": 0}
 MAX_POST = 4000
-
-ADJ = ["Тихий", "Быстрый", "Хитрый", "Смелый", "Умный", "Дикий", "Лёгкий",
-       "Тёмный", "Светлый", "Добрый", "Рыжий", "Белый", "Серый", "Зелёный",
-       "Ночной", "Вольный", "Гордый", "Ясный", "Резвый", "Мягкий"]
-NOUN = ["Лис", "Кот", "Ёж", "Волк", "Барс", "Крот", "Сокол", "Дрозд",
-        "Олень", "Заяц", "Медведь", "Орёл", "Тигр", "Филин", "Выдра", "Хорёк"]
-
-
-def generate_name() -> str:
-    return f"{random.choice(ADJ)} {random.choice(NOUN)}"
 
 
 @app.middleware("http")
@@ -40,7 +30,7 @@ async def anon_middleware(request: Request, call_next):
     if not token or token not in sessions:
         token = secrets.token_hex(16)
         _counter["anon"] += 1
-        sessions[token] = {"id": _counter["anon"], "name": generate_name()}
+        sessions[token] = {"id": _counter["anon"]}
         created = True
     request.state.anon = sessions[token]
     request.state.token = token
@@ -275,18 +265,12 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   scrollbar-color: #a5cfa5 #eaf6ea;
 }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track {
-  background: #eaf6ea;
-  border-radius: 5px;
-}
+::-webkit-scrollbar-track { background: #eaf6ea; border-radius: 5px; }
 ::-webkit-scrollbar-thumb {
-  background: #a5cfa5;
-  border-radius: 5px;
-  border: 2px solid #eaf6ea;
-  background-clip: padding-box;
-  transition: background 0.15s;
+  background: #a5cfa5; border-radius: 5px;
+  border: 2px solid #eaf6ea; background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: #66bb6a; background-clip: padding-box; border: 2px solid #eaf6ea; }
+::-webkit-scrollbar-thumb:hover { background: #66bb6a; border: 2px solid #eaf6ea; background-clip: padding-box; }
 ::-webkit-scrollbar-corner { background: #eaf6ea; }
 ::-webkit-scrollbar-button { display: none; }
 
@@ -326,7 +310,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .layout {
   width: 1080px; margin: 16px auto 30px;
   display: flex; align-items: flex-start; gap: 14px;
-  transition: width 0.15s;
 }
 .layout.wide { width: 1320px; }
 .sidebar { width: 220px; flex-shrink: 0; }
@@ -351,20 +334,8 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .side-link.active { background: linear-gradient(#66bb6a, #43a047); color: #fff; }
 .side-link.active .ic { color: #fff; }
 
-.side-user { display: flex; gap: 9px; align-items: center; }
-.avatar {
-  width: 38px; height: 38px; flex-shrink: 0;
-  background: linear-gradient(#66bb6a, #2e7d32);
-  color: #fff; font-weight: bold; font-size: 17px;
-  border-radius: 50%; display: flex; align-items: center; justify-content: center;
-  text-shadow: 0 1px 0 rgba(0,0,0,0.25);
-  box-shadow: inset 0 -2px 4px rgba(0,0,0,0.15);
-}
-.side-username { font-weight: bold; color: #1b5e20; font-size: 13px; line-height: 1.2; }
-.side-sub { font-size: 11px; color: #7a8f7a; }
-
 .side-stats { font-size: 12px; color: #4b6b4b; }
-.side-stat { padding: 3px 4px; }
+.side-stat { padding: 3px 4px; display: flex; align-items: center; gap: 6px; }
 .side-stat b { color: #1b5e20; }
 
 /* ---------- boxes ---------- */
@@ -372,13 +343,6 @@ a:hover { color: #1b5e20; text-decoration: underline; }
   background: #fff; border: 1px solid #a5cfa5; border-radius: 4px;
   margin-bottom: 12px; box-shadow: 0 1px 2px rgba(27,94,32,0.12);
 }
-.box-title {
-  background: linear-gradient(#eaf6ea, #c8e6c9);
-  border-bottom: 1px solid #a5cfa5;
-  padding: 6px 10px; font-weight: bold; color: #1b5e20;
-  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
-}
-.box-body { padding: 10px; }
 .empty { padding: 22px; text-align: center; color: #7a8f7a; font-size: 13px; }
 .notice { padding: 10px 12px; background: #fffbe6; border-color: #e6d98a; color: #6b5b1b; font-size: 12px; }
 .page-title { margin: 0 0 12px; font-size: 18px; color: #1b5e20; font-weight: bold; }
@@ -408,9 +372,8 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 .score-zero { color: #7a8f7a; }
 
 .post-main { flex: 1; padding: 10px 12px; min-width: 0; }
-.post-head { margin-bottom: 6px; }
-.author { font-weight: bold; color: #1b5e20; }
-.time { color: #8aa38a; font-size: 11px; margin-left: 8px; }
+.post-head { margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.time { color: #8aa38a; font-size: 11px; }
 .edited { color: #a8c0a8; font-size: 11px; }
 .post-text { font-size: 14px; word-wrap: break-word; overflow-wrap: break-word; }
 
@@ -434,15 +397,14 @@ a:hover { color: #1b5e20; text-decoration: underline; }
 }
 .comment { padding: 6px 0; border-bottom: 1px dotted #e0f0e0; }
 .comment:last-child { border-bottom: none; }
-.c-author { font-weight: bold; color: #2e7d32; font-size: 12px; }
-.c-time { color: #9cb89c; font-size: 11px; margin-left: 6px; }
+.c-time { color: #9cb89c; font-size: 11px; }
 .c-text { font-size: 12px; margin-top: 2px; }
 
 .cform { margin-top: 8px; display: flex; gap: 6px; }
 .cform input[type=text] { flex: 1; }
 
 /* ---------- forms ---------- */
-input[type=text], input[type=password], textarea {
+input[type=text], textarea {
   border: 1px solid #a5cfa5; border-radius: 3px;
   padding: 6px 8px; font-family: inherit; font-size: 13px;
   background: #f7fdf7; color: #17381a; outline: none; width: 100%;
@@ -459,20 +421,6 @@ button, .btn-primary {
 }
 button:hover, .btn-primary:hover { background: linear-gradient(#7cc87f, #4caf50); }
 button:active { background: #2e7d32; }
-
-/* ---------- profile ---------- */
-.profile-header { display: flex; align-items: center; gap: 14px; padding: 14px 16px; }
-.avatar-big {
-  width: 64px; height: 64px; flex-shrink: 0;
-  background: linear-gradient(#66bb6a, #2e7d32);
-  color: #fff; font-weight: bold; font-size: 28px;
-  border-radius: 50%; display: flex; align-items: center; justify-content: center;
-  text-shadow: 0 2px 0 rgba(0,0,0,0.25);
-  box-shadow: inset 0 -3px 6px rgba(0,0,0,0.15), 0 2px 4px rgba(27,94,32,0.25);
-}
-.profile-info h2 { margin: 0 0 4px; color: #1b5e20; font-size: 20px; }
-.profile-stats { display: flex; gap: 18px; font-size: 12px; color: #4b6b4b; }
-.profile-stats b { color: #1b5e20; font-size: 14px; }
 
 /* ---------- editor ---------- */
 .editor { overflow: hidden; }
@@ -494,42 +442,23 @@ button:active { background: #2e7d32; }
 .tb-sep { width: 1px; height: 20px; background: #a5cfa5; margin: 0 4px; }
 .tb-spacer { flex: 1; }
 
-/* равные по высоте и ширине панели редактора */
-.editor-body {
-  display: flex;
-  height: 660px;                 /* одинаковая высота обеих панелей */
-  align-items: stretch;
-}
+.editor-body { display: flex; height: 660px; align-items: stretch; }
 .editor-pane {
-  flex: 1 1 50%;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+  flex: 1 1 50%; min-width: 0;
+  display: flex; flex-direction: column; overflow: hidden;
 }
 .editor-pane textarea {
-  flex: 1 1 auto;
-  height: 100%;
-  min-height: 0;
-  border: none;
-  border-radius: 0;
-  background: #fff;
-  resize: none;                   /* фиксируем — панель не «уезжает» */
+  flex: 1 1 auto; height: 100%; min-height: 0;
+  border: none; border-radius: 0; background: #fff; resize: none;
   padding: 12px 14px;
   font-family: Consolas, Monaco, "Courier New", monospace;
-  font-size: 13px;
-  line-height: 1.5;
-  overflow-y: auto;
+  font-size: 13px; line-height: 1.5; overflow-y: auto;
 }
 .editor-pane textarea:focus { background: #fff; }
 .editor-preview {
-  border-left: 1px solid #d6ead6;
-  background: #fafdfa;
-  padding: 12px 14px;
-  height: 100%;
-  overflow-y: auto;
-  font-family: Verdana, sans-serif;
-  font-size: 13px;
+  border-left: 1px solid #d6ead6; background: #fafdfa;
+  padding: 12px 14px; height: 100%; overflow-y: auto;
+  font-family: Verdana, sans-serif; font-size: 13px;
 }
 
 .editor-foot {
@@ -596,21 +525,7 @@ def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> st
 
     nav_items = nav("/", "home", "Лента", "feed")
     nav_items += nav("/create", "plus", "Создать пост", "create")
-    nav_items += nav(f"/u/{anon['id']}", "user", "Мои посты", "profile")
-
-    posts_count = sum(1 for p in posts if p["author_id"] == anon["id"])
-    active_users = len({p["author_id"] for p in posts}) or 1
-
-    user_card = f'''
-    <div class="side-card">
-      <div class="side-user">
-        <div class="avatar">{escape(anon['name'][0].upper())}</div>
-        <div style="min-width:0">
-          <div class="side-username">{escape(anon['name'])}</div>
-          <div class="side-sub">{posts_count} постов · {ic("user", 10)} #{anon['id']}</div>
-        </div>
-      </div>
-    </div>'''
+    nav_items += nav("/my", "user", "Мои посты", "my")
 
     layout_cls = "layout wide" if wide else "layout"
 
@@ -634,11 +549,9 @@ def layout(anon: dict, content: str, active: str = "", wide: bool = False) -> st
 <div class="{layout_cls}">
   <aside class="sidebar">
     <div class="side-card side-nav">{nav_items}</div>
-    {user_card}
     <div class="side-card side-stats">
-      <div class="side-stat"><b>{len(posts)}</b> постов</div>
-      <div class="side-stat"><b>{active_users}</b> авторов</div>
-      <div class="side-stat"><b>{_counter['comment']}</b> комментариев</div>
+      <div class="side-stat">{ic("home", 12)} <b>{len(posts)}</b> постов</div>
+      <div class="side-stat">{ic("comment", 12)} <b>{_counter['comment']}</b> комментариев</div>
     </div>
   </aside>
   <main class="content">
@@ -693,8 +606,7 @@ def post_card(p: dict, anon: dict, link_back: bool = True) -> str:
     if link_back and p["comments"]:
         items = "".join(
             f'<div class="comment">'
-            f'<a href="/u/{c["author_id"]}" class="c-author">{escape(c["author_name"])}</a>'
-            f'<span class="c-time">{fmt_time(c["created"])}</span>'
+            f'<div class="c-time">{fmt_time(c["created"])}</div>'
             f'<div class="c-text md">{render_md(c["text"])}</div>'
             f'</div>'
             for c in p["comments"]
@@ -708,7 +620,7 @@ def post_card(p: dict, anon: dict, link_back: bool = True) -> str:
         cform = (
             f'<form method="post" action="/comment/{pid}" class="cform">'
             f'<input type="text" name="text" maxlength="1000" '
-            f'placeholder="Ваш комментарий (markdown)..." required>'
+            f'placeholder="Анонимный комментарий (markdown)..." required>'
             f'<button type="submit" title="Отправить">{ic("send", 12)}</button></form>'
         )
 
@@ -717,7 +629,6 @@ def post_card(p: dict, anon: dict, link_back: bool = True) -> str:
       <div class="votes">{votes}</div>
       <div class="post-main">
         <div class="post-head">
-          <a href="/u/{p["author_id"]}" class="author">{escape(p["author_name"])}</a>
           <span class="time">{fmt_time(p["created"])}{edited}</span>
         </div>
         {body}
@@ -801,7 +712,7 @@ EDITOR_JS = r"""
   var previewEl = document.getElementById('preview');
   var previewWrap = document.getElementById('preview-wrap');
   var previewBtn = document.getElementById('preview-btn');
-  var previewOn = true;                 // предпросмотр включён по умолчанию
+  var previewOn = true;
   var previewTimer = null;
   var MAX = __MAX__;
 
@@ -930,7 +841,6 @@ def create_post(request: Request, text: str = Form(...)):
         posts.append({
             "id": pid,
             "author_id": anon["id"],
-            "author_name": anon["name"],
             "text": text[:MAX_POST],
             "created": time.time(),
             "edited": None,
@@ -995,37 +905,18 @@ def delete_post(post_id: int, request: Request):
     return RedirectResponse(f"/p/{post_id}", status_code=303)
 
 
-# ---------- профиль автора ----------
+# ---------- мои посты ----------
 
-@app.get("/u/{anon_id}", response_class=HTMLResponse)
-def profile(anon_id: int, request: Request):
+@app.get("/my", response_class=HTMLResponse)
+def my_posts(request: Request):
     anon = request.state.anon
-    user_posts = sorted([p for p in posts if p["author_id"] == anon_id],
-                        key=lambda x: x["created"], reverse=True)
-    if not user_posts:
-        return HTMLResponse(
-            layout(anon, '<div class="box empty">Здесь пока ничего нет. '
-                         '<a href="/">На главную</a></div>'),
-            status_code=404)
-
-    display_name = user_posts[0]["author_name"]
-    karma = sum(len(p["up"]) - len(p["down"]) for p in user_posts)
-
-    header = f'''
-    <div class="box profile-header">
-      <div class="avatar-big">{escape(display_name[0].upper())}</div>
-      <div class="profile-info">
-        <h2>{escape(display_name)}</h2>
-        <div class="profile-stats">
-          <span><b>{len(user_posts)}</b> постов</span>
-          <span><b>{karma}</b> кармы</span>
-          <span>#{anon_id}</span>
-        </div>
-      </div>
-    </div>'''
-
-    feed = "".join(post_card(p, anon) for p in user_posts)
-    return layout(anon, header + feed, active="profile")
+    mine = sorted([p for p in posts if p["author_id"] == anon["id"]],
+                  key=lambda x: x["created"], reverse=True)
+    if not mine:
+        feed = '<div class="box empty">Здесь пока ничего нет. <a href="/create">Создайте пост.</a></div>'
+    else:
+        feed = "".join(post_card(p, anon) for p in mine)
+    return layout(anon, '<h1 class="page-title">Мои посты</h1>' + feed, active="my")
 
 
 # ---------- голосование ----------
@@ -1052,15 +943,12 @@ def vote(post_id: int, request: Request, value: str = Form(...)):
 
 @app.post("/comment/{post_id}")
 def add_comment(post_id: int, request: Request, text: str = Form(...)):
-    anon = request.state.anon
     p = next((x for x in posts if x["id"] == post_id), None)
     text = text.strip()
     if p and text:
         _counter["comment"] += 1
         p["comments"].append({
             "id": _counter["comment"],
-            "author_id": anon["id"],
-            "author_name": anon["name"],
             "text": text[:1000],
             "created": time.time(),
         })
