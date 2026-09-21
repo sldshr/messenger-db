@@ -149,6 +149,10 @@ class UpdateMeIn(BaseModel):
     display_name: str
 
 
+class ContactRequestIn(BaseModel):
+    username: str
+
+
 app = FastAPI(title="sldchat", docs_url=None, redoc_url=None)
 
 
@@ -255,6 +259,161 @@ async def search_users(q: str = Query("", max_length=50), user=Depends(current_u
     return [r for r in rows if r["id"] != user["id"]]
 
 
+# --------------------------------------------------------- contacts
+@app.get("/api/contacts")
+async def list_contacts(user=Depends(current_user)):
+    me_id = user["id"]
+    rows = await sb_select("contacts", {"owner_id": f"eq.{me_id}",
+                                        "select": "contact_id,created_at"})
+    if not rows:
+        return []
+    ids = [r["contact_id"] for r in rows]
+    users = await sb_select("users", {"id": f"in.({','.join(ids)})",
+                                      "select": "id,username,display_name"})
+    u_map = {u["id"]: u for u in users}
+    out = []
+    for r in rows:
+        u = u_map.get(r["contact_id"])
+        if u:
+            out.append({"id": u["id"], "username": u["username"],
+                        "display_name": u["display_name"]})
+    out.sort(key=lambda x: x["display_name"].lower())
+    return out
+
+
+@app.get("/api/contacts/requests")
+async def list_contact_requests(user=Depends(current_user)):
+    me_id = user["id"]
+    rows = await sb_select("contact_requests", {
+        "to_id": f"eq.{me_id}",
+        "status": "eq.pending",
+        "select": "id,from_id,created_at",
+        "order": "created_at.desc",
+    })
+    if not rows:
+        return []
+    ids = [r["from_id"] for r in rows]
+    users = await sb_select("users", {"id": f"in.({','.join(ids)})",
+                                      "select": "id,username,display_name"})
+    u_map = {u["id"]: u for u in users}
+    out = []
+    for r in rows:
+        u = u_map.get(r["from_id"])
+        if u:
+            out.append({"id": r["id"], "from": u, "created_at": r["created_at"]})
+    return out
+
+
+@app.post("/api/contacts/request")
+async def send_contact_request(body: ContactRequestIn, user=Depends(current_user)):
+    me_id = user["id"]
+    uname = body.username.strip().lstrip("@").lower()
+    if not uname:
+        raise HTTPException(400, "Enter a username")
+    rows = await sb_select("users", {"username": f"eq.{uname}",
+                                     "select": "id,username,display_name"})
+    if not rows:
+        raise HTTPException(404, "User not found")
+    target = rows[0]
+    if target["id"] == me_id:
+        raise HTTPException(400, "You can't add yourself")
+
+    already = await sb_select("contacts", {"owner_id": f"eq.{me_id}",
+                                           "contact_id": f"eq.{target['id']}",
+                                           "select": "contact_id"})
+    if already:
+        raise HTTPException(409, "Already in your contacts")
+
+    incoming = await sb_select("contact_requests", {
+        "from_id": f"eq.{target['id']}",
+        "to_id": f"eq.{me_id}",
+        "status": "eq.pending",
+        "select": "id",
+    })
+    if incoming:
+        raise HTTPException(409, "This user already sent you a request — check Contacts")
+
+    dup = await sb_select("contact_requests", {
+        "from_id": f"eq.{me_id}",
+        "to_id": f"eq.{target['id']}",
+        "status": "eq.pending",
+        "select": "id",
+    })
+    if dup:
+        raise HTTPException(409, "Request already sent")
+
+    req = await sb_insert("contact_requests", {
+        "from_id": me_id, "to_id": target["id"], "status": "pending",
+    })
+    row = req[0]
+    payload = {
+        "type": "contact_request",
+        "request": {
+            "id": row["id"],
+            "from": {"id": me_id, "username": user["username"],
+                     "display_name": user["display_name"]},
+            "created_at": row["created_at"],
+        }
+    }
+    await hub.send(target["id"], payload)
+    return {"ok": True}
+
+
+@app.post("/api/contacts/requests/{req_id}/accept")
+async def accept_contact_request(req_id: str, user=Depends(current_user)):
+    me_id = user["id"]
+    rows = await sb_select("contact_requests", {
+        "id": f"eq.{req_id}", "to_id": f"eq.{me_id}",
+        "select": "id,from_id,to_id,status",
+    })
+    if not rows:
+        raise HTTPException(404, "Request not found")
+    req = rows[0]
+    if req["status"] != "pending":
+        raise HTTPException(400, "Already handled")
+    from_id = req["from_id"]
+
+    await sb_update("contact_requests", {"id": f"eq.{req_id}"}, {"status": "accepted"})
+
+    existing = await sb_select("contacts", {"owner_id": f"eq.{me_id}",
+                                            "contact_id": f"eq.{from_id}",
+                                            "select": "contact_id"})
+    if not existing:
+        await sb_insert("contacts", [
+            {"owner_id": me_id, "contact_id": from_id},
+            {"owner_id": from_id, "contact_id": me_id},
+        ])
+
+    await hub.send(from_id, {
+        "type": "contact_accepted",
+        "contact": {"id": me_id, "username": user["username"],
+                    "display_name": user["display_name"]},
+    })
+    return {"ok": True}
+
+
+@app.post("/api/contacts/requests/{req_id}/decline")
+async def decline_contact_request(req_id: str, user=Depends(current_user)):
+    me_id = user["id"]
+    rows = await sb_select("contact_requests", {
+        "id": f"eq.{req_id}", "to_id": f"eq.{me_id}",
+        "select": "id,from_id,status",
+    })
+    if not rows:
+        raise HTTPException(404, "Request not found")
+    req = rows[0]
+    if req["status"] != "pending":
+        raise HTTPException(400, "Already handled")
+    await sb_update("contact_requests", {"id": f"eq.{req_id}"}, {"status": "declined"})
+    await hub.send(req["from_id"], {
+        "type": "contact_declined",
+        "by": {"id": me_id, "username": user["username"],
+               "display_name": user["display_name"]},
+    })
+    return {"ok": True}
+
+
+# --------------------------------------------------------- chats
 @app.get("/api/chats")
 async def list_chats(user=Depends(current_user)):
     me_id = user["id"]
@@ -461,17 +620,62 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <title>sldchat</title>
+<script>
+  (function(){
+    try {
+      var t = localStorage.getItem('sldchat-theme') || 'light';
+      document.documentElement.setAttribute('data-theme', t);
+    } catch(e){}
+  })();
+</script>
 <style>
-:root{
+:root, html[data-theme="light"]{
   --blue:#517da2; --blue-d:#46698a; --blue-l:#6b9dc2;
   --bg:#e6ebee; --panel:#fff; --border:#dfe4e8; --border-2:#eef1f3;
   --text:#222; --text-2:#4a5560; --muted:#8a939b;
-  --bubble-in:#fff; --bubble-out:#e5f3f8; --bubble-out-line:#c8e3ee;
-  --danger:#d9534f; --ok:#5cb85c;
-  --radius:10px;
+  --bubble-in:#fff; --bubble-out:#e5f3f8;
+  --bubble-in-text:#1a1f24; --bubble-out-text:#1a1f24;
+  --bubble-time-in:#96a0a8; --bubble-time-out:#7ba5ba;
+  --date-sep-bg:rgba(255,255,255,.85); --date-sep-text:#68727b;
+  --hover-bg:#f5f8fa; --active-bg:#e9f0f5; --active-bg-2:#e1eaf0;
+  --input-bg:#f7f9fa; --section-bg:#f8fafb; --empty-icon:#c3ccd3;
+  --header-bg:#517da2; --header-text:#fff;
+  --header-grad:linear-gradient(160deg,#5a8bb5 0%,#3d6b8f 100%);
+  --brand-grad:linear-gradient(160deg,#6b9dc2 0%,#3d6b8f 100%);
+  --disabled:#c3ccd3;
+  --btn-ghost-border:#dfe4e8;
+  --btn-ghost-border-hover:#c8d2da;
+  --danger:#d9534f; --danger-border:#f0d4d3; --danger-bg:#fbf1f1;
+  --drawer-bg:#fff;
   --shadow-sm:0 1px 2px rgba(0,0,0,.06);
   --shadow-md:0 4px 16px rgba(0,0,0,.10);
   --shadow-lg:0 12px 48px rgba(0,0,0,.22);
+  --scrollbar:rgba(0,0,0,.15);
+  --scrollbar-h:rgba(0,0,0,.25);
+}
+html[data-theme="dark"]{
+  --blue:#5a95c2; --blue-d:#4a7fa8; --blue-l:#78acd2;
+  --bg:#0e1621; --panel:#17212b; --border:#242f3d; --border-2:#1e2936;
+  --text:#e8eaec; --text-2:#b8c1c9; --muted:#7d8a97;
+  --bubble-in:#182533; --bubble-out:#2b5278;
+  --bubble-in-text:#e8eaec; --bubble-out-text:#f0f4f7;
+  --bubble-time-in:#6b7685; --bubble-time-out:#a4c2d8;
+  --date-sep-bg:rgba(30,42,55,.85); --date-sep-text:#a5b1bc;
+  --hover-bg:#1e2a37; --active-bg:#243d52; --active-bg-2:#2a4761;
+  --input-bg:#1e2936; --section-bg:#141d28; --empty-icon:#3d4c5a;
+  --header-bg:#17212b; --header-text:#e8eaec;
+  --header-grad:linear-gradient(160deg,#1e2a37 0%,#17212b 100%);
+  --brand-grad:linear-gradient(160deg,#2b5278 0%,#17212b 100%);
+  --disabled:#3d4c5a;
+  --btn-ghost-border:#2a3645;
+  --btn-ghost-border-hover:#3a4a5c;
+  --danger:#ef6b6b; --danger-border:#5a2d2d; --danger-bg:#2b1c1c;
+  --drawer-bg:#17212b;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.35);
+  --shadow-md:0 4px 16px rgba(0,0,0,.45);
+  --shadow-lg:0 12px 48px rgba(0,0,0,.65);
+  --scrollbar:rgba(255,255,255,.12);
+  --scrollbar-h:rgba(255,255,255,.22);
 }
 *{box-sizing:border-box}
 html,body{height:100%;margin:0;overflow:hidden}
@@ -479,20 +683,21 @@ body{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   font-size:14px;color:var(--text);background:var(--bg);
   -webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent;
+  transition:background .18s,color .18s;
 }
 button{font:inherit;cursor:pointer;border:none;background:none;color:inherit;padding:0}
 button:disabled{cursor:default}
 input,textarea{font:inherit;color:inherit}
 svg{display:block;flex-shrink:0}
 ::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.25)}
+::-webkit-scrollbar-thumb{background:var(--scrollbar);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--scrollbar-h)}
 ::-webkit-scrollbar-track{background:transparent}
 
 /* ============ AUTH ============ */
-#login{position:fixed;inset:0;display:flex;background:#fff;z-index:100}
+#login{position:fixed;inset:0;display:flex;background:var(--panel);z-index:100}
 .login-brand{
-  flex:1;background:linear-gradient(160deg,#6b9dc2 0%,#3d6b8f 100%);
+  flex:1;background:var(--brand-grad);
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   color:#fff;padding:40px;position:relative;overflow:hidden;
 }
@@ -531,9 +736,9 @@ svg{display:block;flex-shrink:0}
 .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:500}
 .field input{
   width:100%;padding:11px 14px;border:1px solid var(--border);border-radius:8px;
-  outline:none;background:#fff;transition:.15s;
+  outline:none;background:var(--panel);transition:.15s;
 }
-.field input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(81,125,162,.12)}
+.field input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(81,125,162,.14)}
 .field .hint{font-size:11px;color:var(--muted);margin-top:5px}
 
 .btn-primary{
@@ -548,9 +753,7 @@ svg{display:block;flex-shrink:0}
   line-height:1.3;
 }
 
-@media (max-width:860px){
-  .login-brand{display:none}
-}
+@media (max-width:860px){ .login-brand{display:none} }
 
 /* ============ APP ============ */
 #app{display:none;height:100vh;height:100dvh}
@@ -563,7 +766,7 @@ svg{display:block;flex-shrink:0}
 }
 .sidebar-head{
   display:flex;align-items:center;padding:8px 10px;gap:6px;
-  background:var(--blue);color:#fff;height:52px;flex-shrink:0;
+  background:var(--header-bg);color:var(--header-text);height:52px;flex-shrink:0;
 }
 .sidebar-head .title{flex:1;font-weight:600;font-size:15px;letter-spacing:.4px;padding:0 6px}
 .icon-btn{
@@ -571,13 +774,12 @@ svg{display:block;flex-shrink:0}
   display:inline-flex;align-items:center;justify-content:center;
   transition:background .12s;flex-shrink:0;
 }
-.icon-btn:hover{background:rgba(255,255,255,.18)}
-.icon-btn:active{background:rgba(255,255,255,.28)}
+.icon-btn:hover{background:rgba(255,255,255,.15)}
+.icon-btn:active{background:rgba(255,255,255,.25)}
 .icon-btn svg{width:19px;height:19px}
 
 .sidebar-body{flex:1;overflow-y:auto;overflow-x:hidden;min-height:0;display:flex;flex-direction:column}
 
-/* search */
 .search-wrap{position:relative;padding:10px;border-bottom:1px solid var(--border-2);flex-shrink:0}
 .search-wrap .search-icon{
   position:absolute;left:22px;top:50%;transform:translateY(-50%);
@@ -585,19 +787,18 @@ svg{display:block;flex-shrink:0}
 }
 .search-wrap input{
   width:100%;padding:9px 12px 9px 36px;border:1px solid var(--border);
-  border-radius:8px;outline:none;background:#f7f9fa;transition:.15s;
+  border-radius:8px;outline:none;background:var(--input-bg);transition:.15s;
 }
-.search-wrap input:focus{border-color:var(--blue);background:#fff}
+.search-wrap input:focus{border-color:var(--blue);background:var(--panel)}
 
-/* chat list */
 .chat-list{flex:1;overflow-y:auto}
 .chat-item{
   display:flex;align-items:center;gap:12px;
   padding:10px 14px;cursor:pointer;transition:background .12s;
 }
-.chat-item:hover{background:#f5f8fa}
-.chat-item.active{background:#e9f0f5}
-.chat-item:active{background:#e1eaf0}
+.chat-item:hover{background:var(--hover-bg)}
+.chat-item.active{background:var(--active-bg)}
+.chat-item:active{background:var(--active-bg-2)}
 .avatar{
   width:46px;height:46px;min-width:46px;border-radius:50%;
   display:flex;align-items:center;justify-content:center;
@@ -614,31 +815,71 @@ svg{display:block;flex-shrink:0}
 }
 .list-section{
   padding:10px 14px 6px;font-size:11px;text-transform:uppercase;
-  color:var(--muted);font-weight:700;letter-spacing:.6px;background:#f8fafb;
+  color:var(--muted);font-weight:700;letter-spacing:.6px;background:var(--section-bg);
 }
 .empty{
   padding:40px 24px;text-align:center;color:var(--muted);font-size:13.5px;line-height:1.5;
 }
-.empty svg{width:44px;height:44px;margin:0 auto 14px;color:#c3ccd3}
+.empty svg{width:44px;height:44px;margin:0 auto 14px;color:var(--empty-icon)}
 
-/* subviews */
 .sub-view{flex:1;display:flex;flex-direction:column;overflow-y:auto}
 .sub-head{
   padding:16px 18px 12px;border-bottom:1px solid var(--border-2);
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
 }
 .sub-head h2{margin:0;font-size:17px;font-weight:600}
 .sub-head p{margin:4px 0 0;color:var(--muted);font-size:12.5px}
+.sub-head .sub-head-actions{display:flex;gap:8px;flex-shrink:0}
 .sub-body{padding:10px 0}
 .sub-item{
-  display:flex;align-items:center;gap:14px;padding:13px 18px;cursor:pointer;
+  display:flex;align-items:center;gap:14px;padding:13px 18px;
   transition:background .12s;
 }
-.sub-item:hover{background:#f5f8fa}
+.sub-item.clickable{cursor:pointer}
+.sub-item.clickable:hover{background:var(--hover-bg)}
 .sub-item svg{width:20px;height:20px;color:var(--muted);flex-shrink:0}
 .sub-item .sub-item-body{flex:1;min-width:0}
 .sub-item .sub-item-title{font-size:14px;font-weight:500;color:var(--text)}
 .sub-item .sub-item-sub{font-size:12.5px;color:var(--muted);margin-top:2px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.btn-mini{
+  padding:7px 14px;border-radius:7px;font-weight:500;font-size:13px;
+  background:var(--blue);color:#fff;transition:.15s;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.btn-mini:hover{background:var(--blue-d)}
+.btn-mini svg{width:15px;height:15px}
+.btn-mini.ghost{
+  background:transparent;color:var(--text);
+  border:1px solid var(--btn-ghost-border);
+}
+.btn-mini.ghost:hover{background:var(--hover-bg);border-color:var(--btn-ghost-border-hover)}
+.btn-mini.accept{background:#5cb85c}
+.btn-mini.accept:hover{background:#4cae4c}
+.btn-mini.decline{background:transparent;color:var(--danger);border:1px solid var(--danger-border)}
+.btn-mini.decline:hover{background:var(--danger-bg)}
+
+/* contact request row */
+.request-item{
+  display:flex;align-items:center;gap:12px;padding:12px 16px;
+  border-bottom:1px solid var(--border-2);
+}
+.request-item .chat-item-body{flex:1;min-width:0}
+.request-item .request-actions{display:flex;gap:6px;flex-shrink:0}
+
+/* theme toggle switch */
+.switch{
+  width:42px;height:24px;border-radius:12px;flex-shrink:0;
+  background:var(--border);position:relative;transition:background .18s;
+}
+.switch::after{
+  content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);
+  transition:transform .18s;
+}
+.switch.on{background:var(--blue)}
+.switch.on::after{transform:translateX(18px)}
 
 .profile-view{padding:24px 20px;text-align:center}
 .profile-avatar{
@@ -651,19 +892,19 @@ svg{display:block;flex-shrink:0}
 .profile-meta{margin-top:6px;color:var(--muted);font-size:12px}
 .profile-actions{margin-top:28px;display:flex;flex-direction:column;gap:10px}
 .btn-ghost{
-  padding:11px 14px;border:1px solid var(--border);border-radius:8px;
-  font-weight:500;color:var(--text);background:#fff;transition:.15s;
+  padding:11px 14px;border:1px solid var(--btn-ghost-border);border-radius:8px;
+  font-weight:500;color:var(--text);background:var(--panel);transition:.15s;
   display:flex;align-items:center;justify-content:center;gap:8px;
 }
-.btn-ghost:hover{background:#f5f8fa;border-color:#c8d2da}
+.btn-ghost:hover{background:var(--hover-bg);border-color:var(--btn-ghost-border-hover)}
 .btn-ghost svg{width:17px;height:17px}
-.btn-ghost.danger{color:var(--danger);border-color:#f0d4d3}
-.btn-ghost.danger:hover{background:#fbf1f1;border-color:#e8c5c4}
+.btn-ghost.danger{color:var(--danger);border-color:var(--danger-border)}
+.btn-ghost.danger:hover{background:var(--danger-bg)}
 
 /* --- Main --- */
 .main{flex:1;display:flex;flex-direction:column;background:var(--bg);min-width:0;min-height:0}
 .main-header{
-  height:52px;padding:0 12px;background:var(--blue);color:#fff;
+  height:52px;padding:0 12px;background:var(--header-bg);color:var(--header-text);
   display:flex;align-items:center;gap:8px;flex-shrink:0;
 }
 .main-header .chat-title{font-weight:600;font-size:15px;
@@ -682,10 +923,10 @@ svg{display:block;flex-shrink:0}
   margin:auto;color:var(--muted);font-size:14px;text-align:center;
   padding:0 20px;max-width:320px;line-height:1.6;
 }
-.no-chat svg{width:64px;height:64px;color:#c3ccd3;margin:0 auto 18px}
+.no-chat svg{width:64px;height:64px;color:var(--empty-icon);margin:0 auto 18px}
 
 .date-sep{
-  align-self:center;background:rgba(255,255,255,.82);color:#68727b;
+  align-self:center;background:var(--date-sep-bg);color:var(--date-sep-text);
   font-size:12px;padding:4px 12px;border-radius:12px;margin:14px 0 8px;
   box-shadow:var(--shadow-sm);font-weight:500;
 }
@@ -699,23 +940,24 @@ svg{display:block;flex-shrink:0}
   max-width:min(66%,520px);padding:7px 12px 20px;position:relative;
   word-wrap:break-word;overflow-wrap:anywhere;
   line-height:1.4;font-size:14.5px;box-shadow:var(--shadow-sm);
-  background:var(--bubble-in);border-radius:12px 12px 12px 4px;
+  background:var(--bubble-in);color:var(--bubble-in-text);
+  border-radius:12px 12px 12px 4px;
 }
 .msg.out .bubble{
-  background:var(--bubble-out);border-radius:12px 12px 4px 12px;
+  background:var(--bubble-out);color:var(--bubble-out-text);
+  border-radius:12px 12px 4px 12px;
 }
 .bubble .author{
   font-size:12.5px;font-weight:600;color:var(--blue);margin-bottom:2px;
   letter-spacing:.1px;
 }
-.bubble .text{white-space:pre-wrap;color:#1a1f24}
+.bubble .text{white-space:pre-wrap}
 .bubble .time{
   position:absolute;right:10px;bottom:4px;
-  font-size:11px;color:#96a0a8;font-weight:500;
+  font-size:11px;font-weight:500;color:var(--bubble-time-in);
 }
-.msg.out .bubble .time{color:#7ba5ba}
+.msg.out .bubble .time{color:var(--bubble-time-out)}
 
-/* composer */
 .composer{
   display:flex;align-items:flex-end;gap:8px;
   padding:10px 12px;background:var(--panel);border-top:1px solid var(--border);
@@ -724,11 +966,10 @@ svg{display:block;flex-shrink:0}
 .composer textarea{
   flex:1;resize:none;border:1px solid var(--border);outline:none;
   padding:10px 14px;max-height:140px;min-height:42px;
-  background:#f7f9fa;border-radius:21px;line-height:1.4;
-  transition:border-color .15s,background .15s;
-  font-size:14.5px;
+  background:var(--input-bg);border-radius:21px;line-height:1.4;
+  transition:border-color .15s,background .15s;font-size:14.5px;
 }
-.composer textarea:focus{border-color:var(--blue);background:#fff}
+.composer textarea:focus{border-color:var(--blue);background:var(--panel)}
 .composer textarea:disabled{opacity:.55}
 .send-btn{
   width:42px;height:42px;border-radius:50%;flex-shrink:0;
@@ -738,7 +979,7 @@ svg{display:block;flex-shrink:0}
 }
 .send-btn:hover{background:var(--blue-d)}
 .send-btn:active{transform:scale(.94)}
-.send-btn:disabled{background:#c3ccd3;cursor:default}
+.send-btn:disabled{background:var(--disabled);cursor:default}
 .send-btn svg{width:20px;height:20px;margin-left:-2px}
 
 /* ============ DRAWER ============ */
@@ -748,14 +989,14 @@ svg{display:block;flex-shrink:0}
 }
 .drawer-backdrop.open{opacity:1;pointer-events:auto}
 .drawer{
-  position:fixed;top:0;left:0;bottom:0;width:280px;background:#fff;z-index:70;
+  position:fixed;top:0;left:0;bottom:0;width:280px;background:var(--drawer-bg);z-index:70;
   transform:translateX(-100%);transition:transform .22s ease-out;
   box-shadow:6px 0 32px rgba(0,0,0,.18);
   display:flex;flex-direction:column;
 }
 .drawer.open{transform:translateX(0)}
 .drawer-head{
-  padding:20px 18px;background:linear-gradient(160deg,#5a8bb5 0%,#3d6b8f 100%);
+  padding:20px 18px;background:var(--header-grad);
   color:#fff;display:flex;align-items:center;gap:14px;
 }
 .drawer-avatar{
@@ -775,15 +1016,60 @@ svg{display:block;flex-shrink:0}
   padding:13px 22px;color:var(--text);font-size:14.5px;font-weight:500;
   transition:background .12s;text-align:left;
 }
-.drawer-item:hover{background:#f5f8fa}
-.drawer-item:active{background:#eef3f7}
+.drawer-item:hover{background:var(--hover-bg)}
+.drawer-item:active{background:var(--active-bg)}
 .drawer-item svg{width:20px;height:20px;color:var(--muted)}
-.drawer-item.active{background:#eaf1f6;color:var(--blue)}
+.drawer-item.active{background:var(--active-bg);color:var(--blue)}
 .drawer-item.active svg{color:var(--blue)}
+.drawer-item .badge{
+  margin-left:auto;background:var(--blue);color:#fff;font-size:11px;font-weight:600;
+  padding:2px 7px;border-radius:10px;min-width:20px;text-align:center;
+}
 .drawer-footer{
   padding:12px 22px;border-top:1px solid var(--border-2);
   font-size:11.5px;color:var(--muted);letter-spacing:.3px;
 }
+
+/* ============ MODAL ============ */
+.modal-backdrop{
+  position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:80;
+  display:flex;align-items:center;justify-content:center;padding:20px;
+  opacity:0;pointer-events:none;transition:opacity .18s;
+}
+.modal-backdrop.open{opacity:1;pointer-events:auto}
+.modal{
+  background:var(--panel);border-radius:12px;padding:22px;width:100%;max-width:380px;
+  box-shadow:var(--shadow-lg);transform:translateY(8px);
+  transition:transform .18s;
+}
+.modal-backdrop.open .modal{transform:translateY(0)}
+.modal h3{margin:0 0 6px;font-size:17px;font-weight:600}
+.modal p{margin:0 0 16px;font-size:13px;color:var(--muted);line-height:1.5}
+.modal input{
+  width:100%;padding:11px 14px;border:1px solid var(--border);border-radius:8px;
+  outline:none;background:var(--input-bg);transition:.15s;
+}
+.modal input:focus{border-color:var(--blue);background:var(--panel)}
+.modal-error{
+  color:var(--danger);font-size:12.5px;margin-top:8px;min-height:16px;
+}
+.modal-actions{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+
+/* ============ TOAST ============ */
+#toast-wrap{
+  position:fixed;top:14px;left:50%;transform:translateX(-50%);
+  z-index:90;display:flex;flex-direction:column;gap:8px;pointer-events:none;
+  max-width:calc(100% - 24px);
+}
+.toast{
+  background:var(--panel);border:1px solid var(--border);color:var(--text);
+  padding:10px 16px;border-radius:10px;font-size:13.5px;
+  box-shadow:var(--shadow-md);opacity:0;transform:translateY(-6px);
+  transition:opacity .2s,transform .2s;pointer-events:auto;
+  display:flex;align-items:center;gap:10px;
+}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast svg{width:18px;height:18px;color:var(--blue);flex-shrink:0}
 
 /* ============ MOBILE ============ */
 @media (max-width:760px){
@@ -801,10 +1087,13 @@ svg{display:block;flex-shrink:0}
   .composer{padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
   .chat-item{padding:12px 14px}
   .avatar{width:48px;height:48px;min-width:48px}
+  .drawer{width:min(300px,84vw)}
 }
 </style>
 </head>
 <body>
+
+<div id="toast-wrap"></div>
 
 <!-- ============== AUTH ============== -->
 <div id="login">
@@ -864,13 +1153,19 @@ svg{display:block;flex-shrink:0}
       </div>
     </div>
     <nav class="drawer-nav">
+      <button class="drawer-item" data-view="chats" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        <span>Chats</span>
+      </button>
       <button class="drawer-item" data-view="notifications" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
         <span>Notifications</span>
+        <span class="badge" id="nav-badge-notif" style="display:none">0</span>
       </button>
       <button class="drawer-item" data-view="contacts" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span>Contacts</span>
+        <span class="badge" id="nav-badge-contacts" style="display:none">0</span>
       </button>
       <button class="drawer-item" data-view="settings" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -881,7 +1176,7 @@ svg{display:block;flex-shrink:0}
         <span>Profile</span>
       </button>
     </nav>
-    <div class="drawer-footer">sldchat · v1.0</div>
+    <div class="drawer-footer">sldchat · v1.1</div>
   </aside>
 
   <div class="app-layout">
@@ -889,9 +1184,6 @@ svg{display:block;flex-shrink:0}
       <div class="sidebar-head">
         <button class="icon-btn" id="btn-menu" title="Menu" type="button">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-        </button>
-        <button class="icon-btn" id="btn-back" title="Back" style="display:none" type="button">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
         </button>
         <div class="title" id="sidebar-title">sldchat</div>
       </div>
@@ -924,6 +1216,20 @@ svg{display:block;flex-shrink:0}
   </div>
 </div>
 
+<!-- ============== MODAL: add contact ============== -->
+<div class="modal-backdrop" id="contact-modal">
+  <div class="modal">
+    <h3>Add contact</h3>
+    <p>Enter a username — they will get a request to accept or decline.</p>
+    <input id="contact-username" placeholder="@username" autocomplete="off" maxlength="40">
+    <div class="modal-error" id="contact-error"></div>
+    <div class="modal-actions">
+      <button class="btn-mini ghost" id="contact-cancel" type="button">Cancel</button>
+      <button class="btn-mini" id="contact-submit" type="button">Send request</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -931,17 +1237,27 @@ const ICONS = {
   search:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/></svg>',
   bell:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
   users:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  userPlus:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>',
   user:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
   gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
   logout:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
   edit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>',
   chat:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+  moon:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+  sun:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
+  check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  checkCircle:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  x:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
 };
 
 // ----------------------------- state -----------------------------
 let me = null;
 let ws = null;
 let chats = [];
+let contacts = [];
+let contactRequests = [];
+let notifications = [];      // {id, type, text, ts, read}
+let unreadNotif = 0;
 let currentChatId = null;
 let currentChat = null;
 let messages = {};
@@ -950,6 +1266,20 @@ let searchQuery = '';
 let typingTimer = null;
 let typingHideTimer = null;
 let isMobile = () => window.matchMedia('(max-width: 760px)').matches;
+
+// ----------------------------- theme -----------------------------
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('sldchat-theme', t); } catch(e){}
+}
+function currentTheme(){
+  return document.documentElement.getAttribute('data-theme') || 'light';
+}
+function toggleTheme(){
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  if(view === 'settings') renderSidebar();
+}
 
 // ----------------------------- helpers -----------------------------
 function escapeHtml(s){
@@ -993,6 +1323,20 @@ function fmtDate(iso){
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return d.getDate() + ' ' + months[d.getMonth()] +
          (d.getFullYear() !== today.getFullYear() ? ' ' + d.getFullYear() : '');
+}
+
+// ----------------------------- toast -----------------------------
+function toast(text, icon){
+  const wrap = $('toast-wrap');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = (icon || ICONS.checkCircle) + '<span>' + escapeHtml(text) + '</span>';
+  wrap.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 250);
+  }, 3200);
 }
 
 // ----------------------------- auth -----------------------------
@@ -1051,18 +1395,18 @@ function startApp(){
   bindGlobalUI();
   connectWS();
   loadChats();
+  loadContacts();
+  loadContactRequests();
 }
 
 function updateDrawerUser(){
   if(!me) return;
   $('drawer-avatar').textContent = initials(me.display_name);
-  $('drawer-avatar').style.background = 'rgba(255,255,255,.22)';
   $('drawer-name').textContent = me.display_name;
   $('drawer-username').textContent = '@' + me.username;
 }
 
 function bindGlobalUI(){
-  // drawer
   $('btn-menu').onclick = () => openDrawer();
   $('drawer-backdrop').onclick = () => closeDrawer();
   document.querySelectorAll('.drawer-item').forEach(btn => {
@@ -1072,16 +1416,11 @@ function bindGlobalUI(){
     });
   });
 
-  // sidebar back
-  $('btn-back').onclick = () => setView('chats');
-
-  // mobile back
   $('btn-mobile-back').onclick = () => {
     $('main').classList.remove('mobile-open');
     currentChatId = null; currentChat = null;
   };
 
-  // composer
   $('send').onclick = sendMessage;
   const inp = $('input');
   inp.addEventListener('keydown', e => {
@@ -1096,14 +1435,21 @@ function bindGlobalUI(){
     }
   });
 
-  // resize handler: if we switched from mobile to desktop, clear mobile state
   window.addEventListener('resize', () => {
     if(!isMobile()) $('main').classList.remove('mobile-open');
   });
-
-  // esc closes drawer
   window.addEventListener('keydown', e => {
-    if(e.key === 'Escape') closeDrawer();
+    if(e.key === 'Escape'){ closeDrawer(); closeContactModal(); }
+  });
+
+  // contact modal
+  $('contact-cancel').onclick = closeContactModal;
+  $('contact-submit').onclick = submitContactRequest;
+  $('contact-username').addEventListener('keydown', e => {
+    if(e.key === 'Enter'){ e.preventDefault(); submitContactRequest(); }
+  });
+  $('contact-modal').addEventListener('click', e => {
+    if(e.target === $('contact-modal')) closeContactModal();
   });
 }
 
@@ -1119,15 +1465,24 @@ function closeDrawer(){
 // ----------------------------- views -----------------------------
 function setView(v){
   view = v;
-  const isChats = v === 'chats';
-  $('btn-menu').style.display = isChats ? '' : 'none';
-  $('btn-back').style.display = isChats ? 'none' : '';
   const titles = {chats:'sldchat', notifications:'Notifications',
                   contacts:'Contacts', settings:'Settings', profile:'Profile'};
   $('sidebar-title').textContent = titles[v] || 'sldchat';
   document.querySelectorAll('.drawer-item').forEach(b =>
     b.classList.toggle('active', b.dataset.view === v));
+  if(v === 'notifications'){ unreadNotif = 0; updateBadges(); }
   renderSidebar();
+}
+
+function updateBadges(){
+  const pendingReqs = contactRequests.length;
+  const notifBadge = $('nav-badge-notif');
+  const contactsBadge = $('nav-badge-contacts');
+  if(unreadNotif > 0){ notifBadge.style.display=''; notifBadge.textContent = unreadNotif > 99 ? '99+' : unreadNotif; }
+  else { notifBadge.style.display='none'; }
+  const totalContacts = pendingReqs;
+  if(totalContacts > 0){ contactsBadge.style.display=''; contactsBadge.textContent = totalContacts; }
+  else { contactsBadge.style.display='none'; }
 }
 
 function renderSidebar(){
@@ -1170,7 +1525,6 @@ async function renderChatList(){
   el.innerHTML = '';
 
   if(searchQuery){
-    // local chat matches
     const filtered = chats.filter(c =>
       c.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
       (c.username || '').toLowerCase().includes(searchQuery.toLowerCase())
@@ -1181,7 +1535,6 @@ async function renderChatList(){
       el.appendChild(h);
       filtered.forEach(c => el.appendChild(chatItem(c)));
     }
-    // global user search
     try {
       const users = await api('/api/users/search?q=' + encodeURIComponent(searchQuery));
       if(users.length){
@@ -1244,39 +1597,46 @@ async function startChat(userId){
     if(searchInput) searchInput.value = '';
     await loadChats();
     openChat(r.chat_id);
-  } catch(e){ alert(e.message); }
+  } catch(e){ toast(e.message, ICONS.x); }
 }
 
 // --- notifications ---
 function renderNotificationsView(root){
   const wrap = document.createElement('div');
   wrap.className = 'sub-view';
+  const head = document.createElement('div');
+  head.className = 'sub-head';
+  head.innerHTML = '<h2>Notifications</h2><p>' +
+    (notifications.length ? notifications.length + ' recent' : 'You\'re all caught up') +
+    '</p>';
+  wrap.appendChild(head);
+
   const body = document.createElement('div');
   body.className = 'sub-body';
 
-  // derive "notifications" from latest message per chat
-  const items = chats
-    .filter(c => c.last_message)
-    .sort((a,b) => (b.last_message_at||'').localeCompare(a.last_message_at||''))
-    .slice(0, 30);
-
-  if(!items.length){
+  if(!notifications.length){
     body.innerHTML =
       '<div class="empty">'+ICONS.bell+
       '<div>No notifications</div>' +
-      '<div style="margin-top:8px;font-size:12.5px">You\'re all caught up</div></div>';
+      '<div style="margin-top:8px;font-size:12.5px">Contact requests and updates appear here</div></div>';
   } else {
-    items.forEach(c => {
+    notifications.forEach(n => {
       const d = document.createElement('div');
       d.className = 'chat-item';
+      const icon = n.type === 'contact_request' ? ICONS.userPlus
+                 : n.type === 'contact_accepted' ? ICONS.checkCircle
+                 : ICONS.chat;
       d.innerHTML =
-        '<div class="avatar" style="background:'+avatarColor(c.id)+'">'+escapeHtml(initials(c.title))+'</div>' +
+        '<div class="avatar" style="background:'+avatarColor(n.id)+'">'+
+          (n.type === 'contact_request' || n.type === 'contact_accepted'
+            ? escapeHtml(initials(n.name)) : icon) + '</div>' +
         '<div class="chat-item-body">' +
-          '<div class="chat-item-title">'+escapeHtml(c.title)+'</div>' +
-          '<div class="chat-item-sub">'+escapeHtml(c.last_message)+'</div>' +
+          '<div class="chat-item-title">'+escapeHtml(n.title)+'</div>' +
+          '<div class="chat-item-sub">'+escapeHtml(n.text)+'</div>' +
         '</div>' +
-        '<div style="font-size:11.5px;color:#8a939b;margin-left:6px">'+fmtTime(c.last_message_at)+'</div>';
-      d.onclick = () => { setView('chats'); openChat(c.id); };
+        '<div style="font-size:11.5px;color:var(--muted);margin-left:6px">'+fmtTime(n.ts)+'</div>';
+      if(n.type === 'contact_request'){ d.onclick = () => { setView('contacts'); }; }
+      else if(n.chat_id){ d.onclick = () => { setView('chats'); openChat(n.chat_id); }; }
       body.appendChild(d);
     });
   }
@@ -1289,48 +1649,115 @@ function renderContactsView(root){
   const wrap = document.createElement('div');
   wrap.className = 'sub-view';
 
-  // unique peers from chats
-  const seen = new Set();
-  const contacts = [];
-  chats.forEach(c => {
-    if(c.peer_id && !seen.has(c.peer_id)){
-      seen.add(c.peer_id);
-      contacts.push({id: c.peer_id, title: c.title, username: c.username, chat_id: c.id});
-    }
-  });
-  contacts.sort((a,b) => a.title.localeCompare(b.title));
-
   const head = document.createElement('div');
   head.className = 'sub-head';
-  head.innerHTML = '<h2>Contacts</h2><p>' +
-    (contacts.length ? contacts.length + ' contact' + (contacts.length===1?'':'s') : 'No contacts yet') +
-    '</p>';
+  const pending = contactRequests.length;
+  const count = contacts.length;
+  head.innerHTML =
+    '<div>' +
+      '<h2>Contacts</h2>' +
+      '<p>' + (count ? count + ' contact' + (count===1?'':'s') : 'No contacts yet') +
+      (pending ? ' · ' + pending + ' pending' : '') + '</p>' +
+    '</div>' +
+    '<div class="sub-head-actions">' +
+      '<button class="btn-mini" id="btn-add-contact" type="button">' +
+        ICONS.userPlus + '<span>Add contact</span>' +
+      '</button>' +
+    '</div>';
   wrap.appendChild(head);
+  head.querySelector('#btn-add-contact').onclick = () => openContactModal();
 
   const body = document.createElement('div');
   body.className = 'sub-body';
 
-  if(!contacts.length){
-    body.innerHTML =
+  // Pending requests
+  if(contactRequests.length){
+    const s = document.createElement('div');
+    s.className = 'list-section';
+    s.textContent = 'Requests';
+    body.appendChild(s);
+    contactRequests.forEach(r => body.appendChild(requestItem(r)));
+  }
+
+  // Contacts
+  if(contacts.length){
+    const s = document.createElement('div');
+    s.className = 'list-section';
+    s.textContent = 'All contacts';
+    body.appendChild(s);
+    contacts.forEach(u => body.appendChild(contactItem(u)));
+  }
+
+  if(!contacts.length && !contactRequests.length){
+    body.innerHTML +=
       '<div class="empty">'+ICONS.users+
       '<div>No contacts yet</div>' +
-      '<div style="margin-top:8px;font-size:12.5px">Search for people to start chatting</div></div>';
-  } else {
-    contacts.forEach(u => {
-      const d = document.createElement('div');
-      d.className = 'chat-item';
-      d.innerHTML =
-        '<div class="avatar" style="background:'+avatarColor(u.id)+'">'+escapeHtml(initials(u.title))+'</div>' +
-        '<div class="chat-item-body">' +
-          '<div class="chat-item-title">'+escapeHtml(u.title)+'</div>' +
-          '<div class="chat-item-sub">@'+escapeHtml(u.username||'')+'</div>' +
-        '</div>';
-      d.onclick = () => { setView('chats'); openChat(u.chat_id); };
-      body.appendChild(d);
-    });
+      '<div style="margin-top:8px;font-size:12.5px">Tap "Add contact" to send a request</div></div>';
   }
+
   wrap.appendChild(body);
   root.appendChild(wrap);
+}
+
+function requestItem(r){
+  const div = document.createElement('div');
+  div.className = 'request-item';
+  div.innerHTML =
+    '<div class="avatar" style="background:'+avatarColor(r.from.id)+'">'+
+      escapeHtml(initials(r.from.display_name))+'</div>' +
+    '<div class="chat-item-body">' +
+      '<div class="chat-item-title">'+escapeHtml(r.from.display_name)+'</div>' +
+      '<div class="chat-item-sub">@'+escapeHtml(r.from.username)+'</div>' +
+    '</div>' +
+    '<div class="request-actions">' +
+      '<button class="btn-mini accept" type="button">Accept</button>' +
+      '<button class="btn-mini decline" type="button">Decline</button>' +
+    '</div>';
+  const [acceptBtn, declineBtn] = div.querySelectorAll('.request-actions button');
+  acceptBtn.onclick = async (e) => {
+    e.stopPropagation();
+    acceptBtn.disabled = true; declineBtn.disabled = true;
+    try {
+      await api('/api/contacts/requests/' + r.id + '/accept', {method:'POST'});
+      contactRequests = contactRequests.filter(x => x.id !== r.id);
+      await loadContacts();
+      updateBadges();
+      if(view === 'contacts') renderSidebar();
+      toast('Contact added', ICONS.checkCircle);
+    } catch(err){
+      toast(err.message, ICONS.x);
+      acceptBtn.disabled = false; declineBtn.disabled = false;
+    }
+  };
+  declineBtn.onclick = async (e) => {
+    e.stopPropagation();
+    acceptBtn.disabled = true; declineBtn.disabled = true;
+    try {
+      await api('/api/contacts/requests/' + r.id + '/decline', {method:'POST'});
+      contactRequests = contactRequests.filter(x => x.id !== r.id);
+      updateBadges();
+      if(view === 'contacts') renderSidebar();
+      toast('Request declined', ICONS.x);
+    } catch(err){
+      toast(err.message, ICONS.x);
+      acceptBtn.disabled = false; declineBtn.disabled = false;
+    }
+  };
+  return div;
+}
+
+function contactItem(u){
+  const div = document.createElement('div');
+  div.className = 'chat-item';
+  div.innerHTML =
+    '<div class="avatar" style="background:'+avatarColor(u.id)+'">'+
+      escapeHtml(initials(u.display_name))+'</div>' +
+    '<div class="chat-item-body">' +
+      '<div class="chat-item-title">'+escapeHtml(u.display_name)+'</div>' +
+      '<div class="chat-item-sub">@'+escapeHtml(u.username)+'</div>' +
+    '</div>';
+  div.onclick = () => startChat(u.id);
+  return div;
 }
 
 // --- settings ---
@@ -1342,27 +1769,35 @@ function renderSettingsView(root){
   head.innerHTML = '<h2>Settings</h2><p>App preferences</p>';
   wrap.appendChild(head);
 
+  const isDark = currentTheme() === 'dark';
   const body = document.createElement('div');
   body.className = 'sub-body';
-  body.innerHTML =
-    '<div class="sub-item" style="cursor:default">' +
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>' +
-      '<div class="sub-item-body"><div class="sub-item-title">Appearance</div>' +
-      '<div class="sub-item-sub">Light theme</div></div>' +
+
+  const themeRow = document.createElement('div');
+  themeRow.className = 'sub-item clickable';
+  themeRow.innerHTML =
+    (isDark ? ICONS.moon : ICONS.sun) +
+    '<div class="sub-item-body">' +
+      '<div class="sub-item-title">Dark theme</div>' +
+      '<div class="sub-item-sub">' + (isDark ? 'Enabled' : 'Disabled') + '</div>' +
     '</div>' +
-    '<div class="sub-item" style="cursor:default">' +
+    '<div class="switch' + (isDark ? ' on' : '') + '"></div>';
+  themeRow.onclick = () => toggleTheme();
+  body.appendChild(themeRow);
+
+  body.innerHTML +=
+    '<div class="sub-item">' +
       ICONS.bell +
       '<div class="sub-item-body"><div class="sub-item-title">Notifications</div>' +
       '<div class="sub-item-sub">In-app only</div></div>' +
     '</div>' +
-    '<div class="sub-item" style="cursor:default">' +
+    '<div class="sub-item">' +
       ICONS.chat +
       '<div class="sub-item-body"><div class="sub-item-title">Messages</div>' +
       '<div class="sub-item-sub">Text only · Realtime</div></div>' +
     '</div>';
   wrap.appendChild(body);
 
-  // logout at bottom
   const actions = document.createElement('div');
   actions.style.padding = '16px 18px';
   const btn = document.createElement('button');
@@ -1405,7 +1840,8 @@ function renderProfileView(root){
       me.display_name = u.display_name;
       updateDrawerUser();
       renderProfileView(root);
-    } catch(e){ alert(e.message); }
+      toast('Profile updated', ICONS.checkCircle);
+    } catch(e){ toast(e.message, ICONS.x); }
   };
   actions.appendChild(editBtn);
 
@@ -1425,6 +1861,48 @@ async function doLogout(){
   location.reload();
 }
 
+// ----------------------------- contact modal -----------------------------
+function openContactModal(){
+  $('contact-username').value = '';
+  $('contact-error').textContent = '';
+  $('contact-modal').classList.add('open');
+  setTimeout(() => $('contact-username').focus(), 80);
+}
+function closeContactModal(){
+  $('contact-modal').classList.remove('open');
+}
+async function submitContactRequest(){
+  const raw = $('contact-username').value.trim().replace(/^@/, '').toLowerCase();
+  if(!raw){ $('contact-error').textContent = 'Enter a username'; return; }
+  const btn = $('contact-submit');
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = 'Sending…';
+  $('contact-error').textContent = '';
+  try {
+    await api('/api/contacts/request', {method:'POST',
+      body: JSON.stringify({username: raw})});
+    closeContactModal();
+    toast('Request sent to @' + raw, ICONS.checkCircle);
+  } catch(e){
+    $('contact-error').textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
+}
+
+// ----------------------------- contacts load -----------------------------
+async function loadContacts(){
+  try { contacts = await api('/api/contacts'); } catch(_) { contacts = []; }
+  if(view === 'contacts') renderSidebar();
+}
+async function loadContactRequests(){
+  try { contactRequests = await api('/api/contacts/requests'); } catch(_) { contactRequests = []; }
+  updateBadges();
+  if(view === 'contacts') renderSidebar();
+}
+
 // ----------------------------- ws -----------------------------
 function connectWS(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1434,8 +1912,60 @@ function connectWS(){
     if(d.type === 'message') handleIncoming(d.message);
     else if(d.type === 'chat_created') loadChats();
     else if(d.type === 'typing') showTyping(d);
+    else if(d.type === 'contact_request') onContactRequest(d.request);
+    else if(d.type === 'contact_accepted') onContactAccepted(d.contact);
+    else if(d.type === 'contact_declined') onContactDeclined(d.by);
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
+}
+
+function onContactRequest(req){
+  contactRequests.unshift(req);
+  updateBadges();
+  if(view === 'contacts') renderSidebar();
+  // push into notifications
+  notifications.unshift({
+    id: req.from.id,
+    type: 'contact_request',
+    name: req.from.display_name,
+    title: req.from.display_name + ' wants to add you',
+    text: '@' + req.from.username + ' · tap to review',
+    ts: req.created_at,
+  });
+  if(view !== 'notifications') unreadNotif++;
+  updateBadges();
+  toast(req.from.display_name + ' sent a contact request', ICONS.userPlus);
+}
+
+function onContactAccepted(contact){
+  contacts.push(contact);
+  contacts.sort((a,b) => a.display_name.localeCompare(b.display_name));
+  notifications.unshift({
+    id: contact.id,
+    type: 'contact_accepted',
+    name: contact.display_name,
+    title: contact.display_name + ' accepted your request',
+    text: '@' + contact.username + ' is now in your contacts',
+    ts: new Date().toISOString(),
+  });
+  if(view !== 'notifications') unreadNotif++;
+  updateBadges();
+  if(view === 'contacts') renderSidebar();
+  toast(contact.display_name + ' accepted your request', ICONS.checkCircle);
+}
+
+function onContactDeclined(by){
+  notifications.unshift({
+    id: by.id,
+    type: 'contact_declined',
+    name: by.display_name,
+    title: by.display_name + ' declined your request',
+    text: '@' + by.username,
+    ts: new Date().toISOString(),
+  });
+  if(view !== 'notifications') unreadNotif++;
+  updateBadges();
+  toast(by.display_name + ' declined your request', ICONS.x);
 }
 
 function showTyping(d){
