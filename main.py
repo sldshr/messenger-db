@@ -73,6 +73,7 @@ class EventBus:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.clients.setdefault(nick, []).append(q)
         self.presence[nick] = time.time()
+        self._broadcast_presence(nick, True)
         return q
 
     def unsubscribe(self, nick: str, q: asyncio.Queue):
@@ -84,6 +85,13 @@ class EventBus:
                 pass
         if not self.clients.get(nick):
             self.clients.pop(nick, None)
+            self.presence[nick] = time.time() - PRESENCE_TTL + 4.0
+            self._broadcast_presence(nick, False)
+
+    def set_offline(self, nick: str):
+        if nick and not self.clients.get(nick):
+            self.presence[nick] = 0
+            self._broadcast_presence(nick, False)
 
     def touch(self, nick: str):
         if nick:
@@ -92,7 +100,25 @@ class EventBus:
     def is_online(self, nick: str) -> bool:
         if not nick:
             return False
-        return (time.time() - self.presence.get(nick, 0)) < PRESENCE_TTL
+        if self.clients.get(nick):
+            return True
+        return (time.time() - self.presence.get(nick, 0)) < 5.0
+
+    def _broadcast_presence(self, nick: str, online: bool):
+        if not nick:
+            return
+        ev = {"type": "presence", "nick": nick, "online": online}
+        try:
+            threads = db_dm_my_threads(nick)
+        except Exception:
+            threads = []
+        seen = set()
+        for t in threads:
+            other = t["user_b"] if t["user_a"] == nick else t["user_a"]
+            if other in seen:
+                continue
+            seen.add(other)
+            self._deliver(other, ev)
 
     def _deliver(self, nick: str, ev: dict):
         for q in list(self.clients.get(nick, [])):
@@ -265,8 +291,7 @@ def require_user(request: Request) -> dict:
     u = get_current_user(request)
     if not u:
         raise HTTPException(401, "unauthorized")
-    if bus.clients.get(u["nick"]) is not None or True:
-        bus.touch(u["nick"])
+    bus.touch(u["nick"])
     return u
 
 
@@ -274,7 +299,7 @@ def invalidate_user_cache(nick: Optional[str] = None) -> None:
     if nick is None:
         _USER_CACHE.clear()
     else:
-        _USER_CACHE.pop(nick, None)
+        _USER_CACHE.pop(nick.lower(), None)
 
 
 # ============ DB: users ============
@@ -291,6 +316,7 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
+                row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 return row
         except Exception as e:
             print("[sldChat] db_load_user error:", e)
@@ -326,6 +352,7 @@ def db_save_user(u: dict) -> None:
             "blacklist": list(u.get("blacklist") or []),
             "allow_followers_view": u.get("allow_followers_view", True),
             "allow_following_view": u.get("allow_following_view", True),
+            "notify_on_new_post": u.get("notify_on_new_post", True),
         }).execute()
     except Exception as e:
         print("[sldChat] db_save_user error:", e)
@@ -357,6 +384,7 @@ def db_all_users() -> List[dict]:
                 row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
+                row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 out.append(row)
             return out
         except Exception as e:
@@ -626,6 +654,8 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
     if to_user:
         bl = to_user.get("blacklist") or []
         if from_nick in bl:
+            return
+        if ntype == "new_post" and not to_user.get("notify_on_new_post", True):
             return
     n = {
         "id": uuid.uuid4().hex[:10],
@@ -970,6 +1000,7 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "blacklist": list(old.get("blacklist") or []),
             "allow_followers_view": old.get("allow_followers_view", True),
             "allow_following_view": old.get("allow_following_view", True),
+            "notify_on_new_post": old.get("notify_on_new_post", True),
         }).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
@@ -1055,6 +1086,7 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
         d["blacklist"] = list(u.get("blacklist") or [])
+        d["notify_on_new_post"] = u.get("notify_on_new_post", True)
     return d
 
 
@@ -1100,6 +1132,7 @@ class ProfileUpdateIn(BaseModel):
 class SettingsIn(BaseModel):
     allow_followers_view: Optional[bool] = None
     allow_following_view: Optional[bool] = None
+    notify_on_new_post: Optional[bool] = None
 
 
 class DMSendIn(BaseModel):
@@ -1135,6 +1168,7 @@ def api_register(data: RegisterIn, request: Request):
         "created_at": time.time(),
         "following": set(), "followers": set(), "blacklist": [],
         "allow_followers_view": True, "allow_following_view": True,
+        "notify_on_new_post": True,
     }
     db_save_user(u)
     token = new_token()
@@ -1160,7 +1194,9 @@ def api_login(data: LoginIn, request: Request):
 def api_logout(request: Request):
     token = request.headers.get("x-auth")
     if token:
-        SESSIONS.pop(token, None)
+        sess = SESSIONS.pop(token, None)
+        if sess:
+            bus.set_offline(sess.get("nick"))
     return {"ok": True}
 
 
@@ -1207,6 +1243,8 @@ def api_set_settings(data: SettingsIn, request: Request):
         patch["allow_followers_view"] = bool(data.allow_followers_view)
     if data.allow_following_view is not None:
         patch["allow_following_view"] = bool(data.allow_following_view)
+    if data.notify_on_new_post is not None:
+        patch["notify_on_new_post"] = bool(data.notify_on_new_post)
     if patch:
         db_update_user_fields(me["nick"], patch)
     return {"ok": True}
@@ -1381,6 +1419,7 @@ def api_create(payload: PostIn, request: Request):
     pid = uuid.uuid4().hex[:10]
     p = {"id": pid, "text": text, "author": u["nick"], "created_at": time.time()}
     db_create_post(p)
+
     notified = set()
     for nick in extract_mentions(text):
         if nick == u["nick"]:
@@ -1392,6 +1431,17 @@ def api_create(payload: PostIn, request: Request):
             continue
         db_notify(nick, "mention", u["nick"], post_id=pid, text=text[:140])
         notified.add(key)
+
+    for f in (u.get("followers") or set()):
+        if f == u["nick"]:
+            continue
+        if f.lower() in notified:
+            continue
+        if not db_load_user_cached(f):
+            continue
+        db_notify(f, "new_post", u["nick"], post_id=pid, text=text[:140])
+        notified.add(f.lower())
+
     return build_posts_full([p], "u:" + u["nick"])[0]
 
 
@@ -1597,11 +1647,14 @@ def serialize_dm_thread(t: dict, me: str) -> dict:
 @app.get("/api/dm/threads")
 def api_dm_threads(request: Request):
     me = require_user(request)
-    # if user is viewing the list, clear dm_start notifications
     db_clear_dm_start_notifs(me["nick"])
     threads = db_dm_my_threads(me["nick"])
     out = [serialize_dm_thread(t, me["nick"]) for t in threads]
-    return {"threads": out, "unread": sum(x["unread"] for x in out)}
+    return {
+        "threads": out,
+        "unread": sum(x["unread"] for x in out),
+        "unread_notif": db_notifications_unread_count(me["nick"]),
+    }
 
 
 @app.get("/api/dm/with/{nick}")
@@ -1615,7 +1668,13 @@ def api_dm_with(nick: str, request: Request):
     db_clear_dm_start_notifs(me["nick"], other["nick"])
     t = db_dm_find_thread(me["nick"], other["nick"])
     if not t:
-        return {"thread_id": None, "other": serialize_user(other, me["nick"]), "messages": []}
+        return {
+            "thread_id": None,
+            "other": serialize_user(other, me["nick"]),
+            "messages": [],
+            "unread_dm": db_dm_unread_count(me["nick"]),
+            "unread_notif": db_notifications_unread_count(me["nick"]),
+        }
     msgs = db_dm_messages(t["id"])
     db_dm_mark_read(t["id"], me["nick"])
     return {
@@ -1626,6 +1685,8 @@ def api_dm_with(nick: str, request: Request):
              "created_at": m["created_at"], "mine": m["from_nick"] == me["nick"]}
             for m in msgs
         ],
+        "unread_dm": db_dm_unread_count(me["nick"]),
+        "unread_notif": db_notifications_unread_count(me["nick"]),
     }
 
 
@@ -1696,6 +1757,21 @@ def api_presence(request: Request):
     me = require_user(request)
     bus.touch(me["nick"])
     return {"ok": True, "online": True}
+
+
+@app.post("/api/presence/offline")
+async def api_presence_offline(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    token = (body or {}).get("token") or request.headers.get("x-auth")
+    if not token:
+        return {"ok": False}
+    sess = SESSIONS.get(token)
+    if sess:
+        bus.set_offline(sess["nick"])
+    return {"ok": True}
 
 
 @app.get("/api/events")
@@ -1790,17 +1866,19 @@ TEXTS = {
         "own_profile": "Это ваш профиль", "no_user_posts": "Постов пока нет",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
-        "settings_appearance": "Оформление",
-        "settings_theme": "Тема", "settings_lang": "Язык",
         "settings_privacy": "Конфиденциальность",
+        "settings_appearance": "Оформление",
+        "settings_info": "Инфо",
+        "settings_theme": "Тема", "settings_lang": "Язык",
         "settings_allow_followers": "Разрешить просматривать подписчиков",
         "settings_allow_following": "Разрешить просматривать подписки",
+        "settings_notify_new_post": "Уведомления о новых постах",
+        "settings_notify_new_post_hint": "Получать уведомления, когда люди, на которых вы подписаны, публикуют пост",
         "settings_blacklist": "Блеклист",
         "settings_blacklist_hint": "От людей в блеклисте не приходят уведомления и сообщения",
         "settings_blacklist_add_ph": "@ник",
         "settings_blacklist_add": "Добавить",
         "settings_blacklist_empty": "Блеклист пуст",
-        "settings_info": "Инфо",
         "settings_policy": "Политика конфиденциальности",
         "settings_desc": "sldChat — минималистичная соцсеть: посты, комментарии, апвоуты, подписки и личные сообщения в реальном времени.",
         "settings_authors": "Авторы",
@@ -1812,6 +1890,7 @@ TEXTS = {
         "notif_reply": "ответил(а) на ваш комментарий",
         "notif_mention": "упомянул(а) вас",
         "notif_dm": "начал(а) переписку с вами",
+        "notif_new_post": "опубликовал(а) новый пост",
         "notif_clear": "Очистить все",
         "notif_clear_confirm": "Очистить все уведомления?",
         "back_to_main": "В главное меню",
@@ -1896,17 +1975,19 @@ TEXTS = {
         "own_profile": "This is your profile", "no_user_posts": "No posts yet",
         "settings_title": "Settings",
         "settings_account": "Account",
-        "settings_appearance": "Appearance",
-        "settings_theme": "Theme", "settings_lang": "Language",
         "settings_privacy": "Privacy",
+        "settings_appearance": "Appearance",
+        "settings_info": "Info",
+        "settings_theme": "Theme", "settings_lang": "Language",
         "settings_allow_followers": "Allow viewing followers",
         "settings_allow_following": "Allow viewing following",
+        "settings_notify_new_post": "New post notifications",
+        "settings_notify_new_post_hint": "Get notified when people you follow publish a post",
         "settings_blacklist": "Blacklist",
         "settings_blacklist_hint": "People in the blacklist cannot send you notifications or messages",
         "settings_blacklist_add_ph": "@nick",
         "settings_blacklist_add": "Add",
         "settings_blacklist_empty": "Blacklist is empty",
-        "settings_info": "Info",
         "settings_policy": "Privacy policy",
         "settings_desc": "sldChat is a minimalist social network: posts, comments, upvotes, follows and realtime direct messages.",
         "settings_authors": "Authors",
@@ -1918,6 +1999,7 @@ TEXTS = {
         "notif_reply": "replied to your comment",
         "notif_mention": "mentioned you",
         "notif_dm": "started a chat with you",
+        "notif_new_post": "published a new post",
         "notif_clear": "Clear all",
         "notif_clear_confirm": "Clear all notifications?",
         "back_to_main": "Back to main",
@@ -2395,12 +2477,9 @@ button.send:disabled { opacity: .4; cursor: default; }
 }
 .btn-secondary:hover { background: var(--hover); border-color: var(--line-strong); }
 
-.settings-layout {
-  display: flex; gap: 0;
-  height: 100%;
-}
+.settings-layout { display: flex; gap: 0; height: 100%; }
 .settings-nav {
-  flex: 0 0 200px; border-right: 1px solid var(--line);
+  flex: 0 0 220px; border-right: 1px solid var(--line);
   padding: 20px 12px; display: flex; flex-direction: column; gap: 4px;
   overflow-y: auto;
 }
@@ -2413,12 +2492,11 @@ button.send:disabled { opacity: .4; cursor: default; }
 }
 .settings-nav-btn:hover { background: var(--hover); }
 .settings-nav-btn.active { background: var(--accent); color: #fff; font-weight: 600; }
-.settings-content {
-  flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0;
-}
+.settings-nav-btn.active svg { color: #fff; }
+.settings-content { flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0; }
 .settings-section { margin-bottom: 32px; }
 .settings-section:last-child { margin-bottom: 0; }
-.settings h2 {
+.settings h2, .settings-section h2 {
   font-size: 12px; font-weight: 700; text-transform: uppercase;
   letter-spacing: .6px; color: var(--muted); margin: 0 0 12px;
 }
@@ -2648,11 +2726,9 @@ button.send:disabled { opacity: .4; cursor: default; }
     position: sticky; top: 0; background: var(--card); z-index: 5;
   }
   .settings-nav::-webkit-scrollbar { display: none; }
-  .settings-nav-btn {
-    flex-shrink: 0; padding: 8px 14px; font-size: 13px;
-  }
+  .settings-nav-btn { flex-shrink: 0; padding: 8px 14px; font-size: 13px; }
   .settings-content { padding: 18px 16px; }
-  .settings-section { margin-bottom: 26px; }
+  .settings-section { margin-bottom: 26px; scroll-margin-top: 120px; }
 }
 """
 
@@ -2869,6 +2945,15 @@ function doLogoutConfirm() {
 }
 
 // ============ SSE ============
+function refreshCounters() {
+  if (!state.token) return;
+  api('/api/counters').then(function(data){
+    var changed = (data.notif !== state.unreadNotif) || (data.dm !== state.unreadDM);
+    setCounters(data.notif || 0, data.dm || 0);
+    if (changed) renderSidebar();
+  }).catch(function(){});
+}
+
 function disconnectSSE() {
   if (state.es) {
     try { state.es.close(); } catch(e) {}
@@ -2891,15 +2976,12 @@ function connectSSE() {
       handleEvent(ev);
     } catch(err) {}
   };
-  es.onerror = function() {
-    // EventSource will auto-reconnect
-  };
-  // heartbeat
+  es.onerror = function() { /* auto-reconnect */ };
   state.presenceTimer = setInterval(function(){
     if (state.token) {
       fetch('/api/presence', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
     }
-  }, 25000);
+  }, 20000);
 }
 
 function handleEvent(ev) {
@@ -2907,8 +2989,7 @@ function handleEvent(ev) {
   if (ev.type === 'hello') return;
 
   if (ev.type === 'notification') {
-    setCounters(state.unreadNotif + 1, undefined);
-    renderSidebar();
+    refreshCounters();
     if (state.view === 'notifications') loadNotifications();
     return;
   }
@@ -2916,26 +2997,34 @@ function handleEvent(ev) {
   if (ev.type === 'message') {
     var myNick = state.user && state.user.nick;
     if (ev.from === myNick) {
-      // sync my own view (e.g. other tab)
       if (state.view === 'chat' && state.viewData.nick === ev.to) loadChat(true);
       return;
     }
-    // incoming from someone else
     if (state.view === 'chat' && state.viewData.nick === ev.from) {
       loadChat(true);
-      // user is viewing — mark read silently on server
-      // (already handled by /api/dm/with)
+      refreshCounters();
     } else {
-      setCounters(undefined, state.unreadDM + 1);
-      renderSidebar();
+      refreshCounters();
+      if (state.view === 'messages') loadDMs();
     }
-    if (state.view === 'messages') loadDMs();
     return;
   }
 
   if (ev.type === 'typing') {
     if (state.view === 'chat' && state.viewData.nick === ev.from) {
       showTypingIndicator();
+    }
+    return;
+  }
+
+  if (ev.type === 'presence') {
+    if (state.view === 'messages') loadDMs();
+    if (state.view === 'chat' && state.viewData.nick === ev.nick) {
+      var st = document.getElementById('chatStatus');
+      if (st && !st.classList.contains('typing')) {
+        st.textContent = ev.online ? tr('dm_online') : tr('dm_offline');
+        st.className = 'chat-header-sub' + (ev.online ? ' online' : '');
+      }
     }
     return;
   }
@@ -2960,6 +3049,18 @@ function showTypingIndicator() {
     }
   }, 3500);
 }
+
+window.addEventListener('pagehide', function(){
+  if (!state.token) return;
+  try {
+    fetch('/api/presence/offline', {
+      method: 'POST',
+      headers: { 'X-Auth': state.token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: state.token }),
+      keepalive: true,
+    });
+  } catch(e) {}
+});
 
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
@@ -3510,9 +3611,10 @@ async function loadDMs() {
     }
     var data = await api('/api/dm/threads');
     var threads = data.threads || [];
-    setCounters(undefined, data.unread || 0);
-    // dm_start notifications were cleared server-side
-    setCounters(state.unreadNotif, undefined);
+    setCounters(
+      (typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif),
+      data.unread || 0
+    );
     renderSidebar();
     var q = (state.dmQuery || '').trim().toLowerCase();
     if (q) threads = threads.filter(function(t){
@@ -3607,7 +3709,6 @@ function renderChatView(el) {
     updateCounter();
     try {
       await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } });
-      // SSE will deliver the message back to us
     } catch(e) {
       alert(tr(e.message) || e.message);
       inputEl.value = text;
@@ -3616,6 +3717,7 @@ function renderChatView(el) {
   }
 
   loadChat();
+  refreshCounters();
 }
 
 async function loadChat(silent) {
@@ -3624,7 +3726,6 @@ async function loadChat(silent) {
   var nick = state.viewData.nick;
   try {
     var data = await api('/api/dm/with/' + encodeURIComponent(nick));
-    // update chat header status
     var st = document.getElementById('chatStatus');
     if (st && data.other) {
       var isOnline = !!data.other.online;
@@ -3632,6 +3733,14 @@ async function loadChat(silent) {
         st.textContent = isOnline ? tr('dm_online') : tr('dm_offline');
         st.className = 'chat-header-sub' + (isOnline ? ' online' : '');
       }
+    }
+    if (typeof data.unread_dm === 'number') {
+      var changed = (data.unread_dm !== state.unreadDM);
+      setCounters(
+        (typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif),
+        data.unread_dm
+      );
+      if (changed) renderSidebar();
     }
     var msgs = data.messages || [];
     if (silent && msgs.length === state.lastChatLen) return;
@@ -3721,6 +3830,10 @@ function renderNotifHtml(n) {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_mention') + '</span></div>';
     if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
+  } else if (n.type === 'new_post') {
+    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_new_post') + '</span></div>';
+    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    link = n.post_id ? ('/p/' + n.post_id) : null;
   } else if (n.type === 'dm_start') {
     text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_dm') + '</span></div>';
     if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
@@ -3733,13 +3846,14 @@ function renderNotifHtml(n) {
   return '<div class="' + cls + '">' + inner + '</div>';
 }
 
-// ============ Settings (rework) ============
+// ============ Settings ============
 function renderSettingsView(el) {
   var theme = document.documentElement.getAttribute('data-theme') || 'light';
   var lang = LANG;
   var me = state.user || {};
   var allowF = me.allow_followers_view !== false;
   var allowG = me.allow_following_view !== false;
+  var nnp = me.notify_on_new_post !== false;
   var bl = me.blacklist || [];
 
   var sec = state.settingsSection || 'account';
@@ -3754,26 +3868,40 @@ function renderSettingsView(el) {
 
   html += '<nav class="settings-nav">';
   html += '<button class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
+  html += '<button class="settings-nav-btn' + (sec==='privacy'?' active':'') + '" data-section="privacy">' + ICONS.bell + ' ' + tr('settings_privacy') + '</button>';
   html += '<button class="settings-nav-btn' + (sec==='appearance'?' active':'') + '" data-section="appearance">' + ICONS.sun + ' ' + tr('settings_appearance') + '</button>';
   html += '<button class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.gear + ' ' + tr('settings_info') + '</button>';
   html += '</nav>';
 
   html += '<div class="settings-content">';
 
-  // ---- Account section ----
+  // Account
   html += '<div class="settings-section" id="section-account">';
   html += '<h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
     html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">';
     html += '<button class="btn-secondary" id="editProfileBtn2">' + ICONS.edit + ' ' + tr('edit_profile') + '</button>';
     html += '</div>';
-    html += '<div class="settings-section" style="margin-bottom:0"><h2>' + tr('settings_privacy') + '</h2>';
+    html += '<div class="toggle-row"><span>' + tr('settings_notify_new_post') + '</span>'
+      + '<div class="toggle' + (nnp ? ' on' : '') + '" data-toggle="notify_on_new_post"></div></div>';
+    html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_notify_new_post_hint')) + '</p>';
+    html += '<div style="margin-top:20px"><button class="btn-danger" id="settingsLogout">' + ICONS.logout + ' ' + tr('settings_logout') + '</button></div>';
+  } else {
+    html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
+    html += '<a class="follow-btn" href="/login" data-link style="text-decoration:none">' + tr('go_login') + '</a> ';
+    html += '<a class="follow-btn secondary" href="/register" data-link style="text-decoration:none;margin-left:8px">' + tr('go_register') + '</a>';
+  }
+  html += '</div>';
+
+  // Privacy
+  html += '<div class="settings-section" id="section-privacy">';
+  html += '<h2>' + tr('settings_privacy') + '</h2>';
+  if (state.user) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_followers') + '</span>'
       + '<div class="toggle' + (allowF ? ' on' : '') + '" data-toggle="allow_followers_view"></div></div>';
     html += '<div class="toggle-row"><span>' + tr('settings_allow_following') + '</span>'
       + '<div class="toggle' + (allowG ? ' on' : '') + '" data-toggle="allow_following_view"></div></div>';
-    html += '</div>';
-    html += '<div class="settings-section" style="margin-bottom:0;margin-top:24px"><h2>' + tr('settings_blacklist') + '</h2>';
+    html += '<div style="margin-top:24px"><h2>' + tr('settings_blacklist') + '</h2>';
     html += '<p class="settings-desc">' + escapeHtml(tr('settings_blacklist_hint')) + '</p>';
     html += '<div class="blacklist-add">';
     html += '<input type="text" id="blInput" placeholder="' + escapeHtml(tr('settings_blacklist_add_ph')) + '" autocomplete="off" spellcheck="false" />';
@@ -3792,15 +3920,12 @@ function renderSettingsView(el) {
       html += '<div class="empty" style="padding:14px 0;text-align:left">' + escapeHtml(tr('settings_blacklist_empty')) + '</div>';
     }
     html += '</div>';
-    html += '<div style="margin-top:24px"><button class="btn-danger" id="settingsLogout">' + ICONS.logout + ' ' + tr('settings_logout') + '</button></div>';
   } else {
     html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
-    html += '<a class="follow-btn" href="/login" data-link style="text-decoration:none">' + tr('go_login') + '</a> ';
-    html += '<a class="follow-btn secondary" href="/register" data-link style="text-decoration:none;margin-left:8px">' + tr('go_register') + '</a>';
   }
   html += '</div>';
 
-  // ---- Appearance section ----
+  // Appearance
   html += '<div class="settings-section" id="section-appearance">';
   html += '<h2>' + tr('settings_appearance') + '</h2>';
   html += '<div style="margin-bottom:16px"><div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">' + tr('settings_theme') + '</div><div class="opt-row">';
@@ -3813,7 +3938,7 @@ function renderSettingsView(el) {
   html += '</div></div>';
   html += '</div>';
 
-  // ---- Info section ----
+  // Info
   html += '<div class="settings-section" id="section-info">';
   html += '<h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
@@ -3834,6 +3959,7 @@ function renderSettingsView(el) {
       sections.forEach(function(s){ s.style.display = ''; });
     } else {
       sections.forEach(function(s){
+        if (!s.id || !s.id.startsWith('section-')) { return; }
         var id = s.id.replace('section-', '');
         s.style.display = (id === state.settingsSection) ? '' : 'none';
       });
@@ -4008,7 +4134,6 @@ function renderLoginView(el) {
   });
 }
 
-// ============ Post HTML (same as before) ============
 function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
@@ -4308,15 +4433,10 @@ async function copyPost(postId, btn) {
     renderMain();
     if (state.user) {
       connectSSE();
-      // one initial counters fetch
-      api('/api/counters').then(function(data){
-        setCounters(data.notif || 0, data.dm || 0);
-        renderSidebar();
-      }).catch(function(){});
+      refreshCounters();
     }
   });
 
-  // slow fallback refresh for the active view (in case SSE is dropped)
   setInterval(function(){
     if (document.hidden) return;
     if (!state.user) return;
