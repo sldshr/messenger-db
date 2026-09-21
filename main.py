@@ -1,576 +1,745 @@
-"""
-Закрытый постер — админ-панель.
-FastAPI + Uvicorn, всё хранится в оперативной памяти (при перезапуске данные сбрасываются).
+import asyncio
+import json
+import math
+import random
+import time
+import uuid
+from typing import Optional, Dict, List
 
-Установка:
-    pip install fastapi uvicorn python-multipart
-
-Запуск:
-    python app.py
-
-Админка:  http://127.0.0.1:8000/admin
-Публичная страница: http://127.0.0.1:8000/
-Логин/пароль по умолчанию: admin / admin
-"""
-
-import html
-import secrets
-from datetime import datetime
-from typing import List, Optional
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 import uvicorn
-from fastapi import Cookie, Depends, FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
 
-# ============================== НАСТРОЙКИ ==============================
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin"
-SESSION_TTL = 60 * 60 * 24  # 24 часа
+# ---------- Константы поля и игры ----------
+FIELD_W, FIELD_H = 800, 500
+BALL_R = 8
+PADDLE_W, PADDLE_H = 12, 80
+PADDLE_X = 30
+WIN_SCORE = 8
+WARMUP_SEC = 60
+COUNTDOWN_SEC = 5
+TICK = 1.0 / 60.0
+BALL_SPEED = 350
+BALL_MAX_SPEED = 800
 
-# ============================== ХРАНИЛИЩЕ ==============================
-sessions: dict[str, str] = {}   # token -> username
-posts: List[dict] = []          # список постов
-_id_seq = 0
+app = FastAPI()
 
-
-def next_id() -> int:
-    global _id_seq
-    _id_seq += 1
-    return _id_seq
+# ---------- Лидерборд (в оперативке) ----------
+LEADERBOARD: Dict[str, dict] = {}
 
 
-def e(value) -> str:
-    """HTML-экранирование."""
-    return html.escape(str(value))
+def lb_get(nick: str) -> dict:
+    if nick not in LEADERBOARD:
+        LEADERBOARD[nick] = {
+            "wins_pvp": 0, "losses_pvp": 0,
+            "wins_bot_easy": 0, "losses_bot_easy": 0,
+            "wins_bot_medium": 0, "losses_bot_medium": 0,
+            "wins_bot_hard": 0, "losses_bot_hard": 0,
+        }
+    return LEADERBOARD[nick]
 
 
-def now_str() -> str:
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
+# ---------- Сессия подключения ----------
+class Session:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.id = str(uuid.uuid4())
+        self.nick: Optional[str] = None
+        self.game: Optional["Game"] = None
+        self.role: Optional[str] = None  # "left" | "right"
+        self.in_queue = False
+        self.paddle_target = FIELD_H / 2
 
 
-# ============================== МОДЕЛИ ==============================
-class PostIn(BaseModel):
-    title: str
-    content: str
-    author: str = "admin"
-    published: bool = True
-    locked: bool = False
+# ---------- Игра ----------
+class Game:
+    def __init__(self, s1: Session, s2: Optional[Session], bot: Optional[str] = None):
+        self.s1 = s1
+        self.s2 = s2
+        self.bot = bot  # None | "easy" | "medium" | "hard"
+        self.paddle1_y = FIELD_H / 2
+        self.paddle2_y = FIELD_H / 2
+        self.score1 = 0
+        self.score2 = 0
+        self.phase = "warmup"  # warmup -> countdown -> playing -> finished
+        self.phase_start = time.time()
+        self.running = True
+        self.winner: Optional[str] = None  # "left" | "right" | None
+
+        self.ball_x = FIELD_W / 2
+        self.ball_y = FIELD_H / 2
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_frozen_until: Optional[float] = None
+        self.ball_pending_vx = 0.0
+        self.ball_pending_vy = 0.0
+        self._kick_ball(random.choice([-1, 1]), freeze=0.4)
+
+    # --- служебное ---
+    def _kick_ball(self, direction: int, freeze: float = 0.5):
+        self.ball_x = FIELD_W / 2
+        self.ball_y = FIELD_H / 2
+        angle = random.uniform(-0.4, 0.4)
+        vx = direction * BALL_SPEED * math.cos(angle)
+        vy = BALL_SPEED * math.sin(angle)
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_pending_vx = vx
+        self.ball_pending_vy = vy
+        self.ball_frozen_until = time.time() + freeze
+
+    def _freeze_ball(self):
+        self.ball_x = FIELD_W / 2
+        self.ball_y = FIELD_H / 2
+        self.ball_vx = 0.0
+        self.ball_vy = 0.0
+        self.ball_pending_vx = 0.0
+        self.ball_pending_vy = 0.0
+        self.ball_frozen_until = float("inf")
+
+    def launch_ball(self):
+        self._kick_ball(random.choice([-1, 1]), freeze=0.35)
+
+    def finish(self, winner: str):
+        self.winner = winner
+        self.phase = "finished"
+        self.phase_start = time.time()
+
+    # --- физика ---
+    def update_ball(self, dt: float):
+        now = time.time()
+        if self.ball_frozen_until is not None:
+            if now < self.ball_frozen_until:
+                return
+            self.ball_vx = self.ball_pending_vx
+            self.ball_vy = self.ball_pending_vy
+            self.ball_frozen_until = None
+
+        self.ball_x += self.ball_vx * dt
+        self.ball_y += self.ball_vy * dt
+
+        # стены
+        if self.ball_y - BALL_R < 0:
+            self.ball_y = BALL_R
+            self.ball_vy = abs(self.ball_vy)
+        if self.ball_y + BALL_R > FIELD_H:
+            self.ball_y = FIELD_H - BALL_R
+            self.ball_vy = -abs(self.ball_vy)
+
+        left_px = PADDLE_X
+        right_px = FIELD_W - PADDLE_X - PADDLE_W
+
+        # левая ракетка
+        if (self.ball_vx < 0 and
+                self.ball_x - BALL_R <= left_px + PADDLE_W and
+                self.ball_x + BALL_R >= left_px and
+                self.paddle1_y - PADDLE_H / 2 <= self.ball_y <= self.paddle1_y + PADDLE_H / 2):
+            self.ball_x = left_px + PADDLE_W + BALL_R
+            rel = max(-1.0, min(1.0, (self.ball_y - self.paddle1_y) / (PADDLE_H / 2)))
+            speed = min(math.hypot(self.ball_vx, self.ball_vy) * 1.03, BALL_MAX_SPEED)
+            angle = rel * (math.pi / 4)
+            self.ball_vx = speed * math.cos(angle)
+            self.ball_vy = speed * math.sin(angle)
+
+        # правая ракетка
+        if (self.ball_vx > 0 and
+                self.ball_x + BALL_R >= right_px and
+                self.ball_x - BALL_R <= right_px + PADDLE_W and
+                self.paddle2_y - PADDLE_H / 2 <= self.ball_y <= self.paddle2_y + PADDLE_H / 2):
+            self.ball_x = right_px - BALL_R
+            rel = max(-1.0, min(1.0, (self.ball_y - self.paddle2_y) / (PADDLE_H / 2)))
+            speed = min(math.hypot(self.ball_vx, self.ball_vy) * 1.03, BALL_MAX_SPEED)
+            angle = rel * (math.pi / 4)
+            self.ball_vx = -speed * math.cos(angle)
+            self.ball_vy = speed * math.sin(angle)
+
+        # голы
+        if self.ball_x < -BALL_R:
+            if self.phase == "playing":
+                self.score2 += 1
+                if self.score2 >= WIN_SCORE:
+                    self.finish("right")
+                    return
+            self._kick_ball(1)
+        elif self.ball_x > FIELD_W + BALL_R:
+            if self.phase == "playing":
+                self.score1 += 1
+                if self.score1 >= WIN_SCORE:
+                    self.finish("left")
+                    return
+            self._kick_ball(-1)
+
+    def update_bot(self, dt: float):
+        if self.bot == "easy":
+            speed, err = 220, 60
+        elif self.bot == "medium":
+            speed, err = 380, 25
+        else:
+            speed, err = 550, 8
+
+        target_y = self.ball_y + random.uniform(-err, err)
+        diff = target_y - self.paddle2_y
+        max_move = speed * dt
+        if abs(diff) <= max_move:
+            self.paddle2_y = target_y
+        else:
+            self.paddle2_y += math.copysign(max_move, diff)
+        self.paddle2_y = max(PADDLE_H / 2, min(FIELD_H - PADDLE_H / 2, self.paddle2_y))
+
+    def state_dict(self) -> dict:
+        return {
+            "type": "state",
+            "field": [FIELD_W, FIELD_H],
+            "ball": [self.ball_x, self.ball_y, BALL_R],
+            "paddle_w": PADDLE_W,
+            "paddle_h": PADDLE_H,
+            "paddle1_y": self.paddle1_y,
+            "paddle2_y": self.paddle2_y,
+            "score1": self.score1,
+            "score2": self.score2,
+            "phase": self.phase,
+            "phase_elapsed": time.time() - self.phase_start,
+            "warmup_sec": WARMUP_SEC,
+            "countdown_sec": COUNTDOWN_SEC,
+            "win_score": WIN_SCORE,
+            "winner": self.winner,
+        }
 
 
-# ============================== АВТОРИЗАЦИЯ ==============================
-def current_user(session: Optional[str] = Cookie(default=None)) -> Optional[str]:
-    if session and session in sessions:
-        return sessions[session]
-    return None
+# ---------- Игровой цикл ----------
+async def game_loop(game: Game):
+    last = time.time()
+    while game.running:
+        now = time.time()
+        dt = min(now - last, 0.1)
+        last = now
+
+        # фазы
+        if game.phase == "warmup":
+            if now - game.phase_start >= WARMUP_SEC:
+                game.phase = "countdown"
+                game.phase_start = now
+                game._freeze_ball()
+        elif game.phase == "countdown":
+            if now - game.phase_start >= COUNTDOWN_SEC:
+                game.phase = "playing"
+                game.phase_start = now
+                game.launch_ball()
+
+        # ракетки
+        if game.s1 and game.s1.game is game:
+            game.paddle1_y = game.s1.paddle_target
+        if game.s2 and game.s2.game is game:
+            game.paddle2_y = game.s2.paddle_target
+        elif game.bot:
+            game.update_bot(dt)
+
+        game.paddle1_y = max(PADDLE_H / 2, min(FIELD_H - PADDLE_H / 2, game.paddle1_y))
+        game.paddle2_y = max(PADDLE_H / 2, min(FIELD_H - PADDLE_H / 2, game.paddle2_y))
+
+        if game.phase in ("warmup", "playing"):
+            game.update_ball(dt)
+
+        # рассылка состояния
+        msg = json.dumps(game.state_dict())
+        for s in (game.s1, game.s2):
+            if s:
+                try:
+                    await s.ws.send_text(msg)
+                except Exception:
+                    game.running = False
+
+        if game.phase == "finished":
+            break
+        if not game.running:
+            break
+
+        await asyncio.sleep(TICK)
+
+    await end_game(game)
 
 
-def require_user(session: Optional[str] = Cookie(default=None)) -> str:
-    user = current_user(session)
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
+async def end_game(game: Game):
+    # лидерборд
+    if game.winner:
+        if game.bot:
+            human = game.s1
+            if human and human.nick:
+                lb = lb_get(human.nick)
+                if game.winner == "left":
+                    lb[f"wins_bot_{game.bot}"] += 1
+                else:
+                    lb[f"losses_bot_{game.bot}"] += 1
+        else:
+            w, l = (game.s1, game.s2) if game.winner == "left" else (game.s2, game.s1)
+            if w and w.nick:
+                lb_get(w.nick)["wins_pvp"] += 1
+            if l and l.nick:
+                lb_get(l.nick)["losses_pvp"] += 1
+
+    for s in (game.s1, game.s2):
+        if not s:
+            continue
+        try:
+            await s.ws.send_text(json.dumps({
+                "type": "game_over",
+                "winner": game.winner,
+                "your_role": s.role,
+                "score1": game.score1,
+                "score2": game.score2,
+            }))
+        except Exception:
+            pass
+        if s.game is game:
+            s.game = None
+            s.role = None
 
 
-app = FastAPI(title="Closed Poster Admin")
+# ---------- Matchmaking ----------
+pvp_queue: List[Session] = []
 
 
-# ============================== HTML: СТРАНИЦА ВХОДА ==============================
-LOGIN_HTML = """<!DOCTYPE html>
+def build_leaderboard() -> list:
+    rows = []
+    for nick, d in LEADERBOARD.items():
+        total = (d["wins_pvp"] + d["wins_bot_easy"]
+                 + d["wins_bot_medium"] + d["wins_bot_hard"])
+        rows.append({
+            "nick": nick,
+            "wins_pvp": d["wins_pvp"],
+            "wins_bot_easy": d["wins_bot_easy"],
+            "wins_bot_medium": d["wins_bot_medium"],
+            "wins_bot_hard": d["wins_bot_hard"],
+            "total": total,
+        })
+    rows.sort(key=lambda r: -r["total"])
+    return rows
+
+
+# ---------- WebSocket ----------
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    sess = Session(ws)
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            t = msg.get("type")
+
+            if t == "set_nick":
+                nick = str(msg.get("nick", "")).strip()[:20]
+                if not nick:
+                    await ws.send_text(json.dumps({"type": "error", "msg": "Ник не может быть пустым"}))
+                    continue
+                sess.nick = nick
+                lb_get(nick)
+                await ws.send_text(json.dumps({"type": "nick_ok", "nick": nick}))
+
+            elif t == "queue_pvp":
+                if sess.game or not sess.nick:
+                    continue
+                # чистим мёртвые сессии
+                pvp_queue[:] = [s for s in pvp_queue if s.game is None and s.nick]
+                if sess in pvp_queue:
+                    pvp_queue.remove(sess)
+                if pvp_queue:
+                    opp = pvp_queue.pop(0)
+                    game = Game(opp, sess, bot=None)
+                    opp.game = game
+                    opp.role = "left"
+                    opp.paddle_target = FIELD_H / 2
+                    sess.game = game
+                    sess.role = "right"
+                    sess.paddle_target = FIELD_H / 2
+                    try:
+                        await opp.ws.send_text(json.dumps({
+                            "type": "match_start", "role": "left",
+                            "opponent": sess.nick, "is_bot": False,
+                        }))
+                        await ws.send_text(json.dumps({
+                            "type": "match_start", "role": "right",
+                            "opponent": opp.nick, "is_bot": False,
+                        }))
+                    except Exception:
+                        pass
+                    asyncio.create_task(game_loop(game))
+                else:
+                    sess.in_queue = True
+                    pvp_queue.append(sess)
+                    await ws.send_text(json.dumps({"type": "queue_status", "in_queue": True}))
+
+            elif t == "cancel_queue":
+                if sess in pvp_queue:
+                    pvp_queue.remove(sess)
+                sess.in_queue = False
+                await ws.send_text(json.dumps({"type": "queue_status", "in_queue": False}))
+
+            elif t == "start_bot":
+                if sess.game or not sess.nick:
+                    continue
+                diff = msg.get("difficulty", "easy")
+                if diff not in ("easy", "medium", "hard"):
+                    diff = "easy"
+                game = Game(sess, None, bot=diff)
+                sess.game = game
+                sess.role = "left"
+                sess.paddle_target = FIELD_H / 2
+                await ws.send_text(json.dumps({
+                    "type": "match_start", "role": "left",
+                    "opponent": f"БОТ [{diff}]", "is_bot": True, "difficulty": diff,
+                }))
+                asyncio.create_task(game_loop(game))
+
+            elif t == "paddle":
+                if sess.game:
+                    try:
+                        sess.paddle_target = float(msg.get("y", FIELD_H / 2))
+                    except Exception:
+                        pass
+
+            elif t == "leave":
+                if sess in pvp_queue:
+                    pvp_queue.remove(sess)
+                if sess.game:
+                    sess.game.winner = None
+                    sess.game.running = False
+                    sess.game = None
+                    sess.role = None
+
+            elif t == "get_leaderboard":
+                await ws.send_text(json.dumps({
+                    "type": "leaderboard",
+                    "data": build_leaderboard(),
+                }))
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if sess in pvp_queue:
+            pvp_queue.remove(sess)
+        if sess.game:
+            sess.game.winner = None
+            sess.game.running = False
+        sess.game = None
+
+
+# ---------- HTML-клиент ----------
+PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Вход — Админ-панель</title>
+<meta charset="utf-8">
+<title>PONG</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
+  * { box-sizing: border-box; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: radial-gradient(1200px 600px at 50% -10%, #1b2233 0%, #0f1117 60%);
-    color: #e6e8ee; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    padding: 20px;
+    margin: 0; background: #0a0a0a; color: #d8d8d8;
+    font-family: "Courier New", monospace;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh;
   }
-  .card {
-    background: #171a23; padding: 40px; border-radius: 16px;
-    border: 1px solid #262b38; width: 100%; max-width: 380px;
-    box-shadow: 0 20px 60px rgba(0,0,0,.55);
-  }
-  .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #2ecc71; box-shadow: 0 0 10px #2ecc71; }
-  .logo span { font-size: 13px; color: #8b93a7; letter-spacing: .4px; text-transform: uppercase; }
-  h1 { font-size: 22px; margin-bottom: 6px; }
-  p.sub { color: #8b93a7; font-size: 13px; margin-bottom: 24px; }
-  label { display: block; font-size: 11px; color: #8b93a7; margin-bottom: 6px;
-          text-transform: uppercase; letter-spacing: .6px; }
-  input {
-    width: 100%; padding: 12px 14px; background: #0f1117; border: 1px solid #262b38;
-    border-radius: 8px; color: #e6e8ee; font-size: 14px; margin-bottom: 16px;
-    outline: none; transition: border-color .2s;
-  }
-  input:focus { border-color: #4f7cff; }
+  .screen { display: none; padding: 20px; text-align: center; }
+  .screen.active { display: block; }
+  h1 { color: #fff; letter-spacing: 6px; font-weight: normal; margin: 0 0 24px; }
+  h2 { color: #fff; letter-spacing: 3px; font-weight: normal; }
   button {
-    width: 100%; padding: 12px; background: #4f7cff; color: #fff; border: none;
-    border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: .2s;
+    background: #111; color: #eee; border: 2px solid #444;
+    padding: 10px 18px; font-family: inherit; font-size: 15px;
+    margin: 4px; cursor: pointer; letter-spacing: 1px;
   }
-  button:hover { background: #3d68e8; }
-  .error {
-    color: #ff8080; background: #2a1717; border: 1px solid #3a2222;
-    padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px;
+  button:hover { background: #1e1e1e; border-color: #888; }
+  button:active { background: #333; }
+  input {
+    background: #111; color: #eee; border: 2px solid #444;
+    padding: 9px 12px; font-family: inherit; font-size: 15px;
+    outline: none;
   }
+  input:focus { border-color: #888; }
+  canvas { border: 2px solid #333; background: #000; display: block; max-width: 95vw; max-height: 70vh; }
+  .row { margin: 10px 0; }
+  table { margin: 0 auto 16px; border-collapse: collapse; font-size: 14px; }
+  th, td { border: 1px solid #333; padding: 6px 12px; }
+  th { background: #161616; color: #fff; }
+  tr:nth-child(even) td { background: #0f0f0f; }
+  .hint { color: #666; font-size: 12px; margin-top: 16px; }
+  .hidden { display: none !important; }
+  #game-info { margin-bottom: 8px; color: #aaa; font-size: 14px; }
 </style>
 </head>
 <body>
-  <form class="card" method="post" action="/admin/login">
-    <div class="logo"><div class="dot"></div><span>Закрытый постер</span></div>
-    <h1>Вход</h1>
-    <p class="sub">Панель управления сообществом</p>
-    {{ERROR}}
-    <label>Логин</label>
-    <input name="username" autocomplete="username" autofocus required>
-    <label>Пароль</label>
-    <input name="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Войти</button>
-  </form>
-</body>
-</html>
-"""
 
-
-# ============================== HTML: АДМИН-ПАНЕЛЬ ==============================
-ADMIN_HTML = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Админ-панель — Закрытый постер</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg:#0f1117; --panel:#171a23; --panel2:#1d2130; --border:#262b38;
-    --text:#e6e8ee; --muted:#8b93a7; --accent:#4f7cff; --danger:#ff5c5c; --ok:#2ecc71;
-  }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-         background:var(--bg); color:var(--text); min-height:100vh; }
-  header {
-    display:flex; justify-content:space-between; align-items:center; gap:16px;
-    padding:14px 28px; border-bottom:1px solid var(--border); background:rgba(23,26,35,.9);
-    backdrop-filter:blur(8px); position:sticky; top:0; z-index:10;
-  }
-  .logo { display:flex; align-items:center; gap:10px; font-weight:600; font-size:14px; }
-  .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 8px var(--ok); }
-  main { max-width:960px; margin:0 auto; padding:28px 20px 60px; }
-  .toolbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:12px; }
-  h2 { font-size:18px; }
-  button { font-family:inherit; font-size:14px; cursor:pointer; border:none;
-           border-radius:8px; padding:10px 16px; font-weight:600; transition:.2s; }
-  .btn-primary { background:var(--accent); color:#fff; }
-  .btn-primary:hover { background:#3d68e8; }
-  .btn-ghost { background:transparent; color:var(--muted); border:1px solid var(--border); }
-  .btn-ghost:hover { color:var(--text); border-color:#3a4152; }
-  .btn-danger { background:transparent; color:var(--danger); border:1px solid #3a2222; }
-  .btn-danger:hover { background:#2a1717; }
-  .btn-sm { padding:6px 12px; font-size:12px; }
-  .posts { display:flex; flex-direction:column; gap:12px; }
-  .post { background:var(--panel); border:1px solid var(--border); border-radius:12px;
-          padding:18px 20px; display:flex; justify-content:space-between; gap:16px; }
-  .post h3 { font-size:15px; margin-bottom:8px; }
-  .post p { color:var(--muted); font-size:13px; line-height:1.55; white-space:pre-wrap;
-            overflow:hidden; }
-  .meta { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .tag { font-size:11px; padding:3px 9px; border-radius:20px; background:var(--panel2);
-         color:var(--muted); border:1px solid var(--border); }
-  .tag.ok { color:#7ee2a8; border-color:#1f3a2c; background:#14251c; }
-  .tag.warn { color:#ffcf70; border-color:#3a3220; background:#241f14; }
-  .actions { display:flex; gap:8px; flex-shrink:0; align-items:flex-start; }
-  .modal { position:fixed; inset:0; background:rgba(0,0,0,.65); backdrop-filter:blur(4px);
-           display:none; align-items:center; justify-content:center; padding:20px; z-index:100; }
-  .modal.open { display:flex; }
-  .modal-card { background:var(--panel); border:1px solid var(--border); border-radius:16px;
-                width:100%; max-width:520px; padding:26px; max-height:90vh; overflow:auto; }
-  .modal-card h3 { margin-bottom:18px; font-size:17px; }
-  label { display:block; font-size:11px; color:var(--muted); margin-bottom:6px;
-          text-transform:uppercase; letter-spacing:.6px; }
-  input[type=text], textarea {
-    width:100%; padding:11px 13px; background:var(--bg); border:1px solid var(--border);
-    border-radius:8px; color:var(--text); font-size:14px; font-family:inherit;
-    margin-bottom:14px; outline:none; transition:border-color .2s;
-  }
-  input[type=text]:focus, textarea:focus { border-color:var(--accent); }
-  textarea { resize:vertical; min-height:110px; }
-  .checks { display:flex; gap:18px; margin-bottom:20px; flex-wrap:wrap; }
-  .check { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted);
-           cursor:pointer; text-transform:none; letter-spacing:0; margin:0; }
-  .check input { accent-color:var(--accent); width:16px; height:16px; }
-  .modal-actions { display:flex; gap:10px; justify-content:flex-end; }
-  .empty { text-align:center; padding:60px 20px; color:var(--muted);
-           border:1px dashed var(--border); border-radius:12px; font-size:14px; }
-  .toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(80px);
-           background:var(--panel2); border:1px solid var(--border); padding:12px 22px;
-           border-radius:10px; font-size:13px; opacity:0; transition:.3s; pointer-events:none; }
-  .toast.show { transform:translateX(-50%) translateY(0); opacity:1; }
-</style>
-</head>
-<body>
-  <header>
-    <div class="logo"><span class="dot"></span> Закрытый постер · Админ</div>
-    <a href="/admin/logout" style="text-decoration:none">
-      <button class="btn-ghost btn-sm" type="button">Выйти</button>
-    </a>
-  </header>
-
-  <main>
-    <div class="toolbar">
-      <h2>Посты</h2>
-      <button class="btn-primary" onclick="openModal()">+ Новый пост</button>
-    </div>
-    <div class="posts" id="posts"></div>
-  </main>
-
-  <div class="modal" id="modal">
-    <div class="modal-card">
-      <h3 id="modalTitle">Новый пост</h3>
-      <form id="postForm">
-        <input type="hidden" id="postId">
-        <label>Заголовок</label>
-        <input type="text" id="title" required>
-        <label>Автор</label>
-        <input type="text" id="author" value="admin">
-        <label>Содержимое</label>
-        <textarea id="content" required></textarea>
-        <div class="checks">
-          <label class="check"><input type="checkbox" id="published" checked> Опубликован</label>
-          <label class="check"><input type="checkbox" id="locked"> Только для участников</label>
-        </div>
-        <div class="modal-actions">
-          <button type="button" class="btn-ghost" onclick="closeModal()">Отмена</button>
-          <button type="submit" class="btn-primary">Сохранить</button>
-        </div>
-      </form>
-    </div>
+<div id="menu" class="screen active">
+  <h1>PONG</h1>
+  <div class="row">
+    <input id="nick" placeholder="Введите ник" maxlength="20" autocomplete="off">
+    <button id="setnick">ОК</button>
   </div>
+  <div id="menu-options" class="hidden">
+    <div class="row"><button id="btn-pvp">Играть с игроком</button></div>
+    <div class="row">
+      <span>Против бота:</span>
+      <button class="btn-bot" data-diff="easy">Лёгкий</button>
+      <button class="btn-bot" data-diff="medium">Средний</button>
+      <button class="btn-bot" data-diff="hard">Сложный</button>
+    </div>
+    <div class="row"><button id="btn-lb">Лидерборд</button></div>
+  </div>
+  <div class="hint">Управление — мышью по полю. До 8 очков. Перед матчем — 60 сек разминки.</div>
+</div>
 
-  <div class="toast" id="toast"></div>
+<div id="queue" class="screen">
+  <h1>ПОИСК СОПЕРНИКА</h1>
+  <p>Ожидание игрока...</p>
+  <button id="btn-cancel">Отмена</button>
+</div>
+
+<div id="lobby" class="screen">
+  <h1>ЛИДЕРБОРД</h1>
+  <div id="lb-content"></div>
+  <button id="btn-lb-back">Назад</button>
+</div>
+
+<div id="game" class="screen">
+  <div id="game-info"></div>
+  <canvas id="canvas" width="800" height="500"></canvas>
+  <div style="margin-top:8px;"><button id="btn-leave">Покинуть</button></div>
+</div>
+
+<div id="gameover" class="screen">
+  <h1 id="go-title">—</h1>
+  <p id="go-info"></p>
+  <button id="btn-menu-back">В меню</button>
+</div>
 
 <script>
-const $ = id => document.getElementById(id);
-let posts = [];
+const $ = (id) => document.getElementById(id);
+let ws = null, nick = null, role = null, gameState = null;
 
-function toast(msg) {
-  const t = $('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 2000);
+function showScreen(id) {
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  $(id).classList.add("active");
 }
 
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function send(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-async function load() {
-  const r = await fetch('/api/posts');
-  if (r.status === 401) { location.reload(); return; }
-  posts = await r.json();
-  render();
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => {
+    const saved = localStorage.getItem("nick") || $("nick").value.trim();
+    if (saved) send({ type: "set_nick", nick: saved });
+  };
+  ws.onmessage = (e) => {
+    try { handleMessage(JSON.parse(e.data)); } catch (err) {}
+  };
+  ws.onclose = () => setTimeout(connect, 1000);
 }
 
-function render() {
-  const box = $('posts');
-  if (!posts.length) {
-    box.innerHTML = '<div class="empty">Пока нет постов. Создайте первый.</div>';
+function handleMessage(msg) {
+  switch (msg.type) {
+    case "nick_ok":
+      nick = msg.nick;
+      localStorage.setItem("nick", nick);
+      $("menu-options").classList.remove("hidden");
+      break;
+    case "queue_status":
+      if (msg.in_queue) showScreen("queue");
+      else showScreen("menu");
+      break;
+    case "match_start":
+      role = msg.role;
+      gameState = null;
+      $("game-info").textContent = `Вы: ${nick}   |   Соперник: ${msg.opponent}`;
+      showScreen("game");
+      break;
+    case "state":
+      gameState = msg;
+      break;
+    case "game_over":
+      gameState = null;
+      if (msg.winner === null) {
+        $("go-title").textContent = "МАТЧ ПРЕРВАН";
+        $("go-info").textContent = "Соперник покинул игру.";
+      } else {
+        const won = (msg.your_role === msg.winner);
+        $("go-title").textContent = won ? "ПОБЕДА" : "ПОРАЖЕНИЕ";
+        $("go-info").textContent = `Счёт: ${msg.score1} : ${msg.score2}`;
+      }
+      showScreen("gameover");
+      break;
+    case "leaderboard":
+      renderLeaderboard(msg.data);
+      break;
+    case "error":
+      alert(msg.msg);
+      break;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function renderLeaderboard(rows) {
+  if (!rows.length) {
+    $("lb-content").innerHTML = "<p>Пока пусто.</p>";
     return;
   }
-  box.innerHTML = posts.map(p => `
-    <div class="post">
-      <div style="min-width:0">
-        <h3>${esc(p.title)}</h3>
-        <p>${esc(p.content.slice(0, 220))}${p.content.length > 220 ? '…' : ''}</p>
-        <div class="meta">
-          <span class="tag">#${p.id}</span>
-          <span class="tag">${esc(p.author)}</span>
-          <span class="tag">${esc(p.created_at)}</span>
-          <span class="tag ${p.published ? 'ok' : 'warn'}">${p.published ? 'опубликован' : 'черновик'}</span>
-          ${p.locked ? '<span class="tag warn">🔒 для участников</span>' : ''}
-        </div>
-      </div>
-      <div class="actions">
-        <button class="btn-ghost btn-sm" onclick="edit(${p.id})">Изменить</button>
-        <button class="btn-danger btn-sm" onclick="del(${p.id})">Удалить</button>
-      </div>
-    </div>
-  `).join('');
-}
-
-function openModal(p) {
-  $('modalTitle').textContent = p ? 'Редактировать пост' : 'Новый пост';
-  $('postId').value = p ? p.id : '';
-  $('title').value = p ? p.title : '';
-  $('author').value = p ? p.author : 'admin';
-  $('content').value = p ? p.content : '';
-  $('published').checked = p ? p.published : true;
-  $('locked').checked = p ? p.locked : false;
-  $('modal').classList.add('open');
-  setTimeout(() => $('title').focus(), 50);
-}
-
-function closeModal() { $('modal').classList.remove('open'); }
-function edit(id) { openModal(posts.find(p => p.id === id)); }
-
-async function del(id) {
-  if (!confirm('Удалить пост #' + id + '?')) return;
-  await fetch('/api/posts/' + id, { method: 'DELETE' });
-  toast('Удалено');
-  load();
-}
-
-$('postForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  const id = $('postId').value;
-  const body = {
-    title: $('title').value,
-    author: $('author').value || 'admin',
-    content: $('content').value,
-    published: $('published').checked,
-    locked: $('locked').checked
-  };
-  const url = id ? '/api/posts/' + id : '/api/posts';
-  const method = id ? 'PUT' : 'POST';
-  const r = await fetch(url, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+  let html = "<table><tr><th>#</th><th>Ник</th><th>PvP</th><th>Бот Л</th><th>Бот С</th><th>Бот Т</th><th>Всего</th></tr>";
+  rows.forEach((r, i) => {
+    html += `<tr><td>${i+1}</td><td>${escapeHtml(r.nick)}</td><td>${r.wins_pvp}</td><td>${r.wins_bot_easy}</td><td>${r.wins_bot_medium}</td><td>${r.wins_bot_hard}</td><td>${r.total}</td></tr>`;
   });
-  if (r.ok) {
-    closeModal();
-    toast(id ? 'Сохранено' : 'Создано');
-    load();
-  } else {
-    toast('Ошибка сохранения');
+  html += "</table>";
+  $("lb-content").innerHTML = html;
+}
+
+// ---------- Рендер ----------
+const canvas = $("canvas");
+const ctx = canvas.getContext("2d");
+
+function draw(s) {
+  const [W, H] = s.field;
+  if (canvas.width !== W) canvas.width = W;
+  if (canvas.height !== H) canvas.height = H;
+
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+
+  // центральная линия
+  ctx.strokeStyle = "#2a2a2a";
+  ctx.setLineDash([10, 12]);
+  ctx.beginPath();
+  ctx.moveTo(W / 2, 0);
+  ctx.lineTo(W / 2, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // ракетки
+  ctx.fillStyle = "#e8e8e8";
+  ctx.fillRect(PADDLE_X_(), s.paddle1_y - s.paddle_h / 2, s.paddle_w, s.paddle_h);
+  ctx.fillRect(W - PADDLE_X_() - s.paddle_w, s.paddle2_y - s.paddle_h / 2, s.paddle_w, s.paddle_h);
+
+  // мяч
+  ctx.beginPath();
+  ctx.arc(s.ball[0], s.ball[1], s.ball[2], 0, Math.PI * 2);
+  ctx.fill();
+
+  // счёт
+  ctx.fillStyle = "#e8e8e8";
+  ctx.font = "48px 'Courier New', monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(String(s.score1), W / 2 - 60, 64);
+  ctx.fillText(String(s.score2), W / 2 + 60, 64);
+
+  // оверлеи
+  if (s.phase === "warmup") {
+    const remain = Math.max(0, s.warmup_sec - s.phase_elapsed);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, H / 2 - 70, W, 140);
+    ctx.fillStyle = "#fff";
+    ctx.font = "34px 'Courier New', monospace";
+    ctx.fillText("РАЗМИНКА", W / 2, H / 2 - 10);
+    ctx.font = "22px 'Courier New', monospace";
+    ctx.fillStyle = "#bbb";
+    ctx.fillText(`старт через ${Math.ceil(remain)} сек`, W / 2, H / 2 + 35);
+  } else if (s.phase === "countdown") {
+    const remain = Math.max(0, s.countdown_sec - s.phase_elapsed);
+    ctx.fillStyle = "rgba(0,0,0,0.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.font = "140px 'Courier New', monospace";
+    ctx.fillText(String(Math.ceil(remain)), W / 2, H / 2 + 50);
+    ctx.font = "22px 'Courier New', monospace";
+    ctx.fillStyle = "#999";
+    ctx.fillText("ПРИГОТОВЬТЕСЬ", W / 2, H / 2 + 110);
   }
+}
+
+function PADDLE_X_() { return 30; }
+
+let renderRunning = false;
+function renderLoop() {
+  renderRunning = true;
+  const step = () => {
+    if (gameState && $("game").classList.contains("active")) {
+      draw(gameState);
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---------- Управление ----------
+canvas.addEventListener("mousemove", (e) => {
+  if (!gameState) return;
+  const rect = canvas.getBoundingClientRect();
+  const y = (e.clientY - rect.top) / rect.height * gameState.field[1];
+  send({ type: "paddle", y: y });
 });
 
-$('modal').addEventListener('click', ev => { if (ev.target.id === 'modal') closeModal(); });
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeModal(); });
+// ---------- Кнопки меню ----------
+$("setnick").onclick = () => {
+  const v = $("nick").value.trim();
+  if (!v) return;
+  send({ type: "set_nick", nick: v });
+};
 
-load();
+$("nick").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("setnick").click();
+});
+
+$("btn-pvp").onclick = () => {
+  showScreen("queue");
+  send({ type: "queue_pvp" });
+};
+
+document.querySelectorAll(".btn-bot").forEach(b => {
+  b.onclick = () => send({ type: "start_bot", difficulty: b.dataset.diff });
+});
+
+$("btn-cancel").onclick = () => {
+  send({ type: "cancel_queue" });
+  showScreen("menu");
+};
+
+$("btn-lb").onclick = () => {
+  send({ type: "get_leaderboard" });
+  showScreen("lobby");
+};
+
+$("btn-lb-back").onclick = () => showScreen("menu");
+
+$("btn-leave").onclick = () => {
+  send({ type: "leave" });
+  gameState = null;
+  showScreen("menu");
+};
+
+$("btn-menu-back").onclick = () => showScreen("menu");
+
+// автостарт
+const saved = localStorage.getItem("nick");
+if (saved) $("nick").value = saved;
+connect();
+renderLoop();
 </script>
 </body>
 </html>
 """
 
 
-# ============================== ПУБЛИЧНАЯ СТРАНИЦА ==============================
-def render_public(user: Optional[str]) -> str:
-    visible = [p for p in sorted(posts, key=lambda x: x["id"], reverse=True) if p["published"]]
-
-    cards = []
-    for p in visible:
-        hidden = p["locked"] and not user
-        lock_tag = '<span class="tag warn">🔒 участники</span>' if p["locked"] else ""
-        body_text = "🔒 Содержимое доступно только участникам сообщества." if hidden else e(p["content"])
-        body_cls = "body locked" if hidden else "body"
-        cards.append(f"""
-        <article class="post">
-          <div class="meta">
-            <span class="tag">#{p['id']}</span>
-            <span class="tag">{e(p['author'])}</span>
-            <span class="tag">{e(p['created_at'])}</span>
-            {lock_tag}
-          </div>
-          <h2>{e(p['title'])}</h2>
-          <p class="{body_cls}">{body_text}</p>
-        </article>""")
-
-    if not cards:
-        cards.append('<div class="empty">Пока нет публикаций.</div>')
-
-    status = (
-        f'<span class="who">Вы вошли как <b>{e(user)}</b> · <a href="/admin">админка</a> · '
-        f'<a href="/admin/logout">выйти</a></span>'
-        if user else
-        '<span class="who">Гостевой доступ · <a href="/admin">вход для админа</a></span>'
-    )
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Закрытый постер</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: radial-gradient(1000px 500px at 50% -10%, #1b2233 0%, #0f1117 55%);
-    color: #e6e8ee; min-height: 100vh;
-  }}
-  header {{
-    max-width: 760px; margin: 0 auto; padding: 32px 20px 12px;
-    display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap;
-  }}
-  h1 {{ font-size: 24px; letter-spacing: -0.3px; }}
-  .who {{ font-size: 12px; color: #8b93a7; }}
-  .who a {{ color: #4f7cff; text-decoration: none; }}
-  .who a:hover {{ text-decoration: underline; }}
-  main {{ max-width: 760px; margin: 0 auto; padding: 16px 20px 80px;
-          display: flex; flex-direction: column; gap: 14px; }}
-  .post {{
-    background: #171a23; border: 1px solid #262b38; border-radius: 14px; padding: 22px 24px;
-  }}
-  .post h2 {{ font-size: 17px; margin: 12px 0 10px; }}
-  .body {{ color: #a9b1c4; font-size: 14px; line-height: 1.65; white-space: pre-wrap; }}
-  .body.locked {{ color: #ffcf70; font-style: italic; }}
-  .meta {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-  .tag {{ font-size: 11px; padding: 3px 9px; border-radius: 20px; background: #1d2130;
-          color: #8b93a7; border: 1px solid #262b38; }}
-  .tag.warn {{ color: #ffcf70; border-color: #3a3220; background: #241f14; }}
-  .empty {{ text-align: center; padding: 60px 20px; color: #8b93a7;
-            border: 1px dashed #262b38; border-radius: 12px; }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>Закрытый постер</h1>
-    {status}
-  </header>
-  <main>{''.join(cards)}</main>
-</body>
-</html>"""
+@app.get("/")
+async def index():
+    return HTMLResponse(PAGE)
 
 
-# ============================== РОУТЫ ==============================
-@app.get("/", response_class=HTMLResponse)
-def public_index(session: Optional[str] = Cookie(default=None)):
-    return HTMLResponse(render_public(current_user(session)))
-
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page(session: Optional[str] = Cookie(default=None)):
-    if not current_user(session):
-        return HTMLResponse(LOGIN_HTML.replace("{{ERROR}}", ""))
-    return HTMLResponse(ADMIN_HTML)
-
-
-@app.post("/admin/login")
-def admin_login(username: str = Form(...), password: str = Form(...)):
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        token = secrets.token_urlsafe(32)
-        sessions[token] = username
-        resp = RedirectResponse("/admin", status_code=303)
-        resp.set_cookie(
-            "session", token,
-            httponly=True, samesite="lax", max_age=SESSION_TTL,
-        )
-        return resp
-    error = '<div class="error">Неверный логин или пароль</div>'
-    return HTMLResponse(LOGIN_HTML.replace("{{ERROR}}", error), status_code=401)
-
-
-@app.get("/admin/logout")
-def admin_logout(session: Optional[str] = Cookie(default=None)):
-    if session and session in sessions:
-        sessions.pop(session, None)
-    resp = RedirectResponse("/admin", status_code=303)
-    resp.delete_cookie("session")
-    return resp
-
-
-# ------------------------------ API ------------------------------
-@app.get("/api/posts")
-def api_list(user: str = Depends(require_user)):
-    return sorted(posts, key=lambda p: p["id"], reverse=True)
-
-
-@app.post("/api/posts", status_code=201)
-def api_create(data: PostIn, user: str = Depends(require_user)):
-    ts = now_str()
-    post = {
-        "id": next_id(),
-        "title": data.title.strip(),
-        "content": data.content.strip(),
-        "author": (data.author or user).strip(),
-        "published": bool(data.published),
-        "locked": bool(data.locked),
-        "created_at": ts,
-        "updated_at": ts,
-    }
-    posts.append(post)
-    return post
-
-
-@app.put("/api/posts/{pid}")
-def api_update(pid: int, data: PostIn, user: str = Depends(require_user)):
-    for p in posts:
-        if p["id"] == pid:
-            p["title"] = data.title.strip()
-            p["content"] = data.content.strip()
-            p["author"] = (data.author or user).strip()
-            p["published"] = bool(data.published)
-            p["locked"] = bool(data.locked)
-            p["updated_at"] = now_str()
-            return p
-    raise HTTPException(status_code=404, detail="Post not found")
-
-
-@app.delete("/api/posts/{pid}")
-def api_delete(pid: int, user: str = Depends(require_user)):
-    for i, p in enumerate(posts):
-        if p["id"] == pid:
-            posts.pop(i)
-            return {"ok": True, "deleted": pid}
-    raise HTTPException(status_code=404, detail="Post not found")
-
-
-# ============================== СТАРТОВЫЕ ДАННЫЕ ==============================
-def seed():
-    ts = now_str()
-    posts.append({
-        "id": next_id(),
-        "title": "Добро пожаловать в закрытый постер",
-        "content": (
-            "Это закрытое сообщество. Здесь публикуются анонсы, материалы и обсуждения.\n\n"
-            "Часть постов помечена как «только для участников» — их содержимое видят "
-            "лишь авторизованные пользователи."
-        ),
-        "author": "admin",
-        "published": True,
-        "locked": False,
-        "created_at": ts,
-        "updated_at": ts,
-    })
-    posts.append({
-        "id": next_id(),
-        "title": "Материалы для участников (закрытый доступ)",
-        "content": (
-            "Этот пост доступен только участникам сообщества.\n\n"
-            "Здесь может быть внутренняя информация, ссылки, документы и т.п."
-        ),
-        "author": "admin",
-        "published": True,
-        "locked": True,
-        "created_at": ts,
-        "updated_at": ts,
-    })
-    posts.append({
-        "id": next_id(),
-        "title": "Черновик: следующий анонс",
-        "content": "Этот пост ещё не опубликован и виден только в админ-панели.",
-        "author": "admin",
-        "published": False,
-        "locked": False,
-        "created_at": ts,
-        "updated_at": ts,
-    })
-
-
-seed()
-
-
-# ============================== ЗАПУСК ==============================
 if __name__ == "__main__":
-    print("=" * 56)
-    print("  Закрытый постер · Админ-панель")
-    print("  Публичная:  http://127.0.0.1:8000/")
-    print("  Админка:    http://127.0.0.1:8000/admin")
-    print(f"  Логин/пароль: {ADMIN_USERNAME} / {ADMIN_PASSWORD}")
-    print("=" * 56)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
