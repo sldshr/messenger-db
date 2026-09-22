@@ -29,14 +29,14 @@ NOTIFS_MEM: Dict[str, List[dict]] = {}
 _VIEW_COOLDOWN: Dict[str, float] = {}
 _OG_CACHE: Dict[str, Optional[dict]] = {}
 
-MAX_POST_LEN = 1000
-MAX_COMMENT_LEN = 500
+MAX_POST_LEN = 5000
+MAX_COMMENT_LEN = 1500
 MAX_BIO_LEN = 300
 VIEW_COOLDOWN_SEC = 8 * 3600
-TRUNCATE_LINES = 100
-TRUNCATE_CHARS = 500
+TRUNCATE_LINES = 15
+TRUNCATE_CHARS = 800
 SESSION_TTL = 30 * 24 * 3600
-USER_CACHE_TTL = 3.0
+USER_CACHE_TTL = 30.0
 RATE_WINDOW = 60.0
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
@@ -67,8 +67,7 @@ EMOJIS = list(EMOJIS_RAW)
 
 
 class EventBus:
-    """Поддерживает МНОЖЕСТВО комнат на пользователя — чтобы реалтайм работал
-    одновременно и в профиле, и на стене, и в ленте."""
+    """Множество комнат на пользователя. Поддерживает анонимных клиентов."""
     def __init__(self):
         self.clients: Dict[str, List[asyncio.Queue]] = {}
         self.rooms: Dict[str, set] = {}
@@ -87,15 +86,11 @@ class EventBus:
             self.clients.pop(nick, None)
             self.rooms.pop(nick, None)
 
-    def set_rooms(self, nick: str, rooms: Union[str, List[str], None]):
+    def set_rooms(self, nick: str, rooms):
         if not nick: return
-        if rooms is None:
-            rooms_set: set = set()
-        elif isinstance(rooms, str):
-            rooms_set = {rooms} if rooms else set()
-        else:
-            rooms_set = set(r for r in rooms if r)
-        self.rooms[nick] = rooms_set
+        if not rooms: self.rooms[nick] = set()
+        elif isinstance(rooms, str): self.rooms[nick] = {rooms} if rooms else set()
+        else: self.rooms[nick] = set(r for r in rooms if r)
 
     def broadcast_room(self, room: str, ev: dict, except_nick: Optional[str] = None):
         if not room: return
@@ -121,28 +116,27 @@ async def _startup():
     MAIN_LOOP = asyncio.get_running_loop()
 
 
-def bus_publish(nick: str, ev: dict) -> None:
-    if not nick: return
+def _run_sync(fn, *args):
     if MAIN_LOOP and not MAIN_LOOP.is_closed():
         try:
-            MAIN_LOOP.call_soon_threadsafe(bus._deliver, nick, ev)
+            MAIN_LOOP.call_soon_threadsafe(fn, *args)
             return
-        except RuntimeError: pass
-    bus._deliver(nick, ev)
+        except RuntimeError:
+            pass
+    fn(*args)
+
+
+def bus_publish(nick: str, ev: dict) -> None:
+    if not nick: return
+    _run_sync(bus._deliver, nick, ev)
 
 
 def bus_broadcast(room: str, ev: dict, except_nick: Optional[str] = None) -> None:
     if not room: return
-    if MAIN_LOOP and not MAIN_LOOP.is_closed():
-        try:
-            MAIN_LOOP.call_soon_threadsafe(bus.broadcast_room, room, ev, except_nick)
-            return
-        except RuntimeError: pass
-    bus.broadcast_room(room, ev, except_nick)
+    _run_sync(bus.broadcast_room, room, ev, except_nick)
 
 
 def broadcast_post_change(post: dict, except_nick: Optional[str] = None) -> None:
-    """Рассылка во все релевантные комнаты после изменения поста или его комментариев."""
     if not post: return
     pid = post.get("id")
     if pid:
@@ -150,13 +144,15 @@ def broadcast_post_change(post: dict, except_nick: Optional[str] = None) -> None
     author = post.get("author")
     if author:
         bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=except_nick)
-    wall = post.get("wall_owner")
-    if wall:
-        bus_broadcast("wall:" + wall, {"type": "refresh"}, except_nick=except_nick)
-        # Автор поста на стене тоже должен увидеть на своей странице профиля
-        if author and author != wall:
-            bus_broadcast("wall:" + author, {"type": "refresh"}, except_nick=except_nick)
     bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
+
+
+def broadcast_view_update(pid: str, author: str, views: int) -> None:
+    ev = {"type": "view_update", "post_id": pid, "views": views}
+    bus_broadcast("post:" + pid, ev)
+    bus_broadcast("feed", ev)
+    if author:
+        bus_broadcast("profile:" + author, ev)
 
 
 def hash_password(password: str) -> str:
@@ -222,6 +218,15 @@ def extract_first_url(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def detect_device(ua: str) -> str:
+    ua_l = (ua or "").lower()
+    mobile_markers = ("mobile", "android", "iphone", "ipod", "ipad", "windows phone",
+                      "webos", "blackberry", "opera mini")
+    if any(x in ua_l for x in mobile_markers):
+        return "mobile"
+    return "desktop"
+
+
 def fetch_og_data(url: str) -> Optional[dict]:
     if not url: return None
     if url in _OG_CACHE:
@@ -231,8 +236,8 @@ def fetch_og_data(url: str) -> Optional[dict]:
             "User-Agent": "Mozilla/5.0 (compatible; SLDbot/1.0)",
             "Accept": "text/html,application/xhtml+xml",
         })
-        with urllib.request.urlopen(req, timeout=5) as r:
-            raw = r.read(200000)
+        with urllib.request.urlopen(req, timeout=4) as r:
+            raw = r.read(160000)
             html = raw.decode("utf-8", errors="ignore")
     except Exception:
         _OG_CACHE[url] = None
@@ -374,8 +379,7 @@ def clean_emoji(s: Optional[str]) -> str:
 
 NOTIFY_FIELDS = [
     "notify_on_new_post", "notify_on_follow", "notify_on_comment",
-    "notify_on_reply", "notify_on_mention", "notify_on_wall_post",
-    "notify_on_quote",
+    "notify_on_reply", "notify_on_mention", "notify_on_quote",
 ]
 NOTIFY_TYPE_TO_FIELD = {
     "new_post": "notify_on_new_post",
@@ -383,9 +387,26 @@ NOTIFY_TYPE_TO_FIELD = {
     "comment": "notify_on_comment",
     "reply": "notify_on_reply",
     "mention": "notify_on_mention",
-    "wall_post": "notify_on_wall_post",
     "quote": "notify_on_quote",
 }
+
+USER_BOOL_DEFAULTS = {
+    "notify_on_new_post": True, "notify_on_follow": True, "notify_on_comment": True,
+    "notify_on_reply": True, "notify_on_mention": True, "notify_on_quote": True,
+    "show_link_previews": True, "allow_followers_view": True, "allow_following_view": True,
+    "show_device_badge": True,
+}
+
+
+def _norm_user_row(row: dict) -> dict:
+    row["following"] = set(row.get("following") or [])
+    row["followers"] = set(row.get("followers") or [])
+    row["bio"] = row.get("bio") or ""
+    row["created_at"] = iso_to_ts(row.get("created_at"))
+    for f, d in USER_BOOL_DEFAULTS.items():
+        row[f] = bool(row.get(f, d))
+    row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
+    return row
 
 
 def db_load_user(nick: str) -> Optional[dict]:
@@ -394,20 +415,7 @@ def db_load_user(nick: str) -> Optional[dict]:
         try:
             r = supabase.table("users").select("*").ilike("nick", nick).limit(1).execute()
             if r.data:
-                row = r.data[0]
-                row["following"] = set(row.get("following") or [])
-                row["followers"] = set(row.get("followers") or [])
-                row["bio"] = row.get("bio") or ""
-                row["created_at"] = iso_to_ts(row.get("created_at"))
-                for f in NOTIFY_FIELDS:
-                    row[f] = bool(row.get(f, True))
-                row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
-                row["wall_enabled"] = bool(row.get("wall_enabled", True))
-                row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
-                row["show_link_previews"] = bool(row.get("show_link_previews", True))
-                row["allow_followers_view"] = bool(row.get("allow_followers_view", True))
-                row["allow_following_view"] = bool(row.get("allow_following_view", True))
-                return row
+                return _norm_user_row(r.data[0])
         except Exception as e: print("[SLD] db_load_user error:", e)
         return None
     for u in USERS.values():
@@ -424,11 +432,53 @@ def db_load_user_cached(nick: str) -> Optional[dict]:
     return u
 
 
-def _notify_fields_payload(u: dict) -> dict:
-    out = {}
-    for f in NOTIFY_FIELDS:
-        out[f] = bool(u.get(f, True))
+def db_load_users_batch(nicks: List[str]) -> Dict[str, dict]:
+    """Батч-загрузка пользователей одним SQL-запросом. Возвращает {lower_nick: user}."""
+    out: Dict[str, dict] = {}
+    if not nicks: return out
+    # Сначала из кэша
+    now = time.time()
+    missing = []
+    for n in nicks:
+        if not n: continue
+        e = _USER_CACHE.get(n.lower())
+        if e and now - e[0] < USER_CACHE_TTL:
+            out[n.lower()] = e[1]
+        else:
+            missing.append(n)
+    if not missing: return out
+    if supabase:
+        try:
+            r = supabase.table("users").select("*").in_("nick", list(set(missing))).execute()
+            for row in (r.data or []):
+                u = _norm_user_row(row)
+                out[u["nick"].lower()] = u
+                _USER_CACHE[u["nick"].lower()] = (now, u)
+        except Exception as e:
+            print("[SLD] db_load_users_batch error:", e)
+    else:
+        for n in missing:
+            for u in USERS.values():
+                if u["nick"].lower() == n.lower():
+                    out[u["nick"].lower()] = u
     return out
+
+
+def _user_payload(u: dict) -> dict:
+    p = {
+        "nick": u["nick"], "name": u["name"], "bio": u.get("bio",""),
+        "password": u["password"], "created_at": ts_to_iso(u["created_at"]),
+        "following": list(u.get("following") or []),
+        "followers": list(u.get("followers") or []),
+        "allow_followers_view": u.get("allow_followers_view", True),
+        "allow_following_view": u.get("allow_following_view", True),
+        "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
+        "show_link_previews": u.get("show_link_previews", True),
+        "show_device_badge": u.get("show_device_badge", True),
+    }
+    for f in NOTIFY_FIELDS:
+        p[f] = bool(u.get(f, True))
+    return p
 
 
 def db_save_user(u: dict) -> None:
@@ -436,21 +486,9 @@ def db_save_user(u: dict) -> None:
     if not supabase:
         invalidate_user_cache(u["nick"]); return
     try:
-        payload = {
-            "nick": u["nick"], "name": u["name"], "bio": u.get("bio",""),
-            "password": u["password"], "created_at": ts_to_iso(u["created_at"]),
-            "following": list(u.get("following") or []),
-            "followers": list(u.get("followers") or []),
-            "allow_followers_view": u.get("allow_followers_view", True),
-            "allow_following_view": u.get("allow_following_view", True),
-            "allow_wall_posts": u.get("allow_wall_posts", True),
-            "wall_enabled": u.get("wall_enabled", True),
-            "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
-            "show_link_previews": u.get("show_link_previews", True),
-        }
-        payload.update(_notify_fields_payload(u))
-        supabase.table("users").upsert(payload).execute()
-    except Exception as e: print("[SLD] db_save_user error:", e)
+        supabase.table("users").upsert(_user_payload(u)).execute()
+    except Exception as e:
+        print("[SLD] db_save_user error:", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
@@ -459,8 +497,10 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
     if not supabase:
         if nick in USERS: USERS[nick].update(patch)
         invalidate_user_cache(nick); return
-    try: supabase.table("users").update(patch).eq("nick", nick).execute()
-    except Exception as e: print("[SLD] db_update_user_fields error:", e)
+    try:
+        supabase.table("users").update(patch).eq("nick", nick).execute()
+    except Exception as e:
+        print("[SLD] db_update_user_fields error:", e)
     invalidate_user_cache(nick)
 
 
@@ -468,22 +508,7 @@ def db_all_users() -> List[dict]:
     if supabase:
         try:
             r = supabase.table("users").select("*").execute()
-            out = []
-            for row in r.data or []:
-                row["following"] = set(row.get("following") or [])
-                row["followers"] = set(row.get("followers") or [])
-                row["bio"] = row.get("bio") or ""
-                row["created_at"] = iso_to_ts(row.get("created_at"))
-                for f in NOTIFY_FIELDS:
-                    row[f] = bool(row.get(f, True))
-                row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
-                row["wall_enabled"] = bool(row.get("wall_enabled", True))
-                row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
-                row["show_link_previews"] = bool(row.get("show_link_previews", True))
-                row["allow_followers_view"] = bool(row.get("allow_followers_view", True))
-                row["allow_following_view"] = bool(row.get("allow_following_view", True))
-                out.append(row)
-            return out
+            return [_norm_user_row(row) for row in (r.data or [])]
         except Exception as e:
             print("[SLD] db_all_users error:", e); return []
     return list(USERS.values())
@@ -492,15 +517,21 @@ def db_all_users() -> List[dict]:
 def db_create_post(p: dict) -> None:
     if not supabase:
         POSTS_MEM[p["id"]] = p; return
+    payload = {
+        "id": p["id"], "text": p["text"], "author": p["author"],
+        "created_at": ts_to_iso(p["created_at"]),
+        "quoted_post_id": p.get("quoted_post_id"),
+        "og_data": json.dumps(p.get("og_data")) if p.get("og_data") else "",
+    }
+    if p.get("device"): payload["device"] = p["device"]
     try:
-        supabase.table("posts").insert({
-            "id": p["id"], "text": p["text"], "author": p["author"],
-            "created_at": ts_to_iso(p["created_at"]),
-            "wall_owner": p.get("wall_owner"),
-            "quoted_post_id": p.get("quoted_post_id"),
-            "og_data": json.dumps(p.get("og_data")) if p.get("og_data") else "",
-        }).execute()
-    except Exception as e: print("[SLD] db_create_post error:", e)
+        supabase.table("posts").insert(payload).execute()
+    except Exception as e:
+        # Возможно, колонки device ещё нет — попробуем без неё
+        print("[SLD] db_create_post error:", e)
+        payload.pop("device", None)
+        try: supabase.table("posts").insert(payload).execute()
+        except Exception as e2: print("[SLD] db_create_post retry error:", e2)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
@@ -533,15 +564,22 @@ def db_get_post(pid: str) -> Optional[dict]:
     return POSTS_MEM.get(pid)
 
 
-def db_inc_views(pid: str) -> None:
+def db_inc_views(pid: str) -> int:
+    """Возвращает новое количество просмотров."""
     if not supabase:
         p = POSTS_MEM.get(pid)
-        if p: p["views"] = (p.get("views") or 0) + 1
-        return
+        if p:
+            p["views"] = (p.get("views") or 0) + 1
+            return p["views"]
+        return 0
     try:
         supabase.rpc("increment_post_views", {"p_id": pid}).execute()
+        # перечитываем
+        r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
+        if r.data: return r.data[0].get("views") or 0
     except Exception as e:
         print("[SLD] db_inc_views error:", e)
+    return 0
 
 
 def view_should_count(pid: str, vid: str) -> bool:
@@ -597,7 +635,7 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
 def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> List[dict]:
     if supabase:
         try:
-            query = supabase.table("posts").select("*").is_("wall_owner", "null")
+            query = supabase.table("posts").select("*")
             if author: query = query.eq("author", author)
             if subscriptions_of:
                 u = db_load_user_cached(subscriptions_of)
@@ -611,7 +649,7 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
             return rows
         except Exception as e:
             print("[SLD] db_list_posts error:", e); return []
-    items = [p for p in POSTS_MEM.values() if not p.get("wall_owner")]
+    items = list(POSTS_MEM.values())
     if author: items = [p for p in items if p["author"] == author]
     if subscriptions_of:
         u = db_load_user_cached(subscriptions_of)
@@ -620,21 +658,6 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
     if q:
         n = q.lower()
         items = [p for p in items if n in p["text"].lower()]
-    items.sort(key=lambda p: p["created_at"], reverse=True)
-    return items
-
-
-def db_list_wall_posts(owner: str) -> List[dict]:
-    if supabase:
-        try:
-            r = (supabase.table("posts").select("*")
-                 .eq("wall_owner", owner).order("created_at", desc=True).limit(200).execute())
-            rows = r.data or []
-            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
-            return rows
-        except Exception as e:
-            print("[SLD] db_list_wall_posts error:", e); return []
-    items = [p for p in POSTS_MEM.values() if p.get("wall_owner") == owner]
     items.sort(key=lambda p: p["created_at"], reverse=True)
     return items
 
@@ -786,7 +809,6 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
               post_id: str = "", comment_id: str = "", text: str = "") -> None:
     if not to_nick or to_nick == from_nick: return
     to_user = db_load_user_cached(to_nick)
-    # Проверяем персональные настройки уведомлений
     if to_user:
         field = NOTIFY_TYPE_TO_FIELD.get(ntype)
         if field and not to_user.get(field, True):
@@ -856,7 +878,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             u = USERS.pop(old_nick); u["nick"] = new_nick; USERS[new_nick] = u
         for p in POSTS_MEM.values():
             if p["author"] == old_nick: p["author"] = new_nick
-            if p.get("wall_owner") == old_nick: p["wall_owner"] = new_nick
             for c in p.get("comments", []):
                 if c["author"] == old_nick: c["author"] = new_nick
         for u in USERS.values():
@@ -872,24 +893,11 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
     try:
         old = db_load_user(old_nick)
         if not old: return
-        payload = {
-            "nick": new_nick, "name": old.get("name", new_nick),
-            "bio": old.get("bio", ""), "password": old.get("password", ""),
-            "created_at": ts_to_iso(old.get("created_at", time.time())),
-            "following": list(old.get("following") or []),
-            "followers": list(old.get("followers") or []),
-            "allow_followers_view": old.get("allow_followers_view", True),
-            "allow_following_view": old.get("allow_following_view", True),
-            "allow_wall_posts": old.get("allow_wall_posts", True),
-            "wall_enabled": old.get("wall_enabled", True),
-            "avatar_emoji": old.get("avatar_emoji", DEFAULT_EMOJI),
-            "show_link_previews": old.get("show_link_previews", True),
-        }
-        payload.update(_notify_fields_payload(old))
+        payload = _user_payload(old)
+        payload["nick"] = new_nick
         supabase.table("users").insert(payload).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
-        supabase.table("posts").update({"wall_owner": new_nick}).eq("wall_owner", old_nick).execute()
         supabase.table("comments").update({"author": new_nick}).eq("author", old_nick).execute()
         supabase.table("post_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
         supabase.table("comment_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
@@ -921,35 +929,40 @@ def normalize_og(raw):
 def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
     if not posts: return []
     post_ids = [p["id"] for p in posts]
+
+    # Батч-загрузка авторов и авторов цитат
+    author_nicks = set()
+    for p in posts:
+        if p.get("author"): author_nicks.add(p["author"])
+
+    quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
+    quotes = db_get_quotes(list(set(quoted_ids))) if quoted_ids else {}
+    for q in quotes.values():
+        if q.get("author"): author_nicks.add(q["author"])
+
+    users_map = db_load_users_batch(list(author_nicks))
+
+    # Батчим голоса/комменты/комментарии
     votes = db_post_votes(post_ids)
     vmap: Dict[str, Dict[str, int]] = {}
     for v in votes: vmap.setdefault(v["post_id"], {})[v["voter_id"]] = v["direction"]
+
     comments = db_comments_for_posts(post_ids)
     cmap: Dict[str, List[dict]] = {}
     for c in comments: cmap.setdefault(c["post_id"], []).append(c)
+
     comment_ids = [c["id"] for c in comments]
-    cvotes = db_comment_votes(comment_ids)
     cvmap: Dict[str, Dict[str, int]] = {}
-    for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
-
-    quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
-    quotes = db_get_quotes(list(set(quoted_ids)))
-
-    authors_data: Dict[str, dict] = {}
-    for p in posts:
-        a = p.get("author")
-        if a and a not in authors_data:
-            au = db_load_user_cached(a)
-            authors_data[a] = {
-                "name": (au or {}).get("name", a),
-                "avatar_emoji": (au or {}).get("avatar_emoji", DEFAULT_EMOJI),
-            }
+    if comment_ids:
+        cvotes = db_comment_votes(comment_ids)
+        for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
 
     out = []
     for p in posts:
         pvotes = vmap.get(p["id"], {})
         likes = sum(1 for d in pvotes.values() if d == 1)
         uv = pvotes.get(voter_id, 0)
+
         clist = []
         for c in cmap.get(p["id"], []):
             cv = cvmap.get(c["id"], {})
@@ -958,21 +971,29 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
             clist.append({"id": c["id"], "text": c["text"], "created_at": c["created_at"],
                           "author": c.get("author"), "parent_id": c.get("parent_id"),
                           "likes": clikes, "user_like": cuv})
+
         quoted = None
         qid = p.get("quoted_post_id")
         if qid and qid in quotes:
             qp = quotes[qid]
             quoted = {"id": qp["id"], "text": qp["text"], "author": qp.get("author"),
-                      "created_at": qp["created_at"], "wall_owner": qp.get("wall_owner")}
-        ad = authors_data.get(p.get("author"), {})
-        out.append({"id": p["id"], "text": p["text"], "created_at": p["created_at"],
-                    "author": p.get("author"), "wall_owner": p.get("wall_owner"),
-                    "views": p.get("views") or 0,
-                    "og_data": normalize_og(p.get("og_data")),
-                    "author_name": ad.get("name", p.get("author")),
-                    "author_avatar_emoji": ad.get("avatar_emoji", DEFAULT_EMOJI),
-                    "quoted_post_id": qid, "quoted": quoted,
-                    "likes": likes, "user_like": uv, "comments": clist})
+                      "created_at": qp["created_at"]}
+
+        author_u = users_map.get((p.get("author") or "").lower()) or {}
+        author_show_device = bool(author_u.get("show_device_badge", True))
+
+        out.append({
+            "id": p["id"], "text": p["text"], "created_at": p["created_at"],
+            "author": p.get("author"),
+            "views": p.get("views") or 0,
+            "og_data": normalize_og(p.get("og_data")),
+            "device": p.get("device") or None,
+            "author_name": author_u.get("name", p.get("author")),
+            "author_avatar_emoji": author_u.get("avatar_emoji", DEFAULT_EMOJI),
+            "author_show_device": author_show_device,
+            "quoted_post_id": qid, "quoted": quoted,
+            "likes": likes, "user_like": uv, "comments": clist,
+        })
     return out
 
 
@@ -982,13 +1003,12 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
          "followers": len(u.get("followers") or []),
          "following": len(u.get("following") or []),
          "is_me": viewer_nick == u["nick"],
-         "allow_wall_posts": u.get("allow_wall_posts", True),
-         "wall_enabled": u.get("wall_enabled", True),
          "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI) or DEFAULT_EMOJI}
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
         d["show_link_previews"] = u.get("show_link_previews", True)
+        d["show_device_badge"] = u.get("show_device_badge", True)
         for f in NOTIFY_FIELDS:
             d[f] = bool(u.get(f, True))
     return d
@@ -1001,16 +1021,12 @@ class PostIn(BaseModel):
 
 
 class PostEditIn(BaseModel): text: str
-class LikeIn(BaseModel): pass
 class CommentIn(BaseModel): text: str; parent_id: Optional[str] = None
 class CommentEditIn(BaseModel): text: str
 class RegisterIn(BaseModel): name: str; nick: str; password: str; password_confirm: str
 class LoginIn(BaseModel): nick: str; password: str
 class ProfileUpdateIn(BaseModel):
-    name: str
-    nick: str
-    bio: str = ""
-    avatar_emoji: str = ""
+    name: str; nick: str; bio: str = ""; avatar_emoji: str = ""
 class SettingsIn(BaseModel):
     allow_followers_view: Optional[bool] = None
     allow_following_view: Optional[bool] = None
@@ -1019,12 +1035,12 @@ class SettingsIn(BaseModel):
     notify_on_comment: Optional[bool] = None
     notify_on_reply: Optional[bool] = None
     notify_on_mention: Optional[bool] = None
-    notify_on_wall_post: Optional[bool] = None
     notify_on_quote: Optional[bool] = None
-    allow_wall_posts: Optional[bool] = None
-    wall_enabled: Optional[bool] = None
     show_link_previews: Optional[bool] = None
-class RoomIn(BaseModel): rooms: List[str] = []
+    show_device_badge: Optional[bool] = None
+class RoomIn(BaseModel):
+    rooms: List[str] = []
+    anon_id: Optional[str] = None
 
 
 def _build_og_for_text(text: str, enabled: bool):
@@ -1036,8 +1052,15 @@ def _build_og_for_text(text: str, enabled: bool):
 
 @app.post("/api/room")
 def api_room(data: RoomIn, request: Request):
-    u = require_user(request)
-    bus.set_rooms(u["nick"], data.rooms or [])
+    u = get_current_user(request)
+    if u:
+        bus.set_rooms(u["nick"], data.rooms or [])
+        return {"ok": True}
+    if data.anon_id:
+        nick = "anon:" + re.sub(r"[^a-zA-Z0-9]", "", data.anon_id)[:32]
+        if nick != "anon:":
+            bus.set_rooms(nick, data.rooms or ["feed"])
+        return {"ok": True}
     return {"ok": True}
 
 
@@ -1056,8 +1079,8 @@ def api_register(data: RegisterIn, request: Request):
          "password": hash_password(data.password), "created_at": time.time(),
          "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
-         "allow_wall_posts": True, "wall_enabled": True,
-         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True}
+         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True,
+         "show_device_badge": True}
     for f in NOTIFY_FIELDS: u[f] = True
     db_save_user(u)
     token = new_token()
@@ -1071,7 +1094,8 @@ def api_login(data: LoginIn, request: Request):
     if not rate_limit("log:" + ip, 10, 300): raise HTTPException(429, "err_rate_limit")
     nick = data.nick.strip().lstrip("@")
     u = db_load_user(nick)
-    if not u or not check_password(data.password, u["password"]): raise HTTPException(400, "err_bad_login")
+    if not u or not check_password(data.password, u["password"]):
+        raise HTTPException(400, "err_bad_login")
     token = new_token()
     SESSIONS[token] = {"nick": u["nick"], "created": time.time()}
     return {"token": token, "user": serialize_user(u, u["nick"])}
@@ -1092,7 +1116,6 @@ def api_me(request: Request):
 
 @app.get("/api/whoami")
 def api_whoami(request: Request):
-    require_user(request)
     ua = request.headers.get("user-agent", "")
     ip = get_client_ip(request)
     browser, os_name = parse_user_agent(ua)
@@ -1113,7 +1136,8 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     nick_changed = (nick.lower() != old_nick.lower())
     if nick_changed:
         exists = db_load_user(nick)
-        if exists and exists["nick"].lower() != old_nick.lower(): raise HTTPException(400, "err_nick_taken")
+        if exists and exists["nick"].lower() != old_nick.lower():
+            raise HTTPException(400, "err_nick_taken")
     db_update_user_fields(old_nick, {"name": name, "bio": bio, "avatar_emoji": avatar})
     if nick_changed:
         _rename_user_everywhere(old_nick, nick)
@@ -1130,16 +1154,14 @@ def api_set_settings(data: SettingsIn, request: Request):
     patch = {}
     if data.allow_followers_view is not None: patch["allow_followers_view"] = bool(data.allow_followers_view)
     if data.allow_following_view is not None: patch["allow_following_view"] = bool(data.allow_following_view)
-    if data.allow_wall_posts is not None: patch["allow_wall_posts"] = bool(data.allow_wall_posts)
-    if data.wall_enabled is not None: patch["wall_enabled"] = bool(data.wall_enabled)
     if data.show_link_previews is not None: patch["show_link_previews"] = bool(data.show_link_previews)
+    if data.show_device_badge is not None: patch["show_device_badge"] = bool(data.show_device_badge)
     for f in NOTIFY_FIELDS:
         v = getattr(data, f, None)
         if v is not None: patch[f] = bool(v)
     if patch:
         db_update_user_fields(me["nick"], patch)
         bus_broadcast("profile:" + me["nick"], {"type": "refresh"})
-        bus_broadcast("wall:" + me["nick"], {"type": "refresh"})
         bus_broadcast("feed", {"type": "refresh"})
     return {"ok": True}
 
@@ -1188,10 +1210,8 @@ def api_followers(nick: str, request: Request):
             me_u = db_load_user(vn)
             return {"users": [serialize_user(me_u, vn)], "limited": True}
         raise HTTPException(403, "err_private_followers")
-    out = []
-    for n in followers:
-        fu = db_load_user(n)
-        if fu: out.append(serialize_user(fu, vn))
+    users_map = db_load_users_batch(followers)
+    out = [serialize_user(users_map[n.lower()], vn) for n in followers if n.lower() in users_map]
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out, "limited": False}
 
@@ -1210,10 +1230,8 @@ def api_following(nick: str, request: Request):
             me_u = db_load_user(vn)
             return {"users": [serialize_user(me_u, vn)], "limited": True}
         raise HTTPException(403, "err_private_following")
-    out = []
-    for n in following:
-        fu = db_load_user(n)
-        if fu: out.append(serialize_user(fu, vn))
+    users_map = db_load_users_batch(following)
+    out = [serialize_user(users_map[n.lower()], vn) for n in following if n.lower() in users_map]
     out.sort(key=lambda x: x["nick"].lower())
     return {"users": out, "limited": False}
 
@@ -1265,88 +1283,6 @@ def api_list(request: Request, q: str = "", author: str = "", feed: str = ""):
     return {"posts": build_posts_full(posts, vid)}
 
 
-@app.get("/api/users/{nick}/wall")
-def api_wall(nick: str, request: Request):
-    u = db_load_user(nick)
-    if not u: raise HTTPException(404, "not found")
-    viewer = get_current_user(request)
-    vn = viewer["nick"] if viewer else None
-    vid = "u:" + vn if vn else "c:anon"
-    owner_data = serialize_user(u, vn)
-
-    # Стена выключена — никто (включая владельца) не видит содержимое
-    if not u.get("wall_enabled", True):
-        return {"posts": [], "allow_wall_posts": False, "wall_enabled": False,
-                "can_view": False, "can_post": False, "reason": "err_wall_off",
-                "owner": owner_data}
-
-    is_owner = vn == u["nick"]
-    is_follower = bool(vn) and vn in (u.get("followers") or set())
-
-    if not is_owner and not is_follower:
-        return {"posts": [], "allow_wall_posts": u.get("allow_wall_posts", True),
-                "wall_enabled": True,
-                "can_view": False, "can_post": False, "reason": "err_wall_community",
-                "owner": owner_data}
-
-    posts = db_list_wall_posts(u["nick"])
-    can_post = False; reason = ""
-    if viewer:
-        if is_owner:
-            can_post = True
-        elif not u.get("allow_wall_posts", True):
-            reason = "err_wall_disabled"
-        elif not is_follower:
-            reason = "err_need_follow"
-        else:
-            can_post = True
-    return {"posts": build_posts_full(posts, vid),
-            "allow_wall_posts": u.get("allow_wall_posts", True),
-            "wall_enabled": True,
-            "can_view": True, "can_post": can_post, "reason": reason,
-            "owner": owner_data}
-
-
-@app.post("/api/users/{nick}/wall")
-def api_wall_post(nick: str, payload: PostIn, request: Request):
-    me = require_user(request)
-    ip = get_client_ip(request)
-    if not rate_limit("wall:" + ip, 20, 60): raise HTTPException(429, "err_rate_limit")
-    owner = db_load_user(nick)
-    if not owner: raise HTTPException(404, "not found")
-    if not owner.get("wall_enabled", True): raise HTTPException(403, "err_wall_off")
-    is_owner = owner["nick"] == me["nick"]
-    if not is_owner:
-        if not owner.get("allow_wall_posts", True): raise HTTPException(403, "err_wall_disabled")
-        if me["nick"] not in (owner.get("followers") or set()): raise HTTPException(403, "err_need_follow")
-    text = payload.text.strip()
-    if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
-    if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
-    pid = uuid.uuid4().hex[:10]
-    og = _build_og_for_text(text, payload.og_enabled)
-    p = {"id": pid, "text": text, "author": me["nick"],
-         "created_at": time.time(), "wall_owner": owner["nick"],
-         "quoted_post_id": payload.quoted_post_id or None,
-         "og_data": og}
-    db_create_post(p)
-    notified = set()
-    for m in extract_mentions(text):
-        if m == me["nick"]: continue
-        k = m.lower()
-        if k in notified: continue
-        if not db_load_user_cached(m): continue
-        db_notify(m, "mention", me["nick"], post_id=pid, text=text[:140])
-        notified.add(k)
-    if not is_owner and owner["nick"].lower() not in notified:
-        db_notify(owner["nick"], "wall_post", me["nick"], post_id=pid, text=text[:140])
-    if payload.quoted_post_id:
-        qp = db_get_post(payload.quoted_post_id)
-        if qp and qp.get("author") and qp["author"] != me["nick"]:
-            db_notify(qp["author"], "quote", me["nick"], post_id=pid, text=text[:140])
-    broadcast_post_change(p)
-    return build_posts_full([p], "u:" + me["nick"])[0]
-
-
 @app.get("/api/posts/{pid}")
 def api_get(pid: str, request: Request):
     p = db_get_post(pid)
@@ -1366,8 +1302,9 @@ def api_view_post(pid: str, request: Request):
     vid = "u:" + u["nick"]
     if not view_should_count(pid, vid): return {"ok": True, "counted": False}
     view_mark_counted(pid, vid)
-    db_inc_views(pid)
-    return {"ok": True, "counted": True}
+    new_views = db_inc_views(pid)
+    broadcast_view_update(pid, p.get("author"), new_views)
+    return {"ok": True, "counted": True, "views": new_views}
 
 
 @app.post("/api/posts")
@@ -1380,8 +1317,9 @@ def api_create(payload: PostIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
     og = _build_og_for_text(text, payload.og_enabled)
+    device = detect_device(request.headers.get("user-agent", ""))
     p = {"id": pid, "text": text, "author": u["nick"],
-         "created_at": time.time(), "wall_owner": None,
+         "created_at": time.time(), "device": device,
          "quoted_post_id": payload.quoted_post_id or None,
          "og_data": og}
     db_create_post(p)
@@ -1427,16 +1365,13 @@ def api_delete_post(pid: str, request: Request):
     u = require_user(request)
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
-    if p["author"] != u["nick"] and p.get("wall_owner") != u["nick"]:
-        raise HTTPException(403, "forbidden")
+    if p["author"] != u["nick"]: raise HTTPException(403, "forbidden")
     author = p.get("author")
-    wall_owner = p.get("wall_owner")
     db_delete_post(pid)
     ev = {"type": "post_deleted", "post_id": pid}
     bus_broadcast("post:" + pid, ev)
     bus_broadcast("feed", {"type": "refresh"}, except_nick=u["nick"])
     if author: bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=u["nick"])
-    if wall_owner: bus_broadcast("wall:" + wall_owner, {"type": "refresh"}, except_nick=u["nick"])
     return {"ok": True}
 
 
@@ -1462,6 +1397,8 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     u = require_user(request)
     post = db_get_post(pid)
     if not post: raise HTTPException(404, "not found")
+    ip = get_client_ip(request)
+    if not rate_limit("cmt:" + ip, 60, 60): raise HTTPException(429, "err_rate_limit")
     text = c.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
@@ -1514,10 +1451,9 @@ def api_delete_comment(pid: str, cid: str, request: Request):
     u = require_user(request)
     c = db_get_comment(cid)
     if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
-    post = db_get_post(pid)
-    if c["author"] != u["nick"] and (not post or post.get("wall_owner") != u["nick"]):
-        raise HTTPException(403, "forbidden")
+    if c["author"] != u["nick"]: raise HTTPException(403, "forbidden")
     db_delete_comment(cid)
+    post = db_get_post(pid)
     broadcast_post_change(post, except_nick=u["nick"])
     return build_posts_full([post], "u:" + u["nick"])[0]
 
@@ -1566,12 +1502,22 @@ def api_notifications_clear(request: Request):
 
 
 @app.get("/api/events")
-async def api_events(request: Request, token: str = ""):
-    sess = SESSIONS.get(token) if token else None
-    if not sess: raise HTTPException(401, "unauthorized")
-    nick = sess["nick"]
-    u = db_load_user_cached(nick)
-    if not u: raise HTTPException(401, "unauthorized")
+async def api_events(request: Request, token: str = "", anon: str = ""):
+    """SSE: работает и для анонимов (получают только feed)."""
+    if token:
+        sess = SESSIONS.get(token)
+        if not sess: raise HTTPException(401, "unauthorized")
+        nick = sess["nick"]
+        u = db_load_user_cached(nick)
+        if not u: raise HTTPException(401, "unauthorized")
+    elif anon:
+        clean = re.sub(r"[^a-zA-Z0-9]", "", anon)[:32]
+        nick = "anon:" + (clean or uuid.uuid4().hex[:12])
+        bus.set_rooms(nick, ["feed"])
+    else:
+        nick = "anon:" + uuid.uuid4().hex[:12]
+        bus.set_rooms(nick, ["feed"])
+
     q = await bus.subscribe(nick)
     async def gen():
         try:
@@ -1597,7 +1543,7 @@ TEXTS = {
     "ru": {
         "search_ph": "Поиск людей и постов",
         "post_ph": "Что нового?",
-        "comment_ph": "Комментарий...",
+        "comment_ph": "Комментарий... Shift+Enter — отправить",
         "reply_ph": "Ответ...",
         "publish": "Опубликовать",
         "send_comment": "Отправить",
@@ -1618,7 +1564,7 @@ TEXTS = {
         "notif_clear_confirm": "Удалить все уведомления?",
         "author_badge": "автор",
         "feed_all": "Для вас", "feed_subs": "Подписки",
-        "nav_home": "Лента", "nav_walls": "Стены", "nav_users": "Люди",
+        "nav_home": "Лента", "nav_users": "Люди",
         "nav_profile": "Профиль", "nav_notifications": "Уведомления",
         "nav_settings": "Настройки", "nav_logout": "Выйти",
         "nav_login": "Войти", "nav_register": "Регистрация",
@@ -1638,10 +1584,6 @@ TEXTS = {
         "err_private_followers": "Пользователь скрыл подписчиков",
         "err_private_following": "Пользователь скрыл подписки",
         "err_bio_too_long": "Описание слишком длинное (до 300 символов)",
-        "err_wall_disabled": "Стена закрыта",
-        "err_wall_off": "Пользователь отключил стену",
-        "err_need_follow": "Подпишитесь на пользователя, чтобы писать на его стене",
-        "err_wall_community": "Стена сообщества — видна только подписчикам",
         "login_to_post": "Войдите, чтобы публиковать",
         "login_to_comment": "Войдите, чтобы комментировать",
         "go_login": "Войти",
@@ -1650,18 +1592,7 @@ TEXTS = {
         "edit_profile": "Редактировать",
         "edit_profile_title": "Изменить профиль",
         "no_user_posts": "Здесь пока пусто",
-        "bio_empty_short": "Описание не заполнено",
         "tab_posts": "Посты",
-        "tab_wall": "Стена",
-        "wall_title": "Стена",
-        "wall_of": "Стена",
-        "wall_empty": "Стена пуста",
-        "wall_ph": "Что-нибудь на стене...",
-        "wall_send": "Отправить",
-        "wall_community_hint": "Это стена сообщества — писать могут только подписчики",
-        "walls_title": "Стены",
-        "walls_search_ph": "Поиск людей",
-        "walls_subtitle": "Выберите пользователя, чтобы зайти на его стену",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Конфиденциальность",
@@ -1671,21 +1602,19 @@ TEXTS = {
         "settings_theme": "Тема",
         "settings_lang": "Язык",
         "settings_colors": "Основные цвета",
-        "settings_colors_hint": "Цвет кнопок, переключателей, чекбоксов и подсветок",
+        "settings_colors_hint": "Цвет кнопок, переключателей и подсветок",
         "settings_allow_followers": "Показывать список подписчиков",
         "settings_allow_following": "Показывать список подписок",
-        "settings_wall_enabled": "Стена включена",
-        "settings_wall_enabled_hint": "Если выключено, стену не увидит никто, включая вас",
-        "settings_allow_wall": "Разрешить писать на моей стене",
-        "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
         "settings_show_link_previews": "Показывать превью ссылок (OpenGraph)",
         "settings_show_link_previews_hint": "Если включено, к постам со ссылками будут добавляться карточки предпросмотра",
+        "settings_show_device_badge": "Показывать значок устройства на постах",
+        "settings_show_device_badge_hint": "Рядом с вашим именем будет отображаться иконка телефона или компьютера, с которого был опубликован пост",
         "settings_device": "Ваше устройство",
         "settings_device_browser": "Браузер",
         "settings_device_os": "Система",
         "settings_device_city": "Город",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "SLD — минималистичная соцсеть: посты, стены, комментарии.",
+        "settings_desc": "SLD — минималистичная соцсеть: посты и комментарии.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1695,14 +1624,12 @@ TEXTS = {
         "notif_reply": "ответил на ваш комментарий",
         "notif_mention": "упомянул вас",
         "notif_new_post": "опубликовал новый пост",
-        "notif_wall_post": "написал на вашей стене",
         "notif_quote": "процитировал ваш пост",
         "notify_new_post": "Новые посты подписок",
         "notify_follow": "Новые подписчики",
         "notify_comment": "Комментарии к моим постам",
         "notify_reply": "Ответы на мои комментарии",
         "notify_mention": "Упоминания меня",
-        "notify_wall_post": "Посты на моей стене",
         "notify_quote": "Цитаты моих постов",
         "back": "Назад",
         "bio_ph": "О себе (до 300 символов)...",
@@ -1715,32 +1642,70 @@ TEXTS = {
         "no_users": "Никого не найдено",
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
-            "Мы храним минимум данных: имя, ник, пароль (хеш), посты, комментарии, "
-            "стену, цитаты, лайки, подписки, эмодзи аватара, уведомления.\n\n"
-            "Пароль хранится как pbkdf2-hmac-sha256 (100 000 итераций) с солью. Мы не можем его восстановить.\n\n"
-            "Данные хранятся на серверах Supabase. Мы их не продаём и не передаём третьим лицам.\n\n"
-            "Редактировать и удалять можно свои посты и комментарии. Владелец стены может удалять посты и комментарии на своей стене.\n\n"
-            "IP используется для определения языка и города (не сохраняется).\n\n"
-            "Сервис предоставляется как есть."
+            "Мы уважаем вашу конфиденциальность и собираем минимум данных.\n\n"
+            "КАКИЕ ДАННЫЕ ХРАНЯТСЯ\n"
+            "• Имя, ник, эмодзи-аватар, описание (био)\n"
+            "• Хеш пароля (pbkdf2-hmac-sha256, 100 000 итераций, соль). Восстановить пароль невозможно даже нам.\n"
+            "• Посты, комментарии, лайки, подписки, уведомления\n"
+            "• Ваши настройки приватности, уведомлений и внешнего вида\n"
+            "• Устройство (мобильное / компьютерное) в момент публикации поста — только для отображения значка рядом с постом. Можно отключить в настройках.\n\n"
+            "ЧЕГО МЫ НЕ ХРАНИМ\n"
+            "• Пароль в открытом виде\n"
+            "• Ваш IP-адрес. IP используется только для определения языка и города в момент загрузки страницы и не сохраняется в базе.\n"
+            "• Историю просмотров постов (учитывается только счётчик, и только с интервалом 8 часов на пользователя).\n"
+            "• Никаких сторонних cookies, аналитики, трекеров, рекламных идентификаторов.\n\n"
+            "КАК ИСПОЛЬЗУЮТСЯ ДАННЫЕ\n"
+            "• Для отображения вашего профиля и постов другим пользователям\n"
+            "• Для отправки уведомлений о действиях других пользователей\n"
+            "• Для определения языка и города — только чтобы показать их вам в настройках\n"
+            "• Никакой аналитики, никакой рекламы, никакого трекинга.\n\n"
+            "ГДЕ ХРАНЯТСЯ ДАННЫЕ\n"
+            "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером происходит по HTTPS. Мы не продаём и не передаём данные третьим лицам.\n\n"
+            "ВАШИ ПРАВА\n"
+            "• Смотреть и редактировать свой профиль\n"
+            "• Удалять свои посты и комментарии\n"
+            "• Отписаться от пользователей в любой момент\n"
+            "• Отключить уведомления любого типа в настройках\n"
+            "• Скрыть список подписчиков и подписок\n"
+            "• Отключить показ значка устройства на своих постах\n"
+            "• Удалить аккаунт — напишите нам, и мы удалим все ваши данные в течение 30 дней\n\n"
+            "ХРАНЕНИЕ И УДАЛЕНИЕ\n"
+            "Данные хранятся пока активен ваш аккаунт. При удалении аккаунта все посты, комментарии, лайки, подписки и уведомления удаляются безвозвратно.\n\n"
+            "COOKIES И LOCALSTORAGE\n"
+            "Мы используем:\n"
+            "• localStorage: SLD_token (токен сессии), SLD_user (кэш профиля), SLD_theme (тема), SLD_lang (язык), SLD_colors (цвета), SLD_anon_id (анонимный идентификатор для realtime)\n"
+            "• 1 cookie: SLD_lang — только для хранения выбранного языка\n"
+            "Сторонних cookies нет.\n\n"
+            "ДЕТИ\n"
+            "Сервис не предназначен для лиц младше 13 лет. Мы не собираем данные детей намеренно.\n\n"
+            "ИЗМЕНЕНИЯ\n"
+            "Мы можем обновлять эту политику. Актуальная версия всегда доступна по этой ссылке. Продолжая пользоваться сервисом, вы соглашаетесь с обновлениями.\n\n"
+            "КОНТАКТЫ\n"
+            "По вопросам приватности и удаления данных — напишите нам через профиль разработчика.\n\n"
+            "Сервис предоставляется «как есть», без гарантий."
         ),
         "quote": "Цитировать",
         "avatar_choose": "Выберите эмодзи",
         "avatar_current": "Текущий аватар",
         "og_enable": "Превью ссылок",
-        "color_default": "Стандарт",
         "color_blue": "Синий",
         "color_green": "Зелёный",
         "color_purple": "Фиолетовый",
         "color_pink": "Розовый",
         "color_orange": "Оранжевый",
         "color_red": "Красный",
-        "reset_colors": "Сбросить",
-        "settings_saved": "Сохранено",
+        "color_teal": "Бирюзовый",
+        "color_indigo": "Индиго",
+        "color_accent": "Акцент",
+        "color_likes": "Лайки",
+        "reset_colors": "Сбросить цвета",
+        "sent_from_mobile": "Отправлено с телефона",
+        "sent_from_desktop": "Отправлено с компьютера",
     },
     "en": {
         "search_ph": "Search people and posts",
         "post_ph": "What's new?",
-        "comment_ph": "Comment...",
+        "comment_ph": "Comment... Shift+Enter to send",
         "reply_ph": "Reply...",
         "publish": "Publish",
         "send_comment": "Send",
@@ -1761,7 +1726,7 @@ TEXTS = {
         "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
         "feed_all": "For you", "feed_subs": "Subscriptions",
-        "nav_home": "Feed", "nav_walls": "Walls", "nav_users": "People",
+        "nav_home": "Feed", "nav_users": "People",
         "nav_profile": "Profile", "nav_notifications": "Notifications",
         "nav_settings": "Settings", "nav_logout": "Log out",
         "nav_login": "Log in", "nav_register": "Sign up",
@@ -1781,10 +1746,6 @@ TEXTS = {
         "err_private_followers": "User hid their followers",
         "err_private_following": "User hid their following",
         "err_bio_too_long": "Bio is too long (max 300 chars)",
-        "err_wall_disabled": "Wall is closed",
-        "err_wall_off": "User disabled their wall",
-        "err_need_follow": "Follow this user to post on their wall",
-        "err_wall_community": "Wall is a community — visible to followers only",
         "login_to_post": "Log in to publish",
         "login_to_comment": "Log in to comment",
         "go_login": "Log in",
@@ -1793,18 +1754,7 @@ TEXTS = {
         "edit_profile": "Edit",
         "edit_profile_title": "Edit profile",
         "no_user_posts": "Nothing here yet",
-        "bio_empty_short": "No bio yet",
         "tab_posts": "Posts",
-        "tab_wall": "Wall",
-        "wall_title": "Wall",
-        "wall_of": "Wall of",
-        "wall_empty": "Wall is empty",
-        "wall_ph": "Write on the wall...",
-        "wall_send": "Post",
-        "wall_community_hint": "This is a community wall — only followers can post",
-        "walls_title": "Walls",
-        "walls_search_ph": "Search people",
-        "walls_subtitle": "Pick a user to visit their wall",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1814,21 +1764,19 @@ TEXTS = {
         "settings_theme": "Theme",
         "settings_lang": "Language",
         "settings_colors": "Accent colors",
-        "settings_colors_hint": "Color of buttons, toggles, checkboxes and highlights",
+        "settings_colors_hint": "Color of buttons, toggles and highlights",
         "settings_allow_followers": "Show followers list",
         "settings_allow_following": "Show following list",
-        "settings_wall_enabled": "Wall enabled",
-        "settings_wall_enabled_hint": "If disabled, nobody (including you) will see your wall",
-        "settings_allow_wall": "Allow posts on my wall",
-        "settings_allow_wall_hint": "Only your followers can post",
         "settings_show_link_previews": "Show link previews (OpenGraph)",
         "settings_show_link_previews_hint": "If enabled, posts with links will show preview cards",
+        "settings_show_device_badge": "Show device badge on posts",
+        "settings_show_device_badge_hint": "A phone or desktop icon will appear next to your name on posts, indicating the device used to publish",
         "settings_device": "Your device",
         "settings_device_browser": "Browser",
         "settings_device_os": "System",
         "settings_device_city": "City",
         "settings_policy": "Privacy policy",
-        "settings_desc": "SLD — minimalist social network: posts, walls, comments.",
+        "settings_desc": "SLD — minimalist social network: posts and comments.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -1838,14 +1786,12 @@ TEXTS = {
         "notif_reply": "replied to your comment",
         "notif_mention": "mentioned you",
         "notif_new_post": "published a new post",
-        "notif_wall_post": "posted on your wall",
         "notif_quote": "quoted your post",
         "notify_new_post": "New posts from subscriptions",
         "notify_follow": "New followers",
         "notify_comment": "Comments on my posts",
         "notify_reply": "Replies to my comments",
         "notify_mention": "Mentions of me",
-        "notify_wall_post": "Posts on my wall",
         "notify_quote": "Quotes of my posts",
         "back": "Back",
         "bio_ph": "Bio (max 300 chars)...",
@@ -1858,27 +1804,65 @@ TEXTS = {
         "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
-            "We store minimum data: name, nick, password (hash), posts, comments, "
-            "wall, quotes, likes, follows, avatar emoji, notifications.\n\n"
-            "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
-            "Data is stored on Supabase. We do not sell or share it.\n\n"
-            "You can edit/delete your own posts and comments. Wall owner can delete posts/comments on their wall.\n\n"
-            "IP is used to detect language and city (not stored).\n\n"
-            "Service is provided as-is."
+            "We respect your privacy and collect the minimum amount of data.\n\n"
+            "DATA WE STORE\n"
+            "• Name, nick, emoji avatar, bio\n"
+            "• Password hash (pbkdf2-hmac-sha256, 100 000 iterations, salted). Even we cannot recover your password.\n"
+            "• Posts, comments, likes, follows, notifications\n"
+            "• Your privacy, notification and appearance settings\n"
+            "• Device type (mobile / desktop) at the moment of posting — only to display a badge next to the post. Can be disabled in settings.\n\n"
+            "WHAT WE DO NOT STORE\n"
+            "• Your password in plain text\n"
+            "• Your IP address. IP is used only to detect language and city at page load and is not saved to the database.\n"
+            "• Post view history (only a counter is kept, at most once per 8 hours per user).\n"
+            "• No third-party cookies, analytics, trackers, or ad identifiers.\n\n"
+            "HOW WE USE DATA\n"
+            "• To display your profile and posts to other users\n"
+            "• To send you notifications about other users' actions\n"
+            "• To detect language and city — only to show them to you in settings\n"
+            "• No analytics, no ads, no tracking.\n\n"
+            "WHERE DATA IS STORED\n"
+            "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties.\n\n"
+            "YOUR RIGHTS\n"
+            "• View and edit your profile\n"
+            "• Delete your posts and comments\n"
+            "• Unfollow users at any time\n"
+            "• Disable any type of notification in settings\n"
+            "• Hide your followers / following lists\n"
+            "• Disable the device badge on your posts\n"
+            "• Delete your account — write to us and we will remove all your data within 30 days\n\n"
+            "RETENTION & DELETION\n"
+            "Data is retained while your account is active. When you delete your account, all posts, comments, likes, follows and notifications are permanently removed.\n\n"
+            "COOKIES AND LOCALSTORAGE\n"
+            "We use:\n"
+            "• localStorage: SLD_token (session token), SLD_user (profile cache), SLD_theme (theme), SLD_lang (language), SLD_colors (colors), SLD_anon_id (anonymous identifier for realtime)\n"
+            "• One cookie: SLD_lang — only to store your language choice\n"
+            "No third-party cookies.\n\n"
+            "CHILDREN\n"
+            "The service is not intended for users under 13. We do not knowingly collect data from children.\n\n"
+            "CHANGES\n"
+            "We may update this policy. The current version is always available at this link. By continuing to use the service you agree to the updates.\n\n"
+            "CONTACT\n"
+            "For privacy questions or data deletion — write to us via the developer's profile.\n\n"
+            "The service is provided \"as is\", without warranties."
         ),
         "quote": "Quote",
         "avatar_choose": "Choose an emoji",
         "avatar_current": "Current avatar",
         "og_enable": "Link previews",
-        "color_default": "Default",
         "color_blue": "Blue",
         "color_green": "Green",
         "color_purple": "Purple",
         "color_pink": "Pink",
         "color_orange": "Orange",
         "color_red": "Red",
-        "reset_colors": "Reset",
-        "settings_saved": "Saved",
+        "color_teal": "Teal",
+        "color_indigo": "Indigo",
+        "color_accent": "Accent",
+        "color_likes": "Likes",
+        "reset_colors": "Reset colors",
+        "sent_from_mobile": "Sent from a phone",
+        "sent_from_desktop": "Sent from a computer",
     },
 }
 
@@ -1890,8 +1874,6 @@ def svg(paths: str, size: int = 20, sw: float = 2) -> str:
 
 
 I_HOME = svg('<path d="M3 10l9-7 9 7v11a2 2 0 0 1-2 2h-4v-8h-6v8H5a2 2 0 0 1-2-2z"/>')
-I_WALLS = svg('<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>'
-    '<rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>')
 I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
     '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
@@ -1905,8 +1887,8 @@ I_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
 I_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
     '<polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>')
 I_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>')
-I_HEART = svg('<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>', size=16, sw=2)
-I_HEART_FILLED = svg('<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" fill="currentColor"/>', size=16, sw=2)
+I_HEART = svg('<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>', size=16)
+I_HEART_FILLED = svg('<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" fill="currentColor"/>', size=16)
 I_COMMENT = svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>', size=16)
 I_QUOTE = svg('<path d="M6 17h3l2-4V7H5v6h3z"/><path d="M14 17h3l2-4V7h-6v6h3z"/>', size=16)
 I_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=16)
@@ -1925,6 +1907,8 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
 I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=15)
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 I_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=14, sw=3)
+I_MOBILE = svg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
+I_DESKTOP = svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>', size=12)
 
 FAVICON = ("data:image/svg+xml,"
     "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
@@ -1938,16 +1922,16 @@ CSS = """
 :root, [data-theme="dark"] {
   --bg:#0a0a0a; --card:#121212; --card-2:#1a1a1a; --line:#232323; --line-2:#2c2c2c;
   --text:#f2f2f2; --muted:#8a8a8a; --hover:#1e1e1e;
-  --accent:#f2f2f2; --accent-fg:#0a0a0a; --accent-soft:#1e1e1e;
+  --accent:#3b82f6; --accent-fg:#ffffff; --accent-soft:#152238;
   --like:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
-  --toggle-on:#f2f2f2; --toggle-on-fg:#0a0a0a;
+  --toggle-on:#3b82f6; --toggle-on-fg:#ffffff;
 }
 [data-theme="light"] {
   --bg:#f2f3f5; --card:#ffffff; --card-2:#f0f1f3; --line:#e6e6e9; --line-2:#d6d6da;
   --text:#0a0a0a; --muted:#707070; --hover:#f0f1f3;
-  --accent:#0a0a0a; --accent-fg:#ffffff; --accent-soft:#eef0f3;
+  --accent:#2563eb; --accent-fg:#ffffff; --accent-soft:#e0ecff;
   --like:#dc2626; --danger:#dc2626; --mention:#2b6fff;
-  --toggle-on:#0a0a0a; --toggle-on-fg:#ffffff;
+  --toggle-on:#2563eb; --toggle-on-fg:#ffffff;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body {
@@ -1961,17 +1945,15 @@ body {
   user-select: none; -webkit-user-select: none;
 }
 input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px; }
-* { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
 
-/* LAYOUT — уменьшили max-width, чтобы скроллбар был ближе к контенту */
+/* Полное отключение скроллбаров */
+* { scrollbar-width: none; -ms-overflow-style: none; }
+*::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
+
 .layout {
   display: flex; width: 100%; height: 100vh; height: 100dvh;
   background: var(--bg); max-width: 1040px; margin: 0 auto;
 }
-
 .sidebar {
   flex: 0 0 240px; width: 240px;
   background: var(--bg); display: flex; flex-direction: column;
@@ -1993,6 +1975,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--accent-soft); color: var(--text); font-weight: 700; }
 .nav-btn svg { flex-shrink: 0; color: var(--muted); }
+.nav-btn.active svg { color: var(--accent); }
 .nav-btn .badge {
   margin-left: auto; min-width: 22px; height: 22px;
   background: var(--danger); color: #fff;
@@ -2070,22 +2053,21 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
 .card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
 
-/* COMPOSER */
 .composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-body { flex: 1; min-width: 0; }
 .composer-body textarea {
   display: block; width: 100%; background: transparent; border: none;
   outline: none; resize: none; color: var(--text);
   font-family: inherit; font-size: 16px; line-height: 1.55;
-  min-height: 56px; max-height: 400px; padding: 6px 0 0; overflow: hidden;
+  min-height: 56px; max-height: 500px; padding: 6px 0 0; overflow: hidden;
 }
 .composer-body textarea::placeholder { color: var(--muted); }
 .composer-actions {
   display: flex; align-items: center; gap: 10px;
   margin-top: 12px; flex-wrap: wrap;
 }
+.composer-hint { font-size: 11px; color: var(--muted); }
 
-/* CUSTOM CHECKBOX */
 .og-toggle {
   display: inline-flex; align-items: center; gap: 8px;
   font-size: 13px; color: var(--muted);
@@ -2139,7 +2121,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
-/* EMOJI AVATAR */
 .avatar {
   width: 44px; height: 44px; flex-shrink: 0; border-radius: 50%;
   background: var(--card-2);
@@ -2149,7 +2130,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .avatar.sm { width: 36px; height: 36px; font-size: 20px; }
 .avatar.lg { width: 72px; height: 72px; font-size: 40px; }
 
-/* PROFILE — compact */
 .profile-hero {
   background: var(--card); border-radius: 20px;
   padding: 16px;
@@ -2167,11 +2147,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   line-height: 1.2;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* Строка ник+био — минимальные отступы */
 .profile-line {
   display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
   margin: 0 0 6px;
-  min-height: 0;
   line-height: 1.3;
 }
 .profile-line.only-nick { margin-bottom: 4px; }
@@ -2184,7 +2162,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   font-size: 14px; line-height: 1.35;
   color: var(--text);
   min-width: 0;
-  margin: 0;
   word-wrap: break-word; overflow-wrap: anywhere;
 }
 .profile-stats {
@@ -2200,10 +2177,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   margin-top: 4px;
   line-height: 1.2;
 }
-.profile-hero-actions {
-  display: flex; gap: 8px; align-items: center;
-  flex-wrap: wrap;
-}
+.profile-hero-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .pill-action {
   height: 38px; padding: 0 18px;
   background: var(--card-2); color: var(--text);
@@ -2224,7 +2198,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .round-action:hover { background: var(--hover); }
 
-/* POST */
 .post-card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
 .post-header {
   display: flex; align-items: flex-start; gap: 12px;
@@ -2232,14 +2205,16 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .post-header .meta { flex: 1; min-width: 0; }
 .post-header .who {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14px;
 }
 .post-author { font-weight: 700; color: var(--text); text-decoration: none; }
 .post-author:hover { text-decoration: underline; }
 .post-time { color: var(--muted); font-size: 13px; }
-.post-wall-hint { color: var(--muted); font-size: 13px; }
-.post-wall-hint a { color: var(--muted); text-decoration: none; }
-.post-wall-hint a:hover { color: var(--text); }
+.device-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--muted); flex-shrink: 0; line-height: 0;
+}
+.device-badge svg { display: block; }
 
 .post-menu {
   display: flex; gap: 2px; margin-left: auto; flex-shrink: 0;
@@ -2257,6 +2232,8 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .mention { color: var(--mention); text-decoration: none; font-weight: 600; }
 .mention:hover { text-decoration: underline; }
+.ext-link { color: var(--accent); text-decoration: none; word-break: break-all; }
+.ext-link:hover { text-decoration: underline; }
 .read-more {
   display: inline-block; margin-top: 4px;
   color: var(--muted); text-decoration: none;
@@ -2325,12 +2302,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .act-btn:hover { background: var(--hover); color: var(--text); }
 .act-btn svg { display: block; }
 .act-btn.danger:hover { color: var(--danger); }
-
 .like-btn { display: inline-flex; align-items: center; gap: 6px; }
 .like-btn:hover { color: var(--like); }
 .like-btn.active { color: var(--like); }
 .like-btn .num { font-variant-numeric: tabular-nums; }
-
 .views-badge {
   margin-left: auto; color: var(--muted); font-size: 13px;
   display: inline-flex; align-items: center; gap: 5px;
@@ -2342,15 +2317,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   background: var(--card); border-radius: 20px;
   min-height: 320px;
 }
-.not-found-code {
-  font-size: 88px; font-weight: 900; line-height: 1;
-  color: var(--line-2); letter-spacing: -2px;
-}
-.not-found-text {
-  font-size: 15px; color: var(--muted); text-align: center;
-}
+.not-found-code { font-size: 88px; font-weight: 900; line-height: 1; color: var(--line-2); letter-spacing: -2px; }
+.not-found-text { font-size: 15px; color: var(--muted); text-align: center; }
 
-/* PEOPLE / WALLS LIST */
 .user-row {
   display: flex; align-items: center; gap: 14px;
   background: var(--card); padding: 14px 16px;
@@ -2369,7 +2338,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* NOTIFICATIONS */
 .notif-row {
   display: flex; align-items: flex-start; gap: 12px;
   background: var(--card); padding: 14px 16px;
@@ -2390,7 +2358,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .notif-row .time { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
-/* SETTINGS */
 .settings-layout {
   display: flex; gap: 20px;
   max-width: 100%; margin: 0 auto; width: 100%;
@@ -2407,6 +2374,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .settings-nav-btn:hover { background: var(--hover); }
 .settings-nav-btn.active { background: var(--card); color: var(--text); }
+.settings-nav-btn.active svg { color: var(--accent); }
 .settings-nav-btn svg { color: var(--muted); flex-shrink: 0; }
 .settings-content { flex: 1; min-width: 0; }
 .settings-block {
@@ -2453,7 +2421,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .toggle.on::after { transform: translateX(20px); }
 
 .settings-desc { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; }
-.settings-link { display: inline-block; color: var(--text); text-decoration: underline; font-size: 14px; font-weight: 500; }
+.settings-link { display: inline-block; color: var(--accent); text-decoration: underline; font-size: 14px; font-weight: 500; }
 
 .device-info { display: flex; flex-direction: column; gap: 8px; }
 .device-info-row {
@@ -2464,10 +2432,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .device-info-row .label { color: var(--muted); font-weight: 500; }
 .device-info-row .value { color: var(--text); font-weight: 700; }
 
-/* COLOR PICKER */
-.color-swatches {
-  display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;
-}
+.color-swatches { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
 .color-swatch {
   width: 36px; height: 36px; border-radius: 50%;
   border: 2px solid transparent; cursor: pointer;
@@ -2476,12 +2441,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .color-swatch:hover { transform: scale(1.08); }
 .color-swatch.active { border-color: var(--text); }
-.color-swatch.active::after {
-  content: ''; position: absolute; inset: 0;
-  display: flex; align-items: center; justify-content: center;
-}
 
-/* EMOJI PICKER */
 .emoji-current {
   display: flex; align-items: center; gap: 14px;
   padding: 14px; background: var(--card-2);
@@ -2505,7 +2465,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .emoji-opt:hover { background: var(--hover); }
 .emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
 
-/* AUTH */
 .auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
 .auth-card { background: var(--card); border-radius: 24px; padding: 32px; max-width: 400px; width: 100%; }
 .auth-card h1 { font-size: 26px; font-weight: 800; margin: 0 0 24px; }
@@ -2540,7 +2499,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner {
   display: inline-block; width: 28px; height: 28px;
-  border: 3px solid var(--line-2); border-top-color: var(--text);
+  border: 3px solid var(--line-2); border-top-color: var(--accent);
   animation: spin .7s linear infinite; border-radius: 50%;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -2607,7 +2566,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); }
 
-/* EDIT PROFILE - compact textarea */
 .edit-bio-textarea {
   padding: 15px 18px; background: var(--card-2); border: none;
   color: var(--text); font-family: inherit; font-size: 15px;
@@ -2616,7 +2574,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   line-height: 1.4;
 }
 
-/* TABLET */
 @media (max-width: 1100px) and (min-width: 901px) {
   .layout { max-width: 100%; }
   .sidebar { flex: 0 0 76px; width: 76px; padding: 16px 8px; }
@@ -2628,7 +2585,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
     min-width: 18px; height: 18px; line-height: 18px; font-size: 10px; padding: 0 5px; }
 }
 
-/* MOBILE */
 @media (max-width: 900px) {
   .layout { flex-direction: column; max-width: 100%; }
   .main {
@@ -2679,7 +2635,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
     flex: 0 0 auto; flex-direction: row;
     overflow-x: auto; scrollbar-width: none; margin-bottom: 8px;
   }
-  .settings-nav::-webkit-scrollbar { display: none; }
   .settings-nav-btn {
     flex-shrink: 0; padding: 10px 16px;
     background: var(--card); border-radius: 12px; font-size: 13px;
@@ -2712,28 +2667,29 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
 JS = r"""
 var ICONS = {
-  home: __I_HOME__, walls: __I_WALLS__, users: __I_USERS__, user: __I_USER__,
+  home: __I_HOME__, users: __I_USERS__, user: __I_USER__,
   bell: __I_BELL__, gear: __I_GEAR__,
   logout: __I_LOGOUT__, login: __I_LOGIN__, plus: __I_PLUS__,
   heart: __I_HEART__, heart_filled: __I_HEART_FILLED__, comment: __I_COMMENT__,
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
   back: __I_BACK__, search: __I_SEARCH__,
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
-  eye: __I_EYE__, cal: __I_CAL__, check: __I_CHECK__
+  eye: __I_EYE__, cal: __I_CAL__, check: __I_CHECK__,
+  mobile: __I_MOBILE__, desktop: __I_DESKTOP__
 };
 
 var EMOJIS = __EMOJIS__;
 var DEFAULT_EMOJI = '🐱';
 
-/* Color presets for appearance settings */
 var COLOR_PRESETS = {
   accent: [
-    { id: 'default', ru: 'Стандарт', en: 'Default', dark: '#f2f2f2', light: '#0a0a0a' },
-    { id: 'blue',    ru: 'Синий',    en: 'Blue',    dark: '#3b82f6', light: '#2563eb' },
-    { id: 'green',   ru: 'Зелёный',  en: 'Green',   dark: '#22c55e', light: '#16a34a' },
-    { id: 'purple',  ru: 'Фиолетовый', en: 'Purple', dark: '#a855f7', light: '#9333ea' },
-    { id: 'pink',    ru: 'Розовый',  en: 'Pink',    dark: '#ec4899', light: '#db2777' },
-    { id: 'orange',  ru: 'Оранжевый',en: 'Orange',  dark: '#f97316', light: '#ea580c' },
+    { id: 'blue',    ru: 'Синий',     en: 'Blue',     dark: '#3b82f6', light: '#2563eb' },
+    { id: 'green',   ru: 'Зелёный',   en: 'Green',    dark: '#22c55e', light: '#16a34a' },
+    { id: 'purple',  ru: 'Фиолетовый',en: 'Purple',   dark: '#a855f7', light: '#9333ea' },
+    { id: 'pink',    ru: 'Розовый',   en: 'Pink',     dark: '#ec4899', light: '#db2777' },
+    { id: 'orange',  ru: 'Оранжевый', en: 'Orange',   dark: '#f97316', light: '#ea580c' },
+    { id: 'teal',    ru: 'Бирюзовый', en: 'Teal',     dark: '#14b8a6', light: '#0d9488' },
+    { id: 'indigo',  ru: 'Индиго',    en: 'Indigo',   dark: '#6366f1', light: '#4f46e5' },
   ],
   like: [
     { id: 'red',    ru: 'Красный',   en: 'Red',     dark: '#ef4444', light: '#dc2626' },
@@ -2753,21 +2709,22 @@ function applyColors() {
   var c = loadColors();
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var root = document.documentElement.style;
-  // accent
-  if (c.accent && c.accent !== 'default') {
+  if (c.accent) {
     var p = COLOR_PRESETS.accent.find(function(x){ return x.id === c.accent; });
     if (p) {
       var val = theme === 'dark' ? p.dark : p.light;
       root.setProperty('--accent', val);
       root.setProperty('--toggle-on', val);
-      root.setProperty('--accent-fg', theme === 'dark' ? '#0a0a0a' : '#ffffff');
+      root.setProperty('--accent-fg', '#ffffff');
+      // accent-soft — полупрозрачный вариант
+      root.setProperty('--accent-soft', val + '22');
     }
   } else {
     root.removeProperty('--accent');
     root.removeProperty('--toggle-on');
     root.removeProperty('--accent-fg');
+    root.removeProperty('--accent-soft');
   }
-  // like
   if (c.like) {
     var pl = COLOR_PRESETS.like.find(function(x){ return x.id === c.like; });
     if (pl) root.setProperty('--like', theme === 'dark' ? pl.dark : pl.light);
@@ -2785,6 +2742,12 @@ function setColor(key, id) {
 var cachedUser = null;
 try { cachedUser = JSON.parse(localStorage.getItem('SLD_user') || 'null'); } catch(e) { cachedUser = null; }
 
+var anonId = localStorage.getItem('SLD_anon_id');
+if (!anonId) {
+  anonId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  localStorage.setItem('SLD_anon_id', anonId);
+}
+
 var state = {
   user: cachedUser,
   token: localStorage.getItem('SLD_token') || null,
@@ -2793,12 +2756,10 @@ var state = {
   feedMode: 'all',
   peopleTab: 'all',
   peopleQuery: '',
-  wallsQuery: '',
   searchQuery: '',
   composerDraft: '',
   quotePostId: null,
   quotePreview: null,
-  wallDraft: '',
   replyTo: null,
   highlightComment: null,
   suppressRefresh: 0,
@@ -2853,6 +2814,25 @@ function linkifyMentions(escaped) {
     return pre + '<a class="mention" href="/u/' + encodeURIComponent(nick) + '" data-link>@' + nick + '</a>';
   });
 }
+function linkifyText(raw) {
+  if (!raw) return '';
+  var parts = [];
+  var re = /(https?:\/\/[^\s<>"']+)/g;
+  var last = 0, m;
+  while ((m = re.exec(raw)) !== null) {
+    if (m.index > last) parts.push({ type: 'text', v: raw.slice(last, m.index) });
+    parts.push({ type: 'url', v: m[0] });
+    last = m.index + m[0].length;
+  }
+  if (last < raw.length) parts.push({ type: 'text', v: raw.slice(last) });
+  return parts.map(function(p){
+    if (p.type === 'url') {
+      var safe = escapeHtml(p.v);
+      return '<a class="ext-link" href="' + safe + '" target="_blank" rel="noopener noreferrer">' + safe + '</a>';
+    }
+    return linkifyMentions(escapeHtml(p.v));
+  }).join('');
+}
 function tr(k) { return T[k] || k; }
 function timeAgo(ts) {
   var d = Math.floor(Date.now()/1000 - ts);
@@ -2891,7 +2871,7 @@ function notFoundHtml() {
 function autoGrow(el) {
   if (!el) return;
   el.style.height = 'auto';
-  var maxH = 400;
+  var maxH = 500;
   var h = Math.min(el.scrollHeight, maxH);
   el.style.height = h + 'px';
   el.style.overflowY = (el.scrollHeight > maxH) ? 'auto' : 'hidden';
@@ -2928,7 +2908,6 @@ function toggleTheme() {
 applyTheme(localStorage.getItem('SLD_theme') || 'dark');
 applyColors();
 
-/* Иконка кнопки темы зависит от темы */
 function themeIconHtml() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   return theme === 'dark' ? ICONS.sun : ICONS.moon;
@@ -2939,8 +2918,6 @@ function bindThemeBtn() {
   b.innerHTML = themeIconHtml();
   b.addEventListener('click', function(){
     toggleTheme();
-    b.innerHTML = themeIconHtml();
-    // Обновим иконку на всех кнопках темы на странице
     document.querySelectorAll('#mainThemeBtn').forEach(function(x){ x.innerHTML = themeIconHtml(); });
   });
 }
@@ -2951,33 +2928,26 @@ function navigate(url, force) {
   handleRoute();
 }
 
-/* МНОЖЕСТВО комнат */
 function computeRooms() {
   var rooms = [];
   if (state.view === 'feed') rooms.push('feed');
   else if (state.view === 'post') rooms.push('post:' + (state.viewData.post_id || ''));
-  else if (state.view === 'profile') {
-    rooms.push('profile:' + (state.viewData.nick || ''));
-    if (state.profileTab === 'wall') rooms.push('wall:' + (state.viewData.nick || ''));
-  }
-  else if (state.view === 'wall') rooms.push('wall:' + (state.viewData.nick || ''));
-  else if (state.view === 'walls') rooms.push('walls');
-  else if (state.view === 'users') rooms.push('users');
+  else if (state.view === 'profile') rooms.push('profile:' + (state.viewData.nick || ''));
   return rooms;
 }
 function roomsEqual(a, b) {
   if (!a || !b) return false;
   if (a.length !== b.length) return false;
-  var sa = a.slice().sort().join('|');
-  var sb = b.slice().sort().join('|');
-  return sa === sb;
+  return a.slice().sort().join('|') === b.slice().sort().join('|');
 }
 function updateRoom() {
-  if (!state.token) return;
   var rooms = computeRooms();
-  if (roomsEqual(rooms, state.currentRooms)) return;
+  if (state.token && roomsEqual(rooms, state.currentRooms)) return;
+  if (!state.token && roomsEqual(rooms, state.currentRooms)) return;
   state.currentRooms = rooms;
-  api('/api/room', { method: 'POST', body: { rooms: rooms } }).catch(function(){});
+  var body = { rooms: rooms };
+  if (!state.token) body.anon_id = anonId;
+  api('/api/room', { method: 'POST', body: body }).catch(function(){});
 }
 
 function handleRoute() {
@@ -2986,10 +2956,6 @@ function handleRoute() {
   else if ((m = path.match(/^\/p\/([a-z0-9]+)$/))) {
     state.view = 'post'; state.viewData = { post_id: m[1] };
     state.highlightComment = (location.hash && location.hash.match(/^#c-(.+)$/)) ? location.hash.slice(3) : null;
-  }
-  else if (path === '/walls') { state.view = 'walls'; state.viewData = {}; }
-  else if ((m = path.match(/^\/u\/([^\/]+)\/wall$/))) {
-    state.view = 'wall'; state.viewData = { nick: decodeURIComponent(m[1]) };
   }
   else if ((m = path.match(/^\/u\/([^\/]+)\/followers$/))) {
     state.view = 'followers'; state.viewData = { nick: decodeURIComponent(m[1]) };
@@ -3003,11 +2969,7 @@ function handleRoute() {
   }
   else if (path === '/users') { state.view = 'users'; state.viewData = {}; state.peopleTab = 'all'; }
   else if (path === '/notifications') { state.view = 'notifications'; state.viewData = {}; }
-  else if (path === '/settings') { 
-    state.view = 'settings'; state.viewData = {};
-    var h = (location.hash || '').replace('#', '');
-    state.settingsSection = (['account','privacy','appearance','info'].indexOf(h) >= 0) ? h : 'account';
-  }
+  else if (path === '/settings') { state.view = 'settings'; state.viewData = {}; }
   else if (path === '/settings/profile') { state.view = 'edit_profile'; state.viewData = {}; }
   else if (path === '/policy') { state.view = 'policy'; state.viewData = {}; }
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
@@ -3022,15 +2984,6 @@ function handleRoute() {
   updateRoom();
 }
 window.addEventListener('popstate', handleRoute);
-window.addEventListener('hashchange', function(){
-  if (state.view === 'settings') {
-    var h = (location.hash || '').replace('#', '');
-    if (['account','privacy','appearance','info'].indexOf(h) >= 0) {
-      state.settingsSection = h;
-      renderMain();
-    }
-  }
-});
 
 async function loadMe() {
   if (!state.token) return;
@@ -3051,7 +3004,10 @@ function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
     disconnectSSE(); setUser(null); state.token = null;
-    setNotifCount(0); localStorage.removeItem('SLD_token'); navigate('/', true);
+    setNotifCount(0); localStorage.removeItem('SLD_token');
+    navigate('/', true);
+    // переподключаем анонимный SSE
+    connectSSE();
   }, { yesText: tr('confirm_yes') });
 }
 
@@ -3068,9 +3024,11 @@ function disconnectSSE() {
   state.currentRooms = [];
 }
 function connectSSE() {
-  if (!state.token) return;
   disconnectSSE();
-  var es = new EventSource('/api/events?token=' + encodeURIComponent(state.token));
+  var url = '/api/events';
+  if (state.token) url += '?token=' + encodeURIComponent(state.token);
+  else url += '?anon=' + encodeURIComponent(anonId);
+  var es = new EventSource(url);
   state.es = es;
   es.onmessage = function(e) { try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
   es.onerror = function() {};
@@ -3083,7 +3041,7 @@ function scheduleRefresh() {
     var active = document.activeElement;
     if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) return;
     refreshCurrentView();
-  }, 700);
+  }, 500);
 }
 function handleEvent(ev) {
   if (!ev || !ev.type) return;
@@ -3091,6 +3049,13 @@ function handleEvent(ev) {
   if (ev.type === 'notif_changed') {
     refreshCounters();
     if (state.view === 'notifications') loadNotifications();
+    return;
+  }
+  if (ev.type === 'view_update') {
+    // Обновим счётчик просмотров на всех постах с этим id
+    document.querySelectorAll('[data-post-id="' + ev.post_id + '"] [data-views]').forEach(function(el){
+      el.textContent = ev.views;
+    });
     return;
   }
   if (ev.type === 'post_deleted') {
@@ -3118,7 +3083,6 @@ function renderSidebar() {
   if (!el) return;
   var html = '<div class="logo">SLD</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
-  html += navBtn(ICONS.walls, tr('nav_walls'), state.view === 'walls' || state.view === 'wall', 'walls');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
     html += navBtn(ICONS.bell, tr('nav_notifications'),
@@ -3140,7 +3104,6 @@ function renderSidebar() {
     b.addEventListener('click', function(){
       var nav = b.dataset.nav;
       if (nav === 'home') navigate('/');
-      else if (nav === 'walls') navigate('/walls');
       else if (nav === 'users') navigate('/users');
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
@@ -3164,8 +3127,6 @@ function renderMain() {
   if (state.view === 'feed') renderFeedView(el);
   else if (state.view === 'post') renderPostView(el);
   else if (state.view === 'profile') renderProfileView(el);
-  else if (state.view === 'wall') renderWallView(el);
-  else if (state.view === 'walls') renderWallsListView(el);
   else if (state.view === 'followers' || state.view === 'following') renderFollowListView(el);
   else if (state.view === 'users') renderUsersView(el);
   else if (state.view === 'notifications') renderNotificationsView(el);
@@ -3207,6 +3168,7 @@ function composerHtml(opts) {
     + '<div class="composer-actions">'
     + '<label class="og-toggle"><input type="checkbox" id="' + idPrefix + 'OgEnabled"' + (ogOn ? ' checked' : '') + '/><span class="cb">' + ICONS.check + '</span><span>' + tr('og_enable') + '</span></label>'
     + '<div class="spacer"></div>'
+    + '<span class="composer-hint">Shift+Enter</span>'
     + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted)">0 / ' + MAX_POST_LEN + '</span>'
     + '<button class="publish-btn" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
     + '</div></div></div></div>';
@@ -3235,16 +3197,23 @@ function bindComposer(opts) {
   var sendBtn = document.getElementById(idPrefix + 'Send');
   var counter = document.getElementById(idPrefix + 'Counter');
   if (!inputEl || !sendBtn) return;
+  var maxLen = opts.maxLen || MAX_POST_LEN;
   function upd(){
     var len = inputEl.value.length;
-    if (counter) counter.textContent = len + ' / ' + MAX_POST_LEN;
+    if (counter) counter.textContent = len + ' / ' + maxLen;
     var empty = len === 0 && !state.quotePostId;
-    sendBtn.disabled = empty || len > MAX_POST_LEN;
-    if (opts.draftKey === 'wall') state.wallDraft = inputEl.value;
-    else state.composerDraft = inputEl.value;
+    sendBtn.disabled = empty || len > maxLen;
+    state.composerDraft = inputEl.value;
     autoGrow(inputEl);
   }
   inputEl.addEventListener('input', upd);
+  // Shift+Enter — отправить, Enter — перенос строки
+  inputEl.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendBtn.click();
+    }
+  });
   sendBtn.addEventListener('click', async function(){
     var text = inputEl.value.trim();
     if (!text && !state.quotePostId) return;
@@ -3254,8 +3223,7 @@ function bindComposer(opts) {
     try {
       await onSend(text, state.quotePostId, ogEnabled);
       inputEl.value = '';
-      if (opts.draftKey === 'wall') state.wallDraft = '';
-      else state.composerDraft = '';
+      state.composerDraft = '';
       state.quotePostId = null; state.quotePreview = null;
       renderQuoteBox(idPrefix);
       upd();
@@ -3272,7 +3240,6 @@ function renderFeedView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('nav_home') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
-  /* Поиск выше лент/подписок */
   html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
   html += '<div class="pill-tabs">';
   html += '<button class="pill-tab' + (state.feedMode==='all'?' active':'') + '" data-mode="all">' + tr('feed_all') + '</button>';
@@ -3357,6 +3324,7 @@ function renderPostView(el) {
     bindComposer({
       idPrefix: 'comment',
       placeholder: tr('comment_ph'),
+      maxLen: MAX_COMMENT_LEN,
       onSend: async function(text){
         var body = { text: text };
         if (state.replyTo) body.parent_id = state.replyTo.id;
@@ -3376,13 +3344,7 @@ async function loadPostView() {
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl);
     if (state.user && p.author !== state.user.nick) {
-      api('/api/posts/' + state.viewData.post_id + '/view', { method: 'POST' })
-        .then(function(res){
-          if (res && res.counted) {
-            var viewsEl = feedEl.querySelector('[data-views]');
-            if (viewsEl) viewsEl.textContent = (parseInt(viewsEl.textContent, 10) || 0) + 1;
-          }
-        }).catch(function(){});
+      api('/api/posts/' + state.viewData.post_id + '/view', { method: 'POST' }).catch(function(){});
     }
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
@@ -3420,12 +3382,8 @@ async function loadProfile(nick) {
       actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
 
-    /* Пустая био больше не занимает места */
     var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
     var lineClass = u.bio ? 'profile-line' : 'profile-line only-nick';
-
-    /* wallOn — только явное false блокирует */
-    var wallOn = u.wall_enabled !== false;
 
     var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
       + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button>'
@@ -3449,13 +3407,6 @@ async function loadProfile(nick) {
     html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
     html += '</div>';
 
-    if (wallOn) {
-      html += '<div class="pill-tabs" id="profileTabs">'
-        + '<button class="pill-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('tab_posts') + '</button>'
-        + '<button class="pill-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('tab_wall') + '</button>'
-        + '</div>';
-    }
-
     html += '<div id="profileContent">' + spinner() + '</div>';
     root.innerHTML = html;
     bindThemeBtn(); bindLinks(root);
@@ -3478,236 +3429,38 @@ async function loadProfile(nick) {
       } catch(e) { alert(tr(e.message) || e.message); }
     });
 
-    if (wallOn) {
-      root.querySelectorAll('.pill-tab').forEach(function(t){
-        t.addEventListener('click', function(){
-          state.profileTab = t.dataset.tab;
-          root.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
-          updateRoom(); /* пересчитаем комнаты — если вкладка wall, подпишемся на wall:nick */
-          loadProfileContent(u, isMe);
-        });
-      });
-    }
     loadProfileContent(u, isMe);
   } catch(e) {
     root.innerHTML = notFoundHtml();
     bindLinks(root);
   }
 }
-
 async function loadProfileContent(u, isMe) {
   var c = document.getElementById('profileContent');
   if (!c) return;
   c.innerHTML = spinner();
-
-  if (state.profileTab === 'wall' && u.wall_enabled !== false) {
-    try {
-      var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
-      if (!data.can_view) {
-        var reasonText = data.reason === 'err_wall_off' ? tr('err_wall_off')
-                       : data.reason === 'err_wall_community' ? tr('wall_community_hint')
-                       : '';
-        var body = '<div class="card" style="text-align:center;padding:32px 20px">'
-          + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
-          + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(reasonText) + '</div>';
-        if (data.reason === 'err_wall_community' && state.user && !isMe) {
-          body += '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">'
-            + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
-        }
-        body += '</div>';
-        c.innerHTML = body;
-        var wf = document.getElementById('wallFollowBtn');
-        if (wf) wf.addEventListener('click', async function(){
-          try {
-            if (u.is_following) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-            else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-            loadProfile(u.nick);
-          } catch(e) { alert(tr(e.message) || e.message); }
-        });
-        return;
-      }
-      var html = '';
-      /* Владелец может писать на своей стене БЕЗ подписки на себя */
-      if (state.user && data.can_post) {
-        html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
-      } else if (state.user) {
-        var reasonText2 = data.reason === 'err_need_follow' ? tr('err_need_follow')
-                        : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                        : '';
-        if (reasonText2) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText2) + '</div>';
-      }
-      if (data.posts.length) {
-        html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-      } else if (state.user && data.can_post) {
-        html += '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
-      } else if (!state.user) {
-        html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
-      }
-      c.innerHTML = html;
-      bindPostActions(c); bindLinks(c);
-      if (state.user && data.can_post) {
-        bindComposer({
-          idPrefix: 'wall', draftKey: 'wall',
-          onSend: async function(text, quotedId, ogEnabled){
-            await api('/api/users/' + encodeURIComponent(u.nick) + '/wall', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
-            loadProfileContent(u, isMe);
-          }
-        });
-      }
-    } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
-  } else {
-    var html2 = '';
-    if (state.user && isMe) {
-      html2 += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
-    }
-    try {
-      var d2 = await api('/api/posts?author=' + encodeURIComponent(u.nick));
-      var posts2 = (d2.posts || []).slice();
-      posts2.sort(function(a, b){ return b.created_at - a.created_at; });
-      if (!posts2.length) html2 += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
-      else html2 += posts2.map(function(p){ return renderPostHtml(p, false); }).join('');
-      c.innerHTML = html2;
-      bindPostActions(c); bindLinks(c);
-      if (state.user && isMe) {
-        bindComposer({
-          idPrefix: 'profile_post',
-          onSend: async function(text, quotedId, ogEnabled){
-            await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
-            loadProfileContent(u, isMe);
-          }
-        });
-      }
-    } catch(e) { c.innerHTML = html2 + '<div class="empty">—</div>'; }
+  var html = '';
+  if (state.user && isMe) {
+    html += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
   }
-}
-
-/* ============ WALLS LIST ============ */
-function renderWallsListView(el) {
-  var html = '<div class="main-header"><div class="title">' + tr('walls_title') + '</div>'
-    + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
-  html += '<div class="main-body"><div class="main-inner">';
-  html += '<div class="search-box">' + ICONS.search + '<input id="wallsSearch" type="text" placeholder="' + escapeHtml(tr('walls_search_ph')) + '" value="' + escapeHtml(state.wallsQuery) + '" /></div>';
-  html += '<div style="color:var(--muted);font-size:13px;margin-bottom:12px;padding:0 4px">' + escapeHtml(tr('walls_subtitle')) + '</div>';
-  html += '<div id="list">' + spinner() + '</div>';
-  html += '</div></div>';
-  el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
-  var searchEl = document.getElementById('wallsSearch');
-  var tId;
-  searchEl.addEventListener('input', function(){
-    state.wallsQuery = searchEl.value;
-    clearTimeout(tId); tId = setTimeout(loadWallsList, 250);
-  });
-  loadWallsList();
-}
-function wallRowHtml(u) {
-  return '<div class="user-row" data-link-row="/u/' + encodeURIComponent(u.nick) + '/wall">'
-    + avatarHtml(u.avatar_emoji, 'sm')
-    + '<div class="info">'
-    + '<span class="nick">@' + escapeHtml(u.nick) + '</span>'
-    + '<div class="name">' + escapeHtml(u.name) + '</div>'
-    + '</div>'
-    + '</div>';
-}
-async function loadWallsList() {
-  var wrap = document.getElementById('list');
-  if (!wrap) return;
   try {
-    var q = (state.wallsQuery || '').trim();
-    var data = await api('/api/users?q=' + encodeURIComponent(q));
-    /* Только те, у кого стена включена */
-    var users = (data.users || []).filter(function(u){ return u.wall_enabled !== false; });
-    if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
-    wrap.innerHTML = users.map(wallRowHtml).join('');
-    bindLinks(wrap);
-    wrap.querySelectorAll('[data-link-row]').forEach(function(r){
-      r.addEventListener('click', function(){ navigate(r.dataset.linkRow); });
-    });
-  } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
-}
-
-/* ============ WALL PAGE ============ */
-function renderWallView(el) {
-  var nick = state.viewData.nick;
-  var html = '<div class="main-header">'
-    + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
-    + '<div class="title">@' + escapeHtml(nick) + '</div>'
-    + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
-  html += '<div class="main-body"><div class="main-inner" id="wallRoot">' + spinner() + '</div></div>';
-  el.innerHTML = html;
-  bindThemeBtn();
-  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/walls'); });
-  bindLinks(el);
-  loadWall(nick);
-}
-async function loadWall(nick) {
-  var root = document.getElementById('wallRoot');
-  if (!root) return;
-  try {
-    var data = await api('/api/users/' + encodeURIComponent(nick) + '/wall');
-    var owner = data.owner || {};
-    var html = '';
-
-    html += '<div class="wall-hero">';
-    html += avatarHtml(owner.avatar_emoji, 'lg');
-    html += '<div class="info" style="flex:1;min-width:0">';
-    html += '<div style="font-size:18px;font-weight:800;margin-bottom:4px"><a href="/u/' + encodeURIComponent(owner.nick || nick) + '" data-link style="color:inherit;text-decoration:none">@' + escapeHtml(owner.nick || nick) + '</a></div>';
-    html += '<div style="font-size:14px;color:var(--muted)">' + escapeHtml(owner.name || '') + '</div>';
-    html += '</div></div>';
-
-    if (!data.can_view) {
-      var reasonText = data.reason === 'err_wall_off' ? tr('err_wall_off')
-                     : data.reason === 'err_wall_community' ? tr('wall_community_hint')
-                     : '';
-      html += '<div class="card" style="text-align:center;padding:32px 20px">'
-        + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
-        + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(reasonText) + '</div>';
-      if (data.reason === 'err_wall_community' && state.user && state.user.nick !== nick) {
-        html += '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">'
-          + (owner.is_following ? tr('unfollow') : tr('follow')) + '</button>';
-      }
-      html += '</div>';
-      root.innerHTML = html;
-      bindLinks(root);
-      var wf = document.getElementById('wallFollowBtn');
-      if (wf) wf.addEventListener('click', async function(){
-        try {
-          if (owner.is_following) await api('/api/users/' + encodeURIComponent(nick) + '/unfollow', { method: 'POST' });
-          else await api('/api/users/' + encodeURIComponent(nick) + '/follow', { method: 'POST' });
-          loadWall(nick);
-        } catch(e) { alert(tr(e.message) || e.message); }
-      });
-      return;
-    }
-
-    if (state.user && data.can_post) {
-      html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
-    } else if (state.user) {
-      var r2 = data.reason === 'err_need_follow' ? tr('err_need_follow')
-             : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-             : '';
-      if (r2) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(r2) + '</div>';
-    } else {
-      html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
-    }
-
-    if (data.posts.length) {
-      html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-    } else {
-      html += '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
-    }
-    root.innerHTML = html;
-    bindPostActions(root); bindLinks(root);
-    if (state.user && data.can_post) {
+    var d = await api('/api/posts?author=' + encodeURIComponent(u.nick));
+    var posts = (d.posts || []).slice();
+    posts.sort(function(a, b){ return b.created_at - a.created_at; });
+    if (!posts.length) html += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
+    else html += posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+    c.innerHTML = html;
+    bindPostActions(c); bindLinks(c);
+    if (state.user && isMe) {
       bindComposer({
-        idPrefix: 'wall', draftKey: 'wall',
+        idPrefix: 'profile_post',
         onSend: async function(text, quotedId, ogEnabled){
-          await api('/api/users/' + encodeURIComponent(nick) + '/wall', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
-          loadWall(nick);
+          await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
+          loadProfileContent(u, isMe);
         }
       });
     }
-  } catch(e) { root.innerHTML = notFoundHtml(); bindLinks(root); }
+  } catch(e) { c.innerHTML = html + '<div class="empty">—</div>'; }
 }
 
 /* ============ EDIT PROFILE ============ */
@@ -3925,8 +3678,8 @@ function renderNotifHtml(n) {
     var label = n.type === 'comment' ? tr('notif_comment') : n.type === 'reply' ? tr('notif_reply') : tr('notif_mention');
     text = author + ' ' + label;
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
-  } else if (n.type === 'new_post' || n.type === 'wall_post' || n.type === 'quote') {
-    var lbl = n.type === 'new_post' ? tr('notif_new_post') : n.type === 'wall_post' ? tr('notif_wall_post') : tr('notif_quote');
+  } else if (n.type === 'new_post' || n.type === 'quote') {
+    var lbl = n.type === 'new_post' ? tr('notif_new_post') : tr('notif_quote');
     text = author + ' ' + lbl;
     link = n.post_id ? ('/p/' + n.post_id) : null;
   } else {
@@ -3963,7 +3716,7 @@ function renderSettingsView(el) {
   html += '</nav>';
   html += '<div class="settings-content">';
 
-  /* ==== ACCOUNT ==== */
+  /* ACCOUNT */
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
     html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-block;text-decoration:none;line-height:44px;height:44px;margin-bottom:14px">' + tr('edit_profile') + '</a>';
@@ -3973,30 +3726,28 @@ function renderSettingsView(el) {
   }
   html += '</div>';
 
-  /* ==== PRIVACY ==== */
+  /* PRIVACY */
   html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   if (state.user) {
     html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
     html += settingsToggleRow(tr('settings_allow_followers'), 'allow_followers_view', me.allow_followers_view !== false);
     html += settingsToggleRow(tr('settings_allow_following'), 'allow_following_view', me.allow_following_view !== false);
-    html += settingsToggleRow(tr('settings_allow_wall'), 'allow_wall_posts', me.allow_wall_posts !== false);
-    html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_allow_wall_hint')) + '</p>';
+    html += settingsToggleRow(tr('settings_show_device_badge'), 'show_device_badge', me.show_device_badge !== false);
+    html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_show_device_badge_hint')) + '</p>';
 
-    /* Детальные уведомления */
     html += '<div class="settings-subhead">' + escapeHtml(tr('settings_notifications')) + '</div>';
     html += settingsToggleRow(tr('notify_new_post'),  'notify_on_new_post',  me.notify_on_new_post  !== false);
     html += settingsToggleRow(tr('notify_follow'),    'notify_on_follow',    me.notify_on_follow    !== false);
     html += settingsToggleRow(tr('notify_comment'),   'notify_on_comment',   me.notify_on_comment   !== false);
     html += settingsToggleRow(tr('notify_reply'),     'notify_on_reply',     me.notify_on_reply     !== false);
     html += settingsToggleRow(tr('notify_mention'),   'notify_on_mention',   me.notify_on_mention   !== false);
-    html += settingsToggleRow(tr('notify_wall_post'), 'notify_on_wall_post', me.notify_on_wall_post !== false);
     html += settingsToggleRow(tr('notify_quote'),     'notify_on_quote',     me.notify_on_quote     !== false);
   } else {
     html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
   }
   html += '</div>';
 
-  /* ==== APPEARANCE ==== */
+  /* APPEARANCE */
   html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div style="font-size:13px;color:var(--muted);margin-bottom:8px">' + tr('settings_theme') + '</div>';
   html += '<div class="opt-row">';
@@ -4013,18 +3764,17 @@ function renderSettingsView(el) {
     html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_show_link_previews_hint')) + '</p>';
   }
 
-  /* Цвета */
   html += '<div class="settings-subhead" style="margin-top:16px">' + escapeHtml(tr('settings_colors')) + '</div>';
   html += '<p class="settings-desc" style="margin-bottom:10px">' + escapeHtml(tr('settings_colors_hint')) + '</p>';
-  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + escapeHtml(LANG === 'ru' ? 'Акцент' : 'Accent') + '</div>';
+  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + escapeHtml(tr('color_accent')) + '</div>';
   html += '<div class="color-swatches" data-color-group="accent">';
   COLOR_PRESETS.accent.forEach(function(p){
-    var isActive = (colors.accent || 'default') === p.id;
+    var isActive = (colors.accent || 'blue') === p.id;
     var val = theme === 'dark' ? p.dark : p.light;
     html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG === 'ru' ? p.ru : p.en) + '" style="background:' + val + '"></button>';
   });
   html += '</div>';
-  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + escapeHtml(LANG === 'ru' ? 'Лайки' : 'Likes') + '</div>';
+  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:6px">' + escapeHtml(tr('color_likes')) + '</div>';
   html += '<div class="color-swatches" data-color-group="like">';
   COLOR_PRESETS.like.forEach(function(p){
     var isActive = (colors.like || 'red') === p.id;
@@ -4035,23 +3785,20 @@ function renderSettingsView(el) {
   html += '<button class="opt" id="resetColors" style="margin-top:4px">' + escapeHtml(tr('reset_colors')) + '</button>';
   html += '</div>';
 
-  /* ==== INFO ==== */
+  /* INFO */
   html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 14px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
   html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">' + tr('settings_authors') + '</div>';
   html += '<div style="font-size:15px;margin-bottom:16px">SldShr, DeepSeek</div>';
-  if (state.user) {
-    html += '<div class="settings-subhead">' + escapeHtml(tr('settings_device')) + '</div>';
-    html += '<div class="device-info" id="deviceInfo">' + spinner() + '</div>';
-  }
+  html += '<div class="settings-subhead">' + escapeHtml(tr('settings_device')) + '</div>';
+  html += '<div class="device-info" id="deviceInfo">' + spinner() + '</div>';
   html += '</div>';
 
   html += '</div></div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
 
-  /* Показ секции: на мобилке все, на ПК — только выбранная */
   function applySectionVisibility() {
     var isMobile = window.matchMedia('(max-width: 900px)').matches;
     var sections = el.querySelectorAll('.settings-block');
@@ -4070,8 +3817,6 @@ function renderSettingsView(el) {
   el.querySelectorAll('.settings-nav-btn').forEach(function(b){
     b.addEventListener('click', function(){
       state.settingsSection = b.dataset.section;
-      /* Обновим hash, чтобы после перезагрузки/смены языка вернуться в ту же секцию */
-      history.replaceState({}, '', '/settings#' + state.settingsSection);
       var isMobile = window.matchMedia('(max-width: 900px)').matches;
       if (isMobile) {
         var target = document.getElementById('section-' + state.settingsSection);
@@ -4091,19 +3836,16 @@ function renderSettingsView(el) {
   el.querySelectorAll('[data-set-lang]').forEach(function(b){
     b.addEventListener('click', function(){
       document.cookie = 'SLD_lang=' + b.dataset.setLang + '; path=/; max-age=' + (60*60*24*365);
-      /* Сохраняем секцию в hash — после reload вернёмся сюда же */
-      var target = '/settings#' + state.settingsSection;
-      location.href = target;
+      // сохраняем активную секцию, чтобы вернуться сюда же
+      try { sessionStorage.setItem('SLD_set_sec', state.settingsSection); } catch(e) {}
       location.reload();
     });
   });
-  /* Цвета */
   el.querySelectorAll('[data-color-group]').forEach(function(group){
     var groupKey = group.dataset.colorGroup;
     group.querySelectorAll('.color-swatch').forEach(function(sw){
       sw.addEventListener('click', function(){
         setColor(groupKey, sw.dataset.color);
-        /* Обновляем активное состояние */
         group.querySelectorAll('.color-swatch').forEach(function(x){ x.classList.toggle('active', x === sw); });
       });
     });
@@ -4122,13 +3864,8 @@ function renderSettingsView(el) {
       t.classList.toggle('on', newVal);
       var patch = {}; patch[key] = newVal;
       var meNow = state.user || {}; meNow[key] = newVal; setUser(meNow);
-      try {
-        await api('/api/users/me/settings', { method: 'POST', body: patch });
-        if ((key === 'wall_enabled') && state.view === 'profile') {
-          loadProfile(state.viewData.nick);
-        }
-        /* Если выключили/включили стену — обновим список стен при следующем заходе */
-      } catch(e) {
+      try { await api('/api/users/me/settings', { method: 'POST', body: patch }); }
+      catch(e) {
         t.classList.toggle('on', !newVal);
         meNow[key] = !newVal; setUser(meNow);
         alert(tr(e.message) || e.message);
@@ -4225,9 +3962,7 @@ function renderOgCard(og) {
   if (!og) return '';
   if (state.user && state.user.show_link_previews === false) return '';
   var site = og.site_name || '';
-  if (!site) {
-    try { site = new URL(og.url).hostname; } catch(e) {}
-  }
+  if (!site) { try { site = new URL(og.url).hostname; } catch(e) {} }
   var img = og.image ? '<div class="og-image" style="background-image:url(\'' + escapeHtml(og.image).replace(/'/g, '%27') + '\')"></div>' : '';
   return '<a class="og-card" href="' + escapeHtml(og.url) + '" target="_blank" rel="noopener noreferrer">'
     + img
@@ -4246,22 +3981,25 @@ function renderPostHtml(p, showComments) {
     var res = truncateText(p.text);
     displayText = res.text; truncated = res.truncated;
   }
-  var bodyHtml = linkifyMentions(escapeHtml(displayText));
+  var bodyHtml = linkifyText(displayText);
   var readMore = truncated
     ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>'
     : '';
   var isMine = state.user && p.author === state.user.nick;
-  var isWallOwner = state.user && p.wall_owner === state.user.nick;
 
   var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
-  var wallHint = '';
-  if (p.wall_owner) {
-    wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '/wall" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
+
+  var deviceBadge = '';
+  if (p.device && p.author_show_device !== false) {
+    var isMob = p.device === 'mobile';
+    var icon = isMob ? ICONS.mobile : ICONS.desktop;
+    var title = isMob ? tr('sent_from_mobile') : tr('sent_from_desktop');
+    deviceBadge = '<span class="device-badge" title="' + escapeHtml(title) + '">' + icon + '</span>';
   }
 
   var quotedHtml = '';
   if (p.quoted) {
-    var qHtml = linkifyMentions(escapeHtml(p.quoted.text || ''));
+    var qHtml = linkifyText(p.quoted.text || '');
     quotedHtml = '<div class="quoted-post" data-action="open-post" data-post-id="' + p.quoted.id + '">'
       + '<div class="q-author">@' + escapeHtml(p.quoted.author || '?') + '</div>'
       + '<div class="q-text">' + qHtml + '</div>'
@@ -4269,18 +4007,18 @@ function renderPostHtml(p, showComments) {
   }
 
   var menuHtml = '';
-  if (isMine || isWallOwner) {
-    menuHtml = '<div class="post-menu">';
-    if (isMine) menuHtml += '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>';
-    menuHtml += '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>';
-    menuHtml += '</div>';
+  if (isMine) {
+    menuHtml = '<div class="post-menu">'
+      + '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
+      + '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
+      + '</div>';
   }
 
   var ogHtml = renderOgCard(p.og_data);
 
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
-    commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id, p.wall_owner) + '</div>';
+    commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id) + '</div>';
   }
   var viewsHtml = '';
   if (p.views) viewsHtml = '<span class="views-badge">' + ICONS.eye + '<span data-views>' + p.views + '</span></span>';
@@ -4292,7 +4030,7 @@ function renderPostHtml(p, showComments) {
     +   '<div class="post-header">'
     +     avatarHtml(p.author_avatar_emoji)
     +     '<div class="meta">'
-    +       '<div class="who">' + authorHtml + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
+    +       '<div class="who">' + authorHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
     +     '</div>'
     +     menuHtml
     +   '</div>'
@@ -4310,25 +4048,24 @@ function renderPostHtml(p, showComments) {
     +   commentsHtml
     + '</div>';
 }
-function renderCommentsTree(comments, postAuthor, postId, wallOwner) {
+function renderCommentsTree(comments, postAuthor, postId) {
   var tops = comments.filter(function(c){ return !c.parent_id; }).sort(function(a,b){ return a.created_at - b.created_at; });
   var repliesBy = {};
   comments.forEach(function(c){ if (c.parent_id) (repliesBy[c.parent_id] = repliesBy[c.parent_id] || []).push(c); });
   var html = '';
   tops.forEach(function(c){
-    html += renderCommentHtml(c, postAuthor, postId, false, wallOwner);
+    html += renderCommentHtml(c, postAuthor, postId, false);
     var reps = repliesBy[c.id] || [];
     reps.sort(function(a,b){ return a.created_at - b.created_at; });
-    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true, wallOwner); });
+    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true); });
   });
   return html;
 }
-function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
+function renderCommentHtml(c, postAuthor, postId, isReply) {
   var liked = c.user_like === 1;
   var likeCls = liked ? 'active' : '';
   var isAuthor = postAuthor && c.author === postAuthor;
   var isMine = state.user && c.author === state.user.nick;
-  var isWallOwner = state.user && wallOwner === state.user.nick;
   var cls = 'comment' + (isReply ? ' reply' : '') + (isAuthor ? ' is-author' : '');
   var authorHtml = c.author ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>' : '';
   var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
@@ -4337,8 +4074,8 @@ function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
     replyBtn = '<button class="act-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
   }
   var editBtn = isMine ? '<button class="act-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>' : '';
-  var delBtn = (isMine || isWallOwner) ? '<button class="act-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>' : '';
-  var bodyHtml = linkifyMentions(escapeHtml(c.text));
+  var delBtn = isMine ? '<button class="act-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>' : '';
+  var bodyHtml = linkifyText(c.text);
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
   return ''
     + '<div class="' + cls + '" data-comment-id="' + c.id + '">'
@@ -4356,7 +4093,6 @@ function applyLikeUI(btn) {
   var numEl = btn.querySelector('.num');
   var old = parseInt(numEl ? numEl.textContent : '0', 10) || 0;
   var newVal = !was;
-  if (numEl) numEl.textContent = old + (newVal ? 1 : -1);
   btn.classList.toggle('active', newVal);
   btn.innerHTML = (newVal ? ICONS.heart_filled : ICONS.heart) + '<span class="num">' + (old + (newVal ? 1 : -1)) + '</span>';
   return { old: old, was: was };
@@ -4417,17 +4153,17 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'open-post') { navigate('/p/' + postId); return; }
-      if (action === 'copy') { await copyPost(postId); return; }
+      if (action === 'copy') {
+        try { var pp = await api('/api/posts/' + postId); copyText(pp.text || ''); } catch(e) {}
+        return;
+      }
       if (action === 'quote') {
         if (!state.user) { navigate('/login'); return; }
         try {
           var p = await api('/api/posts/' + postId);
           state.quotePostId = postId;
           state.quotePreview = { author: p.author, text: p.text };
-          if (state.view !== 'feed') {
-            navigate('/');
-            return;
-          }
+          if (state.view !== 'feed') { navigate('/'); return; }
           renderQuoteBox('post');
           var inp = document.getElementById('postInput');
           if (inp) { inp.value = ''; inp.focus(); autoGrow(inp); }
@@ -4496,13 +4232,10 @@ async function refreshCurrentView() {
   if (state.view === 'feed') await loadFeed();
   else if (state.view === 'post') await loadPostView();
   else if (state.view === 'profile') await loadProfile(state.viewData.nick);
-  else if (state.view === 'wall') await loadWall(state.viewData.nick);
 }
 
-async function copyPost(postId) {
+async function copyText(txt) {
   try {
-    var p = await api('/api/posts/' + postId);
-    var txt = p.text || '';
     if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(txt);
     else {
       var ta = document.createElement('textarea');
@@ -4513,19 +4246,29 @@ async function copyPost(postId) {
 }
 
 (function init() {
+  // Восстановим активную секцию настроек после перезагрузки (например, при смене языка)
+  try {
+    var savedSec = sessionStorage.getItem('SLD_set_sec');
+    if (savedSec && ['account','privacy','appearance','info'].indexOf(savedSec) >= 0) {
+      state.settingsSection = savedSec;
+      sessionStorage.removeItem('SLD_set_sec');
+    }
+  } catch(e) {}
+
   if (state.user && (state.view === 'login' || state.view === 'register')) {
     history.replaceState({}, '', '/');
     state.view = 'feed'; state.viewData = {};
   }
   renderSidebar(); renderMain();
   updateRoom();
+  connectSSE();   // сразу подключаемся — работает и без входа (anon)
   loadMe().then(function(){
     if (state.user && (state.view === 'login' || state.view === 'register')) {
       history.replaceState({}, '', '/');
       state.view = 'feed'; state.viewData = {};
     }
     renderSidebar(); renderMain();
-    if (state.user) { connectSSE(); refreshCounters(); }
+    if (state.user) { refreshCounters(); }
   });
 })();
 """
@@ -4536,7 +4279,6 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     view_data = view_data or {}
     js = (JS
           .replace("__I_HOME__", json.dumps(I_HOME))
-          .replace("__I_WALLS__", json.dumps(I_WALLS))
           .replace("__I_USERS__", json.dumps(I_USERS))
           .replace("__I_USER__", json.dumps(I_USER))
           .replace("__I_BELL__", json.dumps(I_BELL))
@@ -4558,6 +4300,8 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_EYE__", json.dumps(I_EYE))
           .replace("__I_CAL__", json.dumps(I_CAL))
           .replace("__I_CHECK__", json.dumps(I_CHECK))
+          .replace("__I_MOBILE__", json.dumps(I_MOBILE))
+          .replace("__I_DESKTOP__", json.dumps(I_DESKTOP))
           .replace("__EMOJIS__", json.dumps(EMOJIS)))
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
@@ -4627,16 +4371,9 @@ def page_post(post_id: str, request: Request):
         raise HTTPException(404, "not found")
     return render_page(get_lang(request), "post", {"post_id": post_id})
 
-@app.get("/walls", response_class=HTMLResponse)
-def page_walls(request: Request): return render_page(get_lang(request), "walls")
-
 @app.get("/u/{nick}", response_class=HTMLResponse)
 def page_user(nick: str, request: Request):
     return render_page(get_lang(request), "profile", {"nick": nick})
-
-@app.get("/u/{nick}/wall", response_class=HTMLResponse)
-def page_user_wall(nick: str, request: Request):
-    return render_page(get_lang(request), "wall", {"nick": nick})
 
 @app.get("/u/{nick}/followers", response_class=HTMLResponse)
 def page_followers(nick: str, request: Request):
