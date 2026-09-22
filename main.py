@@ -205,6 +205,16 @@ async def db_save_message(m: dict):
              prefer="resolution=merge-duplicates,return=minimal")
 
 
+async def db_del_messages_between(a: str, b: str):
+    """Удаляет всю переписку между a и b (в обе стороны)."""
+    if not SUPABASE_ENABLED:
+        return
+    await sb("DELETE", "messages",
+             params={"sender": f"eq.{a}", "recipient": f"eq.{b}"})
+    await sb("DELETE", "messages",
+             params={"sender": f"eq.{b}", "recipient": f"eq.{a}"})
+
+
 async def db_load_all():
     if not SUPABASE_ENABLED:
         print("[direct] Supabase не настроен — работаем полностью в оперативке")
@@ -483,6 +493,16 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     if nick in USERS[peer]["blacklist"]:
         raise HTTPException(403, "Пользователь добавил вас в чёрный список")
 
+    # Авто-восстановление контакта, если один из пары ранее удалил чат
+    if peer not in USERS[nick]["contacts"]:
+        USERS[nick]["contacts"].add(peer)
+        await db_add_contact(nick, peer)
+        await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
+    if nick not in USERS[peer]["contacts"]:
+        USERS[peer]["contacts"].add(nick)
+        await db_add_contact(peer, nick)
+        await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
+
     msg = {
         "id": secrets.token_hex(8),
         "from": nick,
@@ -497,6 +517,29 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     await push_to(peer, {"type": "message", "msg": msg})
     await push_to(nick, {"type": "message", "msg": msg, "self": True})
     return {"ok": True, "msg": msg}
+
+
+@app.post("/api/chat/end")
+async def end_chat(body: EncBody, x_token: Optional[str] = Header(None)):
+    """Завершает чат: удаляет контакт с обеих сторон и всю переписку."""
+    nick = auth(x_token)
+    d = parse(body)
+    peer = (d.get("nick") or "").strip().lstrip("@")
+    if peer not in USERS or peer == nick:
+        raise HTTPException(400, "Некорректный пользователь")
+
+    USERS[nick]["contacts"].discard(peer)
+    USERS[peer]["contacts"].discard(nick)
+
+    CHATS.pop(chat_key(nick, peer), None)
+
+    await db_del_contact(nick, peer)
+    await db_del_contact(peer, nick)
+    await db_del_messages_between(nick, peer)
+
+    await push_to(peer, {"type": "contact_removed", "nick": nick})
+    await push_to(nick, {"type": "contact_removed", "nick": peer})
+    return {"ok": True}
 
 
 @app.post("/api/chat/messages")
@@ -854,7 +897,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .icon-btn.danger{color:var(--danger)}
 .icon-btn.accent{color:var(--accent)}
 
-/* ---------- CONTACTS (incremental) ---------- */
 .list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
 .contact{
   display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
@@ -866,9 +908,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .contact:hover{background:var(--card);border-color:var(--border)}
 .contact:active{transform:scale(.985)}
 .contact.selected{background:var(--card);border-color:var(--border)}
-.contact canvas.ava-small{
-  transition:transform .2s ease;
-}
+.contact canvas.ava-small{transition:transform .2s ease}
 .contact.selected canvas.ava-small{transform:scale(1.04)}
 .contact .badge{
   min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;
@@ -1287,7 +1327,9 @@ const I18N = {
     edit_profile:"Редактировать профиль", save:"Сохранить",
     copy_my_link:"Скопировать ссылку на профиль",
     link_copied:"Ссылка скопирована",
-    profile_updated:"Профиль обновлён"
+    profile_updated:"Профиль обновлён",
+    confirm_end_chat:"Завершить чат?\nВся переписка и контакт будут удалены.",
+    chat_ended:"Чат завершён"
   },
   en: {
     login:"Sign in", register:"Sign up", create:"Create account",
@@ -1306,7 +1348,9 @@ const I18N = {
     edit_profile:"Edit profile", save:"Save",
     copy_my_link:"Copy profile link",
     link_copied:"Link copied",
-    profile_updated:"Profile updated"
+    profile_updated:"Profile updated",
+    confirm_end_chat:"End chat?\nAll messages and the contact will be deleted.",
+    chat_ended:"Chat ended"
   }
 };
 let LANG = localStorage.getItem('direct_lang') || 'ru';
@@ -1328,7 +1372,6 @@ const ogClientCache = {};
 const profileMatch = location.pathname.match(/^\/@([^/]+)$/);
 let pendingTarget = profileMatch ? decodeURIComponent(profileMatch[1]) : null;
 
-/* Map<nick, HTMLElement> — источник правды для DOM списка контактов */
 const contactEls = new Map();
 
 /* ============================================================
@@ -1397,7 +1440,6 @@ function handleWsEvent(ev){
     const u = ev.user;
     const c = contacts.find(x => x.nick === u.nick);
     if (c){
-      // Обновляем ТОЛЬКО изменившееся, без пересборки списка
       const changed = (c.name !== u.name) ||
                       (JSON.stringify(c.avatar) !== JSON.stringify(u.avatar));
       c.name = u.name; c.avatar = u.avatar;
@@ -1409,13 +1451,14 @@ function handleWsEvent(ev){
     if (currentPeer === u.nick){
       currentPeerData = u;
       document.getElementById('peerName').textContent = u.name;
-      // мягко: перекрашиваем peer аватар
       const pAva = document.getElementById('peerAva');
       if (pAva._avaKey !== JSON.stringify(u.avatar)){
         paintAva(pAva, u.avatar);
         pAva._avaKey = JSON.stringify(u.avatar);
       }
     }
+  } else if (ev.type === 'contact_removed'){
+    removeContactLocal(ev.nick);
   } else if (ev.type === 'blacklist_changed'){
     refreshMe().catch(()=>{});
   }
@@ -1468,7 +1511,6 @@ function showDesktopNotification(fromNick, text){
 
 function addUnread(nick){
   unread[nick] = (unread[nick] || 0) + 1;
-  // Обновляем только один контакт
   const c = contacts.find(x => x.nick === nick);
   const el = contactEls.get(nick);
   if (c && el) updateContactEl(el, c);
@@ -1669,8 +1711,7 @@ function applyLang(l){
   });
   document.querySelectorAll('[data-lang]').forEach(b =>
     b.classList.toggle('active', b.dataset.lang === l));
-  // Обновляем тексты в списках БЕЗ пересборки
-  renderContacts();      // incremental — просто обновит "пусто" текст
+  renderContacts();
   renderBlacklist();
 }
 
@@ -1728,7 +1769,6 @@ function logout(){
   if (!confirm(t('confirm_logout'))) return;
   disconnectWS();
   token = null; me = null; contacts = []; blacklist = []; unread = {};
-  // Очистим DOM-контакты
   for (const el of contactEls.values()) el.remove();
   contactEls.clear();
   document.getElementById('contactsList').innerHTML = '';
@@ -1758,7 +1798,6 @@ async function refreshMe(){
   const r = await api('/api/me', null, 'GET');
   me = r.me; contacts = r.contacts; blacklist = r.blacklist;
 
-  // Мой аватар — только если реально изменился
   const meAvaEl = document.getElementById('meAva');
   const avaKey = JSON.stringify(me.avatar);
   if (meAvaEl._avaKey !== avaKey){
@@ -1792,8 +1831,10 @@ function createContactEl(c){
   info.className = 'me-info';
   const nm = document.createElement('div');
   nm.className = 'me-name';
+  nm.textContent = c.name;
   const nk = document.createElement('div');
   nk.className = 'me-nick';
+  nk.textContent = '@' + c.nick;
   info.appendChild(nm); info.appendChild(nk);
   el.appendChild(info);
 
@@ -1808,7 +1849,6 @@ function createContactEl(c){
 
   el.addEventListener('click', () => openChat(el.dataset.nick));
 
-  // Плавное появление новой карточки
   el.animate(
     [
       {opacity: 0, transform: 'translateY(6px)'},
@@ -1833,7 +1873,6 @@ function updateContactEl(el, c){
   const nkTxt = '@' + c.nick;
   if (nk.textContent !== nkTxt) nk.textContent = nkTxt;
 
-  // BADGE — плавное появление / исчезновение
   const badge = el.querySelector('.badge');
   const count = unread[c.nick] || 0;
   const wantShow = count > 0;
@@ -1844,7 +1883,6 @@ function updateContactEl(el, c){
     if (!el._badgeShown){
       el._badgeShown = true;
       badge.style.display = 'flex';
-      // отменяем старую анимацию, если была
       if (badge._anim){ try { badge._anim.cancel(); } catch(_){} badge._anim = null; }
       badge._anim = badge.animate(
         [
@@ -1868,7 +1906,6 @@ function updateContactEl(el, c){
         {duration: 160, easing: 'ease-in', fill: 'forwards'}
       );
       a.onfinish = () => {
-        // только если к моменту окончания всё ещё скрываем
         if (!el._badgeShown) badge.style.display = 'none';
         try { a.cancel(); } catch(_){}
       };
@@ -1876,20 +1913,15 @@ function updateContactEl(el, c){
     }
   }
 
-  // Selected — плавно через CSS-транзишн
   el.classList.toggle('selected', currentPeer === c.nick);
 }
 
 function renderContacts(){
   const box = document.getElementById('contactsList');
-  // Стабильный порядок: по нику
   const sorted = [...contacts].sort((a, b) => a.nick.localeCompare(b.nick));
 
-  /* ------- Пустое состояние ------- */
   if (sorted.length === 0){
-    for (const el of contactEls.values()){
-      el.remove();
-    }
+    for (const el of contactEls.values()) el.remove();
     contactEls.clear();
     let empty = box.querySelector('.empty');
     if (!empty){
@@ -1903,7 +1935,6 @@ function renderContacts(){
   const empty = box.querySelector('.empty');
   if (empty) empty.remove();
 
-  /* ------- Удаляем то, чего больше нет ------- */
   const wanted = new Set(sorted.map(c => c.nick));
   for (const [nick, el] of [...contactEls]){
     if (!wanted.has(nick)){
@@ -1919,21 +1950,18 @@ function renderContacts(){
     }
   }
 
-  /* ------- Добавляем / обновляем ------- */
-  const toReorder = [];
   for (const c of sorted){
     let el = contactEls.get(c.nick);
     if (!el){
       el = createContactEl(c);
       contactEls.set(c.nick, el);
       box.appendChild(el);
+      updateContactEl(el, c);
     } else {
       updateContactEl(el, c);
-      toReorder.push(el);
     }
   }
 
-  /* ------- Проверяем порядок и переставляем только если реально нужно ------- */
   const currentDomOrder = Array.from(box.children)
     .filter(n => n.classList && n.classList.contains('contact'))
     .map(n => n.dataset.nick);
@@ -1945,23 +1973,50 @@ function renderContacts(){
     }
   }
   if (orderChanged){
-    // Аккуратно переставим только те, кто не на месте
     let prev = null;
     for (const c of sorted){
       const el = contactEls.get(c.nick);
       if (!el) continue;
       if (prev){
-        if (el.previousElementSibling !== prev){
-          prev.after(el);
-        }
+        if (el.previousElementSibling !== prev) prev.after(el);
       } else {
-        if (box.firstElementChild !== el){
-          box.prepend(el);
-        }
+        if (box.firstElementChild !== el) box.prepend(el);
       }
       prev = el;
     }
   }
+}
+
+function removeContactLocal(nick, animate = true){
+  contacts = contacts.filter(c => c.nick !== nick);
+
+  const el = contactEls.get(nick);
+  if (el){
+    contactEls.delete(nick);
+    if (animate){
+      const a = el.animate(
+        [
+          {opacity: 1, transform: 'translateX(0)'},
+          {opacity: 0, transform: 'translateX(-16px)'}
+        ],
+        {duration: 200, easing: 'ease-in', fill: 'forwards'}
+      );
+      a.onfinish = () => el.remove();
+    } else {
+      el.remove();
+    }
+  }
+
+  if (unread[nick]){
+    delete unread[nick];
+    updateTitle();
+  }
+
+  if (currentPeer === nick){
+    closeChat(true);
+  }
+
+  if (contacts.length === 0) renderContacts();
 }
 
 function renderBlacklist(){
@@ -2175,7 +2230,6 @@ async function openChat(peerNick){
     document.getElementById('screen-app').classList.add('chat-open');
     clearUnread(peerNick);
 
-    // Обновим только selected-класс во всех контактах
     for (const [nick, el] of contactEls){
       el.classList.toggle('selected', nick === peerNick);
     }
@@ -2212,7 +2266,22 @@ function closeChat(silent){
   if (!silent) refreshMe().catch(()=>{});
 }
 
-function endChat(){ closeModal('modal-info'); closeChat(); }
+async function endChat(){
+  if (!currentPeer) return;
+  if (!confirm(t('confirm_end_chat'))) return;
+
+  const peer = currentPeer;
+  try {
+    await api('/api/chat/end', { nick: peer });
+  } catch(e){
+    toast(e.message);
+    return;
+  }
+
+  closeModal('modal-info');
+  removeContactLocal(peer);
+  toast(t('chat_ended'));
+}
 
 function openInfo(){
   if (!currentPeerData) return;
