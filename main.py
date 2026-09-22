@@ -1,638 +1,593 @@
-# sldchat.py
+# main.py — sldchat
 # Запуск:  pip install fastapi uvicorn
-#          python sldchat.py
-# Открыть:  http://127.0.0.1:8000
+#          python main.py
+# Сервер:  http://127.0.0.1:8000
 
-import asyncio
-import secrets
-import threading
 import time
-from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+import random
+import string
+import secrets
+from html import escape
+from urllib.parse import urlparse
 
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 
-# ----------------------------- НАСТРОЙКИ -----------------------------
-SESSION_COOKIE = "sldchat_sid"
-SESSION_TTL    = 60 * 60 * 24 * 30      # 30 дней
-ONLINE_WINDOW  = 60                     # «онлайн» = активность за 60 сек
-MAX_POST_LEN   = 1000
-MAX_COMMENT_LEN = 300
-MAX_NAME_LEN   = 24
-MAX_POSTS      = 300                    # сколько постов держим в памяти
-MAX_COMMENTS   = 200                    # максимум комментариев на пост
-POST_COOLDOWN  = 3.0                    # антифлуд, сек
+app = FastAPI(title="sldchat")
 
-# --------------------- ХРАНИЛИЩЕ В ОПЕРАТИВКЕ ------------------------
-LOCK = threading.Lock()
-SESSIONS: Dict[str, Dict[str, Any]] = {}   # sid -> данные сессии
-POSTS: Dict[str, Dict[str, Any]] = {}      # id  -> пост
+# ─────────────────────────── ХРАНИЛИЩЕ В ОПЕРАТИВКЕ ───────────────────────────
+
+SESSIONS: dict = {}   # sid -> {"uid": str, "created": float, "last_active": float}
+POSTS: dict = {}      # code -> { ... }
+
+ONLINE_WINDOW = 60          # сек. — окно активности для счётчика онлайна
+MAX_TEXT = 10000            # лимит символов в тексте поста
+MAX_TITLE = 80
+MAX_AUTHOR = 40
+MAX_COMMENT = 500
+
+# ──────────────────────────────── УТИЛИТЫ ────────────────────────────────────
+
+def gen_code() -> str:
+    """Генерирует уникальный 5-символьный код поста."""
+    chars = string.ascii_letters + string.digits
+    while True:
+        code = "".join(random.choices(chars, k=5))
+        if code not in POSTS:
+            return code
 
 
-def now() -> float:
-    return time.time()
-
-
-def ordered_posts() -> List[Dict[str, Any]]:
-    return sorted(POSTS.values(), key=lambda p: p["created"], reverse=True)
+def esc(value) -> str:
+    """HTML-экранирование."""
+    return escape(str(value)) if value is not None else ""
 
 
 def online_count() -> int:
-    t = now()
-    return sum(1 for s in SESSIONS.values() if t - s["last_seen"] < ONLINE_WINDOW)
+    now = time.time()
+    return sum(1 for s in SESSIONS.values() if now - s.get("last_active", 0) < ONLINE_WINDOW)
 
 
-def public_post(p: Dict[str, Any], uid: str) -> Dict[str, Any]:
-    return {
-        "id": p["id"],
-        "text": p["text"],
-        "author": p["author"],
-        "created": p["created"],
-        "likes": len(p["likes"]),
-        "liked": uid in p["likes"],
-        "mine": p["owner"] == uid,
-        "comments": [
-            {
-                "id": c["id"],
-                "author": c["author"],
-                "text": c["text"],
-                "created": c["created"],
-                "mine": c["owner"] == uid,
-            }
-            for c in p["comments"]
-        ],
-    }
+def safe_referer(request: Request, fallback: str = "/") -> str:
+    ref = request.headers.get("referer", "")
+    if ref:
+        p = urlparse(ref)
+        if p.path:
+            return p.path + (("?" + p.query) if p.query else "")
+    return fallback
 
 
-async def janitor() -> None:
-    """Раз в минуту подчищаем просроченные сессии."""
-    while True:
-        await asyncio.sleep(60)
-        t = now()
-        with LOCK:
-            dead = [sid for sid, s in SESSIONS.items() if t - s["last_seen"] > SESSION_TTL]
-            for sid in dead:
-                SESSIONS.pop(sid, None)
+def fmt_time(ts: float) -> str:
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(janitor())
-    yield
-    task.cancel()
+# ─────────────────────────── MIDDLEWARE: СЕССИИ ──────────────────────────────
 
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    sid = request.cookies.get("sldchat_sid")
+    is_new = False
 
-app = FastAPI(title="sldchat", lifespan=lifespan)
-
-
-# ------------------------- СЕССИИ И COOKIE ---------------------------
-async def get_session(request: Request, response: Response) -> Dict[str, Any]:
-    """
-    Достаём сессию по cookie. Если её нет — создаём новую
-    и кладём идентификатор в cookie (httponly, 30 дней).
-    """
-    sid = request.cookies.get(SESSION_COOKIE)
-    sess = SESSIONS.get(sid) if sid else None
-
-    if sess is None:
+    if not sid or sid not in SESSIONS:
         sid = secrets.token_urlsafe(24)
-        sess = {
-            "sid": sid,
-            "uid": "u-" + secrets.token_hex(6),
-            "name": None,
-            "created": now(),
-            "last_seen": now(),
-            "last_post": 0.0,
+        SESSIONS[sid] = {
+            "uid": "u_" + secrets.token_hex(8),
+            "created": time.time(),
+            "last_active": time.time(),
         }
-        SESSIONS[sid] = sess
+        is_new = True
+    else:
+        SESSIONS[sid]["last_active"] = time.time()
+
+    request.state.sid = sid
+    request.state.uid = SESSIONS[sid]["uid"]
+
+    response = await call_next(request)
+
+    if is_new:
         response.set_cookie(
-            key=SESSION_COOKIE,
-            value=sid,
-            max_age=SESSION_TTL,
-            httponly=True,
-            samesite="lax",
-            path="/",
+            "sldchat_sid", sid,
+            max_age=60 * 60 * 24 * 30,
+            httponly=True, samesite="lax", path="/",
         )
-
-    sess["last_seen"] = now()
-    return sess
+    return response
 
 
-# ------------------------------ МОДЕЛИ -------------------------------
-class PostIn(BaseModel):
-    text: str = ""
+# ───────────────────────────────── CSS ───────────────────────────────────────
 
+CSS = """
+:root {
+    --bg: #f0f0f2;
+    --surface: #ffffff;
+    --text: #222222;
+    --primary: #0055cc;
+    --border: #888888;
+    --active-bg: #dddddd;
+    --error: #cc0000;
+}
+[data-theme="dark"] {
+    --bg: #121212;
+    --surface: #1e1e1e;
+    --text: #e0e0e0;
+    --primary: #3388ff;
+    --border: #555555;
+    --active-bg: #2d2d2d;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; font-family: "Courier New", Courier, monospace, sans-serif; }
+body { background: var(--bg); color: var(--text); padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
 
-class CommentIn(BaseModel):
-    text: str = ""
+.wrapper { width: 100%; max-width: 1050px; display: flex; flex-direction: column; }
 
+header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 2px solid var(--border); margin-bottom: 12px; }
+.logo-block { display: flex; flex-direction: column; }
+.logo-text { font-size: 1.7rem; font-weight: bold; color: var(--primary); cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 8px; }
+.logo-sub { font-size: 0.8rem; color: var(--text); opacity: 0.7; margin-top: 2px; }
 
-class NameIn(BaseModel):
-    name: str = ""
+.online-counter { font-size: 0.75rem; color: #4caf50; background: rgba(76, 175, 80, 0.1); border: 1px solid rgba(76, 175, 80, 0.3); padding: 2px 8px; border-radius: 12px; font-weight: normal; display: inline-flex; align-items: center; gap: 4px; }
 
+.text-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; font-size: 0.85rem; font-weight: bold; cursor: pointer; text-decoration: none; text-align: center; display: inline-block; }
+.text-btn:hover { background: var(--active-bg); }
 
-# ------------------------------- API ---------------------------------
-@app.get("/api/state")
-async def api_state(sess: Dict[str, Any] = Depends(get_session)):
-    with LOCK:
-        posts = [public_post(p, sess["uid"]) for p in ordered_posts()]
-        online = online_count()
-    return {
-        "me": {
-            "uid": sess["uid"],
-            "name": sess["name"] or "Аноним",
-            "created": sess["created"],
-            "online": online,
-        },
-        "posts": posts,
-    }
+.main-layout { display: flex; gap: 15px; width: 100%; align-items: flex-start; }
 
+.sidebar-left { width: 220px; flex-shrink: 0; display: flex; flex-direction: column; gap: 10px; }
+.sidebar-left-menu { display: flex; flex-direction: column; gap: 6px; }
 
-@app.post("/api/name")
-async def api_set_name(payload: NameIn, sess: Dict[str, Any] = Depends(get_session)):
-    name = (payload.name or "").strip()[:MAX_NAME_LEN]
-    sess["name"] = name or None
-    return {"ok": True, "name": sess["name"] or "Аноним"}
+.nav-btn { background: var(--surface); border: 1px solid var(--border); padding: 10px; border-radius: 4px; color: var(--text); font-weight: bold; font-size: 0.85rem; cursor: pointer; text-align: left; width: 100%; display: block; text-decoration: none; }
+.nav-btn.active { background: var(--primary); color: #ffffff; border-color: var(--primary); }
+.nav-btn:hover:not(.active) { background: var(--active-bg); }
 
+.sidebar-right { width: 220px; flex-shrink: 0; }
+.info-header { font-weight: bold; font-size: 0.9rem; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; text-transform: uppercase; color: var(--primary); }
+.info-text { font-size: 0.8rem; line-height: 1.4; margin-bottom: 12px; }
 
-@app.post("/api/session/reset")
-async def api_reset_session(
-    sess: Dict[str, Any] = Depends(get_session),
-    response: Response = None,
-):
-    """Убиваем текущую сессию и стираем cookie — при следующем запросе будет новая."""
-    SESSIONS.pop(sess["sid"], None)
-    response.delete_cookie(SESSION_COOKIE, path="/")
-    return {"ok": True}
+.content-area { flex-grow: 1; min-width: 0; width: 100%; overflow: hidden; }
 
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; width: 100%; overflow: hidden; }
+.form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+label { font-size: 0.85rem; font-weight: bold; }
+input[type="text"], textarea, select { width: 100%; padding: 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 0.95rem; outline: none; }
+input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 
-@app.post("/api/posts")
-async def api_create_post(payload: PostIn, sess: Dict[str, Any] = Depends(get_session)):
-    text = (payload.text or "").strip()
-    if not text:
-        raise HTTPException(400, "Пустой пост")
-    if len(text) > MAX_POST_LEN:
-        raise HTTPException(400, f"Максимум {MAX_POST_LEN} символов")
+.btn { background: var(--primary); color: #ffffff; border: 1px solid var(--primary); padding: 10px 16px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.95rem; text-align: center; display: inline-block; width: 100%; text-decoration: none; }
+.btn:active { opacity: 0.8; }
+.btn-tonal { background: var(--active-bg); color: var(--text); border: 1px solid var(--border); }
+.btn-tonal:hover { background: var(--surface); }
 
-    t = now()
-    if t - sess["last_post"] < POST_COOLDOWN:
-        raise HTTPException(429, "Слишком часто — подождите пару секунд")
-    sess["last_post"] = t
+.post-author-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 0.8rem; border-bottom: 1px dotted var(--border); padding-bottom: 6px; gap: 8px; }
+.author-name { font-weight: bold; color: var(--primary); }
+.post-time { color: var(--text); opacity: 0.7; }
+.post-title { font-size: 1.25rem; font-weight: bold; margin-bottom: 8px; word-break: break-word; }
+.post-text { font-size: 0.95rem; line-height: 1.4; white-space: pre-wrap; margin-bottom: 12px; word-break: break-word; overflow-wrap: break-word; }
 
-    pid = secrets.token_hex(6)
-    post = {
-        "id": pid,
-        "text": text,
-        "author": sess["name"] or "Аноним",
-        "owner": sess["uid"],
-        "created": t,
-        "likes": set(),
-        "comments": [],
-    }
+.post-footer { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; flex-wrap: wrap; gap: 8px; }
+.action-group { display: flex; gap: 6px; flex-wrap: wrap; }
+.action-btn { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 6px 12px; font-size: 0.8rem; font-weight: bold; color: var(--text); cursor: pointer; text-decoration: none; display: inline-block; }
+.action-btn:hover { background: var(--active-bg); }
+.action-btn.active { background: var(--primary); color: #ffffff; border-color: var(--primary); }
 
-    with LOCK:
-        POSTS[pid] = post
-        if len(POSTS) > MAX_POSTS:
-            extra = len(POSTS) - MAX_POSTS
-            for old in sorted(POSTS.values(), key=lambda p: p["created"])[:extra]:
-                POSTS.pop(old["id"], None)
+.comments-section { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 12px; }
+.comment-item { margin-bottom: 8px; font-size: 0.9rem; background: var(--active-bg); padding: 8px; border-radius: 4px; border: 1px solid var(--border); overflow: hidden; }
+.comment-header { display: flex; justify-content: space-between; font-weight: bold; font-size: 0.8rem; margin-bottom: 4px; gap: 6px; flex-wrap: wrap; }
+.comment-text { line-height: 1.35; word-break: break-word; overflow-wrap: break-word; }
+.comment-form { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 10px; border: 1px dashed var(--border); border-radius: 4px; background: var(--surface); }
 
-    return {"ok": True, "id": pid}
+.empty-msg { text-align: center; padding: 20px; opacity: 0.6; }
 
+.del-inline { background: none; border: none; color: var(--error); cursor: pointer; font-weight: bold; font-size: 0.75rem; padding: 0 2px; font-family: inherit; }
 
-@app.delete("/api/posts/{pid}")
-async def api_delete_post(pid: str, sess: Dict[str, Any] = Depends(get_session)):
-    with LOCK:
-        post = POSTS.get(pid)
-        if not post:
-            raise HTTPException(404, "Пост не найден")
-        if post["owner"] != sess["uid"]:
-            raise HTTPException(403, "Это не ваш пост")
-        POSTS.pop(pid, None)
-    return {"ok": True}
+@media (max-width: 650px) {
+    body { padding-bottom: 80px; }
+    .main-layout { flex-direction: column; gap: 10px; }
+    .sidebar-left { position: fixed; bottom: 0; left: 0; width: 100%; background: var(--surface); border-top: 2px solid var(--border); padding: 10px; z-index: 999; box-shadow: 0px -4px 10px rgba(0,0,0,0.1); }
+    .sidebar-left-menu { flex-direction: row; justify-content: space-around; width: 100%; }
+    .sidebar-left-menu .nav-btn { flex: 1; text-align: center; padding: 8px; font-size: 0.8rem; }
+    .sidebar-right { display: none; }
+}
+"""
 
+# ─────────────────────────── JS (счётчик символов) ───────────────────────────
 
-@app.post("/api/posts/{pid}/like")
-async def api_like(pid: str, sess: Dict[str, Any] = Depends(get_session)):
-    with LOCK:
-        post = POSTS.get(pid)
-        if not post:
-            raise HTTPException(404, "Пост не найден")
-        uid = sess["uid"]
-        if uid in post["likes"]:
-            post["likes"].discard(uid)
-        else:
-            post["likes"].add(uid)
-        likes = len(post["likes"])
-    return {"ok": True, "likes": likes}
+CHAR_COUNTER_JS = """
+<script>
+(function () {
+    var ta = document.getElementById('post-text');
+    var cc = document.getElementById('char-count');
+    if (!ta || !cc) return;
+    function upd() { cc.textContent = ta.value.length + ' / 10000'; }
+    ta.addEventListener('input', upd);
+    upd();
+})();
+</script>
+"""
 
+# ───────────────────────────── ШАБЛОН СТРАНИЦЫ ───────────────────────────────
 
-@app.post("/api/posts/{pid}/comments")
-async def api_add_comment(
-    pid: str, payload: CommentIn, sess: Dict[str, Any] = Depends(get_session)
-):
-    text = (payload.text or "").strip()
-    if not text:
-        raise HTTPException(400, "Пустой комментарий")
-    if len(text) > MAX_COMMENT_LEN:
-        raise HTTPException(400, f"Максимум {MAX_COMMENT_LEN} символов")
+def render_page(content_html: str, active: str, online: int,
+                title: str = "sldchat — Блог-платформа") -> str:
+    feed_a = "active" if active == "feed" else ""
+    create_a = "active" if active == "create" else ""
+    my_a = "active" if active == "my" else ""
 
-    with LOCK:
-        post = POSTS.get(pid)
-        if not post:
-            raise HTTPException(404, "Пост не найден")
-        if len(post["comments"]) >= MAX_COMMENTS:
-            raise HTTPException(400, "К этому посту уже слишком много комментариев")
-        post["comments"].append(
-            {
-                "id": secrets.token_hex(4),
-                "author": sess["name"] or "Аноним",
-                "text": text,
-                "owner": sess["uid"],
-                "created": now(),
-            }
-        )
-    return {"ok": True}
-
-
-@app.delete("/api/posts/{pid}/comments/{cid}")
-async def api_delete_comment(
-    pid: str, cid: str, sess: Dict[str, Any] = Depends(get_session)
-):
-    with LOCK:
-        post = POSTS.get(pid)
-        if not post:
-            raise HTTPException(404, "Пост не найден")
-        comment = next((c for c in post["comments"] if c["id"] == cid), None)
-        if not comment:
-            raise HTTPException(404, "Комментарий не найден")
-        if comment["owner"] != sess["uid"] and post["owner"] != sess["uid"]:
-            raise HTTPException(403, "Нет прав")
-        post["comments"] = [c for c in post["comments"] if c["id"] != cid]
-    return {"ok": True}
-
-
-# ------------------------------ СТРАНИЦА -----------------------------
-PAGE = r"""<!DOCTYPE html>
-<html lang="ru">
+    return f"""<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sldchat — текстовая соцсеть без регистрации</title>
-<style>
-:root{
-  --bg:#0e0e13; --surface:#17171e; --surface2:#1e1e27; --text:#e8e8f0;
-  --muted:#8a8a9c; --primary:#5b8cff; --border:#2a2a37; --ok:#4caf50; --danger:#ff5f5f;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  background:var(--bg); color:var(--text);
-  font-family:"Courier New",Courier,monospace; font-size:15px; line-height:1.45;
-  display:flex; justify-content:center; padding:18px 14px 60px;
-}
-.wrapper{width:100%; max-width:720px; display:flex; flex-direction:column; gap:14px}
-header{display:flex; flex-direction:column; gap:8px; border-bottom:2px solid var(--border); padding-bottom:12px}
-.logo{font-size:1.9rem; font-weight:bold; color:var(--primary); letter-spacing:1px}
-.logo small{color:var(--muted); font-size:.68rem; font-weight:normal; letter-spacing:0}
-.pills{display:flex; gap:8px; flex-wrap:wrap; font-size:.72rem}
-.pill{border:1px solid var(--border); border-radius:20px; padding:2px 10px; color:var(--muted); background:var(--surface)}
-.pill.on{color:var(--ok); border-color:rgba(76,175,80,.35); background:rgba(76,175,80,.08)}
-.card{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px}
-.notice{background:var(--surface2); border:1px dashed var(--border); border-radius:10px; padding:14px; font-size:.82rem; display:flex; flex-direction:column; gap:8px}
-.notice b{color:var(--primary)}
-.notice code{background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--primary)}
-.muted{color:var(--muted)}
-button{font-family:inherit; font-size:.85rem; cursor:pointer; border-radius:6px; border:1px solid var(--border);
-       background:var(--surface2); color:var(--text); padding:8px 14px; font-weight:bold; transition:.15s}
-button:hover{background:#262633}
-button.primary{background:var(--primary); border-color:var(--primary); color:#fff}
-button.primary:hover{filter:brightness(1.1)}
-button.ghost{background:transparent}
-input,textarea{width:100%; font-family:inherit; font-size:.92rem; background:var(--surface2);
-       border:1px solid var(--border); border-radius:6px; color:var(--text); padding:10px; outline:none; resize:vertical}
-input:focus,textarea:focus{border-color:var(--primary)}
-.row{display:flex; gap:8px; align-items:center}
-.between{justify-content:space-between}
-.composer{display:flex; flex-direction:column; gap:10px}
-.post{display:flex; flex-direction:column; gap:10px; margin-bottom:12px}
-.post-head{display:flex; align-items:center; gap:8px; font-size:.78rem; border-bottom:1px dotted var(--border); padding-bottom:8px}
-.author{color:var(--primary); font-weight:bold}
-.post-text{white-space:pre-wrap; word-break:break-word}
-.post-foot{display:flex; gap:8px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:10px}
-.act{padding:5px 11px; font-size:.78rem}
-.act.on{background:var(--primary); border-color:var(--primary); color:#fff}
-.comments{display:none; flex-direction:column; gap:8px; border-top:1px dashed var(--border); padding-top:10px}
-.comments.open{display:flex}
-.comment{background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:.85rem}
-.comment .ch{display:flex; justify-content:space-between; gap:8px; font-size:.72rem; margin-bottom:4px}
-.cform{display:flex; gap:6px}
-.cform button{padding:8px 14px}
-.empty{text-align:center; color:var(--muted); padding:24px; font-size:.85rem}
-#toast{position:fixed; left:50%; bottom:20px; transform:translateX(-50%) translateY(20px);
-       background:var(--surface2); border:1px solid var(--border); color:var(--text);
-       padding:10px 18px; border-radius:8px; font-size:.82rem; opacity:0; pointer-events:none;
-       transition:.2s; z-index:50}
-#toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
-@media(max-width:520px){ .logo{font-size:1.5rem} body{padding:12px 10px 60px} }
-</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{esc(title)}</title>
+<style>{CSS}</style>
 </head>
 <body>
 <div class="wrapper">
+    <header>
+        <div class="logo-block">
+            <a class="logo-text" href="/">sldchat <span class="online-counter">● {online} онлайн</span></a>
+            <div class="logo-sub">посты и обсуждения</div>
+        </div>
+    </header>
 
-  <header>
-    <div class="logo">sldchat <small>// текстовая соцсеть без регистрации</small></div>
-    <div class="pills">
-      <span class="pill on" id="online">● — онлайн</span>
-      <span class="pill" id="me-pill">вы: Аноним</span>
-      <span class="pill" id="sid-pill">сессия: …</span>
-    </div>
-  </header>
+    <div class="main-layout">
+        <aside class="sidebar-left">
+            <div class="sidebar-left-menu">
+                <a class="nav-btn {feed_a}" href="/">Лента</a>
+                <a class="nav-btn {create_a}" href="/create">Создать</a>
+                <a class="nav-btn {my_a}" href="/my">Мои посты</a>
+            </div>
+        </aside>
 
-  <div class="notice">
-    <div><b>Про сессии и cookie.</b> Регистрации и паролей нет. При первом визите сервер создаёт
-      <b>сессию</b> и кладёт её идентификатор в cookie <code>sldchat_sid</code> — именно поэтому
-      вас «помнят» после перезагрузки страницы. Имя и права на посты живут внутри этой сессии.</div>
-    <div><b>Про хранение.</b> Все посты, комментарии и лайки лежат <b>только в оперативной памяти</b>
-      сервера. Перезапуск сервера — и всё исчезает безвозвратно. Фото и файлов нет:
-      <b>только текст</b>.</div>
-    <div class="row between" style="flex-wrap:wrap">
-      <span class="muted" id="session-info">…</span>
-      <button class="ghost" onclick="resetSession()">Сбросить сессию</button>
-    </div>
-  </div>
+        <main class="content-area">
+            {content_html}
+        </main>
 
-  <div class="card composer">
-    <div class="row">
-      <input id="name" maxlength="24" placeholder="Ваше имя (необязательно, по умолчанию «Аноним»)">
-      <button onclick="saveName()">ОК</button>
-    </div>
-    <textarea id="text" rows="4" maxlength="1000" placeholder="Что происходит?"></textarea>
-    <div class="row between">
-      <span class="muted" id="counter">0 / 1000</span>
-      <button class="primary" onclick="createPost()">Опубликовать</button>
-    </div>
-  </div>
+        <aside class="sidebar-right">
+            <div class="card" style="padding: 12px;">
+                <div class="info-header">О платформе</div>
+                <p class="info-text">sldchat — простой и свободный текстовый блог без лишнего.</p>
 
-  <div id="feed"><div class="empty">Загрузка…</div></div>
+                <div class="info-header">Правила</div>
+                <p class="info-text">Пишите вежливо, делитесь мыслями. Максимум 10 000 символов в одном посте.</p>
+
+                <div class="info-header">Хранение</div>
+                <p class="info-text">Все сессии и посты живут в оперативной памяти сервера и исчезают при перезапуске.</p>
+            </div>
+        </aside>
+    </div>
 </div>
-<div id="toast"></div>
-
-<script>
-const $ = (s) => document.querySelector(s);
-
-let STATE = { me: {}, posts: [] };
-let lastPostsJSON = "";
-let lastTickError = 0;
-
-/* ------------------------- утилиты ------------------------- */
-function esc(s){
-  return String(s ?? "").replace(/[&<>"']/g, m => (
-    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]
-  ));
-}
-
-function toast(msg){
-  const t = $("#toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  clearTimeout(t._h);
-  t._h = setTimeout(() => t.classList.remove("show"), 2200);
-}
-
-async function api(path, method = "GET", body){
-  const r = await fetch(path, {
-    method,
-    headers: body ? {"Content-Type": "application/json"} : {},
-    body: body ? JSON.stringify(body) : null,
-    credentials: "same-origin"
-  });
-  let data = null;
-  try { data = await r.json(); } catch(e){}
-  if(!r.ok) throw new Error((data && data.detail) || "Ошибка сервера");
-  return data;
-}
-
-function ago(ts){
-  const d = Math.max(0, Math.floor(Date.now()/1000 - ts));
-  if(d < 5)     return "только что";
-  if(d < 60)    return d + " с назад";
-  if(d < 3600)  return Math.floor(d/60) + " мин назад";
-  if(d < 86400) return Math.floor(d/3600) + " ч назад";
-  return new Date(ts*1000).toLocaleDateString("ru-RU");
-}
-
-/* ------------------------- шапка ------------------------- */
-function updateHeader(){
-  const me = STATE.me || {};
-  $("#online").textContent   = "● " + (me.online ?? 0) + " онлайн";
-  $("#me-pill").textContent  = "вы: " + (me.name || "Аноним");
-  $("#sid-pill").textContent = "сессия: " + String(me.uid || "…").slice(0, 10) + "…";
-  $("#session-info").textContent =
-    "uid: " + (me.uid || "—") +
-    " · сессия создана: " + (me.created ? new Date(me.created*1000).toLocaleString("ru-RU") : "—");
-
-  if(document.activeElement !== $("#name")){
-    $("#name").value = me.name || "";
-  }
-}
-
-/* ------------------------- лента ------------------------- */
-function renderPosts(){
-  const feed = $("#feed");
-
-  // сохраняем черновики комментариев и открытые ветки
-  const drafts = {}, open = new Set();
-  document.querySelectorAll(".cinput").forEach(i => {
-    if(i.value.trim()) drafts[i.dataset.pid] = i.value;
-  });
-  document.querySelectorAll(".comments.open").forEach(c => open.add(c.dataset.pid));
-
-  const active = document.activeElement;
-  const focusPid = (active && active.classList && active.classList.contains("cinput"))
-      ? active.dataset.pid : null;
-  const caret = focusPid ? active.selectionStart : 0;
-
-  if(!STATE.posts.length){
-    feed.innerHTML = '<div class="empty">Пока пусто. Напишите первое сообщение!</div>';
-    return;
-  }
-
-  feed.innerHTML = "";
-  STATE.posts.forEach(p => {
-    const el = document.createElement("div");
-    el.className = "card post";
-
-    const commentsHTML = p.comments.map(c => `
-      <div class="comment">
-        <div class="ch">
-          <span class="author">${esc(c.author)}</span>
-          <span class="muted">
-            ${ago(c.created)}
-            ${(c.mine || p.mine)
-              ? `<button class="ghost" data-act="delcomment" data-pid="${p.id}" data-cid="${c.id}"
-                   style="padding:0 4px;font-size:.72rem;border:none;color:var(--danger)">[×]</button>`
-              : ""}
-          </span>
-        </div>
-        <div>${esc(c.text)}</div>
-      </div>`).join("");
-
-    el.innerHTML = `
-      <div class="post-head">
-        <span class="author">${esc(p.author)}</span>
-        <span class="muted">· ${ago(p.created)}</span>
-        <span style="flex:1"></span>
-        ${p.mine
-          ? `<button class="ghost" data-act="delpost" data-pid="${p.id}"
-               style="padding:2px 8px;font-size:.72rem;color:var(--danger)">[удалить]</button>`
-          : ""}
-      </div>
-      <div class="post-text">${esc(p.text)}</div>
-      <div class="post-foot">
-        <button class="act ${p.liked ? "on" : ""}" data-act="like" data-pid="${p.id}">♥ ${p.likes}</button>
-        <button class="act" data-act="toggle" data-pid="${p.id}">комментарии (${p.comments.length})</button>
-      </div>
-      <div class="comments ${open.has(p.id) ? "open" : ""}" data-pid="${p.id}">
-        ${commentsHTML || '<div class="muted" style="font-size:.78rem">Комментариев пока нет.</div>'}
-        <div class="cform">
-          <input class="cinput" data-pid="${p.id}" maxlength="300" placeholder="Ваш комментарий...">
-          <button data-act="comment" data-pid="${p.id}">→</button>
-        </div>
-      </div>`;
-
-    feed.appendChild(el);
-  });
-
-  // восстанавливаем черновики
-  document.querySelectorAll(".cinput").forEach(i => {
-    const pid = i.dataset.pid;
-    if(drafts[pid]) i.value = drafts[pid];
-  });
-  if(focusPid){
-    const el = document.querySelector('.cinput[data-pid="' + focusPid + '"]');
-    if(el){ el.focus(); try{ el.setSelectionRange(caret, caret); }catch(e){} }
-  }
-}
-
-/* ------------------------- опрос сервера ------------------------- */
-async function tick(){
-  try{
-    const s = await api("/api/state");
-    STATE = s;
-    updateHeader();
-    const j = JSON.stringify(s.posts);
-    if(j !== lastPostsJSON){ lastPostsJSON = j; renderPosts(); }
-  }catch(e){
-    if(Date.now() - lastTickError > 10000){
-      lastTickError = Date.now();
-      toast("Нет связи с сервером");
-    }
-  }
-}
-
-/* ------------------------- действия ------------------------- */
-async function createPost(){
-  const ta = $("#text");
-  const text = ta.value.trim();
-  if(!text) return toast("Введите текст");
-  try{
-    await api("/api/posts", "POST", { text });
-    ta.value = "";
-    $("#counter").textContent = "0 / 1000";
-    await tick();
-    toast("Опубликовано");
-  }catch(e){ toast(e.message); }
-}
-
-async function saveName(){
-  try{
-    const r = await api("/api/name", "POST", { name: $("#name").value });
-    STATE.me.name = r.name;
-    updateHeader();
-    toast("Имя сохранено: " + r.name);
-  }catch(e){ toast(e.message); }
-}
-
-async function resetSession(){
-  if(!confirm("Сбросить сессию? Имя и права на посты будут потеряны.")) return;
-  try{
-    await api("/api/session/reset", "POST");
-    lastPostsJSON = "";
-    await tick();
-    toast("Сессия сброшена");
-  }catch(e){ toast(e.message); }
-}
-
-/* ------------------------- события ------------------------- */
-$("#feed").addEventListener("click", async (e) => {
-  const btn = e.target.closest("[data-act]");
-  if(!btn) return;
-  const act = btn.dataset.act, pid = btn.dataset.pid;
-
-  try{
-    if(act === "like"){
-      await api("/api/posts/" + pid + "/like", "POST");
-      await tick();
-    }
-    else if(act === "toggle"){
-      document.querySelector('.comments[data-pid="' + pid + '"]').classList.toggle("open");
-    }
-    else if(act === "comment"){
-      const input = document.querySelector('.cinput[data-pid="' + pid + '"]');
-      const text = input.value.trim();
-      if(!text) return toast("Пустой комментарий");
-      await api("/api/posts/" + pid + "/comments", "POST", { text });
-      input.value = "";
-      await tick();
-    }
-    else if(act === "delpost"){
-      if(!confirm("Удалить пост?")) return;
-      await api("/api/posts/" + pid, "DELETE");
-      await tick();
-    }
-    else if(act === "delcomment"){
-      if(!confirm("Удалить комментарий?")) return;
-      await api("/api/posts/" + pid + "/comments/" + btn.dataset.cid, "DELETE");
-      await tick();
-    }
-  }catch(err){ toast(err.message); }
-});
-
-$("#feed").addEventListener("keydown", (e) => {
-  if(e.key === "Enter" && e.target.classList.contains("cinput")){
-    e.preventDefault();
-    const pid = e.target.dataset.pid;
-    document.querySelector('[data-act="comment"][data-pid="' + pid + '"]').click();
-  }
-});
-
-$("#text").addEventListener("input", (e) => {
-  $("#counter").textContent = e.target.value.length + " / 1000";
-});
-
-$("#name").addEventListener("keydown", (e) => {
-  if(e.key === "Enter") saveName();
-});
-
-/* ------------------------- старт ------------------------- */
-tick();
-setInterval(tick, 3000);
-</script>
 </body>
-</html>
+</html>"""
+
+
+# ─────────────────────────── РЕНДЕР ОДНОГО ПОСТА ─────────────────────────────
+
+def render_post(post: dict, uid: str, comments_open: bool = False) -> str:
+    code = post["code"]
+    is_owner = post["owner_id"] == uid
+    my_rating = post["rating_users"].get(uid, 0)
+    is_unlisted = post["visibility"] == "unlisted"
+    comments = post.get("comments", [])
+    views = len(post.get("viewed_users", set()))
+
+    up_cls = "active" if my_rating == 1 else ""
+    down_cls = "active" if my_rating == -1 else ""
+
+    h = []
+    h.append('<div class="card">')
+
+    # Шапка поста
+    h.append('<div class="post-author-row"><div>')
+    h.append(f'<span class="author-name">{esc(post["author"])}</span> • '
+             f'<span class="post-time">{fmt_time(post["created_at"])}</span>')
+    h.append('</div>')
+    if is_owner:
+        h.append(
+            f'<form method="post" action="/post/{code}/delete" '
+            f'onsubmit="return confirm(\'Удалить этот пост?\');" style="display:inline;">'
+            f'<button type="submit" class="text-btn" '
+            f'style="color:var(--error); padding:2px 8px; font-size:0.75rem;">[Удалить]</button>'
+            f'</form>'
+        )
+    h.append('</div>')
+
+    # Заголовок и текст
+    h.append(f'<div class="post-title">{esc(post["title"])}</div>')
+    if post["text"]:
+        h.append(f'<div class="post-text">{esc(post["text"])}</div>')
+
+    # Футер
+    h.append('<div class="post-footer">')
+
+    if is_unlisted:
+        h.append(f'<span style="font-size:0.8rem; font-weight:bold; opacity:0.7;">'
+                 f'[Просмотров: {views}]</span>')
+    else:
+        h.append('<div class="action-group">')
+        h.append(
+            f'<form method="post" action="/rate/{code}" style="display:inline;">'
+            f'<input type="hidden" name="value" value="1">'
+            f'<button type="submit" class="action-btn {up_cls}">[Лайков: {post["upvotes"]}]</button>'
+            f'</form>'
+        )
+        h.append(
+            f'<form method="post" action="/rate/{code}" style="display:inline;">'
+            f'<input type="hidden" name="value" value="-1">'
+            f'<button type="submit" class="action-btn {down_cls}">[Дизлайков: {post["downvotes"]}]</button>'
+            f'</form>'
+        )
+        h.append('</div>')
+
+    h.append('<div class="action-group">')
+    h.append(f'<a class="action-btn" href="/p/{code}">[Комментариев: {len(comments)}]</a>')
+    if is_unlisted:
+        h.append(f'<span class="action-btn" style="cursor:default;">[Код: {esc(code)}]</span>')
+    h.append('</div>')
+
+    h.append('</div>')  # /post-footer
+
+    # Комментарии
+    if comments_open:
+        h.append('<div class="comments-section">')
+        h.append('<div style="margin-top:8px;">')
+
+        if comments:
+            for c in comments:
+                can_del = (c["owner_id"] == uid) or is_owner
+                h.append('<div class="comment-item">')
+                h.append('<div class="comment-header">')
+                h.append(f'<span>{esc(c["author"])}</span>')
+                h.append('<div>')
+                h.append(f'<span style="opacity:0.6; font-weight:normal; font-size:0.75rem;">'
+                         f'{fmt_time(c["created_at"])}</span>')
+                if can_del:
+                    h.append(
+                        f'<form method="post" action="/comment/{code}/delete/{c["id"]}" '
+                        f'onsubmit="return confirm(\'Удалить комментарий?\');" '
+                        f'style="display:inline; margin-left:6px;">'
+                        f'<button type="submit" class="del-inline">[Удалить]</button>'
+                        f'</form>'
+                    )
+                h.append('</div>')
+                h.append('</div>')
+                h.append(f'<div class="comment-text">{esc(c["text"])}</div>')
+                h.append('</div>')
+        else:
+            h.append('<p style="font-size:0.8rem; opacity:0.6; margin-bottom:8px; '
+                     'padding-left:2px;">Пока пусто.</p>')
+
+        h.append('</div>')
+
+        h.append(
+            f'<form method="post" action="/comment/{code}" class="comment-form">'
+            f'<input type="text" name="author" placeholder="Имя (Аноним)" maxlength="24">'
+            f'<input type="text" name="text" placeholder="Ваш комментарий..." '
+            f'maxlength="{MAX_COMMENT}" required>'
+            f'<button type="submit" class="btn btn-tonal" '
+            f'style="padding:6px; font-size:0.8rem;">Отправить</button>'
+            f'</form>'
+        )
+        h.append('</div>')  # /comments-section
+
+    h.append('</div>')  # /card
+    return "".join(h)
+
+
+# ──────────────────────────── ФОРМА СОЗДАНИЯ ─────────────────────────────────
+
+CREATE_FORM_HTML = f"""
+<div class="card">
+    <h2 style="margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px;">Написать пост</h2>
+
+    <form method="post" action="/create">
+        <div class="form-group">
+            <label>Ваше имя</label>
+            <input type="text" name="author" placeholder="Аноним" maxlength="{MAX_AUTHOR}">
+        </div>
+
+        <div class="form-group">
+            <label>Заголовок публикации</label>
+            <input type="text" name="title" placeholder="Введите название..." maxlength="{MAX_TITLE}" required>
+        </div>
+
+        <div class="form-group">
+            <label>Текст публикации</label>
+            <textarea id="post-text" name="text" placeholder="Введите текст вашего сообщения..."
+                      rows="10" maxlength="{MAX_TEXT}"></textarea>
+            <div id="char-count" style="font-size:0.75rem; opacity:0.7; text-align:right;">0 / {MAX_TEXT}</div>
+        </div>
+
+        <div class="form-group">
+            <label>Режим приватности</label>
+            <select name="visibility">
+                <option value="public">В общую ленту</option>
+                <option value="unlisted">Только по ссылке (Скрытый)</option>
+            </select>
+        </div>
+
+        <button class="btn" type="submit">Опубликовать</button>
+    </form>
+</div>
+{CHAR_COUNTER_JS}
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(sess: Dict[str, Any] = Depends(get_session)):
-    # Возвращаем строку, а не Response — тогда cookie, выставленная
-    # в зависимости get_session, не потеряется.
-    return PAGE
+# ──────────────────────────────── МАРШРУТЫ ───────────────────────────────────
 
+@app.get("/", response_class=HTMLResponse)
+async def route_feed(request: Request):
+    uid = request.state.uid
+    posts = [p for p in POSTS.values() if p["visibility"] == "public"]
+    posts.sort(key=lambda p: p["created_at"], reverse=True)
+
+    if posts:
+        body = "".join(render_post(p, uid, comments_open=False) for p in posts)
+    else:
+        body = '<div class="empty-msg">Лента пока пуста.</div>'
+
+    return HTMLResponse(render_page(body, "feed", online_count()))
+
+
+@app.get("/create", response_class=HTMLResponse)
+async def route_create_get(request: Request):
+    return HTMLResponse(render_page(CREATE_FORM_HTML, "create", online_count()))
+
+
+@app.post("/create")
+async def route_create_post(
+    request: Request,
+    author: str = Form(""),
+    title: str = Form(""),
+    text: str = Form(""),
+    visibility: str = Form("public"),
+):
+    uid = request.state.uid
+    author = author.strip()[:MAX_AUTHOR] or "Аноним"
+    title = title.strip()[:MAX_TITLE]
+    text = text.strip()[:MAX_TEXT]
+
+    if not title or not text:
+        return RedirectResponse("/create", status_code=303)
+
+    if visibility not in ("public", "unlisted"):
+        visibility = "public"
+
+    code = gen_code()
+    POSTS[code] = {
+        "code": code,
+        "title": title,
+        "text": text,
+        "author": author,
+        "owner_id": uid,
+        "created_at": time.time(),
+        "visibility": visibility,
+        "upvotes": 0,
+        "downvotes": 0,
+        "rating_users": {},
+        "viewed_users": set(),
+        "comments": [],
+    }
+
+    if visibility == "unlisted":
+        return RedirectResponse(f"/p/{code}", status_code=303)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/my", response_class=HTMLResponse)
+async def route_my(request: Request):
+    uid = request.state.uid
+    posts = [p for p in POSTS.values() if p["owner_id"] == uid]
+    posts.sort(key=lambda p: p["created_at"], reverse=True)
+
+    head = ('<h2 style="margin-bottom: 12px; font-size: 1.1rem; '
+            'border-bottom: 1px solid var(--border); padding-bottom: 6px;">Мои публикации</h2>')
+
+    if posts:
+        body = head + "".join(render_post(p, uid, comments_open=False) for p in posts)
+    else:
+        body = head + '<div class="empty-msg">У вас пока нет публикаций.</div>'
+
+    return HTMLResponse(render_page(body, "my", online_count()))
+
+
+@app.get("/p/{code}", response_class=HTMLResponse)
+async def route_single(request: Request, code: str):
+    uid = request.state.uid
+    post = POSTS.get(code)
+
+    back = '<a class="text-btn" href="/" style="margin-bottom: 12px;">[Вернуться в ленту]</a>'
+
+    if not post:
+        content = back + '<div class="card">Запись удалена или не существует.</div>'
+        return HTMLResponse(render_page(content, "", online_count(),
+                                        title="Запись не найдена — sldchat"))
+
+    post["viewed_users"].add(uid)
+    content = back + render_post(post, uid, comments_open=True)
+    return HTMLResponse(render_page(content, "", online_count(),
+                                    title=f'{post["title"]} — sldchat'))
+
+
+@app.post("/rate/{code}")
+async def route_rate(request: Request, code: str, value: int = Form(...)):
+    uid = request.state.uid
+    back = safe_referer(request, "/")
+
+    post = POSTS.get(code)
+    if not post or post["visibility"] == "unlisted" or value not in (1, -1):
+        return RedirectResponse(back, status_code=303)
+
+    current = post["rating_users"].get(uid, 0)
+    if current == value:
+        return RedirectResponse(back, status_code=303)
+
+    if value == 1:
+        post["upvotes"] += 1
+        if current == -1:
+            post["downvotes"] -= 1
+    else:
+        post["downvotes"] += 1
+        if current == 1:
+            post["upvotes"] -= 1
+
+    post["rating_users"][uid] = value
+    return RedirectResponse(back, status_code=303)
+
+
+@app.post("/comment/{code}")
+async def route_add_comment(
+    request: Request,
+    code: str,
+    author: str = Form(""),
+    text: str = Form(""),
+):
+    uid = request.state.uid
+    post = POSTS.get(code)
+    if not post:
+        return RedirectResponse("/", status_code=303)
+
+    author = author.strip()[:24] or "Аноним"
+    text = text.strip()[:MAX_COMMENT]
+
+    if text:
+        post["comments"].append({
+            "id": "c_" + secrets.token_hex(4),
+            "author": author,
+            "text": text,
+            "created_at": time.time(),
+            "owner_id": uid,
+        })
+
+    return RedirectResponse(f"/p/{code}", status_code=303)
+
+
+@app.post("/comment/{code}/delete/{comment_id}")
+async def route_delete_comment(request: Request, code: str, comment_id: str):
+    uid = request.state.uid
+    post = POSTS.get(code)
+    if not post:
+        return RedirectResponse("/", status_code=303)
+
+    post["comments"] = [
+        c for c in post["comments"]
+        if not (c["id"] == comment_id and (c["owner_id"] == uid or post["owner_id"] == uid))
+    ]
+    return RedirectResponse(f"/p/{code}", status_code=303)
+
+
+@app.post("/post/{code}/delete")
+async def route_delete_post(request: Request, code: str):
+    uid = request.state.uid
+    post = POSTS.get(code)
+
+    back = safe_referer(request, "/my")
+    if f"/p/{code}" in back:
+        back = "/my"
+
+    if post and post["owner_id"] == uid:
+        del POSTS[code]
+
+    return RedirectResponse(back, status_code=303)
+
+
+# ──────────────────────────────── ЗАПУСК ─────────────────────────────────────
 
 if __name__ == "__main__":
-    # workers=1 обязательно: данные живут в памяти процесса.
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
