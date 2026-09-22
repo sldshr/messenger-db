@@ -1,5 +1,5 @@
 # main.py
-# pip install fastapi uvicorn
+# pip install fastapi uvicorn pillow
 # Переменные окружения: SUPABASE_URL, SUPABASE_KEY (service_role)
 
 import base64
@@ -15,7 +15,7 @@ import time
 import zlib
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import (FastAPI, Header, HTTPException, Query, Request,
@@ -265,7 +265,7 @@ async def db_del_messages_between(a: str, b: str):
 # ============================================================
 
 CONNECTIONS: Dict[str, list] = {}
-OG_CACHE: Dict[str, Tuple[str, float]] = {}   # url -> (status, ts)
+OG_CACHE: Dict[str, Tuple[dict, float]] = {}
 OG_CACHE_TTL = 300
 
 
@@ -681,8 +681,24 @@ async def avatar_png(nick: str):
 
 
 # ============================================================
-#                    OG: STABLE/UNSTABLE + SVG
+#                    OPENGRAPH
 # ============================================================
+
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+_OG_PATTERNS = [
+    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
+    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
+]
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_WS_RE = re.compile(r"\s+")
+
 
 def is_safe_url(url: str) -> bool:
     try:
@@ -705,63 +721,79 @@ def is_safe_url(url: str) -> bool:
     return True
 
 
-def check_url_stable(url: str) -> str:
-    """stable, если URL отвечает 2xx/3xx, иначе unstable."""
-    for method in ("HEAD", "GET"):
+def _resolve_image(base_url: str, image: str) -> str:
+    image = (image or "").strip()
+    if not image:
+        return ""
+    if not image.startswith(("http://", "https://")):
         try:
-            req = UrlRequest(url, method=method, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; sldchat/1.0)",
-                "Accept": "*/*",
-            })
-            with urlopen(req, timeout=6) as r:
-                if 200 <= r.status < 400:
-                    return "stable"
+            image = urljoin(base_url, image)
         except Exception:
-            continue
-    return "unstable"
+            return ""
+    if not image.startswith(("http://", "https://")):
+        return ""
+    return image[:1500]
 
 
-def make_og_svg(status: str) -> str:
-    stable = (status == "stable")
-    color = "#22c55e" if stable else "#ca8a04"  # green / dark yellow
-    label = "stable" if stable else "unstable"
-    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
-    font = "-apple-system,'Segoe UI',Roboto,Ubuntu,sans-serif"
-    mono = "ui-monospace,Menlo,Consolas,monospace"
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" '
-        'viewBox="0 0 1200 630" width="1200" height="630">'
-        '<defs>'
-        '<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
-        '<stop offset="0" stop-color="#18181b"/>'
-        '<stop offset="1" stop-color="#09090b"/>'
-        '</linearGradient>'
-        '</defs>'
-        '<rect width="1200" height="630" fill="url(#bg)"/>'
-        f'<text x="60" y="100" font-family="{font}" '
-        'font-size="52" font-weight="700" fill="#f4f4f5" '
-        'letter-spacing="-1">sldchat</text>'
-        f'<circle cx="1130" cy="80" r="14" fill="{color}"/>'
-        f'<text x="600" y="380" text-anchor="middle" '
-        f'font-family="{font}" font-size="170" font-weight="800" '
-        f'fill="{color}" letter-spacing="-4">{label}</text>'
-        f'<text x="600" y="580" text-anchor="middle" '
-        f'font-family="{mono}" font-size="28" '
-        f'fill="#71717a">{now}</text>'
-        '</svg>'
-    )
+def fetch_og(url: str) -> dict:
+    """Тянет OG внешнего сайта + помечает стабильность."""
+    now = time.time()
+    cached = OG_CACHE.get(url)
+    if cached and now - cached[1] < OG_CACHE_TTL:
+        return cached[0]
 
+    result = {
+        "url": url,
+        "status": "unstable",
+        "stable": False,
+        "title": "", "description": "", "image": "", "site_name": "",
+    }
 
-@app.get("/og-image.svg")
-def og_image(status: str = "stable"):
-    if status not in ("stable", "unstable"):
-        status = "unstable"
-    svg = make_og_svg(status)
-    return Response(
-        content=svg,
-        media_type="image/svg+xml; charset=utf-8",
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
+    body_text = ""
+    try:
+        req = UrlRequest(url, method="GET", headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
+        })
+        with urlopen(req, timeout=7) as r:
+            if 200 <= r.status < 400:
+                result["status"] = "stable"
+                result["stable"] = True
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "html" in ct or "xml" in ct:
+                body_text = r.read(300_000).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    if body_text:
+        data: Dict[str, str] = {}
+        for pat in _OG_PATTERNS:
+            for m in pat.finditer(body_text):
+                key = m.group(1).lower()
+                if key not in data:
+                    data[key] = m.group(2)
+
+        if "og:title" not in data and "twitter:title" in data:
+            data["og:title"] = data["twitter:title"]
+        if "og:description" not in data and "twitter:description" in data:
+            data["og:description"] = data["twitter:description"]
+        if "og:image" not in data and "twitter:image" in data:
+            data["og:image"] = data["twitter:image"]
+        if "og:title" not in data:
+            tm = _TITLE_RE.search(body_text)
+            if tm:
+                data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
+
+        result["title"] = html_module.unescape((data.get("og:title") or "").strip())[:200]
+        result["description"] = html_module.unescape((data.get("og:description") or "").strip())[:400]
+        result["image"] = _resolve_image(url, data.get("og:image") or "")
+        result["site_name"] = html_module.unescape((data.get("og:site_name") or "").strip())[:80]
+
+    OG_CACHE[url] = (result, now)
+    return result
 
 
 @app.post("/api/og")
@@ -771,24 +803,111 @@ async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
     url = (d.get("url") or "").strip()
     if not is_safe_url(url):
         raise HTTPException(400, "Invalid URL")
+    return await run_in_threadpool(fetch_og, url)
 
-    now = time.time()
-    cached = OG_CACHE.get(url)
-    if cached and (now - cached[1]) < OG_CACHE_TTL:
-        status = cached[0]
-    else:
-        status = await run_in_threadpool(check_url_stable, url)
-        OG_CACHE[url] = (status, now)
 
-    return {
-        "url": url,
-        "status": status,
-        "stable": status == "stable",
-        "image": f"/og-image.svg?status={status}",
-        "site_name": "sldchat",
-        "title": "SldChat - Direct Messages",
-        "description": "SldChat удобное места для передачи сообщения из точки в точку",
-    }
+# ---- Наша собственная картинка для рендера ссылки на наш сайт ----
+
+def _pick_font(size: int, bold: bool = True):
+    if not PIL_AVAILABLE:
+        return None
+    names = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "arialbd.ttf" if bold else "arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold
+        else "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf" if bold
+        else "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def make_og_png(status: str) -> bytes:
+    if not PIL_AVAILABLE:
+        return b""
+    from io import BytesIO
+    W, H = 1200, 630
+    stable = (status == "stable")
+    rgb = (34, 197, 94) if stable else (202, 138, 4)
+    label = "stable" if stable else "unstable"
+    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
+
+    img = PILImage.new("RGB", (W, H), (17, 17, 19))
+    draw = ImageDraw.Draw(img)
+
+    for y in range(240):
+        k = 1 - y / 240
+        c = (int(24 + 10 * k), int(24 + 10 * k), int(27 + 10 * k))
+        draw.line([(0, y), (W, y)], fill=c)
+
+    f_logo = _pick_font(58, bold=True)
+    if f_logo:
+        draw.text((60, 60), "sldchat", fill=(244, 244, 245), font=f_logo)
+
+    draw.ellipse((1110, 68, 1148, 106), fill=rgb)
+
+    f_big = _pick_font(190, bold=True)
+    if f_big:
+        bbox = draw.textbbox((0, 0), label, font=f_big)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(((W - tw) / 2 - bbox[0], (H - th) / 2 - bbox[1] - 50),
+                  label, fill=rgb, font=f_big)
+
+    f_time = _pick_font(30, bold=False)
+    if f_time:
+        bbox2 = draw.textbbox((0, 0), now, font=f_time)
+        tw2 = bbox2[2] - bbox2[0]
+        draw.text(((W - tw2) / 2 - bbox2[0], 550),
+                  now, fill=(113, 113, 122), font=f_time)
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def make_og_svg(status: str) -> str:
+    stable = (status == "stable")
+    color = "#22c55e" if stable else "#ca8a04"
+    label = "stable" if stable else "unstable"
+    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
+    font = "-apple-system,'Segoe UI',Roboto,Ubuntu,sans-serif"
+    mono = "ui-monospace,Menlo,Consolas,monospace"
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" '
+        'width="1200" height="630">'
+        '<rect width="1200" height="630" fill="#111113"/>'
+        f'<text x="60" y="100" font-family="{font}" font-size="52" '
+        'font-weight="700" fill="#f4f4f5">sldchat</text>'
+        f'<circle cx="1130" cy="80" r="14" fill="{color}"/>'
+        f'<text x="600" y="380" text-anchor="middle" font-family="{font}" '
+        f'font-size="170" font-weight="800" fill="{color}">{label}</text>'
+        f'<text x="600" y="580" text-anchor="middle" font-family="{mono}" '
+        f'font-size="28" fill="#71717a">{now}</text></svg>'
+    )
+
+
+@app.get("/og-image.png")
+def og_image_png(status: str = "stable"):
+    if status not in ("stable", "unstable"):
+        status = "unstable"
+    png = make_og_png(status)
+    if png:
+        return Response(content=png, media_type="image/png",
+                        headers={"Cache-Control": "no-store, max-age=0"})
+    svg = make_og_svg(status)
+    return Response(content=svg, media_type="image/svg+xml; charset=utf-8",
+                    headers={"Cache-Control": "no-store, max-age=0"})
 
 
 # ============================================================
@@ -1000,7 +1119,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
   border-bottom-left-radius:6px;border:1px solid var(--border)}
 
-/* ---------- ССЫЛКИ (кликабельны → копируют) ---------- */
+/* ---------- ССЫЛКИ в тексте ---------- */
 .bubble .msg-link{
   color:inherit;
   text-decoration:underline;
@@ -1015,30 +1134,48 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.3)}
 
 /* ---------- OG-КАРТОЧКА ---------- */
-.bubble.has-og{
-  min-width:280px;
-  max-width:78%;
-}
+.bubble.has-og{ min-width:280px; max-width:78%; }
+
 .og-card{
-  display:block;
-  width:100%;
-  margin-top:8px;
-  border-radius:12px;
-  overflow:hidden;
-  cursor:pointer;
-  pointer-events:auto;
-  animation:fadeIn .25s ease;
-  box-sizing:border-box;
+  display:block; width:100%; margin-top:8px;
+  background:rgba(0,0,0,.05);
+  border:1px solid rgba(0,0,0,.08);
+  border-radius:12px; overflow:hidden;
+  cursor:pointer; pointer-events:auto;
+  animation:fadeIn .25s ease; box-sizing:border-box;
   -webkit-tap-highlight-color:transparent;
+  text-decoration:none; color:inherit;
 }
-.og-card img{
-  display:block;
-  width:100%;
-  height:auto;
-  border-radius:12px;
-  background:rgba(0,0,0,.06);
-  pointer-events:none;
-  user-select:none;-webkit-user-drag:none;
+.bubble.out .og-card{ background:rgba(255,255,255,.14); border-color:rgba(255,255,255,.18); }
+
+.og-thumb{
+  display:block; width:100%; height:auto; max-height:220px;
+  object-fit:cover; background:rgba(0,0,0,.06);
+  pointer-events:none; user-select:none; -webkit-user-drag:none;
+}
+
+.og-body{ padding:10px 12px; }
+
+.og-site{
+  display:flex; align-items:center; gap:6px;
+  font-size:11px; font-weight:600; text-transform:uppercase;
+  letter-spacing:.5px; opacity:.75; margin-bottom:4px;
+}
+.og-dot{
+  width:8px; height:8px; border-radius:50%; flex-shrink:0;
+}
+.og-dot.stable{ background:#22c55e; }
+.og-dot.unstable{ background:#ca8a04; }
+
+.og-title{
+  font-size:14px; font-weight:700; line-height:1.3; margin-bottom:3px;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.og-desc{
+  font-size:12px; line-height:1.35; opacity:.8;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+  overflow:hidden;
 }
 
 .composer{
@@ -1360,10 +1497,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 </div>
 
 <script>
-document.addEventListener('contextmenu', e => {
-  if (e.target.closest('.msg-link')) e.preventDefault();
-  else e.preventDefault();
-});
+document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('selectstart', e => {
   if (e.target.closest('input,textarea')) return;
   e.preventDefault();
@@ -1630,14 +1764,12 @@ function toast(msg){
 }
 
 async function copyText(txt){
-  // первый способ — Clipboard API (требует HTTPS или localhost + user gesture)
-  try {
-    if (navigator.clipboard && window.isSecureContext){
+  if (navigator.clipboard && window.isSecureContext){
+    try {
       await navigator.clipboard.writeText(txt);
       return true;
-    }
-  } catch(_){}
-  // фолбэк — execCommand
+    } catch(_){}
+  }
   try {
     const ta = document.createElement('textarea');
     ta.value = txt;
@@ -1647,13 +1779,18 @@ async function copyText(txt){
     ta.style.left = '0';
     ta.style.width = '1px';
     ta.style.height = '1px';
+    ta.style.padding = '0';
+    ta.style.border = 'none';
+    ta.style.outline = 'none';
+    ta.style.boxShadow = 'none';
+    ta.style.background = 'transparent';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
     ta.setSelectionRange(0, txt.length);
     const ok = document.execCommand('copy');
-    ta.remove();
+    document.body.removeChild(ta);
     return ok;
   } catch(_){ return false; }
 }
@@ -1815,7 +1952,6 @@ function applyOg(v){
   document.querySelectorAll('[data-og]').forEach(b =>
     b.classList.toggle('active', b.dataset.og === v));
   if (!OG_ENABLED){
-    // убираем уже отрисованные превью
     document.querySelectorAll('.og-card').forEach(el => el.remove());
     document.querySelectorAll('.bubble.has-og').forEach(el => el.classList.remove('has-og'));
   }
@@ -2262,14 +2398,19 @@ async function maybeRenderOg(bubbleEl, url){
       return;
     }
   }
-  if (!data || data.error || !data.image) return;
+  if (!data || data.error) return;
   if (bubbleEl.querySelector('.og-card')) return;
+
+  let hostname = '';
+  try { hostname = new URL(url).hostname; } catch(_){}
+
+  const hasTitle = !!(data.title || data.description || data.image);
+  if (!hasTitle && !hostname) return;
 
   bubbleEl.classList.add('has-og');
 
-  const card = document.createElement('a');
+  const card = document.createElement('div');
   card.className = 'og-card';
-  card.href = '#';
   card.addEventListener('click', async (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -2278,14 +2419,48 @@ async function maybeRenderOg(bubbleEl, url){
     return false;
   });
 
-  const img = document.createElement('img');
-  img.src = data.image;
-  img.alt = '';
-  img.loading = 'lazy';
-  img.draggable = false;
-  img.onerror = () => { card.remove(); bubbleEl.classList.remove('has-og'); };
-  card.appendChild(img);
+  if (data.image){
+    const img = document.createElement('img');
+    img.className = 'og-thumb';
+    img.src = data.image;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.draggable = false;
+    img.referrerPolicy = 'no-referrer';
+    img.onerror = () => img.remove();
+    card.appendChild(img);
+  }
 
+  const body = document.createElement('div');
+  body.className = 'og-body';
+
+  const site = document.createElement('div');
+  site.className = 'og-site';
+  const dot = document.createElement('span');
+  dot.className = 'og-dot ' + (data.stable ? 'stable' : 'unstable');
+  site.appendChild(dot);
+  const siteName = data.site_name || hostname;
+  if (siteName){
+    const sTxt = document.createElement('span');
+    sTxt.textContent = siteName;
+    site.appendChild(sTxt);
+  }
+  body.appendChild(site);
+
+  if (data.title){
+    const ttl = document.createElement('div');
+    ttl.className = 'og-title';
+    ttl.textContent = data.title;
+    body.appendChild(ttl);
+  }
+  if (data.description){
+    const d = document.createElement('div');
+    d.className = 'og-desc';
+    d.textContent = data.description;
+    body.appendChild(d);
+  }
+
+  card.appendChild(body);
   bubbleEl.appendChild(card);
 
   const box = document.getElementById('messages');
@@ -2541,9 +2716,15 @@ async def index(request: Request):
         '<meta property="og:type" content="website">\n'
         '<meta property="og:title" content="SldChat - Direct Messages">\n'
         '<meta property="og:description" content="SldChat удобное места для передачи сообщения из точки в точку">\n'
-        f'<meta property="og:image" content="{base}/og-image.svg?status=stable">\n'
+        f'<meta property="og:image" content="{base}/og-image.png?status=stable">\n'
+        '<meta property="og:image:type" content="image/png">\n'
+        '<meta property="og:image:width" content="1200">\n'
+        '<meta property="og:image:height" content="630">\n'
         f'<meta property="og:url" content="{base}/">\n'
         '<meta name="twitter:card" content="summary_large_image">\n'
+        '<meta name="twitter:title" content="SldChat - Direct Messages">\n'
+        '<meta name="twitter:description" content="SldChat удобное места для передачи сообщения из точки в точку">\n'
+        f'<meta name="twitter:image" content="{base}/og-image.png?status=stable">\n'
     )
     return render_page(og, "sldchat")
 
