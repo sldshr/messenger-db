@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 
 app = FastAPI(title="SLD")
@@ -130,6 +131,21 @@ def bus_broadcast(room: str, ev: dict, except_nick: Optional[str] = None) -> Non
             return
         except RuntimeError: pass
     bus.broadcast_room(room, ev, except_nick)
+
+
+def broadcast_post_change(post: dict, except_nick: Optional[str] = None) -> None:
+    """Рассылка во все релевантные комнаты после изменения поста или его комментариев."""
+    if not post: return
+    pid = post.get("id")
+    if pid:
+        bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=except_nick)
+    author = post.get("author")
+    if author:
+        bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=except_nick)
+    wall = post.get("wall_owner")
+    if wall:
+        bus_broadcast("wall:" + wall, {"type": "refresh"}, except_nick=except_nick)
+    bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
 
 
 def hash_password(password: str) -> str:
@@ -1066,7 +1082,9 @@ def api_set_settings(data: SettingsIn, request: Request):
     if data.allow_wall_posts is not None: patch["allow_wall_posts"] = bool(data.allow_wall_posts)
     if data.wall_enabled is not None: patch["wall_enabled"] = bool(data.wall_enabled)
     if data.show_link_previews is not None: patch["show_link_previews"] = bool(data.show_link_previews)
-    if patch: db_update_user_fields(me["nick"], patch)
+    if patch:
+        db_update_user_fields(me["nick"], patch)
+        bus_broadcast("profile:" + me["nick"], {"type": "refresh"})
     return {"ok": True}
 
 
@@ -1198,15 +1216,16 @@ def api_wall(nick: str, request: Request):
     viewer = get_current_user(request)
     vn = viewer["nick"] if viewer else None
     vid = "u:" + vn if vn else "c:anon"
-    is_owner = vn == u["nick"]
-    is_follower = vn and vn in (u.get("followers") or set())
-    wall_enabled = u.get("wall_enabled", True)
     owner_data = serialize_user(u, vn)
 
-    if not wall_enabled and not is_owner:
+    # Стена выключена — никто (включая владельца) не видит
+    if not u.get("wall_enabled", True):
         return {"posts": [], "allow_wall_posts": False, "wall_enabled": False,
                 "can_view": False, "can_post": False, "reason": "err_wall_off",
                 "owner": owner_data}
+
+    is_owner = vn == u["nick"]
+    is_follower = vn and vn in (u.get("followers") or set())
 
     if not is_owner and not is_follower:
         return {"posts": [], "allow_wall_posts": u.get("allow_wall_posts", True),
@@ -1235,8 +1254,8 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
     if not rate_limit("wall:" + ip, 20, 60): raise HTTPException(429, "err_rate_limit")
     owner = db_load_user(nick)
     if not owner: raise HTTPException(404, "not found")
+    if not owner.get("wall_enabled", True): raise HTTPException(403, "err_wall_off")
     if owner["nick"] != me["nick"]:
-        if not owner.get("wall_enabled", True): raise HTTPException(403, "err_wall_off")
         if not owner.get("allow_wall_posts", True): raise HTTPException(403, "err_wall_disabled")
         if me["nick"] not in (owner.get("followers") or set()): raise HTTPException(403, "err_need_follow")
     text = payload.text.strip()
@@ -1263,7 +1282,7 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
         qp = db_get_post(payload.quoted_post_id)
         if qp and qp.get("author") and qp["author"] != me["nick"]:
             db_notify(qp["author"], "quote", me["nick"], post_id=pid, text=text[:140])
-    bus_broadcast("wall:" + owner["nick"], {"type": "refresh"}, except_nick=None)
+    broadcast_post_change(p)
     return build_posts_full([p], "u:" + me["nick"])[0]
 
 
@@ -1323,8 +1342,7 @@ def api_create(payload: PostIn, request: Request):
         qp = db_get_post(payload.quoted_post_id)
         if qp and qp.get("author") and qp["author"] != u["nick"]:
             db_notify(qp["author"], "quote", u["nick"], post_id=pid, text=text[:140])
-    bus_broadcast("feed", {"type": "refresh"})
-    bus_broadcast("profile:" + u["nick"], {"type": "refresh"})
+    broadcast_post_change(p)
     return build_posts_full([p], "u:" + u["nick"])[0]
 
 
@@ -1339,11 +1357,7 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     db_update_post_text(pid, text)
     p = db_get_post(pid)
-    bus_broadcast("feed", {"type": "refresh"})
-    bus_broadcast("post:" + pid, {"type": "refresh"})
-    bus_broadcast("profile:" + p.get("author"), {"type": "refresh"})
-    if p.get("wall_owner"):
-        bus_broadcast("wall:" + p["wall_owner"], {"type": "refresh"})
+    broadcast_post_change(p)
     return build_posts_full([p], "u:" + u["nick"])[0]
 
 
@@ -1354,12 +1368,15 @@ def api_delete_post(pid: str, request: Request):
     if not p: raise HTTPException(404, "not found")
     if p["author"] != u["nick"] and p.get("wall_owner") != u["nick"]:
         raise HTTPException(403, "forbidden")
-    author = p.get("author"); wall_owner = p.get("wall_owner")
+    author = p.get("author")
+    wall_owner = p.get("wall_owner")
     db_delete_post(pid)
-    bus_broadcast("feed", {"type": "refresh"})
-    bus_broadcast("post:" + pid, {"type": "refresh"})
-    if author: bus_broadcast("profile:" + author, {"type": "refresh"})
-    if wall_owner: bus_broadcast("wall:" + wall_owner, {"type": "refresh"})
+    # Уведомляем всех о том, что пост удалён
+    ev = {"type": "post_deleted", "post_id": pid}
+    bus_broadcast("post:" + pid, ev)
+    bus_broadcast("feed", {"type": "refresh"}, except_nick=u["nick"])
+    if author: bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=u["nick"])
+    if wall_owner: bus_broadcast("wall:" + wall_owner, {"type": "refresh"}, except_nick=u["nick"])
     return {"ok": True}
 
 
@@ -1376,10 +1393,7 @@ def api_like_post(pid: str, request: Request):
     new = 0 if cur == 1 else 1
     db_set_post_vote(pid, vid, new)
     p = db_get_post(pid)
-    bus_broadcast("feed", {"type": "refresh"}, except_nick=u["nick"])
-    bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=u["nick"])
-    if p.get("author"): bus_broadcast("profile:" + p["author"], {"type": "refresh"}, except_nick=u["nick"])
-    if p.get("wall_owner"): bus_broadcast("wall:" + p["wall_owner"], {"type": "refresh"}, except_nick=u["nick"])
+    broadcast_post_change(p, except_nick=u["nick"])
     return build_posts_full([p], vid)[0]
 
 
@@ -1416,7 +1430,8 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
         if not db_load_user_cached(nick): continue
         db_notify(nick, "mention", u["nick"], post_id=pid, comment_id=cid, text=text[:140])
         notified.add(k)
-    bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=u["nick"])
+    # Broadcast во все релевантные комнаты (пост, профиль автора, стена, лента)
+    broadcast_post_change(post, except_nick=u["nick"])
     return build_posts_full([post], "u:" + u["nick"])[0]
 
 
@@ -1431,7 +1446,7 @@ def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Reques
     if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
     db_update_comment_text(cid, text)
     post = db_get_post(pid)
-    bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=u["nick"])
+    broadcast_post_change(post, except_nick=u["nick"])
     return build_posts_full([post], "u:" + u["nick"])[0]
 
 
@@ -1444,7 +1459,7 @@ def api_delete_comment(pid: str, cid: str, request: Request):
     if c["author"] != u["nick"] and (not post or post.get("wall_owner") != u["nick"]):
         raise HTTPException(403, "forbidden")
     db_delete_comment(cid)
-    bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=u["nick"])
+    broadcast_post_change(post, except_nick=u["nick"])
     return build_posts_full([post], "u:" + u["nick"])[0]
 
 
@@ -1461,7 +1476,7 @@ def api_like_comment(pid: str, cid: str, request: Request):
     new = 0 if cur == 1 else 1
     db_set_comment_vote(cid, vid, new)
     p = db_get_post(pid)
-    bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=u["nick"])
+    broadcast_post_change(p, except_nick=u["nick"])
     return build_posts_full([p], vid)[0]
 
 
@@ -1529,7 +1544,9 @@ TEXTS = {
         "send_comment": "Отправить",
         "reply": "Ответить", "cancel_reply": "Отмена",
         "no_posts": "Здесь пока пусто",
-        "not_found": "Не найдено",
+        "not_found": "Ничего не найдено",
+        "page_not_found": "Страница не найдена или была удалена",
+        "back_home": "На главную",
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
         "read_more": "Показать полностью",
         "copy": "Копировать",
@@ -1597,7 +1614,7 @@ TEXTS = {
         "settings_allow_following": "Показывать список подписок",
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_wall_enabled": "Стена включена",
-        "settings_wall_enabled_hint": "Если выключено, стену не увидит никто, кроме вас",
+        "settings_wall_enabled_hint": "Если выключено, стену не увидит никто, включая вас",
         "settings_allow_wall": "Разрешить писать на моей стене",
         "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
         "settings_show_link_previews": "Показывать превью ссылок (OpenGraph)",
@@ -1642,7 +1659,6 @@ TEXTS = {
         "avatar_choose": "Выберите эмодзи",
         "avatar_current": "Текущий аватар",
         "og_enable": "Превью ссылок",
-        "like": "Нравится",
     },
     "en": {
         "search_ph": "Search people and posts",
@@ -1654,6 +1670,8 @@ TEXTS = {
         "reply": "Reply", "cancel_reply": "Cancel",
         "no_posts": "Nothing here yet",
         "not_found": "Not found",
+        "page_not_found": "Page not found or was deleted",
+        "back_home": "Back to home",
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
         "read_more": "Show more",
         "copy": "Copy",
@@ -1721,7 +1739,7 @@ TEXTS = {
         "settings_allow_following": "Show following list",
         "settings_notify_new_post": "New post notifications",
         "settings_wall_enabled": "Wall enabled",
-        "settings_wall_enabled_hint": "If disabled, nobody except you will see your wall",
+        "settings_wall_enabled_hint": "If disabled, nobody (including you) will see your wall",
         "settings_allow_wall": "Allow posts on my wall",
         "settings_allow_wall_hint": "Only your followers can post",
         "settings_show_link_previews": "Show link previews (OpenGraph)",
@@ -1766,7 +1784,6 @@ TEXTS = {
         "avatar_choose": "Choose an emoji",
         "avatar_current": "Current avatar",
         "og_enable": "Link previews",
-        "like": "Like",
     },
 }
 
@@ -2015,12 +2032,12 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 /* PROFILE — clean compact */
 .profile-hero {
   background: var(--card); border-radius: 20px;
-  padding: 20px;
+  padding: 18px;
   margin-bottom: 14px;
 }
 .profile-hero-row {
-  display: flex; gap: 16px; align-items: flex-start;
-  margin-bottom: 14px;
+  display: flex; gap: 14px; align-items: flex-start;
+  margin-bottom: 12px;
 }
 .profile-hero-avatar { flex-shrink: 0; }
 .profile-hero-info { flex: 1; min-width: 0; }
@@ -2032,7 +2049,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .profile-line {
   display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
   margin-bottom: 8px;
+  min-height: 0;
 }
+.profile-line.only-nick { margin-bottom: 6px; }
 .profile-nick {
   font-size: 14px; color: var(--muted);
   flex-shrink: 0;
@@ -2043,10 +2062,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   min-width: 0;
   word-wrap: break-word; overflow-wrap: anywhere;
 }
-.profile-bio-inline.empty { color: var(--muted); font-style: italic; }
+.profile-bio-inline.empty { color: var(--muted); font-style: italic; font-size: 13px; }
 .profile-stats {
   display: flex; gap: 18px; font-size: 13px;
-  color: var(--muted);
+  color: var(--muted); margin: 0;
 }
 .profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; margin-right: 4px; }
 .profile-stats b:hover { text-decoration: underline; }
@@ -2189,6 +2208,21 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .views-badge {
   margin-left: auto; color: var(--muted); font-size: 13px;
   display: inline-flex; align-items: center; gap: 5px;
+}
+
+/* 404 */
+.not-found {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; padding: 80px 20px; gap: 20px;
+  background: var(--card); border-radius: 20px;
+  min-height: 320px;
+}
+.not-found-code {
+  font-size: 88px; font-weight: 900; line-height: 1;
+  color: var(--line-2); letter-spacing: -2px;
+}
+.not-found-text {
+  font-size: 15px; color: var(--muted); text-align: center;
 }
 
 /* PEOPLE / WALLS LIST */
@@ -2486,10 +2520,19 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   }
   .settings-nav-btn.active { background: var(--accent); color: var(--accent-fg); }
   .settings-block { padding: 16px; border-radius: 16px; }
-  .modal-actions { flex-direction: column-reverse; }
+
+  /* Модалка на телефоне: кнопки выше и текст крупнее */
+  .modal { padding: 22px 18px 18px; border-radius: 18px; }
+  .modal-text { font-size: 16px; margin-bottom: 20px; }
+  .modal-actions { flex-direction: column-reverse; gap: 10px; }
+  .modal-btn { height: 56px; font-size: 16px; border-radius: 14px; flex: 0 0 auto; width: 100%; }
+
   .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 5px; max-height: 280px; }
   .emoji-opt { font-size: 22px; }
   .og-image { height: 140px; }
+
+  .not-found { padding: 60px 16px; min-height: 260px; }
+  .not-found-code { font-size: 72px; }
 }
 @media (max-width: 500px) {
   .main-inner { padding: 12px 10px 30px; }
@@ -2613,6 +2656,14 @@ function truncateText(text) {
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
 
+function notFoundHtml() {
+  return '<div class="not-found">'
+    + '<div class="not-found-code">404</div>'
+    + '<div class="not-found-text">' + escapeHtml(tr('page_not_found')) + '</div>'
+    + '<a class="pill-action primary" href="/" data-link>' + escapeHtml(tr('back_home')) + '</a>'
+    + '</div>';
+}
+
 function autoGrow(el) {
   if (!el) return;
   el.style.height = 'auto';
@@ -2703,7 +2754,7 @@ function handleRoute() {
   else if (path === '/policy') { state.view = 'policy'; state.viewData = {}; }
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
-  else { state.view = 'feed'; state.viewData = {}; }
+  else { state.view = 'not_found'; state.viewData = {}; }
 
   if (state.view !== 'feed') {
     state.quotePostId = null;
@@ -2756,7 +2807,6 @@ function connectSSE() {
   state.es = es;
   es.onmessage = function(e) { try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
   es.onerror = function() {};
-  // сообщаем серверу текущую комнату
   setTimeout(updateRoom, 300);
 }
 function scheduleRefresh() {
@@ -2774,6 +2824,15 @@ function handleEvent(ev) {
   if (ev.type === 'notif_changed') {
     refreshCounters();
     if (state.view === 'notifications') loadNotifications();
+    return;
+  }
+  if (ev.type === 'post_deleted') {
+    // Если я сейчас на этом посте — показать 404
+    if (state.view === 'post' && state.viewData.post_id === ev.post_id) {
+      var main = document.getElementById('main');
+      if (main) main.innerHTML = '<div class="main-body"><div class="main-inner">' + notFoundHtml() + '</div></div>';
+      bindLinks(main);
+    }
     return;
   }
   if (ev.type === 'refresh') {
@@ -2829,6 +2888,13 @@ function renderSidebar() {
 
 function renderMain() {
   var el = document.getElementById('main');
+  if (state.view === 'not_found') {
+    el.innerHTML = '<div class="main-header"><div class="title">404</div>'
+      + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>'
+      + '<div class="main-body"><div class="main-inner">' + notFoundHtml() + '</div></div>';
+    bindThemeBtn(); bindLinks(el);
+    return;
+  }
   if (state.view === 'feed') renderFeedView(el);
   else if (state.view === 'post') renderPostView(el);
   else if (state.view === 'profile') renderProfileView(el);
@@ -3063,7 +3129,7 @@ async function loadPostView() {
         state.highlightComment = null;
       }
     }
-  } catch(e) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>'; }
+  } catch(e) { feedEl.innerHTML = notFoundHtml(); bindLinks(feedEl); }
 }
 
 // ============ PROFILE ============
@@ -3091,11 +3157,11 @@ async function loadProfile(nick) {
       actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
 
-    var bioText = u.bio ? escapeHtml(u.bio) : escapeHtml(tr('bio_empty_short'));
-    var bioCls = u.bio ? 'profile-bio-inline' : 'profile-bio-inline empty';
+    var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
+    var lineClass = u.bio ? 'profile-line' : 'profile-line only-nick';
 
-    var wallOn = u.wall_enabled !== false || isMe;
-    var wallBtn = wallOn ? '<a class="pill-action" href="/u/' + encodeURIComponent(u.nick) + '/wall" data-link>' + ICONS.walls + ' ' + escapeHtml(tr('wall_title')) + '</a>' : '';
+    // Стена включена ИЛИ я владелец (но если владелец выключил — тоже не показываем)
+    var wallOn = u.wall_enabled !== false;
 
     var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
       + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
@@ -3106,9 +3172,9 @@ async function loadProfile(nick) {
     html += '<div class="profile-hero-avatar">' + avatarHtml(u.avatar_emoji, 'lg') + '</div>';
     html += '<div class="profile-hero-info">';
     html += '<div class="profile-name">' + escapeHtml(u.name) + '</div>';
-    html += '<div class="profile-line">';
+    html += '<div class="' + lineClass + '">';
     html += '<span class="profile-nick">@' + escapeHtml(u.nick) + '</span>';
-    html += '<span class="' + bioCls + '">' + bioText + '</span>';
+    html += bioHtml;
     html += '</div>';
     html += '<div class="profile-stats">';
     html += '<div><b id="followersLink">' + u.followers + '</b><span>' + tr('profile_followers') + '</span></div>';
@@ -3116,10 +3182,9 @@ async function loadProfile(nick) {
     html += '</div>';
     html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
     html += '</div></div>';
-    html += '<div class="profile-hero-actions">' + wallBtn + actionsHtml + '</div>';
+    html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
     html += '</div>';
 
-    // Tab for posts/wall
     if (wallOn) {
       html += '<div class="pill-tabs" id="profileTabs">'
         + '<button class="pill-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('tab_posts') + '</button>'
@@ -3160,7 +3225,8 @@ async function loadProfile(nick) {
     }
     loadProfileContent(u, isMe);
   } catch(e) {
-    root.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
+    root.innerHTML = notFoundHtml();
+    bindLinks(root);
   }
 }
 
@@ -3173,11 +3239,18 @@ async function loadProfileContent(u, isMe) {
     try {
       var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
       if (!data.can_view) {
-        c.innerHTML = '<div class="card" style="text-align:center;padding:32px 20px">'
+        var reasonText = data.reason === 'err_wall_off' ? tr('err_wall_off')
+                       : data.reason === 'err_wall_community' ? tr('wall_community_hint')
+                       : '';
+        var body = '<div class="card" style="text-align:center;padding:32px 20px">'
           + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
-          + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>'
-          + (state.user && !isMe ? '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">' + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>' : '')
-          + '</div>';
+          + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(reasonText) + '</div>';
+        if (data.reason === 'err_wall_community' && state.user && !isMe) {
+          body += '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">'
+            + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
+        }
+        body += '</div>';
+        c.innerHTML = body;
         var wf = document.getElementById('wallFollowBtn');
         if (wf) wf.addEventListener('click', async function(){
           try {
@@ -3192,10 +3265,10 @@ async function loadProfileContent(u, isMe) {
       if (state.user && data.can_post) {
         html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
       } else if (state.user) {
-        var reasonText = data.reason === 'err_need_follow' ? tr('err_need_follow')
-                       : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                       : '';
-        if (reasonText) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
+        var reasonText2 = data.reason === 'err_need_follow' ? tr('err_need_follow')
+                        : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
+                        : '';
+        if (reasonText2) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText2) + '</div>';
       }
       if (data.posts.length) {
         html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
@@ -3217,7 +3290,6 @@ async function loadProfileContent(u, isMe) {
       }
     } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
   } else {
-    // posts
     var html2 = '';
     if (state.user && isMe) {
       html2 += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
@@ -3277,7 +3349,7 @@ async function loadWallsList() {
   try {
     var q = (state.wallsQuery || '').trim();
     var data = await api('/api/users?q=' + encodeURIComponent(q));
-    var users = (data.users || []).filter(function(u){ return u.wall_enabled !== false || (state.user && u.nick === state.user.nick); });
+    var users = (data.users || []).filter(function(u){ return u.wall_enabled !== false; });
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
     wrap.innerHTML = users.map(wallRowHtml).join('');
     bindLinks(wrap);
@@ -3317,10 +3389,13 @@ async function loadWall(nick) {
     html += '</div></div>';
 
     if (!data.can_view) {
+      var reasonText = data.reason === 'err_wall_off' ? tr('err_wall_off')
+                     : data.reason === 'err_wall_community' ? tr('wall_community_hint')
+                     : '';
       html += '<div class="card" style="text-align:center;padding:32px 20px">'
         + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
-        + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>';
-      if (state.user && state.user.nick !== nick) {
+        + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(reasonText) + '</div>';
+      if (data.reason === 'err_wall_community' && state.user && state.user.nick !== nick) {
         html += '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">'
           + (owner.is_following ? tr('unfollow') : tr('follow')) + '</button>';
       }
@@ -3341,10 +3416,10 @@ async function loadWall(nick) {
     if (state.user && data.can_post) {
       html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
     } else if (state.user) {
-      var reasonText = data.reason === 'err_need_follow' ? tr('err_need_follow')
-                     : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                     : '';
-      if (reasonText) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
+      var r2 = data.reason === 'err_need_follow' ? tr('err_need_follow')
+             : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
+             : '';
+      if (r2) html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(r2) + '</div>';
     } else {
       html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
     }
@@ -3365,7 +3440,7 @@ async function loadWall(nick) {
         }
       });
     }
-  } catch(e) { root.innerHTML = '<div class="empty">—</div>'; }
+  } catch(e) { root.innerHTML = notFoundHtml(); bindLinks(root); }
 }
 
 // ============ EDIT PROFILE ============
@@ -3630,7 +3705,7 @@ function renderSettingsView(el) {
     html += '<div class="toggle-row"><span>' + tr('settings_wall_enabled') + '</span>'
       + '<div class="toggle' + (wallOn ? ' on' : '') + '" data-toggle="wall_enabled"></div></div>';
     html += '<p class="settings-desc" style="margin-top:8px">' + escapeHtml(tr('settings_wall_enabled_hint')) + '</p>';
-    html += '<div style="margin-top:14px"><button class="modal-btn danger" style="width:auto;padding:0 20px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
+    html += '<div style="margin-top:14px"><button class="modal-btn danger" style="width:auto;padding:0 20px;height:44px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
   } else {
     html += '<a class="publish-btn" href="/login" data-link style="display:inline-block;text-decoration:none;line-height:44px;height:44px">' + tr('go_login') + '</a>';
   }
@@ -3728,7 +3803,13 @@ function renderSettingsView(el) {
       t.classList.toggle('on', newVal);
       var patch = {}; patch[key] = newVal;
       var meNow = state.user || {}; meNow[key] = newVal; setUser(meNow);
-      try { await api('/api/users/me/settings', { method: 'POST', body: patch }); }
+      try {
+        await api('/api/users/me/settings', { method: 'POST', body: patch });
+        // Если выключили стену и мы в профиле — перезагрузим его
+        if (key === 'wall_enabled' && state.view === 'profile') {
+          loadProfile(state.viewData.nick);
+        }
+      }
       catch(e) {
         t.classList.toggle('on', !newVal);
         meNow[key] = !newVal; setUser(meNow);
@@ -4188,12 +4269,46 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         + js + '\n</script>\n</body>\n</html>')
 
 
+def render_404_page(lang: str) -> str:
+    """HTML-страница 404 для серверного рендеринга."""
+    t = TEXTS[lang]
+    return ('<!DOCTYPE html>\n'
+        f'<html lang="{lang}" data-theme="dark">\n'
+        '<head>\n'
+        '<meta charset="utf-8" />\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
+        '<meta name="color-scheme" content="dark light" />\n'
+        f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
+        '<title>404 — SLD</title>\n'
+        '<style>' + CSS + '</style>\n'
+        '</head>\n'
+        '<body>\n'
+        '<div class="layout" style="justify-content:center;align-items:center;">'
+        '<div class="not-found">'
+        '<div class="not-found-code">404</div>'
+        f'<div class="not-found-text">{t["page_not_found"]}</div>'
+        f'<a class="pill-action primary" href="/">{t["back_home"]}</a>'
+        '</div></div></body></html>')
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # Для API — JSON
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    # Для страниц — HTML 404
+    if exc.status_code == 404:
+        return HTMLResponse(render_404_page(get_lang(request)), status_code=404)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+
 @app.get("/", response_class=HTMLResponse)
 def page_index(request: Request): return render_page(get_lang(request), "feed")
 
 @app.get("/p/{post_id}", response_class=HTMLResponse)
 def page_post(post_id: str, request: Request):
-    if not db_get_post(post_id): raise HTTPException(404, "not found")
+    if not db_get_post(post_id):
+        raise HTTPException(404, "not found")
     return render_page(get_lang(request), "post", {"post_id": post_id})
 
 @app.get("/walls", response_class=HTMLResponse)
