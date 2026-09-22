@@ -44,6 +44,7 @@ SESSION_TTL = 30 * 24 * 3600
 MAX_SESSIONS_PER_USER = 10
 USER_CACHE_TTL = 60.0
 RATE_WINDOW = 60.0
+SSE_HEARTBEAT_SEC = 12
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
@@ -1814,24 +1815,36 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
         bus.set_rooms(nick, ["feed"])
 
     q = await bus.subscribe(nick)
+
     async def gen():
         try:
-            yield "retry: 3000\n\n"
+            # Устанавливаем быстрый retry для клиента и сразу шлём hello,
+            # чтобы прокси увидел ответ и не ругался на upstream connect.
+            yield "retry: 2000\n\n"
+            yield ": connected\n\n"
             yield f"data: {json.dumps({'type':'hello','nick':nick}, ensure_ascii=False)}\n\n"
             while True:
-                if await request.is_disconnected(): break
+                if await request.is_disconnected():
+                    break
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=20)
+                    ev = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SEC)
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": ka\n\n"
-        except asyncio.CancelledError: pass
+                    # Heartbeat — держит соединение живым через прокси
+                    yield ": ping\n\n"
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("[SSE] error for %s: %s", nick, e)
         finally:
             bus.unsubscribe(nick, q)
-            invalidate_user_cache(nick)
+
     return StreamingResponse(gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform",
-                 "X-Accel-Buffering": "no", "Connection": "keep-alive"})
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        })
 
 
 TEXTS = {
@@ -1999,7 +2012,7 @@ TEXTS = {
             "## 8. Cookies и localStorage\n"
             "Мы используем минимум локального хранения:\n"
             "• localStorage: SLD_token (токен сессии), SLD_user (кэш профиля), SLD_theme (тема), SLD_lang (язык), SLD_colors (цвета), SLD_sound (звук), SLD_anon_id (анонимный идентификатор для realtime)\n"
-            "• sessionStorage: черновик поста, состояние настроек\n"
+            "• sessionStorage: черновик поста, состояние настроек, цитата\n"
             "• Один cookie: SLD_lang — только чтобы помнить выбранный язык\n"
             "Сторонних cookies нет. Вы можете очистить эти данные в любой момент в настройках браузера.\n\n"
             "## 9. Дети\n"
@@ -2200,7 +2213,7 @@ TEXTS = {
             "## 8. Cookies and localStorage\n"
             "We use the minimum of local storage:\n"
             "• localStorage: SLD_token (session), SLD_user (profile cache), SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id (anonymous realtime id)\n"
-            "• sessionStorage: post draft, settings state\n"
+            "• sessionStorage: post draft, settings state, quote\n"
             "• One cookie: SLD_lang — only to remember your language choice\n"
             "No third-party cookies. You can clear these at any time in your browser.\n\n"
             "## 9. Children\n"
@@ -2392,7 +2405,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn.danger:hover { color: var(--danger); }
 
-/* PILL TABS */
 .pill-tabs { position: relative; display: flex; gap: 0; padding: 4px; background: var(--card-2); border-radius: 12px; margin-bottom: 16px; isolation: isolate; }
 .pill-tabs .pill-slider { position: absolute; top: 4px; left: 0; height: calc(100% - 8px); background: var(--bg-elev); border-radius: 9px; pointer-events: none; z-index: 0; transition: transform .32s cubic-bezier(.4, 0, .2, 1), width .32s cubic-bezier(.4, 0, .2, 1); box-shadow: var(--shadow-sm); will-change: transform, width; }
 [data-theme="dark"] .pill-tabs .pill-slider { background: var(--card-3); }
@@ -2534,7 +2546,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .notif-row .snippet { margin-top: 8px; padding: 8px 12px; background: var(--card-3); border-radius: 10px; font-size: 13px; color: var(--muted); white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; }
 .notif-row .time { font-size: 12px; color: var(--muted-2); margin-top: 6px; }
 
-/* SETTINGS */
 .settings-layout { display: flex; gap: 24px; max-width: 100%; margin: 0 auto; width: 100%; padding: 4px 24px 40px; min-height: 100%; }
 .settings-nav { flex: 0 0 200px; display: flex; flex-direction: column; gap: 2px; padding-top: 4px; }
 .settings-nav-btn { display: flex; align-items: center; gap: 12px; padding: 11px 14px; text-align: left; background: transparent; border: none; color: var(--text-2); cursor: pointer; border-radius: 10px; font: inherit; font-size: 14.5px; font-weight: 500; transition: background .15s ease, color .15s ease; }
@@ -2573,7 +2584,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .color-swatch:hover { transform: scale(1.1); }
 .color-swatch.active { border-color: var(--bg); box-shadow: 0 0 0 2px var(--text); }
 
-/* SETTINGS MOBILE LIST */
 .settings-list-mobile { display: flex; flex-direction: column; gap: 8px; padding: 4px 16px 40px; max-width: 680px; margin: 0 auto; width: 100%; }
 .settings-list-row {
   display: flex; align-items: center; gap: 14px;
@@ -2596,7 +2606,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .settings-list-row .sl-desc { font-size: 12.5px; color: var(--muted); line-height: 1.3; }
 .settings-list-row .sl-chevron { color: var(--muted-2); flex-shrink: 0; }
 
-/* EMOJI PICKER */
 .emoji-current { display: flex; align-items: center; gap: 14px; padding: 14px 16px; background: var(--card-2); border-radius: 12px; margin-bottom: 14px; }
 .emoji-current .preview { font-size: 36px; line-height: 1; }
 .emoji-current .label-wrap { display: flex; flex-direction: column; gap: 2px; }
@@ -2607,7 +2616,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
 .emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
 
-/* AUTH */
 .auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
 .auth-card { background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 32px; max-width: 400px; width: 100%; box-shadow: var(--shadow-lg); }
 .auth-card h1 { font-size: 24px; font-weight: 800; margin: 0 0 22px; letter-spacing: -0.4px; }
@@ -2623,7 +2631,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .auth-switch a { color: var(--text); cursor: pointer; text-decoration: none; font-weight: 700; border-bottom: 1px solid transparent; transition: border-color .15s ease, color .15s ease; }
 .auth-switch a:hover { color: var(--accent); border-color: var(--accent); }
 
-/* POLICY */
 .policy { max-width: 720px; margin: 0 auto; padding: 12px 28px 80px; }
 .policy-h1 {
   font-size: 24px; font-weight: 800; letter-spacing: -0.4px;
@@ -2666,7 +2673,6 @@ a { -webkit-tap-highlight-color: transparent; }
   text-align: center; line-height: 1.6;
 }
 
-/* EMPTY / SPINNER */
 .empty { padding: 56px 20px; text-align: center; color: var(--muted); font-size: 13.5px; background: var(--card); border: 1px dashed var(--line-2); border-radius: 16px; }
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner { display: inline-block; width: 26px; height: 26px; border: 2.5px solid var(--line-2); border-top-color: var(--accent); animation: spin .7s linear infinite; border-radius: 50%; }
@@ -2919,6 +2925,8 @@ var state = {
   whoami: null,
   currentRooms: [],
   refreshTimer: null,
+  sseErrors: 0,
+  sseWasConnected: false,
   soundEnabled: localStorage.getItem('SLD_sound') !== '0',
 };
 
@@ -3213,7 +3221,6 @@ function handleRoute() {
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'not_found'; state.viewData = {}; }
 
-  // Если ушли с настроек (кроме перехода в edit_profile), сбрасываем открытость на мобилке
   if (wasSettings && state.view !== 'settings') {
     state.settingsOpen = false;
   }
@@ -3258,27 +3265,74 @@ function refreshCounters() {
 function disconnectSSE() {
   if (state.es) { try { state.es.close(); } catch(e) {} state.es = null; }
   state.currentRooms = [];
+  state.sseErrors = 0;
 }
 function connectSSE() {
   disconnectSSE();
   var url = '/api/events';
   if (state.token) url += '?token=' + encodeURIComponent(state.token);
   else url += '?anon=' + encodeURIComponent(anonId);
-  var es = new EventSource(url);
+  var es;
+  try {
+    es = new EventSource(url);
+  } catch(e) {
+    // Браузер не поддерживает EventSource — повторим позже
+    setTimeout(connectSSE, 5000);
+    return;
+  }
   state.es = es;
-  es.onmessage = function(e) { try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
-  es.onerror = function() {};
+  es.onopen = function() {
+    state.sseErrors = 0;
+    // Соединение восстановлено — могли пропустить события. Обновим текущий вид.
+    if (state.sseWasConnected) scheduleRefresh();
+    state.sseWasConnected = true;
+    // Сбросим rooms локально, чтобы гарантированно переслать их на сервер
+    state.currentRooms = [];
+    updateRoom();
+  };
+  es.onmessage = function(e) {
+    state.sseErrors = 0;
+    try { handleEvent(JSON.parse(e.data)); } catch(err) {}
+  };
+  es.onerror = function() {
+    state.sseErrors = (state.sseErrors || 0) + 1;
+    // Браузер сам пытается переподключиться, но после 3 подряд ошибок
+    // форсим новое EventSource с экспоненциальной задержкой.
+    if (state.sseErrors >= 3) {
+      try { es.close(); } catch(e) {}
+      if (state.es === es) state.es = null;
+      var delay = Math.min(30000, 1200 * Math.pow(1.6, state.sseErrors - 3));
+      setTimeout(function(){
+        if (state.es === null) connectSSE();
+      }, delay);
+    }
+  };
   setTimeout(updateRoom, 300);
 }
 function scheduleRefresh() {
   if (state.refreshTimer) return;
   state.refreshTimer = setTimeout(function(){
     state.refreshTimer = null;
+    // Если идёт inline-редактирование поста/комментария — не перерисовываем (иначе потеряем ввод).
+    // Перепланируем на короткую задержку.
+    if (document.querySelector('.inline-editor')) {
+      scheduleRefresh();
+      return;
+    }
+    // Если активен ввод в поиске — тоже не перебиваем (иначе сотрём значение и дёрнем лишний раз API).
     var active = document.activeElement;
-    if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) return;
-    if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
-    refreshCurrentView();
-  }, 500);
+    if (active && active.closest && active.closest('.search-box')) {
+      scheduleRefresh();
+      return;
+    }
+    // Пользовательские действия временно приглушают refresh, чтобы не перебить оптимистичные апдейты.
+    // НО не теряем событие — перепланируем.
+    if (state.suppressRefresh && Date.now() < state.suppressRefresh) {
+      scheduleRefresh();
+      return;
+    }
+    try { refreshCurrentView(); } catch(e) {}
+  }, 400);
 }
 function handleEvent(ev) {
   if (!ev || !ev.type) return;
@@ -3305,6 +3359,17 @@ function handleEvent(ev) {
   }
   if (ev.type === 'refresh') { scheduleRefresh(); return; }
 }
+
+/* Догоняем пропущенное при возврате на вкладку */
+document.addEventListener('visibilitychange', function(){
+  if (!document.hidden && state.sseWasConnected) {
+    scheduleRefresh();
+  }
+});
+/* И при возврате фокуса на окно */
+window.addEventListener('focus', function(){
+  if (state.sseWasConnected) scheduleRefresh();
+});
 
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
@@ -4285,7 +4350,6 @@ function renderSettingsView(el) {
       var key = t.dataset.toggle;
       var newVal = !t.classList.contains('on');
       t.classList.toggle('on', newVal);
-      // Локальный тумблер звука
       if (key === 'sound_enabled') {
         state.soundEnabled = newVal;
         localStorage.setItem('SLD_sound', newVal ? '1' : '0');
