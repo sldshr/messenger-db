@@ -1,973 +1,638 @@
-# -*- coding: utf-8 -*-
-"""
-ВКонтактик 2008 — мини-соцсеть на FastAPI.
-Всё хранится в оперативной памяти (словари), никаких файлов и БД.
+# sldchat.py
+# Запуск:  pip install fastapi uvicorn
+#          python sldchat.py
+# Открыть:  http://127.0.0.1:8000
 
-Запуск:
-    pip install fastapi uvicorn python-multipart
-    python main.py
-Открыть: http://127.0.0.1:8000
-"""
-
-import html
-import hashlib
+import asyncio
 import secrets
+import threading
 import time
-from datetime import datetime
-from typing import Dict, Optional, Set
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List
 
 import uvicorn
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
-app = FastAPI(title="ВКонтактик 2008")
+# ----------------------------- НАСТРОЙКИ -----------------------------
+SESSION_COOKIE = "sldchat_sid"
+SESSION_TTL    = 60 * 60 * 24 * 30      # 30 дней
+ONLINE_WINDOW  = 60                     # «онлайн» = активность за 60 сек
+MAX_POST_LEN   = 1000
+MAX_COMMENT_LEN = 300
+MAX_NAME_LEN   = 24
+MAX_POSTS      = 300                    # сколько постов держим в памяти
+MAX_COMMENTS   = 200                    # максимум комментариев на пост
+POST_COOLDOWN  = 3.0                    # антифлуд, сек
 
-# =========================================================================
-#  ХРАНИЛИЩЕ (всё в оперативке)
-# =========================================================================
-
-DB: Dict = {
-    "users": {},        # id -> пользователь
-    "logins": {},       # login(lower) -> id
-    "sessions": {},     # sid -> id
-    "posts": {},        # id -> пост
-    "friends": {},      # id -> set(id) друзей
-    "requests": {},     # id -> set(id) входящих заявок в друзья
-    "next_user_id": 1,
-    "next_post_id": 1,
-}
-
-
-def friends_of(uid: int) -> Set[int]:
-    return DB["friends"].setdefault(uid, set())
+# --------------------- ХРАНИЛИЩЕ В ОПЕРАТИВКЕ ------------------------
+LOCK = threading.Lock()
+SESSIONS: Dict[str, Dict[str, Any]] = {}   # sid -> данные сессии
+POSTS: Dict[str, Dict[str, Any]] = {}      # id  -> пост
 
 
-def requests_of(uid: int) -> Set[int]:
-    return DB["requests"].setdefault(uid, set())
+def now() -> float:
+    return time.time()
 
 
-def hash_pw(password: str, salt: str) -> str:
-    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+def ordered_posts() -> List[Dict[str, Any]]:
+    return sorted(POSTS.values(), key=lambda p: p["created"], reverse=True)
 
 
-def create_user(login, password, name, surname, city="", sex="m", about=""):
-    uid = DB["next_user_id"]
-    DB["next_user_id"] += 1
-    salt = secrets.token_hex(8)
-    user = {
-        "id": uid,
-        "login": login,
-        "salt": salt,
-        "pw": hash_pw(password, salt),
-        "name": name,
-        "surname": surname,
-        "city": city,
-        "sex": sex,
-        "about": about,
-        "created": time.time(),
+def online_count() -> int:
+    t = now()
+    return sum(1 for s in SESSIONS.values() if t - s["last_seen"] < ONLINE_WINDOW)
+
+
+def public_post(p: Dict[str, Any], uid: str) -> Dict[str, Any]:
+    return {
+        "id": p["id"],
+        "text": p["text"],
+        "author": p["author"],
+        "created": p["created"],
+        "likes": len(p["likes"]),
+        "liked": uid in p["likes"],
+        "mine": p["owner"] == uid,
+        "comments": [
+            {
+                "id": c["id"],
+                "author": c["author"],
+                "text": c["text"],
+                "created": c["created"],
+                "mine": c["owner"] == uid,
+            }
+            for c in p["comments"]
+        ],
     }
-    DB["users"][uid] = user
-    DB["logins"][login.lower()] = uid
-    friends_of(uid)
-    requests_of(uid)
-    return user
 
 
-def add_post(author_id: int, owner_id: int, text: str) -> dict:
-    pid = DB["next_post_id"]
-    DB["next_post_id"] += 1
+async def janitor() -> None:
+    """Раз в минуту подчищаем просроченные сессии."""
+    while True:
+        await asyncio.sleep(60)
+        t = now()
+        with LOCK:
+            dead = [sid for sid, s in SESSIONS.items() if t - s["last_seen"] > SESSION_TTL]
+            for sid in dead:
+                SESSIONS.pop(sid, None)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(janitor())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="sldchat", lifespan=lifespan)
+
+
+# ------------------------- СЕССИИ И COOKIE ---------------------------
+async def get_session(request: Request, response: Response) -> Dict[str, Any]:
+    """
+    Достаём сессию по cookie. Если её нет — создаём новую
+    и кладём идентификатор в cookie (httponly, 30 дней).
+    """
+    sid = request.cookies.get(SESSION_COOKIE)
+    sess = SESSIONS.get(sid) if sid else None
+
+    if sess is None:
+        sid = secrets.token_urlsafe(24)
+        sess = {
+            "sid": sid,
+            "uid": "u-" + secrets.token_hex(6),
+            "name": None,
+            "created": now(),
+            "last_seen": now(),
+            "last_post": 0.0,
+        }
+        SESSIONS[sid] = sess
+        response.set_cookie(
+            key=SESSION_COOKIE,
+            value=sid,
+            max_age=SESSION_TTL,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+
+    sess["last_seen"] = now()
+    return sess
+
+
+# ------------------------------ МОДЕЛИ -------------------------------
+class PostIn(BaseModel):
+    text: str = ""
+
+
+class CommentIn(BaseModel):
+    text: str = ""
+
+
+class NameIn(BaseModel):
+    name: str = ""
+
+
+# ------------------------------- API ---------------------------------
+@app.get("/api/state")
+async def api_state(sess: Dict[str, Any] = Depends(get_session)):
+    with LOCK:
+        posts = [public_post(p, sess["uid"]) for p in ordered_posts()]
+        online = online_count()
+    return {
+        "me": {
+            "uid": sess["uid"],
+            "name": sess["name"] or "Аноним",
+            "created": sess["created"],
+            "online": online,
+        },
+        "posts": posts,
+    }
+
+
+@app.post("/api/name")
+async def api_set_name(payload: NameIn, sess: Dict[str, Any] = Depends(get_session)):
+    name = (payload.name or "").strip()[:MAX_NAME_LEN]
+    sess["name"] = name or None
+    return {"ok": True, "name": sess["name"] or "Аноним"}
+
+
+@app.post("/api/session/reset")
+async def api_reset_session(
+    sess: Dict[str, Any] = Depends(get_session),
+    response: Response = None,
+):
+    """Убиваем текущую сессию и стираем cookie — при следующем запросе будет новая."""
+    SESSIONS.pop(sess["sid"], None)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.post("/api/posts")
+async def api_create_post(payload: PostIn, sess: Dict[str, Any] = Depends(get_session)):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Пустой пост")
+    if len(text) > MAX_POST_LEN:
+        raise HTTPException(400, f"Максимум {MAX_POST_LEN} символов")
+
+    t = now()
+    if t - sess["last_post"] < POST_COOLDOWN:
+        raise HTTPException(429, "Слишком часто — подождите пару секунд")
+    sess["last_post"] = t
+
+    pid = secrets.token_hex(6)
     post = {
         "id": pid,
-        "author_id": author_id,
-        "owner_id": owner_id,
         "text": text,
-        "created": time.time(),
+        "author": sess["name"] or "Аноним",
+        "owner": sess["uid"],
+        "created": t,
         "likes": set(),
         "comments": [],
     }
-    DB["posts"][pid] = post
-    return post
+
+    with LOCK:
+        POSTS[pid] = post
+        if len(POSTS) > MAX_POSTS:
+            extra = len(POSTS) - MAX_POSTS
+            for old in sorted(POSTS.values(), key=lambda p: p["created"])[:extra]:
+                POSTS.pop(old["id"], None)
+
+    return {"ok": True, "id": pid}
 
 
-def current_user(request: Request) -> Optional[dict]:
-    sid = request.cookies.get("sid")
-    if not sid:
-        return None
-    uid = DB["sessions"].get(sid)
-    return DB["users"].get(uid) if uid else None
+@app.delete("/api/posts/{pid}")
+async def api_delete_post(pid: str, sess: Dict[str, Any] = Depends(get_session)):
+    with LOCK:
+        post = POSTS.get(pid)
+        if not post:
+            raise HTTPException(404, "Пост не найден")
+        if post["owner"] != sess["uid"]:
+            raise HTTPException(403, "Это не ваш пост")
+        POSTS.pop(pid, None)
+    return {"ok": True}
 
 
-# =========================================================================
-#  ВСПОМОГАТЕЛЬНОЕ
-# =========================================================================
-
-esc = html.escape
-
-MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн",
-          "июл", "авг", "сен", "окт", "ноя", "дек"]
-
-AVA_COLORS = ["#45688e", "#5b7fa6", "#6d8ba7", "#7a6d9e",
-              "#8a6a4a", "#4a7c59", "#8a4a5c", "#3f6b8a"]
-
-
-def fmt_time(ts: float) -> str:
-    now = datetime.now()
-    d = datetime.fromtimestamp(ts)
-    if d.date() == now.date():
-        return "сегодня в " + d.strftime("%H:%M")
-    if (now.date() - d.date()).days == 1:
-        return "вчера в " + d.strftime("%H:%M")
-    return "{0} {1} {2}".format(d.day, MONTHS[d.month - 1], d.year)
+@app.post("/api/posts/{pid}/like")
+async def api_like(pid: str, sess: Dict[str, Any] = Depends(get_session)):
+    with LOCK:
+        post = POSTS.get(pid)
+        if not post:
+            raise HTTPException(404, "Пост не найден")
+        uid = sess["uid"]
+        if uid in post["likes"]:
+            post["likes"].discard(uid)
+        else:
+            post["likes"].add(uid)
+        likes = len(post["likes"])
+    return {"ok": True, "likes": likes}
 
 
-def avatar(u: dict, size: int = 50) -> str:
-    color = AVA_COLORS[u["id"] % len(AVA_COLORS)]
-    ini = esc((u["name"][:1] + u["surname"][:1]).upper())
-    fs = max(12, size // 2)
-    return (
-        '<div class="ava" style="width:{w}px;height:{w}px;background:{c};'
-        'line-height:{w}px;font-size:{f}px">{i}</div>'
-    ).format(w=size, c=color, f=fs, i=ini)
+@app.post("/api/posts/{pid}/comments")
+async def api_add_comment(
+    pid: str, payload: CommentIn, sess: Dict[str, Any] = Depends(get_session)
+):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Пустой комментарий")
+    if len(text) > MAX_COMMENT_LEN:
+        raise HTTPException(400, f"Максимум {MAX_COMMENT_LEN} символов")
+
+    with LOCK:
+        post = POSTS.get(pid)
+        if not post:
+            raise HTTPException(404, "Пост не найден")
+        if len(post["comments"]) >= MAX_COMMENTS:
+            raise HTTPException(400, "К этому посту уже слишком много комментариев")
+        post["comments"].append(
+            {
+                "id": secrets.token_hex(4),
+                "author": sess["name"] or "Аноним",
+                "text": text,
+                "owner": sess["uid"],
+                "created": now(),
+            }
+        )
+    return {"ok": True}
 
 
-def form_button(action: str, label: str, cls: str = "btn") -> str:
-    return (
-        '<form method="post" action="{a}" class="inline">'
-        '<button class="{c}">{l}</button></form>'
-    ).format(a=action, c=cls, l=label)
+@app.delete("/api/posts/{pid}/comments/{cid}")
+async def api_delete_comment(
+    pid: str, cid: str, sess: Dict[str, Any] = Depends(get_session)
+):
+    with LOCK:
+        post = POSTS.get(pid)
+        if not post:
+            raise HTTPException(404, "Пост не найден")
+        comment = next((c for c in post["comments"] if c["id"] == cid), None)
+        if not comment:
+            raise HTTPException(404, "Комментарий не найден")
+        if comment["owner"] != sess["uid"] and post["owner"] != sess["uid"]:
+            raise HTTPException(403, "Нет прав")
+        post["comments"] = [c for c in post["comments"] if c["id"] != cid]
+    return {"ok": True}
 
 
-def back_url(request: Request, default: str = "/") -> str:
-    ref = request.headers.get("referer")
-    if ref and ref.startswith("http"):
-        # оставляем только путь
-        try:
-            return "/" + ref.split("//", 1)[1].split("/", 1)[1]
-        except Exception:
-            return default
-    return ref or default
-
-
-def go(url: str, sid: Optional[str] = None) -> RedirectResponse:
-    r = RedirectResponse(url, status_code=303)
-    if sid:
-        r.set_cookie("sid", sid, httponly=True, max_age=60 * 60 * 24 * 30)
-    return r
-
-
-# =========================================================================
-#  ВЁРСТКА
-# =========================================================================
-
-CSS = """
-* { box-sizing: border-box; }
-html, body { margin:0; padding:0; }
-body {
-  background:#e8ebf0;
-  font: 11px/1.45 Verdana, Tahoma, Arial, sans-serif;
-  color:#2f2f2f;
+# ------------------------------ СТРАНИЦА -----------------------------
+PAGE = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sldchat — текстовая соцсеть без регистрации</title>
+<style>
+:root{
+  --bg:#0e0e13; --surface:#17171e; --surface2:#1e1e27; --text:#e8e8f0;
+  --muted:#8a8a9c; --primary:#5b8cff; --border:#2a2a37; --ok:#4caf50; --danger:#ff5f5f;
 }
-a { color:#2b587a; text-decoration:none; }
-a:hover { text-decoration:underline; }
-.clear { clear:both; }
-.cnt { color:#999; }
-.inline { display:inline; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:"Courier New",Courier,monospace; font-size:15px; line-height:1.45;
+  display:flex; justify-content:center; padding:18px 14px 60px;
+}
+.wrapper{width:100%; max-width:720px; display:flex; flex-direction:column; gap:14px}
+header{display:flex; flex-direction:column; gap:8px; border-bottom:2px solid var(--border); padding-bottom:12px}
+.logo{font-size:1.9rem; font-weight:bold; color:var(--primary); letter-spacing:1px}
+.logo small{color:var(--muted); font-size:.68rem; font-weight:normal; letter-spacing:0}
+.pills{display:flex; gap:8px; flex-wrap:wrap; font-size:.72rem}
+.pill{border:1px solid var(--border); border-radius:20px; padding:2px 10px; color:var(--muted); background:var(--surface)}
+.pill.on{color:var(--ok); border-color:rgba(76,175,80,.35); background:rgba(76,175,80,.08)}
+.card{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px}
+.notice{background:var(--surface2); border:1px dashed var(--border); border-radius:10px; padding:14px; font-size:.82rem; display:flex; flex-direction:column; gap:8px}
+.notice b{color:var(--primary)}
+.notice code{background:var(--bg); border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--primary)}
+.muted{color:var(--muted)}
+button{font-family:inherit; font-size:.85rem; cursor:pointer; border-radius:6px; border:1px solid var(--border);
+       background:var(--surface2); color:var(--text); padding:8px 14px; font-weight:bold; transition:.15s}
+button:hover{background:#262633}
+button.primary{background:var(--primary); border-color:var(--primary); color:#fff}
+button.primary:hover{filter:brightness(1.1)}
+button.ghost{background:transparent}
+input,textarea{width:100%; font-family:inherit; font-size:.92rem; background:var(--surface2);
+       border:1px solid var(--border); border-radius:6px; color:var(--text); padding:10px; outline:none; resize:vertical}
+input:focus,textarea:focus{border-color:var(--primary)}
+.row{display:flex; gap:8px; align-items:center}
+.between{justify-content:space-between}
+.composer{display:flex; flex-direction:column; gap:10px}
+.post{display:flex; flex-direction:column; gap:10px; margin-bottom:12px}
+.post-head{display:flex; align-items:center; gap:8px; font-size:.78rem; border-bottom:1px dotted var(--border); padding-bottom:8px}
+.author{color:var(--primary); font-weight:bold}
+.post-text{white-space:pre-wrap; word-break:break-word}
+.post-foot{display:flex; gap:8px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:10px}
+.act{padding:5px 11px; font-size:.78rem}
+.act.on{background:var(--primary); border-color:var(--primary); color:#fff}
+.comments{display:none; flex-direction:column; gap:8px; border-top:1px dashed var(--border); padding-top:10px}
+.comments.open{display:flex}
+.comment{background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:.85rem}
+.comment .ch{display:flex; justify-content:space-between; gap:8px; font-size:.72rem; margin-bottom:4px}
+.cform{display:flex; gap:6px}
+.cform button{padding:8px 14px}
+.empty{text-align:center; color:var(--muted); padding:24px; font-size:.85rem}
+#toast{position:fixed; left:50%; bottom:20px; transform:translateX(-50%) translateY(20px);
+       background:var(--surface2); border:1px solid var(--border); color:var(--text);
+       padding:10px 18px; border-radius:8px; font-size:.82rem; opacity:0; pointer-events:none;
+       transition:.2s; z-index:50}
+#toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+@media(max-width:520px){ .logo{font-size:1.5rem} body{padding:12px 10px 60px} }
+</style>
+</head>
+<body>
+<div class="wrapper">
 
-/* ---------- шапка ---------- */
-#header { background:#45688e; border-bottom:1px solid #2d4a6b; height:40px; }
-#header .wrap { width:820px; margin:0 auto; height:40px; }
-.logo {
-  float:left; color:#fff; line-height:40px;
-  font:bold 20px Tahoma, Verdana, sans-serif; letter-spacing:-0.5px;
-}
-.logo:hover { text-decoration:none; }
-#header .search { float:left; margin:9px 0 0 30px; }
-#header .search input[type=text] {
-  width:180px; padding:3px 5px; border:1px solid #2d4a6b;
-  font:11px Verdana; background:#fff; color:#000;
-}
-#header .search button {
-  padding:3px 8px; border:1px solid #2d4a6b; background:#5c86b4;
-  color:#fff; font:11px Verdana; cursor:pointer;
-}
-#header .search button:hover { background:#6d95c0; }
-.huser { float:right; color:#dfe7f0; line-height:40px; }
-.huser a { color:#fff; }
-.huser a.logout { color:#c3d3e6; margin-left:8px; }
+  <header>
+    <div class="logo">sldchat <small>// текстовая соцсеть без регистрации</small></div>
+    <div class="pills">
+      <span class="pill on" id="online">● — онлайн</span>
+      <span class="pill" id="me-pill">вы: Аноним</span>
+      <span class="pill" id="sid-pill">сессия: …</span>
+    </div>
+  </header>
 
-/* ---------- каркас ---------- */
-.wrap { width:820px; margin:0 auto; }
-#main { margin-top:12px; margin-bottom:40px; }
-#left { float:left; width:160px; }
-#content { margin-left:172px; }
+  <div class="notice">
+    <div><b>Про сессии и cookie.</b> Регистрации и паролей нет. При первом визите сервер создаёт
+      <b>сессию</b> и кладёт её идентификатор в cookie <code>sldchat_sid</code> — именно поэтому
+      вас «помнят» после перезагрузки страницы. Имя и права на посты живут внутри этой сессии.</div>
+    <div><b>Про хранение.</b> Все посты, комментарии и лайки лежат <b>только в оперативной памяти</b>
+      сервера. Перезапуск сервера — и всё исчезает безвозвратно. Фото и файлов нет:
+      <b>только текст</b>.</div>
+    <div class="row between" style="flex-wrap:wrap">
+      <span class="muted" id="session-info">…</span>
+      <button class="ghost" onclick="resetSession()">Сбросить сессию</button>
+    </div>
+  </div>
 
-.lmenu { background:#fff; border:1px solid #c9d3de; }
-.lmenu a {
-  display:block; padding:5px 8px; border-bottom:1px solid #eef1f5;
-}
-.lmenu a:last-child { border-bottom:none; }
-.lmenu a:hover { background:#f0f4f9; text-decoration:none; }
+  <div class="card composer">
+    <div class="row">
+      <input id="name" maxlength="24" placeholder="Ваше имя (необязательно, по умолчанию «Аноним»)">
+      <button onclick="saveName()">ОК</button>
+    </div>
+    <textarea id="text" rows="4" maxlength="1000" placeholder="Что происходит?"></textarea>
+    <div class="row between">
+      <span class="muted" id="counter">0 / 1000</span>
+      <button class="primary" onclick="createPost()">Опубликовать</button>
+    </div>
+  </div>
 
-/* ---------- блоки ---------- */
-.box { background:#fff; border:1px solid #c9d3de; margin-bottom:12px; }
-.box h2 {
-  margin:0; padding:8px 12px; font:bold 12px Tahoma, Verdana, sans-serif;
-  background:#f0f2f5; border-bottom:1px solid #dde3ea; color:#45688e;
-}
-.box .body { padding:12px; }
+  <div id="feed"><div class="empty">Загрузка…</div></div>
+</div>
+<div id="toast"></div>
 
-/* ---------- формы ---------- */
-input[type=text], input[type=password], textarea, select {
-  font:11px Verdana; border:1px solid #c0c9d3; padding:4px;
-  width:100%; color:#000; background:#fff;
-}
-textarea { resize:vertical; }
-.btn {
-  display:inline-block; padding:4px 12px; background:#5c86b4; color:#fff;
-  border:1px solid #45688e; cursor:pointer; font:11px Verdana;
-}
-.btn:hover { background:#45688e; text-decoration:none; }
-.btn-sm { padding:3px 8px; }
-.linkbtn {
-  background:none; border:none; color:#2b587a; cursor:pointer;
-  font:11px Verdana; padding:0;
-}
-.linkbtn:hover { text-decoration:underline; }
-.lbl { display:block; margin:8px 0 3px; color:#666; }
-.err {
-  background:#ffe9e9; border:1px solid #e0a0a0; color:#a00;
-  padding:6px 8px; margin-bottom:10px;
+<script>
+const $ = (s) => document.querySelector(s);
+
+let STATE = { me: {}, posts: [] };
+let lastPostsJSON = "";
+let lastTickError = 0;
+
+/* ------------------------- утилиты ------------------------- */
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, m => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]
+  ));
 }
 
-/* ---------- аватар ---------- */
-.ava {
-  display:block; color:#fff; text-align:center; font-family:Tahoma;
-  font-weight:bold; border-radius:2px; overflow:hidden;
+function toast(msg){
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 2200);
 }
 
-/* ---------- профиль ---------- */
-.profile { background:#fff; border:1px solid #c9d3de; margin-bottom:12px; }
-.ptop { padding:15px; overflow:hidden; }
-.pava { float:left; margin-right:15px; }
-.profile h1 { font:bold 16px Tahoma, Verdana, sans-serif; margin:0 0 10px; color:#2b587a; }
-.pinfo div { padding:2px 0; }
-.pinfo b { color:#777; font-weight:normal; }
-.pbtns { margin-top:12px; }
-
-/* ---------- записи ---------- */
-.post { border-bottom:1px solid #e5e9ee; padding:12px; overflow:hidden; }
-.post:last-child { border-bottom:none; }
-.pava2 { float:left; }
-.pbody { margin-left:62px; }
-.pauthor { font-weight:bold; }
-.ptime { color:#999; }
-.ptext {
-  margin:6px 0; white-space:pre-wrap; word-wrap:break-word;
-  font-size:12px; line-height:1.5;
+async function api(path, method = "GET", body){
+  const r = await fetch(path, {
+    method,
+    headers: body ? {"Content-Type": "application/json"} : {},
+    body: body ? JSON.stringify(body) : null,
+    credentials: "same-origin"
+  });
+  let data = null;
+  try { data = await r.json(); } catch(e){}
+  if(!r.ok) throw new Error((data && data.detail) || "Ошибка сервера");
+  return data;
 }
-.pact { color:#999; padding:2px 0; }
-.comments { margin-top:4px; }
-.comment { border-top:1px solid #eef1f5; padding:6px 0 2px; }
-.cname { font-weight:bold; }
-.cform { margin-top:8px; }
-.cform input { width:70%; display:inline-block; }
-.empty { padding:12px; color:#999; }
 
-/* ---------- авторизация ---------- */
-.authwrap { width:400px; margin:50px auto; }
-.authwrap .lbl { margin-top:10px; }
-.radio { margin:4px 12px 4px 0; }
+function ago(ts){
+  const d = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  if(d < 5)     return "только что";
+  if(d < 60)    return d + " с назад";
+  if(d < 3600)  return Math.floor(d/60) + " мин назад";
+  if(d < 86400) return Math.floor(d/3600) + " ч назад";
+  return new Date(ts*1000).toLocaleDateString("ru-RU");
+}
+
+/* ------------------------- шапка ------------------------- */
+function updateHeader(){
+  const me = STATE.me || {};
+  $("#online").textContent   = "● " + (me.online ?? 0) + " онлайн";
+  $("#me-pill").textContent  = "вы: " + (me.name || "Аноним");
+  $("#sid-pill").textContent = "сессия: " + String(me.uid || "…").slice(0, 10) + "…";
+  $("#session-info").textContent =
+    "uid: " + (me.uid || "—") +
+    " · сессия создана: " + (me.created ? new Date(me.created*1000).toLocaleString("ru-RU") : "—");
+
+  if(document.activeElement !== $("#name")){
+    $("#name").value = me.name || "";
+  }
+}
+
+/* ------------------------- лента ------------------------- */
+function renderPosts(){
+  const feed = $("#feed");
+
+  // сохраняем черновики комментариев и открытые ветки
+  const drafts = {}, open = new Set();
+  document.querySelectorAll(".cinput").forEach(i => {
+    if(i.value.trim()) drafts[i.dataset.pid] = i.value;
+  });
+  document.querySelectorAll(".comments.open").forEach(c => open.add(c.dataset.pid));
+
+  const active = document.activeElement;
+  const focusPid = (active && active.classList && active.classList.contains("cinput"))
+      ? active.dataset.pid : null;
+  const caret = focusPid ? active.selectionStart : 0;
+
+  if(!STATE.posts.length){
+    feed.innerHTML = '<div class="empty">Пока пусто. Напишите первое сообщение!</div>';
+    return;
+  }
+
+  feed.innerHTML = "";
+  STATE.posts.forEach(p => {
+    const el = document.createElement("div");
+    el.className = "card post";
+
+    const commentsHTML = p.comments.map(c => `
+      <div class="comment">
+        <div class="ch">
+          <span class="author">${esc(c.author)}</span>
+          <span class="muted">
+            ${ago(c.created)}
+            ${(c.mine || p.mine)
+              ? `<button class="ghost" data-act="delcomment" data-pid="${p.id}" data-cid="${c.id}"
+                   style="padding:0 4px;font-size:.72rem;border:none;color:var(--danger)">[×]</button>`
+              : ""}
+          </span>
+        </div>
+        <div>${esc(c.text)}</div>
+      </div>`).join("");
+
+    el.innerHTML = `
+      <div class="post-head">
+        <span class="author">${esc(p.author)}</span>
+        <span class="muted">· ${ago(p.created)}</span>
+        <span style="flex:1"></span>
+        ${p.mine
+          ? `<button class="ghost" data-act="delpost" data-pid="${p.id}"
+               style="padding:2px 8px;font-size:.72rem;color:var(--danger)">[удалить]</button>`
+          : ""}
+      </div>
+      <div class="post-text">${esc(p.text)}</div>
+      <div class="post-foot">
+        <button class="act ${p.liked ? "on" : ""}" data-act="like" data-pid="${p.id}">♥ ${p.likes}</button>
+        <button class="act" data-act="toggle" data-pid="${p.id}">комментарии (${p.comments.length})</button>
+      </div>
+      <div class="comments ${open.has(p.id) ? "open" : ""}" data-pid="${p.id}">
+        ${commentsHTML || '<div class="muted" style="font-size:.78rem">Комментариев пока нет.</div>'}
+        <div class="cform">
+          <input class="cinput" data-pid="${p.id}" maxlength="300" placeholder="Ваш комментарий...">
+          <button data-act="comment" data-pid="${p.id}">→</button>
+        </div>
+      </div>`;
+
+    feed.appendChild(el);
+  });
+
+  // восстанавливаем черновики
+  document.querySelectorAll(".cinput").forEach(i => {
+    const pid = i.dataset.pid;
+    if(drafts[pid]) i.value = drafts[pid];
+  });
+  if(focusPid){
+    const el = document.querySelector('.cinput[data-pid="' + focusPid + '"]');
+    if(el){ el.focus(); try{ el.setSelectionRange(caret, caret); }catch(e){} }
+  }
+}
+
+/* ------------------------- опрос сервера ------------------------- */
+async function tick(){
+  try{
+    const s = await api("/api/state");
+    STATE = s;
+    updateHeader();
+    const j = JSON.stringify(s.posts);
+    if(j !== lastPostsJSON){ lastPostsJSON = j; renderPosts(); }
+  }catch(e){
+    if(Date.now() - lastTickError > 10000){
+      lastTickError = Date.now();
+      toast("Нет связи с сервером");
+    }
+  }
+}
+
+/* ------------------------- действия ------------------------- */
+async function createPost(){
+  const ta = $("#text");
+  const text = ta.value.trim();
+  if(!text) return toast("Введите текст");
+  try{
+    await api("/api/posts", "POST", { text });
+    ta.value = "";
+    $("#counter").textContent = "0 / 1000";
+    await tick();
+    toast("Опубликовано");
+  }catch(e){ toast(e.message); }
+}
+
+async function saveName(){
+  try{
+    const r = await api("/api/name", "POST", { name: $("#name").value });
+    STATE.me.name = r.name;
+    updateHeader();
+    toast("Имя сохранено: " + r.name);
+  }catch(e){ toast(e.message); }
+}
+
+async function resetSession(){
+  if(!confirm("Сбросить сессию? Имя и права на посты будут потеряны.")) return;
+  try{
+    await api("/api/session/reset", "POST");
+    lastPostsJSON = "";
+    await tick();
+    toast("Сессия сброшена");
+  }catch(e){ toast(e.message); }
+}
+
+/* ------------------------- события ------------------------- */
+$("#feed").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-act]");
+  if(!btn) return;
+  const act = btn.dataset.act, pid = btn.dataset.pid;
+
+  try{
+    if(act === "like"){
+      await api("/api/posts/" + pid + "/like", "POST");
+      await tick();
+    }
+    else if(act === "toggle"){
+      document.querySelector('.comments[data-pid="' + pid + '"]').classList.toggle("open");
+    }
+    else if(act === "comment"){
+      const input = document.querySelector('.cinput[data-pid="' + pid + '"]');
+      const text = input.value.trim();
+      if(!text) return toast("Пустой комментарий");
+      await api("/api/posts/" + pid + "/comments", "POST", { text });
+      input.value = "";
+      await tick();
+    }
+    else if(act === "delpost"){
+      if(!confirm("Удалить пост?")) return;
+      await api("/api/posts/" + pid, "DELETE");
+      await tick();
+    }
+    else if(act === "delcomment"){
+      if(!confirm("Удалить комментарий?")) return;
+      await api("/api/posts/" + pid + "/comments/" + btn.dataset.cid, "DELETE");
+      await tick();
+    }
+  }catch(err){ toast(err.message); }
+});
+
+$("#feed").addEventListener("keydown", (e) => {
+  if(e.key === "Enter" && e.target.classList.contains("cinput")){
+    e.preventDefault();
+    const pid = e.target.dataset.pid;
+    document.querySelector('[data-act="comment"][data-pid="' + pid + '"]').click();
+  }
+});
+
+$("#text").addEventListener("input", (e) => {
+  $("#counter").textContent = e.target.value.length + " / 1000";
+});
+
+$("#name").addEventListener("keydown", (e) => {
+  if(e.key === "Enter") saveName();
+});
+
+/* ------------------------- старт ------------------------- */
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
 """
 
-PAGE = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>{css}</style>
-</head>
-<body>
-<div id="header">
-  <div class="wrap">
-    <a class="logo" href="/">ВКонтактик</a>
-    <form class="search" method="get" action="/people">
-      <input type="text" name="q" value="{q}" placeholder="Поиск людей">
-      <button type="submit">Найти</button>
-    </form>
-    {userbox}
-  </div>
-</div>
-<div id="main" class="wrap">
-  {left}
-  <div id="content">{content}</div>
-  <div class="clear"></div>
-</div>
-</body>
-</html>"""
-
-AUTH_PAGE = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>{css}</style>
-</head>
-<body>
-<div id="header"><div class="wrap"><a class="logo" href="/">ВКонтактик</a></div></div>
-<div class="authwrap">
-  <div class="box">
-    <h2>{title}</h2>
-    <div class="body">{content}</div>
-  </div>
-</div>
-</body>
-</html>"""
-
-
-def layout(title: str, content: str, me: Optional[dict], q: str = "") -> str:
-    if me:
-        userbox = (
-            '<div class="huser"><a href="/u/{uid}">{n} {s}</a>'
-            '<a class="logout" href="/logout">выход</a></div>'
-        ).format(uid=me["id"], n=esc(me["name"]), s=esc(me["surname"]))
-
-        left = (
-            '<div id="left"><div class="lmenu">'
-            '<a href="/u/{uid}">Моя страница</a>'
-            '<a href="/feed">Новости</a>'
-            '<a href="/friends">Друзья <span class="cnt">{fc}</span></a>'
-            '<a href="/people">Поиск людей</a>'
-            '<a href="/settings">Настройки</a>'
-            '</div></div>'
-        ).format(uid=me["id"], fc=len(friends_of(me["id"])))
-    else:
-        userbox = ('<div class="huser"><a href="/login">Вход</a> | '
-                   '<a href="/register">Регистрация</a></div>')
-        left = ""
-
-    return PAGE.format(title=esc(title), css=CSS, q=esc(q),
-                       userbox=userbox, left=left, content=content)
-
-
-def auth_layout(title: str, content: str) -> str:
-    return AUTH_PAGE.format(title=esc(title), css=CSS, content=content)
-
-
-def render_comment(c: dict, me: dict) -> str:
-    a = DB["users"].get(c["author_id"])
-    name = (a["name"] + " " + a["surname"]) if a else "Удалённый"
-    return (
-        '<div class="comment">'
-        '<a class="cname" href="/u/{uid}">{n}</a> '
-        '<span class="ptime">{t}</span>'
-        '<div>{txt}</div></div>'
-    ).format(uid=c["author_id"], n=esc(name),
-             t=fmt_time(c["created"]), txt=esc(c["text"]))
-
-
-def render_post(p: dict, me: dict) -> str:
-    a = DB["users"].get(p["author_id"])
-    if not a:
-        return ""
-    pid = p["id"]
-    liked = me["id"] in p["likes"]
-    like_txt = "Больше не нравится" if liked else "Мне нравится"
-    can_del = (me["id"] == p["author_id"]) or (me["id"] == p["owner_id"])
-    del_form = ""
-    if can_del:
-        del_form = (
-            '<form method="post" action="/post/{p}/delete" class="inline">'
-            '<button class="linkbtn">удалить</button></form>'
-        ).format(p=pid)
-
-    comments = "".join(render_comment(c, me) for c in p["comments"])
-
-    return (
-        '<div class="post">'
-        '<div class="pava2">{ava}</div>'
-        '<div class="pbody">'
-        '<a class="pauthor" href="/u/{aid}">{an}</a> '
-        '<span class="ptime">{t}</span>'
-        '<div class="ptext">{txt}</div>'
-        '<div class="pact">'
-        '<form method="post" action="/post/{p}/like" class="inline">'
-        '<button class="linkbtn">{lt}</button></form>'
-        ' <span class="cnt">({lc})</span>'
-        ' &nbsp;·&nbsp; {df}'
-        '</div>'
-        '<div class="comments">{cs}</div>'
-        '<form method="post" action="/post/{p}/comment" class="cform">'
-        '<input type="text" name="text" placeholder="Комментарий..." maxlength="500">'
-        '<button class="btn btn-sm">Отправить</button>'
-        '</form>'
-        '</div>'
-        '<div class="clear"></div>'
-        '</div>'
-    ).format(ava=avatar(a, 50), aid=a["id"],
-             an=esc(a["name"] + " " + a["surname"]),
-             t=fmt_time(p["created"]), txt=esc(p["text"]), p=pid,
-             lt=like_txt, lc=len(p["likes"]), df=del_form, cs=comments)
-
-
-def render_posts(posts, me: dict) -> str:
-    if not posts:
-        return '<div class="empty">Записей пока нет.</div>'
-    return "".join(render_post(p, me) for p in posts)
-
-
-def wall_form(owner_id: int) -> str:
-    return (
-        '<form method="post" action="/post">'
-        '<input type="hidden" name="owner_id" value="{uid}">'
-        '<textarea name="text" rows="3" maxlength="1000" '
-        'placeholder="Что у вас нового?"></textarea>'
-        '<div style="margin-top:6px"><button class="btn">Отправить</button></div>'
-        '</form>'
-    ).format(uid=owner_id)
-
-
-# =========================================================================
-#  ПРОФИЛЬ / СТЕНА
-# =========================================================================
-
-def profile_content(u: dict, me: dict) -> str:
-    uid = u["id"]
-
-    posts = [p for p in DB["posts"].values() if p["owner_id"] == uid]
-    posts.sort(key=lambda p: p["created"], reverse=True)
-
-    # кнопки действий
-    btns = []
-    if uid != me["id"]:
-        if uid in friends_of(me["id"]):
-            btns.append(form_button("/friends/remove/" + str(uid), "Удалить из друзей"))
-        elif uid in requests_of(me["id"]):
-            btns.append(form_button("/friends/accept/" + str(uid), "Принять заявку"))
-        elif me["id"] in requests_of(uid):
-            btns.append('<span class="cnt">Заявка отправлена</span>')
-        else:
-            btns.append(form_button("/friends/add/" + str(uid), "Добавить в друзья"))
-
-    info = [
-        ("Город:", u["city"] or "—"),
-        ("Пол:", "мужской" if u["sex"] == "m" else "женский"),
-        ("Друзей:", str(len(friends_of(uid)))),
-        ("На сайте с:", datetime.fromtimestamp(u["created"]).strftime("%d.%m.%Y")),
-    ]
-    info_html = "".join(
-        '<div><b>{k}</b> {v}</div>'.format(k=esc(k), v=esc(v)) for k, v in info
-    )
-
-    post_form = ('<div class="body">' + wall_form(uid) + '</div>') if True else ""
-
-    about_box = ""
-    if u["about"]:
-        about_box = (
-            '<div class="box"><h2>О себе</h2>'
-            '<div class="body">{t}</div></div>'
-        ).format(t=esc(u["about"]))
-
-    return (
-        '<div class="profile"><div class="ptop">'
-        '<div class="pava">{ava}</div>'
-        '<h1>{name}</h1>'
-        '<div class="pinfo">{info}</div>'
-        '<div class="pbtns">{btns}</div>'
-        '</div></div>'
-        '{about}'
-        '<div class="box"><h2>Стена</h2>'
-        '{pf}'
-        '{wall}'
-        '</div>'
-    ).format(ava=avatar(u, 150),
-             name=esc(u["name"] + " " + u["surname"]),
-             info=info_html,
-             btns=" ".join(btns),
-             about=about_box,
-             pf=post_form,
-             wall=render_posts(posts, me))
-
-
-# =========================================================================
-#  МАРШРУТЫ: ГЛАВНАЯ / СТЕНА
-# =========================================================================
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    return RedirectResponse("/u/{0}".format(me["id"]), status_code=303)
+async def index(sess: Dict[str, Any] = Depends(get_session)):
+    # Возвращаем строку, а не Response — тогда cookie, выставленная
+    # в зависимости get_session, не потеряется.
+    return PAGE
 
-
-@app.get("/u/{uid}", response_class=HTMLResponse)
-def profile(uid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    u = DB["users"].get(uid)
-    if not u:
-        content = ('<div class="box"><div class="body">'
-                   'Пользователь не найден. <a href="/people">Все люди</a>'
-                   '</div></div>')
-        return HTMLResponse(layout("Не найдено", content, me), status_code=404)
-
-    title = u["name"] + " " + u["surname"]
-    return HTMLResponse(layout(title, profile_content(u, me), me))
-
-
-@app.get("/feed", response_class=HTMLResponse)
-def feed(request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    my_friends = friends_of(me["id"])
-    allowed_authors = set(my_friends) | {me["id"]}
-
-    posts = [p for p in DB["posts"].values() if p["author_id"] in allowed_authors]
-    posts.sort(key=lambda p: p["created"], reverse=True)
-    posts = posts[:50]
-
-    content = (
-        '<div class="box"><h2>Новости</h2>{posts}</div>'
-    ).format(posts=render_posts(posts, me))
-
-    return HTMLResponse(layout("Новости", content, me))
-
-
-# =========================================================================
-#  МАРШРУТЫ: ПОСТЫ
-# =========================================================================
-
-@app.post("/post")
-def post_create(request: Request, text: str = Form(""), owner_id: int = Form(0)):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    text = text.strip()
-    if text:
-        if owner_id not in DB["users"]:
-            owner_id = me["id"]
-        add_post(me["id"], owner_id, text[:1000])
-
-    return go(back_url(request, "/u/{0}".format(owner_id or me["id"])))
-
-
-@app.post("/post/{pid}/like")
-def post_like(pid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    p = DB["posts"].get(pid)
-    if p:
-        if me["id"] in p["likes"]:
-            p["likes"].discard(me["id"])
-        else:
-            p["likes"].add(me["id"])
-    return go(back_url(request))
-
-
-@app.post("/post/{pid}/comment")
-def post_comment(pid: int, request: Request, text: str = Form("")):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    p = DB["posts"].get(pid)
-    text = text.strip()
-    if p and text:
-        p["comments"].append({
-            "author_id": me["id"],
-            "text": text[:500],
-            "created": time.time(),
-        })
-    return go(back_url(request))
-
-
-@app.post("/post/{pid}/delete")
-def post_delete(pid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    p = DB["posts"].get(pid)
-    if p and (me["id"] == p["author_id"] or me["id"] == p["owner_id"]):
-        DB["posts"].pop(pid, None)
-    return go(back_url(request))
-
-
-# =========================================================================
-#  МАРШРУТЫ: ДРУЗЬЯ
-# =========================================================================
-
-@app.get("/friends", response_class=HTMLResponse)
-def friends_page(request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    my_friends = sorted(friends_of(me["id"]))
-    incoming = sorted(requests_of(me["id"]))
-    outgoing = sorted(u["id"] for u in DB["users"].values()
-                      if me["id"] in requests_of(u["id"]))
-
-    def user_row(uid, actions=""):
-        u = DB["users"].get(uid)
-        if not u:
-            return ""
-        return (
-            '<div class="post" style="padding:8px 12px">'
-            '<div class="pava2" style="margin-right:10px">{ava}</div>'
-            '<div class="pbody" style="margin-left:52px;padding-top:6px">'
-            '<a class="pauthor" href="/u/{uid}">{n} {s}</a>'
-            '<div class="cnt">{city}</div>'
-            '{act}'
-            '</div><div class="clear"></div></div>'
-        ).format(ava=avatar(u, 40), uid=uid, n=esc(u["name"]), s=esc(u["surname"]),
-                 city=esc(u["city"] or ""), act=actions)
-
-    fr_rows = "".join(
-        user_row(uid, form_button("/friends/remove/" + str(uid),
-                                  "Удалить из друзей", "linkbtn"))
-        for uid in my_friends
-    ) or '<div class="empty">У вас пока нет друзей. <a href="/people">Найти людей</a></div>'
-
-    inc_rows = "".join(
-        user_row(uid, form_button("/friends/accept/" + str(uid), "Принять заявку"))
-        for uid in incoming
-    ) or '<div class="empty">Новых заявок нет.</div>'
-
-    out_rows = "".join(
-        user_row(uid, '<span class="cnt">Заявка отправлена</span>')
-        for uid in outgoing
-    ) or '<div class="empty">Исходящих заявок нет.</div>'
-
-    content = (
-        '<div class="box"><h2>Мои друзья ({fc})</h2>{fr}</div>'
-        '<div class="box"><h2>Заявки в друзья ({ic})</h2>{inc}</div>'
-        '<div class="box"><h2>Я отправил заявки ({oc})</h2>{out}</div>'
-    ).format(fc=len(my_friends), fr=fr_rows,
-             ic=len(incoming), inc=inc_rows,
-             oc=len(outgoing), out=out_rows)
-
-    return HTMLResponse(layout("Друзья", content, me))
-
-
-@app.post("/friends/add/{uid}")
-def friend_add(uid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    if uid in DB["users"] and uid != me["id"] and uid not in friends_of(me["id"]):
-        requests_of(uid).add(me["id"])
-    return go(back_url(request))
-
-
-@app.post("/friends/accept/{uid}")
-def friend_accept(uid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    if uid in DB["users"] and me["id"] in requests_of(uid):
-        requests_of(uid).discard(me["id"])
-        friends_of(me["id"]).add(uid)
-        friends_of(uid).add(me["id"])
-    return go(back_url(request))
-
-
-@app.post("/friends/remove/{uid}")
-def friend_remove(uid: int, request: Request):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-    friends_of(me["id"]).discard(uid)
-    friends_of(uid).discard(me["id"])
-    return go(back_url(request))
-
-
-# =========================================================================
-#  МАРШРУТЫ: ЛЮДИ
-# =========================================================================
-
-@app.get("/people", response_class=HTMLResponse)
-def people(request: Request, q: str = ""):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    q = q.strip()
-    users = sorted(DB["users"].values(), key=lambda u: u["id"])
-    if q:
-        ql = q.lower()
-        users = [u for u in users
-                 if ql in u["name"].lower()
-                 or ql in u["surname"].lower()
-                 or ql in u["login"].lower()]
-
-    rows = []
-    for u in users:
-        act = ""
-        if u["id"] != me["id"]:
-            if u["id"] in friends_of(me["id"]):
-                act = '<span class="cnt">у вас в друзьях</span>'
-            elif u["id"] in requests_of(me["id"]):
-                act = form_button("/friends/accept/" + str(u["id"]), "Принять заявку")
-            elif me["id"] in requests_of(u["id"]):
-                act = '<span class="cnt">заявка отправлена</span>'
-            else:
-                act = form_button("/friends/add/" + str(u["id"]), "Добавить в друзья")
-        else:
-            act = '<span class="cnt">это вы</span>'
-
-        rows.append(
-            '<div class="post" style="padding:10px 12px">'
-            '<div class="pava2" style="margin-right:10px">{ava}</div>'
-            '<div class="pbody" style="margin-left:62px">'
-            '<a class="pauthor" href="/u/{uid}">{n} {s}</a>'
-            '<div class="cnt">{city}</div>'
-            '<div style="margin-top:6px">{act}</div>'
-            '</div><div class="clear"></div></div>'
-        ).format(ava=avatar(u, 50), uid=u["id"], n=esc(u["name"]),
-                 s=esc(u["surname"]), city=esc(u["city"] or ""), act=act))
-
-    body = "".join(rows) or '<div class="empty">Никого не найдено.</div>'
-    title = "Поиск людей" + (": " + q if q else "")
-    content = '<div class="box"><h2>{t}</h2>{b}</div>'.format(t=esc(title), b=body)
-
-    return HTMLResponse(layout(title, content, me, q=q))
-
-
-# =========================================================================
-#  МАРШРУТЫ: НАСТРОЙКИ
-# =========================================================================
-
-@app.get("/settings", response_class=HTMLResponse)
-def settings_get(request: Request, ok: int = 0):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    msg = '<div class="err" style="background:#e8f5e9;border-color:#a5d6a7;color:#2e7d32">Изменения сохранены.</div>' if ok else ""
-
-    form = (
-        '{msg}'
-        '<form method="post" action="/settings">'
-        '<span class="lbl">Имя</span>'
-        '<input type="text" name="name" value="{n}" maxlength="40" required>'
-        '<span class="lbl">Фамилия</span>'
-        '<input type="text" name="surname" value="{s}" maxlength="40" required>'
-        '<span class="lbl">Город</span>'
-        '<input type="text" name="city" value="{c}" maxlength="60">'
-        '<span class="lbl">Пол</span>'
-        '<label class="radio"><input type="radio" name="sex" value="m" {cm}> мужской</label>'
-        '<label class="radio"><input type="radio" name="sex" value="f" {cf}> женский</label>'
-        '<span class="lbl">О себе</span>'
-        '<textarea name="about" rows="4" maxlength="500">{a}</textarea>'
-        '<div style="margin-top:10px"><button class="btn">Сохранить</button></div>'
-        '</form>'
-    ).format(msg=msg, n=esc(me["name"]), s=esc(me["surname"]),
-             c=esc(me["city"]), a=esc(me["about"]),
-             cm="checked" if me["sex"] == "m" else "",
-             cf="checked" if me["sex"] == "f" else "")
-
-    content = (
-        '<div class="box"><h2>Настройки</h2><div class="body">{f}</div></div>'
-        '<div class="box"><h2>Аккаунт</h2><div class="body">'
-        'Логин: <b>{login}</b><br>'
-        'Зарегистрирован: {reg}'
-        '</div></div>'
-    ).format(f=form, login=esc(me["login"]),
-             reg=datetime.fromtimestamp(me["created"]).strftime("%d.%m.%Y %H:%M"))
-
-    return HTMLResponse(layout("Настройки", content, me))
-
-
-@app.post("/settings")
-def settings_post(
-    request: Request,
-    name: str = Form(""),
-    surname: str = Form(""),
-    city: str = Form(""),
-    sex: str = Form("m"),
-    about: str = Form(""),
-):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    if name.strip():
-        me["name"] = name.strip()[:40]
-    if surname.strip():
-        me["surname"] = surname.strip()[:40]
-    me["city"] = city.strip()[:60]
-    me["sex"] = "f" if sex == "f" else "m"
-    me["about"] = about.strip()[:500]
-
-    return RedirectResponse("/settings?ok=1", status_code=303)
-
-
-# =========================================================================
-#  МАРШРУТЫ: РЕГИСТРАЦИЯ / ВХОД / ВЫХОД
-# =========================================================================
-
-def register_form(error: str = "", vals: Optional[dict] = None) -> str:
-    v = vals or {}
-    err = '<div class="err">{0}</div>'.format(esc(error)) if error else ""
-    return (
-        '{err}'
-        '<form method="post" action="/register">'
-        '<span class="lbl">Логин (латиница/цифры, 3-20)</span>'
-        '<input type="text" name="login" value="{login}" maxlength="20" required>'
-        '<span class="lbl">Пароль (мин. 4 символа)</span>'
-        '<input type="password" name="password" maxlength="60" required>'
-        '<span class="lbl">Имя</span>'
-        '<input type="text" name="name" value="{name}" maxlength="40" required>'
-        '<span class="lbl">Фамилия</span>'
-        '<input type="text" name="surname" value="{surname}" maxlength="40" required>'
-        '<span class="lbl">Город</span>'
-        '<input type="text" name="city" value="{city}" maxlength="60">'
-        '<span class="lbl">Пол</span>'
-        '<label class="radio"><input type="radio" name="sex" value="m" checked> мужской</label>'
-        '<label class="radio"><input type="radio" name="sex" value="f"> женский</label>'
-        '<div style="margin-top:14px"><button class="btn">Зарегистрироваться</button></div>'
-        '<div style="margin-top:10px">Уже есть аккаунт? <a href="/login">Войти</a></div>'
-        '</form>'
-    ).format(err=err, login=esc(v.get("login", "")), name=esc(v.get("name", "")),
-             surname=esc(v.get("surname", "")), city=esc(v.get("city", "")))
-
-
-@app.get("/register", response_class=HTMLResponse)
-def register_get():
-    return HTMLResponse(auth_layout("Регистрация", register_form()))
-
-
-@app.post("/register", response_class=HTMLResponse)
-def register_post(
-    request: Request,
-    login: str = Form(""),
-    password: str = Form(""),
-    name: str = Form(""),
-    surname: str = Form(""),
-    city: str = Form(""),
-    sex: str = Form("m"),
-    about: str = Form(""),
-):
-    login = login.strip()
-    name = name.strip()
-    surname = surname.strip()
-
-    vals = {"login": login, "name": name, "surname": surname, "city": city.strip()}
-
-    error = ""
-    if not (3 <= len(login) <= 20) or not login.replace("_", "").isalnum():
-        error = "Логин: 3-20 символов, только буквы, цифры и подчёркивание."
-    elif login.lower() in DB["logins"]:
-        error = "Такой логин уже занят."
-    elif len(password) < 4:
-        error = "Пароль должен быть не короче 4 символов."
-    elif not name or not surname:
-        error = "Имя и фамилия обязательны."
-
-    if error:
-        return HTMLResponse(auth_layout("Регистрация", register_form(error, vals)),
-                            status_code=400)
-
-    user = create_user(login, password, name, surname,
-                       city.strip()[:60], "f" if sex == "f" else "m",
-                       about.strip()[:500])
-
-    sid = secrets.token_urlsafe(24)
-    DB["sessions"][sid] = user["id"]
-    return go("/u/{0}".format(user["id"]), sid=sid)
-
-
-@app.get("/login", response_class=HTMLResponse)
-def login_get(request: Request, err: str = ""):
-    if current_user(request):
-        return RedirectResponse("/", status_code=303)
-
-    err_html = '<div class="err">{0}</div>'.format(esc(err)) if err else ""
-    content = (
-        '{err}'
-        '<form method="post" action="/login">'
-        '<span class="lbl">Логин</span>'
-        '<input type="text" name="login" maxlength="20" required>'
-        '<span class="lbl">Пароль</span>'
-        '<input type="password" name="password" maxlength="60" required>'
-        '<div style="margin-top:14px"><button class="btn">Войти</button></div>'
-        '<div style="margin-top:10px">Нет аккаунта? <a href="/register">Регистрация</a></div>'
-        '</form>'
-    ).format(err=err_html)
-    return HTMLResponse(auth_layout("Вход", content))
-
-
-@app.post("/login")
-def login_post(
-    request: Request,
-    login: str = Form(""),
-    password: str = Form(""),
-):
-    uid = DB["logins"].get(login.strip().lower())
-    u = DB["users"].get(uid) if uid else None
-
-    if not u or hash_pw(password, u["salt"]) != u["pw"]:
-        return RedirectResponse("/login?err=Неверный+логин+или+пароль", status_code=303)
-
-    sid = secrets.token_urlsafe(24)
-    DB["sessions"][sid] = u["id"]
-    return go("/u/{0}".format(u["id"]), sid=sid)
-
-
-@app.get("/logout")
-def logout(request: Request):
-    sid = request.cookies.get("sid")
-    if sid:
-        DB["sessions"].pop(sid, None)
-    r = RedirectResponse("/login", status_code=303)
-    r.delete_cookie("sid")
-    return r
-
-
-# =========================================================================
-#  ДЕМО-ДАННЫЕ
-# =========================================================================
-
-def seed():
-    if DB["users"]:
-        return
-    vasya = create_user("vasya", "1234", "Василий", "Пупкин",
-                        "Москва", "m", "Люблю футбол, семечки и подъездную акустику.")
-    masha = create_user("masha", "1234", "Мария", "Иванова",
-                        "Санкт-Петербург", "f", "Кошки, гитара и дождливые вечера.")
-    friends_of(vasya["id"]).add(masha["id"])
-    friends_of(masha["id"]).add(vasya["id"])
-
-    p1 = add_post(vasya["id"], vasya["id"], "Всем привет! Я тут новенький :)")
-    p2 = add_post(masha["id"], masha["id"], "Кто идёт завтра на концерт в клуб?")
-    p3 = add_post(vasya["id"], masha["id"], "Маша, с днём рождения! 🎉")
-
-    p2["likes"].add(vasya["id"])
-    p2["likes"].add(masha["id"])
-    p1["likes"].add(masha["id"])
-
-    p1["comments"].append({"author_id": masha["id"],
-                           "text": "Добро пожаловать!",
-                           "created": time.time()})
-    p2["comments"].append({"author_id": vasya["id"],
-                           "text": "Я иду, беру два билета",
-                           "created": time.time()})
-
-
-seed()
-
-# =========================================================================
-#  ТОЧКА ВХОДА
-# =========================================================================
 
 if __name__ == "__main__":
-    print("=" * 56)
-    print("  ВКонтактик 2008 запущен: http://127.0.0.1:8000")
-    print("  Демо-аккаунты:  vasya / 1234   и   masha / 1234")
-    print("=" * 56)
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # workers=1 обязательно: данные живут в памяти процесса.
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
