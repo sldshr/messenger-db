@@ -25,37 +25,65 @@ USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
 POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
+_VIEW_COOLDOWN: Dict[str, float] = {}
 
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
 MAX_BIO_LEN = 200
-AVATAR_PIXELS_LEN = 64
-HEADER_PIXELS_LEN = 512
+VIEW_COOLDOWN_SEC = 8 * 3600
 TRUNCATE_LINES = 100
 TRUNCATE_CHARS = 500
 SESSION_TTL = 30 * 24 * 3600
 USER_CACHE_TTL = 3.0
 RATE_WINDOW = 60.0
-PRESENCE_TTL = 45.0
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
-PIXELS_RE = re.compile(r"^[0-9a-f]*$")
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 _lang_cache: Dict[str, str] = {}
 _geo_cache: Dict[str, dict] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
+DEFAULT_EMOJI = "🐱"
+
+# Список эмодзи (150+)
+EMOJIS_RAW = (
+    "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵"
+    "🐔🐧🐦🐤🦆🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋"
+    "🐌🐞🐜🦗🕷🕸🦂🐢🐍🦎🐙🦑🦐🦞🦀"
+    "🐡🐠🐟🐬🐳🐋🦈🐊🐅🐆🦓🦍🐘🦛🦏"
+    "🐪🐫🦒🦘🐃🐂🐄🐎🐖🐏🐑🦙🐐🦌🐕"
+    "🐩🐈🐓🦃🦚🦜🦢🦩🕊🐇🦝🦨🦡🦦🦥"
+    "🐁🐀🐿🦔🌵🎄🌲🌳🌴🌱🌿☘🍀🎍🎋"
+    "🍃🍂🍁🍄🌾💐🌷🌹🥀🌺🌸🌼🌻🌞🌝"
+    "🌛🌜🌚🌕🌖🌗🌘🌑🌒🌓🌔🌙🌎🌍🌏"
+    "🪐💫⭐🌟✨⚡🔥💥☄☀🌤⛅🌥☁🌦"
+    "🌧⛈🌩🌨❄☃⛄🌬💨🌪🌫🌈☔💧💦🌊"
+    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍"
+    "🤩😘😗😚😙🥲😋😛😜🤪😝🤑🤗🤭🤫"
+    "🤔🤐🤨😐😑😶😏😒🙄😬🤥😌😔😪🤤"
+    "😴😷🤒🤕🤢🤮🤧🥵🥶🥴😵🤯🤠🥳😎"
+    "🤓🧐😕😟🙁☹😮😯😲😳🥺😦😧😨😰"
+    "😥😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬"
+    "😈👿💀☠💩🤡👹👺👻👽👾🤖😺😸😹"
+    "😻😼😽🙀😿😾🙈🙉🙊👋🤚🖐✋🖖👌"
+    "🤌🤏✌🤞🤟🤘🤙👈👉👆🖕👇☝👍👎"
+    "✊👊🤛🤜👏🙌👐🤲🤝🙏💪🦾🦿🦵🦶"
+    "👂🦻👃🧠🦷🦴👀👁👅👄💋❤🧡💛💚"
+    "💙💜🖤🤍🤎💔❣💕💞💓💗💖💘💝💟"
+    "🎃🎄🎆🎇🧨✨🎈🎉🎊🎋🎍🎎🎏🎐🎑"
+    "🧧🎀🎁🎗🎟🎫🎖🏆🏅🥇🥈🥉⚽⚾🏀"
+)
+EMOJIS = [c for c in EMOJIS_RAW]
+
 
 class EventBus:
     def __init__(self):
         self.clients: Dict[str, List[asyncio.Queue]] = {}
-        self.presence: Dict[str, float] = {}
 
     async def subscribe(self, nick: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.clients.setdefault(nick, []).append(q)
-        self.presence[nick] = time.time()
         return q
 
     def unsubscribe(self, nick: str, q: asyncio.Queue):
@@ -65,19 +93,6 @@ class EventBus:
             except ValueError: pass
         if not self.clients.get(nick):
             self.clients.pop(nick, None)
-            self.presence[nick] = time.time() - PRESENCE_TTL + 4.0
-
-    def set_offline(self, nick: str):
-        if nick and not self.clients.get(nick):
-            self.presence[nick] = 0
-
-    def touch(self, nick: str):
-        if nick: self.presence[nick] = time.time()
-
-    def is_online(self, nick: str) -> bool:
-        if not nick: return False
-        if self.clients.get(nick): return True
-        return (time.time() - self.presence.get(nick, 0)) < 5.0
 
     def _deliver(self, nick: str, ev: dict):
         for q in list(self.clients.get(nick, [])):
@@ -163,13 +178,13 @@ def extract_mentions(text: str) -> List[str]:
     return out
 
 
-def clean_pixels(s: Optional[str], length: int) -> str:
+def clean_emoji(s: Optional[str]) -> str:
     if not s: return ""
-    s = s.strip().lower()
-    if len(s) > length: s = s[:length]
-    if not PIXELS_RE.match(s): return ""
-    if len(s) < length: s = s + ("0" * (length - len(s)))
-    return s
+    s = s.strip()
+    # только один эмодзи — берём первый символ (или пару если это составной)
+    if not s: return ""
+    # Разрешаем до 8 codepoint'ов (на случай compound-эмодзи)
+    return s[:8]
 
 
 def parse_user_agent(ua: str):
@@ -264,7 +279,7 @@ def get_current_user(request: Request) -> Optional[dict]:
 def require_user(request: Request) -> dict:
     u = get_current_user(request)
     if not u: raise HTTPException(401, "unauthorized")
-    bus.touch(u["nick"]); return u
+    return u
 
 
 def invalidate_user_cache(nick: Optional[str] = None) -> None:
@@ -285,8 +300,7 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
-                row["avatar_pixels"] = row.get("avatar_pixels") or ""
-                row["header_pixels"] = row.get("header_pixels") or ""
+                row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
                 return row
         except Exception as e: print("[sldchat] db_load_user error:", e)
         return None
@@ -318,8 +332,7 @@ def db_save_user(u: dict) -> None:
             "allow_following_view": u.get("allow_following_view", True),
             "notify_on_new_post": u.get("notify_on_new_post", True),
             "allow_wall_posts": u.get("allow_wall_posts", True),
-            "avatar_pixels": u.get("avatar_pixels", ""),
-            "header_pixels": u.get("header_pixels", ""),
+            "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
         }).execute()
     except Exception as e: print("[sldchat] db_save_user error:", e)
     USERS.pop(u["nick"], None)
@@ -347,8 +360,7 @@ def db_all_users() -> List[dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
-                row["avatar_pixels"] = row.get("avatar_pixels") or ""
-                row["header_pixels"] = row.get("header_pixels") or ""
+                row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
                 out.append(row)
             return out
         except Exception as e:
@@ -408,6 +420,39 @@ def db_inc_views(pid: str) -> None:
         supabase.rpc("increment_post_views", {"p_id": pid}).execute()
     except Exception as e:
         print("[sldchat] db_inc_views error:", e)
+
+
+def view_should_count(pid: str, vid: str) -> bool:
+    key = pid + "|" + vid
+    now = time.time()
+    last = _VIEW_COOLDOWN.get(key, 0)
+    if now - last < VIEW_COOLDOWN_SEC:
+        return False
+    # проверим supabase
+    if supabase:
+        try:
+            r = (supabase.table("post_views").select("last_viewed_at")
+                 .eq("post_id", pid).eq("viewer_id", vid).limit(1).execute())
+            if r.data:
+                last_ts = iso_to_ts(r.data[0].get("last_viewed_at"))
+                if now - last_ts < VIEW_COOLDOWN_SEC:
+                    _VIEW_COOLDOWN[key] = last_ts
+                    return False
+        except Exception as e:
+            print("[sldchat] view check error:", e)
+    return True
+
+
+def view_mark_counted(pid: str, vid: str) -> None:
+    now = time.time()
+    _VIEW_COOLDOWN[pid + "|" + vid] = now
+    if supabase:
+        try:
+            supabase.table("post_views").upsert({
+                "post_id": pid, "viewer_id": vid,
+                "last_viewed_at": ts_to_iso(now)}).execute()
+        except Exception as e:
+            print("[sldchat] view mark error:", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
@@ -712,8 +757,7 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "allow_following_view": old.get("allow_following_view", True),
             "notify_on_new_post": old.get("notify_on_new_post", True),
             "allow_wall_posts": old.get("allow_wall_posts", True),
-            "avatar_pixels": old.get("avatar_pixels", ""),
-            "header_pixels": old.get("header_pixels", ""),
+            "avatar_emoji": old.get("avatar_emoji", DEFAULT_EMOJI),
         }).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
@@ -758,7 +802,7 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
             au = db_load_user_cached(a)
             authors_data[a] = {
                 "name": (au or {}).get("name", a),
-                "avatar_pixels": (au or {}).get("avatar_pixels", "") or "",
+                "avatar_emoji": (au or {}).get("avatar_emoji", DEFAULT_EMOJI),
             }
 
     out = []
@@ -787,7 +831,7 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
                     "author": p.get("author"), "wall_owner": p.get("wall_owner"),
                     "views": p.get("views") or 0,
                     "author_name": ad.get("name", p.get("author")),
-                    "author_avatar_pixels": ad.get("avatar_pixels", ""),
+                    "author_avatar_emoji": ad.get("avatar_emoji", DEFAULT_EMOJI),
                     "quoted_post_id": qid, "quoted": quoted,
                     "upvotes": up, "downvotes": down, "user_vote": uv, "comments": clist})
     return out
@@ -799,10 +843,8 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
          "followers": len(u.get("followers") or []),
          "following": len(u.get("following") or []),
          "is_me": viewer_nick == u["nick"],
-         "online": bus.is_online(u["nick"]),
          "allow_wall_posts": u.get("allow_wall_posts", True),
-         "avatar_pixels": u.get("avatar_pixels", "") or "",
-         "header_pixels": u.get("header_pixels", "") or ""}
+         "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI) or DEFAULT_EMOJI}
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
@@ -825,8 +867,7 @@ class ProfileUpdateIn(BaseModel):
     name: str
     nick: str
     bio: str = ""
-    avatar_pixels: str = ""
-    header_pixels: str = ""
+    avatar_emoji: str = ""
 class SettingsIn(BaseModel):
     allow_followers_view: Optional[bool] = None
     allow_following_view: Optional[bool] = None
@@ -851,7 +892,7 @@ def api_register(data: RegisterIn, request: Request):
          "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
          "notify_on_new_post": True, "allow_wall_posts": True,
-         "avatar_pixels": "", "header_pixels": ""}
+         "avatar_emoji": DEFAULT_EMOJI}
     db_save_user(u)
     token = new_token()
     SESSIONS[token] = {"nick": nick, "created": time.time()}
@@ -874,8 +915,7 @@ def api_login(data: LoginIn, request: Request):
 def api_logout(request: Request):
     token = request.headers.get("x-auth")
     if token:
-        sess = SESSIONS.pop(token, None)
-        if sess: bus.set_offline(sess.get("nick"))
+        SESSIONS.pop(token, None)
     return {"ok": True}
 
 
@@ -893,10 +933,8 @@ def api_whoami(request: Request):
     browser, os_name = parse_user_agent(ua)
     geo = get_geo(ip)
     return {
-        "browser": browser,
-        "os": os_name,
-        "city": geo.get("city", ""),
-        "country": geo.get("country", ""),
+        "browser": browser, "os": os_name,
+        "city": geo.get("city", ""), "country": geo.get("country", ""),
     }
 
 
@@ -907,16 +945,13 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
     if len(bio) > MAX_BIO_LEN: raise HTTPException(400, "err_bio_too_long")
-    avatar = clean_pixels(data.avatar_pixels, AVATAR_PIXELS_LEN)
-    header = clean_pixels(data.header_pixels, HEADER_PIXELS_LEN)
+    avatar = clean_emoji(data.avatar_emoji) or DEFAULT_EMOJI
     old_nick = me["nick"]
     nick_changed = (nick.lower() != old_nick.lower())
     if nick_changed:
         exists = db_load_user(nick)
         if exists and exists["nick"].lower() != old_nick.lower(): raise HTTPException(400, "err_nick_taken")
-    db_update_user_fields(old_nick, {"name": name, "bio": bio,
-                                      "avatar_pixels": avatar,
-                                      "header_pixels": header})
+    db_update_user_fields(old_nick, {"name": name, "bio": bio, "avatar_emoji": avatar})
     if nick_changed:
         _rename_user_everywhere(old_nick, nick)
         for t, s in list(SESSIONS.items()):
@@ -1119,11 +1154,26 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
 def api_get(pid: str, request: Request):
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
-    db_inc_views(pid)
-    p = db_get_post(pid)
     u = get_current_user(request)
     vid = "u:" + u["nick"] if u else "c:anon"
     return build_posts_full([p], vid)[0]
+
+
+@app.post("/api/posts/{pid}/view")
+def api_view_post(pid: str, request: Request):
+    p = db_get_post(pid)
+    if not p: raise HTTPException(404, "not found")
+    u = get_current_user(request)
+    if not u:
+        return {"ok": True, "counted": False}
+    if p.get("author") == u["nick"]:
+        return {"ok": True, "counted": False}
+    vid = "u:" + u["nick"]
+    if not view_should_count(pid, vid):
+        return {"ok": True, "counted": False}
+    view_mark_counted(pid, vid)
+    db_inc_views(pid)
+    return {"ok": True, "counted": True}
 
 
 @app.post("/api/posts")
@@ -1327,24 +1377,6 @@ def api_notifications_clear(request: Request):
     db_notifications_clear(me["nick"]); return {"ok": True}
 
 
-@app.post("/api/presence")
-def api_presence(request: Request):
-    me = require_user(request)
-    bus.touch(me["nick"])
-    return {"ok": True, "online": True}
-
-
-@app.post("/api/presence/offline")
-async def api_presence_offline(request: Request):
-    try: body = await request.json()
-    except Exception: body = {}
-    token = (body or {}).get("token") or request.headers.get("x-auth")
-    if not token: return {"ok": False}
-    sess = SESSIONS.get(token)
-    if sess: bus.set_offline(sess["nick"])
-    return {"ok": True}
-
-
 @app.get("/api/events")
 async def api_events(request: Request, token: str = ""):
     sess = SESSIONS.get(token) if token else None
@@ -1353,7 +1385,6 @@ async def api_events(request: Request, token: str = ""):
     u = db_load_user_cached(nick)
     if not u: raise HTTPException(401, "unauthorized")
     q = await bus.subscribe(nick)
-    bus.touch(nick)
     async def gen():
         try:
             yield "retry: 3000\n\n"
@@ -1364,7 +1395,6 @@ async def api_events(request: Request, token: str = ""):
                     ev = await asyncio.wait_for(q.get(), timeout=20)
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    bus.touch(nick)
                     yield ": ka\n\n"
         except asyncio.CancelledError: pass
         finally:
@@ -1427,7 +1457,6 @@ TEXTS = {
         "go_login": "Войти",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
-        "message": "Сообщение",
         "edit_profile": "Редактировать",
         "edit_profile_title": "Изменить профиль",
         "own_profile": "Это ваш профиль",
@@ -1438,7 +1467,7 @@ TEXTS = {
         "wall_send": "Отправить",
         "wall_must_follow": "Подпишитесь, чтобы писать на стене",
         "wall_community_hint": "Это стена сообщества — писать могут только подписчики",
-        "wall_locked_hint": "Стена видна только подписчикам",
+        "bio_empty_short": "Описание пока не заполнено",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Конфиденциальность",
@@ -1481,7 +1510,7 @@ TEXTS = {
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "Мы храним минимум данных: имя, ник, пароль (хеш), посты, комментарии, "
-            "стену, цитаты, голоса, подписки, пиксели аватара и шапки, уведомления.\n\n"
+            "стену, цитаты, голоса, подписки, эмодзи аватара, уведомления.\n\n"
             "Пароль хранится как pbkdf2-hmac-sha256 (100 000 итераций) с солью. Мы не можем его восстановить.\n\n"
             "Данные хранятся на серверах Supabase. Мы их не продаём и не передаём третьим лицам.\n\n"
             "Редактировать и удалять можно свои посты и комментарии. Владелец стены может удалять посты и комментарии на своей стене.\n\n"
@@ -1492,12 +1521,8 @@ TEXTS = {
         "translate_show_original": "Показать оригинал",
         "translate_failed": "Перевод не удался",
         "quote": "Цитировать",
-        "avatar_title": "Аватар 8×8",
-        "header_title": "Шапка 32×16",
-        "pixel_clear": "Очистить",
-        "pixel_fill": "Залить",
-        "pixel_hint": "Тапни или проведи по клеткам",
-        "pixel_eraser": "Ластик",
+        "avatar_choose": "Выберите эмодзи",
+        "avatar_current": "Текущий аватар",
     },
     "en": {
         "search_ph": "Search people and posts",
@@ -1550,7 +1575,6 @@ TEXTS = {
         "go_login": "Log in",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
-        "message": "Message",
         "edit_profile": "Edit",
         "edit_profile_title": "Edit profile",
         "own_profile": "This is your profile",
@@ -1561,7 +1585,7 @@ TEXTS = {
         "wall_send": "Post",
         "wall_must_follow": "Follow to post on this wall",
         "wall_community_hint": "This is a community wall — only followers can post",
-        "wall_locked_hint": "Wall is visible to followers only",
+        "bio_empty_short": "No bio yet",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1604,7 +1628,7 @@ TEXTS = {
         "policy_title": "Privacy Policy",
         "policy_content": (
             "We store minimum data: name, nick, password (hash), posts, comments, "
-            "wall, quotes, votes, follows, avatar and header pixels, notifications.\n\n"
+            "wall, quotes, votes, follows, avatar emoji, notifications.\n\n"
             "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
             "Data is stored on Supabase. We do not sell or share it.\n\n"
             "You can edit/delete your own posts and comments. Wall owner can delete posts/comments on their wall.\n\n"
@@ -1615,12 +1639,8 @@ TEXTS = {
         "translate_show_original": "Show original",
         "translate_failed": "Translation failed",
         "quote": "Quote",
-        "avatar_title": "Avatar 8×8",
-        "header_title": "Header 32×16",
-        "pixel_clear": "Clear",
-        "pixel_fill": "Fill",
-        "pixel_hint": "Tap or drag across cells",
-        "pixel_eraser": "Eraser",
+        "avatar_choose": "Choose an emoji",
+        "avatar_current": "Current avatar",
     },
 }
 
@@ -1680,14 +1700,12 @@ CSS = """
   --text:#f2f2f2; --muted:#8a8a8a; --hover:#1e1e1e;
   --accent:#f2f2f2; --accent-fg:#0a0a0a; --accent-soft:#1e1e1e;
   --up:#22c55e; --down:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
-  --online:#22c55e;
 }
 [data-theme="light"] {
   --bg:#f2f3f5; --card:#ffffff; --card-2:#f0f1f3; --line:#e6e6e9; --line-2:#d6d6da;
   --text:#0a0a0a; --muted:#707070; --hover:#f0f1f3;
   --accent:#0a0a0a; --accent-fg:#ffffff; --accent-soft:#eef0f3;
   --up:#16a34a; --down:#dc2626; --danger:#dc2626; --mention:#2b6fff;
-  --online:#16a34a;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body {
@@ -1719,7 +1737,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   margin: 0 auto;
 }
 
-/* SIDEBAR (слева) */
 .sidebar {
   flex: 0 0 260px;
   width: 260px;
@@ -1767,7 +1784,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .sidebar-logout:hover { background: var(--hover); }
 .sidebar-logout svg { color: var(--muted); }
 
-/* MAIN */
 .main {
   flex: 1 1 auto; min-width: 0;
   display: flex; flex-direction: column;
@@ -1863,7 +1879,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .publish-btn:hover { opacity: .88; }
 .publish-btn:disabled { opacity: .35; cursor: default; }
 
-/* QUOTE PREVIEW */
 .quote-preview {
   margin-top: 10px; padding: 12px 14px;
   background: var(--card-2); border-radius: 14px;
@@ -1882,29 +1897,20 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
-/* AVATAR */
+/* EMOJI AVATAR */
 .avatar {
   width: 44px; height: 44px; flex-shrink: 0;
   border-radius: 50%;
-  background-color: var(--accent-soft);
-  background-size: 100% 100%;
-  background-position: center;
-  background-repeat: no-repeat;
-  image-rendering: pixelated;
-  color: var(--accent-fg);
+  background: var(--card-2);
   display: inline-flex; align-items: center; justify-content: center;
-  font-weight: 800; font-size: 16px;
-  position: relative;
+  font-size: 24px;
+  line-height: 1;
+  user-select: none;
   overflow: hidden;
-  text-transform: uppercase;
+  text-align: center;
 }
-.avatar.sm { width: 36px; height: 36px; font-size: 14px; }
-.avatar .online-dot {
-  position: absolute; bottom: 1px; right: 1px;
-  width: 11px; height: 11px;
-  background: var(--online); border: 2px solid var(--card);
-  border-radius: 50%;
-}
+.avatar.sm { width: 36px; height: 36px; font-size: 20px; }
+.avatar.lg { width: 88px; height: 88px; font-size: 48px; }
 
 /* POST */
 .post-card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
@@ -1947,10 +1953,14 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   max-height: 120px; overflow: hidden;
 }
 
-.post-actions { display: flex; align-items: center; gap: 4px; margin-top: 14px; }
+.post-actions {
+  display: flex; align-items: center; gap: 4px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
 .act-btn {
   display: inline-flex; align-items: center; gap: 6px;
-  height: 36px; padding: 0 12px;
+  height: 36px; padding: 0 10px;
   background: transparent; border: none;
   color: var(--muted); cursor: pointer;
   font-family: inherit; font-size: 13px; font-weight: 600;
@@ -1958,79 +1968,111 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   transition: background .12s, color .12s;
 }
 .act-btn:hover { background: var(--hover); color: var(--text); }
-.act-btn.up:hover, .act-btn.up.active { color: var(--up); }
-.act-btn.down:hover, .act-btn.down.active { color: var(--down); }
-.act-btn.danger:hover { color: var(--danger); }
 .act-btn svg { display: block; }
-.act-btn .num { font-variant-numeric: tabular-nums; }
-.act-btn .num.pos { color: var(--up); }
-.act-btn .num.neg { color: var(--down); }
+
+/* Голосование: up | число | down */
+.vote-group {
+  display: inline-flex; align-items: center;
+  background: transparent; border-radius: 12px;
+  margin-right: 4px;
+}
+.vote-group .act-btn { padding: 0 8px; }
+.vote-group .act-btn.up:hover, .vote-group .act-btn.up.active { color: var(--up); }
+.vote-group .act-btn.down:hover, .vote-group .act-btn.down.active { color: var(--down); }
+.vote-num {
+  min-width: 24px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  user-select: none;
+}
+.vote-num.pos { color: var(--up); }
+.vote-num.neg { color: var(--down); }
+
+.act-btn.danger:hover { color: var(--danger); }
+
+.views-badge {
+  margin-left: auto;
+  color: var(--muted); font-size: 13px;
+  display: inline-flex; align-items: center; gap: 5px;
+}
 
 /* PROFILE */
-.profile-cover {
-  height: 140px; border-radius: 20px;
-  background: linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%);
-  background-size: cover;
-  background-position: center;
-  background-repeat: no-repeat;
-  image-rendering: pixelated;
-  position: relative; margin-bottom: 54px;
+.profile-hero {
+  background: var(--card);
+  border-radius: 20px;
+  padding: 20px;
+  margin-bottom: 14px;
 }
-[data-theme="light"] .profile-cover {
-  background: linear-gradient(135deg, #e6e6e9 0%, #cfd1d6 100%);
+.profile-hero-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 14px;
 }
-.profile-cover-avatar { position: absolute; left: 24px; bottom: -50px; }
-.profile-cover-avatar .avatar {
-  width: 92px; height: 92px; font-size: 34px;
-  border: 4px solid var(--bg); box-sizing: content-box;
+.profile-hero-avatar {
+  flex-shrink: 0;
 }
-.profile-cover-avatar .avatar .online-dot {
-  width: 18px; height: 18px; bottom: 4px; right: 4px;
-  border-width: 3px; border-color: var(--bg);
+.profile-hero-main {
+  flex: 1; min-width: 0;
+  padding-top: 2px;
 }
-.profile-actions-right {
-  position: absolute; right: 20px; bottom: -50px;
-  display: flex; gap: 10px; align-items: center;
-}
-.profile-actions-right .round-action,
-.profile-actions-right .pill-action {
-  height: 44px; box-sizing: border-box;
-  background: var(--card); color: var(--text);
-  border: none; border-radius: 14px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
-  transition: background .12s; text-decoration: none;
-}
-.profile-actions-right .round-action { width: 44px; padding: 0; }
-.profile-actions-right .pill-action { padding: 0 22px; }
-.profile-actions-right .round-action:hover,
-.profile-actions-right .pill-action:hover { background: var(--hover); }
-.profile-actions-right .pill-action.primary {
-  background: var(--accent); color: var(--accent-fg);
-}
-.profile-actions-right .pill-action.primary:hover { opacity: .88; }
-
-.profile-info { padding: 0 8px; margin-bottom: 20px; }
 .profile-name {
-  font-size: 24px; font-weight: 800;
-  display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+  font-size: 22px; font-weight: 800;
+  margin-bottom: 2px;
+  overflow: hidden; text-overflow: ellipsis;
 }
-.profile-nick { font-size: 15px; color: var(--muted); margin-bottom: 12px; }
+.profile-nick {
+  font-size: 14px; color: var(--muted);
+  margin-bottom: 10px;
+}
+.profile-desc {
+  font-size: 15px; line-height: 1.55;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  color: var(--text);
+}
+.profile-desc.empty { color: var(--muted); font-style: italic; }
+
+.profile-hero-actions {
+  display: flex; gap: 10px; align-items: center;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+.pill-action {
+  height: 40px; padding: 0 20px;
+  background: var(--card-2); color: var(--text);
+  border: none; border-radius: 12px;
+  font-family: inherit; font-size: 14px; font-weight: 700;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  text-decoration: none;
+  transition: background .12s;
+}
+.pill-action:hover { background: var(--hover); }
+.pill-action.primary { background: var(--accent); color: var(--accent-fg); }
+.pill-action.primary:hover { opacity: .88; }
+.round-action {
+  width: 40px; height: 40px;
+  background: var(--card-2); border: none; color: var(--text);
+  border-radius: 12px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  text-decoration: none;
+  transition: background .12s;
+}
+.round-action:hover { background: var(--hover); }
+
 .profile-stats {
-  display: flex; gap: 22px; font-size: 14px; margin-bottom: 10px;
+  display: flex; gap: 22px; font-size: 14px;
+  margin-top: 8px;
 }
 .profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; margin-right: 4px; }
 .profile-stats b:hover { text-decoration: underline; }
 .profile-stats span { color: var(--muted); }
-.profile-bio {
-  font-size: 15px; color: var(--text); line-height: 1.5;
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-  margin-bottom: 10px;
-}
-.profile-bio-empty { color: var(--muted); font-style: italic; }
 .profile-meta {
   display: flex; align-items: center; gap: 6px;
   color: var(--muted); font-size: 13px;
+  margin-top: 10px;
 }
 
 /* PEOPLE */
@@ -2135,7 +2177,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .settings-desc { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; }
 .settings-link { display: inline-block; color: var(--text); text-decoration: underline; font-size: 14px; font-weight: 500; }
 
-/* device info rows */
 .device-info { display: flex; flex-direction: column; gap: 8px; }
 .device-info-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -2146,6 +2187,48 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .device-info-row .label { color: var(--muted); font-weight: 500; }
 .device-info-row .value { color: var(--text); font-weight: 700; }
+
+/* EMOJI PICKER */
+.emoji-current {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px;
+  background: var(--card-2);
+  border-radius: 14px;
+  margin-bottom: 14px;
+}
+.emoji-current .label {
+  font-size: 13px; color: var(--muted);
+}
+.emoji-current .preview {
+  font-size: 40px; line-height: 1;
+}
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(46px, 1fr));
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--card-2);
+  border-radius: 14px;
+}
+.emoji-opt {
+  aspect-ratio: 1 / 1;
+  background: transparent;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .12s, border-color .12s;
+  padding: 0;
+}
+.emoji-opt:hover { background: var(--hover); }
+.emoji-opt.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
 
 /* AUTH */
 .auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
@@ -2236,6 +2319,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .comment-actions { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
 .comment-actions .act-btn { height: 30px; padding: 0 10px; font-size: 12px; }
+.comment-actions .vote-group .act-btn { padding: 0 6px; }
 
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea {
@@ -2252,84 +2336,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   background: var(--card-2); color: var(--text);
 }
 .inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); }
-
-/* ============ PIXEL EDITOR ============ */
-.pixel-block {
-  background: var(--card);
-  border-radius: 20px;
-  padding: 18px;
-  margin-bottom: 14px;
-}
-.pixel-head {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 12px; gap: 12px;
-}
-.pixel-head-title {
-  font-size: 15px; font-weight: 800;
-}
-.pixel-head-hint {
-  font-size: 12px; color: var(--muted);
-}
-.pixel-stage {
-  display: flex; justify-content: center; align-items: center;
-  padding: 12px;
-  background: var(--card-2);
-  border-radius: 14px;
-  margin-bottom: 14px;
-  overflow: hidden;
-}
-.pixel-canvas {
-  display: block;
-  cursor: crosshair;
-  touch-action: none;
-  border-radius: 4px;
-  background: #000;
-  image-rendering: pixelated;
-  -ms-interpolation-mode: nearest-neighbor;
-}
-[data-theme="light"] .pixel-canvas { background: #fff; }
-.pixel-palette {
-  display: grid;
-  grid-template-columns: repeat(8, 1fr);
-  gap: 6px;
-  margin-bottom: 12px;
-}
-.px-swatch {
-  aspect-ratio: 1 / 1;
-  border: 2px solid transparent;
-  border-radius: 8px;
-  cursor: pointer;
-  padding: 0;
-  position: relative;
-  transition: transform .1s, border-color .1s, box-shadow .1s;
-}
-.px-swatch:hover { transform: scale(1.06); }
-.px-swatch.active {
-  border-color: var(--text);
-  box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--text);
-}
-.px-swatch.eraser {
-  background:
-    linear-gradient(45deg, #666 25%, transparent 25%),
-    linear-gradient(-45deg, #666 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #666 75%),
-    linear-gradient(-45deg, transparent 75%, #666 75%);
-  background-size: 8px 8px;
-  background-position: 0 0, 0 4px, 4px -4px, -4px 0px;
-  background-color: #2a2a2a;
-}
-.pixel-actions {
-  display: flex; gap: 8px;
-}
-.px-btn {
-  flex: 1; height: 40px;
-  background: var(--card-2); color: var(--text);
-  border: none; border-radius: 12px;
-  font-family: inherit; font-size: 14px; font-weight: 700;
-  cursor: pointer; transition: background .12s;
-}
-.px-btn:hover { background: var(--hover); }
-.px-btn.danger { color: var(--danger); }
 
 /* TABLET */
 @media (max-width: 1100px) and (min-width: 901px) {
@@ -2382,18 +2388,12 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   .main-header { padding: 14px 16px; }
   .main-header .title { font-size: 20px; }
   .main-inner { padding: 16px 12px 40px; }
-  .card, .post-card, .pixel-block { border-radius: 18px; padding: 14px; }
+  .card, .post-card { border-radius: 18px; padding: 14px; }
 
-  .profile-cover { height: 110px; border-radius: 18px; margin-bottom: 46px; }
-  .profile-cover-avatar { left: 16px; bottom: -42px; }
-  .profile-cover-avatar .avatar { width: 76px; height: 76px; font-size: 28px; border-width: 3px; }
-  .profile-cover-avatar .avatar .online-dot { width: 14px; height: 14px; bottom: 2px; right: 2px; }
-  .profile-actions-right { right: 12px; bottom: -42px; }
-  .profile-actions-right .round-action,
-  .profile-actions-right .pill-action { height: 38px; font-size: 13px; }
-  .profile-actions-right .round-action { width: 38px; }
-  .profile-actions-right .pill-action { padding: 0 16px; }
-  .profile-name { font-size: 20px; }
+  .profile-hero { border-radius: 18px; padding: 16px; }
+  .profile-hero-top { gap: 12px; }
+  .profile-name { font-size: 19px; }
+  .avatar.lg { width: 68px; height: 68px; font-size: 36px; }
 
   .settings-layout { flex-direction: column; padding: 12px; }
   .settings-nav {
@@ -2411,16 +2411,15 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
   .modal-actions { flex-direction: column-reverse; }
 
-  .pixel-palette { grid-template-columns: repeat(8, 1fr); gap: 5px; }
+  .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 5px; max-height: 280px; }
+  .emoji-opt { font-size: 22px; }
 }
 @media (max-width: 500px) {
   .main-inner { padding: 12px 10px 30px; }
-  .card, .post-card, .pixel-block { border-radius: 16px; padding: 12px; }
-  .profile-cover { height: 90px; margin-bottom: 42px; }
-  .profile-cover-avatar .avatar { width: 68px; height: 68px; font-size: 24px; }
+  .card, .post-card { border-radius: 16px; padding: 12px; }
   .profile-name { font-size: 18px; }
   .profile-stats { font-size: 13px; gap: 16px; }
-  .pixel-palette { gap: 4px; }
+  .avatar.lg { width: 60px; height: 60px; font-size: 32px; }
 }
 """
 
@@ -2437,38 +2436,8 @@ var ICONS = {
   eye: __I_EYE__, cal: __I_CAL__
 };
 
-var PALETTE = [
-  null,
-  '#000000', '#262626', '#525252', '#a3a3a3', '#ffffff',
-  '#dc2626', '#ea580c', '#facc15', '#16a34a',
-  '#0d9488', '#2563eb', '#4f46e5', '#9333ea',
-  '#db2777', '#78350f'
-];
-
-function pixelsToCssUrl(pixels, w, h) {
-  if (!pixels) return '';
-  var rects = '';
-  var total = w * h;
-  for (var i = 0; i < pixels.length && i < total; i++) {
-    var c = parseInt(pixels[i], 16);
-    if (!c || !PALETTE[c]) continue;
-    var x = i % w;
-    var y = (i / w) | 0;
-    rects += '<rect x="'+x+'" y="'+y+'" width="1" height="1" fill="'+PALETTE[c]+'"/>';
-  }
-  if (!rects) return '';
-  var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+w+' '+h+'" shape-rendering="crispEdges">'+rects+'</svg>';
-  return 'url("data:image/svg+xml;utf8,' + encodeURIComponent(svg) + '")';
-}
-
-function avatarHtml(name, nick, online, size, pixels) {
-  var cls = 'avatar' + (size ? ' ' + size : '');
-  var url = pixels ? pixelsToCssUrl(pixels, 8, 8) : '';
-  var style = url ? 'style="background-image:' + url.replace(/"/g, '&quot;') + '"' : '';
-  var letter = url ? '' : initial(name || nick);
-  var dot = online ? '<span class="online-dot"></span>' : '';
-  return '<div class="' + cls + '" ' + style + '>' + letter + dot + '</div>';
-}
+var EMOJIS = __EMOJIS__;
+var DEFAULT_EMOJI = '🐱';
 
 var cachedUser = null;
 try { cachedUser = JSON.parse(localStorage.getItem('sldchat_user') || 'null'); } catch(e) { cachedUser = null; }
@@ -2492,10 +2461,7 @@ var state = {
   profileTab: 'posts',
   settingsSection: 'account',
   es: null,
-  presenceTimer: null,
-  avatarPixels: '',
-  headerPixels: '',
-  currentColor: 5,
+  currentEmoji: DEFAULT_EMOJI,
   whoami: null
 };
 
@@ -2542,10 +2508,6 @@ function linkifyMentions(escaped) {
   });
 }
 function tr(k) { return T[k] || k; }
-function initial(name) {
-  var n = (name || '?').trim();
-  return n ? n.charAt(0).toUpperCase() : '?';
-}
 function timeAgo(ts) {
   var d = Math.floor(Date.now()/1000 - ts);
   if (d < 5) return tr('just_now');
@@ -2676,7 +2638,6 @@ function refreshCounters() {
 }
 function disconnectSSE() {
   if (state.es) { try { state.es.close(); } catch(e) {} state.es = null; }
-  if (state.presenceTimer) { clearInterval(state.presenceTimer); state.presenceTimer = null; }
 }
 function connectSSE() {
   if (!state.token) return;
@@ -2685,9 +2646,6 @@ function connectSSE() {
   state.es = es;
   es.onmessage = function(e) { try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
   es.onerror = function() {};
-  state.presenceTimer = setInterval(function(){
-    if (state.token) fetch('/api/presence', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
-  }, 20000);
 }
 function handleEvent(ev) {
   if (!ev || !ev.type) return;
@@ -2698,15 +2656,6 @@ function handleEvent(ev) {
     return;
   }
 }
-window.addEventListener('pagehide', function(){
-  if (!state.token) return;
-  try {
-    fetch('/api/presence/offline', {
-      method: 'POST',
-      headers: { 'X-Auth': state.token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: state.token }), keepalive: true });
-  } catch(e) {}
-});
 
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
@@ -2778,6 +2727,12 @@ function bindLinks(root) {
   });
 }
 
+function avatarHtml(emoji, size) {
+  var cls = 'avatar' + (size ? ' ' + size : '');
+  var e = emoji || DEFAULT_EMOJI;
+  return '<div class="' + cls + '">' + escapeHtml(e) + '</div>';
+}
+
 function composerHtml(opts) {
   opts = opts || {};
   var u = state.user;
@@ -2787,7 +2742,7 @@ function composerHtml(opts) {
   var idPrefix = opts.idPrefix || 'post';
   return '<div class="card">'
     + '<div class="composer-avatar-row">'
-    + avatarHtml(u.name, u.nick, false, 'sm', u.avatar_pixels)
+    + avatarHtml(u.avatar_emoji, 'sm')
     + '<div class="composer-body">'
     + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
     + '<div id="' + idPrefix + 'QuoteBox"></div>'
@@ -2848,7 +2803,6 @@ function bindComposer(opts) {
   });
   renderQuoteBox(idPrefix);
   upd();
-  // initial auto-grow
   autoGrow(inputEl);
 }
 
@@ -2959,6 +2913,17 @@ async function loadPostView() {
     var p = await api('/api/posts/' + state.viewData.post_id);
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl);
+    // строгий подсчёт просмотра
+    if (state.user && p.author !== state.user.nick) {
+      api('/api/posts/' + state.viewData.post_id + '/view', { method: 'POST' })
+        .then(function(res){
+          if (res && res.counted) {
+            var viewsEl = feedEl.querySelector('[data-views]');
+            if (viewsEl) viewsEl.textContent = (parseInt(viewsEl.textContent, 10) || 0) + 1;
+          }
+        })
+        .catch(function(){});
+    }
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -2995,27 +2960,27 @@ async function loadProfile(nick) {
       actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
 
-    var headerUrl = u.header_pixels ? pixelsToCssUrl(u.header_pixels, 32, 16) : '';
-    var coverStyle = headerUrl ? ' style="background-image:' + headerUrl.replace(/"/g, '&quot;') + '"' : '';
+    var desc = u.bio ? escapeHtml(u.bio) : escapeHtml(tr('bio_empty_short'));
+    var descCls = u.bio ? 'profile-desc' : 'profile-desc empty';
 
     var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
       + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
       + '</div>';
 
-    html += '<div class="profile-cover"' + coverStyle + '>'
-      + '<div class="profile-cover-avatar">' + avatarHtml(u.name, u.nick, u.online, '', u.avatar_pixels) + '</div>'
-      + '<div class="profile-actions-right">' + actionsHtml + '</div>'
-      + '</div>';
-
-    html += '<div class="profile-info">';
+    html += '<div class="profile-hero">';
+    html += '<div class="profile-hero-top">';
+    html += '<div class="profile-hero-avatar">' + avatarHtml(u.avatar_emoji, 'lg') + '</div>';
+    html += '<div class="profile-hero-main">';
     html += '<div class="profile-name">' + escapeHtml(u.name) + '</div>';
     html += '<div class="profile-nick">@' + escapeHtml(u.nick) + '</div>';
+    html += '<div class="' + descCls + '">' + desc + '</div>';
+    html += '</div></div>';
     html += '<div class="profile-stats">';
     html += '<div><b id="followersLink">' + u.followers + '</b><span>' + tr('profile_followers') + '</span></div>';
     html += '<div><b id="followingLink">' + u.following + '</b><span>' + tr('profile_following') + '</span></div>';
     html += '</div>';
-    if (u.bio) html += '<div class="profile-bio">' + escapeHtml(u.bio) + '</div>';
     html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
+    html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
     html += '</div>';
 
     html += '<div class="pill-tabs" id="profileTabs">'
@@ -3120,152 +3085,32 @@ async function loadProfileTab(u, isMe) {
   }
 }
 
-// ============ PIXEL EDITOR ============
-function setupPixelEditor(opts) {
-  var canvas = opts.canvas;
-  var w = opts.w, h = opts.h, cellSize = opts.cellSize;
-  var getPixels = opts.getPixels;
-  var setPixels = opts.setPixels;
-  var getColor = opts.getColor;
-
-  canvas.width = w * cellSize;
-  canvas.height = h * cellSize;
-  var ctx = canvas.getContext('2d');
-  ctx.imageSmoothingEnabled = false;
-
-  function draw() {
-    var pixels = getPixels() || '';
-    if (!pixels) pixels = '0'.repeat(w * h);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // cells
-    for (var i = 0; i < w * h; i++) {
-      var c = parseInt(pixels[i] || '0', 16);
-      if (!c || !PALETTE[c]) continue;
-      var x = (i % w) * cellSize;
-      var y = ((i / w) | 0) * cellSize;
-      ctx.fillStyle = PALETTE[c];
-      ctx.fillRect(x, y, cellSize, cellSize);
-    }
-
-    // grid lines
-    ctx.strokeStyle = 'rgba(128,128,128,0.18)';
-    ctx.lineWidth = 1;
-    for (var gx = 0; gx <= w; gx++) {
-      ctx.beginPath();
-      ctx.moveTo(gx * cellSize + 0.5, 0);
-      ctx.lineTo(gx * cellSize + 0.5, canvas.height);
-      ctx.stroke();
-    }
-    for (var gy = 0; gy <= h; gy++) {
-      ctx.beginPath();
-      ctx.moveTo(0, gy * cellSize + 0.5);
-      ctx.lineTo(canvas.width, gy * cellSize + 0.5);
-      ctx.stroke();
-    }
-  }
-
-  var painting = false;
-
-  function getIdx(clientX, clientY) {
-    var rect = canvas.getBoundingClientRect();
-    var x = Math.floor((clientX - rect.left) / rect.width * w);
-    var y = Math.floor((clientY - rect.top) / rect.height * h);
-    if (x < 0 || x >= w || y < 0 || y >= h) return null;
-    return y * w + x;
-  }
-
-  function paintAt(clientX, clientY) {
-    var idx = getIdx(clientX, clientY);
-    if (idx === null) return;
-    var c = getColor();
-    var ch = c.toString(16);
-    var pixels = getPixels() || ('0'.repeat(w * h));
-    if (pixels[idx] === ch) return;
-    pixels = pixels.substring(0, idx) + ch + pixels.substring(idx + 1);
-    setPixels(pixels);
-    draw();
-  }
-
-  canvas.addEventListener('mousedown', function(e) {
-    e.preventDefault(); painting = true; paintAt(e.clientX, e.clientY);
-  });
-  canvas.addEventListener('mousemove', function(e) {
-    if (painting) paintAt(e.clientX, e.clientY);
-  });
-  window.addEventListener('mouseup', function() { painting = false; });
-
-  canvas.addEventListener('touchstart', function(e) {
-    e.preventDefault(); painting = true;
-    if (e.touches[0]) paintAt(e.touches[0].clientX, e.touches[0].clientY);
-  }, {passive: false});
-  canvas.addEventListener('touchmove', function(e) {
-    e.preventDefault();
-    if (painting && e.touches[0]) paintAt(e.touches[0].clientX, e.touches[0].clientY);
-  }, {passive: false});
-  canvas.addEventListener('touchend', function() { painting = false; });
-  canvas.addEventListener('touchcancel', function() { painting = false; });
-
-  draw();
-  return { redraw: draw, destroy: function(){ painting = false; } };
-}
-
-function paletteHtml(currentColor) {
-  var html = '';
-  for (var i = 0; i < 16; i++) {
-    if (i === 0) {
-      html += '<button class="px-swatch eraser' + (currentColor === 0 ? ' active' : '') + '" data-color="0" title="Eraser"></button>';
-    } else {
-      var bg = PALETTE[i];
-      html += '<button class="px-swatch' + (currentColor === i ? ' active' : '') + '" data-color="' + i + '" style="background:' + bg + '"></button>';
-    }
-  }
-  return html;
-}
-
-function computeCellSizes() {
-  var w = window.innerWidth;
-  var availAvatar = Math.min(w - 80, 400);
-  var availHeader = Math.min(w - 80, 720);
-  var avatarCell = Math.max(24, Math.min(40, Math.floor(availAvatar / 8)));
-  var headerCell = Math.max(8, Math.min(20, Math.floor(availHeader / 32)));
-  return { avatarCell: avatarCell, headerCell: headerCell };
-}
-
 // ============ EDIT PROFILE ============
 function renderEditProfileView(el) {
   if (!state.user) { navigate('/login'); return; }
   var u = state.user;
-  state.avatarPixels = u.avatar_pixels || '';
-  state.headerPixels = u.header_pixels || '';
-  state.currentColor = 5;
-
-  var cells = computeCellSizes();
+  state.currentEmoji = u.avatar_emoji || DEFAULT_EMOJI;
 
   var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
     + '<div class="title">' + tr('edit_profile_title') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
 
-  html += '<div class="pixel-block">'
-    + '<div class="pixel-head">'
-    + '<div class="pixel-head-title">' + escapeHtml(tr('avatar_title')) + '</div>'
-    + '<div class="pixel-head-hint">' + escapeHtml(tr('pixel_hint')) + '</div>'
-    + '</div>'
-    + '<div class="pixel-stage"><canvas id="avatarCanvas" class="pixel-canvas"></canvas></div>'
-    + '<div class="pixel-palette" id="avatarPalette">' + paletteHtml(5) + '</div>'
-    + '<div class="pixel-actions"><button class="px-btn danger" id="avatarClear">' + escapeHtml(tr('pixel_clear')) + '</button></div>'
+  // текущий эмодзи
+  html += '<div class="card">';
+  html += '<div class="emoji-current">'
+    + '<div class="preview" id="emojiPreview">' + escapeHtml(state.currentEmoji) + '</div>'
+    + '<div class="label">' + escapeHtml(tr('avatar_current')) + '</div>'
     + '</div>';
-
-  html += '<div class="pixel-block">'
-    + '<div class="pixel-head">'
-    + '<div class="pixel-head-title">' + escapeHtml(tr('header_title')) + '</div>'
-    + '<div class="pixel-head-hint">' + escapeHtml(tr('pixel_hint')) + '</div>'
-    + '</div>'
-    + '<div class="pixel-stage"><canvas id="headerCanvas" class="pixel-canvas"></canvas></div>'
-    + '<div class="pixel-palette" id="headerPalette">' + paletteHtml(5) + '</div>'
-    + '<div class="pixel-actions"><button class="px-btn danger" id="headerClear">' + escapeHtml(tr('pixel_clear')) + '</button></div>'
-    + '</div>';
+  html += '<div style="font-size:14px;font-weight:700;margin-bottom:10px">' + escapeHtml(tr('avatar_choose')) + '</div>';
+  html += '<div class="emoji-grid" id="emojiGrid">';
+  for (var i = 0; i < EMOJIS.length; i++) {
+    var e = EMOJIS[i];
+    var isActive = (e === state.currentEmoji);
+    html += '<button type="button" class="emoji-opt' + (isActive ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '">' + e + '</button>';
+  }
+  html += '</div>';
+  html += '</div>';
 
   html += '<div class="card"><form id="editForm" style="display:flex;flex-direction:column;gap:10px">'
     + '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
@@ -3280,66 +3125,17 @@ function renderEditProfileView(el) {
   bindThemeBtn(); bindLinks(el);
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
 
-  // setup editors
-  var avCanvas = document.getElementById('avatarCanvas');
-  var hdCanvas = document.getElementById('headerCanvas');
-  var editors = [];
-
-  function mountEditors() {
-    editors.forEach(function(e){ if (e.destroy) e.destroy(); });
-    editors = [];
-    // resize canvases to current cell size
-    var c = computeCellSizes();
-    avCanvas.width = 8 * c.avatarCell;
-    avCanvas.height = 8 * c.avatarCell;
-    hdCanvas.width = 32 * c.headerCell;
-    hdCanvas.height = 16 * c.headerCell;
-    editors.push(setupPixelEditor({
-      canvas: avCanvas, w: 8, h: 8, cellSize: c.avatarCell,
-      getPixels: function(){ return state.avatarPixels; },
-      setPixels: function(v){ state.avatarPixels = v; },
-      getColor: function(){ return state.currentColor; }
-    }));
-    editors.push(setupPixelEditor({
-      canvas: hdCanvas, w: 32, h: 16, cellSize: c.headerCell,
-      getPixels: function(){ return state.headerPixels; },
-      setPixels: function(v){ state.headerPixels = v; },
-      getColor: function(){ return state.currentColor; }
-    }));
-  }
-  mountEditors();
-
-  // palettes
-  function bindPalette(rootId) {
-    var root = document.getElementById(rootId);
-    if (!root) return;
-    root.querySelectorAll('.px-swatch').forEach(function(sw){
-      sw.addEventListener('click', function(e){
-        e.preventDefault();
-        state.currentColor = parseInt(sw.dataset.color, 10);
-        document.querySelectorAll('.px-swatch').forEach(function(x){
-          x.classList.toggle('active', parseInt(x.dataset.color, 10) === state.currentColor);
-        });
+  var previewEl = document.getElementById('emojiPreview');
+  var gridEl = document.getElementById('emojiGrid');
+  gridEl.querySelectorAll('.emoji-opt').forEach(function(b){
+    b.addEventListener('click', function(e){
+      e.preventDefault();
+      state.currentEmoji = b.dataset.emoji;
+      previewEl.textContent = state.currentEmoji;
+      gridEl.querySelectorAll('.emoji-opt').forEach(function(x){
+        x.classList.toggle('active', x.dataset.emoji === state.currentEmoji);
       });
     });
-  }
-  bindPalette('avatarPalette');
-  bindPalette('headerPalette');
-
-  document.getElementById('avatarClear').addEventListener('click', function(){
-    state.avatarPixels = '0'.repeat(64);
-    if (editors[0]) editors[0].redraw();
-  });
-  document.getElementById('headerClear').addEventListener('click', function(){
-    state.headerPixels = '0'.repeat(512);
-    if (editors[1]) editors[1].redraw();
-  });
-
-  // re-mount on resize
-  var rTimer = null;
-  window.addEventListener('resize', function(){
-    clearTimeout(rTimer);
-    rTimer = setTimeout(mountEditors, 200);
   });
 
   var form = document.getElementById('editForm');
@@ -3352,8 +3148,7 @@ function renderEditProfileView(el) {
       name: (fd.get('name') || '').toString().trim(),
       nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
       bio: (fd.get('bio') || '').toString().trim(),
-      avatar_pixels: state.avatarPixels || '',
-      header_pixels: state.headerPixels || ''
+      avatar_emoji: state.currentEmoji || DEFAULT_EMOJI
     };
     var btn = form.querySelector('button[type="submit"]');
     btn.disabled = true;
@@ -3384,7 +3179,7 @@ function renderFollowListView(el) {
 }
 function userRowHtml(u) {
   return '<div class="user-row" data-link-row="' + encodeURIComponent(u.nick) + '">'
-    + avatarHtml(u.name, u.nick, u.online, 'sm', u.avatar_pixels)
+    + avatarHtml(u.avatar_emoji, 'sm')
     + '<div class="info">'
     + '<a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
     + '<div class="name">' + escapeHtml(u.name) + '</div>'
@@ -3519,8 +3314,8 @@ function renderNotifHtml(n) {
   var inner = '<div class="info"><div class="line">' + text + '</div>'
     + snippet
     + '<div class="time">' + timeAgo(n.created_at) + '</div></div>';
-  if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + avatarHtml(null, n.from_nick, false, 'sm') + inner + '</a>';
-  return '<div class="' + cls + '">' + avatarHtml(null, n.from_nick, false, 'sm') + inner + '</div>';
+  if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + avatarHtml(null, 'sm') + inner + '</a>';
+  return '<div class="' + cls + '">' + avatarHtml(null, 'sm') + inner + '</div>';
 }
 
 // ============ SETTINGS ============
@@ -3650,7 +3445,6 @@ function renderSettingsView(el) {
     });
   });
 
-  // load device info
   var di = document.getElementById('deviceInfo');
   if (di) {
     api('/api/whoami').then(function(info){
@@ -3740,6 +3534,7 @@ function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
   var downCls = p.user_vote === -1 ? 'active' : '';
+  var scCls = score > 0 ? 'pos' : (score < 0 ? 'neg' : '');
   var displayText = p.text, truncated = false;
   if (!showComments) {
     var res = truncateText(p.text);
@@ -3779,12 +3574,12 @@ function renderPostHtml(p, showComments) {
     commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id, p.wall_owner) + '</div>';
   }
   var viewsHtml = '';
-  if (p.views) viewsHtml = '<span style="color:var(--muted);font-size:13px;margin-left:auto;display:inline-flex;align-items:center;gap:5px">' + ICONS.eye + p.views + '</span>';
+  if (p.views) viewsHtml = '<span class="views-badge">' + ICONS.eye + '<span data-views>' + p.views + '</span></span>';
 
   return ''
     + '<div class="post-card" data-post-id="' + p.id + '">'
     +   '<div class="post-header">'
-    +     avatarHtml(p.author_name || null, p.author, false, '', p.author_avatar_pixels)
+    +     avatarHtml(p.author_avatar_emoji)
     +     '<div class="meta">'
     +       '<div class="who">' + authorHtml + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
     +     '</div>'
@@ -3793,9 +3588,12 @@ function renderPostHtml(p, showComments) {
     +   readMore
     +   quotedHtml
     +   '<div class="post-actions">'
-    +     '<button class="act-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '<span class="num ' + (score>0?'pos':'') + '">' + score + '</span></button>'
-    +     '<button class="act-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
-    +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span class="num">' + (p.comments ? p.comments.length : 0) + '</span></button>'
+    +     '<div class="vote-group">'
+    +       '<button class="act-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1" title="' + escapeHtml(tr('publish') ? '' : '') + '">' + ICONS.up + '</button>'
+    +       '<span class="vote-num ' + scCls + '">' + score + '</span>'
+    +       '<button class="act-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
+    +     '</div>'
+    +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + (p.comments ? p.comments.length : 0) + '</span></button>'
     +     '<button class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
     +     '<button class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
     +     '<button class="act-btn" data-action="translate" data-post-id="' + p.id + '" title="' + escapeHtml(tr('translate')) + '">' + ICONS.translate + '</button>'
@@ -3822,6 +3620,7 @@ function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
   var score = c.upvotes - c.downvotes;
   var upCls = c.user_vote === 1 ? 'active' : '';
   var downCls = c.user_vote === -1 ? 'active' : '';
+  var scCls = score > 0 ? 'pos' : (score < 0 ? 'neg' : '');
   var isAuthor = postAuthor && c.author === postAuthor;
   var isMine = state.user && c.author === state.user.nick;
   var isWallOwner = state.user && wallOwner === state.user.nick;
@@ -3840,20 +3639,23 @@ function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
     +   '<div class="comment-head">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
     +   '<div class="comment-text" data-raw="' + escapeHtml(c.text) + '">' + bodyHtml + '</div>'
     +   '<div class="comment-actions">'
-    +     '<button class="act-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICONS.up + '<span class="num">' + score + '</span></button>'
-    +     '<button class="act-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICONS.down + '</button>'
+    +     '<div class="vote-group">'
+    +       '<button class="act-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICONS.up + '</button>'
+    +       '<span class="vote-num ' + scCls + '">' + score + '</span>'
+    +       '<button class="act-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICONS.down + '</button>'
+    +     '</div>'
     +     replyBtn + editBtn + delBtn
     +   '</div>'
     + '</div>';
 }
 
 function applyVoteUI(targetBtn, dir) {
-  var container = targetBtn.parentElement;
-  var upBtn = container.querySelector('.act-btn.up');
-  var downBtn = container.querySelector('.act-btn.down');
-  if (!upBtn || !downBtn) return null;
-  var numEl = upBtn.querySelector('.num');
-  if (!numEl) return null;
+  var group = targetBtn.closest('.vote-group');
+  if (!group) return null;
+  var upBtn = group.querySelector('.act-btn.up');
+  var downBtn = group.querySelector('.act-btn.down');
+  var numEl = group.querySelector('.vote-num');
+  if (!upBtn || !downBtn || !numEl) return null;
   var oldScore = parseInt(numEl.textContent, 10) || 0;
   var wasUp = upBtn.classList.contains('active');
   var wasDown = downBtn.classList.contains('active');
@@ -3944,16 +3746,11 @@ function bindPostActions(root) {
           var p = await api('/api/posts/' + postId);
           state.quotePostId = postId;
           state.quotePreview = { author: p.author, text: p.text };
-          if (state.view !== 'feed') { navigate('/'); setTimeout(function(){
-            var qb = document.getElementById('postQuoteBox');
-            if (qb) {
-              renderQuoteBox('post');
-              var inp = document.getElementById('postInput');
-              if (inp) { inp.value = ''; inp.focus(); autoGrow(inp); }
-              var s = document.getElementById('postSend');
-              if (s) s.disabled = false;
-            }
-          }, 50); return; }
+          // всегда уходим на главную и рендерим цитату в композере
+          if (state.view !== 'feed') {
+            navigate('/');
+            return;
+          }
           renderQuoteBox('post');
           var inp = document.getElementById('postInput');
           if (inp) { inp.value = ''; inp.focus(); autoGrow(inp); }
@@ -4096,7 +3893,8 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_SUN__", json.dumps(I_SUN))
           .replace("__I_QUOTE__", json.dumps(I_QUOTE))
           .replace("__I_EYE__", json.dumps(I_EYE))
-          .replace("__I_CAL__", json.dumps(I_CAL)))
+          .replace("__I_CAL__", json.dumps(I_CAL))
+          .replace("__EMOJIS__", json.dumps(EMOJIS)))
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
