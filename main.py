@@ -13,9 +13,9 @@ import secrets
 import struct
 import time
 import zlib
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import (FastAPI, Header, HTTPException, Query, Request,
@@ -77,7 +77,7 @@ async def sb(method: str, path: str,
 
 
 # ============================================================
-#                    ХЕЛПЕРЫ ПАРОЛЯ И АВАТАРА
+#                    ХЕЛПЕРЫ
 # ============================================================
 
 def hash_pw(pw: str) -> str:
@@ -134,8 +134,7 @@ async def db_get_user(nick: str) -> Optional[dict]:
 
 
 async def db_get_users(nicks: List[str]) -> Dict[str, dict]:
-    """Batch-загрузка пользователей по списку ников."""
-    nicks = [n for n in dict.fromkeys(nicks) if n]  # dedupe + keep order
+    nicks = [n for n in dict.fromkeys(nicks) if n]
     if not nicks:
         return {}
     rows = await sb("GET", "users",
@@ -153,12 +152,8 @@ async def db_get_users(nicks: List[str]) -> Dict[str, dict]:
 
 async def db_create_user(nick: str, name: str, password: str, avatar: list):
     await sb("POST", "users",
-             json_data={
-                 "nick": nick,
-                 "name": name,
-                 "password": password,
-                 "avatar": avatar,
-             },
+             json_data={"nick": nick, "name": name,
+                        "password": password, "avatar": avatar},
              prefer="return=minimal")
 
 
@@ -192,12 +187,8 @@ async def db_del_session(token: str):
     await sb("DELETE", "sessions", params={"token": f"eq.{token}"})
 
 
-async def db_del_sessions_of(nick: str):
-    await sb("DELETE", "sessions", params={"nick": f"eq.{nick}"})
-
-
 # ============================================================
-#                    DB: CONTACTS
+#                    DB: CONTACTS / BLACKLIST / MESSAGES
 # ============================================================
 
 async def db_get_contacts(nick: str) -> Set[str]:
@@ -218,10 +209,6 @@ async def db_del_contact(a: str, b: str):
              params={"user_nick": f"eq.{a}", "contact_nick": f"eq.{b}"})
 
 
-# ============================================================
-#                    DB: BLACKLIST
-# ============================================================
-
 async def db_get_blacklist(nick: str) -> Set[str]:
     rows = await sb("GET", "blacklist",
                     params={"select": "blocked_nick",
@@ -240,23 +227,14 @@ async def db_del_blacklist(a: str, b: str):
              params={"user_nick": f"eq.{a}", "blocked_nick": f"eq.{b}"})
 
 
-# ============================================================
-#                    DB: MESSAGES
-# ============================================================
-
 async def db_save_message(m: dict):
     await sb("POST", "messages",
-             json_data={
-                 "id": m["id"],
-                 "sender": m["from"],
-                 "recipient": m["to"],
-                 "body": m["text"],
-             },
+             json_data={"id": m["id"], "sender": m["from"],
+                        "recipient": m["to"], "body": m["text"]},
              prefer="return=minimal")
 
 
 async def db_get_messages(a: str, b: str) -> List[dict]:
-    """Возвращает переписку a↔b в порядке возрастания времени."""
     rows = await sb("GET", "messages", params={
         "select": "id,sender,recipient,body,created_at",
         "or": f"(and(sender.eq.{a},recipient.eq.{b}),"
@@ -283,11 +261,12 @@ async def db_del_messages_between(a: str, b: str):
 
 
 # ============================================================
-#                    АВТОРИЗАЦИЯ / СЕССИИ
+#                    АВТОРИЗАЦИЯ / WEBSOCKET
 # ============================================================
 
-CONNECTIONS: Dict[str, list] = {}   # только WebSocket — в памяти
-OG_CACHE: Dict[str, dict] = {}      # кэш OG — в памяти (это просто кэш)
+CONNECTIONS: Dict[str, list] = {}
+OG_CACHE: Dict[str, Tuple[str, float]] = {}   # url -> (status, ts)
+OG_CACHE_TTL = 300
 
 
 async def auth(token: Optional[str]) -> str:
@@ -327,28 +306,10 @@ async def push_to(nick: str, event: dict):
 
 
 # ============================================================
-#                         FASTAPI
-# ============================================================
-
-app = FastAPI(title="Direct")
-
-
-class EncBody(BaseModel):
-    data: str
-
-
-def parse(body: EncBody) -> dict:
-    try:
-        return json.loads(dec_str(body.data))
-    except Exception:
-        raise HTTPException(400, "Повреждённый запрос")
-
-
-# ============================================================
 #                    ШИФРОВАНИЕ ЗАПРОСОВ
 # ============================================================
 
-XK = b"DirectSecret2024"
+XK = b"SldChatSecret2024"
 
 
 def _xor(b: bytes) -> bytes:
@@ -364,8 +325,22 @@ def dec_str(s: str) -> str:
 
 
 # ============================================================
-#                          WEBSOCKET
+#                         FASTAPI
 # ============================================================
+
+app = FastAPI(title="sldchat")
+
+
+class EncBody(BaseModel):
+    data: str
+
+
+def parse(body: EncBody) -> dict:
+    try:
+        return json.loads(dec_str(body.data))
+    except Exception:
+        raise HTTPException(400, "Повреждённый запрос")
+
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
@@ -413,7 +388,6 @@ async def register(body: EncBody):
     if len(pw) < 4:
         raise HTTPException(400, "Пароль минимум 4 символа")
 
-    # Проверка занятости — всегда из БД
     existing = await db_get_user(nick)
     if existing:
         raise HTTPException(400, "Такой ник уже занят")
@@ -463,17 +437,13 @@ async def me(x_token: Optional[str] = Header(None)):
 
     contact_nicks = await db_get_contacts(nick)
     black_nicks = await db_get_blacklist(nick)
-
     all_nicks = list(contact_nicks | black_nicks)
     users_map = await db_get_users(all_nicks)
 
-    contacts_out = [users_map[n] for n in contact_nicks if n in users_map]
-    blacklist_out = [users_map[n] for n in black_nicks if n in users_map]
-
     return {
         "me": {"nick": nick, "name": u["name"], "avatar": u["avatar"]},
-        "contacts": contacts_out,
-        "blacklist": blacklist_out,
+        "contacts": [users_map[n] for n in contact_nicks if n in users_map],
+        "blacklist": [users_map[n] for n in black_nicks if n in users_map],
     }
 
 
@@ -495,10 +465,7 @@ async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
     await db_update_user(nick, name, avatar)
 
     me_pub = {"nick": nick, "name": name, "avatar": avatar}
-
-    # оповещаем контакты
-    contact_nicks = await db_get_contacts(nick)
-    for c in contact_nicks:
+    for c in await db_get_contacts(nick):
         await push_to(c, {"type": "contact_updated", "user": me_pub})
 
     return {"ok": True, "me": me_pub}
@@ -522,12 +489,9 @@ async def search(body: EncBody, x_token: Optional[str] = Header(None)):
     if not target:
         raise HTTPException(404, "Пользователь не найден")
 
-    my_blacklist = await db_get_blacklist(nick)
-    if q in my_blacklist:
+    if q in await db_get_blacklist(nick):
         raise HTTPException(403, "Пользователь в вашем чёрном списке")
-
-    their_blacklist = await db_get_blacklist(q)
-    if nick in their_blacklist:
+    if nick in await db_get_blacklist(q):
         raise HTTPException(403, "Пользователь недоступен")
 
     return {"user": {"nick": q, "name": target["name"], "avatar": target["avatar"]}}
@@ -549,11 +513,9 @@ async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
     if not target:
         raise HTTPException(400, "Некорректный пользователь")
 
-    my_bl = await db_get_blacklist(nick)
-    if peer in my_bl:
+    if peer in await db_get_blacklist(nick):
         raise HTTPException(403, "Пользователь в чёрном списке")
-    their_bl = await db_get_blacklist(peer)
-    if nick in their_bl:
+    if nick in await db_get_blacklist(peer):
         raise HTTPException(403, "Пользователь недоступен")
 
     await db_add_contact(nick, peer)
@@ -582,24 +544,19 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
     if not target:
         raise HTTPException(400, "Пользователь не найден")
 
-    my_bl = await db_get_blacklist(nick)
-    if peer in my_bl:
+    if peer in await db_get_blacklist(nick):
         raise HTTPException(403, "Вы добавили пользователя в чёрный список")
-    their_bl = await db_get_blacklist(peer)
-    if nick in their_bl:
+    if nick in await db_get_blacklist(peer):
         raise HTTPException(403, "Пользователь добавил вас в чёрный список")
 
-    # Авто-восстановление контакта, если один из пары удалил чат
-    my_contacts = await db_get_contacts(nick)
-    if peer not in my_contacts:
+    if peer not in await db_get_contacts(nick):
         await db_add_contact(nick, peer)
         await push_to(nick, {"type": "contact_added",
                              "user": {"nick": peer,
                                       "name": target["name"],
                                       "avatar": target["avatar"]}})
 
-    their_contacts = await db_get_contacts(peer)
-    if nick not in their_contacts:
+    if nick not in await db_get_contacts(peer):
         me_pub = await user_public(nick)
         await db_add_contact(peer, nick)
         await push_to(peer, {"type": "contact_added", "user": me_pub})
@@ -620,7 +577,6 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
 
 @app.post("/api/chat/end")
 async def end_chat(body: EncBody, x_token: Optional[str] = Header(None)):
-    """Удаляет контакт с обеих сторон и всю переписку."""
     nick = await auth(x_token)
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
@@ -670,7 +626,6 @@ async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
 
     await db_add_blacklist(nick, peer)
     await db_del_contact(nick, peer)
-
     await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
@@ -726,18 +681,8 @@ async def avatar_png(nick: str):
 
 
 # ============================================================
-#                    OPENGRAPH ПАРСЕР
+#                    OG: STABLE/UNSTABLE + SVG
 # ============================================================
-
-_OG_PATTERNS = [
-    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
-    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
-]
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-_WS_RE = re.compile(r"\s+")
-
 
 def is_safe_url(url: str) -> bool:
     try:
@@ -760,65 +705,63 @@ def is_safe_url(url: str) -> bool:
     return True
 
 
-def fetch_og(url: str) -> dict:
-    if url in OG_CACHE:
-        return OG_CACHE[url]
-    try:
-        req = UrlRequest(url, headers={
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
-        })
-        with urlopen(req, timeout=6) as r:
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if "html" not in ct and "xml" not in ct:
-                out = {"error": "not_html"}
-                OG_CACHE[url] = out
-                return out
-            body = r.read(300_000)
-        text = body.decode("utf-8", errors="ignore")
-    except Exception as e:
-        out = {"error": str(e)[:120]}
-        OG_CACHE[url] = out
-        return out
+def check_url_stable(url: str) -> str:
+    """stable, если URL отвечает 2xx/3xx, иначе unstable."""
+    for method in ("HEAD", "GET"):
+        try:
+            req = UrlRequest(url, method=method, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; sldchat/1.0)",
+                "Accept": "*/*",
+            })
+            with urlopen(req, timeout=6) as r:
+                if 200 <= r.status < 400:
+                    return "stable"
+        except Exception:
+            continue
+    return "unstable"
 
-    data: Dict[str, str] = {}
-    for pat in _OG_PATTERNS:
-        for m in pat.finditer(text):
-            key = m.group(1).lower()
-            if key not in data:
-                data[key] = m.group(2)
 
-    if "og:title" not in data and "twitter:title" in data:
-        data["og:title"] = data["twitter:title"]
-    if "og:description" not in data and "twitter:description" in data:
-        data["og:description"] = data["twitter:description"]
-    if "og:image" not in data and "twitter:image" in data:
-        data["og:image"] = data["twitter:image"]
+def make_og_svg(status: str) -> str:
+    stable = (status == "stable")
+    color = "#22c55e" if stable else "#ca8a04"  # green / dark yellow
+    label = "stable" if stable else "unstable"
+    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
+    font = "-apple-system,'Segoe UI',Roboto,Ubuntu,sans-serif"
+    mono = "ui-monospace,Menlo,Consolas,monospace"
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'viewBox="0 0 1200 630" width="1200" height="630">'
+        '<defs>'
+        '<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#18181b"/>'
+        '<stop offset="1" stop-color="#09090b"/>'
+        '</linearGradient>'
+        '</defs>'
+        '<rect width="1200" height="630" fill="url(#bg)"/>'
+        f'<text x="60" y="100" font-family="{font}" '
+        'font-size="52" font-weight="700" fill="#f4f4f5" '
+        'letter-spacing="-1">sldchat</text>'
+        f'<circle cx="1130" cy="80" r="14" fill="{color}"/>'
+        f'<text x="600" y="380" text-anchor="middle" '
+        f'font-family="{font}" font-size="170" font-weight="800" '
+        f'fill="{color}" letter-spacing="-4">{label}</text>'
+        f'<text x="600" y="580" text-anchor="middle" '
+        f'font-family="{mono}" font-size="28" '
+        f'fill="#71717a">{now}</text>'
+        '</svg>'
+    )
 
-    if "og:title" not in data:
-        tm = _TITLE_RE.search(text)
-        if tm:
-            data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
 
-    image = (data.get("og:image") or "").strip()
-    if image and not image.startswith(("http://", "https://")):
-        image = urljoin(url, image)
-    if image and not image.startswith(("http://", "https://")):
-        image = ""
-
-    out = {
-        "url": url,
-        "title": html_module.unescape((data.get("og:title") or "").strip())[:200],
-        "description": html_module.unescape((data.get("og:description") or "").strip())[:400],
-        "image": image[:1500],
-        "site_name": html_module.unescape((data.get("og:site_name") or "").strip())[:80],
-        "type": (data.get("og:type") or "").strip()[:40],
-    }
-    OG_CACHE[url] = out
-    return out
+@app.get("/og-image.svg")
+def og_image(status: str = "stable"):
+    if status not in ("stable", "unstable"):
+        status = "unstable"
+    svg = make_og_svg(status)
+    return Response(
+        content=svg,
+        media_type="image/svg+xml; charset=utf-8",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.post("/api/og")
@@ -828,7 +771,24 @@ async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
     url = (d.get("url") or "").strip()
     if not is_safe_url(url):
         raise HTTPException(400, "Invalid URL")
-    return await run_in_threadpool(fetch_og, url)
+
+    now = time.time()
+    cached = OG_CACHE.get(url)
+    if cached and (now - cached[1]) < OG_CACHE_TTL:
+        status = cached[0]
+    else:
+        status = await run_in_threadpool(check_url_stable, url)
+        OG_CACHE[url] = (status, now)
+
+    return {
+        "url": url,
+        "status": status,
+        "stable": status == "stable",
+        "image": f"/og-image.svg?status={status}",
+        "site_name": "sldchat",
+        "title": "SldChat - Direct Messages",
+        "description": "SldChat удобное места для передачи сообщения из точки в точку",
+    }
 
 
 # ============================================================
@@ -1032,34 +992,54 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
   scroll-behavior:smooth}
 .bubble{
   max-width:78%;padding:9px 13px;border-radius:18px;font-size:15px;line-height:1.35;
-  word-wrap:break-word;white-space:pre-wrap;
+  word-wrap:break-word;word-break:break-word;white-space:pre-wrap;
   animation:bubbleIn .22s cubic-bezier(.2,.8,.3,1);
 }
 @keyframes bubbleIn{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
 .bubble.out{align-self:flex-end;background:var(--out-bub);color:var(--out-fg);border-bottom-right-radius:6px}
 .bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
   border-bottom-left-radius:6px;border:1px solid var(--border)}
-.bubble .msg-link{color:inherit;text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);
-  cursor:pointer}
-.bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.25)}
 
-.og-card{
-  display:block;margin-top:8px;padding:0;
-  background:rgba(0,0,0,.06);
-  border-radius:12px;overflow:hidden;
-  text-decoration:none;color:inherit;cursor:pointer;
-  border:1px solid rgba(0,0,0,.08);
-  animation:fadeIn .25s ease;
-  max-width:320px;
+/* ---------- ССЫЛКИ (кликабельны → копируют) ---------- */
+.bubble .msg-link{
+  color:inherit;
+  text-decoration:underline;
+  text-decoration-thickness:1px;
+  text-underline-offset:2px;
+  text-decoration-color:rgba(255,255,255,.55);
+  cursor:pointer;
+  pointer-events:auto;
+  -webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;
 }
-.bubble.out .og-card{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.18)}
-.og-card img{display:block;width:100%;height:auto;max-height:180px;object-fit:cover;background:rgba(0,0,0,.06)}
-.og-body{padding:10px 12px}
-.og-site{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;opacity:.7;margin-bottom:3px}
-.og-title{font-size:14px;font-weight:700;line-height:1.3;margin-bottom:3px;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.og-desc{font-size:12px;line-height:1.35;opacity:.8;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.3)}
+
+/* ---------- OG-КАРТОЧКА ---------- */
+.bubble.has-og{
+  min-width:280px;
+  max-width:78%;
+}
+.og-card{
+  display:block;
+  width:100%;
+  margin-top:8px;
+  border-radius:12px;
+  overflow:hidden;
+  cursor:pointer;
+  pointer-events:auto;
+  animation:fadeIn .25s ease;
+  box-sizing:border-box;
+  -webkit-tap-highlight-color:transparent;
+}
+.og-card img{
+  display:block;
+  width:100%;
+  height:auto;
+  border-radius:12px;
+  background:rgba(0,0,0,.06);
+  pointer-events:none;
+  user-select:none;-webkit-user-drag:none;
+}
 
 .composer{
   display:flex;gap:8px;padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom));
@@ -1166,22 +1146,18 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
     <circle cx="12" cy="7" r="4"/>
   </symbol>
-  <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-  </symbol>
 </svg>
 
 <div id="app">
 
   <div class="screen active" id="screen-loading">
     <div class="spinner"></div>
-    <div class="loading-label">Direct</div>
+    <div class="loading-label">sldchat</div>
   </div>
 
   <div class="screen" id="screen-auth">
     <div class="auth-wrap">
-      <h1 class="logo">Direct</h1>
+      <h1 class="logo">sldchat</h1>
       <div class="tabs">
         <button class="tab active" data-tab="login" data-i18n="login">Вход</button>
         <button class="tab" data-tab="reg" data-i18n="register">Регистрация</button>
@@ -1303,10 +1279,13 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
           <svg class="icon icon-sm"><use href="#i-user"/></svg>
           <span data-i18n="edit_profile">Редактировать профиль</span>
         </button>
-        <button class="btn full" onclick="copyMyLink()">
-          <svg class="icon icon-sm"><use href="#i-link"/></svg>
-          <span data-i18n="copy_my_link">Скопировать ссылку на профиль</span>
-        </button>
+        <div class="setting">
+          <span data-i18n="og_rendering">Превью ссылок</span>
+          <div class="seg">
+            <button class="seg-btn" data-og="on" onclick="applyOg('on')" data-i18n="og_on">Вкл</button>
+            <button class="seg-btn" data-og="off" onclick="applyOg('off')" data-i18n="og_off">Выкл</button>
+          </div>
+        </div>
         <div class="setting">
           <span data-i18n="theme">Тема</span>
           <div class="seg">
@@ -1381,7 +1360,10 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 </div>
 
 <script>
-document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('contextmenu', e => {
+  if (e.target.closest('.msg-link')) e.preventDefault();
+  else e.preventDefault();
+});
 document.addEventListener('selectstart', e => {
   if (e.target.closest('input,textarea')) return;
   e.preventDefault();
@@ -1390,7 +1372,7 @@ document.addEventListener('selectstart', e => {
 /* ============================================================
                         ШИФРОВАНИЕ
    ============================================================ */
-const XK = new TextEncoder().encode("DirectSecret2024");
+const XK = new TextEncoder().encode("SldChatSecret2024");
 function xorBytes(bytes){
   const out = new Uint8Array(bytes.length);
   for (let i=0;i<bytes.length;i++) out[i] = bytes[i] ^ XK[i % XK.length];
@@ -1421,13 +1403,13 @@ const I18N = {
     no_bl:"Список пуст",
     confirm_logout:"Выйти из аккаунта?",
     remove:"Убрать",
-    new_chat:"Новый чат", select_chat:"Выберите чат слева",
+    select_chat:"Выберите чат слева",
     edit_profile:"Редактировать профиль", save:"Сохранить",
-    copy_my_link:"Скопировать ссылку на профиль",
     link_copied:"Ссылка скопирована",
     profile_updated:"Профиль обновлён",
     confirm_end_chat:"Завершить чат?\nВся переписка и контакт будут удалены.",
-    chat_ended:"Чат завершён"
+    chat_ended:"Чат завершён",
+    og_rendering:"Превью ссылок", og_on:"Вкл", og_off:"Выкл"
   },
   en: {
     login:"Sign in", register:"Sign up", create:"Create account",
@@ -1442,22 +1424,22 @@ const I18N = {
     no_bl:"List is empty",
     confirm_logout:"Log out?",
     remove:"Remove",
-    new_chat:"New chat", select_chat:"Select a chat on the left",
+    select_chat:"Select a chat on the left",
     edit_profile:"Edit profile", save:"Save",
-    copy_my_link:"Copy profile link",
     link_copied:"Link copied",
     profile_updated:"Profile updated",
     confirm_end_chat:"End chat?\nAll messages and the contact will be deleted.",
-    chat_ended:"Chat ended"
+    chat_ended:"Chat ended",
+    og_rendering:"Link previews", og_on:"On", og_off:"Off"
   }
 };
-let LANG = localStorage.getItem('direct_lang') || 'ru';
+let LANG = localStorage.getItem('sldchat_lang') || 'ru';
 function t(k){ return (I18N[LANG] && I18N[LANG][k]) || k; }
 
 /* ============================================================
                         STATE
    ============================================================ */
-let token = localStorage.getItem('direct_token') || null;
+let token = localStorage.getItem('sldchat_token') || null;
 let me = null;
 let contacts = [];
 let blacklist = [];
@@ -1467,8 +1449,7 @@ let ws = null;
 let unread = {};
 let renderedIds = new Set();
 const ogClientCache = {};
-const profileMatch = location.pathname.match(/^\/@([^/]+)$/);
-let pendingTarget = profileMatch ? decodeURIComponent(profileMatch[1]) : null;
+let OG_ENABLED = localStorage.getItem('sldchat_og') !== 'off';
 
 const contactEls = new Map();
 
@@ -1601,7 +1582,7 @@ function showDesktopNotification(fromNick, text){
   try {
     const n = new Notification(title, {
       body: text.length > 80 ? text.slice(0, 80) + '…' : text,
-      tag: 'direct-' + fromNick, silent: true
+      tag: 'sldchat-' + fromNick, silent: true
     });
     n.onclick = () => { window.focus(); openChat(fromNick); };
   } catch(_){}
@@ -1626,7 +1607,7 @@ function clearUnread(nick){
 
 function updateTitle(){
   const total = Object.values(unread).reduce((a,b)=>a+b, 0);
-  document.title = total > 0 ? `(${total}) Direct` : 'Direct';
+  document.title = total > 0 ? `(${total}) sldchat` : 'sldchat';
 }
 
 /* ============================================================
@@ -1649,20 +1630,36 @@ function toast(msg){
 }
 
 async function copyText(txt){
-  try { await navigator.clipboard.writeText(txt); return true; }
-  catch(_){
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); ta.remove();
+  // первый способ — Clipboard API (требует HTTPS или localhost + user gesture)
+  try {
+    if (navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(txt);
       return true;
-    } catch(_){ return false; }
-  }
+    }
+  } catch(_){}
+  // фолбэк — execCommand
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.width = '1px';
+    ta.style.height = '1px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, txt.length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch(_){ return false; }
 }
 
 /* ============================================================
-                     AVATAR (8x8) — редактор
+                     AVATAR (8x8)
    ============================================================ */
 const PALETTE = [
   '#000000','#ffffff','#8e8e93','#c7c7cc',
@@ -1788,17 +1785,17 @@ function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
 function backdropClose(e, id){ if (e.target.id === id) closeModal(id); }
 
 /* ============================================================
-                       THEME / LANG
+                       THEME / LANG / OG
    ============================================================ */
 function applyTheme(th){
   document.body.classList.toggle('dark', th === 'dark');
-  localStorage.setItem('direct_theme', th);
+  localStorage.setItem('sldchat_theme', th);
   document.querySelectorAll('[data-theme]').forEach(b =>
     b.classList.toggle('active', b.dataset.theme === th));
 }
 function applyLang(l){
   LANG = l;
-  localStorage.setItem('direct_lang', l);
+  localStorage.setItem('sldchat_lang', l);
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const k = el.dataset.i18n;
     if (I18N[l][k]) el.textContent = I18N[l][k];
@@ -1811,6 +1808,17 @@ function applyLang(l){
     b.classList.toggle('active', b.dataset.lang === l));
   renderContacts();
   renderBlacklist();
+}
+function applyOg(v){
+  OG_ENABLED = (v !== 'off');
+  localStorage.setItem('sldchat_og', OG_ENABLED ? 'on' : 'off');
+  document.querySelectorAll('[data-og]').forEach(b =>
+    b.classList.toggle('active', b.dataset.og === v));
+  if (!OG_ENABLED){
+    // убираем уже отрисованные превью
+    document.querySelectorAll('.og-card').forEach(el => el.remove());
+    document.querySelectorAll('.bubble.has-og').forEach(el => el.classList.remove('has-og'));
+  }
 }
 
 /* ============================================================
@@ -1834,12 +1842,11 @@ async function doLogin(){
   try {
     const r = await api('/api/login', { nick, password });
     token = r.token; me = r.me;
-    localStorage.setItem('direct_token', token);
+    localStorage.setItem('sldchat_token', token);
     requestNotifPermission();
     await refreshMe();
     showScreen('screen-app');
     connectWS();
-    await handlePendingTarget();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
@@ -1854,12 +1861,11 @@ async function doRegister(){
       avatar: regEditor.getData()
     });
     token = r.token; me = r.me;
-    localStorage.setItem('direct_token', token);
+    localStorage.setItem('sldchat_token', token);
     requestNotifPermission();
     await refreshMe();
     showScreen('screen-app');
     connectWS();
-    await handlePendingTarget();
   } catch(e){ showErr('auth-err', e.message); }
 }
 
@@ -1871,23 +1877,12 @@ async function logout(){
   for (const el of contactEls.values()) el.remove();
   contactEls.clear();
   document.getElementById('contactsList').innerHTML = '';
-  localStorage.removeItem('direct_token');
+  localStorage.removeItem('sldchat_token');
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
   closeModal('modal-settings'); closeModal('modal-edit');
   closeChat(true); updateTitle();
   showScreen('screen-auth');
-}
-
-async function handlePendingTarget(){
-  if (!pendingTarget) return;
-  const target = pendingTarget; pendingTarget = null;
-  try { history.replaceState({}, '', '/'); } catch(_){}
-  if (!me || target === me.nick) return;
-  try {
-    const r = await api('/api/search', { nick: target });
-    await startChat(r.user.nick);
-  } catch(e){ toast(e.message || 'Не удалось открыть чат'); }
 }
 
 /* ============================================================
@@ -1912,8 +1907,6 @@ async function refreshMe(){
   renderContacts();
   renderBlacklist();
 }
-
-/* --------- incremental DOM helpers --------- */
 
 function createContactEl(c){
   const el = document.createElement('div');
@@ -2218,13 +2211,18 @@ function linkifyInto(container, text){
   let last = 0, m;
   while ((m = re.exec(text)) !== null){
     if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const url = m[0];
     const a = document.createElement('a');
-    a.className = 'msg-link'; a.href = m[0]; a.textContent = m[0];
-    a.onclick = async (e) => {
-      e.preventDefault(); e.stopPropagation();
-      const ok = await copyText(m[0]);
+    a.className = 'msg-link';
+    a.href = '#';
+    a.textContent = url;
+    a.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const ok = await copyText(url);
       toast(ok ? t('link_copied') : 'Copy failed');
-    };
+      return false;
+    });
     container.appendChild(a);
     last = re.lastIndex;
   }
@@ -2247,10 +2245,13 @@ function appendMessage(m, scroll = true){
   if (scroll && nearBottom) box.scrollTop = box.scrollHeight;
 
   const urls = m.text.match(/https?:\/\/[^\s<>"']+/g);
-  if (urls && urls[0]) maybeRenderOg(el, urls[0]);
+  if (urls && urls[0] && OG_ENABLED){
+    maybeRenderOg(el, urls[0]);
+  }
 }
 
 async function maybeRenderOg(bubbleEl, url){
+  if (!OG_ENABLED) return;
   let data = ogClientCache[url];
   if (!data){
     try {
@@ -2261,41 +2262,30 @@ async function maybeRenderOg(bubbleEl, url){
       return;
     }
   }
-  if (!data || data.error || !data.title) return;
+  if (!data || data.error || !data.image) return;
   if (bubbleEl.querySelector('.og-card')) return;
 
+  bubbleEl.classList.add('has-og');
+
   const card = document.createElement('a');
-  card.className = 'og-card'; card.href = url;
-  card.onclick = async (e) => {
-    e.preventDefault(); e.stopPropagation();
+  card.className = 'og-card';
+  card.href = '#';
+  card.addEventListener('click', async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
     const ok = await copyText(url);
     toast(ok ? t('link_copied') : 'Copy failed');
-  };
+    return false;
+  });
 
-  if (data.image){
-    const img = document.createElement('img');
-    img.src = data.image; img.loading = 'lazy'; img.alt = '';
-    img.referrerPolicy = 'no-referrer';
-    img.onerror = () => img.remove();
-    card.appendChild(img);
-  }
+  const img = document.createElement('img');
+  img.src = data.image;
+  img.alt = '';
+  img.loading = 'lazy';
+  img.draggable = false;
+  img.onerror = () => { card.remove(); bubbleEl.classList.remove('has-og'); };
+  card.appendChild(img);
 
-  const body = document.createElement('div');
-  body.className = 'og-body';
-  if (data.site_name){
-    const s = document.createElement('div');
-    s.className = 'og-site'; s.textContent = data.site_name;
-    body.appendChild(s);
-  }
-  const ttl = document.createElement('div');
-  ttl.className = 'og-title'; ttl.textContent = data.title;
-  body.appendChild(ttl);
-  if (data.description){
-    const d = document.createElement('div');
-    d.className = 'og-desc'; d.textContent = data.description;
-    body.appendChild(d);
-  }
-  card.appendChild(body);
   bubbleEl.appendChild(card);
 
   const box = document.getElementById('messages');
@@ -2420,13 +2410,6 @@ async function saveProfile(){
   } catch(e){ toast(e.message); }
 }
 
-async function copyMyLink(){
-  if (!me) return;
-  const url = location.origin + '/@' + me.nick;
-  const ok = await copyText(url);
-  toast(ok ? t('link_copied') : 'Copy failed');
-}
-
 async function blAdd(){
   const inp = document.getElementById('blNick');
   const nick = inp.value.trim();
@@ -2495,11 +2478,10 @@ async function boot(){
       requestNotifPermission();
       connectWS();
       updateViewport();
-      await handlePendingTarget();
       return;
     } catch(_){
       token = null;
-      localStorage.removeItem('direct_token');
+      localStorage.removeItem('sldchat_token');
     }
   }
 
@@ -2509,8 +2491,9 @@ async function boot(){
 }
 
 (function init(){
-  applyTheme(localStorage.getItem('direct_theme') || 'light');
+  applyTheme(localStorage.getItem('sldchat_theme') || 'light');
   applyLang(LANG);
+  applyOg(OG_ENABLED ? 'on' : 'off');
 
   regEditor = makeAvatarEditor(
     document.getElementById('avaCanvas'),
@@ -2551,47 +2534,18 @@ def render_page(og_tags: str, title: str) -> str:
             .replace("__TITLE__", html_module.escape(title)))
 
 
-def _default_og(base: str) -> str:
-    return (
-        '<meta property="og:type" content="website">\n'
-        '<meta property="og:title" content="Direct — простой мессенджер">\n'
-        '<meta property="og:description" content="Приватный мессенджер с шифрованием и обменом сообщениями в реальном времени">\n'
-        f'<meta property="og:url" content="{base}/">\n'
-        '<meta name="twitter:card" content="summary">\n'
-    )
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     base = str(request.base_url).rstrip("/")
-    return render_page(_default_og(base), "Direct — мессенджер")
-
-
-@app.get("/@{nick}", response_class=HTMLResponse)
-async def profile_page(nick: str, request: Request):
-    base = str(request.base_url).rstrip("/")
-    safe_nick = html_module.escape(nick)
-    u = await db_get_user(nick)
-    if u:
-        name = html_module.escape(u["name"])
-        og = (
-            '<meta property="og:type" content="profile">\n'
-            f'<meta property="og:title" content="{name} (@{safe_nick}) — Direct">\n'
-            f'<meta property="og:description" content="Напишите мне в Direct → @{safe_nick}">\n'
-            f'<meta property="og:image" content="{base}/avatar/{safe_nick}.png">\n'
-            f'<meta property="og:image:width" content="256">\n'
-            f'<meta property="og:image:height" content="256">\n'
-            f'<meta property="og:url" content="{base}/@{safe_nick}">\n'
-            '<meta name="twitter:card" content="summary">\n'
-        )
-        return render_page(og, f"{name} (@{nick}) — Direct")
     og = (
         '<meta property="og:type" content="website">\n'
-        '<meta property="og:title" content="Direct">\n'
-        f'<meta property="og:description" content="Пользователь @{safe_nick} не найден">\n'
-        f'<meta property="og:url" content="{base}/@{safe_nick}">\n'
+        '<meta property="og:title" content="SldChat - Direct Messages">\n'
+        '<meta property="og:description" content="SldChat удобное места для передачи сообщения из точки в точку">\n'
+        f'<meta property="og:image" content="{base}/og-image.svg?status=stable">\n'
+        f'<meta property="og:url" content="{base}/">\n'
+        '<meta name="twitter:card" content="summary_large_image">\n'
     )
-    return render_page(og, "Direct")
+    return render_page(og, "sldchat")
 
 
 # ============================================================
