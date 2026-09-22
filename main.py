@@ -37,7 +37,6 @@ SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
 def _sb_sync(method: str, path: str,
              json_data=None, params=None, prefer=None):
-    """Синхронный вызов Supabase REST API. Возвращает dict/list или None."""
     if not SUPABASE_ENABLED:
         return None
     url = f"{SUPABASE_URL}/rest/v1/{path}"
@@ -657,7 +656,6 @@ def fetch_og(url: str) -> dict:
     image = (data.get("og:image") or "").strip()
     if image and not image.startswith(("http://", "https://")):
         image = urljoin(url, image)
-    # защита от javascript:, data: и т.п.
     if image and not image.startswith(("http://", "https://")):
         image = ""
 
@@ -728,7 +726,7 @@ body.dark{
   --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;
   --overlay:rgba(0,0,0,.65);--sidebar:#141416;
 }
-body{background:var(--bg);color:var(--fg)}
+body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s}
 
 #app{
   position:fixed;
@@ -786,7 +784,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .btn{
   padding:13px 16px;border-radius:12px;border:1px solid var(--border);
   background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;
-  transition:transform .1s,background .15s,border-color .15s,color .15s;
+  transition:transform .1s,background .15s,border-color .15s,color .15s,filter .15s;
   display:inline-flex;align-items:center;justify-content:center;gap:8px;
 }
 .btn:active{transform:scale(.97)}
@@ -856,23 +854,30 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .icon-btn.danger{color:var(--danger)}
 .icon-btn.accent{color:var(--accent)}
 
+/* ---------- CONTACTS (incremental) ---------- */
 .list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
 .contact{
   display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
-  background:transparent;margin-bottom:2px;cursor:pointer;transition:background .15s,border-color .15s;
+  background:transparent;margin-bottom:2px;cursor:pointer;
+  transition:background .18s ease,border-color .18s ease,transform .12s ease;
   border:1px solid transparent;position:relative;
-  animation:contactIn .25s ease backwards;
+  will-change:transform,opacity;
 }
-@keyframes contactIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .contact:hover{background:var(--card);border-color:var(--border)}
+.contact:active{transform:scale(.985)}
 .contact.selected{background:var(--card);border-color:var(--border)}
+.contact canvas.ava-small{
+  transition:transform .2s ease;
+}
+.contact.selected canvas.ava-small{transform:scale(1.04)}
 .contact .badge{
   min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;
   font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
-  padding:0 6px;flex-shrink:0;animation:pop .25s ease;
+  padding:0 6px;flex-shrink:0;
+  will-change:transform,opacity;
 }
-@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
-.empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5}
+.empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5;
+  animation:fadeIn .25s ease}
 
 .empty-pane{
   display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;
@@ -960,7 +965,7 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .ava-mid{width:96px;height:96px;border-radius:50%;image-rendering:pixelated;background:#ddd}
 #infoAva{width:140px;height:140px;border-radius:50%;image-rendering:pixelated;background:#ddd;margin:0 auto}
 .bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);
-  border-radius:12px;margin-bottom:6px}
+  border-radius:12px;margin-bottom:6px;animation:fadeIn .2s ease}
 .bl-item canvas{width:32px;height:32px;border-radius:50%;image-rendering:pixelated;flex-shrink:0}
 .bl-item .me-info{flex:1}
 .bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);
@@ -1238,13 +1243,15 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 </div>
 
 <script>
-/* ... JS без изменений из предыдущей версии ... */
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('selectstart', e => {
   if (e.target.closest('input,textarea')) return;
   e.preventDefault();
 });
 
+/* ============================================================
+                        ШИФРОВАНИЕ
+   ============================================================ */
 const XK = new TextEncoder().encode("DirectSecret2024");
 function xorBytes(bytes){
   const out = new Uint8Array(bytes.length);
@@ -1259,6 +1266,9 @@ function encStr(str){
   return btoa(bin);
 }
 
+/* ============================================================
+                          I18N
+   ============================================================ */
 const I18N = {
   ru: {
     login:"Вход", register:"Регистрация", create:"Создать аккаунт",
@@ -1302,6 +1312,9 @@ const I18N = {
 let LANG = localStorage.getItem('direct_lang') || 'ru';
 function t(k){ return (I18N[LANG] && I18N[LANG][k]) || k; }
 
+/* ============================================================
+                        STATE
+   ============================================================ */
 let token = localStorage.getItem('direct_token') || null;
 let me = null;
 let contacts = [];
@@ -1315,6 +1328,12 @@ const ogClientCache = {};
 const profileMatch = location.pathname.match(/^\/@([^/]+)$/);
 let pendingTarget = profileMatch ? decodeURIComponent(profileMatch[1]) : null;
 
+/* Map<nick, HTMLElement> — источник правды для DOM списка контактов */
+const contactEls = new Map();
+
+/* ============================================================
+                       API
+   ============================================================ */
 async function api(path, payload, method='POST'){
   const headers = {'Content-Type':'application/json'};
   if (token) headers['X-Token'] = token;
@@ -1331,6 +1350,9 @@ async function api(path, payload, method='POST'){
   return res.json();
 }
 
+/* ============================================================
+                     WebSocket
+   ============================================================ */
 function connectWS(){
   if (!token || ws) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1374,17 +1396,34 @@ function handleWsEvent(ev){
   } else if (ev.type === 'contact_updated'){
     const u = ev.user;
     const c = contacts.find(x => x.nick === u.nick);
-    if (c){ c.name = u.name; c.avatar = u.avatar; renderContacts(); }
+    if (c){
+      // Обновляем ТОЛЬКО изменившееся, без пересборки списка
+      const changed = (c.name !== u.name) ||
+                      (JSON.stringify(c.avatar) !== JSON.stringify(u.avatar));
+      c.name = u.name; c.avatar = u.avatar;
+      if (changed){
+        const el = contactEls.get(u.nick);
+        if (el) updateContactEl(el, c);
+      }
+    }
     if (currentPeer === u.nick){
       currentPeerData = u;
       document.getElementById('peerName').textContent = u.name;
-      paintAva(document.getElementById('peerAva'), u.avatar);
+      // мягко: перекрашиваем peer аватар
+      const pAva = document.getElementById('peerAva');
+      if (pAva._avaKey !== JSON.stringify(u.avatar)){
+        paintAva(pAva, u.avatar);
+        pAva._avaKey = JSON.stringify(u.avatar);
+      }
     }
   } else if (ev.type === 'blacklist_changed'){
     refreshMe().catch(()=>{});
   }
 }
 
+/* ============================================================
+                     ЗВУК / УВЕДОМЛЕНИЯ
+   ============================================================ */
 let audioCtx = null;
 function playBeep(){
   try {
@@ -1429,16 +1468,30 @@ function showDesktopNotification(fromNick, text){
 
 function addUnread(nick){
   unread[nick] = (unread[nick] || 0) + 1;
-  renderContacts(); updateTitle();
+  // Обновляем только один контакт
+  const c = contacts.find(x => x.nick === nick);
+  const el = contactEls.get(nick);
+  if (c && el) updateContactEl(el, c);
+  updateTitle();
 }
+
 function clearUnread(nick){
-  if (unread[nick]){ delete unread[nick]; renderContacts(); updateTitle(); }
+  if (!unread[nick]) return;
+  delete unread[nick];
+  const c = contacts.find(x => x.nick === nick);
+  const el = contactEls.get(nick);
+  if (c && el) updateContactEl(el, c);
+  updateTitle();
 }
+
 function updateTitle(){
   const total = Object.values(unread).reduce((a,b)=>a+b, 0);
   document.title = total > 0 ? `(${total}) Direct` : 'Direct';
 }
 
+/* ============================================================
+                       TOAST
+   ============================================================ */
 let toastEl = null;
 function toast(msg){
   if (toastEl) toastEl.remove();
@@ -1468,6 +1521,9 @@ async function copyText(txt){
   }
 }
 
+/* ============================================================
+                     AVATAR (8x8) — редактор
+   ============================================================ */
 const PALETTE = [
   '#000000','#ffffff','#8e8e93','#c7c7cc',
   '#ff3b30','#ff9500','#ffcc00','#34c759',
@@ -1574,6 +1630,9 @@ function paintAva(canvas, data){
 
 let regEditor, editEditor;
 
+/* ============================================================
+                       UI
+   ============================================================ */
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -1588,6 +1647,9 @@ function openModal(id){ document.getElementById(id).classList.remove('hidden'); 
 function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
 function backdropClose(e, id){ if (e.target.id === id) closeModal(id); }
 
+/* ============================================================
+                       THEME / LANG
+   ============================================================ */
 function applyTheme(th){
   document.body.classList.toggle('dark', th === 'dark');
   localStorage.setItem('direct_theme', th);
@@ -1607,9 +1669,14 @@ function applyLang(l){
   });
   document.querySelectorAll('[data-lang]').forEach(b =>
     b.classList.toggle('active', b.dataset.lang === l));
-  renderContacts(); renderBlacklist();
+  // Обновляем тексты в списках БЕЗ пересборки
+  renderContacts();      // incremental — просто обновит "пусто" текст
+  renderBlacklist();
 }
 
+/* ============================================================
+                       AUTH
+   ============================================================ */
 document.querySelectorAll('.tab').forEach(tab => {
   tab.onclick = () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1661,6 +1728,10 @@ function logout(){
   if (!confirm(t('confirm_logout'))) return;
   disconnectWS();
   token = null; me = null; contacts = []; blacklist = []; unread = {};
+  // Очистим DOM-контакты
+  for (const el of contactEls.values()) el.remove();
+  contactEls.clear();
+  document.getElementById('contactsList').innerHTML = '';
   localStorage.removeItem('direct_token');
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
@@ -1680,55 +1751,258 @@ async function handlePendingTarget(){
   } catch(e){ toast(e.message || 'Не удалось открыть чат'); }
 }
 
+/* ============================================================
+                       ME / CONTACTS
+   ============================================================ */
 async function refreshMe(){
   const r = await api('/api/me', null, 'GET');
   me = r.me; contacts = r.contacts; blacklist = r.blacklist;
-  paintAva(document.getElementById('meAva'), me.avatar);
-  document.getElementById('meName').textContent = me.name;
-  document.getElementById('meNick').textContent = '@' + me.nick;
-  renderContacts(); renderBlacklist();
+
+  // Мой аватар — только если реально изменился
+  const meAvaEl = document.getElementById('meAva');
+  const avaKey = JSON.stringify(me.avatar);
+  if (meAvaEl._avaKey !== avaKey){
+    paintAva(meAvaEl, me.avatar);
+    meAvaEl._avaKey = avaKey;
+  }
+  const nameEl = document.getElementById('meName');
+  if (nameEl.textContent !== me.name) nameEl.textContent = me.name;
+  const nickEl = document.getElementById('meNick');
+  const nickTxt = '@' + me.nick;
+  if (nickEl.textContent !== nickTxt) nickEl.textContent = nickTxt;
+
+  renderContacts();
+  renderBlacklist();
+}
+
+/* --------- incremental DOM helpers --------- */
+
+function createContactEl(c){
+  const el = document.createElement('div');
+  el.className = 'contact';
+  el.dataset.nick = c.nick;
+
+  const cv = document.createElement('canvas');
+  cv.width = 44; cv.height = 44;
+  cv.className = 'ava-small';
+  paintAva(cv, c.avatar);
+  el.appendChild(cv);
+
+  const info = document.createElement('div');
+  info.className = 'me-info';
+  const nm = document.createElement('div');
+  nm.className = 'me-name';
+  const nk = document.createElement('div');
+  nk.className = 'me-nick';
+  info.appendChild(nm); info.appendChild(nk);
+  el.appendChild(info);
+
+  const badge = document.createElement('span');
+  badge.className = 'badge';
+  badge.style.display = 'none';
+  badge.style.opacity = '1';
+  el.appendChild(badge);
+
+  el._avaKey = JSON.stringify(c.avatar);
+  el._badgeShown = false;
+
+  el.addEventListener('click', () => openChat(el.dataset.nick));
+
+  // Плавное появление новой карточки
+  el.animate(
+    [
+      {opacity: 0, transform: 'translateY(6px)'},
+      {opacity: 1, transform: 'translateY(0)'}
+    ],
+    {duration: 240, easing: 'cubic-bezier(.2,.8,.3,1)'}
+  );
+
+  return el;
+}
+
+function updateContactEl(el, c){
+  const cv = el.querySelector('canvas');
+  const avaKey = JSON.stringify(c.avatar);
+  if (el._avaKey !== avaKey){
+    paintAva(cv, c.avatar);
+    el._avaKey = avaKey;
+  }
+  const nm = el.querySelector('.me-name');
+  if (nm.textContent !== c.name) nm.textContent = c.name;
+  const nk = el.querySelector('.me-nick');
+  const nkTxt = '@' + c.nick;
+  if (nk.textContent !== nkTxt) nk.textContent = nkTxt;
+
+  // BADGE — плавное появление / исчезновение
+  const badge = el.querySelector('.badge');
+  const count = unread[c.nick] || 0;
+  const wantShow = count > 0;
+  const wantTxt = count > 99 ? '99+' : String(count);
+
+  if (wantShow){
+    if (badge.textContent !== wantTxt) badge.textContent = wantTxt;
+    if (!el._badgeShown){
+      el._badgeShown = true;
+      badge.style.display = 'flex';
+      // отменяем старую анимацию, если была
+      if (badge._anim){ try { badge._anim.cancel(); } catch(_){} badge._anim = null; }
+      badge._anim = badge.animate(
+        [
+          {transform: 'scale(.45)', opacity: 0},
+          {transform: 'scale(1.18)', opacity: 1, offset: .7},
+          {transform: 'scale(1)', opacity: 1}
+        ],
+        {duration: 280, easing: 'cubic-bezier(.2,.8,.3,1)'}
+      );
+      badge._anim.onfinish = () => { badge._anim = null; };
+    }
+  } else {
+    if (el._badgeShown){
+      el._badgeShown = false;
+      if (badge._anim){ try { badge._anim.cancel(); } catch(_){} badge._anim = null; }
+      const a = badge.animate(
+        [
+          {transform: 'scale(1)', opacity: 1},
+          {transform: 'scale(.5)', opacity: 0}
+        ],
+        {duration: 160, easing: 'ease-in', fill: 'forwards'}
+      );
+      a.onfinish = () => {
+        // только если к моменту окончания всё ещё скрываем
+        if (!el._badgeShown) badge.style.display = 'none';
+        try { a.cancel(); } catch(_){}
+      };
+      badge._anim = a;
+    }
+  }
+
+  // Selected — плавно через CSS-транзишн
+  el.classList.toggle('selected', currentPeer === c.nick);
 }
 
 function renderContacts(){
   const box = document.getElementById('contactsList');
+  // Стабильный порядок: по нику
+  const sorted = [...contacts].sort((a, b) => a.nick.localeCompare(b.nick));
+
+  /* ------- Пустое состояние ------- */
+  if (sorted.length === 0){
+    for (const el of contactEls.values()){
+      el.remove();
+    }
+    contactEls.clear();
+    let empty = box.querySelector('.empty');
+    if (!empty){
+      empty = document.createElement('div');
+      empty.className = 'empty';
+      box.appendChild(empty);
+    }
+    empty.textContent = t('no_contacts');
+    return;
+  }
+  const empty = box.querySelector('.empty');
+  if (empty) empty.remove();
+
+  /* ------- Удаляем то, чего больше нет ------- */
+  const wanted = new Set(sorted.map(c => c.nick));
+  for (const [nick, el] of [...contactEls]){
+    if (!wanted.has(nick)){
+      contactEls.delete(nick);
+      const a = el.animate(
+        [
+          {opacity: 1, transform: 'translateX(0)'},
+          {opacity: 0, transform: 'translateX(-14px)'}
+        ],
+        {duration: 200, easing: 'ease-in', fill: 'forwards'}
+      );
+      a.onfinish = () => el.remove();
+    }
+  }
+
+  /* ------- Добавляем / обновляем ------- */
+  const toReorder = [];
+  for (const c of sorted){
+    let el = contactEls.get(c.nick);
+    if (!el){
+      el = createContactEl(c);
+      contactEls.set(c.nick, el);
+      box.appendChild(el);
+    } else {
+      updateContactEl(el, c);
+      toReorder.push(el);
+    }
+  }
+
+  /* ------- Проверяем порядок и переставляем только если реально нужно ------- */
+  const currentDomOrder = Array.from(box.children)
+    .filter(n => n.classList && n.classList.contains('contact'))
+    .map(n => n.dataset.nick);
+  const wantedOrder = sorted.map(c => c.nick);
+  let orderChanged = currentDomOrder.length !== wantedOrder.length;
+  if (!orderChanged){
+    for (let i = 0; i < wantedOrder.length; i++){
+      if (currentDomOrder[i] !== wantedOrder[i]){ orderChanged = true; break; }
+    }
+  }
+  if (orderChanged){
+    // Аккуратно переставим только те, кто не на месте
+    let prev = null;
+    for (const c of sorted){
+      const el = contactEls.get(c.nick);
+      if (!el) continue;
+      if (prev){
+        if (el.previousElementSibling !== prev){
+          prev.after(el);
+        }
+      } else {
+        if (box.firstElementChild !== el){
+          box.prepend(el);
+        }
+      }
+      prev = el;
+    }
+  }
+}
+
+function renderBlacklist(){
+  const box = document.getElementById('blacklistBox');
   box.innerHTML = '';
-  if (!contacts.length){
+  if (!blacklist.length){
     const e = document.createElement('div');
-    e.className = 'empty';
-    e.textContent = t('no_contacts');
+    e.className = 'muted';
+    e.style.padding = '6px 2px';
+    e.textContent = t('no_bl');
     box.appendChild(e);
     return;
   }
-  contacts.forEach(c => {
+  blacklist.forEach(u => {
     const el = document.createElement('div');
-    el.className = 'contact' + (currentPeer === c.nick ? ' selected' : '');
-    el.onclick = () => openChat(c.nick);
-
+    el.className = 'bl-item';
     const cv = document.createElement('canvas');
-    cv.width = 44; cv.height = 44;
-    cv.className = 'ava-small';
-    paintAva(cv, c.avatar);
+    cv.width = 32; cv.height = 32;
+    paintAva(cv, u.avatar);
     el.appendChild(cv);
-
     const info = document.createElement('div');
     info.className = 'me-info';
     const nm = document.createElement('div');
-    nm.className = 'me-name'; nm.textContent = c.name;
+    nm.className = 'me-name'; nm.textContent = u.name;
     const nk = document.createElement('div');
-    nk.className = 'me-nick'; nk.textContent = '@' + c.nick;
+    nk.className = 'me-nick'; nk.textContent = '@' + u.nick;
     info.appendChild(nm); info.appendChild(nk);
     el.appendChild(info);
-
-    if (unread[c.nick] > 0){
-      const b = document.createElement('span');
-      b.className = 'badge';
-      b.textContent = unread[c.nick] > 99 ? '99+' : unread[c.nick];
-      el.appendChild(b);
-    }
+    const btn = document.createElement('button');
+    btn.title = t('remove');
+    btn.setAttribute('aria-label', t('remove'));
+    btn.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
+    btn.onclick = () => blRemove(u.nick);
+    el.appendChild(btn);
     box.appendChild(el);
   });
 }
 
+/* ============================================================
+                       SEARCH
+   ============================================================ */
 function openSearch(){
   document.getElementById('searchNick').value = '';
   document.getElementById('searchResult').innerHTML = '';
@@ -1769,6 +2043,9 @@ async function doSearch(){
   }
 }
 
+/* ============================================================
+                       CHAT
+   ============================================================ */
 async function startChat(peerNick){
   try {
     await api('/api/chat/start', { nick: peerNick });
@@ -1878,7 +2155,13 @@ async function openChat(peerNick){
     const r = await api('/api/chat/messages', { peer: peerNick });
     currentPeer = peerNick;
     currentPeerData = r.peer;
-    paintAva(document.getElementById('peerAva'), r.peer.avatar);
+
+    const pAvaEl = document.getElementById('peerAva');
+    const pKey = JSON.stringify(r.peer.avatar);
+    if (pAvaEl._avaKey !== pKey){
+      paintAva(pAvaEl, r.peer.avatar);
+      pAvaEl._avaKey = pKey;
+    }
     document.getElementById('peerName').textContent = r.peer.name;
     document.getElementById('peerNick').textContent = '@' + r.peer.nick;
 
@@ -1891,7 +2174,12 @@ async function openChat(peerNick){
     document.getElementById('emptyPane').classList.add('hidden');
     document.getElementById('screen-app').classList.add('chat-open');
     clearUnread(peerNick);
-    renderContacts();
+
+    // Обновим только selected-класс во всех контактах
+    for (const [nick, el] of contactEls){
+      el.classList.toggle('selected', nick === peerNick);
+    }
+
     setTimeout(() => document.getElementById('msgInput').focus(), 120);
   } catch(e){ toast(e.message); }
 }
@@ -1920,7 +2208,7 @@ function closeChat(silent){
   document.getElementById('chatContent').classList.add('hidden');
   document.getElementById('emptyPane').classList.remove('hidden');
   document.getElementById('screen-app').classList.remove('chat-open');
-  renderContacts();
+  for (const el of contactEls.values()) el.classList.remove('selected');
   if (!silent) refreshMe().catch(()=>{});
 }
 
@@ -1934,6 +2222,9 @@ function openInfo(){
   openModal('modal-info');
 }
 
+/* ============================================================
+                       SETTINGS
+   ============================================================ */
 function openSettings(){ renderBlacklist(); openModal('modal-settings'); }
 
 function openEditProfile(){
@@ -1951,7 +2242,9 @@ async function saveProfile(){
   try {
     const r = await api('/api/profile/update', { name, avatar: editEditor.getData() });
     me = r.me;
-    paintAva(document.getElementById('meAva'), me.avatar);
+    const meAvaEl = document.getElementById('meAva');
+    paintAva(meAvaEl, me.avatar);
+    meAvaEl._avaKey = JSON.stringify(me.avatar);
     document.getElementById('meName').textContent = me.name;
     document.getElementById('meNick').textContent = '@' + me.nick;
     closeModal('modal-edit');
@@ -1964,41 +2257,6 @@ async function copyMyLink(){
   const url = location.origin + '/@' + me.nick;
   const ok = await copyText(url);
   toast(ok ? t('link_copied') : 'Copy failed');
-}
-
-function renderBlacklist(){
-  const box = document.getElementById('blacklistBox');
-  box.innerHTML = '';
-  if (!blacklist.length){
-    const e = document.createElement('div');
-    e.className = 'muted';
-    e.style.padding = '6px 2px';
-    e.textContent = t('no_bl');
-    box.appendChild(e); return;
-  }
-  blacklist.forEach(u => {
-    const el = document.createElement('div');
-    el.className = 'bl-item';
-    const cv = document.createElement('canvas');
-    cv.width = 32; cv.height = 32;
-    paintAva(cv, u.avatar);
-    el.appendChild(cv);
-    const info = document.createElement('div');
-    info.className = 'me-info';
-    const nm = document.createElement('div');
-    nm.className = 'me-name'; nm.textContent = u.name;
-    const nk = document.createElement('div');
-    nk.className = 'me-nick'; nk.textContent = '@' + u.nick;
-    info.appendChild(nm); info.appendChild(nk);
-    el.appendChild(info);
-    const btn = document.createElement('button');
-    btn.title = t('remove');
-    btn.setAttribute('aria-label', t('remove'));
-    btn.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
-    btn.onclick = () => blRemove(u.nick);
-    el.appendChild(btn);
-    box.appendChild(el);
-  });
 }
 
 async function blAdd(){
@@ -2014,6 +2272,9 @@ async function blRemove(nick){
   catch(e){ toast(e.message); }
 }
 
+/* ============================================================
+                 KEYBOARD / VIEWPORT
+   ============================================================ */
 function updateViewport(){
   const vv = window.visualViewport;
   if (!vv){
@@ -2040,6 +2301,9 @@ function pinViewportAfterFocus(){
   }, 80);
 }
 
+/* ============================================================
+                       INIT / BOOT
+   ============================================================ */
 function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function boot(){
@@ -2051,7 +2315,9 @@ async function boot(){
     try {
       const r = await api('/api/me', null, 'GET');
       me = r.me; contacts = r.contacts; blacklist = r.blacklist;
-      paintAva(document.getElementById('meAva'), me.avatar);
+      const meAvaEl = document.getElementById('meAva');
+      paintAva(meAvaEl, me.avatar);
+      meAvaEl._avaKey = JSON.stringify(me.avatar);
       document.getElementById('meName').textContent = me.name;
       document.getElementById('meNick').textContent = '@' + me.nick;
       renderContacts(); renderBlacklist();
