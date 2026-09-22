@@ -1,5 +1,5 @@
 # main.py
-import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request
+import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request, logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Union
 from fastapi import FastAPI, HTTPException, Request
@@ -7,6 +7,9 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("sld")
 
 app = FastAPI(title="SLD")
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -18,9 +21,9 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("[SLD] Supabase connected")
+        log.info("[SLD] Supabase connected")
     except Exception as e:
-        print("[SLD] Supabase init error:", e)
+        log.error("[SLD] Supabase init error: %s", e)
 
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
@@ -28,6 +31,7 @@ POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
 _VIEW_COOLDOWN: Dict[str, float] = {}
 _OG_CACHE: Dict[str, Optional[dict]] = {}
+_NICK_FAILS: Dict[str, List[float]] = {}
 
 MAX_POST_LEN = 5000
 MAX_COMMENT_LEN = 1500
@@ -37,34 +41,211 @@ VIEW_COOLDOWN_SEC = 8 * 3600
 TRUNCATE_LINES = 15
 TRUNCATE_CHARS = 800
 SESSION_TTL = 30 * 24 * 3600
+MAX_SESSIONS_PER_USER = 10
 USER_CACHE_TTL = 60.0
 RATE_WINDOW = 60.0
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
+RESERVED_NICKS = {"admin","root","system","moderator","mod","sld","слд","support","help","api","null","undefined","me","user","users","login","register","settings","policy","notifications","p","u"}
 _lang_cache: Dict[str, str] = {}
 _geo_cache: Dict[str, dict] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
-DEFAULT_EMOJI = "🐱"
+DEFAULT_EMOJI = "😀"
 
-EMOJIS_RAW = (
-    "😀😃😄😁😆😅😂😊😇🙂🙃😉😌😍😘😗😙😚😋😛😝😜😎"
-    "😏😒😞😔😟😕🙁☹😣😖😫😩😢😭😤😠😡😳😱😨😰😥😓"
-    "🤗🤔🤐😶😐😑😬🙄😯😦😧😮😲😴🤤😪😵🤢🤧😷🤒🤕"
-    "😈👿👹👺💩💀👻👽👾🤖🎃😺😸😹😻😼😽🙀😿😾"
-    "🐶🐱🐭🐹🐰🐻🐼🐨🐯🐮🐷🐸🐵"
-    "🐔🐧🐦🐤🐺🐴🐝🐛🐢🐍🐙🐠🐟🐬🐳🐋"
-    "🌵🎄🌲🌳🌴🌱🌿🍀🍃🍂🍁🍄🌾"
-    "🌷🌹🌺🌸🌼🌻💐"
-    "🌞🌝🌛🌜🌚🌕🌙🌎🌍🌏"
-    "⭐🌟✨⚡🔥💥🌈💧🌊"
-    "🍎🍊🍋🍌🍉🍇🍓🍒🍑🍍🍅"
-    "🍞🍔🍟🍕🍜🍣🍦🍩🍪🎂🍰🍫🍬"
-)
-EMOJIS = list(EMOJIS_RAW)
+# emoji + (ru, en) name
+EMOJI_DATA: List[Tuple[str, str, str]] = [
+    # Smileys
+    ("😀", "Улыбашка", "Grinning"),
+    ("😃", "Улыбка с глазами", "Big smile"),
+    ("😄", "Смех", "Laughing"),
+    ("😁", "Сияющая улыбка", "Beaming"),
+    ("😆", "Хохот", "Grinning squint"),
+    ("😅", "Улыбка с потом", "Nervous laugh"),
+    ("😂", "Слёзы смеха", "Tears of joy"),
+    ("😊", "Смущённая улыбка", "Blush"),
+    ("😇", "Ангел", "Angel"),
+    ("🙂", "Легкая улыбка", "Slight smile"),
+    ("🙃", "Перевёрнутая улыбка", "Upside down"),
+    ("😉", "Подмигивание", "Wink"),
+    ("😌", "Спокойствие", "Relieved"),
+    ("😍", "Влюблённые глаза", "Heart eyes"),
+    ("😘", "Воздушный поцелуй", "Kiss"),
+    ("😗", "Поцелуй", "Kissing"),
+    ("😙", "Поцелуй с улыбкой", "Kissing smile"),
+    ("😚", "Закрытый поцелуй", "Kissing closed eyes"),
+    ("😋", "Вкусно", "Yum"),
+    ("😛", "Язык", "Tongue"),
+    ("😝", "Прищур с языком", "Squint tongue"),
+    ("😜", "Подмигивание с языком", "Wink tongue"),
+    ("😎", "Крутой", "Cool"),
+    ("😏", "Ухмылка", "Smirk"),
+    ("😒", "Недовольство", "Unamused"),
+    ("😞", "Разочарование", "Disappointed"),
+    ("😔", "Печаль", "Pensive"),
+    ("😟", "Тревога", "Worried"),
+    ("😕", "Смущение", "Confused"),
+    ("🙁", "Легкая грусть", "Slight frown"),
+    ("☹️", "Грусть", "Frown"),
+    ("😣", "Мучение", "Persevere"),
+    ("😖", "Замешательство", "Confounded"),
+    ("😫", "Усталость", "Tired"),
+    ("😩", "Изнеможение", "Weary"),
+    ("😢", "Слеза", "Crying"),
+    ("😭", "Громкий плач", "Sobbing"),
+    ("😤", "Пар из носа", "Triumph"),
+    ("😠", "Злость", "Angry"),
+    ("😡", "Ярость", "Rage"),
+    ("😳", "Румянец", "Flushed"),
+    ("😱", "Крик", "Scream"),
+    ("😨", "Испуг", "Fearful"),
+    ("😰", "Тревожный пот", "Anxious"),
+    ("😥", "Грустный пот", "Sad relieved"),
+    ("😓", "Пот", "Downcast"),
+    ("🤗", "Обнимашки", "Hug"),
+    ("🤔", "Размышление", "Thinking"),
+    ("🤐", "Молчание", "Zipper mouth"),
+    ("😶", "Без слов", "No mouth"),
+    ("😐", "Нейтрально", "Neutral"),
+    ("😑", "Без эмоций", "Expressionless"),
+    ("😬", "Стиснутые зубы", "Grimacing"),
+    ("🙄", "Закатывает глаза", "Eye roll"),
+    ("😯", "Удивление", "Hushed"),
+    ("😦", "Открытый рот", "Frowning open"),
+    ("😧", "Изумление", "Anguished"),
+    ("😮", "Ох", "Open mouth"),
+    ("😲", "Потрясение", "Astonished"),
+    ("😴", "Сон", "Sleeping"),
+    ("🤤", "Слюни", "Drooling"),
+    ("😪", "Сонливость", "Sleepy"),
+    ("😵", "Головокружение", "Dizzy"),
+    ("🤢", "Тошнота", "Nauseous"),
+    ("🤧", "Чих", "Sneezing"),
+    ("😷", "Маска", "Mask"),
+    ("🤒", "Термометр", "Sick"),
+    ("🤕", "Повязка", "Injured"),
+    ("😈", "Дьяволёнок", "Devil"),
+    ("👿", "Злой дьявол", "Angry devil"),
+    ("👹", "Огр", "Ogre"),
+    ("👺", "Тэнгу", "Goblin"),
+    ("💩", "Какашка", "Poo"),
+    ("💀", "Череп", "Skull"),
+    ("👻", "Призрак", "Ghost"),
+    ("👽", "Инопланетянин", "Alien"),
+    ("👾", "Космический монстр", "Space invader"),
+    ("🤖", "Робот", "Robot"),
+    ("🎃", "Тыква", "Pumpkin"),
+    ("😺", "Кот улыбается", "Grinning cat"),
+    ("😸", "Кот смеётся", "Grinning cat eyes"),
+    ("😹", "Кот со слезами", "Cat tears of joy"),
+    ("😻", "Кот влюблён", "Heart eyes cat"),
+    ("😼", "Кот ухмыляется", "Wry cat"),
+    ("😽", "Кот целует", "Kissing cat"),
+    ("🙀", "Кот в шоке", "Weary cat"),
+    ("😿", "Кот плачет", "Crying cat"),
+    ("😾", "Кот злится", "Pouting cat"),
+    # Animals
+    ("🐶", "Собака", "Dog"),
+    ("🐱", "Кошка", "Cat"),
+    ("🐭", "Мышь", "Mouse"),
+    ("🐹", "Хомяк", "Hamster"),
+    ("🐰", "Кролик", "Rabbit"),
+    ("🐻", "Медведь", "Bear"),
+    ("🐼", "Панда", "Panda"),
+    ("🐨", "Коала", "Koala"),
+    ("🐯", "Тигр", "Tiger"),
+    ("🐮", "Корова", "Cow"),
+    ("🐷", "Свинья", "Pig"),
+    ("🐸", "Лягушка", "Frog"),
+    ("🐵", "Обезьяна", "Monkey"),
+    ("🐔", "Курица", "Chicken"),
+    ("🐧", "Пингвин", "Penguin"),
+    ("🐦", "Птица", "Bird"),
+    ("🐤", "Цыплёнок", "Baby chick"),
+    ("🐺", "Волк", "Wolf"),
+    ("🐴", "Лошадь", "Horse"),
+    ("🐝", "Пчела", "Bee"),
+    ("🐛", "Гусеница", "Bug"),
+    ("🐢", "Черепаха", "Turtle"),
+    ("🐍", "Змея", "Snake"),
+    ("🐙", "Осьминог", "Octopus"),
+    ("🐠", "Тропическая рыба", "Tropical fish"),
+    ("🐟", "Рыба", "Fish"),
+    ("🐬", "Дельфин", "Dolphin"),
+    ("🐳", "Кит", "Whale"),
+    ("🐋", "Кит с фонтанчиком", "Humpback whale"),
+    # Plants
+    ("🌵", "Кактус", "Cactus"),
+    ("🎄", "Новогодняя ёлка", "Christmas tree"),
+    ("🌲", "Ёлка", "Evergreen"),
+    ("🌳", "Дерево", "Tree"),
+    ("🌴", "Пальма", "Palm"),
+    ("🌱", "Росток", "Seedling"),
+    ("🌿", "Трава", "Herb"),
+    ("🍀", "Клевер", "Four-leaf clover"),
+    ("🍃", "Листок на ветру", "Leaf fluttering"),
+    ("🍂", "Осенний лист", "Fallen leaf"),
+    ("🍁", "Кленовый лист", "Maple leaf"),
+    ("🍄", "Гриб", "Mushroom"),
+    ("🌾", "Колосья", "Sheaf of rice"),
+    ("🌷", "Тюльпан", "Tulip"),
+    ("🌹", "Роза", "Rose"),
+    ("🌺", "Гибискус", "Hibiscus"),
+    ("🌸", "Сакура", "Cherry blossom"),
+    ("🌼", "Ромашка", "Blossom"),
+    ("🌻", "Подсолнух", "Sunflower"),
+    ("💐", "Букет", "Bouquet"),
+    # Sky
+    ("🌞", "Солнце с лицом", "Sun with face"),
+    ("🌝", "Полная луна с лицом", "Full moon face"),
+    ("🌛", "Луна с лицом", "First quarter moon face"),
+    ("🌜", "Луна с лицом (влево)", "Last quarter moon"),
+    ("🌚", "Новая луна с лицом", "New moon face"),
+    ("🌕", "Полная луна", "Full moon"),
+    ("🌙", "Полумесяц", "Crescent moon"),
+    ("🌎", "Земля (Америка)", "Earth Americas"),
+    ("🌍", "Земля (Европа)", "Earth Europe"),
+    ("🌏", "Земля (Азия)", "Earth Asia"),
+    ("⭐", "Звезда", "Star"),
+    ("🌟", "Сияющая звезда", "Glowing star"),
+    ("✨", "Искры", "Sparkles"),
+    ("⚡", "Молния", "Lightning"),
+    ("🔥", "Огонь", "Fire"),
+    ("💥", "Взрыв", "Collision"),
+    ("🌈", "Радуга", "Rainbow"),
+    ("💧", "Капля", "Droplet"),
+    ("🌊", "Волна", "Wave"),
+    # Fruits
+    ("🍎", "Красное яблоко", "Red apple"),
+    ("🍊", "Мандарин", "Tangerine"),
+    ("🍋", "Лимон", "Lemon"),
+    ("🍌", "Банан", "Banana"),
+    ("🍉", "Арбуз", "Watermelon"),
+    ("🍇", "Виноград", "Grapes"),
+    ("🍓", "Клубника", "Strawberry"),
+    ("🍒", "Вишня", "Cherries"),
+    ("🍑", "Персик", "Peach"),
+    ("🍍", "Ананас", "Pineapple"),
+    ("🍅", "Помидор", "Tomato"),
+    # Food
+    ("🍞", "Хлеб", "Bread"),
+    ("🍔", "Бургер", "Burger"),
+    ("🍟", "Картошка фри", "Fries"),
+    ("🍕", "Пицца", "Pizza"),
+    ("🍜", "Лапша", "Noodles"),
+    ("🍣", "Суши", "Sushi"),
+    ("🍦", "Мороженое", "Ice cream"),
+    ("🍩", "Пончик", "Donut"),
+    ("🍪", "Печенье", "Cookie"),
+    ("🎂", "Торт", "Birthday cake"),
+    ("🍰", "Кусок торта", "Shortcake"),
+    ("🍫", "Шоколад", "Chocolate"),
+    ("🍬", "Конфета", "Candy"),
+]
+EMOJIS = [e[0] for e in EMOJI_DATA]
 
 
 class EventBus:
@@ -167,8 +348,27 @@ def check_password(password: str, stored: str) -> bool:
         return False
 
 
+def validate_password(pw: str) -> str:
+    if len(pw) < 8: return "err_short_pass"
+    if not re.search(r"[A-Za-z]", pw): return "err_pass_weak"
+    if not re.search(r"\d", pw): return "err_pass_weak"
+    return ""
+
+
 def new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def create_session(nick: str) -> str:
+    """Создать сессию с ограничением количества активных на пользователя."""
+    existing = [(t, s.get("created", 0)) for t, s in SESSIONS.items() if s.get("nick") == nick]
+    if len(existing) >= MAX_SESSIONS_PER_USER:
+        existing.sort(key=lambda x: x[1])
+        for t, _ in existing[:len(existing) - MAX_SESSIONS_PER_USER + 1]:
+            SESSIONS.pop(t, None)
+    token = new_token()
+    SESSIONS[token] = {"nick": nick, "created": time.time()}
+    return token
 
 
 def rate_limit(key: str, max_req: int, window: float = RATE_WINDOW) -> bool:
@@ -177,6 +377,26 @@ def rate_limit(key: str, max_req: int, window: float = RATE_WINDOW) -> bool:
     if len(arr) >= max_req:
         _RATE[key] = arr; return False
     arr.append(now); _RATE[key] = arr; return True
+
+
+def _nick_login_ok(nick: str) -> bool:
+    """Лимит по нику (не только по IP) — защита от brute-force."""
+    now = time.time()
+    arr = [t for t in _NICK_FAILS.get(nick.lower(), []) if now - t < 900]
+    if len(arr) >= 10:
+        _NICK_FAILS[nick.lower()] = arr
+        return False
+    return True
+
+
+def _nick_login_fail(nick: str) -> None:
+    arr = _NICK_FAILS.get(nick.lower(), [])
+    arr.append(time.time())
+    _NICK_FAILS[nick.lower()] = arr[-10:]
+
+
+def _nick_login_ok_clear(nick: str) -> None:
+    _NICK_FAILS.pop(nick.lower(), None)
 
 
 def ts_to_iso(ts) -> str:
@@ -392,7 +612,7 @@ def db_load_user(nick: str) -> Optional[dict]:
         try:
             r = supabase.table("users").select("*").ilike("nick", nick).limit(1).execute()
             if r.data: return _norm_user_row(r.data[0])
-        except Exception as e: print("[SLD] db_load_user error:", e)
+        except Exception as e: log.error("db_load_user error: %s", e)
         return None
     for u in USERS.values():
         if u["nick"].lower() == nick.lower(): return u
@@ -433,7 +653,7 @@ def db_load_users_batch(nicks: List[str]) -> Dict[str, dict]:
                 out[u["nick"].lower()] = u
                 _USER_CACHE[u["nick"].lower()] = (now, u)
         except Exception as e:
-            print("[SLD] db_load_users_batch error:", e)
+            log.error("db_load_users_batch error: %s", e)
     else:
         for n in missing:
             for u in USERS.values():
@@ -465,7 +685,7 @@ def db_save_user(u: dict) -> None:
     try:
         supabase.table("users").upsert(_user_payload(u)).execute()
     except Exception as e:
-        print("[SLD] db_save_user error:", e)
+        log.error("db_save_user error: %s", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
@@ -477,7 +697,7 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
     try:
         supabase.table("users").update(patch).eq("nick", nick).execute()
     except Exception as e:
-        print("[SLD] db_update_user_fields error:", e)
+        log.error("db_update_user_fields error: %s", e)
     invalidate_user_cache(nick)
 
 
@@ -487,7 +707,7 @@ def db_all_users() -> List[dict]:
             r = supabase.table("users").select("*").execute()
             return [_norm_user_row(row) for row in (r.data or [])]
         except Exception as e:
-            print("[SLD] db_all_users error:", e); return []
+            log.error("db_all_users error: %s", e); return []
     return list(USERS.values())
 
 
@@ -504,10 +724,10 @@ def db_create_post(p: dict) -> None:
     try:
         supabase.table("posts").insert(payload).execute()
     except Exception as e:
-        print("[SLD] db_create_post error:", e)
+        log.error("db_create_post error: %s", e)
         payload.pop("device", None)
         try: supabase.table("posts").insert(payload).execute()
-        except Exception as e2: print("[SLD] db_create_post retry error:", e2)
+        except Exception as e2: log.error("db_create_post retry: %s", e2)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
@@ -515,7 +735,7 @@ def db_update_post_text(pid: str, text: str) -> None:
         if pid in POSTS_MEM: POSTS_MEM[pid]["text"] = text
         return
     try: supabase.table("posts").update({"text": text}).eq("id", pid).execute()
-    except Exception as e: print("[SLD] db_update_post error:", e)
+    except Exception as e: log.error("db_update_post: %s", e)
 
 
 def db_delete_post(pid: str) -> None:
@@ -524,7 +744,7 @@ def db_delete_post(pid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("post_id", pid).execute()
         supabase.table("posts").delete().eq("id", pid).execute()
-    except Exception as e: print("[SLD] db_delete_post error:", e)
+    except Exception as e: log.error("db_delete_post: %s", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
@@ -536,7 +756,7 @@ def db_get_post(pid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[SLD] db_get_post error:", e); return None
+            log.error("db_get_post: %s", e); return None
     return POSTS_MEM.get(pid)
 
 
@@ -552,7 +772,7 @@ def db_inc_views(pid: str) -> int:
         r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
         if r.data: return r.data[0].get("views") or 0
     except Exception as e:
-        print("[SLD] db_inc_views error:", e)
+        log.error("db_inc_views: %s", e)
     return 0
 
 
@@ -571,7 +791,7 @@ def view_should_count(pid: str, vid: str) -> bool:
                     _VIEW_COOLDOWN[key] = last_ts
                     return False
         except Exception as e:
-            print("[SLD] view check error:", e)
+            log.error("view check: %s", e)
     return True
 
 
@@ -583,7 +803,7 @@ def view_mark_counted(pid: str, vid: str) -> None:
             supabase.table("post_views").upsert({
                 "post_id": pid, "viewer_id": vid,
                 "last_viewed_at": ts_to_iso(now)}).execute()
-        except Exception as e: print("[SLD] view mark error:", e)
+        except Exception as e: log.error("view mark: %s", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
@@ -596,7 +816,7 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 out[row["id"]] = row
         except Exception as e:
-            print("[SLD] db_get_quotes error:", e)
+            log.error("db_get_quotes: %s", e)
         return out
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -620,7 +840,7 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[SLD] db_list_posts error:", e); return []
+            log.error("db_list_posts: %s", e); return []
     items = list(POSTS_MEM.values())
     if author: items = [p for p in items if p["author"] == author]
     if subscriptions_of:
@@ -640,7 +860,7 @@ def db_post_votes(post_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("post_votes").select("*").in_("post_id", post_ids).execute().data or []
         except Exception as e:
-            print("[SLD] db_post_votes error:", e); return []
+            log.error("db_post_votes: %s", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -658,7 +878,7 @@ def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("post_votes").upsert({
                     "post_id": post_id, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[SLD] db_set_post_vote error:", e)
+        except Exception as e: log.error("db_set_post_vote: %s", e)
         return
     p = POSTS_MEM.get(post_id)
     if not p: return
@@ -677,7 +897,7 @@ def db_comment_counts(post_ids: List[str]) -> Dict[str, int]:
                 if pid: out[pid] = out.get(pid, 0) + 1
             return out
         except Exception as e:
-            print("[SLD] db_comment_counts error:", e); return {}
+            log.error("db_comment_counts: %s", e); return {}
     out = {}
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -694,7 +914,7 @@ def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[SLD] db_comments_for_posts error:", e); return []
+            log.error("db_comments_for_posts: %s", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -712,7 +932,7 @@ def db_comment_votes(comment_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("comment_votes").select("*").in_("comment_id", comment_ids).execute().data or []
         except Exception as e:
-            print("[SLD] db_comment_votes error:", e); return []
+            log.error("db_comment_votes: %s", e); return []
     out = []
     for pid, p in POSTS_MEM.items():
         for c in p.get("comments", []):
@@ -735,7 +955,7 @@ def db_create_comment(c: dict) -> None:
             "id": c["id"], "post_id": c["post_id"], "author": c["author"],
             "parent_id": c.get("parent_id"), "text": c["text"],
             "created_at": ts_to_iso(c["created_at"])}).execute()
-    except Exception as e: print("[SLD] db_create_comment error:", e)
+    except Exception as e: log.error("db_create_comment: %s", e)
 
 
 def db_update_comment_text(cid: str, text: str) -> None:
@@ -745,16 +965,15 @@ def db_update_comment_text(cid: str, text: str) -> None:
                 if c["id"] == cid: c["text"] = text; return
         return
     try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
-    except Exception as e: print("[SLD] db_update_comment error:", e)
+    except Exception as e: log.error("db_update_comment: %s", e)
 
 
 def db_delete_comment(cid: str) -> None:
-    """Каскадное удаление: сам комментарий + все его ответы (parent_id == cid)."""
+    """Каскадное удаление: комментарий + все ответы (parent_id == cid)."""
     if not supabase:
         for p in POSTS_MEM.values():
             comments = p.get("comments", [])
             if not comments: continue
-            # Найдём все id для удаления: сам cid и все прямые ответы
             to_del = {cid}
             for c in comments:
                 if c.get("parent_id") == cid:
@@ -763,10 +982,9 @@ def db_delete_comment(cid: str) -> None:
         return
     try:
         supabase.table("notifications").delete().eq("comment_id", cid).execute()
-        # Удаляем прямые ответы (на один уровень)
         supabase.table("comments").delete().eq("parent_id", cid).execute()
         supabase.table("comments").delete().eq("id", cid).execute()
-    except Exception as e: print("[SLD] db_delete_comment error:", e)
+    except Exception as e: log.error("db_delete_comment: %s", e)
 
 
 def db_get_comment(cid: str) -> Optional[dict]:
@@ -778,7 +996,7 @@ def db_get_comment(cid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[SLD] db_get_comment error:", e); return None
+            log.error("db_get_comment: %s", e); return None
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
@@ -796,7 +1014,7 @@ def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("comment_votes").upsert({
                     "comment_id": cid, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[SLD] db_set_comment_vote error:", e)
+        except Exception as e: log.error("db_set_comment_vote: %s", e)
         return
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
@@ -844,7 +1062,7 @@ def db_notify_many(notifications: List[dict], users_map: Optional[Dict[str, dict
         try:
             supabase.table("notifications").insert(valid).execute()
         except Exception as e:
-            print("[SLD] db_notify_many error:", e)
+            log.error("db_notify_many: %s", e)
     else:
         for row in valid:
             NOTIFS_MEM.setdefault(row["to_nick"], []).append({
@@ -870,7 +1088,7 @@ def db_notifications(nick: str) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[SLD] db_notifications error:", e); return []
+            log.error("db_notifications: %s", e); return []
     items = list(NOTIFS_MEM.get(nick, []))
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:100]
@@ -883,14 +1101,14 @@ def db_notifications_unread_count(nick: str) -> int:
                  .eq("to_nick", nick).eq("read", False).limit(1).execute())
             return r.count or 0
         except Exception as e:
-            print("[SLD] db_notif_unread error:", e); return 0
+            log.error("db_notif_unread: %s", e); return 0
     return sum(1 for n in NOTIFS_MEM.get(nick, []) if not n.get("read"))
 
 
 def db_notifications_mark_read(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
-        except Exception as e: print("[SLD] db_notif_read error:", e)
+        except Exception as e: log.error("db_notif_read: %s", e)
         return
     for n in NOTIFS_MEM.get(nick, []): n["read"] = True
 
@@ -898,7 +1116,7 @@ def db_notifications_mark_read(nick: str) -> None:
 def db_notifications_clear(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").delete().eq("to_nick", nick).execute()
-        except Exception as e: print("[SLD] db_notif_clear error:", e)
+        except Exception as e: log.error("db_notif_clear: %s", e)
         return
     NOTIFS_MEM[nick] = []
 
@@ -940,7 +1158,7 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             fw = u.get("followers") or set()
             if old_nick in fw: patch["followers"] = [new_nick if x == old_nick else x for x in fw]
             if patch: db_update_user_fields(u["nick"], patch)
-    except Exception as e: print("[SLD] _rename_user_everywhere error:", e)
+    except Exception as e: log.error("_rename_user_everywhere: %s", e)
     invalidate_user_cache()
 
 
@@ -1102,8 +1320,10 @@ def api_register(data: RegisterIn, request: Request):
     name = data.name.strip()
     nick = data.nick.strip().lstrip("@")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
+    if nick.lower() in RESERVED_NICKS: raise HTTPException(400, "err_nick_reserved")
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
-    if len(data.password) < 6: raise HTTPException(400, "err_short_pass")
+    perr = validate_password(data.password)
+    if perr: raise HTTPException(400, perr)
     if data.password != data.password_confirm: raise HTTPException(400, "err_pass_mismatch")
     if db_load_user(nick): raise HTTPException(400, "err_nick_taken")
     u = {"nick": nick, "name": name, "bio": "",
@@ -1114,28 +1334,34 @@ def api_register(data: RegisterIn, request: Request):
          "show_device_badge": True}
     for f in NOTIFY_FIELDS: u[f] = True
     db_save_user(u)
-    token = new_token()
-    SESSIONS[token] = {"nick": nick, "created": time.time()}
+    token = create_session(nick)
+    log.info("[reg] %s from %s", nick, ip)
     return {"token": token, "user": serialize_user(u, nick)}
 
 
 @app.post("/api/login")
 def api_login(data: LoginIn, request: Request):
     ip = get_client_ip(request)
-    if not rate_limit("log:" + ip, 10, 300): raise HTTPException(429, "err_rate_limit")
     nick = data.nick.strip().lstrip("@")
+    if not rate_limit("log:" + ip, 10, 300): raise HTTPException(429, "err_rate_limit")
+    if not _nick_login_ok(nick): raise HTTPException(429, "err_rate_limit")
     u = db_load_user(nick)
     if not u or not check_password(data.password, u["password"]):
+        _nick_login_fail(nick)
+        log.info("[login-fail] %s from %s", nick, ip)
         raise HTTPException(400, "err_bad_login")
-    token = new_token()
-    SESSIONS[token] = {"nick": u["nick"], "created": time.time()}
+    _nick_login_ok_clear(nick)
+    token = create_session(u["nick"])
+    log.info("[login] %s from %s", u["nick"], ip)
     return {"token": token, "user": serialize_user(u, u["nick"])}
 
 
 @app.post("/api/logout")
 def api_logout(request: Request):
     token = request.headers.get("x-auth")
-    if token: SESSIONS.pop(token, None)
+    if token:
+        sess = SESSIONS.pop(token, None)
+        if sess: log.info("[logout] %s", sess.get("nick"))
     return {"ok": True}
 
 
@@ -1158,6 +1384,8 @@ def api_whoami(request: Request):
 @app.put("/api/users/me")
 def api_update_me(data: ProfileUpdateIn, request: Request):
     me = require_user(request)
+    ip = get_client_ip(request)
+    if not rate_limit("upd:" + me["nick"], 10, 60): raise HTTPException(429, "err_rate_limit")
     name = data.name.strip(); nick = data.nick.strip().lstrip("@"); bio = data.bio.strip()
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
@@ -1166,6 +1394,7 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     old_nick = me["nick"]
     nick_changed = (nick.lower() != old_nick.lower())
     if nick_changed:
+        if nick.lower() in RESERVED_NICKS: raise HTTPException(400, "err_nick_reserved")
         exists = db_load_user(nick)
         if exists and exists["nick"].lower() != old_nick.lower():
             raise HTTPException(400, "err_nick_taken")
@@ -1182,6 +1411,7 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
 @app.post("/api/users/me/settings")
 def api_set_settings(data: SettingsIn, request: Request):
     me = require_user(request)
+    if not rate_limit("set:" + me["nick"], 20, 60): raise HTTPException(429, "err_rate_limit")
     patch = {}
     if data.allow_followers_view is not None: patch["allow_followers_view"] = bool(data.allow_followers_view)
     if data.allow_following_view is not None: patch["allow_following_view"] = bool(data.allow_following_view)
@@ -1268,6 +1498,7 @@ def api_following(nick: str, request: Request):
 @app.post("/api/users/{nick}/follow")
 def api_follow(nick: str, request: Request):
     me = require_user(request)
+    if not rate_limit("fol:" + me["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     target = db_load_user(nick)
     if not target: raise HTTPException(404, "not found")
     if target["nick"] == me["nick"]: raise HTTPException(400, "self")
@@ -1286,6 +1517,7 @@ def api_follow(nick: str, request: Request):
 @app.post("/api/users/{nick}/unfollow")
 def api_unfollow(nick: str, request: Request):
     me = require_user(request)
+    if not rate_limit("fol:" + me["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     target = db_load_user(nick)
     if not target: raise HTTPException(404, "not found")
     if target["nick"] in (me.get("following") or set()):
@@ -1341,6 +1573,7 @@ def api_create(payload: PostIn, request: Request):
     u = require_user(request)
     ip = get_client_ip(request)
     if not rate_limit("post:" + ip, 30, 60): raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("post:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     text = payload.text.strip()
     if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
@@ -1385,6 +1618,7 @@ def api_create(payload: PostIn, request: Request):
 @app.put("/api/posts/{pid}")
 def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     u = require_user(request)
+    if not rate_limit("edit:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
     if p["author"] != u["nick"]: raise HTTPException(403, "forbidden")
@@ -1400,6 +1634,7 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
 @app.delete("/api/posts/{pid}")
 def api_delete_post(pid: str, request: Request):
     u = require_user(request)
+    if not rate_limit("del:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
     if p["author"] != u["nick"]: raise HTTPException(403, "forbidden")
@@ -1416,6 +1651,7 @@ def api_like_post(pid: str, request: Request):
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
     u = require_user(request)
+    if not rate_limit("like:" + u["nick"], 120, 60): raise HTTPException(429, "err_rate_limit")
     vid = "u:" + u["nick"]
     existing = db_post_votes([pid])
     cur = 0
@@ -1437,6 +1673,7 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     u = require_user(request)
     ip = get_client_ip(request)
     if not rate_limit("cmt:" + ip, 60, 60): raise HTTPException(429, "err_rate_limit")
+    if not rate_limit("cmt:" + u["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     post = db_get_post(pid)
     if not post: raise HTTPException(404, "not found")
     text = c.text.strip()
@@ -1496,6 +1733,7 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
 @app.put("/api/posts/{pid}/comments/{cid}")
 def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Request):
     u = require_user(request)
+    if not rate_limit("editc:" + u["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     c = db_get_comment(cid)
     if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
     if c["author"] != u["nick"]: raise HTTPException(403, "forbidden")
@@ -1511,6 +1749,7 @@ def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Reques
 @app.delete("/api/posts/{pid}/comments/{cid}")
 def api_delete_comment(pid: str, cid: str, request: Request):
     u = require_user(request)
+    if not rate_limit("delc:" + u["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     c = db_get_comment(cid)
     if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
     if c["author"] != u["nick"]: raise HTTPException(403, "forbidden")
@@ -1525,6 +1764,7 @@ def api_like_comment(pid: str, cid: str, request: Request):
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
     u = require_user(request)
+    if not rate_limit("like:" + u["nick"], 120, 60): raise HTTPException(429, "err_rate_limit")
     vid = "u:" + u["nick"]
     existing = db_comment_votes([cid])
     cur = 0
@@ -1564,6 +1804,7 @@ def api_notifications_read(request: Request):
 @app.post("/api/notifications/clear")
 def api_notifications_clear(request: Request):
     me = require_user(request)
+    if not rate_limit("nc:" + me["nick"], 10, 60): raise HTTPException(429, "err_rate_limit")
     db_notifications_clear(me["nick"]); return {"ok": True}
 
 
@@ -1606,6 +1847,7 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
 
 TEXTS = {
     "ru": {
+        "site_name": "СЛД",
         "search_ph": "Поиск людей и постов",
         "post_ph": "Что нового?",
         "comment_ph": "Комментарий... Shift+Enter — отправить",
@@ -1640,8 +1882,10 @@ TEXTS = {
         "to_login": "Уже зарегистрированы? Войти",
         "to_reg": "Нет аккаунта? Зарегистрироваться",
         "err_bad_nick": "Ник: 3-20 символов, латиница, цифры, _",
+        "err_nick_reserved": "Этот ник зарезервирован",
         "err_bad_name": "Имя: от 1 до 50 символов",
-        "err_short_pass": "Пароль: минимум 6 символов",
+        "err_short_pass": "Пароль: минимум 8 символов",
+        "err_pass_weak": "Пароль должен содержать буквы и цифры",
         "err_pass_mismatch": "Пароли не совпадают",
         "err_nick_taken": "Этот ник уже занят",
         "err_bad_login": "Неверный ник или пароль",
@@ -1679,7 +1923,7 @@ TEXTS = {
         "settings_device_os": "Система",
         "settings_device_city": "Город",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "SLD — минималистичная соцсеть: посты и комментарии.",
+        "settings_desc": "СЛД — минималистичная соцсеть: посты и комментарии.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1724,6 +1968,13 @@ TEXTS = {
             "• Для отправки уведомлений о действиях других пользователей\n"
             "• Для определения языка и города — только чтобы показать их вам в настройках\n"
             "• Никакой аналитики, никакой рекламы, никакого трекинга.\n\n"
+            "БЕЗОПАСНОСТЬ АККАУНТА\n"
+            "• Пароль минимум 8 символов, требует буквы и цифры\n"
+            "• Сессии привязаны к токену; их можно сбросить, сменив пароль (напишите нам)\n"
+            "• Ограничение попыток входа (по IP и по нику) защищает от подбора пароля\n"
+            "• Максимум 10 активных сессий на аккаунт\n"
+            "• Все операции изменения данных проверяют владельца\n"
+            "• Зарезервированные ники (admin, root, sld и др.) недоступны для регистрации\n\n"
             "ГДЕ ХРАНЯТСЯ ДАННЫЕ\n"
             "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером происходит по HTTPS. Мы не продаём и не передаём данные третьим лицам.\n\n"
             "ВАШИ ПРАВА\n"
@@ -1761,8 +2012,22 @@ TEXTS = {
         "sent_from_mobile": "Отправлено с телефона",
         "sent_from_desktop": "Отправлено с компьютера",
         "og_img_fallback": "Упсс... не удалось загрузить :(",
+        "page_title_feed": "Лента",
+        "page_title_post": "Пост",
+        "page_title_profile": "Профиль",
+        "page_title_users": "Люди",
+        "page_title_notifications": "Уведомления",
+        "page_title_settings": "Настройки",
+        "page_title_edit_profile": "Изменить профиль",
+        "page_title_policy": "Политика",
+        "page_title_register": "Регистрация",
+        "page_title_login": "Вход",
+        "page_title_followers": "Подписчики",
+        "page_title_following": "Подписки",
+        "page_title_notfound": "Не найдено",
     },
     "en": {
+        "site_name": "SLD",
         "search_ph": "Search people and posts",
         "post_ph": "What's new?",
         "comment_ph": "Comment... Shift+Enter to send",
@@ -1797,8 +2062,10 @@ TEXTS = {
         "to_login": "Already have an account? Log in",
         "to_reg": "No account? Sign up",
         "err_bad_nick": "Nick: 3-20 chars, letters/digits/_",
+        "err_nick_reserved": "This nick is reserved",
         "err_bad_name": "Name: 1-50 chars",
-        "err_short_pass": "Password: min 6 chars",
+        "err_short_pass": "Password: min 8 chars",
+        "err_pass_weak": "Password must contain letters and digits",
         "err_pass_mismatch": "Passwords do not match",
         "err_nick_taken": "Nick already taken",
         "err_bad_login": "Wrong nick or password",
@@ -1881,6 +2148,13 @@ TEXTS = {
             "• To send you notifications about other users' actions\n"
             "• To detect language and city — only to show them to you in settings\n"
             "• No analytics, no ads, no tracking.\n\n"
+            "ACCOUNT SECURITY\n"
+            "• Password must be at least 8 characters and include letters and digits\n"
+            "• Sessions are bound to a token; they can be reset by changing the password (contact us)\n"
+            "• Login attempts are limited (per IP and per nick) to prevent brute-force\n"
+            "• Maximum of 10 active sessions per account\n"
+            "• All data modification operations verify the owner\n"
+            "• Reserved nicks (admin, root, sld, etc.) are unavailable for registration\n\n"
             "WHERE DATA IS STORED\n"
             "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties.\n\n"
             "YOUR RIGHTS\n"
@@ -1918,6 +2192,19 @@ TEXTS = {
         "sent_from_mobile": "Sent from a phone",
         "sent_from_desktop": "Sent from a computer",
         "og_img_fallback": "Oops... could not load :(",
+        "page_title_feed": "Feed",
+        "page_title_post": "Post",
+        "page_title_profile": "Profile",
+        "page_title_users": "People",
+        "page_title_notifications": "Notifications",
+        "page_title_settings": "Settings",
+        "page_title_edit_profile": "Edit profile",
+        "page_title_policy": "Policy",
+        "page_title_register": "Sign up",
+        "page_title_login": "Log in",
+        "page_title_followers": "Followers",
+        "page_title_following": "Following",
+        "page_title_notfound": "Not found",
     },
 }
 
@@ -1967,22 +2254,37 @@ I_MOBILE = svg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y
 I_DESKTOP = svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>', size=12)
 
 
-def _favicon_data_url(bg: str, fg: str) -> str:
+def _urlenc(svg_str: str) -> str:
+    return (svg_str
+            .replace("%", "%25")
+            .replace("#", "%23")
+            .replace("<", "%3C")
+            .replace(">", "%3E")
+            .replace("'", "%27")
+            .replace('"', "%22")
+            .replace(" ", "%20")
+            .replace("\n", " "))
+
+
+def _favicon(text: str, bg: str, fg: str, font_size: int) -> str:
+    y = int(50 + font_size * 0.36)
     svg_str = (
         "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
         f"<circle cx='50' cy='50' r='50' fill='{bg}'/>"
-        f"<text x='50' y='68' font-family='Arial Black, Arial, sans-serif' "
-        f"font-weight='900' font-size='40' text-anchor='middle' fill='{fg}'>SLD</text>"
+        f"<text x='50' y='{y}' font-family='Arial Black, Arial, sans-serif' "
+        f"font-weight='900' font-size='{font_size}' text-anchor='middle' "
+        f"letter-spacing='-1' fill='{fg}'>{text}</text>"
         "</svg>"
     )
-    # encodeURIComponent, но решётку оставляем — %23
-    return "data:image/svg+xml," + svg_str.replace("#", "%23").replace("<", "%3C").replace(">", "%3E").replace("'", "%27").replace(" ", "%20")
+    return "data:image/svg+xml," + _urlenc(svg_str)
 
 
-FAVICON_DARK = _favicon_data_url("#000000", "#ffffff")   # для тёмной темы сайта
-FAVICON_LIGHT = _favicon_data_url("#ffffff", "#000000")  # для светлой темы сайта
-# Начальный — тёмный (совпадает с дефолтной темой)
-FAVICON = FAVICON_DARK
+# 4 варианта: RU/EN × dark/light
+FAVICON_RU_DARK  = _favicon("СЛД", "#000000", "#ffffff", 34)
+FAVICON_RU_LIGHT = _favicon("СЛД", "#ffffff", "#000000", 34)
+FAVICON_EN_DARK  = _favicon("SLD", "#000000", "#ffffff", 40)
+FAVICON_EN_LIGHT = _favicon("SLD", "#ffffff", "#000000", 40)
+FAVICON = FAVICON_RU_DARK
 
 
 CSS = """
@@ -2048,7 +2350,6 @@ body {
   background: var(--bg); color: var(--text); font-size: 15px; line-height: 1.5;
   -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
   user-select: none; -webkit-user-select: none;
-  font-feature-settings: "cv02","cv03","cv04","cv11";
 }
 input, textarea, button { font-family: inherit; }
 input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px; }
@@ -2056,13 +2357,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
 button { cursor: pointer; }
 
-/* LAYOUT */
 .layout {
   display: flex; width: 100%; height: 100vh; height: 100dvh;
   background: var(--bg); max-width: 1100px; margin: 0 auto;
 }
-
-/* SIDEBAR */
 .sidebar {
   flex: 0 0 232px; width: 232px;
   background: var(--bg); display: flex; flex-direction: column;
@@ -2073,9 +2371,7 @@ button { cursor: pointer; }
   padding: 0 14px 22px; color: var(--text);
   user-select: none;
 }
-.sidebar .logo::after {
-  content: '.'; color: var(--accent);
-}
+.sidebar .logo::after { content: '.'; color: var(--accent); }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
   display: flex; align-items: center; gap: 14px;
@@ -2109,7 +2405,6 @@ button { cursor: pointer; }
 .sidebar-logout svg { color: currentColor; opacity: .8; flex-shrink: 0; }
 .sidebar-logout span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* MAIN */
 .main {
   flex: 1 1 auto; min-width: 0;
   display: flex; flex-direction: column;
@@ -2140,27 +2435,38 @@ button { cursor: pointer; }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn.danger:hover { color: var(--danger); }
 
-/* PILL TABS */
+/* PILL TABS — с анимированным слайдером */
 .pill-tabs {
-  display: flex; gap: 4px; padding: 4px;
+  position: relative;
+  display: flex; gap: 0; padding: 4px;
   background: var(--card-2); border-radius: 12px; margin-bottom: 16px;
+  isolation: isolate;
 }
+.pill-tabs .pill-slider {
+  position: absolute; top: 4px; left: 0;
+  height: calc(100% - 8px);
+  background: var(--bg-elev);
+  border-radius: 9px;
+  pointer-events: none; z-index: 0;
+  transition: transform .32s cubic-bezier(.4, 0, .2, 1),
+              width .32s cubic-bezier(.4, 0, .2, 1);
+  box-shadow: var(--shadow-sm);
+  will-change: transform, width;
+}
+[data-theme="dark"] .pill-tabs .pill-slider { background: var(--card-3); }
 .pill-tab {
+  position: relative; z-index: 1;
   flex: 1; padding: 9px 14px;
   background: transparent; border: none;
   color: var(--muted); font-family: inherit;
   font-size: 13.5px; font-weight: 600;
   cursor: pointer; border-radius: 9px;
-  transition: background .15s ease, color .15s ease; white-space: nowrap;
+  transition: color .2s ease; white-space: nowrap;
+  text-align: center;
 }
-.pill-tab:hover { color: var(--text); }
-.pill-tab.active {
-  background: var(--bg-elev); color: var(--text);
-  box-shadow: var(--shadow-sm);
-}
-[data-theme="dark"] .pill-tab.active { background: var(--card-3); }
+.pill-tab:hover { color: var(--text-2); }
+.pill-tab.active { color: var(--text); }
 
-/* SEARCH */
 .search-box {
   display: flex; align-items: center; gap: 12px;
   background: var(--card-2); border-radius: 14px;
@@ -2177,14 +2483,12 @@ button { cursor: pointer; }
 }
 .search-box input::placeholder { color: var(--muted); }
 
-/* CARD */
 .card {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 18px; padding: 18px; margin-bottom: 14px;
 }
 
-/* COMPOSER */
 .composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-avatar-col {
   display: flex; flex-direction: column; gap: 8px;
@@ -2236,14 +2540,12 @@ button { cursor: pointer; }
   border: none; border-radius: 10px;
   font-family: inherit; font-size: 14px; font-weight: 700;
   cursor: pointer; transition: opacity .15s ease, transform .1s ease;
-  letter-spacing: .1px;
 }
 .publish-btn:hover { opacity: .9; }
 .publish-btn:active { transform: scale(.97); }
 .publish-btn:disabled { opacity: .35; cursor: default; }
 .publish-btn-mobile { display: none !important; }
 
-/* QUOTE PREVIEW */
 .quote-preview {
   margin-top: 10px; padding: 12px 14px;
   background: var(--card-2); border-radius: 12px;
@@ -2268,7 +2570,6 @@ button { cursor: pointer; }
 }
 .quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
-/* AVATAR */
 .avatar {
   width: 40px; height: 40px; flex-shrink: 0; border-radius: 50%;
   background: var(--card-2);
@@ -2279,7 +2580,6 @@ button { cursor: pointer; }
 .avatar.sm { width: 36px; height: 36px; font-size: 18px; }
 .avatar.lg { width: 76px; height: 76px; font-size: 42px; border-width: 2px; }
 
-/* PROFILE */
 .profile-hero {
   background: var(--card); border: 1px solid var(--line);
   border-radius: 20px; padding: 20px; margin-bottom: 16px;
@@ -2342,7 +2642,6 @@ button { cursor: pointer; }
 }
 .round-action:hover { background: var(--hover); }
 
-/* POST */
 .post-card {
   background: var(--card); border: 1px solid var(--line);
   border-radius: 18px; padding: 18px; margin-bottom: 12px;
@@ -2394,7 +2693,6 @@ button { cursor: pointer; }
 }
 .read-more:hover { text-decoration: underline; }
 
-/* OG CARD */
 .og-card {
   display: block; margin-top: 12px;
   background: var(--card-2); border-radius: 14px;
@@ -2432,7 +2730,6 @@ button { cursor: pointer; }
   overflow: hidden;
 }
 
-/* QUOTED POST */
 .quoted-post {
   margin-top: 12px; padding: 12px 14px;
   background: var(--card-2); border-radius: 12px;
@@ -2451,7 +2748,6 @@ button { cursor: pointer; }
   max-height: 120px; overflow: hidden;
 }
 
-/* POST ACTIONS */
 .post-actions {
   display: flex; align-items: center; gap: 2px;
   margin-top: 10px; margin-left: -8px;
@@ -2479,7 +2775,6 @@ button { cursor: pointer; }
   padding: 0 8px;
 }
 
-/* NOT FOUND */
 .not-found {
   display: flex; flex-direction: column; align-items: center;
   justify-content: center; padding: 80px 20px; gap: 18px;
@@ -2492,7 +2787,6 @@ button { cursor: pointer; }
 }
 .not-found-text { font-size: 15px; color: var(--muted); text-align: center; }
 
-/* USER ROW */
 .user-row {
   display: flex; align-items: center; gap: 14px;
   background: var(--card); border: 1px solid var(--line);
@@ -2514,7 +2808,6 @@ button { cursor: pointer; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* NOTIFICATIONS */
 .notif-row {
   display: flex; align-items: flex-start; gap: 12px;
   background: var(--card); border: 1px solid var(--line);
@@ -2544,7 +2837,6 @@ button { cursor: pointer; }
 }
 .notif-row .time { font-size: 12px; color: var(--muted-2); margin-top: 6px; }
 
-/* SETTINGS */
 .settings-layout {
   display: flex; gap: 24px;
   max-width: 100%; margin: 0 auto; width: 100%;
@@ -2634,7 +2926,6 @@ button { cursor: pointer; }
 .device-info-row .label { color: var(--muted); font-weight: 500; }
 .device-info-row .value { color: var(--text); font-weight: 700; }
 
-/* COLOR SWATCHES */
 .color-swatches { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; padding-top: 4px; }
 .color-swatch {
   width: 34px; height: 34px; border-radius: 50%;
@@ -2654,12 +2945,19 @@ button { cursor: pointer; }
   padding: 14px 16px; background: var(--card-2);
   border-radius: 12px; margin-bottom: 14px;
 }
-.emoji-current .label { font-size: 13px; color: var(--muted); font-weight: 500; }
 .emoji-current .preview { font-size: 36px; line-height: 1; }
+.emoji-current .label-wrap { display: flex; flex-direction: column; gap: 2px; }
+.emoji-current .label-cap {
+  font-size: 11px; color: var(--muted-2);
+  text-transform: uppercase; letter-spacing: .5px; font-weight: 700;
+}
+.emoji-current .label {
+  font-size: 15px; color: var(--text); font-weight: 700;
+}
 .emoji-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(46px, 1fr));
-  gap: 4px; max-height: 320px; overflow-y: auto;
+  gap: 4px; max-height: 360px; overflow-y: auto;
   padding: 6px; background: var(--card-2); border-radius: 12px;
 }
 .emoji-opt {
@@ -2675,7 +2973,6 @@ button { cursor: pointer; }
   background: var(--accent-soft); border-color: var(--accent);
 }
 
-/* AUTH */
 .auth-page {
   min-height: 100%; display: flex; align-items: center; justify-content: center;
   padding: 40px 20px;
@@ -2718,7 +3015,6 @@ button { cursor: pointer; }
 }
 .auth-switch a:hover { color: var(--accent); border-color: var(--accent); }
 
-/* POLICY */
 .policy { max-width: 680px; margin: 0 auto; padding: 20px 24px 60px; }
 .policy h1 {
   font-size: 22px; margin: 0 0 20px; font-weight: 800;
@@ -2726,7 +3022,6 @@ button { cursor: pointer; }
 }
 .policy p { font-size: 14.5px; line-height: 1.75; color: var(--text-2); white-space: pre-wrap; margin: 0; }
 
-/* EMPTY / SPINNER */
 .empty {
   padding: 56px 20px; text-align: center;
   color: var(--muted); font-size: 13.5px;
@@ -2741,7 +3036,6 @@ button { cursor: pointer; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* MODAL */
 .modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,.55);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
@@ -2773,7 +3067,6 @@ button { cursor: pointer; }
 .modal-btn.danger { background: var(--danger); color: #fff; }
 .modal-btn.danger:hover { opacity: .9; }
 
-/* COMMENTS */
 .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash {
   0% { background: var(--accent-soft-2); }
@@ -2784,7 +3077,6 @@ button { cursor: pointer; }
 .comments {
   margin-top: 12px; padding-top: 12px;
   border-top: 1px solid var(--line);
-  display: flex; flex-direction: column; gap: 0;
 }
 .comment {
   padding: 10px 14px; background: var(--card-2); border-radius: 12px;
@@ -2819,7 +3111,6 @@ button { cursor: pointer; }
 .comment-actions { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin-left: -6px; }
 .comment-actions .act-btn { height: 26px; padding: 0 8px; font-size: 11.5px; }
 
-/* INLINE EDITOR */
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea {
   width: 100%; padding: 12px 14px; min-height: 90px;
@@ -2843,7 +3134,6 @@ button { cursor: pointer; }
 }
 .inline-editor .edit-actions button.edit-save:hover { opacity: .9; }
 
-/* EDIT PROFILE BIO */
 .edit-bio-textarea {
   padding: 14px 16px; background: var(--card-2); border: 1px solid var(--line);
   color: var(--text); font-family: inherit; font-size: 15px;
@@ -2853,7 +3143,6 @@ button { cursor: pointer; }
 }
 .edit-bio-textarea:focus { border-color: var(--accent); }
 
-/* TABLET */
 @media (max-width: 1100px) and (min-width: 901px) {
   .layout { max-width: 100%; }
   .sidebar { flex: 0 0 76px; width: 76px; padding: 20px 8px 16px; }
@@ -2873,7 +3162,6 @@ button { cursor: pointer; }
   .sidebar-logout svg { width: 20px; height: 20px; }
 }
 
-/* MOBILE */
 @media (max-width: 900px) {
   .layout { flex-direction: column; max-width: 100%; }
   .main {
@@ -2900,7 +3188,7 @@ button { cursor: pointer; }
   .nav-btn span { font-size: 10px; line-height: 1; font-weight: 500; }
   .nav-btn svg { width: 22px; height: 22px; }
   .nav-btn.active { background: transparent; }
-  .nav-btn.active svg, .nav-btn.active span { color: var(--accent); }
+  .nav-btn.active svg { color: var(--accent); }
   .nav-btn.active span { color: var(--text); }
   .nav-btn .badge {
     position: absolute; top: 4px; right: 22%;
@@ -2919,7 +3207,6 @@ button { cursor: pointer; }
   .profile-stats { font-size: 12px; gap: 14px; }
   .profile-meta { margin-top: 6px; font-size: 11.5px; }
 
-  /* Композер на мобилке: кнопка под аватаркой, только иконка */
   .composer-avatar-row { gap: 10px; }
   .composer-avatar-col { gap: 6px; }
   .composer-body textarea { min-height: 40px; font-size: 15px; }
@@ -2954,7 +3241,7 @@ button { cursor: pointer; }
   .modal-actions { flex-direction: column-reverse; gap: 8px; }
   .modal-btn { height: 50px; font-size: 15px; }
 
-  .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 3px; max-height: 260px; }
+  .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 3px; max-height: 300px; }
   .emoji-opt { font-size: 22px; }
   .og-image { height: 160px; }
 
@@ -2988,10 +3275,18 @@ var ICONS = {
   mobile: __I_MOBILE__, desktop: __I_DESKTOP__
 };
 
-var EMOJIS = __EMOJIS__;
-var DEFAULT_EMOJI = '🐱';
-var FAVICON_DARK  = "__FAVICON_DARK__";
-var FAVICON_LIGHT = "__FAVICON_LIGHT__";
+var EMOJI_NAMES = __EMOJI_NAMES__;
+var EMOJIS = Object.keys(EMOJI_NAMES);
+var DEFAULT_EMOJI = '😀';
+var SITE_NAME = (LANG === 'ru') ? 'СЛД' : 'SLD';
+var FAVICON_RU_DARK  = "__FAVICON_RU_DARK__";
+var FAVICON_RU_LIGHT = "__FAVICON_RU_LIGHT__";
+var FAVICON_EN_DARK  = "__FAVICON_EN_DARK__";
+var FAVICON_EN_LIGHT = "__FAVICON_EN_LIGHT__";
+function faviconFor(theme) {
+  if (LANG === 'ru') return theme === 'light' ? FAVICON_RU_LIGHT : FAVICON_RU_DARK;
+  return theme === 'light' ? FAVICON_EN_LIGHT : FAVICON_EN_DARK;
+}
 
 var COLOR_PRESETS = {
   accent: [
@@ -3021,7 +3316,6 @@ function rgba(hex, a) {
   var c = hexToRgb(hex);
   return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
 }
-
 function loadColors() {
   try { return JSON.parse(localStorage.getItem('SLD_colors') || '{}') || {}; }
   catch(e) { return {}; }
@@ -3032,8 +3326,6 @@ function applyColors() {
   var c = loadColors();
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var root = document.documentElement.style;
-
-  /* accent */
   var accentVal = null;
   if (c.accent) {
     var p = COLOR_PRESETS.accent.find(function(x){ return x.id === c.accent; });
@@ -3052,8 +3344,6 @@ function applyColors() {
     root.removeProperty('--accent-soft-2');
     root.removeProperty('--mention');
   }
-
-  /* like */
   if (c.like) {
     var pl = COLOR_PRESETS.like.find(function(x){ return x.id === c.like; });
     if (pl) root.setProperty('--like', theme === 'dark' ? pl.dark : pl.light);
@@ -3067,7 +3357,6 @@ function setColor(key, id) {
 
 var cachedUser = null;
 try { cachedUser = JSON.parse(localStorage.getItem('SLD_user') || 'null'); } catch(e) { cachedUser = null; }
-
 var anonId = localStorage.getItem('SLD_anon_id');
 if (!anonId) {
   anonId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -3222,9 +3511,8 @@ function updateFavicon() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var link = document.getElementById('sld-favicon');
   if (!link) return;
-  link.href = (theme === 'light') ? FAVICON_LIGHT : FAVICON_DARK;
+  link.href = faviconFor(theme);
 }
-
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('SLD_theme', theme);
@@ -3238,6 +3526,21 @@ function toggleTheme() {
 applyTheme(localStorage.getItem('SLD_theme') || 'dark');
 applyColors();
 updateFavicon();
+
+/* Титл вкладки */
+var PAGE_TITLES = {
+  feed: 'page_title_feed', post: 'page_title_post', profile: 'page_title_profile',
+  users: 'page_title_users', notifications: 'page_title_notifications',
+  settings: 'page_title_settings', edit_profile: 'page_title_edit_profile',
+  policy: 'page_title_policy', register: 'page_title_register', login: 'page_title_login',
+  followers: 'page_title_followers', following: 'page_title_following',
+  not_found: 'page_title_notfound',
+};
+function updateTitle() {
+  var key = PAGE_TITLES[state.view];
+  var sub = key ? tr(key) : '';
+  document.title = sub ? (SITE_NAME + ' — ' + sub) : SITE_NAME;
+}
 
 function themeIconHtml() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
@@ -3307,6 +3610,7 @@ function handleRoute() {
   if (state.view !== 'feed') {
     state.quotePostId = null; state.quotePreview = null;
   }
+  updateTitle();
   renderSidebar(); renderMain();
   updateRoom();
 }
@@ -3403,7 +3707,7 @@ function navBtn(icon, label, active, action, count) {
 function renderSidebar() {
   var el = document.getElementById('sidebar');
   if (!el) return;
-  var html = '<div class="logo">SLD</div><div class="nav">';
+  var html = '<div class="logo">' + SITE_NAME + '</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
@@ -3437,10 +3741,41 @@ function renderSidebar() {
   });
 }
 
+/* === Pill tabs: анимированный слайдер === */
+function pillTabsHtml(items) {
+  var html = '<div class="pill-tabs"><div class="pill-slider"></div>';
+  items.forEach(function(it){
+    html += '<button class="pill-tab' + (it.active ? ' active' : '') + '" data-key="' + it.key + '">' + escapeHtml(it.label) + '</button>';
+  });
+  html += '</div>';
+  return html;
+}
+function setupPillSlider(container) {
+  if (!container) return;
+  var tabsRoot = container.querySelector('.pill-tabs');
+  if (!tabsRoot) return;
+  var slider = tabsRoot.querySelector('.pill-slider');
+  if (!slider) return;
+  var tabs = tabsRoot.querySelectorAll('.pill-tab');
+  if (!tabs.length) return;
+  function position() {
+    var active = tabsRoot.querySelector('.pill-tab.active');
+    if (!active) return;
+    slider.style.width = active.offsetWidth + 'px';
+    slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+  }
+  // Небольшая задержка, чтобы браузер просчитал layout
+  requestAnimationFrame(position);
+  window.addEventListener('resize', function(){
+    requestAnimationFrame(position);
+  });
+  return { position: position };
+}
+
 function renderMain() {
   var el = document.getElementById('main');
   if (state.view === 'not_found') {
-    el.innerHTML = '<div class="main-header"><div class="title">404</div>'
+    el.innerHTML = '<div class="main-header"><div class="title">' + tr('page_title_notfound') + '</div>'
       + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>'
       + '<div class="main-body"><div class="main-inner">' + notFoundHtml() + '</div></div>';
     bindThemeBtn(); bindLinks(el);
@@ -3584,20 +3919,22 @@ function renderFeedView(el) {
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
-  html += '<div class="pill-tabs">';
-  html += '<button class="pill-tab' + (state.feedMode==='all'?' active':'') + '" data-mode="all">' + tr('feed_all') + '</button>';
-  html += '<button class="pill-tab' + (state.feedMode==='subs'?' active':'') + '" data-mode="subs">' + tr('feed_subs') + '</button>';
-  html += '</div>';
+  html += pillTabsHtml([
+    { key: 'all', label: tr('feed_all'), active: state.feedMode === 'all' },
+    { key: 'subs', label: tr('feed_subs'), active: state.feedMode === 'subs' },
+  ]);
   if (state.user) html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
   else html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent);font-weight:700;text-decoration:none">' + tr('go_login') + '</a></div>';
   html += '<div id="feed">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
+  var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
-      state.feedMode = t.dataset.mode;
+      state.feedMode = t.dataset.key;
       el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+      if (slider) requestAnimationFrame(slider.position);
       loadFeed();
     });
   });
@@ -3648,7 +3985,7 @@ async function loadFeed() {
 function renderPostView(el) {
   var html = '<div class="main-header">'
     + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
-    + '<div class="title">' + tr('nav_home') + '</div>'
+    + '<div class="title">' + tr('page_title_post') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div id="feed">' + spinner() + '</div>';
@@ -3780,7 +4117,7 @@ function decrementCommentCount(pid, by) {
 
 /* ============ PROFILE ============ */
 function renderProfileView(el) {
-  var html = '<div class="main-header"><div class="title">' + tr('nav_profile') + '</div>'
+  var html = '<div class="main-header"><div class="title">' + tr('page_title_profile') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner" id="profileRoot">' + spinner() + '</div></div>';
   el.innerHTML = html;
@@ -3904,13 +4241,16 @@ function renderEditProfileView(el) {
   html += '<div class="card">';
   html += '<div class="emoji-current">'
     + '<div class="preview" id="emojiPreview">' + escapeHtml(state.currentEmoji) + '</div>'
-    + '<div class="label">' + escapeHtml(tr('avatar_current')) + '</div>'
+    + '<div class="label-wrap">'
+    +   '<div class="label-cap">' + escapeHtml(tr('avatar_current')) + '</div>'
+    +   '<div class="label" id="emojiName">' + escapeHtml(emojiNameOf(state.currentEmoji)) + '</div>'
+    + '</div>'
     + '</div>';
   html += '<div style="font-size:13px;font-weight:700;margin-bottom:10px;color:var(--text-2)">' + escapeHtml(tr('avatar_choose')) + '</div>';
   html += '<div class="emoji-grid" id="emojiGrid">';
   for (var i = 0; i < EMOJIS.length; i++) {
     var e = EMOJIS[i];
-    html += '<button type="button" class="emoji-opt' + (e === state.currentEmoji ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '">' + e + '</button>';
+    html += '<button type="button" class="emoji-opt' + (e === state.currentEmoji ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '" title="' + escapeHtml(emojiNameOf(e)) + '">' + e + '</button>';
   }
   html += '</div></div>';
 
@@ -3928,12 +4268,14 @@ function renderEditProfileView(el) {
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
 
   var previewEl = document.getElementById('emojiPreview');
+  var nameEl = document.getElementById('emojiName');
   var gridEl = document.getElementById('emojiGrid');
   gridEl.querySelectorAll('.emoji-opt').forEach(function(b){
     b.addEventListener('click', function(e){
       e.preventDefault();
       state.currentEmoji = b.dataset.emoji;
       previewEl.textContent = state.currentEmoji;
+      if (nameEl) nameEl.textContent = emojiNameOf(state.currentEmoji);
       gridEl.querySelectorAll('.emoji-opt').forEach(function(x){
         x.classList.toggle('active', x.dataset.emoji === state.currentEmoji);
       });
@@ -3963,6 +4305,11 @@ function renderEditProfileView(el) {
       btn.disabled = false;
     }
   });
+}
+function emojiNameOf(e) {
+  var m = EMOJI_NAMES[e];
+  if (!m) return '';
+  return LANG === 'ru' ? m.ru : m.en;
 }
 
 /* ============ FOLLOWERS/FOLLOWING ============ */
@@ -4016,18 +4363,20 @@ function renderUsersView(el) {
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div class="search-box">' + ICONS.search + '<input id="peopleSearch" type="text" placeholder="' + escapeHtml(tr('people_search_ph')) + '" value="' + escapeHtml(state.peopleQuery) + '" /></div>';
-  html += '<div class="pill-tabs">';
-  html += '<button class="pill-tab' + (state.peopleTab==='all'?' active':'') + '" data-tab="all">' + tr('people_all') + '</button>';
-  html += '<button class="pill-tab' + (state.peopleTab==='subs'?' active':'') + '" data-tab="subs">' + tr('people_subs') + '</button>';
-  html += '</div>';
+  html += pillTabsHtml([
+    { key: 'all', label: tr('people_all'), active: state.peopleTab === 'all' },
+    { key: 'subs', label: tr('people_subs'), active: state.peopleTab === 'subs' },
+  ]);
   html += '<div id="list">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
+  var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
-      state.peopleTab = t.dataset.tab;
+      state.peopleTab = t.dataset.key;
       el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+      if (slider) requestAnimationFrame(slider.position);
       loadPeople();
     });
   });
@@ -4142,9 +4491,7 @@ function renderSettingsView(el) {
   html += '</nav>';
   html += '<div class="settings-content">';
 
-  /* ACCOUNT */
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
-  html += '<p class="settings-desc">' + (LANG === 'ru' ? 'Профиль, подписки и выход из аккаунта.' : 'Profile, subscriptions and signing out.') + '</p>';
   if (state.user) {
     html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-flex;align-items:center;text-decoration:none;height:42px;padding:0 20px;margin-bottom:12px">' + tr('edit_profile') + '</a>';
     html += '<div style="margin-top:6px"><button class="modal-btn danger" style="width:auto;padding:0 18px;height:42px;font-size:14px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
@@ -4153,7 +4500,6 @@ function renderSettingsView(el) {
   }
   html += '</div>';
 
-  /* PRIVACY */
   html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   if (state.user) {
     html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
@@ -4161,7 +4507,6 @@ function renderSettingsView(el) {
     html += settingsToggleRow(tr('settings_allow_following'), 'allow_following_view', me.allow_following_view !== false);
     html += settingsToggleRow(tr('settings_show_device_badge'), 'show_device_badge', me.show_device_badge !== false);
     html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_device_badge_hint')) + '</p>';
-
     html += '<div class="settings-subhead">' + escapeHtml(tr('settings_notifications')) + '</div>';
     html += settingsToggleRow(tr('notify_new_post'),  'notify_on_new_post',  me.notify_on_new_post  !== false);
     html += settingsToggleRow(tr('notify_follow'),    'notify_on_follow',    me.notify_on_follow    !== false);
@@ -4174,7 +4519,6 @@ function renderSettingsView(el) {
   }
   html += '</div>';
 
-  /* APPEARANCE */
   html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div class="settings-subhead">' + tr('settings_theme') + '</div>';
   html += '<div class="opt-row">';
@@ -4212,7 +4556,6 @@ function renderSettingsView(el) {
   html += '<button class="opt" id="resetColors" style="margin-top:4px">' + escapeHtml(tr('reset_colors')) + '</button>';
   html += '</div>';
 
-  /* INFO */
   html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 16px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
@@ -4569,7 +4912,6 @@ function removeCommentAndRepliesFromDom(postId, commentId) {
   var target = root.querySelector('[data-comment-id="' + commentId + '"]');
   if (!target) return 0;
   var removed = 1;
-  // Если это родитель — удаляем все следующие подряд reply-комментарии
   var isReply = target.classList.contains('reply');
   if (!isReply) {
     var next = target.nextElementSibling;
@@ -4723,6 +5065,7 @@ async function copyText(txt) {
     history.replaceState({}, '', '/');
     state.view = 'feed'; state.viewData = {};
   }
+  updateTitle();
   renderSidebar(); renderMain();
   updateRoom();
   connectSSE();
@@ -4741,6 +5084,7 @@ async function copyText(txt) {
 def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     t = TEXTS[lang]
     view_data = view_data or {}
+    emoji_names = {e[0]: {"ru": e[1], "en": e[2]} for e in EMOJI_DATA}
     js = (JS
           .replace("__I_HOME__", json.dumps(I_HOME))
           .replace("__I_USERS__", json.dumps(I_USERS))
@@ -4767,9 +5111,12 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_CHECK__", json.dumps(I_CHECK))
           .replace("__I_MOBILE__", json.dumps(I_MOBILE))
           .replace("__I_DESKTOP__", json.dumps(I_DESKTOP))
-          .replace("__EMOJIS__", json.dumps(EMOJIS))
-          .replace("__FAVICON_DARK__", FAVICON_DARK)
-          .replace("__FAVICON_LIGHT__", FAVICON_LIGHT))
+          .replace("__EMOJI_NAMES__", json.dumps(emoji_names, ensure_ascii=False))
+          .replace("__FAVICON_RU_DARK__", FAVICON_RU_DARK)
+          .replace("__FAVICON_RU_LIGHT__", FAVICON_RU_LIGHT)
+          .replace("__FAVICON_EN_DARK__", FAVICON_EN_DARK)
+          .replace("__FAVICON_EN_LIGHT__", FAVICON_EN_LIGHT))
+    init_fav = FAVICON_RU_DARK if lang == "ru" else FAVICON_EN_DARK
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
@@ -4777,8 +5124,8 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
         '<meta name="color-scheme" content="dark light" />\n'
         '<meta name="theme-color" content="#0a0a0b" />\n'
-        f'<link id="sld-favicon" rel="icon" type="image/svg+xml" href="{FAVICON_DARK}" />\n'
-        '<title>SLD</title>\n'
+        f'<link id="sld-favicon" rel="icon" type="image/svg+xml" href="{init_fav}" />\n'
+        f'<title>{t["site_name"]}</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
@@ -4801,14 +5148,15 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
 
 def render_404_page(lang: str) -> str:
     t = TEXTS[lang]
+    init_fav = FAVICON_RU_DARK if lang == "ru" else FAVICON_EN_DARK
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
         '<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
         '<meta name="color-scheme" content="dark light" />\n'
-        f'<link id="sld-favicon" rel="icon" type="image/svg+xml" href="{FAVICON_DARK}" />\n'
-        '<title>404 — SLD</title>\n'
+        f'<link id="sld-favicon" rel="icon" type="image/svg+xml" href="{init_fav}" />\n'
+        f'<title>{t["site_name"]} — 404</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
