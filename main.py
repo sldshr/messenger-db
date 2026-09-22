@@ -25,13 +25,12 @@ USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
 POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
-DM_THREADS_MEM: Dict[str, dict] = {}
-DM_MSGS_MEM: Dict[str, List[dict]] = {}
 
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
 MAX_BIO_LEN = 200
-MAX_DM_LEN = 2000
+AVATAR_PIXELS_LEN = 64     # 8x8
+HEADER_PIXELS_LEN = 512    # 32x16
 TRUNCATE_LINES = 100
 TRUNCATE_CHARS = 500
 SESSION_TTL = 30 * 24 * 3600
@@ -40,6 +39,7 @@ RATE_WINDOW = 60.0
 PRESENCE_TTL = 45.0
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
+PIXELS_RE = re.compile(r"^[0-9a-f]*$")
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 _lang_cache: Dict[str, str] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
@@ -55,7 +55,6 @@ class EventBus:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.clients.setdefault(nick, []).append(q)
         self.presence[nick] = time.time()
-        self._broadcast_presence(nick, True)
         return q
 
     def unsubscribe(self, nick: str, q: asyncio.Queue):
@@ -66,12 +65,10 @@ class EventBus:
         if not self.clients.get(nick):
             self.clients.pop(nick, None)
             self.presence[nick] = time.time() - PRESENCE_TTL + 4.0
-            self._broadcast_presence(nick, False)
 
     def set_offline(self, nick: str):
         if nick and not self.clients.get(nick):
             self.presence[nick] = 0
-            self._broadcast_presence(nick, False)
 
     def touch(self, nick: str):
         if nick: self.presence[nick] = time.time()
@@ -80,18 +77,6 @@ class EventBus:
         if not nick: return False
         if self.clients.get(nick): return True
         return (time.time() - self.presence.get(nick, 0)) < 5.0
-
-    def _broadcast_presence(self, nick: str, online: bool):
-        if not nick: return
-        ev = {"type": "presence", "nick": nick, "online": online}
-        try: threads = db_dm_my_threads(nick)
-        except Exception: threads = []
-        seen = set()
-        for t in threads:
-            other = t["user_b"] if t["user_a"] == nick else t["user_a"]
-            if other in seen: continue
-            seen.add(other)
-            self._deliver(other, ev)
 
     def _deliver(self, nick: str, ev: dict):
         for q in list(self.clients.get(nick, [])):
@@ -177,6 +162,15 @@ def extract_mentions(text: str) -> List[str]:
     return out
 
 
+def clean_pixels(s: Optional[str], length: int) -> str:
+    if not s: return ""
+    s = s.strip().lower()
+    if len(s) > length: s = s[:length]
+    if not PIXELS_RE.match(s): return ""
+    if len(s) < length: s = s + ("0" * (length - len(s)))
+    return s
+
+
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
     if fwd: return fwd.split(",")[0].strip()
@@ -252,6 +246,8 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
+                row["avatar_pixels"] = row.get("avatar_pixels") or ""
+                row["header_pixels"] = row.get("header_pixels") or ""
                 return row
         except Exception as e: print("[sldChat] db_load_user error:", e)
         return None
@@ -284,6 +280,8 @@ def db_save_user(u: dict) -> None:
             "allow_following_view": u.get("allow_following_view", True),
             "notify_on_new_post": u.get("notify_on_new_post", True),
             "allow_wall_posts": u.get("allow_wall_posts", True),
+            "avatar_pixels": u.get("avatar_pixels", ""),
+            "header_pixels": u.get("header_pixels", ""),
         }).execute()
     except Exception as e: print("[sldChat] db_save_user error:", e)
     USERS.pop(u["nick"], None)
@@ -312,6 +310,8 @@ def db_all_users() -> List[dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
+                row["avatar_pixels"] = row.get("avatar_pixels") or ""
+                row["header_pixels"] = row.get("header_pixels") or ""
                 out.append(row)
             return out
         except Exception as e:
@@ -377,7 +377,6 @@ def db_inc_views(pid: str) -> None:
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
-    """Возвращает {post_id: quoted_post_dict} для всех quoted_post_id."""
     out = {}
     if not post_ids: return out
     if supabase:
@@ -649,197 +648,6 @@ def db_notifications_clear(nick: str) -> None:
     NOTIFS_MEM[nick] = []
 
 
-def db_clear_dm_start_notifs(nick: str, from_nick: Optional[str] = None) -> None:
-    if supabase:
-        try:
-            q = supabase.table("notifications").delete().eq("to_nick", nick).eq("type", "dm_start")
-            if from_nick: q = q.eq("from_nick", from_nick)
-            q.execute()
-        except Exception as e: print("[sldChat] clear_dm_start error:", e)
-        return
-    def keep(n):
-        if n.get("type") != "dm_start": return True
-        if from_nick and n.get("from_nick") != from_nick: return True
-        return False
-    NOTIFS_MEM[nick] = [n for n in NOTIFS_MEM.get(nick, []) if keep(n)]
-
-
-def thread_pair(a: str, b: str) -> Tuple[str, str]:
-    return (a, b) if a < b else (b, a)
-
-
-def db_dm_find_thread(a: str, b: str) -> Optional[dict]:
-    ua, ub = thread_pair(a, b)
-    if supabase:
-        try:
-            r = (supabase.table("dm_threads").select("*")
-                 .eq("user_a", ua).eq("user_b", ub).limit(1).execute())
-            if r.data:
-                row = r.data[0]
-                row["created_at"] = iso_to_ts(row.get("created_at"))
-                row["last_message_at"] = iso_to_ts(row.get("last_message_at"))
-                row["last_read_a"] = iso_to_ts(row.get("last_read_a")) if row.get("last_read_a") else 0
-                row["last_read_b"] = iso_to_ts(row.get("last_read_b")) if row.get("last_read_b") else 0
-                return row
-        except Exception as e: print("[sldChat] db_dm_find_thread error:", e)
-        return None
-    return DM_THREADS_MEM.get(ua + "|" + ub)
-
-
-def db_dm_create_thread(a: str, b: str) -> dict:
-    ua, ub = thread_pair(a, b)
-    tid = uuid.uuid4().hex[:12]
-    row = {"id": tid, "user_a": ua, "user_b": ub, "created_at": time.time(),
-           "last_message_at": time.time(), "last_read_a": 0, "last_read_b": 0}
-    if supabase:
-        try:
-            supabase.table("dm_threads").insert({
-                "id": tid, "user_a": ua, "user_b": ub,
-                "created_at": ts_to_iso(row["created_at"]),
-                "last_message_at": ts_to_iso(row["last_message_at"])}).execute()
-        except Exception as e: print("[sldChat] db_dm_create_thread error:", e)
-        return row
-    DM_THREADS_MEM[ua + "|" + ub] = row
-    return row
-
-
-def db_dm_get_or_create_thread(a: str, b: str) -> Tuple[dict, bool]:
-    t = db_dm_find_thread(a, b)
-    if t: return t, False
-    return db_dm_create_thread(a, b), True
-
-
-def db_dm_delete_thread(tid: str) -> None:
-    if supabase:
-        try: supabase.table("dm_threads").delete().eq("id", tid).execute()
-        except Exception as e: print("[sldChat] db_dm_delete_thread error:", e)
-        return
-    for k in list(DM_THREADS_MEM.keys()):
-        if DM_THREADS_MEM[k]["id"] == tid: del DM_THREADS_MEM[k]
-    DM_MSGS_MEM.pop(tid, None)
-
-
-def db_dm_update_thread_last_message(tid: str, ts: float) -> None:
-    if supabase:
-        try: supabase.table("dm_threads").update({"last_message_at": ts_to_iso(ts)}).eq("id", tid).execute()
-        except Exception as e: print("[sldChat] db_dm_update_thread error:", e)
-        return
-    for k, v in DM_THREADS_MEM.items():
-        if v["id"] == tid: v["last_message_at"] = ts; return
-
-
-def db_dm_mark_read(tid: str, nick: str) -> None:
-    t = db_dm_get_thread_by_id(tid)
-    if not t: return
-    now = time.time()
-    field = "last_read_a" if t["user_a"] == nick else "last_read_b"
-    if supabase:
-        try: supabase.table("dm_threads").update({field: ts_to_iso(now)}).eq("id", tid).execute()
-        except Exception as e: print("[sldChat] db_dm_mark_read error:", e)
-        return
-    for k, v in DM_THREADS_MEM.items():
-        if v["id"] == tid: v[field] = now; return
-
-
-def db_dm_get_thread_by_id(tid: str) -> Optional[dict]:
-    if supabase:
-        try:
-            r = supabase.table("dm_threads").select("*").eq("id", tid).limit(1).execute()
-            if not r.data: return None
-            row = r.data[0]
-            row["created_at"] = iso_to_ts(row.get("created_at"))
-            row["last_message_at"] = iso_to_ts(row.get("last_message_at"))
-            row["last_read_a"] = iso_to_ts(row.get("last_read_a")) if row.get("last_read_a") else 0
-            row["last_read_b"] = iso_to_ts(row.get("last_read_b")) if row.get("last_read_b") else 0
-            return row
-        except Exception as e:
-            print("[sldChat] db_dm_get_thread error:", e); return None
-    for v in DM_THREADS_MEM.values():
-        if v["id"] == tid: return v
-    return None
-
-
-def db_dm_create_message(tid: str, from_nick: str, text: str) -> dict:
-    mid = uuid.uuid4().hex[:12]
-    ts = time.time()
-    row = {"id": mid, "thread_id": tid, "from_nick": from_nick, "text": text, "created_at": ts}
-    if supabase:
-        try:
-            supabase.table("dm_messages").insert({
-                "id": mid, "thread_id": tid, "from_nick": from_nick,
-                "text": text, "created_at": ts_to_iso(ts)}).execute()
-        except Exception as e: print("[sldChat] db_dm_create_message error:", e)
-        return row
-    DM_MSGS_MEM.setdefault(tid, []).append(row)
-    return row
-
-
-def db_dm_messages(tid: str) -> List[dict]:
-    if supabase:
-        try:
-            r = (supabase.table("dm_messages").select("*").eq("thread_id", tid)
-                 .order("created_at").limit(500).execute())
-            rows = r.data or []
-            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
-            return rows
-        except Exception as e:
-            print("[sldChat] db_dm_messages error:", e); return []
-    items = list(DM_MSGS_MEM.get(tid, []))
-    items.sort(key=lambda x: x["created_at"])
-    return items
-
-
-def db_dm_my_threads(nick: str) -> List[dict]:
-    if supabase:
-        try:
-            r1 = (supabase.table("dm_threads").select("*").eq("user_a", nick)
-                  .order("last_message_at", desc=True).limit(100).execute())
-            r2 = (supabase.table("dm_threads").select("*").eq("user_b", nick)
-                  .order("last_message_at", desc=True).limit(100).execute())
-            rows = (r1.data or []) + (r2.data or [])
-            for row in rows:
-                row["created_at"] = iso_to_ts(row.get("created_at"))
-                row["last_message_at"] = iso_to_ts(row.get("last_message_at"))
-                row["last_read_a"] = iso_to_ts(row.get("last_read_a")) if row.get("last_read_a") else 0
-                row["last_read_b"] = iso_to_ts(row.get("last_read_b")) if row.get("last_read_b") else 0
-            rows.sort(key=lambda x: x["last_message_at"], reverse=True)
-            return rows
-        except Exception as e:
-            print("[sldChat] db_dm_my_threads error:", e); return []
-    rows = [v for v in DM_THREADS_MEM.values() if v["user_a"] == nick or v["user_b"] == nick]
-    rows.sort(key=lambda x: x["last_message_at"], reverse=True)
-    return rows
-
-
-def db_dm_unread_count(nick: str) -> int:
-    if supabase:
-        try:
-            r1 = (supabase.table("dm_threads").select("id,user_a,user_b,last_read_a,last_read_b")
-                  .eq("user_a", nick).execute())
-            r2 = (supabase.table("dm_threads").select("id,user_a,user_b,last_read_a,last_read_b")
-                  .eq("user_b", nick).execute())
-            threads = (r1.data or []) + (r2.data or [])
-            total = 0
-            for t in threads:
-                my_read = t["last_read_a"] if t["user_a"] == nick else t["last_read_b"]
-                other = t["user_b"] if t["user_a"] == nick else t["user_a"]
-                q = (supabase.table("dm_messages").select("id", count="exact")
-                     .eq("thread_id", t["id"]).eq("from_nick", other)
-                     .gt("created_at", my_read or "1970-01-01T00:00:00+00:00").limit(1).execute())
-                total += (q.count or 0)
-            return total
-        except Exception as e:
-            print("[sldChat] db_dm_unread error:", e); return 0
-    threads = db_dm_my_threads(nick)
-    total = 0
-    for t in threads:
-        my_read = t["last_read_a"] if t["user_a"] == nick else t["last_read_b"]
-        other = t["user_b"] if t["user_a"] == nick else t["user_a"]
-        for m in db_dm_messages(t["id"]):
-            if m["from_nick"] == other and m["created_at"] > (my_read or 0): total += 1
-    return total
-
-
 def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
     if not supabase:
         if old_nick in USERS:
@@ -860,12 +668,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             for n in items:
                 if n.get("to_nick") == old_nick: n["to_nick"] = new_nick
                 if n.get("from_nick") == old_nick: n["from_nick"] = new_nick
-        for v in DM_THREADS_MEM.values():
-            if v["user_a"] == old_nick: v["user_a"] = new_nick
-            if v["user_b"] == old_nick: v["user_b"] = new_nick
-        for msgs in DM_MSGS_MEM.values():
-            for m in msgs:
-                if m["from_nick"] == old_nick: m["from_nick"] = new_nick
         invalidate_user_cache(); return
     try:
         old = db_load_user(old_nick)
@@ -880,7 +682,10 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "allow_followers_view": old.get("allow_followers_view", True),
             "allow_following_view": old.get("allow_following_view", True),
             "notify_on_new_post": old.get("notify_on_new_post", True),
-            "allow_wall_posts": old.get("allow_wall_posts", True)}).execute()
+            "allow_wall_posts": old.get("allow_wall_posts", True),
+            "avatar_pixels": old.get("avatar_pixels", ""),
+            "header_pixels": old.get("header_pixels", ""),
+        }).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
         supabase.table("posts").update({"wall_owner": new_nick}).eq("wall_owner", old_nick).execute()
@@ -889,9 +694,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
         supabase.table("comment_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
         supabase.table("notifications").update({"to_nick": new_nick}).eq("to_nick", old_nick).execute()
         supabase.table("notifications").update({"from_nick": new_nick}).eq("from_nick", old_nick).execute()
-        supabase.table("dm_threads").update({"user_a": new_nick}).eq("user_a", old_nick).execute()
-        supabase.table("dm_threads").update({"user_b": new_nick}).eq("user_b", old_nick).execute()
-        supabase.table("dm_messages").update({"from_nick": new_nick}).eq("from_nick", old_nick).execute()
         for u in db_all_users():
             patch = {}
             fl = u.get("following") or set()
@@ -919,9 +721,19 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
     cvmap: Dict[str, Dict[str, int]] = {}
     for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
 
-    # quoted posts batch
     quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
     quotes = db_get_quotes(list(set(quoted_ids)))
+
+    # авторы: собираем пиксели аватаров батчем
+    authors_data: Dict[str, dict] = {}
+    for p in posts:
+        a = p.get("author")
+        if a and a not in authors_data:
+            au = db_load_user_cached(a)
+            authors_data[a] = {
+                "name": (au or {}).get("name", a),
+                "avatar_pixels": (au or {}).get("avatar_pixels", "") or "",
+            }
 
     out = []
     for p in posts:
@@ -942,16 +754,14 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
         qid = p.get("quoted_post_id")
         if qid and qid in quotes:
             qp = quotes[qid]
-            quoted = {
-                "id": qp["id"],
-                "text": qp["text"],
-                "author": qp.get("author"),
-                "created_at": qp["created_at"],
-                "wall_owner": qp.get("wall_owner"),
-            }
+            quoted = {"id": qp["id"], "text": qp["text"], "author": qp.get("author"),
+                      "created_at": qp["created_at"], "wall_owner": qp.get("wall_owner")}
+        ad = authors_data.get(p.get("author"), {})
         out.append({"id": p["id"], "text": p["text"], "created_at": p["created_at"],
                     "author": p.get("author"), "wall_owner": p.get("wall_owner"),
                     "views": p.get("views") or 0,
+                    "author_name": ad.get("name", p.get("author")),
+                    "author_avatar_pixels": ad.get("avatar_pixels", ""),
                     "quoted_post_id": qid, "quoted": quoted,
                     "upvotes": up, "downvotes": down, "user_vote": uv, "comments": clist})
     return out
@@ -964,7 +774,9 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
          "following": len(u.get("following") or []),
          "is_me": viewer_nick == u["nick"],
          "online": bus.is_online(u["nick"]),
-         "allow_wall_posts": u.get("allow_wall_posts", True)}
+         "allow_wall_posts": u.get("allow_wall_posts", True),
+         "avatar_pixels": u.get("avatar_pixels", "") or "",
+         "header_pixels": u.get("header_pixels", "") or ""}
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
@@ -984,13 +796,17 @@ class CommentIn(BaseModel): text: str; parent_id: Optional[str] = None
 class CommentEditIn(BaseModel): text: str
 class RegisterIn(BaseModel): name: str; nick: str; password: str; password_confirm: str
 class LoginIn(BaseModel): nick: str; password: str
-class ProfileUpdateIn(BaseModel): name: str; nick: str; bio: str = ""
+class ProfileUpdateIn(BaseModel):
+    name: str
+    nick: str
+    bio: str = ""
+    avatar_pixels: str = ""
+    header_pixels: str = ""
 class SettingsIn(BaseModel):
     allow_followers_view: Optional[bool] = None
     allow_following_view: Optional[bool] = None
     notify_on_new_post: Optional[bool] = None
     allow_wall_posts: Optional[bool] = None
-class DMSendIn(BaseModel): to: str; text: str
 class BlacklistIn(BaseModel): nick: str
 class TranslateIn(BaseModel): text: str; to: str
 
@@ -1010,7 +826,8 @@ def api_register(data: RegisterIn, request: Request):
          "password": hash_password(data.password), "created_at": time.time(),
          "following": set(), "followers": set(), "blacklist": [],
          "allow_followers_view": True, "allow_following_view": True,
-         "notify_on_new_post": True, "allow_wall_posts": True}
+         "notify_on_new_post": True, "allow_wall_posts": True,
+         "avatar_pixels": "", "header_pixels": ""}
     db_save_user(u)
     token = new_token()
     SESSIONS[token] = {"nick": nick, "created": time.time()}
@@ -1051,12 +868,16 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     if len(name) < 1 or len(name) > 50: raise HTTPException(400, "err_bad_name")
     if not NICK_RE.match(nick): raise HTTPException(400, "err_bad_nick")
     if len(bio) > MAX_BIO_LEN: raise HTTPException(400, "err_bio_too_long")
+    avatar = clean_pixels(data.avatar_pixels, AVATAR_PIXELS_LEN)
+    header = clean_pixels(data.header_pixels, HEADER_PIXELS_LEN)
     old_nick = me["nick"]
     nick_changed = (nick.lower() != old_nick.lower())
     if nick_changed:
         exists = db_load_user(nick)
         if exists and exists["nick"].lower() != old_nick.lower(): raise HTTPException(400, "err_nick_taken")
-    db_update_user_fields(old_nick, {"name": name, "bio": bio})
+    db_update_user_fields(old_nick, {"name": name, "bio": bio,
+                                      "avatar_pixels": avatar,
+                                      "header_pixels": header})
     if nick_changed:
         _rename_user_everywhere(old_nick, nick)
         for t, s in list(SESSIONS.items()):
@@ -1226,34 +1047,19 @@ def api_wall(nick: str, request: Request):
     if not u: raise HTTPException(404, "not found")
     viewer = get_current_user(request)
     vid = "u:" + viewer["nick"] if viewer else "c:anon"
-
     is_owner = viewer and viewer["nick"] == u["nick"]
     is_follower = viewer and viewer["nick"] in (u.get("followers") or set())
-
-    # Стена — сообщество: видна только владельцу и его подписчикам
     if not is_owner and not is_follower:
-        return {
-            "posts": [],
-            "allow_wall_posts": u.get("allow_wall_posts", True),
-            "can_view": False,
-            "can_post": False,
-            "reason": "err_wall_community",
-        }
-
+        return {"posts": [], "allow_wall_posts": u.get("allow_wall_posts", True),
+                "can_view": False, "can_post": False, "reason": "err_wall_community"}
     posts = db_list_wall_posts(u["nick"])
-    can_post = False
-    reason = ""
+    can_post = False; reason = ""
     if viewer:
-        if is_owner:
-            can_post = True
-        elif not u.get("allow_wall_posts", True):
-            reason = "err_wall_disabled"
-        elif viewer["nick"] in (u.get("blacklist") or []):
-            reason = "err_user_blocked"
-        elif not is_follower:
-            reason = "err_need_follow"
-        else:
-            can_post = True
+        if is_owner: can_post = True
+        elif not u.get("allow_wall_posts", True): reason = "err_wall_disabled"
+        elif viewer["nick"] in (u.get("blacklist") or []): reason = "err_user_blocked"
+        elif not is_follower: reason = "err_need_follow"
+        else: can_post = True
     return {"posts": build_posts_full(posts, vid),
             "allow_wall_posts": u.get("allow_wall_posts", True),
             "can_view": True, "can_post": can_post, "reason": reason}
@@ -1271,7 +1077,7 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
         if me["nick"] in (owner.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
         if me["nick"] not in (owner.get("followers") or set()): raise HTTPException(403, "err_need_follow")
     text = payload.text.strip()
-    if not text: raise HTTPException(400, "empty")
+    if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
     p = {"id": pid, "text": text, "author": me["nick"],
@@ -1484,8 +1290,7 @@ def api_translate(data: TranslateIn, request: Request):
 @app.get("/api/counters")
 def api_counters(request: Request):
     me = require_user(request)
-    return {"notif": db_notifications_unread_count(me["nick"]),
-            "dm": db_dm_unread_count(me["nick"])}
+    return {"notif": db_notifications_unread_count(me["nick"])}
 
 
 @app.get("/api/notifications")
@@ -1506,101 +1311,6 @@ def api_notifications_read(request: Request):
 def api_notifications_clear(request: Request):
     me = require_user(request)
     db_notifications_clear(me["nick"]); return {"ok": True}
-
-
-def serialize_dm_thread(t: dict, me: str) -> dict:
-    other = t["user_b"] if t["user_a"] == me else t["user_a"]
-    ou = db_load_user_cached(other)
-    msgs = db_dm_messages(t["id"])
-    last = msgs[-1] if msgs else None
-    my_read = t["last_read_a"] if t["user_a"] == me else t["last_read_b"]
-    unread = 0
-    for m in msgs:
-        if m["from_nick"] == other and m["created_at"] > (my_read or 0): unread += 1
-    return {"id": t["id"], "other_nick": other,
-            "other_name": (ou or {}).get("name", other),
-            "last_message": (last or {}).get("text", ""),
-            "last_message_at": t["last_message_at"],
-            "last_from_me": bool(last and last["from_nick"] == me),
-            "unread": unread, "online": bus.is_online(other)}
-
-
-@app.get("/api/dm/threads")
-def api_dm_threads(request: Request):
-    me = require_user(request)
-    db_clear_dm_start_notifs(me["nick"])
-    threads = db_dm_my_threads(me["nick"])
-    out = [serialize_dm_thread(t, me["nick"]) for t in threads]
-    return {"threads": out, "unread": sum(x["unread"] for x in out),
-            "unread_notif": db_notifications_unread_count(me["nick"])}
-
-
-@app.get("/api/dm/with/{nick}")
-def api_dm_with(nick: str, request: Request):
-    me = require_user(request)
-    other = db_load_user(nick)
-    if not other: raise HTTPException(404, "not found")
-    if other["nick"] == me["nick"]: raise HTTPException(400, "self")
-    db_clear_dm_start_notifs(me["nick"], other["nick"])
-    t = db_dm_find_thread(me["nick"], other["nick"])
-    if not t:
-        return {"thread_id": None, "other": serialize_user(other, me["nick"]),
-                "messages": [], "unread_dm": db_dm_unread_count(me["nick"]),
-                "unread_notif": db_notifications_unread_count(me["nick"])}
-    msgs = db_dm_messages(t["id"])
-    db_dm_mark_read(t["id"], me["nick"])
-    return {"thread_id": t["id"], "other": serialize_user(other, me["nick"]),
-            "messages": [{"id": m["id"], "from_nick": m["from_nick"], "text": m["text"],
-                          "created_at": m["created_at"], "mine": m["from_nick"] == me["nick"]}
-                         for m in msgs],
-            "unread_dm": db_dm_unread_count(me["nick"]),
-            "unread_notif": db_notifications_unread_count(me["nick"])}
-
-
-@app.delete("/api/dm/thread/{tid}")
-def api_dm_delete_thread(tid: str, request: Request):
-    me = require_user(request)
-    t = db_dm_get_thread_by_id(tid)
-    if not t: raise HTTPException(404, "not found")
-    if me["nick"] != t["user_a"] and me["nick"] != t["user_b"]: raise HTTPException(403, "forbidden")
-    db_dm_delete_thread(tid)
-    other = t["user_b"] if t["user_a"] == me["nick"] else t["user_a"]
-    bus_publish(me["nick"], {"type": "thread_deleted", "thread_id": tid, "other": other})
-    bus_publish(other, {"type": "thread_deleted", "thread_id": tid, "other": me["nick"]})
-    return {"ok": True}
-
-
-@app.post("/api/dm/send")
-def api_dm_send(data: DMSendIn, request: Request):
-    me = require_user(request)
-    other = db_load_user(data.to)
-    if not other: raise HTTPException(404, "not found")
-    if other["nick"] == me["nick"]: raise HTTPException(400, "self")
-    if me["nick"] in (other.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
-    if other["nick"] in (me.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
-    text = data.text.strip()
-    if not text: raise HTTPException(400, "empty")
-    if len(text) > MAX_DM_LEN: raise HTTPException(400, "too long")
-    if not rate_limit("dm:" + me["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
-    t, is_new = db_dm_get_or_create_thread(me["nick"], other["nick"])
-    msg = db_dm_create_message(t["id"], me["nick"], text)
-    db_dm_update_thread_last_message(t["id"], msg["created_at"])
-    if is_new: db_notify(other["nick"], "dm_start", me["nick"], text=text[:140])
-    payload = {"type": "message", "thread_id": t["id"], "id": msg["id"],
-               "from": me["nick"], "to": other["nick"], "text": text,
-               "created_at": msg["created_at"]}
-    bus_publish(other["nick"], payload)
-    bus_publish(me["nick"], payload)
-    return {"thread_id": t["id"], "is_new": is_new}
-
-
-@app.post("/api/dm/{nick}/typing")
-def api_dm_typing(nick: str, request: Request):
-    me = require_user(request)
-    target = db_load_user(nick)
-    if not target: return {"ok": False}
-    bus_publish(target["nick"], {"type": "typing", "from": me["nick"]})
-    return {"ok": True}
 
 
 @app.post("/api/presence")
@@ -1674,7 +1384,7 @@ TEXTS = {
         "notif_clear_confirm": "Удалить все уведомления?",
         "author_badge": "автор",
         "feed_all": "Для вас", "feed_subs": "Подписки",
-        "nav_home": "Лента", "nav_users": "Люди", "nav_messages": "Сообщения",
+        "nav_home": "Лента", "nav_users": "Люди",
         "nav_profile": "Профиль", "nav_notifications": "Уведомления",
         "nav_settings": "Настройки", "nav_logout": "Выйти",
         "nav_login": "Войти", "nav_register": "Регистрация",
@@ -1700,7 +1410,6 @@ TEXTS = {
         "err_wall_community": "Стена сообщества — видна только подписчикам",
         "login_to_post": "Войдите, чтобы публиковать",
         "login_to_comment": "Войдите, чтобы комментировать",
-        "login_to_dm": "Войдите, чтобы писать сообщения",
         "login_to_wall": "Войдите, чтобы писать на стене",
         "go_login": "Войти",
         "profile_followers": "подписчиков", "profile_following": "подписок",
@@ -1714,10 +1423,9 @@ TEXTS = {
         "wall_empty": "Стена пуста",
         "wall_ph": "Что-нибудь на стене...",
         "wall_send": "Отправить",
-        "wall_hint": "Писать могут только ваши подписчики",
         "wall_must_follow": "Подпишитесь, чтобы писать на стене",
-        "wall_owner_prefix": "→",
-        "wall_community_hint": "Стена сообщества — видна только подписчикам",
+        "wall_community_hint": "Это стена сообщества — писать могут только подписчики",
+        "wall_locked_hint": "Стена видна только подписчикам",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Приватность",
@@ -1729,14 +1437,14 @@ TEXTS = {
         "settings_allow_following": "Показывать список подписок",
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_allow_wall": "Разрешить писать на моей стене",
-        "settings_allow_wall_hint": "Стена видна и открыта только для ваших подписчиков",
+        "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
         "settings_blacklist": "Чёрный список",
         "settings_blacklist_hint": "Люди из этого списка не могут вам писать, комментировать и отправлять сообщения",
         "settings_blacklist_add_ph": "Ник (без @)",
         "settings_blacklist_add": "Заблокировать",
         "settings_blacklist_empty": "Список пуст",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldChat — минималистичная соцсеть: посты, стены-сообщества, комментарии и сообщения в реальном времени.",
+        "settings_desc": "sldChat — минималистичная соцсеть: посты, стены-сообщества, комментарии.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1745,7 +1453,6 @@ TEXTS = {
         "notif_comment": "оставил комментарий",
         "notif_reply": "ответил на ваш комментарий",
         "notif_mention": "упомянул вас",
-        "notif_dm": "начал переписку с вами",
         "notif_new_post": "опубликовал новый пост",
         "notif_wall_post": "написал на вашей стене",
         "notif_quote": "процитировал ваш пост",
@@ -1762,32 +1469,24 @@ TEXTS = {
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "Мы храним минимум данных: имя, ник, пароль (хеш), посты, комментарии, "
-            "стену, цитаты, голоса, подписки, чёрный список, сообщения и уведомления.\n\n"
+            "стену, цитаты, голоса, подписки, чёрный список, пиксели аватара и шапки, уведомления.\n\n"
             "Пароль хранится как pbkdf2-hmac-sha256 (100 000 итераций) с солью. Мы не можем его восстановить.\n\n"
             "Данные хранятся на серверах Supabase. Мы их не продаём и не передаём третьим лицам.\n\n"
             "Редактировать и удалять можно свои посты и комментарии. Владелец стены может удалять посты и комментарии на своей стене.\n\n"
-            "Личные сообщения видны только участникам диалога. Чёрный список полностью блокирует уведомления и сообщения.\n\n"
             "IP используется только для определения языка (не сохраняется).\n\n"
             "Сервис предоставляется как есть."
         ),
-        "dm_title": "Сообщения",
-        "dm_empty": "Здесь появятся ваши переписки",
-        "dm_search_ph": "Поиск по сообщениям",
-        "dm_send_ph": "Сообщение...",
-        "dm_send": "Отправить",
-        "dm_no_messages": "Начните первое сообщение",
-        "dm_delete": "Удалить переписку",
-        "dm_delete_confirm": "Удалить переписку? Сообщения исчезнут у обоих.",
-        "dm_typing": "печатает…",
-        "dm_online": "в сети", "dm_offline": "не в сети",
         "translate": "Перевести",
         "translate_show_original": "Показать оригинал",
         "translate_failed": "Перевод не удался",
         "quote": "Цитировать",
-        "quote_banner": "Цитата:",
         "quote_cancel": "Отменить",
-        "quoting": "Вы цитируете",
-        "quoted_title": "Цитата",
+        "avatar_title": "Аватар 8×8",
+        "header_title": "Шапка профиля 32×16",
+        "pixel_clear": "Очистить",
+        "pixel_fill": "Залить",
+        "pixel_hint": "Рисуй мышью или пальцем",
+        "profile_edit": "Профиль",
     },
     "en": {
         "search_ph": "Search people and posts",
@@ -1811,7 +1510,7 @@ TEXTS = {
         "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
         "feed_all": "For you", "feed_subs": "Subscriptions",
-        "nav_home": "Feed", "nav_users": "People", "nav_messages": "Messages",
+        "nav_home": "Feed", "nav_users": "People",
         "nav_profile": "Profile", "nav_notifications": "Notifications",
         "nav_settings": "Settings", "nav_logout": "Log out",
         "nav_login": "Log in", "nav_register": "Sign up",
@@ -1837,7 +1536,6 @@ TEXTS = {
         "err_wall_community": "Wall is a community — visible to followers only",
         "login_to_post": "Log in to publish",
         "login_to_comment": "Log in to comment",
-        "login_to_dm": "Log in to send messages",
         "login_to_wall": "Log in to post on the wall",
         "go_login": "Log in",
         "profile_followers": "followers", "profile_following": "following",
@@ -1851,10 +1549,9 @@ TEXTS = {
         "wall_empty": "Wall is empty",
         "wall_ph": "Write on the wall...",
         "wall_send": "Post",
-        "wall_hint": "Only followers can post",
         "wall_must_follow": "Follow to post on this wall",
-        "wall_owner_prefix": "→",
-        "wall_community_hint": "Wall is a community — visible to followers only",
+        "wall_community_hint": "This is a community wall — only followers can post",
+        "wall_locked_hint": "Wall is visible to followers only",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1866,14 +1563,14 @@ TEXTS = {
         "settings_allow_following": "Show following list",
         "settings_notify_new_post": "New post notifications",
         "settings_allow_wall": "Allow posts on my wall",
-        "settings_allow_wall_hint": "Wall is visible and open to your followers only",
+        "settings_allow_wall_hint": "Only your followers can post",
         "settings_blacklist": "Blacklist",
         "settings_blacklist_hint": "People in this list cannot write, comment or message you",
         "settings_blacklist_add_ph": "Nick (no @)",
         "settings_blacklist_add": "Block",
         "settings_blacklist_empty": "List is empty",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldChat — minimalist social network: posts, community walls, comments, realtime messages.",
+        "settings_desc": "sldChat — minimalist social network: posts, community walls, comments.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -1882,7 +1579,6 @@ TEXTS = {
         "notif_comment": "commented",
         "notif_reply": "replied to your comment",
         "notif_mention": "mentioned you",
-        "notif_dm": "started a chat with you",
         "notif_new_post": "published a new post",
         "notif_wall_post": "posted on your wall",
         "notif_quote": "quoted your post",
@@ -1899,32 +1595,24 @@ TEXTS = {
         "policy_title": "Privacy Policy",
         "policy_content": (
             "We store minimum data: name, nick, password (hash), posts, comments, "
-            "wall, quotes, votes, follows, blacklist, messages and notifications.\n\n"
+            "wall, quotes, votes, follows, blacklist, avatar and header pixels, notifications.\n\n"
             "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
             "Data is stored on Supabase. We do not sell or share it.\n\n"
             "You can edit/delete your own posts and comments. Wall owner can delete posts/comments on their wall.\n\n"
-            "DMs are visible only to participants. Blacklist fully blocks notifications and messages.\n\n"
             "IP is used only to detect language (not stored).\n\n"
             "Service is provided as-is."
         ),
-        "dm_title": "Messages",
-        "dm_empty": "Your chats will appear here",
-        "dm_search_ph": "Search messages",
-        "dm_send_ph": "Message...",
-        "dm_send": "Send",
-        "dm_no_messages": "Send the first message",
-        "dm_delete": "Delete chat",
-        "dm_delete_confirm": "Delete chat? Messages will disappear for both.",
-        "dm_typing": "typing…",
-        "dm_online": "online", "dm_offline": "offline",
         "translate": "Translate",
         "translate_show_original": "Show original",
         "translate_failed": "Translation failed",
         "quote": "Quote",
-        "quote_banner": "Quote:",
         "quote_cancel": "Cancel",
-        "quoting": "You are quoting",
-        "quoted_title": "Quote",
+        "avatar_title": "Avatar 8×8",
+        "header_title": "Profile header 32×16",
+        "pixel_clear": "Clear",
+        "pixel_fill": "Fill",
+        "pixel_hint": "Draw with mouse or finger",
+        "profile_edit": "Profile",
     },
 }
 
@@ -1940,7 +1628,6 @@ I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
     '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
 I_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>')
-I_MAIL = svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>')
 I_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
     '<path d="M13.7 21a2 2 0 0 1-3.4 0"/>')
 I_GEAR = svg('<circle cx="12" cy="12" r="3"/>'
@@ -1973,7 +1660,7 @@ I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="
 
 FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
            "%3Crect width='64' height='64' fill='%230a0a0a'/%3E"
-           "%3Ctext x='50%25' y='65%25' font-family='Arial' font-weight='900' font-size='32' fill='%23fff' text-anchor='middle'%3EИ%3C/text%3E%3C/svg%3E")
+           "%3Ctext x='50%25' y='68%25' font-family='Arial' font-weight='900' font-size='38' fill='%23fff' text-anchor='middle'%3Es%3C/text%3E%3C/svg%3E")
 
 
 CSS = """
@@ -1982,17 +1669,13 @@ CSS = """
   --text:#f2f2f2; --muted:#8a8a8a; --hover:#1e1e1e;
   --accent:#f2f2f2; --accent-fg:#0a0a0a; --accent-soft:#1e1e1e;
   --up:#22c55e; --down:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
-  --bubble-mine:#2b2b2b; --bubble-mine-fg:#f2f2f2;
-  --bubble-theirs:#1a1a1a; --bubble-theirs-fg:#f2f2f2;
   --online:#22c55e;
 }
 [data-theme="light"] {
-  --bg:#f2f3f5; --card:#ffffff; --card-2:#ffffff; --line:#e6e6e9; --line-2:#d6d6da;
+  --bg:#f2f3f5; --card:#ffffff; --card-2:#f0f1f3; --line:#e6e6e9; --line-2:#d6d6da;
   --text:#0a0a0a; --muted:#707070; --hover:#f0f1f3;
   --accent:#0a0a0a; --accent-fg:#ffffff; --accent-soft:#eef0f3;
   --up:#16a34a; --down:#dc2626; --danger:#dc2626; --mention:#2b6fff;
-  --bubble-mine:#0a0a0a; --bubble-mine-fg:#ffffff;
-  --bubble-theirs:#f0f1f3; --bubble-theirs-fg:#0a0a0a;
   --online:#16a34a;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -2018,7 +1701,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   margin: 0 auto;
 }
 
-/* SIDEBAR */
+/* SIDEBAR (слева) */
 .sidebar {
   flex: 0 0 260px;
   width: 260px;
@@ -2030,18 +1713,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .sidebar .logo {
   font-size: 22px;
   font-weight: 900;
-  letter-spacing: 2px;
+  letter-spacing: 1px;
   padding: 4px 12px 28px;
   color: var(--text);
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-.sidebar .logo .ver {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--muted);
-  letter-spacing: 0;
 }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
@@ -2056,7 +1730,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--accent-soft); color: var(--text); font-weight: 700; }
-.nav-btn.active svg { color: var(--text); }
 .nav-btn svg { flex-shrink: 0; color: var(--muted); }
 .nav-btn .badge {
   margin-left: auto; min-width: 22px; height: 22px;
@@ -2066,7 +1739,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .sidebar .spacer { flex: 1; }
 .sidebar-user {
-  padding: 12px 14px; font-size: 14px; font-weight: 600;
+  padding: 12px 14px; font-size: 14px; font-weight: 700;
   color: var(--text); display: flex; align-items: center; gap: 10px;
   cursor: pointer; border-radius: 12px;
   transition: background .12s;
@@ -2093,29 +1766,19 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   overflow: hidden;
 }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
+.main-inner { max-width: 720px; margin: 0 auto; padding: 20px 20px 100px; }
 
-.main-inner {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 20px 20px 100px;
-}
-
-/* HEADER */
 .main-header {
   display: flex; align-items: center; gap: 10px;
   padding: 16px 20px;
-  max-width: 720px;
-  margin: 0 auto;
-  width: 100%;
+  max-width: 720px; margin: 0 auto; width: 100%;
 }
 .main-header .title {
   flex: 1; font-size: 22px; font-weight: 800;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.main-header .title a { color: var(--text); text-decoration: none; }
-.main-header .sub { font-size: 13px; color: var(--muted); font-weight: 400; margin-top: 2px; }
 
-/* BUTTONS */
+/* ICON BUTTON */
 .icon-btn {
   width: 40px; height: 40px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -2125,30 +1788,21 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   transition: background .12s, color .12s;
   flex-shrink: 0;
 }
-.icon-btn:hover { background: var(--hover); color: var(--text); }
-.icon-btn svg { display: block; }
+.icon-btn:hover { background: var(--hover); }
 .icon-btn.danger:hover { color: var(--danger); }
+.icon-btn svg { display: block; }
 
 /* PILL TABS */
 .pill-tabs {
-  display: flex;
-  gap: 6px;
-  padding: 4px;
-  background: var(--card);
-  border-radius: 16px;
-  margin-bottom: 16px;
+  display: flex; gap: 6px; padding: 4px;
+  background: var(--card); border-radius: 16px; margin-bottom: 16px;
 }
 .pill-tab {
-  flex: 1;
-  padding: 10px 16px;
-  background: transparent;
-  border: none;
-  color: var(--muted);
-  font-family: inherit;
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  border-radius: 12px;
+  flex: 1; padding: 10px 16px;
+  background: transparent; border: none;
+  color: var(--muted); font-family: inherit;
+  font-size: 14px; font-weight: 600;
+  cursor: pointer; border-radius: 12px;
   transition: background .12s, color .12s;
   white-space: nowrap;
 }
@@ -2168,30 +1822,19 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .search-box input::placeholder { color: var(--muted); }
 
-/* CARD / COMPOSER */
-.card {
-  background: var(--card);
-  border-radius: 20px;
-  padding: 18px;
-  margin-bottom: 14px;
-}
-.composer-avatar-row {
-  display: flex; gap: 14px; align-items: flex-start;
-}
+/* CARD */
+.card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
+
+/* COMPOSER */
+.composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-body { flex: 1; min-width: 0; }
 .composer-body textarea {
-  width: 100%;
-  background: transparent;
-  border: none; outline: none; resize: none;
-  color: var(--text); font-family: inherit; font-size: 16px;
-  line-height: 1.5; min-height: 30px;
-  padding: 8px 0 0;
+  width: 100%; background: transparent; border: none; outline: none;
+  resize: none; color: var(--text); font-family: inherit; font-size: 16px;
+  line-height: 1.5; min-height: 30px; padding: 8px 0 0;
 }
 .composer-body textarea::placeholder { color: var(--muted); }
-.composer-actions {
-  display: flex; align-items: center; gap: 6px;
-  margin-top: 12px;
-}
+.composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
 .composer-actions .spacer { flex: 1; }
 .composer-icon {
   width: 38px; height: 38px;
@@ -2207,25 +1850,18 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   background: var(--accent); color: var(--accent-fg);
   border: none; border-radius: 12px;
   font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer;
-  transition: opacity .12s;
+  cursor: pointer; transition: opacity .12s;
 }
 .publish-btn:hover { opacity: .88; }
 .publish-btn:disabled { opacity: .35; cursor: default; }
 
-/* QUOTE BANNER in composer */
+/* QUOTE PREVIEW */
 .quote-preview {
-  margin-top: 10px;
-  padding: 12px 14px;
-  background: var(--card-2);
-  border-radius: 14px;
-  border-left: 3px solid var(--line-2);
-  position: relative;
+  margin-top: 10px; padding: 12px 14px;
+  background: var(--card-2); border-radius: 14px;
+  border-left: 3px solid var(--line-2); position: relative;
 }
-.quote-preview .qp-author {
-  font-size: 13px; font-weight: 700;
-  color: var(--text); margin-bottom: 4px;
-}
+.quote-preview .qp-author { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
 .quote-preview .qp-text {
   font-size: 14px; color: var(--muted);
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
@@ -2233,47 +1869,51 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .quote-preview .qp-close {
   position: absolute; top: 8px; right: 8px;
-  width: 28px; height: 28px;
-  background: transparent; border: none;
-  color: var(--muted); cursor: pointer;
-  border-radius: 8px;
+  width: 28px; height: 28px; background: transparent; border: none;
+  color: var(--muted); cursor: pointer; border-radius: 8px;
 }
 .quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
+/* AVATAR (pixel) */
+.avatar {
+  width: 44px; height: 44px; flex-shrink: 0;
+  border-radius: 50%;
+  background-color: var(--accent-soft);
+  background-size: 100% 100%;
+  background-position: center;
+  image-rendering: pixelated;
+  -ms-interpolation-mode: nearest-neighbor;
+  color: var(--accent-fg);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 16px;
+  position: relative;
+  overflow: hidden;
+  text-transform: uppercase;
+}
+.avatar.sm { width: 36px; height: 36px; font-size: 14px; }
+.avatar .online-dot {
+  position: absolute; bottom: 1px; right: 1px;
+  width: 11px; height: 11px;
+  background: var(--online); border: 2px solid var(--card);
+  border-radius: 50%;
+}
+
 /* POST */
-.post-card {
-  background: var(--card);
-  border-radius: 20px;
-  padding: 18px;
-  margin-bottom: 14px;
-}
-.post-header {
-  display: flex; align-items: flex-start; gap: 12px;
-  margin-bottom: 12px;
-}
+.post-card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
+.post-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 .post-header .meta { flex: 1; min-width: 0; }
-.post-header .who {
-  display: flex; align-items: center; gap: 8px;
-  flex-wrap: wrap;
-  font-size: 14px;
-}
-.post-author {
-  font-weight: 700; color: var(--text); text-decoration: none;
-}
+.post-header .who { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.post-author { font-weight: 700; color: var(--text); text-decoration: none; }
 .post-author:hover { text-decoration: underline; }
 .post-time { color: var(--muted); font-size: 13px; }
-.post-wall-hint {
-  color: var(--muted); font-size: 13px;
-}
+.post-wall-hint { color: var(--muted); font-size: 13px; }
 .post-wall-hint a { color: var(--muted); text-decoration: none; }
 .post-wall-hint a:hover { color: var(--text); }
 .post-text {
   font-size: 15px; line-height: 1.55;
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-  color: var(--text);
-  margin-bottom: 8px;
+  color: var(--text); margin-bottom: 8px;
 }
-.post-text:empty { display: none; }
 .mention { color: var(--mention); text-decoration: none; font-weight: 600; }
 .mention:hover { text-decoration: underline; }
 .read-more {
@@ -2283,21 +1923,15 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .read-more:hover { color: var(--text); }
 
-/* QUOTED POST block */
+/* QUOTED POST */
 .quoted-post {
-  margin-top: 10px;
-  padding: 12px 14px;
-  background: var(--card-2);
-  border-radius: 14px;
+  margin-top: 10px; padding: 12px 14px;
+  background: var(--card-2); border-radius: 14px;
   border-left: 3px solid var(--line-2);
-  cursor: pointer;
-  transition: background .12s;
+  cursor: pointer; transition: background .12s;
 }
 .quoted-post:hover { background: var(--hover); }
-.quoted-post .q-author {
-  font-size: 13px; font-weight: 700; color: var(--text);
-  margin-bottom: 4px;
-}
+.quoted-post .q-author { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
 .quoted-post .q-author a { color: var(--text); text-decoration: none; }
 .quoted-post .q-author a:hover { text-decoration: underline; }
 .quoted-post .q-text {
@@ -2306,11 +1940,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   max-height: 120px; overflow: hidden;
 }
 
-.post-actions {
-  display: flex; align-items: center; gap: 4px;
-  margin-top: 14px;
-}
-.post-actions .push-right { flex: 1; }
+.post-actions { display: flex; align-items: center; gap: 4px; margin-top: 14px; }
 .act-btn {
   display: inline-flex; align-items: center; gap: 6px;
   height: 36px; padding: 0 12px;
@@ -2329,95 +1959,59 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .act-btn .num.pos { color: var(--up); }
 .act-btn .num.neg { color: var(--down); }
 
-/* AVATAR */
-.avatar {
-  width: 44px; height: 44px; flex-shrink: 0;
-  border-radius: 50%;
-  background: var(--accent);
-  color: var(--accent-fg);
-  display: inline-flex; align-items: center; justify-content: center;
-  font-weight: 800; font-size: 16px;
-  position: relative;
-  overflow: hidden;
-  text-transform: uppercase;
-}
-.avatar.sm { width: 36px; height: 36px; font-size: 14px; }
-.avatar.lg { width: 96px; height: 96px; font-size: 36px; border: 4px solid var(--bg); }
-.avatar .online-dot {
-  position: absolute; bottom: 2px; right: 2px;
-  width: 12px; height: 12px;
-  background: var(--online); border: 2px solid var(--card);
-  border-radius: 50%;
-}
-.avatar.lg .online-dot {
-  width: 18px; height: 18px; bottom: 6px; right: 6px;
-  border-width: 3px; border-color: var(--bg);
-}
-
 /* PROFILE */
 .profile-cover {
-  height: 140px;
-  border-radius: 20px;
-  background: linear-gradient(135deg, var(--card) 0%, var(--card-2) 100%);
-  position: relative;
-  margin-bottom: 44px;
+  height: 140px; border-radius: 20px;
+  background: linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%);
+  background-size: cover;
+  background-position: center;
+  image-rendering: pixelated;
+  position: relative; margin-bottom: 54px;
 }
-.profile-cover-avatar {
-  position: absolute;
-  left: 24px; bottom: -46px;
+[data-theme="light"] .profile-cover {
+  background: linear-gradient(135deg, #e6e6e9 0%, #cfd1d6 100%);
 }
-.profile-cover-avatar .avatar { width: 92px; height: 92px; font-size: 34px; }
+.profile-cover-avatar { position: absolute; left: 24px; bottom: -50px; }
+.profile-cover-avatar .avatar {
+  width: 92px; height: 92px; font-size: 34px;
+  border: 4px solid var(--bg); box-sizing: content-box;
+}
 .profile-cover-avatar .avatar .online-dot {
-  width: 20px; height: 20px; bottom: 4px; right: 4px;
+  width: 18px; height: 18px; bottom: 4px; right: 4px;
   border-width: 3px; border-color: var(--bg);
 }
 .profile-actions-right {
-  position: absolute; right: 20px; bottom: -46px;
+  position: absolute; right: 20px; bottom: -50px;
   display: flex; gap: 10px; align-items: center;
 }
-.profile-actions-right .round-action {
-  width: 44px; height: 44px;
-  background: var(--card); border: none; color: var(--text);
-  border-radius: 14px; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  transition: background .12s;
-}
-.profile-actions-right .round-action:hover { background: var(--hover); }
+.profile-actions-right .round-action,
 .profile-actions-right .pill-action {
-  height: 44px; padding: 0 22px;
+  height: 44px; box-sizing: border-box;
   background: var(--card); color: var(--text);
   border: none; border-radius: 14px;
   font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer;
-  transition: background .12s;
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  transition: background .12s; text-decoration: none;
 }
+.profile-actions-right .round-action { width: 44px; padding: 0; }
+.profile-actions-right .pill-action { padding: 0 22px; }
+.profile-actions-right .round-action:hover,
 .profile-actions-right .pill-action:hover { background: var(--hover); }
 .profile-actions-right .pill-action.primary {
   background: var(--accent); color: var(--accent-fg);
 }
 .profile-actions-right .pill-action.primary:hover { opacity: .88; }
 
-.profile-info {
-  padding: 0 8px;
-  margin-bottom: 20px;
-}
+.profile-info { padding: 0 8px; margin-bottom: 20px; }
 .profile-name {
   font-size: 24px; font-weight: 800;
-  display: flex; align-items: center; gap: 10px;
-  margin-bottom: 4px;
+  display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
 }
-.profile-nick {
-  font-size: 15px; color: var(--muted);
-  margin-bottom: 12px;
-}
+.profile-nick { font-size: 15px; color: var(--muted); margin-bottom: 12px; }
 .profile-stats {
-  display: flex; gap: 22px; font-size: 14px;
-  margin-bottom: 10px;
+  display: flex; gap: 22px; font-size: 14px; margin-bottom: 10px;
 }
-.profile-stats b {
-  color: var(--text); font-weight: 700;
-  cursor: pointer; margin-right: 4px;
-}
+.profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; margin-right: 4px; }
 .profile-stats b:hover { text-decoration: underline; }
 .profile-stats span { color: var(--muted); }
 .profile-bio {
@@ -2430,23 +2024,18 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   display: flex; align-items: center; gap: 6px;
   color: var(--muted); font-size: 13px;
 }
-.profile-meta svg { opacity: .8; }
 
 /* PEOPLE */
 .user-row {
   display: flex; align-items: center; gap: 14px;
-  background: var(--card);
-  padding: 14px 16px;
-  border-radius: 16px;
-  margin-bottom: 8px;
-  cursor: pointer;
-  transition: background .12s;
+  background: var(--card); padding: 14px 16px;
+  border-radius: 16px; margin-bottom: 8px;
+  cursor: pointer; transition: background .12s;
 }
 .user-row:hover { background: var(--hover); }
 .user-row .info { flex: 1; min-width: 0; }
 .user-row .nick {
-  font-weight: 700; color: var(--text);
-  font-size: 15px;
+  font-weight: 700; color: var(--text); font-size: 15px;
   display: block; text-decoration: none;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -2458,10 +2047,8 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 /* NOTIFICATIONS */
 .notif-row {
   display: flex; align-items: flex-start; gap: 12px;
-  background: var(--card);
-  padding: 14px 16px;
-  border-radius: 16px;
-  margin-bottom: 8px;
+  background: var(--card); padding: 14px 16px;
+  border-radius: 16px; margin-bottom: 8px;
   text-decoration: none; color: inherit;
   transition: background .12s;
 }
@@ -2478,135 +2065,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .notif-row .time { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
-/* DM LIST */
-.dm-row {
-  display: flex; align-items: center; gap: 14px;
-  background: var(--card);
-  padding: 14px 16px;
-  border-radius: 16px;
-  margin-bottom: 8px;
-  cursor: pointer;
-  transition: background .12s;
-}
-.dm-row:hover { background: var(--hover); }
-.dm-row .info { flex: 1; min-width: 0; text-decoration: none; color: inherit; }
-.dm-row .who {
-  font-weight: 700; font-size: 15px;
-  display: flex; align-items: center; gap: 8px;
-}
-.dm-row .preview {
-  font-size: 13px; color: var(--muted); margin-top: 3px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.dm-row .meta {
-  display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
-  flex-shrink: 0;
-}
-.dm-row .time { font-size: 12px; color: var(--muted); }
-.dm-row .unread-badge {
-  min-width: 22px; height: 22px; line-height: 22px;
-  background: var(--danger); color: #fff;
-  font-size: 12px; font-weight: 700;
-  padding: 0 7px; border-radius: 11px;
-  text-align: center;
-}
-.dm-del-btn {
-  width: 36px; height: 36px;
-  background: transparent; border: none;
-  color: var(--muted); cursor: pointer;
-  border-radius: 10px; display: inline-flex;
-  align-items: center; justify-content: center;
-  transition: color .12s, background .12s;
-}
-.dm-del-btn:hover { color: var(--danger); background: var(--hover); }
-
-/* CHAT */
-.chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.chat-body {
-  flex: 1; overflow-y: auto;
-  padding: 20px;
-  max-width: 720px; margin: 0 auto; width: 100%;
-  -webkit-overflow-scrolling: touch;
-}
-.chat-intro {
-  text-align: center; color: var(--muted); font-size: 14px;
-  padding: 40px 20px;
-}
-.chat-msg {
-  width: fit-content; max-width: 72%;
-  margin-bottom: 8px; padding: 10px 14px;
-  word-wrap: break-word; overflow-wrap: anywhere;
-  white-space: pre-wrap; font-size: 15px; line-height: 1.45;
-  border-radius: 18px;
-}
-.chat-msg.mine {
-  margin-left: auto;
-  background: var(--bubble-mine);
-  color: var(--bubble-mine-fg);
-  border-bottom-right-radius: 6px;
-}
-.chat-msg.theirs {
-  margin-right: auto;
-  background: var(--bubble-theirs);
-  color: var(--bubble-theirs-fg);
-  border-bottom-left-radius: 6px;
-}
-.chat-msg .chat-time {
-  font-size: 11px; opacity: .6; margin-top: 4px;
-}
-.chat-composer {
-  border-top: 1px solid var(--line);
-  padding: 12px 20px;
-  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0));
-  display: flex; gap: 10px; align-items: flex-end;
-  max-width: 720px; margin: 0 auto; width: 100%;
-}
-.chat-composer textarea {
-  flex: 1; min-height: 46px; max-height: 160px;
-  padding: 12px 16px;
-  border: none; background: var(--card); color: var(--text);
-  font-family: inherit; font-size: 15px; line-height: 1.4;
-  outline: none; resize: none; border-radius: 16px;
-}
-.chat-composer textarea::placeholder { color: var(--muted); }
-.chat-composer button {
-  height: 46px; padding: 0 22px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 14px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; transition: opacity .12s;
-}
-.chat-composer button:hover { opacity: .88; }
-.chat-composer button:disabled { opacity: .35; cursor: default; }
-
-.chat-header {
-  display: flex; align-items: center; gap: 12px;
-  padding: 16px 20px;
-  max-width: 720px; margin: 0 auto;
-  width: 100%;
-}
-.chat-header .who {
-  flex: 1; min-width: 0;
-  display: flex; align-items: center; gap: 12px;
-}
-.chat-header .who .info { min-width: 0; }
-.chat-header .who .name {
-  font-weight: 700; font-size: 16px;
-  color: var(--text); text-decoration: none;
-  display: block;
-}
-.chat-header .who .name:hover { text-decoration: underline; }
-.chat-header .who .status {
-  font-size: 13px; color: var(--muted); margin-top: 2px;
-}
-.chat-header .who .status.online { color: var(--online); }
-.chat-header .who .status.typing { color: var(--text); font-style: italic; }
-
 /* SETTINGS */
 .settings-layout {
   display: flex; gap: 20px;
-  max-width: 900px; margin: 0 auto;
-  width: 100%;
+  max-width: 900px; margin: 0 auto; width: 100%;
   padding: 20px;
   min-height: 100%;
 }
@@ -2630,8 +2092,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   padding: 20px; margin-bottom: 16px;
 }
 .settings-block h2 {
-  font-size: 15px; font-weight: 800;
-  margin: 0 0 16px; color: var(--text);
+  font-size: 15px; font-weight: 800; margin: 0 0 16px; color: var(--text);
 }
 .opt-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .opt {
@@ -2639,8 +2100,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   background: var(--card-2); color: var(--text);
   border: none; border-radius: 12px;
   font-family: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer;
-  transition: background .12s;
+  cursor: pointer; transition: background .12s;
 }
 .opt:hover { background: var(--hover); }
 .opt.active { background: var(--accent); color: var(--accent-fg); }
@@ -2664,21 +2124,14 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .toggle.on { background: var(--up); }
 .toggle.on::after { transform: translateX(20px); }
 
-.settings-desc {
-  font-size: 13px; line-height: 1.55; color: var(--muted);
-  margin: 0 0 14px;
-}
-.settings-link {
-  display: inline-block; color: var(--text);
-  text-decoration: underline; font-size: 14px; font-weight: 500;
-}
+.settings-desc { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; }
+.settings-link { display: inline-block; color: var(--text); text-decoration: underline; font-size: 14px; font-weight: 500; }
 
 .blacklist-add { display: flex; gap: 8px; margin-bottom: 12px; }
 .blacklist-add input {
   flex: 1; padding: 12px 16px;
   border: none; background: var(--card-2); color: var(--text);
-  font-family: inherit; font-size: 15px;
-  outline: none; border-radius: 14px;
+  font-family: inherit; font-size: 15px; outline: none; border-radius: 14px;
 }
 .blacklist-add input::placeholder { color: var(--muted); }
 .blacklist-add button {
@@ -2691,8 +2144,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .blacklist-item {
   display: flex; align-items: center; gap: 12px;
   padding: 12px 16px; background: var(--card-2);
-  border-radius: 14px; margin-bottom: 6px;
-  font-size: 15px;
+  border-radius: 14px; margin-bottom: 6px; font-size: 15px;
 }
 .blacklist-item .nick { flex: 1; font-weight: 700; }
 .blacklist-item .nick a { color: var(--text); text-decoration: none; }
@@ -2707,21 +2159,12 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .blacklist-item .rm:hover { background: rgba(239,68,68,.1); }
 
 /* AUTH */
-.auth-page {
-  min-height: 100%; display: flex; align-items: center; justify-content: center;
-  padding: 40px 20px;
-}
-.auth-card {
-  background: var(--card); border-radius: 24px;
-  padding: 32px; max-width: 400px; width: 100%;
-}
-.auth-card h1 {
-  font-size: 26px; font-weight: 800; margin: 0 0 24px;
-}
+.auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
+.auth-card { background: var(--card); border-radius: 24px; padding: 32px; max-width: 400px; width: 100%; }
+.auth-card h1 { font-size: 26px; font-weight: 800; margin: 0 0 24px; }
 .auth-card form { display: flex; flex-direction: column; gap: 10px; }
 .auth-card input {
-  padding: 15px 18px;
-  background: var(--card-2); border: none;
+  padding: 15px 18px; background: var(--card-2); border: none;
   color: var(--text); font-family: inherit; font-size: 15px;
   outline: none; border-radius: 14px;
 }
@@ -2735,20 +2178,13 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .auth-card button[type="submit"]:disabled { opacity: .5; cursor: default; }
 .auth-error { color: var(--danger); font-size: 14px; min-height: 20px; }
-.auth-switch {
-  margin-top: 18px; font-size: 14px; color: var(--muted); text-align: center;
-}
+.auth-switch { margin-top: 18px; font-size: 14px; color: var(--muted); text-align: center; }
 .auth-switch a { color: var(--text); cursor: pointer; text-decoration: underline; font-weight: 600; }
 
 /* POLICY */
-.policy {
-  max-width: 720px; margin: 0 auto; padding: 20px;
-}
+.policy { max-width: 720px; margin: 0 auto; padding: 20px; }
 .policy h1 { font-size: 24px; margin: 0 0 20px; font-weight: 800; }
-.policy p {
-  font-size: 15px; line-height: 1.7; color: var(--text);
-  white-space: pre-wrap; margin: 0;
-}
+.policy p { font-size: 15px; line-height: 1.7; color: var(--text); white-space: pre-wrap; margin: 0; }
 
 /* EMPTY / SPINNER */
 .empty {
@@ -2778,10 +2214,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   background: var(--card); border-radius: 22px;
   padding: 26px; max-width: 400px; width: 100%;
 }
-.modal-text {
-  font-size: 16px; line-height: 1.5; color: var(--text);
-  margin-bottom: 22px; text-align: center;
-}
+.modal-text { font-size: 16px; line-height: 1.5; color: var(--text); margin-bottom: 22px; text-align: center; }
 .modal-actions { display: flex; gap: 8px; }
 .modal-btn {
   flex: 1; height: 48px;
@@ -2791,7 +2224,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .modal-btn.secondary { background: var(--card-2); color: var(--text); }
 .modal-btn.danger { background: var(--danger); color: #fff; }
 
-.comment.highlight, .post-card.highlight { animation: flash 1.6s ease-out; }
+.post-card.highlight, .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash {
   0% { background: var(--up); color: #fff; }
   100% { background: var(--card); }
@@ -2799,22 +2232,11 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 
 /* COMMENTS */
 .comments { margin-top: 16px; padding-top: 4px; }
-.comment {
-  padding: 12px 14px;
-  background: var(--card-2);
-  border-radius: 14px;
-  margin-top: 8px;
-}
+.comment { padding: 12px 14px; background: var(--card-2); border-radius: 14px; margin-top: 8px; }
 .comment.reply { margin-left: 28px; background: transparent; }
 .comment.is-author { box-shadow: 0 0 0 2px var(--line-2) inset; }
-.comment-head {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 6px; flex-wrap: wrap;
-}
-.comment-author {
-  font-size: 13px; font-weight: 700; color: var(--text);
-  text-decoration: none;
-}
+.comment-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.comment-author { font-size: 13px; font-weight: 700; color: var(--text); text-decoration: none; }
 .comment-author:hover { text-decoration: underline; }
 .comment-author-badge {
   font-size: 10px; font-weight: 800; text-transform: uppercase;
@@ -2827,11 +2249,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
   color: var(--text); margin-bottom: 6px;
 }
-.comment-actions {
-  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
-}
+.comment-actions { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
 .comment-actions .act-btn { height: 30px; padding: 0 10px; font-size: 12px; }
 
+/* INLINE EDIT */
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea {
   width: 100%; padding: 12px 14px; min-height: 90px;
@@ -2839,17 +2260,91 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   font-family: inherit; font-size: 15px; line-height: 1.5;
   outline: none; resize: none; border-radius: 14px;
 }
-.inline-editor .edit-actions {
-  display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px;
-}
+.inline-editor .edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .inline-editor .edit-actions button {
   height: 38px; padding: 0 16px; font-family: inherit;
   font-size: 14px; font-weight: 700; cursor: pointer;
   border: none; border-radius: 12px;
   background: var(--card-2); color: var(--text);
 }
-.inline-editor .edit-actions button.edit-save {
-  background: var(--accent); color: var(--accent-fg);
+.inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); }
+
+/* PIXEL EDITOR */
+.pixel-section {
+  margin-bottom: 20px;
+}
+.pixel-title {
+  font-size: 14px; font-weight: 700; color: var(--text);
+  margin-bottom: 4px;
+}
+.pixel-sub {
+  font-size: 12px; color: var(--muted); margin-bottom: 12px;
+}
+.pixel-canvas-wrap {
+  display: flex; justify-content: center; margin-bottom: 14px;
+  background: var(--card-2); padding: 14px; border-radius: 14px;
+  overflow: auto;
+}
+.pixel-canvas {
+  display: block; cursor: crosshair;
+  border-radius: 6px;
+  touch-action: none;
+  background:
+    linear-gradient(45deg, var(--line) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--line) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--line) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--line) 75%);
+  background-size: 12px 12px;
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
+  background-color: var(--card);
+}
+.pixel-palette {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;
+}
+.pixel-swatch {
+  width: 30px; height: 30px;
+  border-radius: 8px; border: 2px solid var(--line-2);
+  cursor: pointer; transition: transform .1s, border-color .1s;
+  position: relative;
+}
+.pixel-swatch:hover { transform: scale(1.08); }
+.pixel-swatch.selected {
+  border-color: var(--text);
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--text);
+}
+.pixel-swatch[data-color="0"] {
+  background:
+    linear-gradient(45deg, #666 25%, transparent 25%),
+    linear-gradient(-45deg, #666 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #666 75%),
+    linear-gradient(-45deg, transparent 75%, #666 75%);
+  background-size: 8px 8px;
+  background-position: 0 0, 0 4px, 4px -4px, -4px 0px;
+  background-color: #2a2a2a;
+}
+.pixel-actions {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.pixel-action {
+  height: 36px; padding: 0 14px;
+  background: var(--card-2); color: var(--text);
+  border: none; border-radius: 10px;
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+}
+.pixel-action:hover { background: var(--hover); }
+
+/* TABLET */
+@media (max-width: 1100px) and (min-width: 901px) {
+  .sidebar { flex: 0 0 76px; width: 76px; padding: 16px 8px; }
+  .sidebar .logo { font-size: 18px; padding: 4px 6px 18px; text-align: center; }
+  .nav-btn { flex-direction: column; gap: 4px; padding: 10px 6px; font-size: 11px;
+    justify-content: center; align-items: center; text-align: center; }
+  .nav-btn span { font-size: 11px; }
+  .nav-btn .badge { position: absolute; top: 2px; right: 8px;
+    min-width: 18px; height: 18px; line-height: 18px; font-size: 10px; padding: 0 5px; }
+  .sidebar-user { font-size: 11px; padding: 10px 4px; justify-content: center; }
+  .sidebar-user .nick-text { display: none; }
 }
 
 /* MOBILE */
@@ -2867,15 +2362,11 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   .sidebar .spacer { display: none; }
   .sidebar-user { display: none; }
   .sidebar-logout { display: none; }
-  .nav {
-    flex-direction: row; flex: 1;
-    justify-content: space-around; align-items: stretch;
-  }
+  .nav { flex-direction: row; flex: 1; justify-content: space-around; align-items: stretch; }
   .nav-btn {
     flex-direction: column; gap: 3px; padding: 8px 4px;
     flex: 1; justify-content: center; align-items: center;
-    text-align: center; border-radius: 0;
-    min-height: 68px;
+    text-align: center; border-radius: 0; min-height: 68px;
   }
   .nav-btn span { font-size: 10px; line-height: 1; font-weight: 500; }
   .nav-btn svg { width: 24px; height: 24px; }
@@ -2886,23 +2377,20 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
     min-width: 16px; height: 16px; line-height: 16px;
     font-size: 10px; padding: 0 4px; border-radius: 8px;
   }
-
   .main-header { padding: 14px 16px; }
   .main-header .title { font-size: 20px; }
   .main-inner { padding: 16px 12px 100px; }
   .card, .post-card { border-radius: 18px; padding: 14px; }
-  .post-text { font-size: 15px; }
-  .composer-body textarea { font-size: 15px; }
 
-  .profile-cover { height: 110px; border-radius: 18px; margin-bottom: 38px; }
-  .profile-cover-avatar { left: 16px; bottom: -38px; }
-  .profile-cover-avatar .avatar { width: 76px; height: 76px; font-size: 28px; }
-  .profile-cover-avatar .avatar .online-dot {
-    width: 16px; height: 16px; bottom: 3px; right: 3px;
-  }
-  .profile-actions-right { right: 12px; bottom: -38px; }
-  .profile-actions-right .pill-action { height: 38px; padding: 0 16px; font-size: 13px; }
-  .profile-actions-right .round-action { width: 38px; height: 38px; }
+  .profile-cover { height: 110px; border-radius: 18px; margin-bottom: 46px; }
+  .profile-cover-avatar { left: 16px; bottom: -42px; }
+  .profile-cover-avatar .avatar { width: 76px; height: 76px; font-size: 28px; border-width: 3px; }
+  .profile-cover-avatar .avatar .online-dot { width: 14px; height: 14px; bottom: 2px; right: 2px; }
+  .profile-actions-right { right: 12px; bottom: -42px; }
+  .profile-actions-right .round-action,
+  .profile-actions-right .pill-action { height: 38px; font-size: 13px; }
+  .profile-actions-right .round-action { width: 38px; }
+  .profile-actions-right .pill-action { padding: 0 16px; }
   .profile-name { font-size: 20px; }
 
   .settings-layout { flex-direction: column; padding: 12px; }
@@ -2913,29 +2401,24 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   }
   .settings-nav::-webkit-scrollbar { display: none; }
   .settings-nav-btn {
-    flex-shrink: 0;
-    padding: 10px 16px;
-    background: var(--card); border-radius: 12px;
-    font-size: 13px;
+    flex-shrink: 0; padding: 10px 16px;
+    background: var(--card); border-radius: 12px; font-size: 13px;
   }
   .settings-nav-btn.active { background: var(--accent); color: var(--accent-fg); }
   .settings-block { padding: 16px; border-radius: 16px; }
 
-  .chat-body { padding: 14px 12px; }
-  .chat-msg { max-width: 82%; font-size: 15px; }
-  .chat-composer { padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0)); }
-  .chat-header { padding: 14px 16px; }
-
   .modal-actions { flex-direction: column-reverse; }
+
+  .pixel-swatch { width: 26px; height: 26px; }
 }
 @media (max-width: 500px) {
   .main-inner { padding: 12px 10px 90px; }
-  .search-box { padding: 10px 14px; border-radius: 14px; }
   .card, .post-card { border-radius: 16px; padding: 12px; }
-  .profile-cover { height: 90px; margin-bottom: 34px; }
+  .profile-cover { height: 90px; margin-bottom: 42px; }
   .profile-cover-avatar .avatar { width: 68px; height: 68px; font-size: 24px; }
   .profile-name { font-size: 18px; }
   .profile-stats { font-size: 13px; gap: 16px; }
+  .pixel-swatch { width: 24px; height: 24px; }
 }
 """
 
@@ -2943,7 +2426,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 JS = r"""
 var ICONS = {
   home: __I_HOME__, users: __I_USERS__, user: __I_USER__,
-  mail: __I_MAIL__, bell: __I_BELL__, gear: __I_GEAR__,
+  bell: __I_BELL__, gear: __I_GEAR__,
   logout: __I_LOGOUT__, login: __I_LOGIN__, plus: __I_PLUS__,
   up: __I_UP__, down: __I_DOWN__, comment: __I_COMMENT__,
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
@@ -2951,6 +2434,52 @@ var ICONS = {
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
   eye: __I_EYE__, cal: __I_CAL__
 };
+
+// 16-цветная палитра: индекс = символ в hex (0-f)
+// 0 = прозрачный (ластик)
+var PALETTE = [
+  null,           // 0 - прозрачный
+  '#000000',      // 1
+  '#262626',      // 2
+  '#525252',      // 3
+  '#a3a3a3',      // 4
+  '#ffffff',      // 5
+  '#dc2626',      // 6 красный
+  '#ea580c',      // 7 оранжевый
+  '#facc15',      // 8 жёлтый
+  '#16a34a',      // 9 зелёный
+  '#0d9488',      // 10 бирюзовый
+  '#2563eb',      // 11 синий
+  '#4f46e5',      // 12 индиго
+  '#9333ea',      // 13 фиолетовый
+  '#db2777',      // 14 розовый
+  '#78350f'       // 15 коричневый
+];
+
+function pixelsToCssUrl(pixels, w, h) {
+  if (!pixels) return '';
+  var rects = '';
+  var total = w * h;
+  for (var i = 0; i < pixels.length && i < total; i++) {
+    var c = parseInt(pixels[i], 16);
+    if (!c || !PALETTE[c]) continue;
+    var x = i % w;
+    var y = (i / w) | 0;
+    rects += '<rect x="'+x+'" y="'+y+'" width="1" height="1" fill="'+PALETTE[c]+'"/>';
+  }
+  if (!rects) return '';
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+w+' '+h+'" shape-rendering="crispEdges">'+rects+'</svg>';
+  return 'url("data:image/svg+xml;utf8,' + encodeURIComponent(svg) + '")';
+}
+
+function avatarHtml(name, nick, online, size, pixels) {
+  var cls = 'avatar' + (size ? ' ' + size : '');
+  var url = pixels ? pixelsToCssUrl(pixels, 8, 8) : '';
+  var style = url ? 'style="background-image:' + url.replace(/"/g, '&quot;') + '"' : '';
+  var letter = url ? '' : initial(name || nick);
+  var dot = online ? '<span class="online-dot"></span>' : '';
+  return '<div class="' + cls + '" ' + style + '>' + letter + dot + '</div>';
+}
 
 var cachedUser = null;
 try { cachedUser = JSON.parse(localStorage.getItem('sldchat_user') || 'null'); } catch(e) { cachedUser = null; }
@@ -2960,11 +2489,9 @@ var state = {
   token: localStorage.getItem('sldchat_token') || null,
   view: VIEW, viewData: VIEW_DATA || {},
   unreadNotif: parseInt(localStorage.getItem('sldchat_un') || '0', 10) || 0,
-  unreadDM: parseInt(localStorage.getItem('sldchat_dm') || '0', 10) || 0,
   feedMode: 'all',
   peopleTab: 'all',
   peopleQuery: '',
-  dmQuery: '',
   searchQuery: '',
   composerDraft: '',
   quotePostId: null,
@@ -2973,13 +2500,14 @@ var state = {
   replyTo: null,
   highlightComment: null,
   suppressRefresh: 0,
-  lastChatLen: 0,
   profileTab: 'posts',
   settingsSection: 'account',
   es: null,
-  typingTimer: null,
-  lastTypingSent: 0,
-  presenceTimer: null
+  presenceTimer: null,
+  // pixel editors
+  avatarPixels: '',
+  headerPixels: '',
+  currentColor: 5
 };
 
 function setUser(u) {
@@ -2987,9 +2515,8 @@ function setUser(u) {
   if (u) localStorage.setItem('sldchat_user', JSON.stringify(u));
   else localStorage.removeItem('sldchat_user');
 }
-function setCounters(n, d) {
+function setNotifCount(n) {
   if (typeof n === 'number') { state.unreadNotif = n; localStorage.setItem('sldchat_un', String(n)); }
-  if (typeof d === 'number') { state.unreadDM = d; localStorage.setItem('sldchat_dm', String(d)); }
 }
 
 async function api(path, opts) {
@@ -3056,13 +2583,6 @@ function truncateText(text) {
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
 
-function avatarHtml(name, nick, online, size) {
-  var cls = 'avatar' + (size ? ' ' + size : '');
-  var letter = initial(name || nick);
-  var dot = online ? '<span class="online-dot"></span>' : '';
-  return '<div class="' + cls + '">' + letter + dot + '</div>';
-}
-
 function showConfirm(text, onConfirm, opts) {
   opts = opts || {};
   var yesText = opts.yesText || tr('confirm_yes');
@@ -3113,11 +2633,6 @@ function handleRoute() {
     state.view = 'profile'; state.viewData = { nick: decodeURIComponent(m[1]) };
     state.profileTab = 'posts';
   }
-  else if ((m = path.match(/^\/messages\/(.+)$/))) {
-    state.view = 'chat'; state.viewData = { nick: decodeURIComponent(m[1]) };
-    state.lastChatLen = 0;
-  }
-  else if (path === '/messages') { state.view = 'messages'; state.viewData = {}; }
   else if (path === '/users') { state.view = 'users'; state.viewData = {}; state.peopleTab = 'all'; }
   else if (path === '/notifications') { state.view = 'notifications'; state.viewData = {}; }
   else if (path === '/settings') { state.view = 'settings'; state.viewData = {}; }
@@ -3149,15 +2664,15 @@ function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
     disconnectSSE(); setUser(null); state.token = null;
-    setCounters(0, 0); localStorage.removeItem('sldchat_token'); navigate('/');
+    setNotifCount(0); localStorage.removeItem('sldchat_token'); navigate('/');
   }, { yesText: tr('confirm_yes') });
 }
 
 function refreshCounters() {
   if (!state.token) return;
   api('/api/counters').then(function(data){
-    var changed = (data.notif !== state.unreadNotif) || (data.dm !== state.unreadDM);
-    setCounters(data.notif || 0, data.dm || 0);
+    var changed = (data.notif !== state.unreadNotif);
+    setNotifCount(data.notif || 0);
     if (changed) renderSidebar();
   }).catch(function(){});
 }
@@ -3184,50 +2699,6 @@ function handleEvent(ev) {
     if (state.view === 'notifications') loadNotifications();
     return;
   }
-  if (ev.type === 'message') {
-    var myNick = state.user && state.user.nick;
-    if (ev.from === myNick) {
-      if (state.view === 'chat' && state.viewData.nick === ev.to) loadChat(true);
-      return;
-    }
-    if (state.view === 'chat' && state.viewData.nick === ev.from) {
-      loadChat(true); refreshCounters();
-    } else {
-      refreshCounters();
-      if (state.view === 'messages') loadDMs();
-    }
-    return;
-  }
-  if (ev.type === 'typing') {
-    if (state.view === 'chat' && state.viewData.nick === ev.from) showTypingIndicator();
-    return;
-  }
-  if (ev.type === 'presence') {
-    if (state.view === 'messages') loadDMs();
-    if (state.view === 'chat' && state.viewData.nick === ev.nick) {
-      var st = document.getElementById('chatStatus');
-      if (st && !st.classList.contains('typing')) {
-        st.textContent = ev.online ? tr('dm_online') : tr('dm_offline');
-        st.className = 'status' + (ev.online ? ' online' : '');
-      }
-    }
-    return;
-  }
-  if (ev.type === 'thread_deleted') {
-    if (state.view === 'messages') loadDMs();
-    if (state.view === 'chat' && state.viewData.nick === ev.other) navigate('/messages');
-    return;
-  }
-}
-function showTypingIndicator() {
-  var el = document.getElementById('chatStatus');
-  if (!el) return;
-  el.textContent = tr('dm_typing');
-  el.className = 'status typing';
-  clearTimeout(state.typingTimer);
-  state.typingTimer = setTimeout(function(){
-    if (el) { el.textContent = ''; el.className = 'status'; }
-  }, 3500);
 }
 window.addEventListener('pagehide', function(){
   if (!state.token) return;
@@ -3248,12 +2719,10 @@ function navBtn(icon, label, active, action, count) {
 function renderSidebar() {
   var el = document.getElementById('sidebar');
   if (!el) return;
-  var html = '<div class="logo">ИТД<span class="ver">v1.1.4</span></div><div class="nav">';
+  var html = '<div class="logo">sldchat</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
-    html += navBtn(ICONS.mail, tr('nav_messages'),
-      state.view === 'messages' || state.view === 'chat', 'messages', state.unreadDM);
     html += navBtn(ICONS.bell, tr('nav_notifications'),
       state.view === 'notifications', 'notifications', state.unreadNotif);
     html += navBtn(ICONS.user, tr('nav_profile'),
@@ -3261,7 +2730,7 @@ function renderSidebar() {
     html += navBtn(ICONS.gear, tr('nav_settings'),
       state.view === 'settings' || state.view === 'edit_profile', 'settings');
     html += '</div><div class="spacer"></div>';
-    html += '<div class="sidebar-user" data-nav="profile"><span class="star">★</span>@' + escapeHtml(state.user.nick) + '</div>';
+    html += '<div class="sidebar-user" data-nav="profile"><span class="star">★</span><span class="nick-text">@' + escapeHtml(state.user.nick) + '</span></div>';
     html += '<button class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
   } else {
     html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
@@ -3275,7 +2744,6 @@ function renderSidebar() {
       var nav = b.dataset.nav;
       if (nav === 'home') navigate('/');
       else if (nav === 'users') navigate('/users');
-      else if (nav === 'messages') navigate('/messages');
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
       else if (nav === 'settings') navigate('/settings');
@@ -3293,8 +2761,6 @@ function renderMain() {
   else if (state.view === 'profile') renderProfileView(el);
   else if (state.view === 'followers' || state.view === 'following') renderFollowListView(el);
   else if (state.view === 'users') renderUsersView(el);
-  else if (state.view === 'messages') renderMessagesView(el);
-  else if (state.view === 'chat') renderChatView(el);
   else if (state.view === 'notifications') renderNotificationsView(el);
   else if (state.view === 'settings') renderSettingsView(el);
   else if (state.view === 'edit_profile') renderEditProfileView(el);
@@ -3303,15 +2769,19 @@ function renderMain() {
   else if (state.view === 'login') renderLoginView(el);
   else renderFeedView(el);
 }
+function bindThemeBtn() {
+  var b = document.getElementById('mainThemeBtn');
+  if (b) b.addEventListener('click', toggleTheme);
+}
 function bindLinks(root) {
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
     a.dataset.linkBound = '1';
-    a.addEventListener('click', function(e){ e.preventDefault(); navigate(a.getAttribute('href')); });
+    a.addEventListener('click', function(e){ e.preventDefault(); e.stopPropagation(); navigate(a.getAttribute('href')); });
   });
 }
 
-// ============ COMPOSER (shared) ============
+// ============ COMPOSER ============
 function composerHtml(opts) {
   opts = opts || {};
   var u = state.user;
@@ -3321,15 +2791,13 @@ function composerHtml(opts) {
   var idPrefix = opts.idPrefix || 'post';
   return '<div class="card">'
     + '<div class="composer-avatar-row">'
-    + avatarHtml(u.name, u.nick, false, 'sm')
+    + avatarHtml(u.name, u.nick, false, 'sm', u.avatar_pixels)
     + '<div class="composer-body">'
     + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
     + '<div id="' + idPrefix + 'QuoteBox"></div>'
     + '<div class="composer-actions">'
-    + '<button class="composer-icon" type="button" title="Прикрепить">' + svgAttach() + '</button>'
-    + '<button class="composer-icon" type="button" title="Эмодзи">' + svgEmoji() + '</button>'
-    + '<button class="composer-icon" type="button" title="Стикер">' + svgSticker() + '</button>'
-    + '<button class="composer-icon" type="button" title="Опрос">' + svgChart() + '</button>'
+    + '<button class="composer-icon" type="button">' + svgAttach() + '</button>'
+    + '<button class="composer-icon" type="button">' + svgEmoji() + '</button>'
     + '<div class="spacer"></div>'
     + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted);margin-right:8px">0 / ' + MAX_POST_LEN + '</span>'
     + '<button class="publish-btn" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
@@ -3337,28 +2805,26 @@ function composerHtml(opts) {
 }
 function svgAttach() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66L9.41 16.55a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>'; }
 function svgEmoji() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>'; }
-function svgSticker() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>'; }
-function svgChart() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="20" x2="6" y2="12"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="18" y1="20" x2="18" y2="10"/></svg>'; }
 
-function renderQuoteBox(idPrefix, container) {
+function renderQuoteBox(idPrefix) {
   var el = document.getElementById(idPrefix + 'QuoteBox');
   if (!el) return;
   if (!state.quotePreview) { el.innerHTML = ''; return; }
   el.innerHTML = '<div class="quote-preview">'
     + '<div class="qp-author">@' + escapeHtml(state.quotePreview.author) + '</div>'
     + '<div class="qp-text">' + escapeHtml(state.quotePreview.text) + '</div>'
-    + '<button class="qp-close" type="button" title="' + escapeHtml(tr('quote_cancel')) + '">✕</button>'
+    + '<button class="qp-close" type="button">✕</button>'
     + '</div>';
   el.querySelector('.qp-close').addEventListener('click', function(){
     state.quotePostId = null; state.quotePreview = null;
-    renderQuoteBox(idPrefix, container);
+    renderQuoteBox(idPrefix);
   });
 }
 
 function bindComposer(opts) {
   opts = opts || {};
   var idPrefix = opts.idPrefix || 'post';
-  var onSend = opts.onSend; // async function(text, quotedId) {}
+  var onSend = opts.onSend;
   var inputEl = document.getElementById(idPrefix + 'Input');
   var sendBtn = document.getElementById(idPrefix + 'Send');
   var counter = document.getElementById(idPrefix + 'Counter');
@@ -3368,10 +2834,8 @@ function bindComposer(opts) {
     if (counter) counter.textContent = len + ' / ' + MAX_POST_LEN;
     var empty = len === 0 && !state.quotePostId;
     sendBtn.disabled = empty || len > MAX_POST_LEN;
-    if (opts.draftKey !== undefined) {
-      if (opts.draftKey === 'wall') state.wallDraft = inputEl.value;
-      else state.composerDraft = inputEl.value;
-    } else state.composerDraft = inputEl.value;
+    if (opts.draftKey === 'wall') state.wallDraft = inputEl.value;
+    else state.composerDraft = inputEl.value;
   }
   inputEl.addEventListener('input', upd);
   sendBtn.addEventListener('click', async function(){
@@ -3404,12 +2868,11 @@ function renderFeedView(el) {
   html += '</div>';
   html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
   if (state.user) html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
-  else html += '<div class="card"><div class="auth-switch" style="margin:0"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
+  else html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
   html += '<div id="feed">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn();
-  bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
       state.feedMode = t.dataset.mode;
@@ -3458,7 +2921,6 @@ function renderPostView(el) {
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div id="feed">' + spinner() + '</div>';
   if (state.user) html += composerHtml({ idPrefix: 'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
-  else html += '<div class="card"><div class="auth-switch" style="margin:0"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
   html += '</div></div>';
   el.innerHTML = html;
   bindThemeBtn();
@@ -3485,7 +2947,7 @@ function renderPostView(el) {
       idPrefix: 'comment',
       placeholder: tr('comment_ph'),
       onSend: async function(text, quotedId){
-        var body = { text: text, quoted_post_id: quotedId };
+        var body = { text: text };
         if (state.replyTo) body.parent_id = state.replyTo.id;
         await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
         state.replyTo = null; renderReplyBanner();
@@ -3527,25 +2989,27 @@ async function loadProfile(nick) {
     var u = await api('/api/users/' + encodeURIComponent(nick));
     var isMe = state.user && state.user.nick === u.nick;
 
-    var actions = '';
+    var actionsHtml = '';
     if (isMe) {
-      actions = '<button class="round-action" id="editProfileBtn" title="' + escapeHtml(tr('edit_profile')) + '">' + ICONS.gear + '</button>'
-              + '<a class="pill-action" href="/settings/profile" data-link>' + tr('edit_profile') + '</a>';
+      actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>'
+                  + '<a class="pill-action primary" href="/settings/profile" data-link>' + escapeHtml(tr('edit_profile')) + '</a>';
     } else if (state.user) {
-      actions = '<button class="round-action" id="dmBtn" title="' + escapeHtml(tr('message')) + '">' + ICONS.mail + '</button>'
-              + '<button class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
-              + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
+      actionsHtml = '<button class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
+                  + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
     } else {
-      actions = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
+      actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
+
+    var headerUrl = u.header_pixels ? pixelsToCssUrl(u.header_pixels, 32, 16) : '';
+    var coverStyle = headerUrl ? ' style="background-image:' + headerUrl.replace(/"/g, '&quot;') + '"' : '';
 
     var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
       + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
       + '</div>';
 
-    html += '<div class="profile-cover">'
-      + '<div class="profile-cover-avatar">' + avatarHtml(u.name, u.nick, u.online) + '</div>'
-      + '<div class="profile-actions-right">' + actions + '</div>'
+    html += '<div class="profile-cover"' + coverStyle + '>'
+      + '<div class="profile-cover-avatar">' + avatarHtml(u.name, u.nick, u.online, '', u.avatar_pixels) + '</div>'
+      + '<div class="profile-actions-right">' + actionsHtml + '</div>'
       + '</div>';
 
     html += '<div class="profile-info">';
@@ -3559,7 +3023,6 @@ async function loadProfile(nick) {
     html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
     html += '</div>';
 
-    // tabs
     html += '<div class="pill-tabs" id="profileTabs">'
       + '<button class="pill-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('posts_tab') + '</button>'
       + '<button class="pill-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_tab') + '</button>'
@@ -3586,8 +3049,6 @@ async function loadProfile(nick) {
         loadProfile(nick);
       } catch(e) { alert(tr(e.message) || e.message); }
     });
-    var dmBtn = document.getElementById('dmBtn');
-    if (dmBtn) dmBtn.addEventListener('click', function(){ navigate('/messages/' + encodeURIComponent(u.nick)); });
 
     root.querySelectorAll('.pill-tab').forEach(function(t){
       t.addEventListener('click', function(){
@@ -3612,7 +3073,7 @@ async function loadProfileTab(u, isMe) {
         c.innerHTML = '<div class="card" style="text-align:center;padding:32px 20px">'
           + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
           + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>'
-          + (state.user && !isMe ? '<button class="pill-action primary" id="wallFollowBtn" style="height:44px;padding:0 22px;background:var(--accent);color:var(--accent-fg);border:none;border-radius:14px;font-weight:700;cursor:pointer">' + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>' : '')
+          + (state.user && !isMe ? '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">' + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>' : '')
           + '</div>';
         var wf = document.getElementById('wallFollowBtn');
         if (wf) wf.addEventListener('click', async function(){
@@ -3624,7 +3085,6 @@ async function loadProfileTab(u, isMe) {
         });
         return;
       }
-
       var html = '';
       if (state.user && data.can_post) {
         html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
@@ -3666,24 +3126,188 @@ async function loadProfileTab(u, isMe) {
   }
 }
 
+// ============ PIXEL EDITOR ============
+function setupPixelEditor(opts) {
+  var canvas = opts.canvas;
+  var w = opts.w, h = opts.h;
+  var getPixels = opts.getPixels;
+  var setPixels = opts.setPixels;
+  var getColor = opts.getColor;
+
+  canvas.width = w;
+  canvas.height = h;
+  canvas.style.width = opts.displayW + 'px';
+  canvas.style.height = opts.displayH + 'px';
+  var ctx = canvas.getContext('2d');
+
+  function draw() {
+    var pixels = getPixels();
+    if (!pixels) pixels = '0'.repeat(w * h);
+    ctx.clearRect(0, 0, w, h);
+    for (var i = 0; i < w * h; i++) {
+      var c = parseInt(pixels[i] || '0', 16);
+      if (!c || !PALETTE[c]) continue;
+      ctx.fillStyle = PALETTE[c];
+      ctx.fillRect(i % w, (i / w) | 0, 1, 1);
+    }
+  }
+
+  var painting = false;
+
+  function getIdx(clientX, clientY) {
+    var rect = canvas.getBoundingClientRect();
+    var x = Math.floor((clientX - rect.left) / rect.width * w);
+    var y = Math.floor((clientY - rect.top) / rect.height * h);
+    if (x < 0 || x >= w || y < 0 || y >= h) return null;
+    return y * w + x;
+  }
+
+  function paintAt(clientX, clientY) {
+    var idx = getIdx(clientX, clientY);
+    if (idx === null) return;
+    var c = getColor();
+    var ch = c.toString(16);
+    var pixels = getPixels() || ('0'.repeat(w * h));
+    if (pixels[idx] === ch) return;
+    pixels = pixels.substring(0, idx) + ch + pixels.substring(idx + 1);
+    setPixels(pixels);
+    draw();
+  }
+
+  canvas.addEventListener('mousedown', function(e) {
+    e.preventDefault(); painting = true; paintAt(e.clientX, e.clientY);
+  });
+  canvas.addEventListener('mousemove', function(e) {
+    if (painting) paintAt(e.clientX, e.clientY);
+  });
+  window.addEventListener('mouseup', function() { painting = false; });
+
+  canvas.addEventListener('touchstart', function(e) {
+    e.preventDefault(); painting = true;
+    if (e.touches[0]) paintAt(e.touches[0].clientX, e.touches[0].clientY);
+  }, {passive: false});
+  canvas.addEventListener('touchmove', function(e) {
+    e.preventDefault();
+    if (painting && e.touches[0]) paintAt(e.touches[0].clientX, e.touches[0].clientY);
+  }, {passive: false});
+  canvas.addEventListener('touchend', function() { painting = false; });
+  canvas.addEventListener('touchcancel', function() { painting = false; });
+
+  return { redraw: draw };
+}
+
+function renderPaletteHtml(selected) {
+  var html = '';
+  for (var i = 0; i < 16; i++) {
+    var bg = PALETTE[i];
+    var style = bg ? 'background:' + bg : '';
+    var cls = 'pixel-swatch' + (i === selected ? ' selected' : '');
+    html += '<div class="' + cls + '" data-color="' + i + '" style="' + style + '"></div>';
+  }
+  return html;
+}
+
 // ============ EDIT PROFILE ============
 function renderEditProfileView(el) {
   if (!state.user) { navigate('/login'); return; }
   var u = state.user;
+  state.avatarPixels = u.avatar_pixels || '';
+  state.headerPixels = u.header_pixels || '';
+
   var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
     + '<div class="title">' + tr('edit_profile_title') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
-  html += '<div class="main-body"><div class="auth-page">';
-  html += '<div class="auth-card"><form id="editForm">';
-  html += '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required />';
-  html += '<input type="text" name="nick" maxlength="20" placeholder="' + escapeHtml(tr('nick_ph')) + '" value="' + escapeHtml(u.nick) + '" required />';
-  html += '<input type="text" name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" value="' + escapeHtml(u.bio || '') + '" />';
-  html += '<div class="auth-error" id="editError"></div>';
-  html += '<button type="submit">' + tr('save') + '</button>';
-  html += '</form></div></div></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+
+  html += '<div class="card">'
+    + '<div class="pixel-section">'
+    + '<div class="pixel-title">' + escapeHtml(tr('avatar_title')) + '</div>'
+    + '<div class="pixel-sub">' + escapeHtml(tr('pixel_hint')) + '</div>'
+    + '<div class="pixel-canvas-wrap"><canvas id="avatarCanvas" class="pixel-canvas"></canvas></div>'
+    + '<div class="pixel-palette" id="avatarPalette">' + renderPaletteHtml(state.currentColor) + '</div>'
+    + '<div class="pixel-actions">'
+    + '<button class="pixel-action" id="avatarClear">' + escapeHtml(tr('pixel_clear')) + '</button>'
+    + '</div></div>'
+    + '<div class="pixel-section" style="margin-bottom:0">'
+    + '<div class="pixel-title">' + escapeHtml(tr('header_title')) + '</div>'
+    + '<div class="pixel-sub">' + escapeHtml(tr('pixel_hint')) + '</div>'
+    + '<div class="pixel-canvas-wrap"><canvas id="headerCanvas" class="pixel-canvas"></canvas></div>'
+    + '<div class="pixel-palette" id="headerPalette">' + renderPaletteHtml(state.currentColor) + '</div>'
+    + '<div class="pixel-actions">'
+    + '<button class="pixel-action" id="headerClear">' + escapeHtml(tr('pixel_clear')) + '</button>'
+    + '</div></div>'
+    + '</div>';
+
+  html += '<div class="card"><form id="editForm" style="display:flex;flex-direction:column;gap:10px">'
+    + '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
+    + '<input type="text" name="nick" maxlength="20" placeholder="' + escapeHtml(tr('nick_ph')) + '" value="' + escapeHtml(u.nick) + '" required style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
+    + '<input type="text" name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" value="' + escapeHtml(u.bio || '') + '" style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
+    + '<div class="auth-error" id="editError"></div>'
+    + '<button type="submit" class="publish-btn" style="height:52px;font-size:16px">' + tr('save') + '</button>'
+    + '</form></div>';
+
+  html += '</div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
+
+  // editor avatar
+  var avatarEditor = setupPixelEditor({
+    canvas: document.getElementById('avatarCanvas'),
+    w: 8, h: 8,
+    displayW: 240, displayH: 240,
+    getPixels: function(){ return state.avatarPixels; },
+    setPixels: function(v){ state.avatarPixels = v; },
+    getColor: function(){ return state.currentColor; }
+  });
+  var headerEditor = setupPixelEditor({
+    canvas: document.getElementById('headerCanvas'),
+    w: 32, h: 16,
+    displayW: 512, displayH: 256,
+    getPixels: function(){ return state.headerPixels; },
+    setPixels: function(v){ state.headerPixels = v; },
+    getColor: function(){ return state.currentColor; }
+  });
+
+  // palettes
+  function bindPalette(rootId) {
+    var root = document.getElementById(rootId);
+    if (!root) return;
+    root.querySelectorAll('.pixel-swatch').forEach(function(sw){
+      sw.addEventListener('click', function(){
+        state.currentColor = parseInt(sw.dataset.color, 10);
+        document.querySelectorAll('.pixel-swatch').forEach(function(x){
+          x.classList.toggle('selected', parseInt(x.dataset.color, 10) === state.currentColor);
+        });
+      });
+    });
+  }
+  bindPalette('avatarPalette');
+  bindPalette('headerPalette');
+
+  document.getElementById('avatarClear').addEventListener('click', function(){
+    state.avatarPixels = '0'.repeat(64);
+    avatarEditor.redraw();
+  });
+  document.getElementById('headerClear').addEventListener('click', function(){
+    state.headerPixels = '0'.repeat(512);
+    headerEditor.redraw();
+  });
+
+  // resize для планшета/мобилки
+  function resizeEditors() {
+    var w = window.innerWidth;
+    var av = w < 480 ? 200 : 240;
+    var hd = Math.min(w - 60, 512);
+    var hh = Math.round(hd / 2);
+    var avc = document.getElementById('avatarCanvas');
+    var hdc = document.getElementById('headerCanvas');
+    if (avc) { avc.style.width = av + 'px'; avc.style.height = av + 'px'; }
+    if (hdc) { hdc.style.width = hd + 'px'; hdc.style.height = hh + 'px'; }
+  }
+  resizeEditors();
+  window.addEventListener('resize', resizeEditors);
+
   var form = document.getElementById('editForm');
   var errEl = document.getElementById('editError');
   form.addEventListener('submit', async function(e){
@@ -3694,6 +3318,8 @@ function renderEditProfileView(el) {
       name: (fd.get('name') || '').toString().trim(),
       nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
       bio: (fd.get('bio') || '').toString().trim(),
+      avatar_pixels: state.avatarPixels || '',
+      header_pixels: state.headerPixels || ''
     };
     var btn = form.querySelector('button[type="submit"]');
     btn.disabled = true;
@@ -3724,7 +3350,7 @@ function renderFollowListView(el) {
 }
 function userRowHtml(u) {
   return '<div class="user-row" data-link-row="' + encodeURIComponent(u.nick) + '">'
-    + avatarHtml(u.name, u.nick, u.online, 'sm')
+    + avatarHtml(u.name, u.nick, u.online, 'sm', u.avatar_pixels)
     + '<div class="info">'
     + '<a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
     + '<div class="name">' + escapeHtml(u.name) + '</div>'
@@ -3801,150 +3427,10 @@ async function loadPeople() {
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
-// ============ MESSAGES ============
-function renderMessagesView(el) {
-  var html = '<div class="main-header"><div class="title">' + tr('dm_title') + '</div>'
-    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
-  html += '<div class="main-body"><div class="main-inner">';
-  html += '<div class="search-box">' + ICONS.search + '<input id="dmSearch" type="text" placeholder="' + escapeHtml(tr('dm_search_ph')) + '" value="' + escapeHtml(state.dmQuery) + '" /></div>';
-  html += '<div id="list">' + spinner() + '</div>';
-  html += '</div></div>';
-  el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
-  var searchEl = document.getElementById('dmSearch');
-  var tId;
-  searchEl.addEventListener('input', function(){
-    state.dmQuery = searchEl.value;
-    clearTimeout(tId); tId = setTimeout(loadDMs, 200);
-  });
-  loadDMs();
-}
-async function loadDMs() {
-  var wrap = document.getElementById('list');
-  if (!wrap) return;
-  try {
-    if (!state.user) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_dm')) + '</div>'; return; }
-    var data = await api('/api/dm/threads');
-    var threads = data.threads || [];
-    setCounters((typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif), data.unread || 0);
-    renderSidebar();
-    var q = (state.dmQuery || '').trim().toLowerCase();
-    if (q) threads = threads.filter(function(t){
-      return t.other_nick.toLowerCase().includes(q) || (t.other_name || '').toLowerCase().includes(q);
-    });
-    if (!threads.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('dm_empty')) + '</div>'; return; }
-    wrap.innerHTML = threads.map(function(t){
-      var badge = t.unread > 0 ? '<span class="unread-badge">' + t.unread + '</span>' : '';
-      var mineLabel = t.last_from_me ? '<span style="color:var(--muted)">' + escapeHtml(LANG === 'ru' ? 'вы: ' : 'you: ') + '</span>' : '';
-      return '<div class="dm-row">'
-        + avatarHtml(t.other_name, t.other_nick, t.online, 'sm')
-        + '<a class="info" href="/messages/' + encodeURIComponent(t.other_nick) + '" data-link>'
-        + '<div class="who">@' + escapeHtml(t.other_nick) + '</div>'
-        + '<div class="preview">' + mineLabel + escapeHtml(t.last_message || '') + '</div>'
-        + '</a>'
-        + '<div class="meta"><span class="time">' + timeAgo(t.last_message_at) + '</span>' + badge + '</div>'
-        + '<button class="dm-del-btn" data-del-thread="' + t.id + '" title="' + escapeHtml(tr('dm_delete')) + '">' + ICONS.trash + '</button>'
-        + '</div>';
-    }).join('');
-    bindLinks(wrap);
-    wrap.querySelectorAll('[data-del-thread]').forEach(function(b){
-      b.addEventListener('click', function(e){
-        e.preventDefault();
-        var tid = b.dataset.delThread;
-        showConfirm(tr('dm_delete_confirm'), async function(){
-          try { await api('/api/dm/thread/' + tid, { method: 'DELETE' }); loadDMs(); }
-          catch(err) { alert(tr(err.message) || err.message); }
-        }, { yesText: tr('delete') });
-      });
-    });
-  } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
-}
-
-function renderChatView(el) {
-  var nick = state.viewData.nick || '';
-  if (!state.user) { navigate('/login'); return; }
-  var html = '<div class="chat-header">'
-    + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
-    + '<div class="who"><div class="info"><div class="name" id="chatName">@' + escapeHtml(nick) + '</div>'
-    + '<div class="status" id="chatStatus"></div></div></div>'
-    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
-    + '</div>';
-  html += '<div class="main-body"><div class="chat">';
-  html += '<div class="chat-body" id="chatBody">' + spinner() + '</div>';
-  html += '<div class="chat-composer">';
-  html += '<textarea id="dmInput" maxlength="' + MAX_DM_LEN + '" placeholder="' + escapeHtml(tr('dm_send_ph')) + '" rows="1"></textarea>';
-  html += '<button id="dmSend" disabled>' + tr('dm_send') + '</button>';
-  html += '</div></div></div>';
-  el.innerHTML = html;
-  bindThemeBtn();
-  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/messages'); });
-  var inputEl = document.getElementById('dmInput');
-  var sendBtn = document.getElementById('dmSend');
-  function upd() { sendBtn.disabled = inputEl.value.trim().length === 0; }
-  inputEl.addEventListener('input', function(){
-    upd();
-    var now = Date.now();
-    if (now - state.lastTypingSent > 2500 && state.token) {
-      state.lastTypingSent = now;
-      fetch('/api/dm/' + encodeURIComponent(nick) + '/typing', { method: 'POST', headers: { 'X-Auth': state.token } }).catch(function(){});
-    }
-  });
-  inputEl.addEventListener('keydown', function(e){
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendDM(); }
-  });
-  sendBtn.addEventListener('click', sendDM);
-  upd();
-  async function sendDM() {
-    var text = inputEl.value.trim();
-    if (!text) return;
-    sendBtn.disabled = true;
-    inputEl.value = ''; upd();
-    try { await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } }); }
-    catch(e) { alert(tr(e.message) || e.message); inputEl.value = text; upd(); }
-  }
-  loadChat(); refreshCounters();
-}
-async function loadChat(silent) {
-  var body = document.getElementById('chatBody');
-  if (!body) return;
-  var nick = state.viewData.nick;
-  try {
-    var data = await api('/api/dm/with/' + encodeURIComponent(nick));
-    var st = document.getElementById('chatStatus');
-    var nm = document.getElementById('chatName');
-    if (data.other) {
-      if (nm) nm.textContent = data.other.name + ' · @' + data.other.nick;
-      if (st) {
-        var isOnline = !!data.other.online;
-        if (!st.classList.contains('typing')) {
-          st.textContent = isOnline ? tr('dm_online') : tr('dm_offline');
-          st.className = 'status' + (isOnline ? ' online' : '');
-        }
-      }
-    }
-    if (typeof data.unread_dm === 'number') {
-      var changed = (data.unread_dm !== state.unreadDM);
-      setCounters((typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif), data.unread_dm);
-      if (changed) renderSidebar();
-    }
-    var msgs = data.messages || [];
-    if (silent && msgs.length === state.lastChatLen) return;
-    state.lastChatLen = msgs.length;
-    if (!msgs.length) { body.innerHTML = '<div class="chat-intro">' + escapeHtml(tr('dm_no_messages')) + '</div>'; return; }
-    var wasAtBottom = (body.scrollHeight - body.scrollTop - body.clientHeight) < 60;
-    body.innerHTML = msgs.map(function(m){
-      return '<div class="chat-msg ' + (m.mine ? 'mine' : 'theirs') + '">'
-        + escapeHtml(m.text)
-        + '<div class="chat-time">' + timeAgo(m.created_at) + '</div></div>';
-    }).join('');
-    if (!silent || wasAtBottom) body.scrollTop = body.scrollHeight;
-  } catch(e) { body.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>'; }
-}
-
 // ============ NOTIFICATIONS ============
 function renderNotificationsView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('notif_title') + '</div>'
-    + '<button class="icon-btn danger" id="clearNotifsBtn" title="' + escapeHtml(tr('notif_clear')) + '">' + ICONS.trash + '</button>'
+    + '<button class="icon-btn danger" id="clearNotifsBtn">' + ICONS.trash + '</button>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="main-inner"><div id="notifList">' + spinner() + '</div></div></div>';
   el.innerHTML = html;
@@ -3953,7 +3439,7 @@ function renderNotificationsView(el) {
     showConfirm(tr('notif_clear_confirm'), async function(){
       try {
         await api('/api/notifications/clear', { method: 'POST' });
-        setCounters(0, undefined); renderSidebar(); loadNotifications();
+        setNotifCount(0); renderSidebar(); loadNotifications();
       } catch(e) { alert(tr(e.message) || e.message); }
     }, { yesText: tr('notif_clear') });
   });
@@ -3965,11 +3451,11 @@ async function loadNotifications() {
   try {
     var data = await api('/api/notifications');
     var items = data.items || [];
-    setCounters(data.unread || 0, undefined);
+    setNotifCount(data.unread || 0);
     if (data.unread > 0) {
       api('/api/notifications/read', { method: 'POST' }).catch(function(){});
       items.forEach(function(n){ n.read = true; });
-      setCounters(0, undefined); renderSidebar();
+      setNotifCount(0); renderSidebar();
     }
     if (!items.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('notif_empty')) + '</div>'; return; }
     wrap.innerHTML = items.map(renderNotifHtml).join('');
@@ -3991,9 +3477,6 @@ function renderNotifHtml(n) {
     var lbl = n.type === 'new_post' ? tr('notif_new_post') : n.type === 'wall_post' ? tr('notif_wall_post') : tr('notif_quote');
     text = author + ' ' + lbl;
     link = n.post_id ? ('/p/' + n.post_id) : null;
-  } else if (n.type === 'dm_start') {
-    text = author + ' ' + tr('notif_dm');
-    link = '/messages/' + encodeURIComponent(n.from_nick);
   } else {
     text = author;
   }
@@ -4030,12 +3513,12 @@ function renderSettingsView(el) {
 
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
-    html += '<a class="pill-action" style="display:inline-block;padding:12px 20px;background:var(--card-2);border-radius:12px;color:var(--text);text-decoration:none;font-weight:600;margin-bottom:14px" href="/settings/profile" data-link>' + tr('edit_profile') + '</a>';
+    html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-block;text-decoration:none;line-height:44px;height:44px;margin-bottom:14px">' + tr('edit_profile') + '</a>';
     html += '<div class="toggle-row"><span>' + tr('settings_notify_new_post') + '</span>'
       + '<div class="toggle' + (nnp ? ' on' : '') + '" data-toggle="notify_on_new_post"></div></div>';
     html += '<div style="margin-top:14px"><button class="modal-btn danger" style="width:auto;padding:0 20px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
   } else {
-    html += '<a class="pill-action primary" style="display:inline-block;padding:12px 20px;background:var(--accent);color:var(--accent-fg);border-radius:12px;text-decoration:none;font-weight:600" href="/login" data-link>' + tr('go_login') + '</a>';
+    html += '<a class="publish-btn" href="/login" data-link style="display:inline-block;text-decoration:none;line-height:44px;height:44px">' + tr('go_login') + '</a>';
   }
   html += '</div>';
 
@@ -4212,7 +3695,6 @@ function renderRegisterView(el) {
     } catch(err) { errEl.textContent = tr(err.message) || err.message; }
   });
 }
-
 function renderLoginView(el) {
   var html = '<div class="main-body"><div class="auth-page"><div class="auth-card">';
   html += '<h1>' + tr('log_title') + '</h1>';
@@ -4234,11 +3716,6 @@ function renderLoginView(el) {
     try { await doLogin({ nick: fd.get('nick'), password: fd.get('password') }); }
     catch(err) { errEl.textContent = tr(err.message) || err.message; }
   });
-}
-
-function bindThemeBtn() {
-  var b = document.getElementById('mainThemeBtn');
-  if (b) b.addEventListener('click', toggleTheme);
 }
 
 // ============ POST RENDER ============
@@ -4265,7 +3742,6 @@ function renderPostHtml(p, showComments) {
     wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
   }
 
-  // quoted
   var quotedHtml = '';
   if (p.quoted) {
     var qHtml = linkifyMentions(escapeHtml(p.quoted.text || ''));
@@ -4292,7 +3768,7 @@ function renderPostHtml(p, showComments) {
   return ''
     + '<div class="post-card" data-post-id="' + p.id + '">'
     +   '<div class="post-header">'
-    +     avatarHtml(null, p.author, false)
+    +     avatarHtml(p.author_name || null, p.author, false, '', p.author_avatar_pixels)
     +     '<div class="meta">'
     +       '<div class="who">' + authorHtml + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
     +     '</div>'
@@ -4356,8 +3832,6 @@ function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
 }
 
 function applyVoteUI(targetBtn, dir) {
-  var card = targetBtn.closest('.post-card, .comment');
-  if (!card) return null;
   var container = targetBtn.parentElement;
   var upBtn = container.querySelector('.act-btn.up');
   var downBtn = container.querySelector('.act-btn.down');
@@ -4454,17 +3928,21 @@ function bindPostActions(root) {
           var p = await api('/api/posts/' + postId);
           state.quotePostId = postId;
           state.quotePreview = { author: p.author, text: p.text };
-          state.composerDraft = '';
-          if (state.view !== 'feed') { navigate('/'); return; }
-          // already in feed
-          var qb = document.getElementById('postQuoteBox');
-          if (qb) {
-            renderQuoteBox('post');
-            var inp = document.getElementById('postInput');
-            if (inp) { inp.value = ''; inp.focus(); }
-            var s = document.getElementById('postSend');
-            if (s) s.disabled = false;
-          }
+          if (state.view !== 'feed') { navigate('/'); setTimeout(function(){
+            var qb = document.getElementById('postQuoteBox');
+            if (qb) {
+              renderQuoteBox('post');
+              var inp = document.getElementById('postInput');
+              if (inp) { inp.value = ''; inp.focus(); }
+              var s = document.getElementById('postSend');
+              if (s) s.disabled = false;
+            }
+          }, 50); return; }
+          renderQuoteBox('post');
+          var inp = document.getElementById('postInput');
+          if (inp) { inp.value = ''; inp.focus(); }
+          var s = document.getElementById('postSend');
+          if (s) s.disabled = false;
         } catch(e) { alert(tr(e.message) || e.message); }
         return;
       }
@@ -4577,8 +4055,6 @@ async function translatePost(postId, btn) {
     if (document.hidden) return;
     if (!state.user) return;
     if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
-    if (state.view === 'chat') loadChat(true);
-    else if (state.view === 'messages') loadDMs();
   }, 25000);
 })();
 """
@@ -4591,7 +4067,6 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_HOME__", json.dumps(I_HOME))
           .replace("__I_USERS__", json.dumps(I_USERS))
           .replace("__I_USER__", json.dumps(I_USER))
-          .replace("__I_MAIL__", json.dumps(I_MAIL))
           .replace("__I_BELL__", json.dumps(I_BELL))
           .replace("__I_GEAR__", json.dumps(I_GEAR))
           .replace("__I_LOGOUT__", json.dumps(I_LOGOUT))
@@ -4618,13 +4093,13 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
         '<meta name="color-scheme" content="dark light" />\n'
         f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
-        '<title>ИТД</title>\n'
+        '<title>sldchat</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
         '<div class="layout">\n'
-        '  <main class="main" id="main"></main>\n'
         '  <aside class="sidebar" id="sidebar"></aside>\n'
+        '  <main class="main" id="main"></main>\n'
         '</div>\n'
         '<script>\n'
         f'const LANG = {json.dumps(lang)};\n'
@@ -4633,7 +4108,6 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         f'const MAX_POST_LEN = {MAX_POST_LEN};\n'
         f'const MAX_COMMENT_LEN = {MAX_COMMENT_LEN};\n'
         f'const MAX_BIO_LEN = {MAX_BIO_LEN};\n'
-        f'const MAX_DM_LEN = {MAX_DM_LEN};\n'
         f'const TRUNCATE_LINES = {TRUNCATE_LINES};\n'
         f'const TRUNCATE_CHARS = {TRUNCATE_CHARS};\n'
         f'const T = {json.dumps(t, ensure_ascii=False)};\n'
@@ -4662,13 +4136,6 @@ def page_following(nick: str, request: Request):
 
 @app.get("/users", response_class=HTMLResponse)
 def page_users(request: Request): return render_page(get_lang(request), "users")
-
-@app.get("/messages", response_class=HTMLResponse)
-def page_messages(request: Request): return render_page(get_lang(request), "messages")
-
-@app.get("/messages/{nick}", response_class=HTMLResponse)
-def page_chat(nick: str, request: Request):
-    return render_page(get_lang(request), "chat", {"nick": nick})
 
 @app.get("/notifications", response_class=HTMLResponse)
 def page_notifications(request: Request): return render_page(get_lang(request), "notifications")
