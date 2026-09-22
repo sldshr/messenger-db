@@ -7,7 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="sldChat")
+app = FastAPI(title="sldchat")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -17,9 +17,9 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("[sldChat] Supabase connected")
+        print("[sldchat] Supabase connected")
     except Exception as e:
-        print("[sldChat] Supabase init error:", e)
+        print("[sldchat] Supabase init error:", e)
 
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
@@ -29,8 +29,8 @@ NOTIFS_MEM: Dict[str, List[dict]] = {}
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
 MAX_BIO_LEN = 200
-AVATAR_PIXELS_LEN = 64     # 8x8
-HEADER_PIXELS_LEN = 512    # 32x16
+AVATAR_PIXELS_LEN = 64
+HEADER_PIXELS_LEN = 512
 TRUNCATE_LINES = 100
 TRUNCATE_CHARS = 500
 SESSION_TTL = 30 * 24 * 3600
@@ -42,6 +42,7 @@ MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 PIXELS_RE = re.compile(r"^[0-9a-f]*$")
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 _lang_cache: Dict[str, str] = {}
+_geo_cache: Dict[str, dict] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
@@ -171,29 +172,68 @@ def clean_pixels(s: Optional[str], length: int) -> str:
     return s
 
 
+def parse_user_agent(ua: str):
+    ua = ua or ""
+    browser = "Unknown"
+    if "YaBrowser" in ua: browser = "Yandex"
+    elif "Edg/" in ua: browser = "Edge"
+    elif "OPR/" in ua or "Opera" in ua: browser = "Opera"
+    elif "Firefox/" in ua: browser = "Firefox"
+    elif "Chrome/" in ua: browser = "Chrome"
+    elif "Safari/" in ua: browser = "Safari"
+    os_name = "Unknown"
+    if "Windows NT" in ua: os_name = "Windows"
+    elif "Mac OS X" in ua: os_name = "macOS"
+    elif "Android" in ua: os_name = "Android"
+    elif "iPhone" in ua or "iPad" in ua or "iPod" in ua: os_name = "iOS"
+    elif "Linux" in ua: os_name = "Linux"
+    return browser, os_name
+
+
 def get_client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip")
     if fwd: return fwd.split(",")[0].strip()
     return request.client.host if request.client else ""
 
 
+def _is_private_ip(ip: str) -> bool:
+    if not ip: return True
+    return (ip.startswith("127.") or ip.startswith("10.") or ip.startswith("192.168.")
+            or ip.startswith("172.") or ip in ("::1", "localhost"))
+
+
+def get_geo(ip: str) -> dict:
+    if not ip: return {}
+    if ip in _geo_cache: return _geo_cache[ip]
+    if _is_private_ip(ip):
+        _geo_cache[ip] = {}
+        return {}
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=countryCode,city,country",
+            headers={"User-Agent": "sldchat"})
+        with urllib.request.urlopen(req, timeout=2) as r:
+            data = json.loads(r.read().decode())
+        result = {
+            "city": data.get("city", "") or "",
+            "country": data.get("country", "") or "",
+            "country_code": (data.get("countryCode") or "").upper(),
+        }
+        _geo_cache[ip] = result
+        return result
+    except Exception:
+        _geo_cache[ip] = {}
+        return {}
+
+
 def detect_lang(ip: str, accept_language: str) -> str:
     key = ip or "unknown"
     if key in _lang_cache: return _lang_cache[key]
     lang = None
-    private = (not ip or ip.startswith("127.") or ip.startswith("10.")
-               or ip.startswith("192.168.") or ip.startswith("172.")
-               or ip in ("::1","localhost"))
-    if not private:
-        try:
-            req = urllib.request.Request(f"http://ip-api.com/json/{ip}?fields=countryCode",
-                                         headers={"User-Agent": "sldChat"})
-            with urllib.request.urlopen(req, timeout=2) as r:
-                data = json.loads(r.read().decode())
-                cc = (data.get("countryCode") or "").upper()
-                if cc in RU_COUNTRIES: lang = "ru"
-                elif cc: lang = "en"
-        except Exception: pass
+    geo = get_geo(ip)
+    cc = geo.get("country_code", "")
+    if cc in RU_COUNTRIES: lang = "ru"
+    elif cc: lang = "en"
     if not lang:
         al = (accept_language or "").lower()
         lang = "ru" if (al.startswith("ru") or ",ru" in al or "ru-" in al) else "en"
@@ -241,7 +281,6 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row = r.data[0]
                 row["following"] = set(row.get("following") or [])
                 row["followers"] = set(row.get("followers") or [])
-                row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
@@ -249,7 +288,7 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["avatar_pixels"] = row.get("avatar_pixels") or ""
                 row["header_pixels"] = row.get("header_pixels") or ""
                 return row
-        except Exception as e: print("[sldChat] db_load_user error:", e)
+        except Exception as e: print("[sldchat] db_load_user error:", e)
         return None
     for u in USERS.values():
         if u["nick"].lower() == nick.lower(): return u
@@ -275,7 +314,6 @@ def db_save_user(u: dict) -> None:
             "password": u["password"], "created_at": ts_to_iso(u["created_at"]),
             "following": list(u.get("following") or []),
             "followers": list(u.get("followers") or []),
-            "blacklist": list(u.get("blacklist") or []),
             "allow_followers_view": u.get("allow_followers_view", True),
             "allow_following_view": u.get("allow_following_view", True),
             "notify_on_new_post": u.get("notify_on_new_post", True),
@@ -283,7 +321,7 @@ def db_save_user(u: dict) -> None:
             "avatar_pixels": u.get("avatar_pixels", ""),
             "header_pixels": u.get("header_pixels", ""),
         }).execute()
-    except Exception as e: print("[sldChat] db_save_user error:", e)
+    except Exception as e: print("[sldchat] db_save_user error:", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
@@ -293,7 +331,7 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
         if nick in USERS: USERS[nick].update(patch)
         invalidate_user_cache(nick); return
     try: supabase.table("users").update(patch).eq("nick", nick).execute()
-    except Exception as e: print("[sldChat] db_update_user_fields error:", e)
+    except Exception as e: print("[sldchat] db_update_user_fields error:", e)
     invalidate_user_cache(nick)
 
 
@@ -305,7 +343,6 @@ def db_all_users() -> List[dict]:
             for row in r.data or []:
                 row["following"] = set(row.get("following") or [])
                 row["followers"] = set(row.get("followers") or [])
-                row["blacklist"] = list(row.get("blacklist") or [])
                 row["bio"] = row.get("bio") or ""
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
@@ -315,7 +352,7 @@ def db_all_users() -> List[dict]:
                 out.append(row)
             return out
         except Exception as e:
-            print("[sldChat] db_all_users error:", e); return []
+            print("[sldchat] db_all_users error:", e); return []
     return list(USERS.values())
 
 
@@ -329,7 +366,7 @@ def db_create_post(p: dict) -> None:
             "wall_owner": p.get("wall_owner"),
             "quoted_post_id": p.get("quoted_post_id"),
         }).execute()
-    except Exception as e: print("[sldChat] db_create_post error:", e)
+    except Exception as e: print("[sldchat] db_create_post error:", e)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
@@ -337,7 +374,7 @@ def db_update_post_text(pid: str, text: str) -> None:
         if pid in POSTS_MEM: POSTS_MEM[pid]["text"] = text
         return
     try: supabase.table("posts").update({"text": text}).eq("id", pid).execute()
-    except Exception as e: print("[sldChat] db_update_post error:", e)
+    except Exception as e: print("[sldchat] db_update_post error:", e)
 
 
 def db_delete_post(pid: str) -> None:
@@ -346,7 +383,7 @@ def db_delete_post(pid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("post_id", pid).execute()
         supabase.table("posts").delete().eq("id", pid).execute()
-    except Exception as e: print("[sldChat] db_delete_post error:", e)
+    except Exception as e: print("[sldchat] db_delete_post error:", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
@@ -358,7 +395,7 @@ def db_get_post(pid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldChat] db_get_post error:", e); return None
+            print("[sldchat] db_get_post error:", e); return None
     return POSTS_MEM.get(pid)
 
 
@@ -368,12 +405,9 @@ def db_inc_views(pid: str) -> None:
         if p: p["views"] = (p.get("views") or 0) + 1
         return
     try:
-        r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
-        if r.data:
-            v = (r.data[0].get("views") or 0) + 1
-            supabase.table("posts").update({"views": v}).eq("id", pid).execute()
+        supabase.rpc("increment_post_views", {"p_id": pid}).execute()
     except Exception as e:
-        print("[sldChat] db_inc_views error:", e)
+        print("[sldchat] db_inc_views error:", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
@@ -386,7 +420,7 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 out[row["id"]] = row
         except Exception as e:
-            print("[sldChat] db_get_quotes error:", e)
+            print("[sldchat] db_get_quotes error:", e)
         return out
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -410,7 +444,7 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_list_posts error:", e); return []
+            print("[sldchat] db_list_posts error:", e); return []
     items = [p for p in POSTS_MEM.values() if not p.get("wall_owner")]
     if author: items = [p for p in items if p["author"] == author]
     if subscriptions_of:
@@ -433,7 +467,7 @@ def db_list_wall_posts(owner: str) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_list_wall_posts error:", e); return []
+            print("[sldchat] db_list_wall_posts error:", e); return []
     items = [p for p in POSTS_MEM.values() if p.get("wall_owner") == owner]
     items.sort(key=lambda p: p["created_at"], reverse=True)
     return items
@@ -445,7 +479,7 @@ def db_post_votes(post_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("post_votes").select("*").in_("post_id", post_ids).execute().data or []
         except Exception as e:
-            print("[sldChat] db_post_votes error:", e); return []
+            print("[sldchat] db_post_votes error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -463,7 +497,7 @@ def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("post_votes").upsert({
                     "post_id": post_id, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[sldChat] db_set_post_vote error:", e)
+        except Exception as e: print("[sldchat] db_set_post_vote error:", e)
         return
     p = POSTS_MEM.get(post_id)
     if not p: return
@@ -480,7 +514,7 @@ def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_comments_for_posts error:", e); return []
+            print("[sldchat] db_comments_for_posts error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -498,7 +532,7 @@ def db_comment_votes(comment_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("comment_votes").select("*").in_("comment_id", comment_ids).execute().data or []
         except Exception as e:
-            print("[sldChat] db_comment_votes error:", e); return []
+            print("[sldchat] db_comment_votes error:", e); return []
     out = []
     for pid, p in POSTS_MEM.items():
         for c in p.get("comments", []):
@@ -521,7 +555,7 @@ def db_create_comment(c: dict) -> None:
             "id": c["id"], "post_id": c["post_id"], "author": c["author"],
             "parent_id": c.get("parent_id"), "text": c["text"],
             "created_at": ts_to_iso(c["created_at"])}).execute()
-    except Exception as e: print("[sldChat] db_create_comment error:", e)
+    except Exception as e: print("[sldchat] db_create_comment error:", e)
 
 
 def db_update_comment_text(cid: str, text: str) -> None:
@@ -531,7 +565,7 @@ def db_update_comment_text(cid: str, text: str) -> None:
                 if c["id"] == cid: c["text"] = text; return
         return
     try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
-    except Exception as e: print("[sldChat] db_update_comment error:", e)
+    except Exception as e: print("[sldchat] db_update_comment error:", e)
 
 
 def db_delete_comment(cid: str) -> None:
@@ -542,7 +576,7 @@ def db_delete_comment(cid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("comment_id", cid).execute()
         supabase.table("comments").delete().eq("id", cid).execute()
-    except Exception as e: print("[sldChat] db_delete_comment error:", e)
+    except Exception as e: print("[sldchat] db_delete_comment error:", e)
 
 
 def db_get_comment(cid: str) -> Optional[dict]:
@@ -554,7 +588,7 @@ def db_get_comment(cid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldChat] db_get_comment error:", e); return None
+            print("[sldchat] db_get_comment error:", e); return None
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
@@ -572,7 +606,7 @@ def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("comment_votes").upsert({
                     "comment_id": cid, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[sldChat] db_set_comment_vote error:", e)
+        except Exception as e: print("[sldchat] db_set_comment_vote error:", e)
         return
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
@@ -586,10 +620,8 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
               post_id: str = "", comment_id: str = "", text: str = "") -> None:
     if not to_nick or to_nick == from_nick: return
     to_user = db_load_user_cached(to_nick)
-    if to_user:
-        bl = to_user.get("blacklist") or []
-        if from_nick in bl: return
-        if ntype == "new_post" and not to_user.get("notify_on_new_post", True): return
+    if to_user and ntype == "new_post" and not to_user.get("notify_on_new_post", True):
+        return
     n = {"id": uuid.uuid4().hex[:10], "to_nick": to_nick, "type": ntype,
          "from_nick": from_nick, "post_id": post_id, "comment_id": comment_id,
          "text": text, "read": False, "created_at": time.time()}
@@ -600,7 +632,7 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
                 "from_nick": n["from_nick"], "post_id": n["post_id"],
                 "comment_id": n["comment_id"] or None, "text": n["text"],
                 "read": n["read"], "created_at": ts_to_iso(n["created_at"])}).execute()
-        except Exception as e: print("[sldChat] db_notify error:", e)
+        except Exception as e: print("[sldchat] db_notify error:", e)
         bus_publish(to_nick, {"type": "notification", "notif": n}); return
     NOTIFS_MEM.setdefault(to_nick, []).append(n)
     bus_publish(to_nick, {"type": "notification", "notif": n})
@@ -615,7 +647,7 @@ def db_notifications(nick: str) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldChat] db_notifications error:", e); return []
+            print("[sldchat] db_notifications error:", e); return []
     items = list(NOTIFS_MEM.get(nick, []))
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:100]
@@ -628,14 +660,14 @@ def db_notifications_unread_count(nick: str) -> int:
                  .eq("to_nick", nick).eq("read", False).limit(1).execute())
             return r.count or 0
         except Exception as e:
-            print("[sldChat] db_notif_unread error:", e); return 0
+            print("[sldchat] db_notif_unread error:", e); return 0
     return sum(1 for n in NOTIFS_MEM.get(nick, []) if not n.get("read"))
 
 
 def db_notifications_mark_read(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
-        except Exception as e: print("[sldChat] db_notif_read error:", e)
+        except Exception as e: print("[sldchat] db_notif_read error:", e)
         return
     for n in NOTIFS_MEM.get(nick, []): n["read"] = True
 
@@ -643,7 +675,7 @@ def db_notifications_mark_read(nick: str) -> None:
 def db_notifications_clear(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").delete().eq("to_nick", nick).execute()
-        except Exception as e: print("[sldChat] db_notif_clear error:", e)
+        except Exception as e: print("[sldchat] db_notif_clear error:", e)
         return
     NOTIFS_MEM[nick] = []
 
@@ -662,8 +694,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
                 u["following"].discard(old_nick); u["following"].add(new_nick)
             if old_nick in u.get("followers", set()):
                 u["followers"].discard(old_nick); u["followers"].add(new_nick)
-            if old_nick in (u.get("blacklist") or []):
-                u["blacklist"] = [new_nick if x == old_nick else x for x in u["blacklist"]]
         for items in NOTIFS_MEM.values():
             for n in items:
                 if n.get("to_nick") == old_nick: n["to_nick"] = new_nick
@@ -678,7 +708,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "created_at": ts_to_iso(old.get("created_at", time.time())),
             "following": list(old.get("following") or []),
             "followers": list(old.get("followers") or []),
-            "blacklist": list(old.get("blacklist") or []),
             "allow_followers_view": old.get("allow_followers_view", True),
             "allow_following_view": old.get("allow_following_view", True),
             "notify_on_new_post": old.get("notify_on_new_post", True),
@@ -700,10 +729,8 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             if old_nick in fl: patch["following"] = [new_nick if x == old_nick else x for x in fl]
             fw = u.get("followers") or set()
             if old_nick in fw: patch["followers"] = [new_nick if x == old_nick else x for x in fw]
-            bl = u.get("blacklist") or []
-            if old_nick in bl: patch["blacklist"] = [new_nick if x == old_nick else x for x in bl]
             if patch: db_update_user_fields(u["nick"], patch)
-    except Exception as e: print("[sldChat] _rename_user_everywhere error:", e)
+    except Exception as e: print("[sldchat] _rename_user_everywhere error:", e)
     invalidate_user_cache()
 
 
@@ -724,7 +751,6 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
     quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
     quotes = db_get_quotes(list(set(quoted_ids)))
 
-    # авторы: собираем пиксели аватаров батчем
     authors_data: Dict[str, dict] = {}
     for p in posts:
         a = p.get("author")
@@ -780,7 +806,6 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
     if viewer_nick == u["nick"]:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
-        d["blacklist"] = list(u.get("blacklist") or [])
         d["notify_on_new_post"] = u.get("notify_on_new_post", True)
     return d
 
@@ -807,7 +832,6 @@ class SettingsIn(BaseModel):
     allow_following_view: Optional[bool] = None
     notify_on_new_post: Optional[bool] = None
     allow_wall_posts: Optional[bool] = None
-class BlacklistIn(BaseModel): nick: str
 class TranslateIn(BaseModel): text: str; to: str
 
 
@@ -824,7 +848,7 @@ def api_register(data: RegisterIn, request: Request):
     if db_load_user(nick): raise HTTPException(400, "err_nick_taken")
     u = {"nick": nick, "name": name, "bio": "",
          "password": hash_password(data.password), "created_at": time.time(),
-         "following": set(), "followers": set(), "blacklist": [],
+         "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
          "notify_on_new_post": True, "allow_wall_posts": True,
          "avatar_pixels": "", "header_pixels": ""}
@@ -859,6 +883,21 @@ def api_logout(request: Request):
 def api_me(request: Request):
     u = require_user(request)
     return serialize_user(u, u["nick"])
+
+
+@app.get("/api/whoami")
+def api_whoami(request: Request):
+    require_user(request)
+    ua = request.headers.get("user-agent", "")
+    ip = get_client_ip(request)
+    browser, os_name = parse_user_agent(ua)
+    geo = get_geo(ip)
+    return {
+        "browser": browser,
+        "os": os_name,
+        "city": geo.get("city", ""),
+        "country": geo.get("country", ""),
+    }
 
 
 @app.put("/api/users/me")
@@ -897,29 +936,6 @@ def api_set_settings(data: SettingsIn, request: Request):
     if data.allow_wall_posts is not None: patch["allow_wall_posts"] = bool(data.allow_wall_posts)
     if patch: db_update_user_fields(me["nick"], patch)
     return {"ok": True}
-
-
-@app.post("/api/users/me/blacklist")
-def api_bl_add(data: BlacklistIn, request: Request):
-    me = require_user(request)
-    nick = data.nick.strip().lstrip("@")
-    if not nick: raise HTTPException(400, "empty")
-    target = db_load_user(nick)
-    if not target: raise HTTPException(404, "not found")
-    if target["nick"] == me["nick"]: raise HTTPException(400, "self")
-    bl = list(me.get("blacklist") or [])
-    if target["nick"] not in bl:
-        bl.append(target["nick"]); db_update_user_fields(me["nick"], {"blacklist": bl})
-    return {"ok": True, "blacklist": bl}
-
-
-@app.delete("/api/users/me/blacklist/{nick}")
-def api_bl_remove(nick: str, request: Request):
-    me = require_user(request)
-    bl = list(me.get("blacklist") or [])
-    bl = [n for n in bl if n.lower() != nick.lower()]
-    db_update_user_fields(me["nick"], {"blacklist": bl})
-    return {"ok": True, "blacklist": bl}
 
 
 @app.get("/api/users")
@@ -1057,7 +1073,6 @@ def api_wall(nick: str, request: Request):
     if viewer:
         if is_owner: can_post = True
         elif not u.get("allow_wall_posts", True): reason = "err_wall_disabled"
-        elif viewer["nick"] in (u.get("blacklist") or []): reason = "err_user_blocked"
         elif not is_follower: reason = "err_need_follow"
         else: can_post = True
     return {"posts": build_posts_full(posts, vid),
@@ -1074,7 +1089,6 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
     if not owner: raise HTTPException(404, "not found")
     if owner["nick"] != me["nick"]:
         if not owner.get("allow_wall_posts", True): raise HTTPException(403, "err_wall_disabled")
-        if me["nick"] in (owner.get("blacklist") or []): raise HTTPException(403, "err_user_blocked")
         if me["nick"] not in (owner.get("followers") or set()): raise HTTPException(403, "err_need_follow")
     text = payload.text.strip()
     if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
@@ -1278,7 +1292,7 @@ def api_translate(data: TranslateIn, request: Request):
     try:
         q = urllib.parse.quote(text)
         url = f"https://api.mymemory.translated.net/get?q={q}&langpair={src}|{target}"
-        req = urllib.request.Request(url, headers={"User-Agent": "sldChat"})
+        req = urllib.request.Request(url, headers={"User-Agent": "sldchat"})
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read().decode())
         t = (data.get("responseData") or {}).get("translatedText") or text
@@ -1403,7 +1417,6 @@ TEXTS = {
         "err_rate_limit": "Слишком много запросов, подождите",
         "err_private_followers": "Пользователь скрыл подписчиков",
         "err_private_following": "Пользователь скрыл подписки",
-        "err_user_blocked": "Вы в чёрном списке — действие запрещено",
         "err_bio_too_long": "Описание слишком длинное",
         "err_wall_disabled": "Стена закрыта",
         "err_need_follow": "Подпишитесь на пользователя, чтобы писать на его стене",
@@ -1428,7 +1441,7 @@ TEXTS = {
         "wall_locked_hint": "Стена видна только подписчикам",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
-        "settings_privacy": "Приватность",
+        "settings_privacy": "Конфиденциальность",
         "settings_appearance": "Внешний вид",
         "settings_info": "О приложении",
         "settings_theme": "Тема",
@@ -1438,13 +1451,12 @@ TEXTS = {
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_allow_wall": "Разрешить писать на моей стене",
         "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
-        "settings_blacklist": "Чёрный список",
-        "settings_blacklist_hint": "Люди из этого списка не могут вам писать, комментировать и отправлять сообщения",
-        "settings_blacklist_add_ph": "Ник (без @)",
-        "settings_blacklist_add": "Заблокировать",
-        "settings_blacklist_empty": "Список пуст",
+        "settings_device": "Ваше устройство",
+        "settings_device_browser": "Браузер",
+        "settings_device_os": "Система",
+        "settings_device_city": "Город",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldChat — минималистичная соцсеть: посты, стены-сообщества, комментарии.",
+        "settings_desc": "sldchat — минималистичная соцсеть: посты, стены-сообщества, комментарии.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1469,24 +1481,23 @@ TEXTS = {
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "Мы храним минимум данных: имя, ник, пароль (хеш), посты, комментарии, "
-            "стену, цитаты, голоса, подписки, чёрный список, пиксели аватара и шапки, уведомления.\n\n"
+            "стену, цитаты, голоса, подписки, пиксели аватара и шапки, уведомления.\n\n"
             "Пароль хранится как pbkdf2-hmac-sha256 (100 000 итераций) с солью. Мы не можем его восстановить.\n\n"
             "Данные хранятся на серверах Supabase. Мы их не продаём и не передаём третьим лицам.\n\n"
             "Редактировать и удалять можно свои посты и комментарии. Владелец стены может удалять посты и комментарии на своей стене.\n\n"
-            "IP используется только для определения языка (не сохраняется).\n\n"
+            "IP используется для определения языка и города (не сохраняется).\n\n"
             "Сервис предоставляется как есть."
         ),
         "translate": "Перевести",
         "translate_show_original": "Показать оригинал",
         "translate_failed": "Перевод не удался",
         "quote": "Цитировать",
-        "quote_cancel": "Отменить",
         "avatar_title": "Аватар 8×8",
-        "header_title": "Шапка профиля 32×16",
+        "header_title": "Шапка 32×16",
         "pixel_clear": "Очистить",
         "pixel_fill": "Залить",
-        "pixel_hint": "Рисуй мышью или пальцем",
-        "profile_edit": "Профиль",
+        "pixel_hint": "Тапни или проведи по клеткам",
+        "pixel_eraser": "Ластик",
     },
     "en": {
         "search_ph": "Search people and posts",
@@ -1529,7 +1540,6 @@ TEXTS = {
         "err_rate_limit": "Too many requests, please wait",
         "err_private_followers": "User hid their followers",
         "err_private_following": "User hid their following",
-        "err_user_blocked": "You are blocked — action not allowed",
         "err_bio_too_long": "Bio is too long",
         "err_wall_disabled": "Wall is closed",
         "err_need_follow": "Follow this user to post on their wall",
@@ -1564,13 +1574,12 @@ TEXTS = {
         "settings_notify_new_post": "New post notifications",
         "settings_allow_wall": "Allow posts on my wall",
         "settings_allow_wall_hint": "Only your followers can post",
-        "settings_blacklist": "Blacklist",
-        "settings_blacklist_hint": "People in this list cannot write, comment or message you",
-        "settings_blacklist_add_ph": "Nick (no @)",
-        "settings_blacklist_add": "Block",
-        "settings_blacklist_empty": "List is empty",
+        "settings_device": "Your device",
+        "settings_device_browser": "Browser",
+        "settings_device_os": "System",
+        "settings_device_city": "City",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldChat — minimalist social network: posts, community walls, comments.",
+        "settings_desc": "sldchat — minimalist social network: posts, community walls, comments.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -1595,24 +1604,23 @@ TEXTS = {
         "policy_title": "Privacy Policy",
         "policy_content": (
             "We store minimum data: name, nick, password (hash), posts, comments, "
-            "wall, quotes, votes, follows, blacklist, avatar and header pixels, notifications.\n\n"
+            "wall, quotes, votes, follows, avatar and header pixels, notifications.\n\n"
             "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
             "Data is stored on Supabase. We do not sell or share it.\n\n"
             "You can edit/delete your own posts and comments. Wall owner can delete posts/comments on their wall.\n\n"
-            "IP is used only to detect language (not stored).\n\n"
+            "IP is used to detect language and city (not stored).\n\n"
             "Service is provided as-is."
         ),
         "translate": "Translate",
         "translate_show_original": "Show original",
         "translate_failed": "Translation failed",
         "quote": "Quote",
-        "quote_cancel": "Cancel",
         "avatar_title": "Avatar 8×8",
-        "header_title": "Profile header 32×16",
+        "header_title": "Header 32×16",
         "pixel_clear": "Clear",
         "pixel_fill": "Fill",
-        "pixel_hint": "Draw with mouse or finger",
-        "profile_edit": "Profile",
+        "pixel_hint": "Tap or drag across cells",
+        "pixel_eraser": "Eraser",
     },
 }
 
@@ -1658,9 +1666,12 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
 I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=15)
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 
-FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-           "%3Crect width='64' height='64' fill='%230a0a0a'/%3E"
-           "%3Ctext x='50%25' y='68%25' font-family='Arial' font-weight='900' font-size='38' fill='%23fff' text-anchor='middle'%3Es%3C/text%3E%3C/svg%3E")
+FAVICON = ("data:image/svg+xml,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+    "%3Crect width='64' height='64' fill='%23ffffff'/%3E"
+    "%3Ctext x='32' y='44' font-family='Arial Black,Arial,sans-serif' "
+    "font-weight='900' font-size='22' fill='%23000000' text-anchor='middle' "
+    "letter-spacing='-1'%3Esld%3C/text%3E%3C/svg%3E")
 
 
 CSS = """
@@ -1679,14 +1690,20 @@ CSS = """
   --online:#16a34a;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
+html, body {
+  height: 100vh;
+  height: 100dvh;
+  margin: 0; padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background: var(--bg); color: var(--text); font-size: 15px;
   -webkit-font-smoothing: antialiased;
   user-select: none; -webkit-user-select: none;
 }
-input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px; }
+input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px; }
 * { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -1696,6 +1713,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   display: flex;
   width: 100%;
   height: 100vh;
+  height: 100dvh;
   background: var(--bg);
   max-width: 1400px;
   margin: 0 auto;
@@ -1738,18 +1756,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   text-align: center; padding: 0 7px; border-radius: 11px;
 }
 .sidebar .spacer { flex: 1; }
-.sidebar-user {
-  padding: 12px 14px; font-size: 14px; font-weight: 700;
-  color: var(--text); display: flex; align-items: center; gap: 10px;
-  cursor: pointer; border-radius: 12px;
-  transition: background .12s;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.sidebar-user:hover { background: var(--hover); }
-.sidebar-user .star { color: #f5b400; flex-shrink: 0; }
 .sidebar-logout {
   display: flex; align-items: center; gap: 14px;
-  padding: 12px 14px; margin-top: 2px;
+  padding: 12px 14px;
   color: var(--text); font-size: 15px; font-weight: 500;
   background: transparent; border: none; cursor: pointer;
   border-radius: 12px; text-align: left; width: 100%;
@@ -1766,19 +1775,20 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   overflow: hidden;
 }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
-.main-inner { max-width: 720px; margin: 0 auto; padding: 20px 20px 100px; }
+.main-inner { max-width: 720px; margin: 0 auto; padding: 20px 20px 40px; }
 
 .main-header {
   display: flex; align-items: center; gap: 10px;
   padding: 16px 20px;
   max-width: 720px; margin: 0 auto; width: 100%;
 }
+.main-header.wide { max-width: 960px; }
 .main-header .title {
   flex: 1; font-size: 22px; font-weight: 800;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.main-header .icon-btn { margin-left: auto; }
 
-/* ICON BUTTON */
 .icon-btn {
   width: 40px; height: 40px;
   display: inline-flex; align-items: center; justify-content: center;
@@ -1790,9 +1800,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .icon-btn:hover { background: var(--hover); }
 .icon-btn.danger:hover { color: var(--danger); }
-.icon-btn svg { display: block; }
 
-/* PILL TABS */
 .pill-tabs {
   display: flex; gap: 6px; padding: 4px;
   background: var(--card); border-radius: 16px; margin-bottom: 16px;
@@ -1809,7 +1817,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .pill-tab:hover { color: var(--text); }
 .pill-tab.active { background: var(--accent); color: var(--accent-fg); }
 
-/* SEARCH */
 .search-box {
   display: flex; align-items: center; gap: 12px;
   background: var(--card); border-radius: 16px;
@@ -1822,29 +1829,30 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .search-box input::placeholder { color: var(--muted); }
 
-/* CARD */
 .card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
 
 /* COMPOSER */
 .composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-body { flex: 1; min-width: 0; }
 .composer-body textarea {
-  width: 100%; background: transparent; border: none; outline: none;
-  resize: none; color: var(--text); font-family: inherit; font-size: 16px;
-  line-height: 1.5; min-height: 30px; padding: 8px 0 0;
+  display: block;
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  resize: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1.55;
+  min-height: 56px;
+  max-height: 400px;
+  padding: 6px 0 0;
+  overflow: hidden;
 }
 .composer-body textarea::placeholder { color: var(--muted); }
 .composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
 .composer-actions .spacer { flex: 1; }
-.composer-icon {
-  width: 38px; height: 38px;
-  background: transparent; border: none; cursor: pointer;
-  color: var(--muted); display: inline-flex;
-  align-items: center; justify-content: center;
-  border-radius: 10px;
-  transition: background .12s, color .12s;
-}
-.composer-icon:hover { background: var(--hover); color: var(--text); }
 .publish-btn {
   height: 42px; padding: 0 22px;
   background: var(--accent); color: var(--accent-fg);
@@ -1874,15 +1882,15 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
-/* AVATAR (pixel) */
+/* AVATAR */
 .avatar {
   width: 44px; height: 44px; flex-shrink: 0;
   border-radius: 50%;
   background-color: var(--accent-soft);
   background-size: 100% 100%;
   background-position: center;
+  background-repeat: no-repeat;
   image-rendering: pixelated;
-  -ms-interpolation-mode: nearest-neighbor;
   color: var(--accent-fg);
   display: inline-flex; align-items: center; justify-content: center;
   font-weight: 800; font-size: 16px;
@@ -1923,7 +1931,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .read-more:hover { color: var(--text); }
 
-/* QUOTED POST */
 .quoted-post {
   margin-top: 10px; padding: 12px 14px;
   background: var(--card-2); border-radius: 14px;
@@ -1965,6 +1972,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   background: linear-gradient(135deg, #1a1a1a 0%, #2a2a2a 100%);
   background-size: cover;
   background-position: center;
+  background-repeat: no-repeat;
   image-rendering: pixelated;
   position: relative; margin-bottom: 54px;
 }
@@ -2068,7 +2076,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 /* SETTINGS */
 .settings-layout {
   display: flex; gap: 20px;
-  max-width: 900px; margin: 0 auto; width: 100%;
+  max-width: 960px; margin: 0 auto; width: 100%;
   padding: 20px;
   min-height: 100%;
 }
@@ -2127,36 +2135,17 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .settings-desc { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; }
 .settings-link { display: inline-block; color: var(--text); text-decoration: underline; font-size: 14px; font-weight: 500; }
 
-.blacklist-add { display: flex; gap: 8px; margin-bottom: 12px; }
-.blacklist-add input {
-  flex: 1; padding: 12px 16px;
-  border: none; background: var(--card-2); color: var(--text);
-  font-family: inherit; font-size: 15px; outline: none; border-radius: 14px;
+/* device info rows */
+.device-info { display: flex; flex-direction: column; gap: 8px; }
+.device-info-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px;
+  background: var(--card-2);
+  border-radius: 12px;
+  font-size: 14px;
 }
-.blacklist-add input::placeholder { color: var(--muted); }
-.blacklist-add button {
-  height: 46px; padding: 0 20px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 14px;
-  font-family: inherit; font-size: 14px; font-weight: 700;
-  cursor: pointer;
-}
-.blacklist-item {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px; background: var(--card-2);
-  border-radius: 14px; margin-bottom: 6px; font-size: 15px;
-}
-.blacklist-item .nick { flex: 1; font-weight: 700; }
-.blacklist-item .nick a { color: var(--text); text-decoration: none; }
-.blacklist-item .nick a:hover { text-decoration: underline; }
-.blacklist-item .rm {
-  height: 32px; padding: 0 14px;
-  background: transparent; border: none;
-  color: var(--danger); font-family: inherit;
-  font-size: 13px; font-weight: 700;
-  cursor: pointer; border-radius: 10px;
-}
-.blacklist-item .rm:hover { background: rgba(239,68,68,.1); }
+.device-info-row .label { color: var(--muted); font-weight: 500; }
+.device-info-row .value { color: var(--text); font-weight: 700; }
 
 /* AUTH */
 .auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
@@ -2181,12 +2170,10 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .auth-switch { margin-top: 18px; font-size: 14px; color: var(--muted); text-align: center; }
 .auth-switch a { color: var(--text); cursor: pointer; text-decoration: underline; font-weight: 600; }
 
-/* POLICY */
 .policy { max-width: 720px; margin: 0 auto; padding: 20px; }
 .policy h1 { font-size: 24px; margin: 0 0 20px; font-weight: 800; }
 .policy p { font-size: 15px; line-height: 1.7; color: var(--text); white-space: pre-wrap; margin: 0; }
 
-/* EMPTY / SPINNER */
 .empty {
   padding: 60px 20px; text-align: center;
   color: var(--muted); font-size: 14px;
@@ -2200,7 +2187,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* MODAL */
 .modal-overlay {
   position: fixed; inset: 0;
   background: rgba(0,0,0,.6);
@@ -2224,13 +2210,12 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .modal-btn.secondary { background: var(--card-2); color: var(--text); }
 .modal-btn.danger { background: var(--danger); color: #fff; }
 
-.post-card.highlight, .comment.highlight { animation: flash 1.6s ease-out; }
+.comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash {
   0% { background: var(--up); color: #fff; }
-  100% { background: var(--card); }
+  100% { background: var(--card-2); }
 }
 
-/* COMMENTS */
 .comments { margin-top: 16px; padding-top: 4px; }
 .comment { padding: 12px 14px; background: var(--card-2); border-radius: 14px; margin-top: 8px; }
 .comment.reply { margin-left: 28px; background: transparent; }
@@ -2252,7 +2237,6 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 .comment-actions { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
 .comment-actions .act-btn { height: 30px; padding: 0 10px; font-size: 12px; }
 
-/* INLINE EDIT */
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea {
   width: 100%; padding: 12px 14px; min-height: 90px;
@@ -2269,50 +2253,62 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 }
 .inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); }
 
-/* PIXEL EDITOR */
-.pixel-section {
-  margin-bottom: 20px;
+/* ============ PIXEL EDITOR ============ */
+.pixel-block {
+  background: var(--card);
+  border-radius: 20px;
+  padding: 18px;
+  margin-bottom: 14px;
 }
-.pixel-title {
-  font-size: 14px; font-weight: 700; color: var(--text);
-  margin-bottom: 4px;
+.pixel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px; gap: 12px;
 }
-.pixel-sub {
-  font-size: 12px; color: var(--muted); margin-bottom: 12px;
+.pixel-head-title {
+  font-size: 15px; font-weight: 800;
 }
-.pixel-canvas-wrap {
-  display: flex; justify-content: center; margin-bottom: 14px;
-  background: var(--card-2); padding: 14px; border-radius: 14px;
-  overflow: auto;
+.pixel-head-hint {
+  font-size: 12px; color: var(--muted);
+}
+.pixel-stage {
+  display: flex; justify-content: center; align-items: center;
+  padding: 12px;
+  background: var(--card-2);
+  border-radius: 14px;
+  margin-bottom: 14px;
+  overflow: hidden;
 }
 .pixel-canvas {
-  display: block; cursor: crosshair;
-  border-radius: 6px;
+  display: block;
+  cursor: crosshair;
   touch-action: none;
-  background:
-    linear-gradient(45deg, var(--line) 25%, transparent 25%),
-    linear-gradient(-45deg, var(--line) 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, var(--line) 75%),
-    linear-gradient(-45deg, transparent 75%, var(--line) 75%);
-  background-size: 12px 12px;
-  background-position: 0 0, 0 6px, 6px -6px, -6px 0px;
-  background-color: var(--card);
+  border-radius: 4px;
+  background: #000;
+  image-rendering: pixelated;
+  -ms-interpolation-mode: nearest-neighbor;
 }
+[data-theme="light"] .pixel-canvas { background: #fff; }
 .pixel-palette {
-  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+  margin-bottom: 12px;
 }
-.pixel-swatch {
-  width: 30px; height: 30px;
-  border-radius: 8px; border: 2px solid var(--line-2);
-  cursor: pointer; transition: transform .1s, border-color .1s;
+.px-swatch {
+  aspect-ratio: 1 / 1;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  padding: 0;
   position: relative;
+  transition: transform .1s, border-color .1s, box-shadow .1s;
 }
-.pixel-swatch:hover { transform: scale(1.08); }
-.pixel-swatch.selected {
+.px-swatch:hover { transform: scale(1.06); }
+.px-swatch.active {
   border-color: var(--text);
   box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--text);
 }
-.pixel-swatch[data-color="0"] {
+.px-swatch.eraser {
   background:
     linear-gradient(45deg, #666 25%, transparent 25%),
     linear-gradient(-45deg, #666 25%, transparent 25%),
@@ -2323,64 +2319,70 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
   background-color: #2a2a2a;
 }
 .pixel-actions {
-  display: flex; gap: 8px; flex-wrap: wrap;
+  display: flex; gap: 8px;
 }
-.pixel-action {
-  height: 36px; padding: 0 14px;
+.px-btn {
+  flex: 1; height: 40px;
   background: var(--card-2); color: var(--text);
-  border: none; border-radius: 10px;
-  font-family: inherit; font-size: 13px; font-weight: 600;
-  cursor: pointer;
+  border: none; border-radius: 12px;
+  font-family: inherit; font-size: 14px; font-weight: 700;
+  cursor: pointer; transition: background .12s;
 }
-.pixel-action:hover { background: var(--hover); }
+.px-btn:hover { background: var(--hover); }
+.px-btn.danger { color: var(--danger); }
 
 /* TABLET */
 @media (max-width: 1100px) and (min-width: 901px) {
   .sidebar { flex: 0 0 76px; width: 76px; padding: 16px 8px; }
-  .sidebar .logo { font-size: 18px; padding: 4px 6px 18px; text-align: center; }
+  .sidebar .logo { font-size: 16px; padding: 4px 6px 18px; text-align: center; letter-spacing: 0; }
   .nav-btn { flex-direction: column; gap: 4px; padding: 10px 6px; font-size: 11px;
     justify-content: center; align-items: center; text-align: center; }
   .nav-btn span { font-size: 11px; }
   .nav-btn .badge { position: absolute; top: 2px; right: 8px;
     min-width: 18px; height: 18px; line-height: 18px; font-size: 10px; padding: 0 5px; }
-  .sidebar-user { font-size: 11px; padding: 10px 4px; justify-content: center; }
-  .sidebar-user .nick-text { display: none; }
 }
 
 /* MOBILE */
 @media (max-width: 900px) {
   .layout { flex-direction: column; }
-  .main { order: 1; height: calc(100vh - 70px - env(safe-area-inset-bottom, 0)); }
+  .main {
+    order: 1;
+    height: calc(100vh - 68px - env(safe-area-inset-bottom, 0px));
+    height: calc(100dvh - 68px - env(safe-area-inset-bottom, 0px));
+  }
   .sidebar {
     order: 2;
-    width: 100%; height: calc(70px + env(safe-area-inset-bottom, 0));
-    flex-direction: row; border-top: 1px solid var(--line);
-    padding: 0 0 env(safe-area-inset-bottom, 0);
+    width: 100%;
+    height: calc(68px + env(safe-area-inset-bottom, 0px));
+    flex-direction: row;
+    border-top: 1px solid var(--line);
+    padding: 0 0 env(safe-area-inset-bottom, 0px);
     flex: 0 0 auto;
+    background: var(--card);
   }
   .sidebar .logo { display: none; }
   .sidebar .spacer { display: none; }
-  .sidebar-user { display: none; }
   .sidebar-logout { display: none; }
   .nav { flex-direction: row; flex: 1; justify-content: space-around; align-items: stretch; }
   .nav-btn {
-    flex-direction: column; gap: 3px; padding: 8px 4px;
+    flex-direction: column; gap: 2px; padding: 8px 4px;
     flex: 1; justify-content: center; align-items: center;
-    text-align: center; border-radius: 0; min-height: 68px;
+    text-align: center; border-radius: 0;
+    min-height: 66px;
   }
   .nav-btn span { font-size: 10px; line-height: 1; font-weight: 500; }
-  .nav-btn svg { width: 24px; height: 24px; }
+  .nav-btn svg { width: 22px; height: 22px; }
   .nav-btn.active { background: transparent; }
   .nav-btn.active svg, .nav-btn.active span { color: var(--text); }
   .nav-btn .badge {
-    position: absolute; top: 4px; right: 18%;
+    position: absolute; top: 2px; right: 20%;
     min-width: 16px; height: 16px; line-height: 16px;
     font-size: 10px; padding: 0 4px; border-radius: 8px;
   }
   .main-header { padding: 14px 16px; }
   .main-header .title { font-size: 20px; }
-  .main-inner { padding: 16px 12px 100px; }
-  .card, .post-card { border-radius: 18px; padding: 14px; }
+  .main-inner { padding: 16px 12px 40px; }
+  .card, .post-card, .pixel-block { border-radius: 18px; padding: 14px; }
 
   .profile-cover { height: 110px; border-radius: 18px; margin-bottom: 46px; }
   .profile-cover-avatar { left: 16px; bottom: -42px; }
@@ -2409,16 +2411,16 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px;
 
   .modal-actions { flex-direction: column-reverse; }
 
-  .pixel-swatch { width: 26px; height: 26px; }
+  .pixel-palette { grid-template-columns: repeat(8, 1fr); gap: 5px; }
 }
 @media (max-width: 500px) {
-  .main-inner { padding: 12px 10px 90px; }
-  .card, .post-card { border-radius: 16px; padding: 12px; }
+  .main-inner { padding: 12px 10px 30px; }
+  .card, .post-card, .pixel-block { border-radius: 16px; padding: 12px; }
   .profile-cover { height: 90px; margin-bottom: 42px; }
   .profile-cover-avatar .avatar { width: 68px; height: 68px; font-size: 24px; }
   .profile-name { font-size: 18px; }
   .profile-stats { font-size: 13px; gap: 16px; }
-  .pixel-swatch { width: 24px; height: 24px; }
+  .pixel-palette { gap: 4px; }
 }
 """
 
@@ -2435,25 +2437,12 @@ var ICONS = {
   eye: __I_EYE__, cal: __I_CAL__
 };
 
-// 16-цветная палитра: индекс = символ в hex (0-f)
-// 0 = прозрачный (ластик)
 var PALETTE = [
-  null,           // 0 - прозрачный
-  '#000000',      // 1
-  '#262626',      // 2
-  '#525252',      // 3
-  '#a3a3a3',      // 4
-  '#ffffff',      // 5
-  '#dc2626',      // 6 красный
-  '#ea580c',      // 7 оранжевый
-  '#facc15',      // 8 жёлтый
-  '#16a34a',      // 9 зелёный
-  '#0d9488',      // 10 бирюзовый
-  '#2563eb',      // 11 синий
-  '#4f46e5',      // 12 индиго
-  '#9333ea',      // 13 фиолетовый
-  '#db2777',      // 14 розовый
-  '#78350f'       // 15 коричневый
+  null,
+  '#000000', '#262626', '#525252', '#a3a3a3', '#ffffff',
+  '#dc2626', '#ea580c', '#facc15', '#16a34a',
+  '#0d9488', '#2563eb', '#4f46e5', '#9333ea',
+  '#db2777', '#78350f'
 ];
 
 function pixelsToCssUrl(pixels, w, h) {
@@ -2504,10 +2493,10 @@ var state = {
   settingsSection: 'account',
   es: null,
   presenceTimer: null,
-  // pixel editors
   avatarPixels: '',
   headerPixels: '',
-  currentColor: 5
+  currentColor: 5,
+  whoami: null
 };
 
 function setUser(u) {
@@ -2582,6 +2571,15 @@ function truncateText(text) {
   return { text: out, truncated: truncated };
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
+
+function autoGrow(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  var maxH = 400;
+  var h = Math.min(el.scrollHeight, maxH);
+  el.style.height = h + 'px';
+  el.style.overflowY = (el.scrollHeight > maxH) ? 'auto' : 'hidden';
+}
 
 function showConfirm(text, onConfirm, opts) {
   opts = opts || {};
@@ -2730,7 +2728,6 @@ function renderSidebar() {
     html += navBtn(ICONS.gear, tr('nav_settings'),
       state.view === 'settings' || state.view === 'edit_profile', 'settings');
     html += '</div><div class="spacer"></div>';
-    html += '<div class="sidebar-user" data-nav="profile"><span class="star">★</span><span class="nick-text">@' + escapeHtml(state.user.nick) + '</span></div>';
     html += '<button class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
   } else {
     html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
@@ -2781,7 +2778,6 @@ function bindLinks(root) {
   });
 }
 
-// ============ COMPOSER ============
 function composerHtml(opts) {
   opts = opts || {};
   var u = state.user;
@@ -2796,15 +2792,11 @@ function composerHtml(opts) {
     + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
     + '<div id="' + idPrefix + 'QuoteBox"></div>'
     + '<div class="composer-actions">'
-    + '<button class="composer-icon" type="button">' + svgAttach() + '</button>'
-    + '<button class="composer-icon" type="button">' + svgEmoji() + '</button>'
+    + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted)">0 / ' + MAX_POST_LEN + '</span>'
     + '<div class="spacer"></div>'
-    + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted);margin-right:8px">0 / ' + MAX_POST_LEN + '</span>'
     + '<button class="publish-btn" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
     + '</div></div></div></div>';
 }
-function svgAttach() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66L9.41 16.55a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>'; }
-function svgEmoji() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>'; }
 
 function renderQuoteBox(idPrefix) {
   var el = document.getElementById(idPrefix + 'QuoteBox');
@@ -2836,6 +2828,7 @@ function bindComposer(opts) {
     sendBtn.disabled = empty || len > MAX_POST_LEN;
     if (opts.draftKey === 'wall') state.wallDraft = inputEl.value;
     else state.composerDraft = inputEl.value;
+    autoGrow(inputEl);
   }
   inputEl.addEventListener('input', upd);
   sendBtn.addEventListener('click', async function(){
@@ -2855,6 +2848,8 @@ function bindComposer(opts) {
   });
   renderQuoteBox(idPrefix);
   upd();
+  // initial auto-grow
+  autoGrow(inputEl);
 }
 
 // ============ FEED ============
@@ -3091,7 +3086,6 @@ async function loadProfileTab(u, isMe) {
       } else if (state.user) {
         var reasonText = data.reason === 'err_need_follow' ? tr('wall_must_follow')
                        : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                       : data.reason === 'err_user_blocked' ? tr('err_user_blocked')
                        : '';
         html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
       }
@@ -3129,26 +3123,45 @@ async function loadProfileTab(u, isMe) {
 // ============ PIXEL EDITOR ============
 function setupPixelEditor(opts) {
   var canvas = opts.canvas;
-  var w = opts.w, h = opts.h;
+  var w = opts.w, h = opts.h, cellSize = opts.cellSize;
   var getPixels = opts.getPixels;
   var setPixels = opts.setPixels;
   var getColor = opts.getColor;
 
-  canvas.width = w;
-  canvas.height = h;
-  canvas.style.width = opts.displayW + 'px';
-  canvas.style.height = opts.displayH + 'px';
+  canvas.width = w * cellSize;
+  canvas.height = h * cellSize;
   var ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
 
   function draw() {
-    var pixels = getPixels();
+    var pixels = getPixels() || '';
     if (!pixels) pixels = '0'.repeat(w * h);
-    ctx.clearRect(0, 0, w, h);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // cells
     for (var i = 0; i < w * h; i++) {
       var c = parseInt(pixels[i] || '0', 16);
       if (!c || !PALETTE[c]) continue;
+      var x = (i % w) * cellSize;
+      var y = ((i / w) | 0) * cellSize;
       ctx.fillStyle = PALETTE[c];
-      ctx.fillRect(i % w, (i / w) | 0, 1, 1);
+      ctx.fillRect(x, y, cellSize, cellSize);
+    }
+
+    // grid lines
+    ctx.strokeStyle = 'rgba(128,128,128,0.18)';
+    ctx.lineWidth = 1;
+    for (var gx = 0; gx <= w; gx++) {
+      ctx.beginPath();
+      ctx.moveTo(gx * cellSize + 0.5, 0);
+      ctx.lineTo(gx * cellSize + 0.5, canvas.height);
+      ctx.stroke();
+    }
+    for (var gy = 0; gy <= h; gy++) {
+      ctx.beginPath();
+      ctx.moveTo(0, gy * cellSize + 0.5);
+      ctx.lineTo(canvas.width, gy * cellSize + 0.5);
+      ctx.stroke();
     }
   }
 
@@ -3193,18 +3206,30 @@ function setupPixelEditor(opts) {
   canvas.addEventListener('touchend', function() { painting = false; });
   canvas.addEventListener('touchcancel', function() { painting = false; });
 
-  return { redraw: draw };
+  draw();
+  return { redraw: draw, destroy: function(){ painting = false; } };
 }
 
-function renderPaletteHtml(selected) {
+function paletteHtml(currentColor) {
   var html = '';
   for (var i = 0; i < 16; i++) {
-    var bg = PALETTE[i];
-    var style = bg ? 'background:' + bg : '';
-    var cls = 'pixel-swatch' + (i === selected ? ' selected' : '');
-    html += '<div class="' + cls + '" data-color="' + i + '" style="' + style + '"></div>';
+    if (i === 0) {
+      html += '<button class="px-swatch eraser' + (currentColor === 0 ? ' active' : '') + '" data-color="0" title="Eraser"></button>';
+    } else {
+      var bg = PALETTE[i];
+      html += '<button class="px-swatch' + (currentColor === i ? ' active' : '') + '" data-color="' + i + '" style="background:' + bg + '"></button>';
+    }
   }
   return html;
+}
+
+function computeCellSizes() {
+  var w = window.innerWidth;
+  var availAvatar = Math.min(w - 80, 400);
+  var availHeader = Math.min(w - 80, 720);
+  var avatarCell = Math.max(24, Math.min(40, Math.floor(availAvatar / 8)));
+  var headerCell = Math.max(8, Math.min(20, Math.floor(availHeader / 32)));
+  return { avatarCell: avatarCell, headerCell: headerCell };
 }
 
 // ============ EDIT PROFILE ============
@@ -3213,29 +3238,33 @@ function renderEditProfileView(el) {
   var u = state.user;
   state.avatarPixels = u.avatar_pixels || '';
   state.headerPixels = u.header_pixels || '';
+  state.currentColor = 5;
+
+  var cells = computeCellSizes();
 
   var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
     + '<div class="title">' + tr('edit_profile_title') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
 
-  html += '<div class="card">'
-    + '<div class="pixel-section">'
-    + '<div class="pixel-title">' + escapeHtml(tr('avatar_title')) + '</div>'
-    + '<div class="pixel-sub">' + escapeHtml(tr('pixel_hint')) + '</div>'
-    + '<div class="pixel-canvas-wrap"><canvas id="avatarCanvas" class="pixel-canvas"></canvas></div>'
-    + '<div class="pixel-palette" id="avatarPalette">' + renderPaletteHtml(state.currentColor) + '</div>'
-    + '<div class="pixel-actions">'
-    + '<button class="pixel-action" id="avatarClear">' + escapeHtml(tr('pixel_clear')) + '</button>'
-    + '</div></div>'
-    + '<div class="pixel-section" style="margin-bottom:0">'
-    + '<div class="pixel-title">' + escapeHtml(tr('header_title')) + '</div>'
-    + '<div class="pixel-sub">' + escapeHtml(tr('pixel_hint')) + '</div>'
-    + '<div class="pixel-canvas-wrap"><canvas id="headerCanvas" class="pixel-canvas"></canvas></div>'
-    + '<div class="pixel-palette" id="headerPalette">' + renderPaletteHtml(state.currentColor) + '</div>'
-    + '<div class="pixel-actions">'
-    + '<button class="pixel-action" id="headerClear">' + escapeHtml(tr('pixel_clear')) + '</button>'
-    + '</div></div>'
+  html += '<div class="pixel-block">'
+    + '<div class="pixel-head">'
+    + '<div class="pixel-head-title">' + escapeHtml(tr('avatar_title')) + '</div>'
+    + '<div class="pixel-head-hint">' + escapeHtml(tr('pixel_hint')) + '</div>'
+    + '</div>'
+    + '<div class="pixel-stage"><canvas id="avatarCanvas" class="pixel-canvas"></canvas></div>'
+    + '<div class="pixel-palette" id="avatarPalette">' + paletteHtml(5) + '</div>'
+    + '<div class="pixel-actions"><button class="px-btn danger" id="avatarClear">' + escapeHtml(tr('pixel_clear')) + '</button></div>'
+    + '</div>';
+
+  html += '<div class="pixel-block">'
+    + '<div class="pixel-head">'
+    + '<div class="pixel-head-title">' + escapeHtml(tr('header_title')) + '</div>'
+    + '<div class="pixel-head-hint">' + escapeHtml(tr('pixel_hint')) + '</div>'
+    + '</div>'
+    + '<div class="pixel-stage"><canvas id="headerCanvas" class="pixel-canvas"></canvas></div>'
+    + '<div class="pixel-palette" id="headerPalette">' + paletteHtml(5) + '</div>'
+    + '<div class="pixel-actions"><button class="px-btn danger" id="headerClear">' + escapeHtml(tr('pixel_clear')) + '</button></div>'
     + '</div>';
 
   html += '<div class="card"><form id="editForm" style="display:flex;flex-direction:column;gap:10px">'
@@ -3243,7 +3272,7 @@ function renderEditProfileView(el) {
     + '<input type="text" name="nick" maxlength="20" placeholder="' + escapeHtml(tr('nick_ph')) + '" value="' + escapeHtml(u.nick) + '" required style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
     + '<input type="text" name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" value="' + escapeHtml(u.bio || '') + '" style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
     + '<div class="auth-error" id="editError"></div>'
-    + '<button type="submit" class="publish-btn" style="height:52px;font-size:16px">' + tr('save') + '</button>'
+    + '<button type="submit" class="publish-btn" style="height:52px;font-size:16px;width:100%">' + tr('save') + '</button>'
     + '</form></div>';
 
   html += '</div></div>';
@@ -3251,33 +3280,45 @@ function renderEditProfileView(el) {
   bindThemeBtn(); bindLinks(el);
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
 
-  // editor avatar
-  var avatarEditor = setupPixelEditor({
-    canvas: document.getElementById('avatarCanvas'),
-    w: 8, h: 8,
-    displayW: 240, displayH: 240,
-    getPixels: function(){ return state.avatarPixels; },
-    setPixels: function(v){ state.avatarPixels = v; },
-    getColor: function(){ return state.currentColor; }
-  });
-  var headerEditor = setupPixelEditor({
-    canvas: document.getElementById('headerCanvas'),
-    w: 32, h: 16,
-    displayW: 512, displayH: 256,
-    getPixels: function(){ return state.headerPixels; },
-    setPixels: function(v){ state.headerPixels = v; },
-    getColor: function(){ return state.currentColor; }
-  });
+  // setup editors
+  var avCanvas = document.getElementById('avatarCanvas');
+  var hdCanvas = document.getElementById('headerCanvas');
+  var editors = [];
+
+  function mountEditors() {
+    editors.forEach(function(e){ if (e.destroy) e.destroy(); });
+    editors = [];
+    // resize canvases to current cell size
+    var c = computeCellSizes();
+    avCanvas.width = 8 * c.avatarCell;
+    avCanvas.height = 8 * c.avatarCell;
+    hdCanvas.width = 32 * c.headerCell;
+    hdCanvas.height = 16 * c.headerCell;
+    editors.push(setupPixelEditor({
+      canvas: avCanvas, w: 8, h: 8, cellSize: c.avatarCell,
+      getPixels: function(){ return state.avatarPixels; },
+      setPixels: function(v){ state.avatarPixels = v; },
+      getColor: function(){ return state.currentColor; }
+    }));
+    editors.push(setupPixelEditor({
+      canvas: hdCanvas, w: 32, h: 16, cellSize: c.headerCell,
+      getPixels: function(){ return state.headerPixels; },
+      setPixels: function(v){ state.headerPixels = v; },
+      getColor: function(){ return state.currentColor; }
+    }));
+  }
+  mountEditors();
 
   // palettes
   function bindPalette(rootId) {
     var root = document.getElementById(rootId);
     if (!root) return;
-    root.querySelectorAll('.pixel-swatch').forEach(function(sw){
-      sw.addEventListener('click', function(){
+    root.querySelectorAll('.px-swatch').forEach(function(sw){
+      sw.addEventListener('click', function(e){
+        e.preventDefault();
         state.currentColor = parseInt(sw.dataset.color, 10);
-        document.querySelectorAll('.pixel-swatch').forEach(function(x){
-          x.classList.toggle('selected', parseInt(x.dataset.color, 10) === state.currentColor);
+        document.querySelectorAll('.px-swatch').forEach(function(x){
+          x.classList.toggle('active', parseInt(x.dataset.color, 10) === state.currentColor);
         });
       });
     });
@@ -3287,26 +3328,19 @@ function renderEditProfileView(el) {
 
   document.getElementById('avatarClear').addEventListener('click', function(){
     state.avatarPixels = '0'.repeat(64);
-    avatarEditor.redraw();
+    if (editors[0]) editors[0].redraw();
   });
   document.getElementById('headerClear').addEventListener('click', function(){
     state.headerPixels = '0'.repeat(512);
-    headerEditor.redraw();
+    if (editors[1]) editors[1].redraw();
   });
 
-  // resize для планшета/мобилки
-  function resizeEditors() {
-    var w = window.innerWidth;
-    var av = w < 480 ? 200 : 240;
-    var hd = Math.min(w - 60, 512);
-    var hh = Math.round(hd / 2);
-    var avc = document.getElementById('avatarCanvas');
-    var hdc = document.getElementById('headerCanvas');
-    if (avc) { avc.style.width = av + 'px'; avc.style.height = av + 'px'; }
-    if (hdc) { hdc.style.width = hd + 'px'; hdc.style.height = hh + 'px'; }
-  }
-  resizeEditors();
-  window.addEventListener('resize', resizeEditors);
+  // re-mount on resize
+  var rTimer = null;
+  window.addEventListener('resize', function(){
+    clearTimeout(rTimer);
+    rTimer = setTimeout(mountEditors, 200);
+  });
 
   var form = document.getElementById('editForm');
   var errEl = document.getElementById('editError');
@@ -3497,10 +3531,9 @@ function renderSettingsView(el) {
   var allowG = me.allow_following_view !== false;
   var nnp = me.notify_on_new_post !== false;
   var allowW = me.allow_wall_posts !== false;
-  var bl = me.blacklist || [];
   var sec = state.settingsSection || 'account';
 
-  var html = '<div class="main-header"><div class="title">' + tr('settings_title') + '</div>'
+  var html = '<div class="main-header wide"><div class="title">' + tr('settings_title') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="settings-layout">';
   html += '<nav class="settings-nav">';
@@ -3533,20 +3566,8 @@ function renderSettingsView(el) {
     html += '<p class="settings-desc" style="margin-top:8px">' + escapeHtml(tr('settings_allow_wall_hint')) + '</p>';
     html += '</div>';
 
-    html += '<div class="settings-block"><h2>' + tr('settings_blacklist') + '</h2>';
-    html += '<p class="settings-desc">' + escapeHtml(tr('settings_blacklist_hint')) + '</p>';
-    html += '<div class="blacklist-add">';
-    html += '<input type="text" id="blInput" placeholder="' + escapeHtml(tr('settings_blacklist_add_ph')) + '" autocomplete="off" />';
-    html += '<button id="blAdd">' + tr('settings_blacklist_add') + '</button>';
-    html += '</div>';
-    if (bl.length) {
-      html += bl.map(function(n){
-        return '<div class="blacklist-item"><span class="nick"><a href="/u/' + encodeURIComponent(n) + '" data-link>@' + escapeHtml(n) + '</a></span>'
-          + '<button class="rm" data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button></div>';
-      }).join('');
-    } else {
-      html += '<p class="settings-desc" style="text-align:center;padding:14px 0">' + escapeHtml(tr('settings_blacklist_empty')) + '</p>';
-    }
+    html += '<div class="settings-block"><h2>' + tr('settings_device') + '</h2>';
+    html += '<div class="device-info" id="deviceInfo">' + spinner() + '</div>';
   } else {
     html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
   }
@@ -3628,31 +3649,27 @@ function renderSettingsView(el) {
       }
     });
   });
-  var blAdd = document.getElementById('blAdd');
-  if (blAdd) {
-    var blInput = document.getElementById('blInput');
-    async function addBL() {
-      var v = blInput.value.trim().replace(/^@/, '');
-      if (!v) return;
-      try {
-        var r = await api('/api/users/me/blacklist', { method: 'POST', body: { nick: v } });
-        var meNow = state.user || {}; meNow.blacklist = r.blacklist || []; setUser(meNow);
-        renderSettingsView(el);
-      } catch(err) { alert(tr(err.message) || err.message); }
-    }
-    blAdd.addEventListener('click', addBL);
-    blInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') { e.preventDefault(); addBL(); } });
-  }
-  el.querySelectorAll('[data-bl-remove]').forEach(function(b){
-    b.addEventListener('click', async function(){
-      var nick = b.dataset.blRemove;
-      try {
-        var r = await api('/api/users/me/blacklist/' + encodeURIComponent(nick), { method: 'DELETE' });
-        var meNow = state.user || {}; meNow.blacklist = r.blacklist || []; setUser(meNow);
-        renderSettingsView(el);
-      } catch(err) { alert(tr(err.message) || err.message); }
+
+  // load device info
+  var di = document.getElementById('deviceInfo');
+  if (di) {
+    api('/api/whoami').then(function(info){
+      state.whoami = info;
+      var city = info.city || '—';
+      var country = info.country ? (', ' + info.country) : '';
+      var cityFull = (city === '—') ? '—' : (city + country);
+      di.innerHTML = ''
+        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_browser')) + '</span>'
+        + '<span class="value">' + escapeHtml(info.browser || '—') + '</span></div>'
+        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_os')) + '</span>'
+        + '<span class="value">' + escapeHtml(info.os || '—') + '</span></div>'
+        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_city')) + '</span>'
+        + '<span class="value">' + escapeHtml(cityFull) + '</span></div>';
+    }).catch(function(){
+      di.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>';
     });
-  });
+  }
+
   var lo = document.getElementById('settingsLogout');
   if (lo) lo.addEventListener('click', doLogoutConfirm);
 }
@@ -3723,7 +3740,6 @@ function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
   var downCls = p.user_vote === -1 ? 'active' : '';
-  var scCls = score > 0 ? 'pos' : (score < 0 ? 'neg' : '');
   var displayText = p.text, truncated = false;
   if (!showComments) {
     var res = truncateText(p.text);
@@ -3933,14 +3949,14 @@ function bindPostActions(root) {
             if (qb) {
               renderQuoteBox('post');
               var inp = document.getElementById('postInput');
-              if (inp) { inp.value = ''; inp.focus(); }
+              if (inp) { inp.value = ''; inp.focus(); autoGrow(inp); }
               var s = document.getElementById('postSend');
               if (s) s.disabled = false;
             }
           }, 50); return; }
           renderQuoteBox('post');
           var inp = document.getElementById('postInput');
-          if (inp) { inp.value = ''; inp.focus(); }
+          if (inp) { inp.value = ''; inp.focus(); autoGrow(inp); }
           var s = document.getElementById('postSend');
           if (s) s.disabled = false;
         } catch(e) { alert(tr(e.message) || e.message); }
@@ -4051,11 +4067,6 @@ async function translatePost(postId, btn) {
     renderSidebar(); renderMain();
     if (state.user) { connectSSE(); refreshCounters(); }
   });
-  setInterval(function(){
-    if (document.hidden) return;
-    if (!state.user) return;
-    if (state.suppressRefresh && Date.now() < state.suppressRefresh) return;
-  }, 25000);
 })();
 """
 
@@ -4092,6 +4103,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         '<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
         '<meta name="color-scheme" content="dark light" />\n'
+        '<meta name="theme-color" content="#0a0a0a" />\n'
         f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
         '<title>sldchat</title>\n'
         '<style>' + CSS + '</style>\n'
