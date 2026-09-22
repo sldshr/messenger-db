@@ -1,5 +1,5 @@
 # main.py
-import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request, urllib.parse
+import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request
@@ -7,7 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="sldchat")
+app = FastAPI(title="SLD")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -17,15 +17,16 @@ if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("[sldchat] Supabase connected")
+        print("[SLD] Supabase connected")
     except Exception as e:
-        print("[sldchat] Supabase init error:", e)
+        print("[SLD] Supabase init error:", e)
 
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
 POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
 _VIEW_COOLDOWN: Dict[str, float] = {}
+_OG_CACHE: Dict[str, Optional[dict]] = {}
 
 MAX_POST_LEN = 1000
 MAX_COMMENT_LEN = 500
@@ -38,6 +39,7 @@ USER_CACHE_TTL = 3.0
 RATE_WINDOW = 60.0
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
+URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 _lang_cache: Dict[str, str] = {}
 _geo_cache: Dict[str, dict] = {}
@@ -46,35 +48,22 @@ _RATE: Dict[str, List[float]] = {}
 
 DEFAULT_EMOJI = "🐱"
 
-# Список эмодзи (150+)
+# Только универсальные эмодзи (Unicode 6.0–8.0, есть везде: Windows 10+, macOS, Android 7+, iOS 10+)
 EMOJIS_RAW = (
-    "🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵"
-    "🐔🐧🐦🐤🦆🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋"
-    "🐌🐞🐜🦗🕷🕸🦂🐢🐍🦎🐙🦑🦐🦞🦀"
-    "🐡🐠🐟🐬🐳🐋🦈🐊🐅🐆🦓🦍🐘🦛🦏"
-    "🐪🐫🦒🦘🐃🐂🐄🐎🐖🐏🐑🦙🐐🦌🐕"
-    "🐩🐈🐓🦃🦚🦜🦢🦩🕊🐇🦝🦨🦡🦦🦥"
-    "🐁🐀🐿🦔🌵🎄🌲🌳🌴🌱🌿☘🍀🎍🎋"
-    "🍃🍂🍁🍄🌾💐🌷🌹🥀🌺🌸🌼🌻🌞🌝"
-    "🌛🌜🌚🌕🌖🌗🌘🌑🌒🌓🌔🌙🌎🌍🌏"
-    "🪐💫⭐🌟✨⚡🔥💥☄☀🌤⛅🌥☁🌦"
-    "🌧⛈🌩🌨❄☃⛄🌬💨🌪🌫🌈☔💧💦🌊"
-    "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍"
-    "🤩😘😗😚😙🥲😋😛😜🤪😝🤑🤗🤭🤫"
-    "🤔🤐🤨😐😑😶😏😒🙄😬🤥😌😔😪🤤"
-    "😴😷🤒🤕🤢🤮🤧🥵🥶🥴😵🤯🤠🥳😎"
-    "🤓🧐😕😟🙁☹😮😯😲😳🥺😦😧😨😰"
-    "😥😢😭😱😖😣😞😓😩😫🥱😤😡😠🤬"
-    "😈👿💀☠💩🤡👹👺👻👽👾🤖😺😸😹"
-    "😻😼😽🙀😿😾🙈🙉🙊👋🤚🖐✋🖖👌"
-    "🤌🤏✌🤞🤟🤘🤙👈👉👆🖕👇☝👍👎"
-    "✊👊🤛🤜👏🙌👐🤲🤝🙏💪🦾🦿🦵🦶"
-    "👂🦻👃🧠🦷🦴👀👁👅👄💋❤🧡💛💚"
-    "💙💜🖤🤍🤎💔❣💕💞💓💗💖💘💝💟"
-    "🎃🎄🎆🎇🧨✨🎈🎉🎊🎋🎍🎎🎏🎐🎑"
-    "🧧🎀🎁🎗🎟🎫🎖🏆🏅🥇🥈🥉⚽⚾🏀"
+    "😀😃😄😁😆😅😂😊😇🙂🙃😉😌😍😘😗😙😚😋😛😝😜😎"
+    "😏😒😞😔😟😕🙁☹😣😖😫😩😢😭😤😠😡😳😱😨😰😥😓"
+    "🤗🤔🤐😶😐😑😬🙄😯😦😧😮😲😴🤤😪😵🤢🤧😷🤒🤕"
+    "😈👿👹👺💩💀👻👽👾🤖🎃😺😸😹😻😼😽🙀😿😾"
+    "🐶🐱🐭🐹🐰🐻🐼🐨🐯🐮🐷🐸🐵"
+    "🐔🐧🐦🐤🐺🐴🐝🐛🐢🐍🐙🐠🐟🐬🐳🐋"
+    "🌵🎄🌲🌳🌴🌱🌿🍀🍃🍂🍁🍄🌾"
+    "🌷🌹🌺🌸🌼🌻💐"
+    "🌞🌝🌛🌜🌚🌕🌙🌎🌍🌏"
+    "⭐🌟✨⚡🔥💥🌈💧🌊"
+    "🍎🍊🍋🍌🍉🍇🍓🍒🍑🍍🍅"
+    "🍞🍔🍟🍕🍜🍣🍦🍩🍪🎂🍰🍫🍬"
 )
-EMOJIS = [c for c in EMOJIS_RAW]
+EMOJIS = list(EMOJIS_RAW)
 
 
 class EventBus:
@@ -178,13 +167,54 @@ def extract_mentions(text: str) -> List[str]:
     return out
 
 
-def clean_emoji(s: Optional[str]) -> str:
-    if not s: return ""
-    s = s.strip()
-    # только один эмодзи — берём первый символ (или пару если это составной)
-    if not s: return ""
-    # Разрешаем до 8 codepoint'ов (на случай compound-эмодзи)
-    return s[:8]
+def extract_first_url(text: str) -> Optional[str]:
+    if not text: return None
+    m = URL_RE.search(text)
+    return m.group(0) if m else None
+
+
+def fetch_og_data(url: str) -> Optional[dict]:
+    if not url: return None
+    if url in _OG_CACHE:
+        return _OG_CACHE[url]
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SLDbot/1.0; +https://example.com)",
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read(200000)
+            html = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        _OG_CACHE[url] = None
+        return None
+
+    def og(prop):
+        patterns = [
+            r'<meta[^>]+property=["\']og:' + prop + r'["\'][^>]+content=["\']([^"\']*)["\']',
+            r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+property=["\']og:' + prop + r'["\']',
+            r'<meta[^>]+name=["\']og:' + prop + r'["\'][^>]+content=["\']([^"\']*)["\']',
+        ]
+        for p in patterns:
+            m = re.search(p, html, re.I)
+            if m: return m.group(1)
+        return ""
+
+    data = {
+        "url": url,
+        "title": (og("title") or "").strip()[:200],
+        "description": (og("description") or "").strip()[:300],
+        "image": (og("image") or "").strip()[:500],
+        "site_name": (og("site_name") or "").strip()[:100],
+    }
+    if not data["title"]:
+        m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
+        if m: data["title"] = m.group(1).strip()[:200]
+    if not (data["title"] or data["description"] or data["image"]):
+        _OG_CACHE[url] = None
+        return None
+    _OG_CACHE[url] = data
+    return data
 
 
 def parse_user_agent(ua: str):
@@ -226,7 +256,7 @@ def get_geo(ip: str) -> dict:
     try:
         req = urllib.request.Request(
             f"http://ip-api.com/json/{ip}?fields=countryCode,city,country",
-            headers={"User-Agent": "sldchat"})
+            headers={"User-Agent": "SLD"})
         with urllib.request.urlopen(req, timeout=2) as r:
             data = json.loads(r.read().decode())
         result = {
@@ -259,7 +289,7 @@ def detect_lang(ip: str, accept_language: str) -> str:
 def get_lang(request: Request) -> str:
     qp = request.query_params.get("lang")
     if qp in ("ru","en"): return qp
-    ck = request.cookies.get("sldchat_lang")
+    ck = request.cookies.get("SLD_lang")
     if ck in ("ru","en"): return ck
     return detect_lang(get_client_ip(request), request.headers.get("accept-language",""))
 
@@ -287,6 +317,12 @@ def invalidate_user_cache(nick: Optional[str] = None) -> None:
     else: _USER_CACHE.pop(nick.lower(), None)
 
 
+def clean_emoji(s: Optional[str]) -> str:
+    if not s: return ""
+    s = s.strip()
+    return s[:8]
+
+
 def db_load_user(nick: str) -> Optional[dict]:
     if not nick: return None
     if supabase:
@@ -301,8 +337,9 @@ def db_load_user(nick: str) -> Optional[dict]:
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
                 row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
+                row["show_link_previews"] = bool(row.get("show_link_previews", True))
                 return row
-        except Exception as e: print("[sldchat] db_load_user error:", e)
+        except Exception as e: print("[SLD] db_load_user error:", e)
         return None
     for u in USERS.values():
         if u["nick"].lower() == nick.lower(): return u
@@ -333,8 +370,9 @@ def db_save_user(u: dict) -> None:
             "notify_on_new_post": u.get("notify_on_new_post", True),
             "allow_wall_posts": u.get("allow_wall_posts", True),
             "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
+            "show_link_previews": u.get("show_link_previews", True),
         }).execute()
-    except Exception as e: print("[sldchat] db_save_user error:", e)
+    except Exception as e: print("[SLD] db_save_user error:", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
@@ -344,7 +382,7 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
         if nick in USERS: USERS[nick].update(patch)
         invalidate_user_cache(nick); return
     try: supabase.table("users").update(patch).eq("nick", nick).execute()
-    except Exception as e: print("[sldchat] db_update_user_fields error:", e)
+    except Exception as e: print("[SLD] db_update_user_fields error:", e)
     invalidate_user_cache(nick)
 
 
@@ -361,10 +399,11 @@ def db_all_users() -> List[dict]:
                 row["notify_on_new_post"] = bool(row.get("notify_on_new_post", True))
                 row["allow_wall_posts"] = bool(row.get("allow_wall_posts", True))
                 row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
+                row["show_link_previews"] = bool(row.get("show_link_previews", True))
                 out.append(row)
             return out
         except Exception as e:
-            print("[sldchat] db_all_users error:", e); return []
+            print("[SLD] db_all_users error:", e); return []
     return list(USERS.values())
 
 
@@ -377,8 +416,9 @@ def db_create_post(p: dict) -> None:
             "created_at": ts_to_iso(p["created_at"]),
             "wall_owner": p.get("wall_owner"),
             "quoted_post_id": p.get("quoted_post_id"),
+            "og_data": json.dumps(p.get("og_data")) if p.get("og_data") else "",
         }).execute()
-    except Exception as e: print("[sldchat] db_create_post error:", e)
+    except Exception as e: print("[SLD] db_create_post error:", e)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
@@ -386,7 +426,7 @@ def db_update_post_text(pid: str, text: str) -> None:
         if pid in POSTS_MEM: POSTS_MEM[pid]["text"] = text
         return
     try: supabase.table("posts").update({"text": text}).eq("id", pid).execute()
-    except Exception as e: print("[sldchat] db_update_post error:", e)
+    except Exception as e: print("[SLD] db_update_post error:", e)
 
 
 def db_delete_post(pid: str) -> None:
@@ -395,7 +435,7 @@ def db_delete_post(pid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("post_id", pid).execute()
         supabase.table("posts").delete().eq("id", pid).execute()
-    except Exception as e: print("[sldchat] db_delete_post error:", e)
+    except Exception as e: print("[SLD] db_delete_post error:", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
@@ -407,7 +447,7 @@ def db_get_post(pid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldchat] db_get_post error:", e); return None
+            print("[SLD] db_get_post error:", e); return None
     return POSTS_MEM.get(pid)
 
 
@@ -419,7 +459,7 @@ def db_inc_views(pid: str) -> None:
     try:
         supabase.rpc("increment_post_views", {"p_id": pid}).execute()
     except Exception as e:
-        print("[sldchat] db_inc_views error:", e)
+        print("[SLD] db_inc_views error:", e)
 
 
 def view_should_count(pid: str, vid: str) -> bool:
@@ -428,7 +468,6 @@ def view_should_count(pid: str, vid: str) -> bool:
     last = _VIEW_COOLDOWN.get(key, 0)
     if now - last < VIEW_COOLDOWN_SEC:
         return False
-    # проверим supabase
     if supabase:
         try:
             r = (supabase.table("post_views").select("last_viewed_at")
@@ -439,7 +478,7 @@ def view_should_count(pid: str, vid: str) -> bool:
                     _VIEW_COOLDOWN[key] = last_ts
                     return False
         except Exception as e:
-            print("[sldchat] view check error:", e)
+            print("[SLD] view check error:", e)
     return True
 
 
@@ -452,7 +491,7 @@ def view_mark_counted(pid: str, vid: str) -> None:
                 "post_id": pid, "viewer_id": vid,
                 "last_viewed_at": ts_to_iso(now)}).execute()
         except Exception as e:
-            print("[sldchat] view mark error:", e)
+            print("[SLD] view mark error:", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
@@ -465,7 +504,7 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 out[row["id"]] = row
         except Exception as e:
-            print("[sldchat] db_get_quotes error:", e)
+            print("[SLD] db_get_quotes error:", e)
         return out
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -489,7 +528,7 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldchat] db_list_posts error:", e); return []
+            print("[SLD] db_list_posts error:", e); return []
     items = [p for p in POSTS_MEM.values() if not p.get("wall_owner")]
     if author: items = [p for p in items if p["author"] == author]
     if subscriptions_of:
@@ -512,7 +551,7 @@ def db_list_wall_posts(owner: str) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldchat] db_list_wall_posts error:", e); return []
+            print("[SLD] db_list_wall_posts error:", e); return []
     items = [p for p in POSTS_MEM.values() if p.get("wall_owner") == owner]
     items.sort(key=lambda p: p["created_at"], reverse=True)
     return items
@@ -524,7 +563,7 @@ def db_post_votes(post_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("post_votes").select("*").in_("post_id", post_ids).execute().data or []
         except Exception as e:
-            print("[sldchat] db_post_votes error:", e); return []
+            print("[SLD] db_post_votes error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -542,7 +581,7 @@ def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("post_votes").upsert({
                     "post_id": post_id, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[sldchat] db_set_post_vote error:", e)
+        except Exception as e: print("[SLD] db_set_post_vote error:", e)
         return
     p = POSTS_MEM.get(post_id)
     if not p: return
@@ -559,7 +598,7 @@ def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldchat] db_comments_for_posts error:", e); return []
+            print("[SLD] db_comments_for_posts error:", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -577,7 +616,7 @@ def db_comment_votes(comment_ids: List[str]) -> List[dict]:
         try:
             return supabase.table("comment_votes").select("*").in_("comment_id", comment_ids).execute().data or []
         except Exception as e:
-            print("[sldchat] db_comment_votes error:", e); return []
+            print("[SLD] db_comment_votes error:", e); return []
     out = []
     for pid, p in POSTS_MEM.items():
         for c in p.get("comments", []):
@@ -600,7 +639,7 @@ def db_create_comment(c: dict) -> None:
             "id": c["id"], "post_id": c["post_id"], "author": c["author"],
             "parent_id": c.get("parent_id"), "text": c["text"],
             "created_at": ts_to_iso(c["created_at"])}).execute()
-    except Exception as e: print("[sldchat] db_create_comment error:", e)
+    except Exception as e: print("[SLD] db_create_comment error:", e)
 
 
 def db_update_comment_text(cid: str, text: str) -> None:
@@ -610,7 +649,7 @@ def db_update_comment_text(cid: str, text: str) -> None:
                 if c["id"] == cid: c["text"] = text; return
         return
     try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
-    except Exception as e: print("[sldchat] db_update_comment error:", e)
+    except Exception as e: print("[SLD] db_update_comment error:", e)
 
 
 def db_delete_comment(cid: str) -> None:
@@ -621,7 +660,7 @@ def db_delete_comment(cid: str) -> None:
     try:
         supabase.table("notifications").delete().eq("comment_id", cid).execute()
         supabase.table("comments").delete().eq("id", cid).execute()
-    except Exception as e: print("[sldchat] db_delete_comment error:", e)
+    except Exception as e: print("[SLD] db_delete_comment error:", e)
 
 
 def db_get_comment(cid: str) -> Optional[dict]:
@@ -633,7 +672,7 @@ def db_get_comment(cid: str) -> Optional[dict]:
             row["created_at"] = iso_to_ts(row.get("created_at"))
             return row
         except Exception as e:
-            print("[sldchat] db_get_comment error:", e); return None
+            print("[SLD] db_get_comment error:", e); return None
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
@@ -651,7 +690,7 @@ def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
             else:
                 supabase.table("comment_votes").upsert({
                     "comment_id": cid, "voter_id": voter_id, "direction": direction}).execute()
-        except Exception as e: print("[sldchat] db_set_comment_vote error:", e)
+        except Exception as e: print("[SLD] db_set_comment_vote error:", e)
         return
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
@@ -677,7 +716,7 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
                 "from_nick": n["from_nick"], "post_id": n["post_id"],
                 "comment_id": n["comment_id"] or None, "text": n["text"],
                 "read": n["read"], "created_at": ts_to_iso(n["created_at"])}).execute()
-        except Exception as e: print("[sldchat] db_notify error:", e)
+        except Exception as e: print("[SLD] db_notify error:", e)
         bus_publish(to_nick, {"type": "notification", "notif": n}); return
     NOTIFS_MEM.setdefault(to_nick, []).append(n)
     bus_publish(to_nick, {"type": "notification", "notif": n})
@@ -692,7 +731,7 @@ def db_notifications(nick: str) -> List[dict]:
             for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
             return rows
         except Exception as e:
-            print("[sldchat] db_notifications error:", e); return []
+            print("[SLD] db_notifications error:", e); return []
     items = list(NOTIFS_MEM.get(nick, []))
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:100]
@@ -705,14 +744,14 @@ def db_notifications_unread_count(nick: str) -> int:
                  .eq("to_nick", nick).eq("read", False).limit(1).execute())
             return r.count or 0
         except Exception as e:
-            print("[sldchat] db_notif_unread error:", e); return 0
+            print("[SLD] db_notif_unread error:", e); return 0
     return sum(1 for n in NOTIFS_MEM.get(nick, []) if not n.get("read"))
 
 
 def db_notifications_mark_read(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
-        except Exception as e: print("[sldchat] db_notif_read error:", e)
+        except Exception as e: print("[SLD] db_notif_read error:", e)
         return
     for n in NOTIFS_MEM.get(nick, []): n["read"] = True
 
@@ -720,7 +759,7 @@ def db_notifications_mark_read(nick: str) -> None:
 def db_notifications_clear(nick: str) -> None:
     if supabase:
         try: supabase.table("notifications").delete().eq("to_nick", nick).execute()
-        except Exception as e: print("[sldchat] db_notif_clear error:", e)
+        except Exception as e: print("[SLD] db_notif_clear error:", e)
         return
     NOTIFS_MEM[nick] = []
 
@@ -758,6 +797,7 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             "notify_on_new_post": old.get("notify_on_new_post", True),
             "allow_wall_posts": old.get("allow_wall_posts", True),
             "avatar_emoji": old.get("avatar_emoji", DEFAULT_EMOJI),
+            "show_link_previews": old.get("show_link_previews", True),
         }).execute()
         supabase.table("users").delete().eq("nick", old_nick).execute()
         supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
@@ -774,8 +814,20 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
             fw = u.get("followers") or set()
             if old_nick in fw: patch["followers"] = [new_nick if x == old_nick else x for x in fw]
             if patch: db_update_user_fields(u["nick"], patch)
-    except Exception as e: print("[sldchat] _rename_user_everywhere error:", e)
+    except Exception as e: print("[SLD] _rename_user_everywhere error:", e)
     invalidate_user_cache()
+
+
+def normalize_og(raw):
+    if not raw: return None
+    if isinstance(raw, dict): return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
@@ -830,6 +882,7 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
         out.append({"id": p["id"], "text": p["text"], "created_at": p["created_at"],
                     "author": p.get("author"), "wall_owner": p.get("wall_owner"),
                     "views": p.get("views") or 0,
+                    "og_data": normalize_og(p.get("og_data")),
                     "author_name": ad.get("name", p.get("author")),
                     "author_avatar_emoji": ad.get("avatar_emoji", DEFAULT_EMOJI),
                     "quoted_post_id": qid, "quoted": quoted,
@@ -849,12 +902,14 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
         d["allow_following_view"] = u.get("allow_following_view", True)
         d["notify_on_new_post"] = u.get("notify_on_new_post", True)
+        d["show_link_previews"] = u.get("show_link_previews", True)
     return d
 
 
 class PostIn(BaseModel):
     text: str
     quoted_post_id: Optional[str] = None
+    og_enabled: bool = True
 
 
 class PostEditIn(BaseModel): text: str
@@ -873,7 +928,14 @@ class SettingsIn(BaseModel):
     allow_following_view: Optional[bool] = None
     notify_on_new_post: Optional[bool] = None
     allow_wall_posts: Optional[bool] = None
-class TranslateIn(BaseModel): text: str; to: str
+    show_link_previews: Optional[bool] = None
+
+
+def _build_og_for_text(text: str, enabled: bool):
+    if not enabled: return None
+    url = extract_first_url(text or "")
+    if not url: return None
+    return fetch_og_data(url)
 
 
 @app.post("/api/register")
@@ -892,7 +954,7 @@ def api_register(data: RegisterIn, request: Request):
          "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
          "notify_on_new_post": True, "allow_wall_posts": True,
-         "avatar_emoji": DEFAULT_EMOJI}
+         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True}
     db_save_user(u)
     token = new_token()
     SESSIONS[token] = {"nick": nick, "created": time.time()}
@@ -914,8 +976,7 @@ def api_login(data: LoginIn, request: Request):
 @app.post("/api/logout")
 def api_logout(request: Request):
     token = request.headers.get("x-auth")
-    if token:
-        SESSIONS.pop(token, None)
+    if token: SESSIONS.pop(token, None)
     return {"ok": True}
 
 
@@ -932,10 +993,8 @@ def api_whoami(request: Request):
     ip = get_client_ip(request)
     browser, os_name = parse_user_agent(ua)
     geo = get_geo(ip)
-    return {
-        "browser": browser, "os": os_name,
-        "city": geo.get("city", ""), "country": geo.get("country", ""),
-    }
+    return {"browser": browser, "os": os_name,
+            "city": geo.get("city", ""), "country": geo.get("country", "")}
 
 
 @app.put("/api/users/me")
@@ -969,6 +1028,7 @@ def api_set_settings(data: SettingsIn, request: Request):
     if data.allow_following_view is not None: patch["allow_following_view"] = bool(data.allow_following_view)
     if data.notify_on_new_post is not None: patch["notify_on_new_post"] = bool(data.notify_on_new_post)
     if data.allow_wall_posts is not None: patch["allow_wall_posts"] = bool(data.allow_wall_posts)
+    if data.show_link_previews is not None: patch["show_link_previews"] = bool(data.show_link_previews)
     if patch: db_update_user_fields(me["nick"], patch)
     return {"ok": True}
 
@@ -1102,7 +1162,8 @@ def api_wall(nick: str, request: Request):
     is_follower = viewer and viewer["nick"] in (u.get("followers") or set())
     if not is_owner and not is_follower:
         return {"posts": [], "allow_wall_posts": u.get("allow_wall_posts", True),
-                "can_view": False, "can_post": False, "reason": "err_wall_community"}
+                "can_view": False, "can_post": False, "reason": "err_wall_community",
+                "owner": serialize_user(u, viewer["nick"] if viewer else None)}
     posts = db_list_wall_posts(u["nick"])
     can_post = False; reason = ""
     if viewer:
@@ -1112,7 +1173,8 @@ def api_wall(nick: str, request: Request):
         else: can_post = True
     return {"posts": build_posts_full(posts, vid),
             "allow_wall_posts": u.get("allow_wall_posts", True),
-            "can_view": True, "can_post": can_post, "reason": reason}
+            "can_view": True, "can_post": can_post, "reason": reason,
+            "owner": serialize_user(u, viewer["nick"] if viewer else None)}
 
 
 @app.post("/api/users/{nick}/wall")
@@ -1129,9 +1191,11 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
     if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
+    og = _build_og_for_text(text, payload.og_enabled)
     p = {"id": pid, "text": text, "author": me["nick"],
          "created_at": time.time(), "wall_owner": owner["nick"],
-         "quoted_post_id": payload.quoted_post_id or None}
+         "quoted_post_id": payload.quoted_post_id or None,
+         "og_data": og}
     db_create_post(p)
     notified = set()
     for m in extract_mentions(text):
@@ -1164,13 +1228,10 @@ def api_view_post(pid: str, request: Request):
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
     u = get_current_user(request)
-    if not u:
-        return {"ok": True, "counted": False}
-    if p.get("author") == u["nick"]:
-        return {"ok": True, "counted": False}
+    if not u: return {"ok": True, "counted": False}
+    if p.get("author") == u["nick"]: return {"ok": True, "counted": False}
     vid = "u:" + u["nick"]
-    if not view_should_count(pid, vid):
-        return {"ok": True, "counted": False}
+    if not view_should_count(pid, vid): return {"ok": True, "counted": False}
     view_mark_counted(pid, vid)
     db_inc_views(pid)
     return {"ok": True, "counted": True}
@@ -1185,9 +1246,11 @@ def api_create(payload: PostIn, request: Request):
     if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
+    og = _build_og_for_text(text, payload.og_enabled)
     p = {"id": pid, "text": text, "author": u["nick"],
          "created_at": time.time(), "wall_owner": None,
-         "quoted_post_id": payload.quoted_post_id or None}
+         "quoted_post_id": payload.quoted_post_id or None,
+         "og_data": og}
     db_create_post(p)
     notified = set()
     for nick in extract_mentions(text):
@@ -1329,28 +1392,6 @@ def api_vote_comment(pid: str, cid: str, v: VoteIn, request: Request):
     return build_posts_full([p], vid)[0]
 
 
-@app.post("/api/translate")
-def api_translate(data: TranslateIn, request: Request):
-    require_user(request)
-    text = (data.text or "").strip()
-    if not text: raise HTTPException(400, "empty")
-    text = text[:1000]
-    target = data.to if data.to in ("ru", "en") else "en"
-    cyr = sum(1 for ch in text if "\u0400" <= ch <= "\u04FF")
-    src = "ru" if cyr > max(1, len(text) // 10) else "en"
-    if src == target: return {"text": text, "src": src, "dst": target, "translated": False}
-    try:
-        q = urllib.parse.quote(text)
-        url = f"https://api.mymemory.translated.net/get?q={q}&langpair={src}|{target}"
-        req = urllib.request.Request(url, headers={"User-Agent": "sldchat"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode())
-        t = (data.get("responseData") or {}).get("translatedText") or text
-        return {"text": t, "src": src, "dst": target, "translated": True}
-    except Exception:
-        raise HTTPException(502, "translate_failed")
-
-
 @app.get("/api/counters")
 def api_counters(request: Request):
     me = require_user(request)
@@ -1428,7 +1469,7 @@ TEXTS = {
         "notif_clear_confirm": "Удалить все уведомления?",
         "author_badge": "автор",
         "feed_all": "Для вас", "feed_subs": "Подписки",
-        "nav_home": "Лента", "nav_users": "Люди",
+        "nav_home": "Лента", "nav_walls": "Стены", "nav_users": "Люди",
         "nav_profile": "Профиль", "nav_notifications": "Уведомления",
         "nav_settings": "Настройки", "nav_logout": "Выйти",
         "nav_login": "Войти", "nav_register": "Регистрация",
@@ -1453,7 +1494,6 @@ TEXTS = {
         "err_wall_community": "Стена сообщества — видна только подписчикам",
         "login_to_post": "Войдите, чтобы публиковать",
         "login_to_comment": "Войдите, чтобы комментировать",
-        "login_to_wall": "Войдите, чтобы писать на стене",
         "go_login": "Войти",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
@@ -1461,13 +1501,17 @@ TEXTS = {
         "edit_profile_title": "Изменить профиль",
         "own_profile": "Это ваш профиль",
         "no_user_posts": "Здесь пока пусто",
-        "wall_tab": "Стена", "posts_tab": "Посты",
+        "bio_empty": "Описание не заполнено",
+        "wall_title": "Стена",
+        "wall_of": "Стена",
         "wall_empty": "Стена пуста",
         "wall_ph": "Что-нибудь на стене...",
         "wall_send": "Отправить",
-        "wall_must_follow": "Подпишитесь, чтобы писать на стене",
+        "wall_open": "Перейти на стену",
         "wall_community_hint": "Это стена сообщества — писать могут только подписчики",
-        "bio_empty_short": "Описание пока не заполнено",
+        "walls_title": "Стены",
+        "walls_search_ph": "Поиск людей",
+        "walls_subtitle": "Выберите пользователя, чтобы зайти на его стену",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Конфиденциальность",
@@ -1480,12 +1524,14 @@ TEXTS = {
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_allow_wall": "Разрешить писать на моей стене",
         "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
+        "settings_show_link_previews": "Показывать превью ссылок (OpenGraph)",
+        "settings_show_link_previews_hint": "Если включено, к постам со ссылками будут добавляться карточки предпросмотра",
         "settings_device": "Ваше устройство",
         "settings_device_browser": "Браузер",
         "settings_device_os": "Система",
         "settings_device_city": "Город",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldchat — минималистичная соцсеть: посты, стены-сообщества, комментарии.",
+        "settings_desc": "SLD — минималистичная соцсеть: посты, стены, комментарии.",
         "settings_authors": "Авторы",
         "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
@@ -1499,7 +1545,7 @@ TEXTS = {
         "notif_quote": "процитировал ваш пост",
         "back": "Назад",
         "bio_ph": "О себе...",
-        "bio_empty": "Описание не заполнено",
+        "bio_empty_short": "Описание не заполнено",
         "followers_title": "Подписчики", "following_title": "Подписки",
         "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
         "limited_list": "Список скрыт. Вам виден только ваш аккаунт.",
@@ -1517,12 +1563,10 @@ TEXTS = {
             "IP используется для определения языка и города (не сохраняется).\n\n"
             "Сервис предоставляется как есть."
         ),
-        "translate": "Перевести",
-        "translate_show_original": "Показать оригинал",
-        "translate_failed": "Перевод не удался",
         "quote": "Цитировать",
         "avatar_choose": "Выберите эмодзи",
         "avatar_current": "Текущий аватар",
+        "og_enable": "Превью ссылок",
     },
     "en": {
         "search_ph": "Search people and posts",
@@ -1546,7 +1590,7 @@ TEXTS = {
         "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
         "feed_all": "For you", "feed_subs": "Subscriptions",
-        "nav_home": "Feed", "nav_users": "People",
+        "nav_home": "Feed", "nav_walls": "Walls", "nav_users": "People",
         "nav_profile": "Profile", "nav_notifications": "Notifications",
         "nav_settings": "Settings", "nav_logout": "Log out",
         "nav_login": "Log in", "nav_register": "Sign up",
@@ -1571,7 +1615,6 @@ TEXTS = {
         "err_wall_community": "Wall is a community — visible to followers only",
         "login_to_post": "Log in to publish",
         "login_to_comment": "Log in to comment",
-        "login_to_wall": "Log in to post on the wall",
         "go_login": "Log in",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
@@ -1579,13 +1622,17 @@ TEXTS = {
         "edit_profile_title": "Edit profile",
         "own_profile": "This is your profile",
         "no_user_posts": "Nothing here yet",
-        "wall_tab": "Wall", "posts_tab": "Posts",
+        "bio_empty": "No bio yet",
+        "wall_title": "Wall",
+        "wall_of": "Wall of",
         "wall_empty": "Wall is empty",
         "wall_ph": "Write on the wall...",
         "wall_send": "Post",
-        "wall_must_follow": "Follow to post on this wall",
+        "wall_open": "Open wall",
         "wall_community_hint": "This is a community wall — only followers can post",
-        "bio_empty_short": "No bio yet",
+        "walls_title": "Walls",
+        "walls_search_ph": "Search people",
+        "walls_subtitle": "Pick a user to visit their wall",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1598,12 +1645,14 @@ TEXTS = {
         "settings_notify_new_post": "New post notifications",
         "settings_allow_wall": "Allow posts on my wall",
         "settings_allow_wall_hint": "Only your followers can post",
+        "settings_show_link_previews": "Show link previews (OpenGraph)",
+        "settings_show_link_previews_hint": "If enabled, posts with links will show preview cards",
         "settings_device": "Your device",
         "settings_device_browser": "Browser",
         "settings_device_os": "System",
         "settings_device_city": "City",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldchat — minimalist social network: posts, community walls, comments.",
+        "settings_desc": "SLD — minimalist social network: posts, walls, comments.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
@@ -1617,7 +1666,7 @@ TEXTS = {
         "notif_quote": "quoted your post",
         "back": "Back",
         "bio_ph": "Bio...",
-        "bio_empty": "No bio yet",
+        "bio_empty_short": "No bio yet",
         "followers_title": "Followers", "following_title": "Following",
         "no_followers": "No followers yet", "no_following": "No following yet",
         "limited_list": "List is hidden. You can see only your account.",
@@ -1635,12 +1684,10 @@ TEXTS = {
             "IP is used to detect language and city (not stored).\n\n"
             "Service is provided as-is."
         ),
-        "translate": "Translate",
-        "translate_show_original": "Show original",
-        "translate_failed": "Translation failed",
         "quote": "Quote",
         "avatar_choose": "Choose an emoji",
         "avatar_current": "Current avatar",
+        "og_enable": "Link previews",
     },
 }
 
@@ -1652,6 +1699,8 @@ def svg(paths: str, size: int = 20, sw: float = 2) -> str:
 
 
 I_HOME = svg('<path d="M3 10l9-7 9 7v11a2 2 0 0 1-2 2h-4v-8h-6v8H5a2 2 0 0 1-2-2z"/>')
+I_WALLS = svg('<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>'
+    '<rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>')
 I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
     '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
@@ -1674,7 +1723,6 @@ I_EDIT = svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l
 I_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
     '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
     '<path d="M10 11v6M14 11v6"/>', size=16)
-I_TRANSLATE = svg('<path d="M4 5h12M10 3v2c0 4-2 7-5 9"/><path d="M5 15l6-6 6 6"/><path d="M14 13l5 8"/><path d="M22 13l-5 8"/>', size=16)
 I_BACK = svg('<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>')
 I_SEARCH = svg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
 I_MOON = svg('<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>')
@@ -1685,13 +1733,14 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
     '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
 I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=15)
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
+I_DOTS = svg('<circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>', size=18, sw=0)
 
 FAVICON = ("data:image/svg+xml,"
     "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
     "%3Crect width='64' height='64' fill='%23ffffff'/%3E"
     "%3Ctext x='32' y='44' font-family='Arial Black,Arial,sans-serif' "
     "font-weight='900' font-size='22' fill='%23000000' text-anchor='middle' "
-    "letter-spacing='-1'%3Esld%3C/text%3E%3C/svg%3E")
+    "letter-spacing='-1'%3ESLD%3C/text%3E%3C/svg%3E")
 
 
 CSS = """
@@ -1709,11 +1758,8 @@ CSS = """
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body {
-  height: 100vh;
-  height: 100dvh;
-  margin: 0; padding: 0;
-  overflow: hidden;
-  overscroll-behavior: none;
+  height: 100vh; height: 100dvh; margin: 0; padding: 0;
+  overflow: hidden; overscroll-behavior: none;
 }
 body {
   font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -1728,29 +1774,18 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
 
 .layout {
-  display: flex;
-  width: 100%;
-  height: 100vh;
-  height: 100dvh;
-  background: var(--bg);
-  max-width: 1400px;
-  margin: 0 auto;
+  display: flex; width: 100%; height: 100vh; height: 100dvh;
+  background: var(--bg); max-width: 1400px; margin: 0 auto;
 }
 
 .sidebar {
-  flex: 0 0 260px;
-  width: 260px;
-  background: var(--bg);
-  display: flex;
-  flex-direction: column;
+  flex: 0 0 260px; width: 260px;
+  background: var(--bg); display: flex; flex-direction: column;
   padding: 24px 16px 16px;
 }
 .sidebar .logo {
-  font-size: 22px;
-  font-weight: 900;
-  letter-spacing: 1px;
-  padding: 4px 12px 28px;
-  color: var(--text);
+  font-size: 22px; font-weight: 900; letter-spacing: 2px;
+  padding: 4px 12px 28px; color: var(--text);
 }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
@@ -1758,10 +1793,8 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   width: 100%; padding: 12px 14px;
   border: none; background: transparent;
   color: var(--text); font: inherit; font-size: 15px; font-weight: 500;
-  cursor: pointer; text-align: left;
-  border-radius: 12px;
-  transition: background .12s;
-  position: relative;
+  cursor: pointer; text-align: left; border-radius: 12px;
+  transition: background .12s; position: relative;
 }
 .nav-btn:hover { background: var(--hover); }
 .nav-btn.active { background: var(--accent-soft); color: var(--text); font-weight: 700; }
@@ -1775,8 +1808,8 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .sidebar .spacer { flex: 1; }
 .sidebar-logout {
   display: flex; align-items: center; gap: 14px;
-  padding: 12px 14px;
-  color: var(--text); font-size: 15px; font-weight: 500;
+  padding: 12px 14px; color: var(--text);
+  font-size: 15px; font-weight: 500;
   background: transparent; border: none; cursor: pointer;
   border-radius: 12px; text-align: left; width: 100%;
   transition: background .12s;
@@ -1787,16 +1820,14 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .main {
   flex: 1 1 auto; min-width: 0;
   display: flex; flex-direction: column;
-  background: var(--bg);
-  overflow: hidden;
+  background: var(--bg); overflow: hidden;
 }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
 .main-inner { max-width: 720px; margin: 0 auto; padding: 20px 20px 40px; }
 
 .main-header {
   display: flex; align-items: center; gap: 10px;
-  padding: 16px 20px;
-  max-width: 720px; margin: 0 auto; width: 100%;
+  padding: 16px 20px; max-width: 720px; margin: 0 auto; width: 100%;
 }
 .main-header.wide { max-width: 960px; }
 .main-header .title {
@@ -1810,9 +1841,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--card); border: none; color: var(--text);
   cursor: pointer; padding: 0; text-decoration: none;
-  border-radius: 12px;
-  transition: background .12s, color .12s;
-  flex-shrink: 0;
+  border-radius: 12px; transition: background .12s, color .12s; flex-shrink: 0;
 }
 .icon-btn:hover { background: var(--hover); }
 .icon-btn.danger:hover { color: var(--danger); }
@@ -1827,8 +1856,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   color: var(--muted); font-family: inherit;
   font-size: 14px; font-weight: 600;
   cursor: pointer; border-radius: 12px;
-  transition: background .12s, color .12s;
-  white-space: nowrap;
+  transition: background .12s, color .12s; white-space: nowrap;
 }
 .pill-tab:hover { color: var(--text); }
 .pill-tab.active { background: var(--accent); color: var(--accent-fg); }
@@ -1851,23 +1879,22 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-body { flex: 1; min-width: 0; }
 .composer-body textarea {
-  display: block;
-  width: 100%;
-  background: transparent;
-  border: none;
-  outline: none;
-  resize: none;
-  color: var(--text);
-  font-family: inherit;
-  font-size: 16px;
-  line-height: 1.55;
-  min-height: 56px;
-  max-height: 400px;
-  padding: 6px 0 0;
-  overflow: hidden;
+  display: block; width: 100%; background: transparent; border: none;
+  outline: none; resize: none; color: var(--text);
+  font-family: inherit; font-size: 16px; line-height: 1.55;
+  min-height: 56px; max-height: 400px; padding: 6px 0 0; overflow: hidden;
 }
 .composer-body textarea::placeholder { color: var(--muted); }
-.composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+.composer-actions {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 12px; flex-wrap: wrap;
+}
+.og-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--muted);
+  cursor: pointer; user-select: none;
+}
+.og-toggle input { margin: 0; cursor: pointer; accent-color: var(--accent); }
 .composer-actions .spacer { flex: 1; }
 .publish-btn {
   height: 42px; padding: 0 22px;
@@ -1899,30 +1926,41 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
 /* EMOJI AVATAR */
 .avatar {
-  width: 44px; height: 44px; flex-shrink: 0;
-  border-radius: 50%;
+  width: 44px; height: 44px; flex-shrink: 0; border-radius: 50%;
   background: var(--card-2);
   display: inline-flex; align-items: center; justify-content: center;
-  font-size: 24px;
-  line-height: 1;
-  user-select: none;
-  overflow: hidden;
-  text-align: center;
+  font-size: 24px; line-height: 1; user-select: none; overflow: hidden; text-align: center;
 }
 .avatar.sm { width: 36px; height: 36px; font-size: 20px; }
 .avatar.lg { width: 88px; height: 88px; font-size: 48px; }
 
 /* POST */
 .post-card { background: var(--card); border-radius: 20px; padding: 18px; margin-bottom: 14px; }
-.post-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+.post-header {
+  display: flex; align-items: flex-start; gap: 12px;
+  margin-bottom: 12px;
+}
 .post-header .meta { flex: 1; min-width: 0; }
-.post-header .who { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px; }
+.post-header .who {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 14px;
+}
 .post-author { font-weight: 700; color: var(--text); text-decoration: none; }
 .post-author:hover { text-decoration: underline; }
 .post-time { color: var(--muted); font-size: 13px; }
 .post-wall-hint { color: var(--muted); font-size: 13px; }
 .post-wall-hint a { color: var(--muted); text-decoration: none; }
 .post-wall-hint a:hover { color: var(--text); }
+
+/* Верхнее меню поста (ред/удал справа сверху) */
+.post-menu {
+  display: flex; gap: 2px; margin-left: auto; flex-shrink: 0;
+  align-self: flex-start;
+}
+.post-menu .act-btn {
+  height: 30px; width: 30px; padding: 0;
+  justify-content: center;
+}
+
 .post-text {
   font-size: 15px; line-height: 1.55;
   white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
@@ -1936,6 +1974,36 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   font-size: 14px; font-weight: 500; cursor: pointer;
 }
 .read-more:hover { color: var(--text); }
+
+/* OG CARD */
+.og-card {
+  display: block; margin-top: 10px;
+  background: var(--card-2); border-radius: 14px;
+  text-decoration: none; color: inherit;
+  overflow: hidden; transition: background .12s;
+  border: 1px solid var(--line);
+}
+.og-card:hover { background: var(--hover); }
+.og-image {
+  width: 100%; height: 180px;
+  background-size: cover; background-position: center;
+  background-color: var(--line);
+}
+.og-body { padding: 12px 14px; }
+.og-site {
+  font-size: 12px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px; font-weight: 600;
+  margin-bottom: 4px;
+}
+.og-title {
+  font-size: 15px; font-weight: 700; color: var(--text);
+  margin-bottom: 4px;
+  word-wrap: break-word; overflow-wrap: anywhere;
+}
+.og-desc {
+  font-size: 13px; color: var(--muted); line-height: 1.5;
+  word-wrap: break-word; overflow-wrap: anywhere;
+}
 
 .quoted-post {
   margin-top: 10px; padding: 12px 14px;
@@ -1955,8 +2023,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
 .post-actions {
   display: flex; align-items: center; gap: 4px;
-  margin-top: 14px;
-  flex-wrap: wrap;
+  margin-top: 14px; flex-wrap: wrap;
 }
 .act-btn {
   display: inline-flex; align-items: center; gap: 6px;
@@ -1969,76 +2036,70 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .act-btn:hover { background: var(--hover); color: var(--text); }
 .act-btn svg { display: block; }
+.act-btn.danger:hover { color: var(--danger); }
 
-/* Голосование: up | число | down */
 .vote-group {
   display: inline-flex; align-items: center;
-  background: transparent; border-radius: 12px;
-  margin-right: 4px;
+  background: transparent; border-radius: 12px; margin-right: 4px;
 }
 .vote-group .act-btn { padding: 0 8px; }
 .vote-group .act-btn.up:hover, .vote-group .act-btn.up.active { color: var(--up); }
 .vote-group .act-btn.down:hover, .vote-group .act-btn.down.active { color: var(--down); }
 .vote-num {
-  min-width: 24px;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text);
-  user-select: none;
+  min-width: 24px; text-align: center;
+  font-variant-numeric: tabular-nums; font-size: 14px; font-weight: 700;
+  color: var(--text); user-select: none;
 }
 .vote-num.pos { color: var(--up); }
 .vote-num.neg { color: var(--down); }
 
-.act-btn.danger:hover { color: var(--danger); }
-
 .views-badge {
-  margin-left: auto;
-  color: var(--muted); font-size: 13px;
+  margin-left: auto; color: var(--muted); font-size: 13px;
   display: inline-flex; align-items: center; gap: 5px;
 }
 
 /* PROFILE */
 .profile-hero {
-  background: var(--card);
-  border-radius: 20px;
-  padding: 20px;
-  margin-bottom: 14px;
+  background: var(--card); border-radius: 20px;
+  padding: 20px; margin-bottom: 14px;
 }
 .profile-hero-top {
-  display: flex;
-  align-items: flex-start;
-  gap: 16px;
-  margin-bottom: 14px;
+  display: flex; align-items: flex-start; gap: 16px; margin-bottom: 14px;
 }
-.profile-hero-avatar {
-  flex-shrink: 0;
-}
-.profile-hero-main {
-  flex: 1; min-width: 0;
-  padding-top: 2px;
-}
+.profile-hero-avatar { flex-shrink: 0; }
+.profile-hero-main { flex: 1; min-width: 0; padding-top: 2px; }
 .profile-name {
-  font-size: 22px; font-weight: 800;
-  margin-bottom: 2px;
+  font-size: 22px; font-weight: 800; margin-bottom: 6px;
   overflow: hidden; text-overflow: ellipsis;
+}
+.profile-line {
+  display: flex; align-items: baseline; gap: 10px;
+  flex-wrap: wrap; margin-bottom: 8px;
 }
 .profile-nick {
   font-size: 14px; color: var(--muted);
-  margin-bottom: 10px;
+  flex-shrink: 0;
 }
-.profile-desc {
-  font-size: 15px; line-height: 1.55;
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+.profile-bio-inline {
+  font-size: 14px; line-height: 1.5;
   color: var(--text);
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
 }
-.profile-desc.empty { color: var(--muted); font-style: italic; }
+.profile-bio-inline.empty { color: var(--muted); font-style: italic; }
 
+.profile-stats {
+  display: flex; gap: 22px; font-size: 14px; margin-top: 8px;
+}
+.profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; margin-right: 4px; }
+.profile-stats b:hover { text-decoration: underline; }
+.profile-stats span { color: var(--muted); }
+.profile-meta {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--muted); font-size: 13px; margin-top: 10px;
+}
 .profile-hero-actions {
   display: flex; gap: 10px; align-items: center;
-  flex-wrap: wrap;
-  margin-top: 14px;
+  flex-wrap: wrap; margin-top: 14px;
 }
 .pill-action {
   height: 40px; padding: 0 20px;
@@ -2046,8 +2107,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   border: none; border-radius: 12px;
   font-family: inherit; font-size: 14px; font-weight: 700;
   cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
-  text-decoration: none;
-  transition: background .12s;
+  text-decoration: none; transition: background .12s;
 }
 .pill-action:hover { background: var(--hover); }
 .pill-action.primary { background: var(--accent); color: var(--accent-fg); }
@@ -2057,25 +2117,26 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   background: var(--card-2); border: none; color: var(--text);
   border-radius: 12px; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
-  text-decoration: none;
-  transition: background .12s;
+  text-decoration: none; transition: background .12s;
 }
 .round-action:hover { background: var(--hover); }
 
-.profile-stats {
-  display: flex; gap: 22px; font-size: 14px;
-  margin-top: 8px;
+/* WALL HERO */
+.wall-hero {
+  background: var(--card); border-radius: 20px;
+  padding: 20px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 16px;
 }
-.profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; margin-right: 4px; }
-.profile-stats b:hover { text-decoration: underline; }
-.profile-stats span { color: var(--muted); }
-.profile-meta {
-  display: flex; align-items: center; gap: 6px;
-  color: var(--muted); font-size: 13px;
-  margin-top: 10px;
+.wall-hero .info { flex: 1; min-width: 0; }
+.wall-hero .title {
+  font-size: 20px; font-weight: 800;
+  margin-bottom: 4px; word-wrap: break-word; overflow-wrap: anywhere;
 }
+.wall-hero .sub { font-size: 14px; color: var(--muted); }
+.wall-hero .sub a { color: var(--text); text-decoration: none; font-weight: 700; }
+.wall-hero .sub a:hover { text-decoration: underline; }
 
-/* PEOPLE */
+/* PEOPLE / WALLS LIST */
 .user-row {
   display: flex; align-items: center; gap: 14px;
   background: var(--card); padding: 14px 16px;
@@ -2093,14 +2154,16 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   font-size: 13px; color: var(--muted); margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.user-row .go {
+  color: var(--muted); flex-shrink: 0;
+}
 
 /* NOTIFICATIONS */
 .notif-row {
   display: flex; align-items: flex-start; gap: 12px;
   background: var(--card); padding: 14px 16px;
   border-radius: 16px; margin-bottom: 8px;
-  text-decoration: none; color: inherit;
-  transition: background .12s;
+  text-decoration: none; color: inherit; transition: background .12s;
 }
 .notif-row.unread { background: var(--card-2); }
 .notif-row:hover { background: var(--hover); }
@@ -2119,13 +2182,9 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .settings-layout {
   display: flex; gap: 20px;
   max-width: 960px; margin: 0 auto; width: 100%;
-  padding: 20px;
-  min-height: 100%;
+  padding: 20px; min-height: 100%;
 }
-.settings-nav {
-  flex: 0 0 220px;
-  display: flex; flex-direction: column; gap: 4px;
-}
+.settings-nav { flex: 0 0 220px; display: flex; flex-direction: column; gap: 4px; }
 .settings-nav-btn {
   display: flex; align-items: center; gap: 12px;
   padding: 12px 16px; text-align: left;
@@ -2180,10 +2239,8 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 .device-info { display: flex; flex-direction: column; gap: 8px; }
 .device-info-row {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 14px;
-  background: var(--card-2);
-  border-radius: 12px;
-  font-size: 14px;
+  padding: 12px 14px; background: var(--card-2);
+  border-radius: 12px; font-size: 14px;
 }
 .device-info-row .label { color: var(--muted); font-weight: 500; }
 .device-info-row .value { color: var(--text); font-weight: 700; }
@@ -2191,44 +2248,26 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 /* EMOJI PICKER */
 .emoji-current {
   display: flex; align-items: center; gap: 14px;
-  padding: 14px;
-  background: var(--card-2);
-  border-radius: 14px;
-  margin-bottom: 14px;
+  padding: 14px; background: var(--card-2);
+  border-radius: 14px; margin-bottom: 14px;
 }
-.emoji-current .label {
-  font-size: 13px; color: var(--muted);
-}
-.emoji-current .preview {
-  font-size: 40px; line-height: 1;
-}
+.emoji-current .label { font-size: 13px; color: var(--muted); }
+.emoji-current .preview { font-size: 40px; line-height: 1; }
 .emoji-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(46px, 1fr));
-  gap: 6px;
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 4px;
-  background: var(--card-2);
-  border-radius: 14px;
+  gap: 6px; max-height: 320px; overflow-y: auto;
+  padding: 4px; background: var(--card-2); border-radius: 14px;
 }
 .emoji-opt {
-  aspect-ratio: 1 / 1;
-  background: transparent;
-  border: 2px solid transparent;
-  border-radius: 10px;
-  font-size: 24px;
-  line-height: 1;
-  cursor: pointer;
+  aspect-ratio: 1 / 1; background: transparent;
+  border: 2px solid transparent; border-radius: 10px;
+  font-size: 24px; line-height: 1; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  transition: background .12s, border-color .12s;
-  padding: 0;
+  transition: background .12s, border-color .12s; padding: 0;
 }
 .emoji-opt:hover { background: var(--hover); }
-.emoji-opt.active {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-}
+.emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
 
 /* AUTH */
 .auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
@@ -2271,18 +2310,14 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .modal-overlay {
-  position: fixed; inset: 0;
-  background: rgba(0,0,0,.6);
+  position: fixed; inset: 0; background: rgba(0,0,0,.6);
   backdrop-filter: blur(6px);
   display: flex; align-items: center; justify-content: center;
   z-index: 1000; padding: 20px;
   animation: fadeIn .12s ease;
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-.modal {
-  background: var(--card); border-radius: 22px;
-  padding: 26px; max-width: 400px; width: 100%;
-}
+.modal { background: var(--card); border-radius: 22px; padding: 26px; max-width: 400px; width: 100%; }
 .modal-text { font-size: 16px; line-height: 1.5; color: var(--text); margin-bottom: 22px; text-align: center; }
 .modal-actions { display: flex; gap: 8px; }
 .modal-btn {
@@ -2340,7 +2375,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 /* TABLET */
 @media (max-width: 1100px) and (min-width: 901px) {
   .sidebar { flex: 0 0 76px; width: 76px; padding: 16px 8px; }
-  .sidebar .logo { font-size: 16px; padding: 4px 6px 18px; text-align: center; letter-spacing: 0; }
+  .sidebar .logo { font-size: 16px; padding: 4px 6px 18px; text-align: center; letter-spacing: 1px; }
   .nav-btn { flex-direction: column; gap: 4px; padding: 10px 6px; font-size: 11px;
     justify-content: center; align-items: center; text-align: center; }
   .nav-btn span { font-size: 11px; }
@@ -2357,40 +2392,35 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
     height: calc(100dvh - 68px - env(safe-area-inset-bottom, 0px));
   }
   .sidebar {
-    order: 2;
-    width: 100%;
+    order: 2; width: 100%;
     height: calc(68px + env(safe-area-inset-bottom, 0px));
-    flex-direction: row;
-    border-top: 1px solid var(--line);
+    flex-direction: row; border-top: 1px solid var(--line);
     padding: 0 0 env(safe-area-inset-bottom, 0px);
-    flex: 0 0 auto;
-    background: var(--card);
+    flex: 0 0 auto; background: var(--card);
   }
   .sidebar .logo { display: none; }
   .sidebar .spacer { display: none; }
   .sidebar-logout { display: none; }
   .nav { flex-direction: row; flex: 1; justify-content: space-around; align-items: stretch; }
   .nav-btn {
-    flex-direction: column; gap: 2px; padding: 8px 4px;
+    flex-direction: column; gap: 2px; padding: 8px 2px;
     flex: 1; justify-content: center; align-items: center;
-    text-align: center; border-radius: 0;
-    min-height: 66px;
+    text-align: center; border-radius: 0; min-height: 66px;
   }
   .nav-btn span { font-size: 10px; line-height: 1; font-weight: 500; }
   .nav-btn svg { width: 22px; height: 22px; }
   .nav-btn.active { background: transparent; }
   .nav-btn.active svg, .nav-btn.active span { color: var(--text); }
   .nav-btn .badge {
-    position: absolute; top: 2px; right: 20%;
+    position: absolute; top: 2px; right: 16%;
     min-width: 16px; height: 16px; line-height: 16px;
     font-size: 10px; padding: 0 4px; border-radius: 8px;
   }
   .main-header { padding: 14px 16px; }
   .main-header .title { font-size: 20px; }
   .main-inner { padding: 16px 12px 40px; }
-  .card, .post-card { border-radius: 18px; padding: 14px; }
+  .card, .post-card, .profile-hero, .wall-hero { border-radius: 18px; padding: 14px; }
 
-  .profile-hero { border-radius: 18px; padding: 16px; }
   .profile-hero-top { gap: 12px; }
   .profile-name { font-size: 19px; }
   .avatar.lg { width: 68px; height: 68px; font-size: 36px; }
@@ -2398,8 +2428,7 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
   .settings-layout { flex-direction: column; padding: 12px; }
   .settings-nav {
     flex: 0 0 auto; flex-direction: row;
-    overflow-x: auto; scrollbar-width: none;
-    margin-bottom: 8px;
+    overflow-x: auto; scrollbar-width: none; margin-bottom: 8px;
   }
   .settings-nav::-webkit-scrollbar { display: none; }
   .settings-nav-btn {
@@ -2413,25 +2442,28 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 
   .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 5px; max-height: 280px; }
   .emoji-opt { font-size: 22px; }
+
+  .og-image { height: 140px; }
 }
 @media (max-width: 500px) {
   .main-inner { padding: 12px 10px 30px; }
-  .card, .post-card { border-radius: 16px; padding: 12px; }
+  .card, .post-card, .profile-hero, .wall-hero { border-radius: 16px; padding: 12px; }
   .profile-name { font-size: 18px; }
   .profile-stats { font-size: 13px; gap: 16px; }
   .avatar.lg { width: 60px; height: 60px; font-size: 32px; }
+  .og-image { height: 120px; }
 }
 """
 
 
 JS = r"""
 var ICONS = {
-  home: __I_HOME__, users: __I_USERS__, user: __I_USER__,
+  home: __I_HOME__, walls: __I_WALLS__, users: __I_USERS__, user: __I_USER__,
   bell: __I_BELL__, gear: __I_GEAR__,
   logout: __I_LOGOUT__, login: __I_LOGIN__, plus: __I_PLUS__,
   up: __I_UP__, down: __I_DOWN__, comment: __I_COMMENT__,
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
-  translate: __I_TRANSLATE__, back: __I_BACK__, search: __I_SEARCH__,
+  back: __I_BACK__, search: __I_SEARCH__,
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
   eye: __I_EYE__, cal: __I_CAL__
 };
@@ -2450,6 +2482,7 @@ var state = {
   feedMode: 'all',
   peopleTab: 'all',
   peopleQuery: '',
+  wallsQuery: '',
   searchQuery: '',
   composerDraft: '',
   quotePostId: null,
@@ -2458,7 +2491,6 @@ var state = {
   replyTo: null,
   highlightComment: null,
   suppressRefresh: 0,
-  profileTab: 'posts',
   settingsSection: 'account',
   es: null,
   currentEmoji: DEFAULT_EMOJI,
@@ -2572,16 +2604,23 @@ function toggleTheme() {
 }
 applyTheme(localStorage.getItem('sldchat_theme') || 'dark');
 
-function navigate(url) {
+function navigate(url, force) {
+  if (!force && location.pathname === url) return;
   history.pushState({}, '', url);
   handleRoute();
 }
+
 function handleRoute() {
+  var prevView = state.view;
   var path = location.pathname, m;
   if (path === '/' || path === '') { state.view = 'feed'; state.viewData = {}; }
   else if ((m = path.match(/^\/p\/([a-z0-9]+)$/))) {
     state.view = 'post'; state.viewData = { post_id: m[1] };
     state.highlightComment = (location.hash && location.hash.match(/^#c-(.+)$/)) ? location.hash.slice(3) : null;
+  }
+  else if (path === '/walls') { state.view = 'walls'; state.viewData = {}; }
+  else if ((m = path.match(/^\/u\/([^\/]+)\/wall$/))) {
+    state.view = 'wall'; state.viewData = { nick: decodeURIComponent(m[1]) };
   }
   else if ((m = path.match(/^\/u\/([^\/]+)\/followers$/))) {
     state.view = 'followers'; state.viewData = { nick: decodeURIComponent(m[1]) };
@@ -2591,7 +2630,6 @@ function handleRoute() {
   }
   else if ((m = path.match(/^\/u\/(.+)$/))) {
     state.view = 'profile'; state.viewData = { nick: decodeURIComponent(m[1]) };
-    state.profileTab = 'posts';
   }
   else if (path === '/users') { state.view = 'users'; state.viewData = {}; state.peopleTab = 'all'; }
   else if (path === '/notifications') { state.view = 'notifications'; state.viewData = {}; }
@@ -2601,6 +2639,12 @@ function handleRoute() {
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'feed'; state.viewData = {}; }
+
+  // Если ушли с feed — очищаем цитату
+  if (prevView === 'feed' && state.view !== 'feed') {
+    state.quotePostId = null;
+    state.quotePreview = null;
+  }
   renderSidebar(); renderMain();
 }
 window.addEventListener('popstate', handleRoute);
@@ -2613,18 +2657,18 @@ async function loadMe() {
 async function doRegister(data) {
   var res = await api('/api/register', { method: 'POST', body: data });
   state.token = res.token; localStorage.setItem('sldchat_token', res.token);
-  setUser(res.user); connectSSE(); navigate('/');
+  setUser(res.user); connectSSE(); navigate('/', true);
 }
 async function doLogin(data) {
   var res = await api('/api/login', { method: 'POST', body: data });
   state.token = res.token; localStorage.setItem('sldchat_token', res.token);
-  setUser(res.user); connectSSE(); navigate('/');
+  setUser(res.user); connectSSE(); navigate('/', true);
 }
 function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
     disconnectSSE(); setUser(null); state.token = null;
-    setNotifCount(0); localStorage.removeItem('sldchat_token'); navigate('/');
+    setNotifCount(0); localStorage.removeItem('sldchat_token'); navigate('/', true);
   }, { yesText: tr('confirm_yes') });
 }
 
@@ -2666,8 +2710,9 @@ function navBtn(icon, label, active, action, count) {
 function renderSidebar() {
   var el = document.getElementById('sidebar');
   if (!el) return;
-  var html = '<div class="logo">sldchat</div><div class="nav">';
+  var html = '<div class="logo">SLD</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
+  html += navBtn(ICONS.walls, tr('nav_walls'), state.view === 'walls' || state.view === 'wall', 'walls');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
     html += navBtn(ICONS.bell, tr('nav_notifications'),
@@ -2689,6 +2734,7 @@ function renderSidebar() {
     b.addEventListener('click', function(){
       var nav = b.dataset.nav;
       if (nav === 'home') navigate('/');
+      else if (nav === 'walls') navigate('/walls');
       else if (nav === 'users') navigate('/users');
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
@@ -2705,6 +2751,8 @@ function renderMain() {
   if (state.view === 'feed') renderFeedView(el);
   else if (state.view === 'post') renderPostView(el);
   else if (state.view === 'profile') renderProfileView(el);
+  else if (state.view === 'wall') renderWallView(el);
+  else if (state.view === 'walls') renderWallsListView(el);
   else if (state.view === 'followers' || state.view === 'following') renderFollowListView(el);
   else if (state.view === 'users') renderUsersView(el);
   else if (state.view === 'notifications') renderNotificationsView(el);
@@ -2740,6 +2788,7 @@ function composerHtml(opts) {
   var placeholder = opts.placeholder || tr('post_ph');
   var sendLabel = opts.sendLabel || tr('publish');
   var idPrefix = opts.idPrefix || 'post';
+  var ogOn = (u.show_link_previews !== false);
   return '<div class="card">'
     + '<div class="composer-avatar-row">'
     + avatarHtml(u.avatar_emoji, 'sm')
@@ -2747,8 +2796,9 @@ function composerHtml(opts) {
     + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
     + '<div id="' + idPrefix + 'QuoteBox"></div>'
     + '<div class="composer-actions">'
-    + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted)">0 / ' + MAX_POST_LEN + '</span>'
+    + '<label class="og-toggle"><input type="checkbox" id="' + idPrefix + 'OgEnabled"' + (ogOn ? ' checked' : '') + '/><span>' + tr('og_enable') + '</span></label>'
     + '<div class="spacer"></div>'
+    + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted)">0 / ' + MAX_POST_LEN + '</span>'
     + '<button class="publish-btn" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
     + '</div></div></div></div>';
 }
@@ -2789,9 +2839,11 @@ function bindComposer(opts) {
   sendBtn.addEventListener('click', async function(){
     var text = inputEl.value.trim();
     if (!text && !state.quotePostId) return;
+    var ogCheckbox = document.getElementById(idPrefix + 'OgEnabled');
+    var ogEnabled = ogCheckbox ? ogCheckbox.checked : true;
     sendBtn.disabled = true;
     try {
-      await onSend(text, state.quotePostId);
+      await onSend(text, state.quotePostId, ogEnabled);
       inputEl.value = '';
       if (opts.draftKey === 'wall') state.wallDraft = '';
       else state.composerDraft = '';
@@ -2838,8 +2890,8 @@ function renderFeedView(el) {
   if (state.user) {
     bindComposer({
       idPrefix: 'post',
-      onSend: async function(text, quotedId){
-        await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId } });
+      onSend: async function(text, quotedId, ogEnabled){
+        await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
         state.searchQuery = '';
         await loadFeed();
       }
@@ -2865,7 +2917,7 @@ async function loadFeed() {
 function renderPostView(el) {
   var html = '<div class="main-header">'
     + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
-    + '<div class="title">' + tr('posts_tab') + '</div>'
+    + '<div class="title">' + tr('nav_home') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div id="feed">' + spinner() + '</div>';
@@ -2895,7 +2947,7 @@ function renderPostView(el) {
     bindComposer({
       idPrefix: 'comment',
       placeholder: tr('comment_ph'),
-      onSend: async function(text, quotedId){
+      onSend: async function(text){
         var body = { text: text };
         if (state.replyTo) body.parent_id = state.replyTo.id;
         await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
@@ -2913,7 +2965,6 @@ async function loadPostView() {
     var p = await api('/api/posts/' + state.viewData.post_id);
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl);
-    // строгий подсчёт просмотра
     if (state.user && p.author !== state.user.nick) {
       api('/api/posts/' + state.viewData.post_id + '/view', { method: 'POST' })
         .then(function(res){
@@ -2921,8 +2972,7 @@ async function loadPostView() {
             var viewsEl = feedEl.querySelector('[data-views]');
             if (viewsEl) viewsEl.textContent = (parseInt(viewsEl.textContent, 10) || 0) + 1;
           }
-        })
-        .catch(function(){});
+        }).catch(function(){});
     }
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
@@ -2960,8 +3010,8 @@ async function loadProfile(nick) {
       actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
 
-    var desc = u.bio ? escapeHtml(u.bio) : escapeHtml(tr('bio_empty_short'));
-    var descCls = u.bio ? 'profile-desc' : 'profile-desc empty';
+    var bioText = u.bio ? escapeHtml(u.bio) : escapeHtml(tr('bio_empty_short'));
+    var bioCls = u.bio ? 'profile-bio-inline' : 'profile-bio-inline empty';
 
     var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
       + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
@@ -2972,21 +3022,20 @@ async function loadProfile(nick) {
     html += '<div class="profile-hero-avatar">' + avatarHtml(u.avatar_emoji, 'lg') + '</div>';
     html += '<div class="profile-hero-main">';
     html += '<div class="profile-name">' + escapeHtml(u.name) + '</div>';
-    html += '<div class="profile-nick">@' + escapeHtml(u.nick) + '</div>';
-    html += '<div class="' + descCls + '">' + desc + '</div>';
-    html += '</div></div>';
+    html += '<div class="profile-line">';
+    html += '<span class="profile-nick">@' + escapeHtml(u.nick) + '</span>';
+    html += '<span class="' + bioCls + '">' + bioText + '</span>';
+    html += '</div>';
     html += '<div class="profile-stats">';
     html += '<div><b id="followersLink">' + u.followers + '</b><span>' + tr('profile_followers') + '</span></div>';
     html += '<div><b id="followingLink">' + u.following + '</b><span>' + tr('profile_following') + '</span></div>';
     html += '</div>';
     html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
-    html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
+    html += '<div class="profile-hero-actions">';
+    html += '<a class="pill-action" href="/u/' + encodeURIComponent(u.nick) + '/wall" data-link>' + ICONS.walls + ' ' + escapeHtml(tr('wall_open')) + '</a>';
+    html += actionsHtml;
     html += '</div>';
-
-    html += '<div class="pill-tabs" id="profileTabs">'
-      + '<button class="pill-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('posts_tab') + '</button>'
-      + '<button class="pill-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_tab') + '</button>'
-      + '</div>';
+    html += '</div></div></div>';
 
     html += '<div id="profileContent">' + spinner() + '</div>';
     root.innerHTML = html;
@@ -3010,68 +3059,8 @@ async function loadProfile(nick) {
       } catch(e) { alert(tr(e.message) || e.message); }
     });
 
-    root.querySelectorAll('.pill-tab').forEach(function(t){
-      t.addEventListener('click', function(){
-        state.profileTab = t.dataset.tab;
-        root.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
-        loadProfileTab(u, isMe);
-      });
-    });
-    loadProfileTab(u, isMe);
-  } catch(e) {
-    root.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
-  }
-}
-async function loadProfileTab(u, isMe) {
-  var c = document.getElementById('profileContent');
-  if (!c) return;
-  c.innerHTML = spinner();
-  if (state.profileTab === 'wall') {
-    try {
-      var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
-      if (!data.can_view) {
-        c.innerHTML = '<div class="card" style="text-align:center;padding:32px 20px">'
-          + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
-          + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>'
-          + (state.user && !isMe ? '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">' + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>' : '')
-          + '</div>';
-        var wf = document.getElementById('wallFollowBtn');
-        if (wf) wf.addEventListener('click', async function(){
-          try {
-            if (u.is_following) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-            else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-            loadProfile(u.nick);
-          } catch(e) { alert(tr(e.message) || e.message); }
-        });
-        return;
-      }
-      var html = '';
-      if (state.user && data.can_post) {
-        html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
-      } else if (state.user) {
-        var reasonText = data.reason === 'err_need_follow' ? tr('wall_must_follow')
-                       : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                       : '';
-        html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
-      }
-      if (data.posts.length) {
-        html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-      } else if (state.user && data.can_post) {
-        html += '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
-      }
-      c.innerHTML = html;
-      bindPostActions(c); bindLinks(c);
-      if (state.user && data.can_post) {
-        bindComposer({
-          idPrefix: 'wall', draftKey: 'wall',
-          onSend: async function(text, quotedId){
-            await api('/api/users/' + encodeURIComponent(u.nick) + '/wall', { method: 'POST', body: { text: text, quoted_post_id: quotedId } });
-            loadProfileTab(u, isMe);
-          }
-        });
-      }
-    } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
-  } else {
+    // Show user's own posts only
+    var c = document.getElementById('profileContent');
     try {
       var d2 = await api('/api/posts?author=' + encodeURIComponent(u.nick));
       var posts2 = (d2.posts || []).slice();
@@ -3082,7 +3071,135 @@ async function loadProfileTab(u, isMe) {
         bindPostActions(c); bindLinks(c);
       }
     } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
+  } catch(e) {
+    root.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
   }
+}
+
+// ============ WALLS LIST ============
+function renderWallsListView(el) {
+  var html = '<div class="main-header"><div class="title">' + tr('walls_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+  html += '<div class="search-box">' + ICONS.search + '<input id="wallsSearch" type="text" placeholder="' + escapeHtml(tr('walls_search_ph')) + '" value="' + escapeHtml(state.wallsQuery) + '" /></div>';
+  html += '<div style="color:var(--muted);font-size:13px;margin-bottom:12px;padding:0 4px">' + escapeHtml(tr('walls_subtitle')) + '</div>';
+  html += '<div id="list">' + spinner() + '</div>';
+  html += '</div></div>';
+  el.innerHTML = html;
+  bindThemeBtn(); bindLinks(el);
+  var searchEl = document.getElementById('wallsSearch');
+  var tId;
+  searchEl.addEventListener('input', function(){
+    state.wallsQuery = searchEl.value;
+    clearTimeout(tId); tId = setTimeout(loadWallsList, 250);
+  });
+  loadWallsList();
+}
+function wallRowHtml(u) {
+  return '<div class="user-row" data-link-row="/u/' + encodeURIComponent(u.nick) + '/wall">'
+    + avatarHtml(u.avatar_emoji, 'sm')
+    + '<div class="info">'
+    + '<span class="nick">@' + escapeHtml(u.nick) + '</span>'
+    + '<div class="name">' + escapeHtml(u.name) + '</div>'
+    + '</div>'
+    + '<div class="go">' + ICONS.back.replace('<line x1="19"','<line transform="rotate(180 12 12)" x1="19"') + '</div>'
+    + '</div>';
+}
+async function loadWallsList() {
+  var wrap = document.getElementById('list');
+  if (!wrap) return;
+  try {
+    var q = (state.wallsQuery || '').trim();
+    var data = await api('/api/users?q=' + encodeURIComponent(q));
+    var users = data.users || [];
+    if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
+    wrap.innerHTML = users.map(wallRowHtml).join('');
+    bindLinks(wrap);
+    wrap.querySelectorAll('[data-link-row]').forEach(function(r){
+      r.addEventListener('click', function(){ navigate(r.dataset.linkRow); });
+    });
+  } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
+}
+
+// ============ WALL PAGE ============
+function renderWallView(el) {
+  var nick = state.viewData.nick;
+  var html = '<div class="main-header">'
+    + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="title">' + escapeHtml(tr('wall_title')) + ' @' + escapeHtml(nick) + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner" id="wallRoot">' + spinner() + '</div></div>';
+  el.innerHTML = html;
+  bindThemeBtn();
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/walls'); });
+  bindLinks(el);
+  loadWall(nick);
+}
+async function loadWall(nick) {
+  var root = document.getElementById('wallRoot');
+  if (!root) return;
+  try {
+    var data = await api('/api/users/' + encodeURIComponent(nick) + '/wall');
+    var owner = data.owner || {};
+    var html = '';
+    html += '<div class="wall-hero">';
+    html += avatarHtml(owner.avatar_emoji, 'lg');
+    html += '<div class="info">';
+    html += '<div class="title">' + escapeHtml(tr('wall_of')) + ' <a href="/u/' + encodeURIComponent(owner.nick || nick) + '" data-link>@' + escapeHtml(owner.nick || nick) + '</a></div>';
+    html += '<div class="sub">' + escapeHtml(owner.name || '') + '</div>';
+    html += '</div></div>';
+
+    if (!data.can_view) {
+      html += '<div class="card" style="text-align:center;padding:32px 20px">'
+        + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
+        + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>';
+      if (state.user && state.user.nick !== nick) {
+        html += '<button class="publish-btn" id="wallFollowBtn" style="height:44px;padding:0 22px">'
+          + (data.owner && data.owner.is_me ? '' : (data.owner && data.owner.is_following ? tr('unfollow') : tr('follow'))) + '</button>';
+      }
+      html += '</div>';
+      root.innerHTML = html;
+      bindLinks(root);
+      var wf = document.getElementById('wallFollowBtn');
+      if (wf) wf.addEventListener('click', async function(){
+        try {
+          var isFol = data.owner && data.owner.is_following;
+          if (isFol) await api('/api/users/' + encodeURIComponent(nick) + '/unfollow', { method: 'POST' });
+          else await api('/api/users/' + encodeURIComponent(nick) + '/follow', { method: 'POST' });
+          loadWall(nick);
+        } catch(e) { alert(tr(e.message) || e.message); }
+      });
+      return;
+    }
+
+    if (state.user && data.can_post) {
+      html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
+    } else if (state.user) {
+      var reasonText = data.reason === 'err_need_follow' ? tr('err_need_follow')
+                     : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
+                     : '';
+      html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
+    } else {
+      html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
+    }
+
+    if (data.posts.length) {
+      html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+    } else {
+      html += '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
+    }
+    root.innerHTML = html;
+    bindPostActions(root); bindLinks(root);
+    if (state.user && data.can_post) {
+      bindComposer({
+        idPrefix: 'wall', draftKey: 'wall',
+        onSend: async function(text, quotedId, ogEnabled){
+          await api('/api/users/' + encodeURIComponent(nick) + '/wall', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
+          loadWall(nick);
+        }
+      });
+    }
+  } catch(e) { root.innerHTML = '<div class="empty">—</div>'; }
 }
 
 // ============ EDIT PROFILE ============
@@ -3096,7 +3213,6 @@ function renderEditProfileView(el) {
     + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
 
-  // текущий эмодзи
   html += '<div class="card">';
   html += '<div class="emoji-current">'
     + '<div class="preview" id="emojiPreview">' + escapeHtml(state.currentEmoji) + '</div>'
@@ -3109,8 +3225,7 @@ function renderEditProfileView(el) {
     var isActive = (e === state.currentEmoji);
     html += '<button type="button" class="emoji-opt' + (isActive ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '">' + e + '</button>';
   }
-  html += '</div>';
-  html += '</div>';
+  html += '</div></div>';
 
   html += '<div class="card"><form id="editForm" style="display:flex;flex-direction:column;gap:10px">'
     + '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required style="padding:15px 18px;background:var(--card-2);border:none;color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:14px" />'
@@ -3155,7 +3270,7 @@ function renderEditProfileView(el) {
     try {
       var r = await api('/api/users/me', { method: 'PUT', body: body });
       setUser(r.user); renderSidebar();
-      navigate('/u/' + encodeURIComponent(r.user.nick));
+      navigate('/u/' + encodeURIComponent(r.user.nick), true);
     } catch(err) {
       errEl.textContent = tr(err.message) || err.message;
       btn.disabled = false;
@@ -3178,7 +3293,7 @@ function renderFollowListView(el) {
   loadFollowList(nick, isFollowers);
 }
 function userRowHtml(u) {
-  return '<div class="user-row" data-link-row="' + encodeURIComponent(u.nick) + '">'
+  return '<div class="user-row" data-link-row="/u/' + encodeURIComponent(u.nick) + '">'
     + avatarHtml(u.avatar_emoji, 'sm')
     + '<div class="info">'
     + '<a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
@@ -3189,7 +3304,7 @@ function bindUserRows(root) {
   root.querySelectorAll('[data-link-row]').forEach(function(r){
     r.addEventListener('click', function(e){
       if (e.target.closest('[data-link]')) return;
-      navigate('/u/' + r.dataset.linkRow);
+      navigate(r.dataset.linkRow);
     });
   });
 }
@@ -3326,6 +3441,7 @@ function renderSettingsView(el) {
   var allowG = me.allow_following_view !== false;
   var nnp = me.notify_on_new_post !== false;
   var allowW = me.allow_wall_posts !== false;
+  var showOG = me.show_link_previews !== false;
   var sec = state.settingsSection || 'account';
 
   var html = '<div class="main-header wide"><div class="title">' + tr('settings_title') + '</div>'
@@ -3375,10 +3491,16 @@ function renderSettingsView(el) {
   html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
   html += '</div>';
   html += '<div style="font-size:13px;color:var(--muted);margin-bottom:8px">' + tr('settings_lang') + '</div>';
-  html += '<div class="opt-row" style="margin-bottom:0">';
+  html += '<div class="opt-row">';
   html += '<button class="opt' + (LANG==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
   html += '<button class="opt' + (LANG==='en'?' active':'') + '" data-set-lang="en">English</button>';
-  html += '</div></div>';
+  html += '</div>';
+  if (state.user) {
+    html += '<div class="toggle-row" style="margin-top:14px"><span>' + escapeHtml(tr('settings_show_link_previews')) + '</span>'
+      + '<div class="toggle' + (showOG ? ' on' : '') + '" data-toggle="show_link_previews"></div></div>';
+    html += '<p class="settings-desc" style="margin-top:6px">' + escapeHtml(tr('settings_show_link_previews_hint')) + '</p>';
+  }
+  html += '</div>';
 
   html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
@@ -3425,7 +3547,7 @@ function renderSettingsView(el) {
   });
   el.querySelectorAll('[data-set-lang]').forEach(function(b){
     b.addEventListener('click', function(){
-      document.cookie = 'sldchat_lang=' + b.dataset.setLang + '; path=/; max-age=' + (60*60*24*365);
+      document.cookie = 'SLD_lang=' + b.dataset.setLang + '; path=/; max-age=' + (60*60*24*365);
       location.reload();
     });
   });
@@ -3530,6 +3652,25 @@ function renderLoginView(el) {
 }
 
 // ============ POST RENDER ============
+function renderOgCard(og) {
+  if (!og) return '';
+  var show = true;
+  if (state.user && state.user.show_link_previews === false) show = false;
+  if (!show) return '';
+  var site = og.site_name || '';
+  if (!site) {
+    try { site = new URL(og.url).hostname; } catch(e) {}
+  }
+  var img = og.image ? '<div class="og-image" style="background-image:url(\'' + escapeHtml(og.image).replace(/'/g, '%27') + '\')"></div>' : '';
+  return '<a class="og-card" href="' + escapeHtml(og.url) + '" target="_blank" rel="noopener noreferrer">'
+    + img
+    + '<div class="og-body">'
+    + (site ? '<div class="og-site">' + escapeHtml(site) + '</div>' : '')
+    + (og.title ? '<div class="og-title">' + escapeHtml(og.title) + '</div>' : '')
+    + (og.description ? '<div class="og-desc">' + escapeHtml(og.description) + '</div>' : '')
+    + '</div></a>';
+}
+
 function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
@@ -3550,7 +3691,7 @@ function renderPostHtml(p, showComments) {
   var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
   var wallHint = '';
   if (p.wall_owner) {
-    wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
+    wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '/wall" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
   }
 
   var quotedHtml = '';
@@ -3562,12 +3703,16 @@ function renderPostHtml(p, showComments) {
       + '</div>';
   }
 
-  var editBtn = isMine
-    ? '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '">' + ICONS.edit + '</button>'
-    : '';
-  var delBtn = (isMine || isWallOwner)
-    ? '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '">' + ICONS.trash + '</button>'
-    : '';
+  // Меню в правом верхнем углу поста
+  var menuHtml = '';
+  if (isMine || isWallOwner) {
+    menuHtml = '<div class="post-menu">';
+    if (isMine) menuHtml += '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>';
+    menuHtml += '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>';
+    menuHtml += '</div>';
+  }
+
+  var ogHtml = renderOgCard(p.og_data);
 
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
@@ -3583,21 +3728,21 @@ function renderPostHtml(p, showComments) {
     +     '<div class="meta">'
     +       '<div class="who">' + authorHtml + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
     +     '</div>'
+    +     menuHtml
     +   '</div>'
     +   (displayText ? '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>' : '')
     +   readMore
+    +   ogHtml
     +   quotedHtml
     +   '<div class="post-actions">'
     +     '<div class="vote-group">'
-    +       '<button class="act-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1" title="' + escapeHtml(tr('publish') ? '' : '') + '">' + ICONS.up + '</button>'
+    +       '<button class="act-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '</button>'
     +       '<span class="vote-num ' + scCls + '">' + score + '</span>'
     +       '<button class="act-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
     +     '</div>'
     +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + (p.comments ? p.comments.length : 0) + '</span></button>'
     +     '<button class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
     +     '<button class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
-    +     '<button class="act-btn" data-action="translate" data-post-id="' + p.id + '" title="' + escapeHtml(tr('translate')) + '">' + ICONS.translate + '</button>'
-    +     editBtn + delBtn
     +     viewsHtml
     +   '</div>'
     +   commentsHtml
@@ -3739,14 +3884,12 @@ function bindPostActions(root) {
       }
       if (action === 'open-post') { navigate('/p/' + postId); return; }
       if (action === 'copy') { await copyPost(postId); return; }
-      if (action === 'translate') { await translatePost(postId, btn); return; }
       if (action === 'quote') {
         if (!state.user) { navigate('/login'); return; }
         try {
           var p = await api('/api/posts/' + postId);
           state.quotePostId = postId;
           state.quotePreview = { author: p.author, text: p.text };
-          // всегда уходим на главную и рендерим цитату в композере
           if (state.view !== 'feed') {
             navigate('/');
             return;
@@ -3770,6 +3913,7 @@ function bindPostActions(root) {
       if (action === 'edit-post') {
         var postEl = btn.closest('.post-card');
         var textEl = postEl.querySelector('.post-text');
+        if (!textEl) return;
         var raw = textEl.getAttribute('data-raw') || '';
         startInlineEdit(postEl, textEl, raw, async function(newText){
           await api('/api/posts/' + postId, { method: 'PUT', body: { text: newText } });
@@ -3781,8 +3925,7 @@ function bindPostActions(root) {
         showConfirm(tr('confirm_delete'), async function(){
           try {
             await api('/api/posts/' + postId, { method: 'DELETE' });
-            if (state.view === 'post') navigate('/');
-            else refreshCurrentView();
+            refreshCurrentView();
           } catch(err) { alert(tr(err.message) || err.message); }
         }, { yesText: tr('confirm_delete_yes') });
         return;
@@ -3819,6 +3962,7 @@ async function refreshCurrentView() {
   if (state.view === 'feed') await loadFeed();
   else if (state.view === 'post') await loadPostView();
   else if (state.view === 'profile') await loadProfile(state.viewData.nick);
+  else if (state.view === 'wall') await loadWall(state.viewData.nick);
 }
 
 async function copyPost(postId) {
@@ -3832,22 +3976,6 @@ async function copyPost(postId) {
       document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
     }
   } catch(e) {}
-}
-async function translatePost(postId, btn) {
-  try {
-    var p = await api('/api/posts/' + postId);
-    var dst = LANG || 'en';
-    var r = await api('/api/translate', { method: 'POST', body: { text: p.text, to: dst } });
-    var card = btn.closest('.post-card');
-    var old = card.querySelector('.quoted-post.translated');
-    if (old) old.remove();
-    var div = document.createElement('div');
-    div.className = 'quoted-post translated';
-    div.innerHTML = '<div class="q-author">' + escapeHtml(tr('translate')) + (r.translated ? '' : ' · ' + tr('translate_show_original')) + '</div>'
-      + '<div class="q-text">' + escapeHtml(r.text) + '</div>';
-    var text = card.querySelector('.post-text');
-    if (text) text.parentNode.insertBefore(div, text.nextSibling);
-  } catch(e) { alert(tr('translate_failed')); }
 }
 
 (function init() {
@@ -3873,6 +4001,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     view_data = view_data or {}
     js = (JS
           .replace("__I_HOME__", json.dumps(I_HOME))
+          .replace("__I_WALLS__", json.dumps(I_WALLS))
           .replace("__I_USERS__", json.dumps(I_USERS))
           .replace("__I_USER__", json.dumps(I_USER))
           .replace("__I_BELL__", json.dumps(I_BELL))
@@ -3886,7 +4015,6 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_COPY__", json.dumps(I_COPY))
           .replace("__I_EDIT__", json.dumps(I_EDIT))
           .replace("__I_TRASH__", json.dumps(I_TRASH))
-          .replace("__I_TRANSLATE__", json.dumps(I_TRANSLATE))
           .replace("__I_BACK__", json.dumps(I_BACK))
           .replace("__I_SEARCH__", json.dumps(I_SEARCH))
           .replace("__I_MOON__", json.dumps(I_MOON))
@@ -3903,7 +4031,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         '<meta name="color-scheme" content="dark light" />\n'
         '<meta name="theme-color" content="#0a0a0a" />\n'
         f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
-        '<title>sldchat</title>\n'
+        '<title>SLD</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
@@ -3932,9 +4060,16 @@ def page_post(post_id: str, request: Request):
     if not db_get_post(post_id): raise HTTPException(404, "not found")
     return render_page(get_lang(request), "post", {"post_id": post_id})
 
+@app.get("/walls", response_class=HTMLResponse)
+def page_walls(request: Request): return render_page(get_lang(request), "walls")
+
 @app.get("/u/{nick}", response_class=HTMLResponse)
 def page_user(nick: str, request: Request):
     return render_page(get_lang(request), "profile", {"nick": nick})
+
+@app.get("/u/{nick}/wall", response_class=HTMLResponse)
+def page_user_wall(nick: str, request: Request):
+    return render_page(get_lang(request), "wall", {"nick": nick})
 
 @app.get("/u/{nick}/followers", response_class=HTMLResponse)
 def page_followers(nick: str, request: Request):
