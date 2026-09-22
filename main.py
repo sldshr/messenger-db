@@ -149,11 +149,8 @@ def rate_limit(key: str, max_req: int, window: float = RATE_WINDOW) -> bool:
     now = time.time()
     arr = [t for t in _RATE.get(key, []) if now - t < window]
     if len(arr) >= max_req:
-        _RATE[key] = arr
-        return False
-    arr.append(now)
-    _RATE[key] = arr
-    return True
+        _RATE[key] = arr; return False
+    arr.append(now); _RATE[key] = arr; return True
 
 
 def ts_to_iso(ts) -> str:
@@ -233,8 +230,7 @@ def get_current_user(request: Request) -> Optional[dict]:
 def require_user(request: Request) -> dict:
     u = get_current_user(request)
     if not u: raise HTTPException(401, "unauthorized")
-    bus.touch(u["nick"])
-    return u
+    bus.touch(u["nick"]); return u
 
 
 def invalidate_user_cache(nick: Optional[str] = None) -> None:
@@ -331,6 +327,7 @@ def db_create_post(p: dict) -> None:
             "id": p["id"], "text": p["text"], "author": p["author"],
             "created_at": ts_to_iso(p["created_at"]),
             "wall_owner": p.get("wall_owner"),
+            "quoted_post_id": p.get("quoted_post_id"),
         }).execute()
     except Exception as e: print("[sldChat] db_create_post error:", e)
 
@@ -365,6 +362,39 @@ def db_get_post(pid: str) -> Optional[dict]:
     return POSTS_MEM.get(pid)
 
 
+def db_inc_views(pid: str) -> None:
+    if not supabase:
+        p = POSTS_MEM.get(pid)
+        if p: p["views"] = (p.get("views") or 0) + 1
+        return
+    try:
+        r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
+        if r.data:
+            v = (r.data[0].get("views") or 0) + 1
+            supabase.table("posts").update({"views": v}).eq("id", pid).execute()
+    except Exception as e:
+        print("[sldChat] db_inc_views error:", e)
+
+
+def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
+    """Возвращает {post_id: quoted_post_dict} для всех quoted_post_id."""
+    out = {}
+    if not post_ids: return out
+    if supabase:
+        try:
+            r = supabase.table("posts").select("*").in_("id", post_ids).execute()
+            for row in r.data or []:
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+                out[row["id"]] = row
+        except Exception as e:
+            print("[sldChat] db_get_quotes error:", e)
+        return out
+    for pid in post_ids:
+        p = POSTS_MEM.get(pid)
+        if p: out[pid] = p
+    return out
+
+
 def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> List[dict]:
     if supabase:
         try:
@@ -373,8 +403,7 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
             if subscriptions_of:
                 u = db_load_user_cached(subscriptions_of)
                 fol = list(u.get("following") or []) if u else []
-                if not fol:
-                    return []
+                if not fol: return []
                 query = query.in_("author", fol)
             if q: query = query.ilike("text", f"%{q}%")
             query = query.order("created_at", desc=True).limit(300)
@@ -500,8 +529,7 @@ def db_update_comment_text(cid: str, text: str) -> None:
     if not supabase:
         for p in POSTS_MEM.values():
             for c in p.get("comments", []):
-                if c["id"] == cid:
-                    c["text"] = text; return
+                if c["id"] == cid: c["text"] = text; return
         return
     try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
     except Exception as e: print("[sldChat] db_update_comment error:", e)
@@ -890,6 +918,11 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
     cvotes = db_comment_votes(comment_ids)
     cvmap: Dict[str, Dict[str, int]] = {}
     for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
+
+    # quoted posts batch
+    quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
+    quotes = db_get_quotes(list(set(quoted_ids)))
+
     out = []
     for p in posts:
         pvotes = vmap.get(p["id"], {})
@@ -905,8 +938,21 @@ def build_posts_full(posts: List[dict], voter_id: str) -> List[dict]:
             clist.append({"id": c["id"], "text": c["text"], "created_at": c["created_at"],
                           "author": c.get("author"), "parent_id": c.get("parent_id"),
                           "upvotes": cup, "downvotes": cdown, "user_vote": cuv})
+        quoted = None
+        qid = p.get("quoted_post_id")
+        if qid and qid in quotes:
+            qp = quotes[qid]
+            quoted = {
+                "id": qp["id"],
+                "text": qp["text"],
+                "author": qp.get("author"),
+                "created_at": qp["created_at"],
+                "wall_owner": qp.get("wall_owner"),
+            }
         out.append({"id": p["id"], "text": p["text"], "created_at": p["created_at"],
                     "author": p.get("author"), "wall_owner": p.get("wall_owner"),
+                    "views": p.get("views") or 0,
+                    "quoted_post_id": qid, "quoted": quoted,
                     "upvotes": up, "downvotes": down, "user_vote": uv, "comments": clist})
     return out
 
@@ -927,7 +973,11 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
     return d
 
 
-class PostIn(BaseModel): text: str
+class PostIn(BaseModel):
+    text: str
+    quoted_post_id: Optional[str] = None
+
+
 class PostEditIn(BaseModel): text: str
 class VoteIn(BaseModel): direction: int
 class CommentIn(BaseModel): text: str; parent_id: Optional[str] = None
@@ -1077,6 +1127,7 @@ def api_user(nick: str, request: Request):
     viewer = get_current_user(request)
     data = serialize_user(u, viewer["nick"] if viewer else None)
     data["is_following"] = bool(viewer and u["nick"] in (viewer.get("following") or set()))
+    data["is_follower"] = bool(viewer and viewer["nick"] in (u.get("followers") or set()))
     return data
 
 
@@ -1173,25 +1224,39 @@ def api_list(request: Request, q: str = "", author: str = "", feed: str = ""):
 def api_wall(nick: str, request: Request):
     u = db_load_user(nick)
     if not u: raise HTTPException(404, "not found")
-    posts = db_list_wall_posts(u["nick"])
     viewer = get_current_user(request)
     vid = "u:" + viewer["nick"] if viewer else "c:anon"
+
+    is_owner = viewer and viewer["nick"] == u["nick"]
+    is_follower = viewer and viewer["nick"] in (u.get("followers") or set())
+
+    # Стена — сообщество: видна только владельцу и его подписчикам
+    if not is_owner and not is_follower:
+        return {
+            "posts": [],
+            "allow_wall_posts": u.get("allow_wall_posts", True),
+            "can_view": False,
+            "can_post": False,
+            "reason": "err_wall_community",
+        }
+
+    posts = db_list_wall_posts(u["nick"])
     can_post = False
     reason = ""
     if viewer:
-        if viewer["nick"] == u["nick"]:
+        if is_owner:
             can_post = True
         elif not u.get("allow_wall_posts", True):
             reason = "err_wall_disabled"
         elif viewer["nick"] in (u.get("blacklist") or []):
             reason = "err_user_blocked"
-        elif viewer["nick"] not in (u.get("followers") or set()):
+        elif not is_follower:
             reason = "err_need_follow"
         else:
             can_post = True
     return {"posts": build_posts_full(posts, vid),
             "allow_wall_posts": u.get("allow_wall_posts", True),
-            "can_post": can_post, "reason": reason}
+            "can_view": True, "can_post": can_post, "reason": reason}
 
 
 @app.post("/api/users/{nick}/wall")
@@ -1210,7 +1275,8 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
     p = {"id": pid, "text": text, "author": me["nick"],
-         "created_at": time.time(), "wall_owner": owner["nick"]}
+         "created_at": time.time(), "wall_owner": owner["nick"],
+         "quoted_post_id": payload.quoted_post_id or None}
     db_create_post(p)
     notified = set()
     for m in extract_mentions(text):
@@ -1222,6 +1288,10 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
         notified.add(k)
     if owner["nick"] != me["nick"] and owner["nick"].lower() not in notified:
         db_notify(owner["nick"], "wall_post", me["nick"], post_id=pid, text=text[:140])
+    if payload.quoted_post_id:
+        qp = db_get_post(payload.quoted_post_id)
+        if qp and qp.get("author") and qp["author"] != me["nick"]:
+            db_notify(qp["author"], "quote", me["nick"], post_id=pid, text=text[:140])
     return build_posts_full([p], "u:" + me["nick"])[0]
 
 
@@ -1229,6 +1299,8 @@ def api_wall_post(nick: str, payload: PostIn, request: Request):
 def api_get(pid: str, request: Request):
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
+    db_inc_views(pid)
+    p = db_get_post(pid)
     u = get_current_user(request)
     vid = "u:" + u["nick"] if u else "c:anon"
     return build_posts_full([p], vid)[0]
@@ -1240,11 +1312,12 @@ def api_create(payload: PostIn, request: Request):
     ip = get_client_ip(request)
     if not rate_limit("post:" + ip, 30, 60): raise HTTPException(429, "err_rate_limit")
     text = payload.text.strip()
-    if not text: raise HTTPException(400, "empty")
+    if not text and not payload.quoted_post_id: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
     p = {"id": pid, "text": text, "author": u["nick"],
-         "created_at": time.time(), "wall_owner": None}
+         "created_at": time.time(), "wall_owner": None,
+         "quoted_post_id": payload.quoted_post_id or None}
     db_create_post(p)
     notified = set()
     for nick in extract_mentions(text):
@@ -1260,6 +1333,10 @@ def api_create(payload: PostIn, request: Request):
         if not db_load_user_cached(f): continue
         db_notify(f, "new_post", u["nick"], post_id=pid, text=text[:140])
         notified.add(f.lower())
+    if payload.quoted_post_id:
+        qp = db_get_post(payload.quoted_post_id)
+        if qp and qp.get("author") and qp["author"] != u["nick"]:
+            db_notify(qp["author"], "quote", u["nick"], post_id=pid, text=text[:140])
     return build_posts_full([p], "u:" + u["nick"])[0]
 
 
@@ -1389,7 +1466,6 @@ def api_translate(data: TranslateIn, request: Request):
     if not text: raise HTTPException(400, "empty")
     text = text[:1000]
     target = data.to if data.to in ("ru", "en") else "en"
-    # определяем исходный по эвристике: если много кириллицы — ru, иначе en
     cyr = sum(1 for ch in text if "\u0400" <= ch <= "\u04FF")
     src = "ru" if cyr > max(1, len(text) // 10) else "en"
     if src == target: return {"text": text, "src": src, "dst": target, "translated": False}
@@ -1401,7 +1477,7 @@ def api_translate(data: TranslateIn, request: Request):
             data = json.loads(r.read().decode())
         t = (data.get("responseData") or {}).get("translatedText") or text
         return {"text": t, "src": src, "dst": target, "translated": True}
-    except Exception as e:
+    except Exception:
         raise HTTPException(502, "translate_failed")
 
 
@@ -1423,15 +1499,13 @@ def api_notifications(request: Request):
 @app.post("/api/notifications/read")
 def api_notifications_read(request: Request):
     me = require_user(request)
-    db_notifications_mark_read(me["nick"])
-    return {"ok": True}
+    db_notifications_mark_read(me["nick"]); return {"ok": True}
 
 
 @app.post("/api/notifications/clear")
 def api_notifications_clear(request: Request):
     me = require_user(request)
-    db_notifications_clear(me["nick"])
-    return {"ok": True}
+    db_notifications_clear(me["nick"]); return {"ok": True}
 
 
 def serialize_dm_thread(t: dict, me: str) -> dict:
@@ -1579,14 +1653,14 @@ async def api_events(request: Request, token: str = ""):
 
 TEXTS = {
     "ru": {
-        "search_ph": "Поиск постов",
-        "post_ph": "Что нового? Напишите пост...",
+        "search_ph": "Поиск людей и постов",
+        "post_ph": "Что нового?",
         "comment_ph": "Комментарий...",
         "reply_ph": "Ответ...",
         "publish": "Опубликовать",
         "send_comment": "Отправить",
         "reply": "Ответить", "cancel_reply": "Отмена",
-        "no_posts": "Постов нет. Будьте первым!",
+        "no_posts": "Здесь пока пусто",
         "not_found": "Не найдено",
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
         "read_more": "Показать полностью",
@@ -1599,7 +1673,7 @@ TEXTS = {
         "notif_clear": "Очистить",
         "notif_clear_confirm": "Удалить все уведомления?",
         "author_badge": "автор",
-        "feed_all": "Все посты", "feed_subs": "Мои подписки",
+        "feed_all": "Для вас", "feed_subs": "Подписки",
         "nav_home": "Лента", "nav_users": "Люди", "nav_messages": "Сообщения",
         "nav_profile": "Профиль", "nav_notifications": "Уведомления",
         "nav_settings": "Настройки", "nav_logout": "Выйти",
@@ -1623,6 +1697,7 @@ TEXTS = {
         "err_bio_too_long": "Описание слишком длинное",
         "err_wall_disabled": "Стена закрыта",
         "err_need_follow": "Подпишитесь на пользователя, чтобы писать на его стене",
+        "err_wall_community": "Стена сообщества — видна только подписчикам",
         "login_to_post": "Войдите, чтобы публиковать",
         "login_to_comment": "Войдите, чтобы комментировать",
         "login_to_dm": "Войдите, чтобы писать сообщения",
@@ -1630,18 +1705,19 @@ TEXTS = {
         "go_login": "Войти",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
-        "message": "Написать",
-        "edit_profile": "Изменить профиль",
+        "message": "Сообщение",
+        "edit_profile": "Редактировать",
         "edit_profile_title": "Изменить профиль",
         "own_profile": "Это ваш профиль",
-        "no_user_posts": "Постов пока нет",
+        "no_user_posts": "Здесь пока пусто",
         "wall_tab": "Стена", "posts_tab": "Посты",
         "wall_empty": "Стена пуста",
-        "wall_ph": "Написать на стене...",
+        "wall_ph": "Что-нибудь на стене...",
         "wall_send": "Отправить",
         "wall_hint": "Писать могут только ваши подписчики",
-        "wall_must_follow": "Чтобы писать на стене, подпишитесь на пользователя",
+        "wall_must_follow": "Подпишитесь, чтобы писать на стене",
         "wall_owner_prefix": "→",
+        "wall_community_hint": "Стена сообщества — видна только подписчикам",
         "settings_title": "Настройки",
         "settings_account": "Аккаунт",
         "settings_privacy": "Приватность",
@@ -1653,18 +1729,18 @@ TEXTS = {
         "settings_allow_following": "Показывать список подписок",
         "settings_notify_new_post": "Уведомления о новых постах",
         "settings_allow_wall": "Разрешить писать на моей стене",
-        "settings_allow_wall_hint": "Писать смогут только ваши подписчики",
+        "settings_allow_wall_hint": "Стена видна и открыта только для ваших подписчиков",
         "settings_blacklist": "Чёрный список",
-        "settings_blacklist_hint": "Люди в этом списке не могут писать вам, комментировать и отправлять сообщения",
+        "settings_blacklist_hint": "Люди из этого списка не могут вам писать, комментировать и отправлять сообщения",
         "settings_blacklist_add_ph": "Ник (без @)",
         "settings_blacklist_add": "Заблокировать",
         "settings_blacklist_empty": "Список пуст",
         "settings_policy": "Политика конфиденциальности",
-        "settings_desc": "sldChat — минималистичная соцсеть: посты, стены, комментарии, сообщения в реальном времени.",
+        "settings_desc": "sldChat — минималистичная соцсеть: посты, стены-сообщества, комментарии и сообщения в реальном времени.",
         "settings_authors": "Авторы",
-        "settings_logout": "Выйти из аккаунта",
+        "settings_logout": "Выйти",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
-        "notif_title": "Уведомления", "notif_empty": "Уведомлений нет",
+        "notif_title": "Уведомления", "notif_empty": "Здесь пока пусто",
         "notif_follow": "подписался на вас",
         "notif_comment": "оставил комментарий",
         "notif_reply": "ответил на ваш комментарий",
@@ -1672,6 +1748,7 @@ TEXTS = {
         "notif_dm": "начал переписку с вами",
         "notif_new_post": "опубликовал новый пост",
         "notif_wall_post": "написал на вашей стене",
+        "notif_quote": "процитировал ваш пост",
         "back": "Назад",
         "bio_ph": "О себе...",
         "bio_empty": "Описание не заполнено",
@@ -1680,12 +1757,12 @@ TEXTS = {
         "limited_list": "Список скрыт. Вам виден только ваш аккаунт.",
         "people_title": "Люди",
         "people_search_ph": "Поиск людей",
-        "people_all": "Все", "people_subs": "Мои подписки",
+        "people_all": "Все", "people_subs": "Подписки",
         "no_users": "Никого не найдено",
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "Мы храним минимум данных: имя, ник, пароль (хеш), посты, комментарии, "
-            "стену, голоса, подписки, чёрный список, сообщения и уведомления.\n\n"
+            "стену, цитаты, голоса, подписки, чёрный список, сообщения и уведомления.\n\n"
             "Пароль хранится как pbkdf2-hmac-sha256 (100 000 итераций) с солью. Мы не можем его восстановить.\n\n"
             "Данные хранятся на серверах Supabase. Мы их не продаём и не передаём третьим лицам.\n\n"
             "Редактировать и удалять можно свои посты и комментарии. Владелец стены может удалять посты и комментарии на своей стене.\n\n"
@@ -1706,16 +1783,21 @@ TEXTS = {
         "translate": "Перевести",
         "translate_show_original": "Показать оригинал",
         "translate_failed": "Перевод не удался",
+        "quote": "Цитировать",
+        "quote_banner": "Цитата:",
+        "quote_cancel": "Отменить",
+        "quoting": "Вы цитируете",
+        "quoted_title": "Цитата",
     },
     "en": {
-        "search_ph": "Search posts",
-        "post_ph": "What's new? Write a post...",
+        "search_ph": "Search people and posts",
+        "post_ph": "What's new?",
         "comment_ph": "Comment...",
         "reply_ph": "Reply...",
         "publish": "Publish",
         "send_comment": "Send",
         "reply": "Reply", "cancel_reply": "Cancel",
-        "no_posts": "No posts yet. Be the first!",
+        "no_posts": "Nothing here yet",
         "not_found": "Not found",
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
         "read_more": "Show more",
@@ -1728,13 +1810,13 @@ TEXTS = {
         "notif_clear": "Clear",
         "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
-        "feed_all": "All posts", "feed_subs": "My subscriptions",
+        "feed_all": "For you", "feed_subs": "Subscriptions",
         "nav_home": "Feed", "nav_users": "People", "nav_messages": "Messages",
         "nav_profile": "Profile", "nav_notifications": "Notifications",
         "nav_settings": "Settings", "nav_logout": "Log out",
         "nav_login": "Log in", "nav_register": "Sign up",
         "reg_title": "Sign up", "log_title": "Log in",
-        "name_ph": "Name", "nick_ph": "Nick (without @)",
+        "name_ph": "Name", "nick_ph": "Nick (no @)",
         "pass_ph": "Password", "pass2_ph": "Confirm password",
         "reg_btn": "Sign up", "log_btn": "Log in",
         "to_login": "Already have an account? Log in",
@@ -1752,6 +1834,7 @@ TEXTS = {
         "err_bio_too_long": "Bio is too long",
         "err_wall_disabled": "Wall is closed",
         "err_need_follow": "Follow this user to post on their wall",
+        "err_wall_community": "Wall is a community — visible to followers only",
         "login_to_post": "Log in to publish",
         "login_to_comment": "Log in to comment",
         "login_to_dm": "Log in to send messages",
@@ -1760,17 +1843,18 @@ TEXTS = {
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
         "message": "Message",
-        "edit_profile": "Edit profile",
+        "edit_profile": "Edit",
         "edit_profile_title": "Edit profile",
         "own_profile": "This is your profile",
-        "no_user_posts": "No posts yet",
+        "no_user_posts": "Nothing here yet",
         "wall_tab": "Wall", "posts_tab": "Posts",
         "wall_empty": "Wall is empty",
         "wall_ph": "Write on the wall...",
         "wall_send": "Post",
         "wall_hint": "Only followers can post",
-        "wall_must_follow": "Follow this user to post on their wall",
+        "wall_must_follow": "Follow to post on this wall",
         "wall_owner_prefix": "→",
+        "wall_community_hint": "Wall is a community — visible to followers only",
         "settings_title": "Settings",
         "settings_account": "Account",
         "settings_privacy": "Privacy",
@@ -1782,18 +1866,18 @@ TEXTS = {
         "settings_allow_following": "Show following list",
         "settings_notify_new_post": "New post notifications",
         "settings_allow_wall": "Allow posts on my wall",
-        "settings_allow_wall_hint": "Only your followers will be able to post",
+        "settings_allow_wall_hint": "Wall is visible and open to your followers only",
         "settings_blacklist": "Blacklist",
         "settings_blacklist_hint": "People in this list cannot write, comment or message you",
-        "settings_blacklist_add_ph": "Nick (without @)",
+        "settings_blacklist_add_ph": "Nick (no @)",
         "settings_blacklist_add": "Block",
         "settings_blacklist_empty": "List is empty",
         "settings_policy": "Privacy policy",
-        "settings_desc": "sldChat — minimalist social network: posts, walls, comments, realtime messages.",
+        "settings_desc": "sldChat — minimalist social network: posts, community walls, comments, realtime messages.",
         "settings_authors": "Authors",
         "settings_logout": "Log out",
         "theme_light": "Light", "theme_dark": "Dark",
-        "notif_title": "Notifications", "notif_empty": "No notifications",
+        "notif_title": "Notifications", "notif_empty": "Nothing here yet",
         "notif_follow": "followed you",
         "notif_comment": "commented",
         "notif_reply": "replied to your comment",
@@ -1801,6 +1885,7 @@ TEXTS = {
         "notif_dm": "started a chat with you",
         "notif_new_post": "published a new post",
         "notif_wall_post": "posted on your wall",
+        "notif_quote": "quoted your post",
         "back": "Back",
         "bio_ph": "Bio...",
         "bio_empty": "No bio yet",
@@ -1809,13 +1894,13 @@ TEXTS = {
         "limited_list": "List is hidden. You can see only your account.",
         "people_title": "People",
         "people_search_ph": "Search people",
-        "people_all": "All", "people_subs": "My subscriptions",
+        "people_all": "All", "people_subs": "Subscriptions",
         "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
             "We store minimum data: name, nick, password (hash), posts, comments, "
-            "wall, votes, follows, blacklist, messages and notifications.\n\n"
-            "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt. We cannot recover it.\n\n"
+            "wall, quotes, votes, follows, blacklist, messages and notifications.\n\n"
+            "Password is stored as pbkdf2-hmac-sha256 (100 000 iterations) with salt.\n\n"
             "Data is stored on Supabase. We do not sell or share it.\n\n"
             "You can edit/delete your own posts and comments. Wall owner can delete posts/comments on their wall.\n\n"
             "DMs are visible only to participants. Blacklist fully blocks notifications and messages.\n\n"
@@ -1835,11 +1920,16 @@ TEXTS = {
         "translate": "Translate",
         "translate_show_original": "Show original",
         "translate_failed": "Translation failed",
+        "quote": "Quote",
+        "quote_banner": "Quote:",
+        "quote_cancel": "Cancel",
+        "quoting": "You are quoting",
+        "quoted_title": "Quote",
     },
 }
 
 
-def svg(paths: str, size: int = 18, sw: float = 2) -> str:
+def svg(paths: str, size: int = 20, sw: float = 2) -> str:
     return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
             f'stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" '
             f'stroke-linejoin="round">{paths}</svg>')
@@ -1850,7 +1940,7 @@ I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
     '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
 I_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>')
-I_MAIL = svg('<rect x="3" y="5" width="18" height="14"/><polyline points="3 7 12 13 21 7"/>')
+I_MAIL = svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>')
 I_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
     '<path d="M13.7 21a2 2 0 0 1-3.4 0"/>')
 I_GEAR = svg('<circle cx="12" cy="12" r="3"/>'
@@ -1860,15 +1950,16 @@ I_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
 I_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
     '<polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>')
 I_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>')
-I_UP = svg('<polyline points="6 15 12 9 18 15"/>', size=14, sw=2.5)
-I_DOWN = svg('<polyline points="6 9 12 15 18 9"/>', size=14, sw=2.5)
-I_COMMENT = svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>', size=14)
-I_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=14)
-I_EDIT = svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=14)
+I_UP = svg('<polyline points="6 15 12 9 18 15"/>', size=16, sw=2.5)
+I_DOWN = svg('<polyline points="6 9 12 15 18 9"/>', size=16, sw=2.5)
+I_COMMENT = svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>', size=16)
+I_QUOTE = svg('<path d="M6 17h3l2-4V7H5v6h3z"/><path d="M14 17h3l2-4V7h-6v6h3z"/>', size=16)
+I_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=16)
+I_EDIT = svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=16)
 I_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
     '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
-    '<path d="M10 11v6M14 11v6"/>', size=14)
-I_TRANSLATE = svg('<path d="M4 5h12M10 3v2c0 4-2 7-5 9"/><path d="M5 15l6-6 6 6"/><path d="M14 13l5 8"/><path d="M22 13l-5 8"/>', size=14)
+    '<path d="M10 11v6M14 11v6"/>', size=16)
+I_TRANSLATE = svg('<path d="M4 5h12M10 3v2c0 4-2 7-5 9"/><path d="M5 15l6-6 6 6"/><path d="M14 13l5 8"/><path d="M22 13l-5 8"/>', size=16)
 I_BACK = svg('<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>')
 I_SEARCH = svg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
 I_MOON = svg('<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>')
@@ -1877,32 +1968,32 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
     '<line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/>'
     '<line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/>'
     '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
+I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=15)
+I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 
 FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
-           "%3Crect width='64' height='64' fill='%230866ff'/%3E"
-           "%3Cpath d='M14 16h36v24H28l-14 12V16z' fill='%23ffffff'/%3E%3C/svg%3E")
+           "%3Crect width='64' height='64' fill='%230a0a0a'/%3E"
+           "%3Ctext x='50%25' y='65%25' font-family='Arial' font-weight='900' font-size='32' fill='%23fff' text-anchor='middle'%3EИ%3C/text%3E%3C/svg%3E")
 
 
 CSS = """
-:root, [data-theme="light"] {
-  --bg:#eef0f3; --card:#fff; --line:#e1e4e8; --line-strong:#c0c4cc;
-  --text:#14161a; --muted:#65676b; --hover:#f1f3f5;
-  --accent:#0866ff; --accent-fg:#fff; --accent-soft:#e6efff;
-  --up:#16a34a; --down:#dc2626; --comment-bg:#f1f3f5;
-  --danger:#dc2626; --mention:#0866ff;
-  --bubble-mine:#0866ff; --bubble-mine-fg:#fff;
-  --bubble-theirs:#eef0f3; --bubble-theirs-fg:#14161a;
-  --online:#22c55e; --shadow:0 1px 3px rgba(0,0,0,.06);
+:root, [data-theme="dark"] {
+  --bg:#0a0a0a; --card:#121212; --card-2:#1a1a1a; --line:#232323; --line-2:#2c2c2c;
+  --text:#f2f2f2; --muted:#8a8a8a; --hover:#1e1e1e;
+  --accent:#f2f2f2; --accent-fg:#0a0a0a; --accent-soft:#1e1e1e;
+  --up:#22c55e; --down:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
+  --bubble-mine:#2b2b2b; --bubble-mine-fg:#f2f2f2;
+  --bubble-theirs:#1a1a1a; --bubble-theirs-fg:#f2f2f2;
+  --online:#22c55e;
 }
-[data-theme="dark"] {
-  --bg:#0b0d10; --card:#161a1f; --line:#272c33; --line-strong:#3a4149;
-  --text:#e7eaee; --muted:#8a929c; --hover:#1e232a;
-  --accent:#4a90ff; --accent-fg:#fff; --accent-soft:#182a44;
-  --up:#34d058; --down:#ff5c5c; --comment-bg:#1e232a;
-  --danger:#ff5c5c; --mention:#6aa9ff;
-  --bubble-mine:#4a90ff; --bubble-mine-fg:#fff;
-  --bubble-theirs:#1e232a; --bubble-theirs-fg:#e7eaee;
-  --online:#34d058; --shadow:0 1px 3px rgba(0,0,0,.4);
+[data-theme="light"] {
+  --bg:#f2f3f5; --card:#ffffff; --card-2:#ffffff; --line:#e6e6e9; --line-2:#d6d6da;
+  --text:#0a0a0a; --muted:#707070; --hover:#f0f1f3;
+  --accent:#0a0a0a; --accent-fg:#ffffff; --accent-soft:#eef0f3;
+  --up:#16a34a; --down:#dc2626; --danger:#dc2626; --mention:#2b6fff;
+  --bubble-mine:#0a0a0a; --bubble-mine-fg:#ffffff;
+  --bubble-theirs:#f0f1f3; --bubble-theirs-fg:#0a0a0a;
+  --online:#16a34a;
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
@@ -1911,53 +2002,61 @@ body {
   background: var(--bg); color: var(--text); font-size: 15px;
   -webkit-font-smoothing: antialiased;
   user-select: none; -webkit-user-select: none;
-  display: flex;
 }
-input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px; }
-* { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+input, textarea { user-select: text; -webkit-user-select: text; font-size: 15px; }
+* { scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
 
-.layout { display: flex; width: 100%; height: 100vh; background: var(--card); }
-.main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--card); }
-.main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
-
-/* HEADER */
-.main-header {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
-  padding: 12px 16px; border-bottom: 1px solid var(--line);
-  min-height: 58px; background: var(--card);
+.layout {
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  background: var(--bg);
+  max-width: 1400px;
+  margin: 0 auto;
 }
-.main-header .title {
-  flex: 1; font-size: 17px; font-weight: 700;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.main-header .title a { color: var(--text); text-decoration: none; }
-.main-header .sub { font-size: 13px; color: var(--muted); font-weight: 400; margin-top: 2px; }
 
-/* SIDEBAR (desktop) */
+/* SIDEBAR */
 .sidebar {
-  flex: 0 0 260px; width: 260px; border-left: 1px solid var(--line);
-  background: var(--card); display: flex; flex-direction: column;
-  padding: 20px 12px 12px;
+  flex: 0 0 260px;
+  width: 260px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 16px 16px;
 }
 .sidebar .logo {
-  font-size: 22px; font-weight: 800; letter-spacing: -0.5px;
-  padding: 4px 14px 24px; color: var(--accent);
+  font-size: 22px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  padding: 4px 12px 28px;
+  color: var(--text);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
 }
-.nav { display: flex; flex-direction: column; gap: 4px; }
+.sidebar .logo .ver {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0;
+}
+.nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-btn {
   display: flex; align-items: center; gap: 14px;
-  width: 100%; padding: 12px 14px; border: none; background: transparent;
+  width: 100%; padding: 12px 14px;
+  border: none; background: transparent;
   color: var(--text); font: inherit; font-size: 15px; font-weight: 500;
-  cursor: pointer; text-align: left; border-radius: 10px;
+  cursor: pointer; text-align: left;
+  border-radius: 12px;
   transition: background .12s;
   position: relative;
 }
 .nav-btn:hover { background: var(--hover); }
-.nav-btn.active { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
-.nav-btn.active svg { color: var(--accent); }
+.nav-btn.active { background: var(--accent-soft); color: var(--text); font-weight: 700; }
+.nav-btn.active svg { color: var(--text); }
 .nav-btn svg { flex-shrink: 0; color: var(--muted); }
 .nav-btn .badge {
   margin-left: auto; min-width: 22px; height: 22px;
@@ -1967,149 +2066,756 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 }
 .sidebar .spacer { flex: 1; }
 .sidebar-user {
-  padding: 14px; font-size: 14px; color: var(--muted);
-  border-top: 1px solid var(--line); display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px; font-size: 14px; font-weight: 600;
+  color: var(--text); display: flex; align-items: center; gap: 10px;
+  cursor: pointer; border-radius: 12px;
+  transition: background .12s;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sidebar-user .dot {
-  width: 10px; height: 10px; background: var(--online); flex-shrink: 0;
-  border-radius: 50%; box-shadow: 0 0 0 3px rgba(34,197,94,.2);
+.sidebar-user:hover { background: var(--hover); }
+.sidebar-user .star { color: #f5b400; flex-shrink: 0; }
+.sidebar-logout {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 14px; margin-top: 2px;
+  color: var(--text); font-size: 15px; font-weight: 500;
+  background: transparent; border: none; cursor: pointer;
+  border-radius: 12px; text-align: left; width: 100%;
+  transition: background .12s;
+}
+.sidebar-logout:hover { background: var(--hover); }
+.sidebar-logout svg { color: var(--muted); }
+
+/* MAIN */
+.main {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg);
+  overflow: hidden;
+}
+.main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
+
+.main-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 20px 100px;
 }
 
-/* ICON BUTTON */
+/* HEADER */
+.main-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 20px;
+  max-width: 720px;
+  margin: 0 auto;
+  width: 100%;
+}
+.main-header .title {
+  flex: 1; font-size: 22px; font-weight: 800;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.main-header .title a { color: var(--text); text-decoration: none; }
+.main-header .sub { font-size: 13px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+
+/* BUTTONS */
 .icon-btn {
-  width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
-  background: transparent; border: none; color: var(--text);
+  width: 40px; height: 40px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--card); border: none; color: var(--text);
   cursor: pointer; padding: 0; text-decoration: none;
-  border-radius: 10px; transition: background .12s, color .12s;
+  border-radius: 12px;
+  transition: background .12s, color .12s;
   flex-shrink: 0;
 }
-.icon-btn:hover { background: var(--hover); color: var(--accent); }
-.icon-btn.danger:hover { color: var(--danger); }
+.icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn svg { display: block; }
+.icon-btn.danger:hover { color: var(--danger); }
+
+/* PILL TABS */
+.pill-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  background: var(--card);
+  border-radius: 16px;
+  margin-bottom: 16px;
+}
+.pill-tab {
+  flex: 1;
+  padding: 10px 16px;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 12px;
+  transition: background .12s, color .12s;
+  white-space: nowrap;
+}
+.pill-tab:hover { color: var(--text); }
+.pill-tab.active { background: var(--accent); color: var(--accent-fg); }
 
 /* SEARCH */
-header.search-header {
-  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
-  padding: 12px 16px; border-bottom: 1px solid var(--line);
+.search-box {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--card); border-radius: 16px;
+  padding: 12px 18px; margin-bottom: 16px;
 }
-header.search-header input[type="search"], header.search-header input[type="text"] {
-  flex: 1; min-width: 0; padding: 0 16px; height: 44px;
-  border: 1px solid var(--line); background: var(--hover);
+.search-box svg { color: var(--muted); flex-shrink: 0; }
+.search-box input {
+  flex: 1; background: transparent; border: none; outline: none;
   color: var(--text); font-size: 15px; font-family: inherit;
-  outline: none; transition: border-color .12s, background .12s;
-  border-radius: 22px;
 }
-header.search-header input:focus { border-color: var(--accent); background: var(--card); }
+.search-box input::placeholder { color: var(--muted); }
 
-/* FEED TABS */
-.feed-tabs {
-  flex: 0 0 auto; display: flex; gap: 8px;
-  padding: 10px 16px; border-bottom: 1px solid var(--line);
+/* CARD / COMPOSER */
+.card {
+  background: var(--card);
+  border-radius: 20px;
+  padding: 18px;
+  margin-bottom: 14px;
 }
-.feed-tab {
-  flex: 1; height: 42px; padding: 0 16px;
-  background: var(--hover); border: 1px solid transparent;
-  color: var(--text); font-family: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer; border-radius: 10px;
-  transition: background .12s, color .12s, border-color .12s;
+.composer-avatar-row {
+  display: flex; gap: 14px; align-items: flex-start;
 }
-.feed-tab:hover { background: var(--line); }
-.feed-tab.active {
+.composer-body { flex: 1; min-width: 0; }
+.composer-body textarea {
+  width: 100%;
+  background: transparent;
+  border: none; outline: none; resize: none;
+  color: var(--text); font-family: inherit; font-size: 16px;
+  line-height: 1.5; min-height: 30px;
+  padding: 8px 0 0;
+}
+.composer-body textarea::placeholder { color: var(--muted); }
+.composer-actions {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 12px;
+}
+.composer-actions .spacer { flex: 1; }
+.composer-icon {
+  width: 38px; height: 38px;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--muted); display: inline-flex;
+  align-items: center; justify-content: center;
+  border-radius: 10px;
+  transition: background .12s, color .12s;
+}
+.composer-icon:hover { background: var(--hover); color: var(--text); }
+.publish-btn {
+  height: 42px; padding: 0 22px;
   background: var(--accent); color: var(--accent-fg);
+  border: none; border-radius: 12px;
+  font-family: inherit; font-size: 15px; font-weight: 700;
+  cursor: pointer;
+  transition: opacity .12s;
 }
+.publish-btn:hover { opacity: .88; }
+.publish-btn:disabled { opacity: .35; cursor: default; }
 
-/* EMPTY / SPINNER */
-.empty { padding: 60px 20px; text-align: center; color: var(--muted); font-size: 14px; }
-.spinner-wrap { padding: 60px 0; text-align: center; }
-.spinner {
-  display: inline-block; width: 28px; height: 28px;
-  border: 3px solid var(--line); border-top-color: var(--accent);
-  animation: spin .7s linear infinite; border-radius: 50%;
+/* QUOTE BANNER in composer */
+.quote-preview {
+  margin-top: 10px;
+  padding: 12px 14px;
+  background: var(--card-2);
+  border-radius: 14px;
+  border-left: 3px solid var(--line-2);
+  position: relative;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
+.quote-preview .qp-author {
+  font-size: 13px; font-weight: 700;
+  color: var(--text); margin-bottom: 4px;
+}
+.quote-preview .qp-text {
+  font-size: 14px; color: var(--muted);
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  max-height: 100px; overflow: hidden;
+}
+.quote-preview .qp-close {
+  position: absolute; top: 8px; right: 8px;
+  width: 28px; height: 28px;
+  background: transparent; border: none;
+  color: var(--muted); cursor: pointer;
+  border-radius: 8px;
+}
+.quote-preview .qp-close:hover { color: var(--danger); background: var(--hover); }
 
 /* POST */
-.post {
-  padding: 18px 20px; border-bottom: 1px solid var(--line);
+.post-card {
   background: var(--card);
+  border-radius: 20px;
+  padding: 18px;
+  margin-bottom: 14px;
 }
-.post-meta {
-  display: flex; align-items: center; gap: 10px;
-  margin-bottom: 10px; font-size: 13px; flex-wrap: wrap;
+.post-header {
+  display: flex; align-items: flex-start; gap: 12px;
+  margin-bottom: 12px;
+}
+.post-header .meta { flex: 1; min-width: 0; }
+.post-header .who {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+  font-size: 14px;
 }
 .post-author {
   font-weight: 700; color: var(--text); text-decoration: none;
-  font-size: 15px;
 }
-.post-author:hover { color: var(--accent); }
-.post-wall-hint { color: var(--muted); font-size: 13px; }
+.post-author:hover { text-decoration: underline; }
+.post-time { color: var(--muted); font-size: 13px; }
+.post-wall-hint {
+  color: var(--muted); font-size: 13px;
+}
 .post-wall-hint a { color: var(--muted); text-decoration: none; }
-.post-wall-hint a:hover { color: var(--accent); }
-.post-time { color: var(--muted); font-size: 13px; margin-left: auto; }
+.post-wall-hint a:hover { color: var(--text); }
 .post-text {
-  font-size: 16px; line-height: 1.55; white-space: pre-wrap;
-  word-wrap: break-word; overflow-wrap: anywhere; color: var(--text);
+  font-size: 15px; line-height: 1.55;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  color: var(--text);
+  margin-bottom: 8px;
 }
+.post-text:empty { display: none; }
 .mention { color: var(--mention); text-decoration: none; font-weight: 600; }
 .mention:hover { text-decoration: underline; }
 .read-more {
-  display: inline-block; margin-top: 8px; color: var(--accent);
-  text-decoration: none; font-size: 14px; font-weight: 600;
-  cursor: pointer;
+  display: inline-block; margin-top: 4px;
+  color: var(--muted); text-decoration: none;
+  font-size: 14px; font-weight: 500; cursor: pointer;
 }
-.read-more:hover { text-decoration: underline; }
-.post-translated {
-  margin-top: 8px; padding: 8px 12px; background: var(--accent-soft);
-  border-radius: 8px; font-size: 12px; color: var(--accent);
-  display: flex; align-items: center; gap: 6px;
+.read-more:hover { color: var(--text); }
+
+/* QUOTED POST block */
+.quoted-post {
+  margin-top: 10px;
+  padding: 12px 14px;
+  background: var(--card-2);
+  border-radius: 14px;
+  border-left: 3px solid var(--line-2);
+  cursor: pointer;
+  transition: background .12s;
+}
+.quoted-post:hover { background: var(--hover); }
+.quoted-post .q-author {
+  font-size: 13px; font-weight: 700; color: var(--text);
+  margin-bottom: 4px;
+}
+.quoted-post .q-author a { color: var(--text); text-decoration: none; }
+.quoted-post .q-author a:hover { text-decoration: underline; }
+.quoted-post .q-text {
+  font-size: 14px; color: var(--muted); line-height: 1.5;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  max-height: 120px; overflow: hidden;
 }
 
 .post-actions {
   display: flex; align-items: center; gap: 4px;
-  margin-top: 14px; font-size: 13px; color: var(--muted);
-  flex-wrap: wrap;
+  margin-top: 14px;
 }
-.vote-btn, .action-btn {
+.post-actions .push-right { flex: 1; }
+.act-btn {
   display: inline-flex; align-items: center; gap: 6px;
-  height: 38px; padding: 0 14px;
-  background: transparent; border: none; color: var(--muted);
-  cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600;
+  height: 36px; padding: 0 12px;
+  background: transparent; border: none;
+  color: var(--muted); cursor: pointer;
+  font-family: inherit; font-size: 13px; font-weight: 600;
   border-radius: 10px;
+  transition: background .12s, color .12s;
+}
+.act-btn:hover { background: var(--hover); color: var(--text); }
+.act-btn.up:hover, .act-btn.up.active { color: var(--up); }
+.act-btn.down:hover, .act-btn.down.active { color: var(--down); }
+.act-btn.danger:hover { color: var(--danger); }
+.act-btn svg { display: block; }
+.act-btn .num { font-variant-numeric: tabular-nums; }
+.act-btn .num.pos { color: var(--up); }
+.act-btn .num.neg { color: var(--down); }
+
+/* AVATAR */
+.avatar {
+  width: 44px; height: 44px; flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 16px;
+  position: relative;
+  overflow: hidden;
+  text-transform: uppercase;
+}
+.avatar.sm { width: 36px; height: 36px; font-size: 14px; }
+.avatar.lg { width: 96px; height: 96px; font-size: 36px; border: 4px solid var(--bg); }
+.avatar .online-dot {
+  position: absolute; bottom: 2px; right: 2px;
+  width: 12px; height: 12px;
+  background: var(--online); border: 2px solid var(--card);
+  border-radius: 50%;
+}
+.avatar.lg .online-dot {
+  width: 18px; height: 18px; bottom: 6px; right: 6px;
+  border-width: 3px; border-color: var(--bg);
+}
+
+/* PROFILE */
+.profile-cover {
+  height: 140px;
+  border-radius: 20px;
+  background: linear-gradient(135deg, var(--card) 0%, var(--card-2) 100%);
+  position: relative;
+  margin-bottom: 44px;
+}
+.profile-cover-avatar {
+  position: absolute;
+  left: 24px; bottom: -46px;
+}
+.profile-cover-avatar .avatar { width: 92px; height: 92px; font-size: 34px; }
+.profile-cover-avatar .avatar .online-dot {
+  width: 20px; height: 20px; bottom: 4px; right: 4px;
+  border-width: 3px; border-color: var(--bg);
+}
+.profile-actions-right {
+  position: absolute; right: 20px; bottom: -46px;
+  display: flex; gap: 10px; align-items: center;
+}
+.profile-actions-right .round-action {
+  width: 44px; height: 44px;
+  background: var(--card); border: none; color: var(--text);
+  border-radius: 14px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background .12s;
+}
+.profile-actions-right .round-action:hover { background: var(--hover); }
+.profile-actions-right .pill-action {
+  height: 44px; padding: 0 22px;
+  background: var(--card); color: var(--text);
+  border: none; border-radius: 14px;
+  font-family: inherit; font-size: 15px; font-weight: 700;
+  cursor: pointer;
+  transition: background .12s;
+}
+.profile-actions-right .pill-action:hover { background: var(--hover); }
+.profile-actions-right .pill-action.primary {
+  background: var(--accent); color: var(--accent-fg);
+}
+.profile-actions-right .pill-action.primary:hover { opacity: .88; }
+
+.profile-info {
+  padding: 0 8px;
+  margin-bottom: 20px;
+}
+.profile-name {
+  font-size: 24px; font-weight: 800;
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 4px;
+}
+.profile-nick {
+  font-size: 15px; color: var(--muted);
+  margin-bottom: 12px;
+}
+.profile-stats {
+  display: flex; gap: 22px; font-size: 14px;
+  margin-bottom: 10px;
+}
+.profile-stats b {
+  color: var(--text); font-weight: 700;
+  cursor: pointer; margin-right: 4px;
+}
+.profile-stats b:hover { text-decoration: underline; }
+.profile-stats span { color: var(--muted); }
+.profile-bio {
+  font-size: 15px; color: var(--text); line-height: 1.5;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  margin-bottom: 10px;
+}
+.profile-bio-empty { color: var(--muted); font-style: italic; }
+.profile-meta {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--muted); font-size: 13px;
+}
+.profile-meta svg { opacity: .8; }
+
+/* PEOPLE */
+.user-row {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--card);
+  padding: 14px 16px;
+  border-radius: 16px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background .12s;
+}
+.user-row:hover { background: var(--hover); }
+.user-row .info { flex: 1; min-width: 0; }
+.user-row .nick {
+  font-weight: 700; color: var(--text);
+  font-size: 15px;
+  display: block; text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.user-row .name {
+  font-size: 13px; color: var(--muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* NOTIFICATIONS */
+.notif-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: var(--card);
+  padding: 14px 16px;
+  border-radius: 16px;
+  margin-bottom: 8px;
+  text-decoration: none; color: inherit;
+  transition: background .12s;
+}
+.notif-row.unread { background: var(--card-2); }
+.notif-row:hover { background: var(--hover); }
+.notif-row .info { flex: 1; min-width: 0; }
+.notif-row .line { font-size: 14px; line-height: 1.45; }
+.notif-row .line b { font-weight: 700; }
+.notif-row .snippet {
+  margin-top: 6px; padding: 8px 12px;
+  background: var(--card-2); border-radius: 10px;
+  font-size: 13px; color: var(--muted);
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+}
+.notif-row .time { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+/* DM LIST */
+.dm-row {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--card);
+  padding: 14px 16px;
+  border-radius: 16px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background .12s;
+}
+.dm-row:hover { background: var(--hover); }
+.dm-row .info { flex: 1; min-width: 0; text-decoration: none; color: inherit; }
+.dm-row .who {
+  font-weight: 700; font-size: 15px;
+  display: flex; align-items: center; gap: 8px;
+}
+.dm-row .preview {
+  font-size: 13px; color: var(--muted); margin-top: 3px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dm-row .meta {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
+  flex-shrink: 0;
+}
+.dm-row .time { font-size: 12px; color: var(--muted); }
+.dm-row .unread-badge {
+  min-width: 22px; height: 22px; line-height: 22px;
+  background: var(--danger); color: #fff;
+  font-size: 12px; font-weight: 700;
+  padding: 0 7px; border-radius: 11px;
+  text-align: center;
+}
+.dm-del-btn {
+  width: 36px; height: 36px;
+  background: transparent; border: none;
+  color: var(--muted); cursor: pointer;
+  border-radius: 10px; display: inline-flex;
+  align-items: center; justify-content: center;
   transition: color .12s, background .12s;
 }
-.vote-btn:hover, .action-btn:hover { background: var(--hover); color: var(--text); }
-.vote-btn svg, .action-btn svg { display: block; }
-.vote-btn.up:hover { color: var(--up); background: rgba(22,163,74,.1); }
-.vote-btn.down:hover { color: var(--down); background: rgba(220,38,38,.1); }
-.vote-btn.up.active { color: var(--up); background: rgba(22,163,74,.1); }
-.vote-btn.down.active { color: var(--down); background: rgba(220,38,38,.1); }
-.action-btn.copied { color: var(--up); }
-.action-btn.danger:hover { color: var(--danger); background: rgba(220,38,38,.08); }
-.score {
-  min-width: 26px; padding: 0 4px; text-align: center;
-  font-weight: 700; font-size: 13px; color: var(--text);
-  font-variant-numeric: tabular-nums;
+.dm-del-btn:hover { color: var(--danger); background: var(--hover); }
+
+/* CHAT */
+.chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.chat-body {
+  flex: 1; overflow-y: auto;
+  padding: 20px;
+  max-width: 720px; margin: 0 auto; width: 100%;
+  -webkit-overflow-scrolling: touch;
 }
-.score.up { color: var(--up); }
-.score.down { color: var(--down); }
+.chat-intro {
+  text-align: center; color: var(--muted); font-size: 14px;
+  padding: 40px 20px;
+}
+.chat-msg {
+  width: fit-content; max-width: 72%;
+  margin-bottom: 8px; padding: 10px 14px;
+  word-wrap: break-word; overflow-wrap: anywhere;
+  white-space: pre-wrap; font-size: 15px; line-height: 1.45;
+  border-radius: 18px;
+}
+.chat-msg.mine {
+  margin-left: auto;
+  background: var(--bubble-mine);
+  color: var(--bubble-mine-fg);
+  border-bottom-right-radius: 6px;
+}
+.chat-msg.theirs {
+  margin-right: auto;
+  background: var(--bubble-theirs);
+  color: var(--bubble-theirs-fg);
+  border-bottom-left-radius: 6px;
+}
+.chat-msg .chat-time {
+  font-size: 11px; opacity: .6; margin-top: 4px;
+}
+.chat-composer {
+  border-top: 1px solid var(--line);
+  padding: 12px 20px;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0));
+  display: flex; gap: 10px; align-items: flex-end;
+  max-width: 720px; margin: 0 auto; width: 100%;
+}
+.chat-composer textarea {
+  flex: 1; min-height: 46px; max-height: 160px;
+  padding: 12px 16px;
+  border: none; background: var(--card); color: var(--text);
+  font-family: inherit; font-size: 15px; line-height: 1.4;
+  outline: none; resize: none; border-radius: 16px;
+}
+.chat-composer textarea::placeholder { color: var(--muted); }
+.chat-composer button {
+  height: 46px; padding: 0 22px;
+  background: var(--accent); color: var(--accent-fg);
+  border: none; border-radius: 14px;
+  font-family: inherit; font-size: 15px; font-weight: 700;
+  cursor: pointer; transition: opacity .12s;
+}
+.chat-composer button:hover { opacity: .88; }
+.chat-composer button:disabled { opacity: .35; cursor: default; }
+
+.chat-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 20px;
+  max-width: 720px; margin: 0 auto;
+  width: 100%;
+}
+.chat-header .who {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 12px;
+}
+.chat-header .who .info { min-width: 0; }
+.chat-header .who .name {
+  font-weight: 700; font-size: 16px;
+  color: var(--text); text-decoration: none;
+  display: block;
+}
+.chat-header .who .name:hover { text-decoration: underline; }
+.chat-header .who .status {
+  font-size: 13px; color: var(--muted); margin-top: 2px;
+}
+.chat-header .who .status.online { color: var(--online); }
+.chat-header .who .status.typing { color: var(--text); font-style: italic; }
+
+/* SETTINGS */
+.settings-layout {
+  display: flex; gap: 20px;
+  max-width: 900px; margin: 0 auto;
+  width: 100%;
+  padding: 20px;
+  min-height: 100%;
+}
+.settings-nav {
+  flex: 0 0 220px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.settings-nav-btn {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; text-align: left;
+  background: transparent; border: none; color: var(--text);
+  cursor: pointer; border-radius: 12px;
+  font: inherit; font-size: 15px; font-weight: 600;
+  transition: background .12s;
+}
+.settings-nav-btn:hover { background: var(--hover); }
+.settings-nav-btn.active { background: var(--card); color: var(--text); }
+.settings-content { flex: 1; min-width: 0; }
+.settings-block {
+  background: var(--card); border-radius: 20px;
+  padding: 20px; margin-bottom: 16px;
+}
+.settings-block h2 {
+  font-size: 15px; font-weight: 800;
+  margin: 0 0 16px; color: var(--text);
+}
+.opt-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.opt {
+  height: 40px; padding: 0 20px;
+  background: var(--card-2); color: var(--text);
+  border: none; border-radius: 12px;
+  font-family: inherit; font-size: 14px; font-weight: 600;
+  cursor: pointer;
+  transition: background .12s;
+}
+.opt:hover { background: var(--hover); }
+.opt.active { background: var(--accent); color: var(--accent-fg); }
+
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 0; font-size: 15px; gap: 16px;
+}
+.toggle-row + .toggle-row { border-top: 1px solid var(--line); }
+.toggle {
+  position: relative; width: 48px; height: 28px;
+  background: var(--line-2); cursor: pointer;
+  border: none; flex-shrink: 0; border-radius: 14px;
+  transition: background .18s;
+}
+.toggle::after {
+  content: ''; position: absolute; left: 2px; top: 2px;
+  width: 24px; height: 24px; background: #fff;
+  transition: transform .18s; border-radius: 50%;
+}
+.toggle.on { background: var(--up); }
+.toggle.on::after { transform: translateX(20px); }
+
+.settings-desc {
+  font-size: 13px; line-height: 1.55; color: var(--muted);
+  margin: 0 0 14px;
+}
+.settings-link {
+  display: inline-block; color: var(--text);
+  text-decoration: underline; font-size: 14px; font-weight: 500;
+}
+
+.blacklist-add { display: flex; gap: 8px; margin-bottom: 12px; }
+.blacklist-add input {
+  flex: 1; padding: 12px 16px;
+  border: none; background: var(--card-2); color: var(--text);
+  font-family: inherit; font-size: 15px;
+  outline: none; border-radius: 14px;
+}
+.blacklist-add input::placeholder { color: var(--muted); }
+.blacklist-add button {
+  height: 46px; padding: 0 20px;
+  background: var(--accent); color: var(--accent-fg);
+  border: none; border-radius: 14px;
+  font-family: inherit; font-size: 14px; font-weight: 700;
+  cursor: pointer;
+}
+.blacklist-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; background: var(--card-2);
+  border-radius: 14px; margin-bottom: 6px;
+  font-size: 15px;
+}
+.blacklist-item .nick { flex: 1; font-weight: 700; }
+.blacklist-item .nick a { color: var(--text); text-decoration: none; }
+.blacklist-item .nick a:hover { text-decoration: underline; }
+.blacklist-item .rm {
+  height: 32px; padding: 0 14px;
+  background: transparent; border: none;
+  color: var(--danger); font-family: inherit;
+  font-size: 13px; font-weight: 700;
+  cursor: pointer; border-radius: 10px;
+}
+.blacklist-item .rm:hover { background: rgba(239,68,68,.1); }
+
+/* AUTH */
+.auth-page {
+  min-height: 100%; display: flex; align-items: center; justify-content: center;
+  padding: 40px 20px;
+}
+.auth-card {
+  background: var(--card); border-radius: 24px;
+  padding: 32px; max-width: 400px; width: 100%;
+}
+.auth-card h1 {
+  font-size: 26px; font-weight: 800; margin: 0 0 24px;
+}
+.auth-card form { display: flex; flex-direction: column; gap: 10px; }
+.auth-card input {
+  padding: 15px 18px;
+  background: var(--card-2); border: none;
+  color: var(--text); font-family: inherit; font-size: 15px;
+  outline: none; border-radius: 14px;
+}
+.auth-card input::placeholder { color: var(--muted); }
+.auth-card button[type="submit"] {
+  margin-top: 8px; height: 52px;
+  background: var(--accent); color: var(--accent-fg);
+  border: none; border-radius: 14px;
+  font-family: inherit; font-size: 16px; font-weight: 700;
+  cursor: pointer;
+}
+.auth-card button[type="submit"]:disabled { opacity: .5; cursor: default; }
+.auth-error { color: var(--danger); font-size: 14px; min-height: 20px; }
+.auth-switch {
+  margin-top: 18px; font-size: 14px; color: var(--muted); text-align: center;
+}
+.auth-switch a { color: var(--text); cursor: pointer; text-decoration: underline; font-weight: 600; }
+
+/* POLICY */
+.policy {
+  max-width: 720px; margin: 0 auto; padding: 20px;
+}
+.policy h1 { font-size: 24px; margin: 0 0 20px; font-weight: 800; }
+.policy p {
+  font-size: 15px; line-height: 1.7; color: var(--text);
+  white-space: pre-wrap; margin: 0;
+}
+
+/* EMPTY / SPINNER */
+.empty {
+  padding: 60px 20px; text-align: center;
+  color: var(--muted); font-size: 14px;
+  background: var(--card); border-radius: 20px;
+}
+.spinner-wrap { padding: 60px 0; text-align: center; }
+.spinner {
+  display: inline-block; width: 28px; height: 28px;
+  border: 3px solid var(--line-2); border-top-color: var(--text);
+  animation: spin .7s linear infinite; border-radius: 50%;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* MODAL */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.6);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000; padding: 20px;
+  animation: fadeIn .12s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  background: var(--card); border-radius: 22px;
+  padding: 26px; max-width: 400px; width: 100%;
+}
+.modal-text {
+  font-size: 16px; line-height: 1.5; color: var(--text);
+  margin-bottom: 22px; text-align: center;
+}
+.modal-actions { display: flex; gap: 8px; }
+.modal-btn {
+  flex: 1; height: 48px;
+  font-family: inherit; font-size: 15px; font-weight: 700;
+  cursor: pointer; border: none; border-radius: 14px;
+}
+.modal-btn.secondary { background: var(--card-2); color: var(--text); }
+.modal-btn.danger { background: var(--danger); color: #fff; }
+
+.comment.highlight, .post-card.highlight { animation: flash 1.6s ease-out; }
+@keyframes flash {
+  0% { background: var(--up); color: #fff; }
+  100% { background: var(--card); }
+}
 
 /* COMMENTS */
-.comments { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.comments { margin-top: 16px; padding-top: 4px; }
 .comment {
-  padding: 12px 14px; margin-top: 10px;
-  background: var(--comment-bg); border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--card-2);
+  border-radius: 14px;
+  margin-top: 8px;
 }
-.comment.reply { margin-left: 28px; background: transparent; border: 1px solid var(--line); }
-.comment.is-author { box-shadow: 0 0 0 2px var(--accent) inset; }
-.comment-meta {
+.comment.reply { margin-left: 28px; background: transparent; }
+.comment.is-author { box-shadow: 0 0 0 2px var(--line-2) inset; }
+.comment-head {
   display: flex; align-items: center; gap: 8px;
   margin-bottom: 6px; flex-wrap: wrap;
 }
 .comment-author {
-  font-size: 13px; font-weight: 700; color: var(--text); text-decoration: none;
+  font-size: 13px; font-weight: 700; color: var(--text);
+  text-decoration: none;
 }
-.comment-author:hover { color: var(--accent); }
+.comment-author:hover { text-decoration: underline; }
 .comment-author-badge {
   font-size: 10px; font-weight: 800; text-transform: uppercase;
   letter-spacing: .5px; padding: 2px 8px; border-radius: 6px;
@@ -2117,611 +2823,119 @@ header.search-header input:focus { border-color: var(--accent); background: var(
 }
 .comment-time { font-size: 12px; color: var(--muted); margin-left: auto; }
 .comment-text {
-  font-size: 14px; line-height: 1.55; white-space: pre-wrap;
-  word-wrap: break-word; overflow-wrap: anywhere; color: var(--text);
+  font-size: 14px; line-height: 1.5;
+  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
+  color: var(--text); margin-bottom: 6px;
 }
 .comment-actions {
-  display: flex; align-items: center; gap: 2px;
-  margin-top: 8px; font-size: 12px; color: var(--muted);
-  flex-wrap: wrap;
+  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
 }
-.comment-actions .vote-btn { height: 30px; padding: 0 10px; font-size: 12px; }
-.comment-reply-btn, .comment-edit-btn {
-  background: transparent; border: none; color: var(--muted);
-  font-family: inherit; font-size: 12px; font-weight: 600;
-  cursor: pointer; padding: 6px 10px; height: 30px;
-  display: inline-flex; align-items: center; gap: 4px;
-  border-radius: 8px; transition: color .12s, background .12s;
-}
-.comment-reply-btn:hover, .comment-edit-btn:hover { color: var(--text); background: var(--hover); }
-.comment-edit-btn.danger:hover { color: var(--danger); }
+.comment-actions .act-btn { height: 30px; padding: 0 10px; font-size: 12px; }
 
-/* INLINE EDITOR */
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea {
-  display: block; width: 100%; padding: 12px 14px; min-height: 90px;
-  border: 1px solid var(--line-strong); background: var(--card);
-  color: var(--text); font-family: inherit; font-size: 15px; line-height: 1.5;
-  outline: none; resize: none; border-radius: 10px;
-}
-.inline-editor .edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
-.inline-editor .edit-actions button {
-  height: 38px; padding: 0 18px; font-family: inherit;
-  font-size: 14px; font-weight: 600; cursor: pointer;
-  border: 1px solid var(--line); background: transparent; color: var(--text);
-  border-radius: 10px;
-}
-.inline-editor .edit-actions button:hover { background: var(--hover); }
-.inline-editor .edit-actions button.edit-save {
-  background: var(--accent); color: var(--accent-fg); border-color: var(--accent);
-}
-
-/* COMPOSER */
-.composer { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--card); padding: 12px 16px; }
-.composer textarea {
-  display: block; width: 100%; min-height: 100px; padding: 14px 16px;
-  border: 1px solid var(--line); background: var(--card);
-  color: var(--text); font-family: inherit; font-size: 15px; line-height: 1.5;
-  outline: none; resize: none; transition: border-color .12s; border-radius: 12px;
-}
-.composer.composer-comment textarea { min-height: 80px; }
-.composer textarea:focus { border-color: var(--accent); }
-.composer textarea::placeholder { color: var(--muted); }
-.composer-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; }
-.counter { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.counter.warn { color: var(--danger); }
-.reply-banner {
-  display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-  background: var(--accent-soft); border-radius: 10px;
-  font-size: 13px; color: var(--text); margin-bottom: 10px;
-}
-.reply-banner b { font-weight: 700; }
-.reply-banner button {
-  margin-left: auto; background: transparent; border: none;
-  color: var(--accent); font-family: inherit; font-size: 13px;
-  font-weight: 600; cursor: pointer; padding: 4px 10px; border-radius: 8px;
-}
-.reply-banner button:hover { background: rgba(0,0,0,.06); }
-
-button.send {
-  height: 44px; padding: 0 24px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 10px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; transition: opacity .12s;
-}
-button.send:hover { opacity: .9; }
-button.send:disabled { opacity: .35; cursor: default; }
-
-.login-prompt { padding: 20px; text-align: center; color: var(--muted); font-size: 14px; }
-.login-prompt a { color: var(--accent); font-weight: 600; text-decoration: none; }
-
-/* AUTH */
-.auth-wrap { max-width: 420px; margin: 0 auto; padding: 40px 20px; }
-.auth-title { font-size: 26px; font-weight: 800; margin: 0 0 24px; letter-spacing: -0.5px; }
-.auth-form { display: flex; flex-direction: column; gap: 12px; }
-.auth-form input, .auth-form textarea {
-  width: 100%; padding: 16px 16px; border: 1px solid var(--line);
-  background: var(--card); color: var(--text);
-  font-family: inherit; font-size: 15px;
-  outline: none; transition: border-color .12s; border-radius: 12px;
-}
-.auth-form textarea { min-height: 90px; resize: none; }
-.auth-form input:focus, .auth-form textarea:focus { border-color: var(--accent); }
-.auth-form button {
-  margin-top: 8px; height: 52px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 12px;
-  font-family: inherit; font-size: 16px; font-weight: 700;
-  cursor: pointer; transition: opacity .12s;
-}
-.auth-form button:hover { opacity: .9; }
-.auth-form button:disabled { opacity: .5; cursor: default; }
-.auth-error { color: var(--danger); font-size: 14px; min-height: 20px; }
-.auth-switch { margin-top: 20px; font-size: 14px; color: var(--muted); text-align: center; }
-.auth-switch a { color: var(--accent); cursor: pointer; text-decoration: none; font-weight: 600; }
-.auth-switch a:hover { text-decoration: underline; }
-
-/* PROFILE */
-.profile-header { padding: 24px 20px 20px; border-bottom: 1px solid var(--line); }
-.profile-name-big {
-  font-size: 26px; font-weight: 800; letter-spacing: -0.4px;
-  display: flex; align-items: center; gap: 12px;
-}
-.profile-online {
-  width: 12px; height: 12px; border-radius: 50%;
-  background: var(--online); box-shadow: 0 0 0 3px rgba(34,197,94,.2);
-  flex-shrink: 0;
-}
-.profile-nick-small { color: var(--muted); font-size: 15px; margin-top: 4px; }
-.profile-bio {
-  margin-top: 16px; font-size: 15px; color: var(--text); line-height: 1.55;
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-}
-.profile-bio-empty { color: var(--muted); font-style: italic; }
-.profile-stats {
-  display: flex; gap: 24px; margin-top: 18px; font-size: 14px; color: var(--muted);
-}
-.profile-stats b { color: var(--text); font-weight: 700; cursor: pointer; }
-.profile-stats b:hover { color: var(--accent); }
-.profile-actions { margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
-.follow-btn {
-  height: 44px; padding: 0 24px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 12px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; transition: opacity .12s;
-  display: inline-flex; align-items: center; gap: 8px;
-  text-decoration: none;
-}
-.follow-btn:hover { opacity: .9; }
-.follow-btn.following { background: var(--hover); color: var(--text); }
-.follow-btn.following:hover { background: var(--line); }
-.follow-btn.secondary { background: var(--hover); color: var(--text); }
-.follow-btn.secondary:hover { background: var(--line); }
-.own-note { font-size: 14px; color: var(--muted); font-weight: 500; }
-
-.profile-tabs {
-  display: flex; border-bottom: 1px solid var(--line);
-  padding: 0 20px;
-}
-.profile-tab {
-  flex: 1; padding: 14px 12px;
-  background: transparent; border: none;
-  color: var(--muted); font-family: inherit;
-  font-size: 14px; font-weight: 700;
-  cursor: pointer; position: relative;
-  transition: color .12s;
-}
-.profile-tab:hover { color: var(--text); }
-.profile-tab.active { color: var(--accent); }
-.profile-tab.active::after {
-  content: ''; position: absolute; left: 12px; right: 12px; bottom: -1px;
-  height: 3px; background: var(--accent); border-radius: 3px 3px 0 0;
-}
-
-/* WALL */
-.wall-composer {
-  padding: 14px 20px; border-bottom: 1px solid var(--line);
-}
-.wall-composer textarea {
-  display: block; width: 100%; min-height: 70px;
-  padding: 14px 16px; border: 1px solid var(--line);
-  background: var(--card); color: var(--text);
+  width: 100%; padding: 12px 14px; min-height: 90px;
+  border: none; background: var(--card-2); color: var(--text);
   font-family: inherit; font-size: 15px; line-height: 1.5;
-  outline: none; resize: none; border-radius: 12px;
-  transition: border-color .12s;
+  outline: none; resize: none; border-radius: 14px;
 }
-.wall-composer textarea:focus { border-color: var(--accent); }
-.wall-composer-row {
-  display: flex; justify-content: space-between; align-items: center;
-  gap: 12px; margin-top: 10px;
+.inline-editor .edit-actions {
+  display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px;
 }
-.wall-notice {
-  padding: 14px 20px; font-size: 14px; color: var(--muted);
-  background: var(--hover); border-bottom: 1px solid var(--line);
-  line-height: 1.5;
+.inline-editor .edit-actions button {
+  height: 38px; padding: 0 16px; font-family: inherit;
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  border: none; border-radius: 12px;
+  background: var(--card-2); color: var(--text);
 }
-.wall-notice a { color: var(--accent); font-weight: 600; text-decoration: none; }
-.wall-notice a:hover { text-decoration: underline; }
-
-/* PEOPLE */
-.people-tabs {
-  display: flex; gap: 8px; padding: 10px 16px;
-  border-bottom: 1px solid var(--line);
-}
-.people-tab {
-  flex: 1; height: 42px; padding: 0 12px;
-  background: var(--hover); border: 1px solid transparent;
-  color: var(--text); font-family: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer; border-radius: 10px;
-  transition: background .12s, color .12s;
-}
-.people-tab:hover { background: var(--line); }
-.people-tab.active { background: var(--accent); color: var(--accent-fg); }
-
-.user-list { padding: 4px 0; }
-.user-item {
-  display: flex; align-items: center; gap: 14px;
-  padding: 16px 20px; border-bottom: 1px solid var(--line);
-}
-.user-item .user-info { flex: 1; min-width: 0; }
-.user-item .user-nick {
-  font-weight: 700; color: var(--text); text-decoration: none;
-  font-size: 15px; display: flex; align-items: center; gap: 8px;
-}
-.user-item .user-nick:hover { color: var(--accent); }
-.user-item .user-name { font-size: 13px; color: var(--muted); margin-top: 3px; }
-.user-dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--line-strong); flex-shrink: 0;
-}
-.user-dot.online { background: var(--online); box-shadow: 0 0 0 2px rgba(34,197,94,.2); }
-
-/* NOTIFS */
-.notif-list { padding: 4px 0; }
-.notif {
-  display: block; padding: 16px 20px;
-  border-bottom: 1px solid var(--line);
-  font-size: 15px; line-height: 1.5; text-decoration: none; color: inherit;
-  transition: background .12s;
-}
-.notif.unread { background: var(--accent-soft); }
-.notif:hover { background: var(--hover); }
-.notif-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.notif-author { font-weight: 700; color: var(--text); }
-.notif-text { color: var(--muted); font-size: 14px; }
-.notif-snippet {
-  margin-top: 8px; padding: 10px 14px;
-  background: var(--comment-bg); border-radius: 10px;
-  font-size: 14px; color: var(--text);
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-}
-.notif-time { font-size: 12px; color: var(--muted); margin-top: 6px; }
-
-/* BUTTONS */
-.btn-danger {
-  height: 44px; padding: 0 20px;
-  background: transparent; color: var(--danger);
-  border: 1px solid var(--danger); border-radius: 12px;
-  font-family: inherit; font-size: 14px; font-weight: 700;
-  cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
-  transition: background .12s, color .12s;
-}
-.btn-danger:hover { background: var(--danger); color: #fff; }
-.btn-secondary {
-  height: 44px; padding: 0 20px;
-  background: transparent; color: var(--text);
-  border: 1px solid var(--line); border-radius: 12px;
-  font-family: inherit; font-size: 14px; font-weight: 700;
-  cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
-  transition: background .12s, border-color .12s;
-  text-decoration: none;
-}
-.btn-secondary:hover { background: var(--hover); border-color: var(--line-strong); }
-
-/* SETTINGS */
-.settings-layout { display: flex; height: 100%; }
-.settings-nav {
-  flex: 0 0 240px; border-right: 1px solid var(--line);
-  padding: 20px 12px; display: flex; flex-direction: column; gap: 6px;
-  overflow-y: auto;
-}
-.settings-nav-btn {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px; text-align: left;
-  background: transparent; border: none; color: var(--text);
-  cursor: pointer; border-radius: 10px;
-  font: inherit; font-size: 15px; font-weight: 600;
-  transition: background .12s;
-}
-.settings-nav-btn:hover { background: var(--hover); }
-.settings-nav-btn.active { background: var(--accent); color: var(--accent-fg); }
-.settings-nav-btn.active svg { color: var(--accent-fg); }
-.settings-content { flex: 1; padding: 24px 28px; overflow-y: auto; min-width: 0; }
-.settings-section { margin-bottom: 32px; }
-.settings-section h2 {
-  font-size: 13px; font-weight: 800; text-transform: uppercase;
-  letter-spacing: .8px; color: var(--muted); margin: 0 0 14px;
-}
-.opt-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.opt {
-  height: 44px; padding: 0 22px;
-  background: var(--hover); color: var(--text);
-  border: 1px solid transparent; border-radius: 12px;
-  font-family: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer; transition: background .12s, color .12s;
-}
-.opt:hover { background: var(--line); }
-.opt.active { background: var(--accent); color: var(--accent-fg); }
-
-.toggle-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 0; border-bottom: 1px solid var(--line);
-  font-size: 15px; gap: 16px;
-}
-.toggle-row:last-child { border-bottom: none; }
-.toggle {
-  position: relative; width: 52px; height: 30px;
-  background: var(--line); cursor: pointer;
-  border: none; flex-shrink: 0; border-radius: 15px;
-  transition: background .18s;
-}
-.toggle::after {
-  content: ''; position: absolute; left: 3px; top: 3px;
-  width: 24px; height: 24px; background: #fff;
-  transition: transform .18s; border-radius: 50%;
-  box-shadow: 0 2px 4px rgba(0,0,0,.2);
-}
-.toggle.on { background: var(--up); }
-.toggle.on::after { transform: translateX(22px); }
-
-.settings-desc {
-  font-size: 14px; line-height: 1.6; color: var(--muted);
-  margin: 0 0 16px;
-}
-.settings-link {
-  display: inline-block; color: var(--accent); text-decoration: none;
-  font-size: 14px; font-weight: 600;
-}
-.settings-link:hover { text-decoration: underline; }
-.settings-authors { font-size: 15px; color: var(--text); }
-
-.blacklist-add { display: flex; gap: 10px; margin-bottom: 14px; }
-.blacklist-add input {
-  flex: 1; padding: 14px 16px;
-  border: 1px solid var(--line); background: var(--card);
-  color: var(--text); font-family: inherit; font-size: 15px;
-  outline: none; border-radius: 12px;
-}
-.blacklist-add input:focus { border-color: var(--accent); }
-.blacklist-list { display: flex; flex-direction: column; gap: 8px; }
-.blacklist-item {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px; background: var(--hover);
-  border-radius: 12px; font-size: 15px;
-}
-.blacklist-item .bl-nick { flex: 1; font-weight: 700; }
-.blacklist-item .bl-nick a { color: var(--text); text-decoration: none; }
-.blacklist-item .bl-nick a:hover { color: var(--accent); }
-.blacklist-item button {
-  height: 36px; padding: 0 16px;
-  background: transparent; border: 1px solid var(--danger);
-  color: var(--danger); font-family: inherit;
-  font-size: 13px; font-weight: 700; cursor: pointer;
-  border-radius: 10px;
-  transition: background .12s, color .12s;
-}
-.blacklist-item button:hover { background: var(--danger); color: #fff; }
-
-/* POLICY */
-.policy { padding: 24px; max-width: 720px; }
-.policy h1 { font-size: 24px; margin: 0 0 20px; font-weight: 800; }
-.policy p {
-  font-size: 15px; line-height: 1.7; color: var(--text);
-  white-space: pre-wrap; margin: 0;
-}
-
-/* DM */
-.dm-list { padding: 4px 0; }
-.dm-thread {
-  display: flex; gap: 14px; padding: 16px 20px;
-  border-bottom: 1px solid var(--line);
-  text-decoration: none; color: inherit;
-  transition: background .12s; align-items: center;
-}
-.dm-thread:hover { background: var(--hover); }
-.dm-thread .info { flex: 1; min-width: 0; text-decoration: none; color: inherit; display: block; }
-.dm-thread .who {
-  font-weight: 700; font-size: 15px;
-  display: flex; align-items: center; gap: 10px;
-}
-.dm-thread .preview {
-  font-size: 14px; color: var(--muted); margin-top: 4px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.dm-thread .meta {
-  flex-shrink: 0; display: flex; flex-direction: column;
-  align-items: flex-end; gap: 6px;
-}
-.dm-thread .time { font-size: 12px; color: var(--muted); }
-.dm-thread .unread-badge {
-  min-width: 22px; height: 22px; line-height: 22px;
-  background: var(--danger); color: #fff;
-  font-size: 12px; font-weight: 700; text-align: center;
-  padding: 0 7px; border-radius: 11px;
-}
-.dm-thread .mine-label { color: var(--muted); }
-.dm-del-btn {
-  width: 40px; height: 40px; flex-shrink: 0;
-  background: transparent; border: none; color: var(--muted);
-  cursor: pointer; display: inline-flex;
-  align-items: center; justify-content: center;
-  border-radius: 10px;
-  transition: color .12s, background .12s;
-}
-.dm-del-btn:hover { color: var(--danger); background: rgba(220,38,38,.08); }
-
-.chat { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.chat-header-sub {
-  font-size: 13px; color: var(--muted); font-weight: 500;
-  margin-left: 8px;
-}
-.chat-header-sub.online { color: var(--online); }
-.chat-header-sub.typing { color: var(--accent); font-style: italic; }
-.chat-body {
-  flex: 1; overflow-y: auto; overflow-x: hidden;
-  padding: 20px; background: var(--bg);
-  -webkit-overflow-scrolling: touch;
-}
-.chat-intro { text-align: center; color: var(--muted); font-size: 14px; padding: 30px 0; }
-.chat-msg {
-  width: fit-content; max-width: 72%;
-  margin-bottom: 10px; padding: 12px 16px;
-  word-wrap: break-word; overflow-wrap: anywhere;
-  white-space: pre-wrap; font-size: 15px; line-height: 1.45;
-  border-radius: 16px; box-shadow: var(--shadow);
-}
-.chat-msg.mine {
-  margin-left: auto; background: var(--bubble-mine);
-  color: var(--bubble-mine-fg); border-bottom-right-radius: 4px;
-}
-.chat-msg.theirs {
-  margin-right: auto; background: var(--bubble-theirs);
-  color: var(--bubble-theirs-fg); border-bottom-left-radius: 4px;
-}
-.chat-msg .chat-time { font-size: 11px; opacity: .7; margin-top: 4px; }
-.chat-composer {
-  flex: 0 0 auto; border-top: 1px solid var(--line);
-  padding: 12px 16px; display: flex; gap: 10px; align-items: flex-end;
-  background: var(--card);
-}
-.chat-composer textarea {
-  flex: 1; min-height: 46px; max-height: 160px;
-  padding: 12px 16px; border: 1px solid var(--line);
-  background: var(--hover); color: var(--text);
-  font-family: inherit; font-size: 15px; line-height: 1.4;
-  outline: none; resize: none; border-radius: 22px;
-  transition: border-color .12s, background .12s;
-}
-.chat-composer textarea:focus { border-color: var(--accent); background: var(--card); }
-.chat-composer button {
-  height: 46px; padding: 0 24px;
+.inline-editor .edit-actions button.edit-save {
   background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 22px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; transition: opacity .12s;
-}
-.chat-composer button:hover { opacity: .9; }
-.chat-composer button:disabled { opacity: .35; cursor: default; }
-
-/* MODAL */
-.modal-overlay {
-  position: fixed; inset: 0; background: rgba(0,0,0,.5);
-  display: flex; align-items: center; justify-content: center;
-  z-index: 1000; padding: 20px;
-  animation: fadeIn .15s ease;
-}
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-.modal {
-  background: var(--card); border-radius: 16px;
-  padding: 24px; max-width: 400px; width: 100%;
-  box-shadow: 0 20px 60px rgba(0,0,0,.3);
-}
-.modal-text { font-size: 16px; line-height: 1.5; color: var(--text); margin-bottom: 22px; }
-.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
-.modal-btn {
-  height: 44px; padding: 0 22px;
-  font-family: inherit; font-size: 14px; font-weight: 700;
-  cursor: pointer; border: none; border-radius: 12px;
-  transition: opacity .12s, background .12s;
-}
-.modal-btn.secondary { background: var(--hover); color: var(--text); }
-.modal-btn.secondary:hover { background: var(--line); }
-.modal-btn.danger { background: var(--danger); color: #fff; }
-.modal-btn.danger:hover { opacity: .9; }
-
-.comment.highlight { animation: flash 1.6s ease-out; }
-@keyframes flash {
-  0% { background: var(--up); color: #fff; }
-  100% { background: var(--comment-bg); }
 }
 
-/* TABLET (768 - 1100) — sidebar сжимается до иконок */
-@media (min-width: 768px) and (max-width: 1100px) {
-  .sidebar { flex: 0 0 76px; width: 76px; padding: 16px 8px; }
-  .sidebar .logo { font-size: 24px; padding: 4px 6px 18px; text-align: center; letter-spacing: 0; }
-  .sidebar .logo span { display: none; }
-  .sidebar .logo::after { content: 'S'; display: inline-block; }
-  .nav-btn {
-    flex-direction: column; gap: 4px; padding: 10px 6px;
-    font-size: 11px; justify-content: center; align-items: center;
-    text-align: center; border-radius: 12px;
-  }
-  .nav-btn span { font-size: 11px; }
-  .nav-btn .badge {
-    position: absolute; top: 2px; right: 8px;
-    min-width: 18px; height: 18px; line-height: 18px;
-    font-size: 10px; padding: 0 5px; border-radius: 9px;
-  }
-  .sidebar-user { font-size: 11px; padding: 10px 4px; justify-content: center; }
-  .sidebar-user .nick-text { display: none; }
-  .main-header { padding: 12px 20px; }
-  .post { padding: 18px 24px; }
-  .post-text { font-size: 16px; }
-  .chat-body { padding: 20px 24px; }
-  .chat-msg { max-width: 65%; }
-  .settings-nav { flex: 0 0 200px; }
-}
-
-/* MOBILE (< 768) */
-@media (max-width: 767px) {
+/* MOBILE */
+@media (max-width: 900px) {
   .layout { flex-direction: column; }
-  .main {
-    order: 1;
-    height: calc(100vh - 68px - env(safe-area-inset-bottom, 0));
-  }
+  .main { order: 1; height: calc(100vh - 70px - env(safe-area-inset-bottom, 0)); }
   .sidebar {
-    order: 2; width: 100%;
-    height: calc(68px + env(safe-area-inset-bottom, 0));
-    flex-direction: row; border-left: none;
-    border-top: 1px solid var(--line);
+    order: 2;
+    width: 100%; height: calc(70px + env(safe-area-inset-bottom, 0));
+    flex-direction: row; border-top: 1px solid var(--line);
     padding: 0 0 env(safe-area-inset-bottom, 0);
     flex: 0 0 auto;
-    box-shadow: 0 -2px 12px rgba(0,0,0,.06);
   }
   .sidebar .logo { display: none; }
   .sidebar .spacer { display: none; }
   .sidebar-user { display: none; }
+  .sidebar-logout { display: none; }
   .nav {
     flex-direction: row; flex: 1;
     justify-content: space-around; align-items: stretch;
-    gap: 0;
   }
   .nav-btn {
     flex-direction: column; gap: 3px; padding: 8px 4px;
     flex: 1; justify-content: center; align-items: center;
     text-align: center; border-radius: 0;
-    min-height: 66px;
+    min-height: 68px;
   }
-  .nav-btn[data-nav="logout"] { display: none; }
-  .nav-btn span { font-size: 11px; line-height: 1; font-weight: 500; }
+  .nav-btn span { font-size: 10px; line-height: 1; font-weight: 500; }
   .nav-btn svg { width: 24px; height: 24px; }
   .nav-btn.active { background: transparent; }
-  .nav-btn.active svg, .nav-btn.active span { color: var(--accent); }
+  .nav-btn.active svg, .nav-btn.active span { color: var(--text); }
   .nav-btn .badge {
     position: absolute; top: 4px; right: 18%;
-    margin: 0; min-width: 18px; height: 18px;
-    line-height: 18px; font-size: 11px;
-    padding: 0 5px; border-radius: 9px;
+    min-width: 16px; height: 16px; line-height: 16px;
+    font-size: 10px; padding: 0 4px; border-radius: 8px;
   }
-  .main-header {
-    min-height: 56px; padding: 10px 14px;
-    padding-top: calc(10px + env(safe-area-inset-top, 0));
-  }
-  .main-header .title { font-size: 16px; }
-  .post { padding: 16px; }
+
+  .main-header { padding: 14px 16px; }
+  .main-header .title { font-size: 20px; }
+  .main-inner { padding: 16px 12px 100px; }
+  .card, .post-card { border-radius: 18px; padding: 14px; }
   .post-text { font-size: 15px; }
-  .post-meta { gap: 8px; }
-  .post-author { font-size: 14px; }
-  .post-actions { gap: 2px; margin-top: 12px; }
-  .vote-btn, .action-btn { height: 40px; padding: 0 12px; font-size: 12px; gap: 4px; }
-  .vote-btn span:not(.score), .action-btn span:not(.score) { display: none; }
-  .action-btn .action-label { display: none; }
-  .composer { padding: 12px 14px; padding-bottom: calc(12px + env(safe-area-inset-bottom, 0)); }
-  .composer textarea { min-height: 90px; }
-  .profile-header { padding: 20px 16px 16px; }
-  .profile-name-big { font-size: 22px; }
-  .profile-tabs { padding: 0 12px; }
-  .wall-composer { padding: 12px 16px; }
-  .chat-body { padding: 16px 14px; }
-  .chat-msg { max-width: 84%; font-size: 15px; }
-  .chat-composer {
-    padding: 10px 12px;
-    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0));
-    gap: 8px;
+  .composer-body textarea { font-size: 15px; }
+
+  .profile-cover { height: 110px; border-radius: 18px; margin-bottom: 38px; }
+  .profile-cover-avatar { left: 16px; bottom: -38px; }
+  .profile-cover-avatar .avatar { width: 76px; height: 76px; font-size: 28px; }
+  .profile-cover-avatar .avatar .online-dot {
+    width: 16px; height: 16px; bottom: 3px; right: 3px;
   }
-  .chat-composer button { padding: 0 20px; }
-  .user-item { padding: 14px 16px; }
-  .notif { padding: 14px 16px; }
-  .dm-thread { padding: 14px 16px; }
-  .feed-tabs, .people-tabs { padding: 10px 12px; }
-  .settings-layout { flex-direction: column; height: auto; }
+  .profile-actions-right { right: 12px; bottom: -38px; }
+  .profile-actions-right .pill-action { height: 38px; padding: 0 16px; font-size: 13px; }
+  .profile-actions-right .round-action { width: 38px; height: 38px; }
+  .profile-name { font-size: 20px; }
+
+  .settings-layout { flex-direction: column; padding: 12px; }
   .settings-nav {
     flex: 0 0 auto; flex-direction: row;
-    border-right: none; border-bottom: 1px solid var(--line);
-    padding: 10px 12px; gap: 6px;
-    overflow-x: auto; overflow-y: hidden;
-    scrollbar-width: none;
-    position: sticky; top: 0; background: var(--card); z-index: 5;
+    overflow-x: auto; scrollbar-width: none;
+    margin-bottom: 8px;
   }
   .settings-nav::-webkit-scrollbar { display: none; }
-  .settings-nav-btn { flex-shrink: 0; padding: 10px 16px; font-size: 13px; }
-  .settings-content { padding: 18px 16px; }
-  .settings-section { margin-bottom: 26px; scroll-margin-top: 130px; }
-  .blacklist-add { flex-direction: column; }
+  .settings-nav-btn {
+    flex-shrink: 0;
+    padding: 10px 16px;
+    background: var(--card); border-radius: 12px;
+    font-size: 13px;
+  }
+  .settings-nav-btn.active { background: var(--accent); color: var(--accent-fg); }
+  .settings-block { padding: 16px; border-radius: 16px; }
+
+  .chat-body { padding: 14px 12px; }
+  .chat-msg { max-width: 82%; font-size: 15px; }
+  .chat-composer { padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0)); }
+  .chat-header { padding: 14px 16px; }
+
   .modal-actions { flex-direction: column-reverse; }
-  .modal-btn { width: 100%; }
+}
+@media (max-width: 500px) {
+  .main-inner { padding: 12px 10px 90px; }
+  .search-box { padding: 10px 14px; border-radius: 14px; }
+  .card, .post-card { border-radius: 16px; padding: 12px; }
+  .profile-cover { height: 90px; margin-bottom: 34px; }
+  .profile-cover-avatar .avatar { width: 68px; height: 68px; font-size: 24px; }
+  .profile-name { font-size: 18px; }
+  .profile-stats { font-size: 13px; gap: 16px; }
 }
 """
 
@@ -2734,7 +2948,8 @@ var ICONS = {
   up: __I_UP__, down: __I_DOWN__, comment: __I_COMMENT__,
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
   translate: __I_TRANSLATE__, back: __I_BACK__, search: __I_SEARCH__,
-  moon: __I_MOON__, sun: __I_SUN__
+  moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
+  eye: __I_EYE__, cal: __I_CAL__
 };
 
 var cachedUser = null;
@@ -2752,6 +2967,8 @@ var state = {
   dmQuery: '',
   searchQuery: '',
   composerDraft: '',
+  quotePostId: null,
+  quotePreview: null,
   wallDraft: '',
   replyTo: null,
   highlightComment: null,
@@ -2762,8 +2979,7 @@ var state = {
   es: null,
   typingTimer: null,
   lastTypingSent: 0,
-  presenceTimer: null,
-  translatedPosts: {}
+  presenceTimer: null
 };
 
 function setUser(u) {
@@ -2810,6 +3026,10 @@ function linkifyMentions(escaped) {
   });
 }
 function tr(k) { return T[k] || k; }
+function initial(name) {
+  var n = (name || '?').trim();
+  return n ? n.charAt(0).toUpperCase() : '?';
+}
 function timeAgo(ts) {
   var d = Math.floor(Date.now()/1000 - ts);
   if (d < 5) return tr('just_now');
@@ -2822,8 +3042,9 @@ function timeAgo(ts) {
   if (days < 30) return days + ' ' + tr('day_ago');
   return new Date(ts*1000).toLocaleDateString();
 }
-function scoreClass(up, down) {
-  var s = up - down; if (s > 0) return 'up'; if (s < 0) return 'down'; return '';
+function fmtDate(ts) {
+  try { return new Date(ts*1000).toLocaleDateString(LANG === 'ru' ? 'ru-RU' : 'en-US', { year: 'numeric', month: 'long' }); }
+  catch(e) { return new Date(ts*1000).toLocaleDateString(); }
 }
 function truncateText(text) {
   var lines = text.split('\n');
@@ -2834,6 +3055,13 @@ function truncateText(text) {
   return { text: out, truncated: truncated };
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
+
+function avatarHtml(name, nick, online, size) {
+  var cls = 'avatar' + (size ? ' ' + size : '');
+  var letter = initial(name || nick);
+  var dot = online ? '<span class="online-dot"></span>' : '';
+  return '<div class="' + cls + '">' + letter + dot + '</div>';
+}
 
 function showConfirm(text, onConfirm, opts) {
   opts = opts || {};
@@ -2857,14 +3085,12 @@ function showConfirm(text, onConfirm, opts) {
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('sldchat_theme', theme);
-  var el = document.getElementById('mainThemeBtn');
-  if (el) el.innerHTML = (theme === 'dark') ? ICONS.sun : ICONS.moon;
 }
 function toggleTheme() {
-  var cur = document.documentElement.getAttribute('data-theme') || 'light';
+  var cur = document.documentElement.getAttribute('data-theme') || 'dark';
   applyTheme(cur === 'dark' ? 'light' : 'dark');
 }
-applyTheme(localStorage.getItem('sldchat_theme') || 'light');
+applyTheme(localStorage.getItem('sldchat_theme') || 'dark');
 
 function navigate(url) {
   history.pushState({}, '', url);
@@ -2982,7 +3208,7 @@ function handleEvent(ev) {
       var st = document.getElementById('chatStatus');
       if (st && !st.classList.contains('typing')) {
         st.textContent = ev.online ? tr('dm_online') : tr('dm_offline');
-        st.className = 'chat-header-sub' + (ev.online ? ' online' : '');
+        st.className = 'status' + (ev.online ? ' online' : '');
       }
     }
     return;
@@ -2997,10 +3223,10 @@ function showTypingIndicator() {
   var el = document.getElementById('chatStatus');
   if (!el) return;
   el.textContent = tr('dm_typing');
-  el.className = 'chat-header-sub typing';
+  el.className = 'status typing';
   clearTimeout(state.typingTimer);
   state.typingTimer = setTimeout(function(){
-    if (el) { el.textContent = ''; el.className = 'chat-header-sub'; }
+    if (el) { el.textContent = ''; el.className = 'status'; }
   }, 3500);
 }
 window.addEventListener('pagehide', function(){
@@ -3022,7 +3248,7 @@ function navBtn(icon, label, active, action, count) {
 function renderSidebar() {
   var el = document.getElementById('sidebar');
   if (!el) return;
-  var html = '<div class="logo">sldchat</div><div class="nav">';
+  var html = '<div class="logo">ИТД<span class="ver">v1.1.4</span></div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
   if (state.user) {
@@ -3034,14 +3260,15 @@ function renderSidebar() {
       state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
     html += navBtn(ICONS.gear, tr('nav_settings'),
       state.view === 'settings' || state.view === 'edit_profile', 'settings');
-    html += navBtn(ICONS.logout, tr('nav_logout'), false, 'logout');
+    html += '</div><div class="spacer"></div>';
+    html += '<div class="sidebar-user" data-nav="profile"><span class="star">★</span>@' + escapeHtml(state.user.nick) + '</div>';
+    html += '<button class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
   } else {
     html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
     html += navBtn(ICONS.login, tr('nav_login'), state.view === 'login', 'login');
     html += navBtn(ICONS.plus, tr('nav_register'), state.view === 'register', 'register');
+    html += '</div><div class="spacer"></div>';
   }
-  html += '</div><div class="spacer"></div>';
-  if (state.user) html += '<div class="sidebar-user"><span class="dot"></span><span class="nick-text">@' + escapeHtml(state.user.nick) + '</span></div>';
   el.innerHTML = html;
   el.querySelectorAll('[data-nav]').forEach(function(b){
     b.addEventListener('click', function(){
@@ -3076,13 +3303,6 @@ function renderMain() {
   else if (state.view === 'login') renderLoginView(el);
   else renderFeedView(el);
 }
-function attachThemeBtn() {
-  var b = document.getElementById('mainThemeBtn');
-  if (b) {
-    b.innerHTML = (document.documentElement.getAttribute('data-theme') === 'dark') ? ICONS.sun : ICONS.moon;
-    b.addEventListener('click', toggleTheme);
-  }
-}
 function bindLinks(root) {
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
@@ -3091,76 +3311,127 @@ function bindLinks(root) {
   });
 }
 
+// ============ COMPOSER (shared) ============
+function composerHtml(opts) {
+  opts = opts || {};
+  var u = state.user;
+  if (!u) return '';
+  var placeholder = opts.placeholder || tr('post_ph');
+  var sendLabel = opts.sendLabel || tr('publish');
+  var idPrefix = opts.idPrefix || 'post';
+  return '<div class="card">'
+    + '<div class="composer-avatar-row">'
+    + avatarHtml(u.name, u.nick, false, 'sm')
+    + '<div class="composer-body">'
+    + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
+    + '<div id="' + idPrefix + 'QuoteBox"></div>'
+    + '<div class="composer-actions">'
+    + '<button class="composer-icon" type="button" title="Прикрепить">' + svgAttach() + '</button>'
+    + '<button class="composer-icon" type="button" title="Эмодзи">' + svgEmoji() + '</button>'
+    + '<button class="composer-icon" type="button" title="Стикер">' + svgSticker() + '</button>'
+    + '<button class="composer-icon" type="button" title="Опрос">' + svgChart() + '</button>'
+    + '<div class="spacer"></div>'
+    + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted);margin-right:8px">0 / ' + MAX_POST_LEN + '</span>'
+    + '<button class="publish-btn" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
+    + '</div></div></div></div>';
+}
+function svgAttach() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66L9.41 16.55a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>'; }
+function svgEmoji() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>'; }
+function svgSticker() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>'; }
+function svgChart() { return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="20" x2="6" y2="12"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="18" y1="20" x2="18" y2="10"/></svg>'; }
+
+function renderQuoteBox(idPrefix, container) {
+  var el = document.getElementById(idPrefix + 'QuoteBox');
+  if (!el) return;
+  if (!state.quotePreview) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="quote-preview">'
+    + '<div class="qp-author">@' + escapeHtml(state.quotePreview.author) + '</div>'
+    + '<div class="qp-text">' + escapeHtml(state.quotePreview.text) + '</div>'
+    + '<button class="qp-close" type="button" title="' + escapeHtml(tr('quote_cancel')) + '">✕</button>'
+    + '</div>';
+  el.querySelector('.qp-close').addEventListener('click', function(){
+    state.quotePostId = null; state.quotePreview = null;
+    renderQuoteBox(idPrefix, container);
+  });
+}
+
+function bindComposer(opts) {
+  opts = opts || {};
+  var idPrefix = opts.idPrefix || 'post';
+  var onSend = opts.onSend; // async function(text, quotedId) {}
+  var inputEl = document.getElementById(idPrefix + 'Input');
+  var sendBtn = document.getElementById(idPrefix + 'Send');
+  var counter = document.getElementById(idPrefix + 'Counter');
+  if (!inputEl || !sendBtn) return;
+  function upd(){
+    var len = inputEl.value.length;
+    if (counter) counter.textContent = len + ' / ' + MAX_POST_LEN;
+    var empty = len === 0 && !state.quotePostId;
+    sendBtn.disabled = empty || len > MAX_POST_LEN;
+    if (opts.draftKey !== undefined) {
+      if (opts.draftKey === 'wall') state.wallDraft = inputEl.value;
+      else state.composerDraft = inputEl.value;
+    } else state.composerDraft = inputEl.value;
+  }
+  inputEl.addEventListener('input', upd);
+  sendBtn.addEventListener('click', async function(){
+    var text = inputEl.value.trim();
+    if (!text && !state.quotePostId) return;
+    sendBtn.disabled = true;
+    try {
+      await onSend(text, state.quotePostId);
+      inputEl.value = '';
+      if (opts.draftKey === 'wall') state.wallDraft = '';
+      else state.composerDraft = '';
+      state.quotePostId = null; state.quotePreview = null;
+      renderQuoteBox(idPrefix);
+      upd();
+    } catch(e) { alert(tr(e.message) || e.message); }
+    finally { upd(); }
+  });
+  renderQuoteBox(idPrefix);
+  upd();
+}
+
 // ============ FEED ============
 function renderFeedView(el) {
-  var html = '';
-  html += '<header class="search-header">';
-  html += '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" autocomplete="off" value="' + escapeHtml(state.searchQuery) + '" />';
-  html += '<button class="icon-btn" id="searchBtn">' + ICONS.search + '</button>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="feed-tabs">';
-  html += '<button class="feed-tab' + (state.feedMode==='all'?' active':'') + '" data-mode="all">' + tr('feed_all') + '</button>';
-  html += '<button class="feed-tab' + (state.feedMode==='subs'?' active':'') + '" data-mode="subs">' + tr('feed_subs') + '</button>';
+  var html = '<div class="main-header"><div class="title">' + tr('nav_home') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+  html += '<div class="pill-tabs">';
+  html += '<button class="pill-tab' + (state.feedMode==='all'?' active':'') + '" data-mode="all">' + tr('feed_all') + '</button>';
+  html += '<button class="pill-tab' + (state.feedMode==='subs'?' active':'') + '" data-mode="subs">' + tr('feed_subs') + '</button>';
   html += '</div>';
-  html += '<div class="main-body"><div id="feed">' + spinner() + '</div></div>';
-  if (state.user) {
-    html += '<div class="composer">';
-    html += '<textarea id="newPost" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('post_ph')) + '"></textarea>';
-    html += '<div class="composer-row">';
-    html += '<div id="counter" class="counter">0 / ' + MAX_POST_LEN + '</div>';
-    html += '<button id="send" class="send" disabled>' + tr('publish') + '</button>';
-    html += '</div></div>';
-  } else {
-    html += '<div class="composer"><div class="login-prompt">'
-      + '<a href="/login" data-link>' + tr('go_login') + '</a> · <a href="/register" data-link>' + tr('nav_register') + '</a>'
-      + '</div></div>';
-  }
+  html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
+  if (state.user) html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
+  else html += '<div class="card"><div class="auth-switch" style="margin:0"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
+  html += '<div id="feed">' + spinner() + '</div>';
+  html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
-
-  el.querySelectorAll('.feed-tab').forEach(function(t){
+  bindThemeBtn();
+  bindLinks(el);
+  el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
       state.feedMode = t.dataset.mode;
-      el.querySelectorAll('.feed-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+      el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
       loadFeed();
     });
   });
   var searchEl = document.getElementById('search');
-  var searchBtn = document.getElementById('searchBtn');
   var tId;
   searchEl.addEventListener('input', function(){
     state.searchQuery = searchEl.value;
     clearTimeout(tId); tId = setTimeout(loadFeed, 250);
   });
-  searchBtn.addEventListener('click', function(){ loadFeed(); });
-
   if (state.user) {
-    var inputEl = document.getElementById('newPost');
-    var sendBtn = document.getElementById('send');
-    var counter = document.getElementById('counter');
-    inputEl.value = state.composerDraft || '';
-    function updateCounter(){
-      var len = inputEl.value.length;
-      counter.textContent = len + ' / ' + MAX_POST_LEN;
-      counter.classList.toggle('warn', len >= MAX_POST_LEN);
-      sendBtn.disabled = len === 0 || len > MAX_POST_LEN;
-    }
-    inputEl.addEventListener('input', function(){ state.composerDraft = inputEl.value; updateCounter(); });
-    sendBtn.addEventListener('click', sendPost);
-    updateCounter();
-    async function sendPost(){
-      var text = inputEl.value.trim();
-      if (!text) return;
-      sendBtn.disabled = true;
-      try {
-        await api('/api/posts', { method: 'POST', body: { text: text } });
-        inputEl.value = ''; state.composerDraft = '';
-        updateCounter(); state.searchQuery = '';
+    bindComposer({
+      idPrefix: 'post',
+      onSend: async function(text, quotedId){
+        await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId } });
+        state.searchQuery = '';
         await loadFeed();
-      } catch(e) { alert(tr(e.message) || e.message); }
-      finally { updateCounter(); }
-    }
+      }
+    });
   }
   loadFeed();
 }
@@ -3175,68 +3446,52 @@ async function loadFeed() {
     if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
     feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     bindPostActions(feedEl); bindLinks(feedEl);
-    applyTranslations(feedEl);
   } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
 }
 
-// ============ POST ============
+// ============ POST VIEW ============
 function renderPostView(el) {
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('posts_tab') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div id="feed">' + spinner() + '</div></div>';
-  if (state.user) {
-    html += '<div class="composer composer-comment">';
-    html += '<div id="replyBanner"></div>';
-    html += '<textarea id="newComment" maxlength="' + MAX_COMMENT_LEN + '" placeholder="' + escapeHtml(tr('comment_ph')) + '"></textarea>';
-    html += '<div class="composer-row">';
-    html += '<div id="counter" class="counter">0 / ' + MAX_COMMENT_LEN + '</div>';
-    html += '<button id="send" class="send" disabled>' + tr('send_comment') + '</button>';
-    html += '</div></div>';
-  } else {
-    html += '<div class="composer"><div class="login-prompt"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
-  }
+  var html = '<div class="main-header">'
+    + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="title">' + tr('posts_tab') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+  html += '<div id="feed">' + spinner() + '</div>';
+  if (state.user) html += composerHtml({ idPrefix: 'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
+  else html += '<div class="card"><div class="auth-switch" style="margin:0"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
+  html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn();
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/'); });
+  bindLinks(el);
   if (state.user) {
-    var inputEl = document.getElementById('newComment');
-    var sendBtn = document.getElementById('send');
-    var counter = document.getElementById('counter');
-    var replyBanner = document.getElementById('replyBanner');
+    var replyBanner = document.createElement('div');
+    replyBanner.id = 'replyBanner';
+    var inputEl = document.getElementById('commentInput');
+    inputEl.parentNode.insertBefore(replyBanner, inputEl);
     function renderReplyBanner() {
       if (!state.replyTo) { replyBanner.innerHTML = ''; inputEl.placeholder = tr('comment_ph'); return; }
-      replyBanner.innerHTML = '<div class="reply-banner">' + tr('reply') + ': <b>@' + escapeHtml(state.replyTo.author) + '</b> <button id="cancelReplyBtn">' + tr('cancel_reply') + '</button></div>';
+      replyBanner.innerHTML = '<div class="quote-preview" style="margin-bottom:8px">'
+        + '<div class="qp-author">' + tr('reply') + ': @' + escapeHtml(state.replyTo.author) + '</div>'
+        + '<button class="qp-close" type="button">✕</button></div>';
       inputEl.placeholder = tr('reply_ph');
-      document.getElementById('cancelReplyBtn').addEventListener('click', function(){
+      replyBanner.querySelector('.qp-close').addEventListener('click', function(){
         state.replyTo = null; renderReplyBanner();
       });
     }
-    renderReplyBanner(); state._renderReplyBanner = renderReplyBanner;
-    function updateCounter(){
-      var len = inputEl.value.length;
-      counter.textContent = len + ' / ' + MAX_COMMENT_LEN;
-      counter.classList.toggle('warn', len >= MAX_COMMENT_LEN);
-      sendBtn.disabled = len === 0 || len > MAX_COMMENT_LEN;
-    }
-    inputEl.addEventListener('input', updateCounter);
-    sendBtn.addEventListener('click', sendComment);
-    updateCounter();
-    async function sendComment(){
-      var text = inputEl.value.trim();
-      if (!text) return;
-      sendBtn.disabled = true;
-      try {
-        var body = { text: text };
+    renderReplyBanner();
+    state._renderReplyBanner = renderReplyBanner;
+    bindComposer({
+      idPrefix: 'comment',
+      placeholder: tr('comment_ph'),
+      onSend: async function(text, quotedId){
+        var body = { text: text, quoted_post_id: quotedId };
         if (state.replyTo) body.parent_id = state.replyTo.id;
         await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
-        inputEl.value = ''; state.replyTo = null; renderReplyBanner();
-        updateCounter(); await loadPostView();
-      } catch(e) { alert(tr(e.message) || e.message); }
-      finally { updateCounter(); }
-    }
+        state.replyTo = null; renderReplyBanner();
+        await loadPostView();
+      }
+    });
   }
   loadPostView();
 }
@@ -3247,7 +3502,6 @@ async function loadPostView() {
     var p = await api('/api/posts/' + state.viewData.post_id);
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl);
-    applyTranslations(feedEl);
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -3261,50 +3515,60 @@ async function loadPostView() {
 
 // ============ PROFILE ============
 function renderProfileView(el) {
-  var nick = state.viewData.nick || '';
-  var isOwn = state.user && state.user.nick === nick;
-  var html = '';
-  html += '<header class="main-header">';
-  if (!isOwn) html += '<a href="/" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">@' + escapeHtml(nick) + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div id="profileHeader">' + spinner() + '</div><div id="profileTabs"></div><div id="feed"></div></div>';
+  var html = '<div class="main-body"><div class="main-inner" id="profileRoot">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
-  loadProfile(nick);
+  bindLinks(el);
+  loadProfile(state.viewData.nick);
 }
 async function loadProfile(nick) {
-  var headerEl = document.getElementById('profileHeader');
-  var tabsEl = document.getElementById('profileTabs');
-  var feedEl = document.getElementById('feed');
+  var root = document.getElementById('profileRoot');
+  if (!root) return;
   try {
     var u = await api('/api/users/' + encodeURIComponent(nick));
     var isMe = state.user && state.user.nick === u.nick;
-    var h = '<div class="profile-header">';
-    h += '<div class="profile-name-big">';
-    if (u.online) h += '<span class="profile-online"></span>';
-    h += escapeHtml(u.name) + '</div>';
-    h += '<div class="profile-nick-small">@' + escapeHtml(u.nick) + '</div>';
-    if (u.bio) h += '<div class="profile-bio">' + escapeHtml(u.bio) + '</div>';
-    else h += '<div class="profile-bio profile-bio-empty">' + escapeHtml(tr('bio_empty')) + '</div>';
-    h += '<div class="profile-stats">';
-    h += '<span><b id="followersLink">' + u.followers + '</b> ' + tr('profile_followers') + '</span>';
-    h += '<span><b id="followingLink">' + u.following + '</b> ' + tr('profile_following') + '</span>';
-    h += '</div>';
-    h += '<div class="profile-actions">';
+
+    var actions = '';
     if (isMe) {
-      h += '<a class="follow-btn secondary" href="/settings/profile" data-link>' + ICONS.edit + ' ' + tr('edit_profile') + '</a>';
+      actions = '<button class="round-action" id="editProfileBtn" title="' + escapeHtml(tr('edit_profile')) + '">' + ICONS.gear + '</button>'
+              + '<a class="pill-action" href="/settings/profile" data-link>' + tr('edit_profile') + '</a>';
     } else if (state.user) {
-      h += '<button class="follow-btn' + (u.is_following ? ' following' : '') + '" id="followBtn">'
-        + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
-      h += '<button class="follow-btn secondary" id="dmBtn">' + ICONS.mail + ' ' + tr('message') + '</button>';
+      actions = '<button class="round-action" id="dmBtn" title="' + escapeHtml(tr('message')) + '">' + ICONS.mail + '</button>'
+              + '<button class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
+              + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
     } else {
-      h += '<a class="follow-btn" href="/login" data-link>' + tr('go_login') + '</a>';
+      actions = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
-    h += '</div></div>';
-    headerEl.innerHTML = h;
-    bindLinks(headerEl);
+
+    var html = '<div style="display:flex;justify-content:flex-end;padding:8px 0;gap:8px">'
+      + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
+      + '</div>';
+
+    html += '<div class="profile-cover">'
+      + '<div class="profile-cover-avatar">' + avatarHtml(u.name, u.nick, u.online) + '</div>'
+      + '<div class="profile-actions-right">' + actions + '</div>'
+      + '</div>';
+
+    html += '<div class="profile-info">';
+    html += '<div class="profile-name">' + escapeHtml(u.name) + '</div>';
+    html += '<div class="profile-nick">@' + escapeHtml(u.nick) + '</div>';
+    html += '<div class="profile-stats">';
+    html += '<div><b id="followersLink">' + u.followers + '</b><span>' + tr('profile_followers') + '</span></div>';
+    html += '<div><b id="followingLink">' + u.following + '</b><span>' + tr('profile_following') + '</span></div>';
+    html += '</div>';
+    if (u.bio) html += '<div class="profile-bio">' + escapeHtml(u.bio) + '</div>';
+    html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
+    html += '</div>';
+
+    // tabs
+    html += '<div class="pill-tabs" id="profileTabs">'
+      + '<button class="pill-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + tr('posts_tab') + '</button>'
+      + '<button class="pill-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_tab') + '</button>'
+      + '</div>';
+
+    html += '<div id="profileContent">' + spinner() + '</div>';
+    root.innerHTML = html;
+    bindThemeBtn(); bindLinks(root);
+
     document.getElementById('followersLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/followers');
     });
@@ -3312,112 +3576,93 @@ async function loadProfile(nick) {
       navigate('/u/' + encodeURIComponent(u.nick) + '/following');
     });
     var btn = document.getElementById('followBtn');
-    if (btn) {
-      btn.addEventListener('click', async function(){
-        try {
-          if (btn.classList.contains('following')) {
-            await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-          } else {
-            await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-          }
-          loadProfile(nick);
-        } catch(e) { alert(tr(e.message) || e.message); }
-      });
-    }
-    var dmBtn = document.getElementById('dmBtn');
-    if (dmBtn) dmBtn.addEventListener('click', function(){
-      navigate('/messages/' + encodeURIComponent(u.nick));
+    if (btn) btn.addEventListener('click', async function(){
+      try {
+        if (btn.textContent.trim() === tr('unfollow')) {
+          await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
+        } else {
+          await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
+        }
+        loadProfile(nick);
+      } catch(e) { alert(tr(e.message) || e.message); }
     });
+    var dmBtn = document.getElementById('dmBtn');
+    if (dmBtn) dmBtn.addEventListener('click', function(){ navigate('/messages/' + encodeURIComponent(u.nick)); });
 
-    var labelPosts = tr('posts_tab');
-    tabsEl.innerHTML = '<div class="profile-tabs">'
-      + '<button class="profile-tab' + (state.profileTab==='posts'?' active':'') + '" data-tab="posts">' + labelPosts + '</button>'
-      + '<button class="profile-tab' + (state.profileTab==='wall'?' active':'') + '" data-tab="wall">' + tr('wall_tab') + '</button>'
-      + '</div>';
-    tabsEl.querySelectorAll('.profile-tab').forEach(function(t){
+    root.querySelectorAll('.pill-tab').forEach(function(t){
       t.addEventListener('click', function(){
         state.profileTab = t.dataset.tab;
-        tabsEl.querySelectorAll('.profile-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+        root.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
         loadProfileTab(u, isMe);
       });
     });
     loadProfileTab(u, isMe);
   } catch(e) {
-    headerEl.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
-    tabsEl.innerHTML = ''; feedEl.innerHTML = '';
+    root.innerHTML = '<div class="empty">' + escapeHtml(tr('not_found')) + '</div>';
   }
 }
 async function loadProfileTab(u, isMe) {
-  var feedEl = document.getElementById('feed');
-  if (!feedEl) return;
-  feedEl.innerHTML = spinner();
+  var c = document.getElementById('profileContent');
+  if (!c) return;
+  c.innerHTML = spinner();
   if (state.profileTab === 'wall') {
     try {
       var data = await api('/api/users/' + encodeURIComponent(u.nick) + '/wall');
-      var posts = data.posts || [];
-      var composer = '';
-      if (!state.user) {
-        composer = '<div class="wall-notice">' + tr('login_to_wall') + ' · <a href="/login" data-link>' + tr('go_login') + '</a></div>';
-      } else if (data.can_post) {
-        composer = '<div class="wall-composer">'
-          + '<textarea id="wallInput" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(tr('wall_ph')) + '">' + escapeHtml(state.wallDraft || '') + '</textarea>'
-          + '<div class="wall-composer-row">'
-          + '<div id="wallCounter" class="counter">0 / ' + MAX_POST_LEN + '</div>'
-          + '<button class="send" id="wallSend" disabled>' + tr('wall_send') + '</button>'
-          + '</div></div>';
-      } else {
-        var reason = data.reason || '';
-        var reasonText = reason === 'err_need_follow' ? tr('wall_must_follow')
-                       : reason === 'err_wall_disabled' ? tr('err_wall_disabled')
-                       : reason === 'err_user_blocked' ? tr('err_user_blocked')
-                       : '';
-        var extra = '';
-        if (reason === 'err_need_follow') {
-          extra = ' · <a href="/u/' + encodeURIComponent(u.nick) + '" data-link>' + tr('follow') + '</a>';
-        }
-        composer = '<div class="wall-notice">' + escapeHtml(reasonText) + extra + '</div>';
-      }
-      var bodyHtml = posts.length
-        ? posts.map(function(p){ return renderPostHtml(p, false); }).join('')
-        : '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
-      feedEl.innerHTML = composer + bodyHtml;
-      bindPostActions(feedEl); bindLinks(feedEl); applyTranslations(feedEl);
-      var wi = document.getElementById('wallInput');
-      var ws = document.getElementById('wallSend');
-      var wc = document.getElementById('wallCounter');
-      if (wi && ws && wc) {
-        function updW(){
-          var len = wi.value.length;
-          wc.textContent = len + ' / ' + MAX_POST_LEN;
-          wc.classList.toggle('warn', len >= MAX_POST_LEN);
-          ws.disabled = len === 0 || len > MAX_POST_LEN;
-        }
-        wi.value = state.wallDraft || '';
-        wi.addEventListener('input', function(){ state.wallDraft = wi.value; updW(); });
-        ws.addEventListener('click', async function(){
-          var text = wi.value.trim();
-          if (!text) return;
-          ws.disabled = true;
+      if (!data.can_view) {
+        c.innerHTML = '<div class="card" style="text-align:center;padding:32px 20px">'
+          + '<div style="font-size:40px;margin-bottom:12px">🔒</div>'
+          + '<div style="font-size:15px;color:var(--muted);margin-bottom:16px">' + escapeHtml(tr('wall_community_hint')) + '</div>'
+          + (state.user && !isMe ? '<button class="pill-action primary" id="wallFollowBtn" style="height:44px;padding:0 22px;background:var(--accent);color:var(--accent-fg);border:none;border-radius:14px;font-weight:700;cursor:pointer">' + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>' : '')
+          + '</div>';
+        var wf = document.getElementById('wallFollowBtn');
+        if (wf) wf.addEventListener('click', async function(){
           try {
-            await api('/api/users/' + encodeURIComponent(u.nick) + '/wall', { method: 'POST', body: { text: text } });
-            wi.value = ''; state.wallDraft = ''; updW();
-            loadProfileTab(u, isMe);
-          } catch(e) { alert(tr(e.message) || e.message); updW(); }
+            if (u.is_following) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
+            else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
+            loadProfile(u.nick);
+          } catch(e) { alert(tr(e.message) || e.message); }
         });
-        updW();
+        return;
       }
-    } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
+
+      var html = '';
+      if (state.user && data.can_post) {
+        html += composerHtml({ idPrefix: 'wall', placeholder: tr('wall_ph'), sendLabel: tr('wall_send'), draftKey: 'wall' });
+      } else if (state.user) {
+        var reasonText = data.reason === 'err_need_follow' ? tr('wall_must_follow')
+                       : data.reason === 'err_wall_disabled' ? tr('err_wall_disabled')
+                       : data.reason === 'err_user_blocked' ? tr('err_user_blocked')
+                       : '';
+        html += '<div class="card" style="text-align:center;color:var(--muted)">' + escapeHtml(reasonText) + '</div>';
+      }
+      if (data.posts.length) {
+        html += data.posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+      } else if (state.user && data.can_post) {
+        html += '<div class="empty">' + escapeHtml(tr('wall_empty')) + '</div>';
+      }
+      c.innerHTML = html;
+      bindPostActions(c); bindLinks(c);
+      if (state.user && data.can_post) {
+        bindComposer({
+          idPrefix: 'wall', draftKey: 'wall',
+          onSend: async function(text, quotedId){
+            await api('/api/users/' + encodeURIComponent(u.nick) + '/wall', { method: 'POST', body: { text: text, quoted_post_id: quotedId } });
+            loadProfileTab(u, isMe);
+          }
+        });
+      }
+    } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
   } else {
     try {
       var d2 = await api('/api/posts?author=' + encodeURIComponent(u.nick));
       var posts2 = (d2.posts || []).slice();
       posts2.sort(function(a, b){ return b.created_at - a.created_at; });
-      if (!posts2.length) feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
+      if (!posts2.length) c.innerHTML = '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
       else {
-        feedEl.innerHTML = posts2.map(function(p){ return renderPostHtml(p, false); }).join('');
-        bindPostActions(feedEl); bindLinks(feedEl); applyTranslations(feedEl);
+        c.innerHTML = posts2.map(function(p){ return renderPostHtml(p, false); }).join('');
+        bindPostActions(c); bindLinks(c);
       }
-    } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
+    } catch(e) { c.innerHTML = '<div class="empty">—</div>'; }
   }
 }
 
@@ -3425,22 +3670,20 @@ async function loadProfileTab(u, isMe) {
 function renderEditProfileView(el) {
   if (!state.user) { navigate('/login'); return; }
   var u = state.user;
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/settings" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('edit_profile_title') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div class="auth-wrap">';
-  html += '<form class="auth-form" id="editForm">';
+  var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="title">' + tr('edit_profile_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="auth-page">';
+  html += '<div class="auth-card"><form id="editForm">';
   html += '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required />';
   html += '<input type="text" name="nick" maxlength="20" placeholder="' + escapeHtml(tr('nick_ph')) + '" value="' + escapeHtml(u.nick) + '" required />';
-  html += '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '">' + escapeHtml(u.bio || '') + '</textarea>';
+  html += '<input type="text" name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" value="' + escapeHtml(u.bio || '') + '" />';
   html += '<div class="auth-error" id="editError"></div>';
   html += '<button type="submit">' + tr('save') + '</button>';
-  html += '</form></div></div>';
+  html += '</form></div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
   var form = document.getElementById('editForm');
   var errEl = document.getElementById('editError');
   form.addEventListener('submit', async function(e){
@@ -3470,23 +3713,30 @@ function renderFollowListView(el) {
   var nick = state.viewData.nick;
   var isFollowers = state.view === 'followers';
   var title = isFollowers ? tr('followers_title') : tr('following_title');
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/u/' + encodeURIComponent(nick) + '" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">@' + escapeHtml(nick) + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
+  var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="title">' + escapeHtml(title) + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner"><div id="list">' + spinner() + '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/u/' + encodeURIComponent(nick)); });
   loadFollowList(nick, isFollowers);
 }
-function userItemHtml(u) {
-  var dotCls = u.online ? ' online' : '';
-  return '<div class="user-item"><div class="user-info">'
-    + '<a class="user-nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>'
-    + '<span class="user-dot' + dotCls + '"></span>@' + escapeHtml(u.nick) + '</a>'
-    + '<div class="user-name">' + escapeHtml(u.name) + '</div></div></div>';
+function userRowHtml(u) {
+  return '<div class="user-row" data-link-row="' + encodeURIComponent(u.nick) + '">'
+    + avatarHtml(u.name, u.nick, u.online, 'sm')
+    + '<div class="info">'
+    + '<a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
+    + '<div class="name">' + escapeHtml(u.name) + '</div>'
+    + '</div></div>';
+}
+function bindUserRows(root) {
+  root.querySelectorAll('[data-link-row]').forEach(function(r){
+    r.addEventListener('click', function(e){
+      if (e.target.closest('[data-link]')) return;
+      navigate('/u/' + r.dataset.linkRow);
+    });
+  });
 }
 async function loadFollowList(nick, isFollowers) {
   var wrap = document.getElementById('list');
@@ -3496,31 +3746,31 @@ async function loadFollowList(nick, isFollowers) {
       : ('/api/users/' + encodeURIComponent(nick) + '/following');
     var data = await api(path);
     var users = data.users || [];
-    var limitedNote = data.limited ? '<div class="empty" style="padding:14px 20px;text-align:left">' + escapeHtml(tr('limited_list')) + '</div>' : '';
+    var limitedNote = data.limited ? '<div class="empty" style="margin-bottom:12px;padding:16px">' + escapeHtml(tr('limited_list')) + '</div>' : '';
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(isFollowers ? tr('no_followers') : tr('no_following')) + '</div>'; return; }
-    wrap.innerHTML = limitedNote + '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
-    bindLinks(wrap);
+    wrap.innerHTML = limitedNote + users.map(userRowHtml).join('');
+    bindLinks(wrap); bindUserRows(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
 }
 
 // ============ PEOPLE ============
 function renderUsersView(el) {
-  var html = '';
-  html += '<header class="search-header">';
-  html += '<input id="peopleSearch" type="text" placeholder="' + escapeHtml(tr('people_search_ph')) + '" value="' + escapeHtml(state.peopleQuery) + '" />';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="people-tabs">';
-  html += '<button class="people-tab' + (state.peopleTab==='all'?' active':'') + '" data-tab="all">' + tr('people_all') + '</button>';
-  html += '<button class="people-tab' + (state.peopleTab==='subs'?' active':'') + '" data-tab="subs">' + tr('people_subs') + '</button>';
+  var html = '<div class="main-header"><div class="title">' + tr('people_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+  html += '<div class="search-box">' + ICONS.search + '<input id="peopleSearch" type="text" placeholder="' + escapeHtml(tr('people_search_ph')) + '" value="' + escapeHtml(state.peopleQuery) + '" /></div>';
+  html += '<div class="pill-tabs">';
+  html += '<button class="pill-tab' + (state.peopleTab==='all'?' active':'') + '" data-tab="all">' + tr('people_all') + '</button>';
+  html += '<button class="pill-tab' + (state.peopleTab==='subs'?' active':'') + '" data-tab="subs">' + tr('people_subs') + '</button>';
   html += '</div>';
-  html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
+  html += '<div id="list">' + spinner() + '</div>';
+  html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
-  el.querySelectorAll('.people-tab').forEach(function(t){
+  bindThemeBtn(); bindLinks(el);
+  el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
       state.peopleTab = t.dataset.tab;
-      el.querySelectorAll('.people-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
+      el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
       loadPeople();
     });
   });
@@ -3536,8 +3786,8 @@ async function loadPeople() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
   if (!state.user && state.peopleTab === 'subs') {
-    wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_post')) + ' · <a href="/login" data-link style="color:var(--accent)">' + tr('go_login') + '</a></div>';
-    bindLinks(wrap); return;
+    wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_post')) + '</div>';
+    return;
   }
   try {
     var q = (state.peopleQuery || '').trim();
@@ -3546,21 +3796,21 @@ async function loadPeople() {
     var data = await api(url);
     var users = data.users || [];
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
-    wrap.innerHTML = '<div class="user-list">' + users.map(userItemHtml).join('') + '</div>';
-    bindLinks(wrap);
+    wrap.innerHTML = users.map(userRowHtml).join('');
+    bindLinks(wrap); bindUserRows(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
 // ============ MESSAGES ============
 function renderMessagesView(el) {
-  var html = '';
-  html += '<header class="search-header">';
-  html += '<input id="dmSearch" type="text" placeholder="' + escapeHtml(tr('dm_search_ph')) + '" value="' + escapeHtml(state.dmQuery) + '" />';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div id="list">' + spinner() + '</div></div>';
+  var html = '<div class="main-header"><div class="title">' + tr('dm_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner">';
+  html += '<div class="search-box">' + ICONS.search + '<input id="dmSearch" type="text" placeholder="' + escapeHtml(tr('dm_search_ph')) + '" value="' + escapeHtml(state.dmQuery) + '" /></div>';
+  html += '<div id="list">' + spinner() + '</div>';
+  html += '</div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
   var searchEl = document.getElementById('dmSearch');
   var tId;
   searchEl.addEventListener('input', function(){
@@ -3573,10 +3823,7 @@ async function loadDMs() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
   try {
-    if (!state.user) {
-      wrap.innerHTML = '<div class="login-prompt"><a href="/login" data-link>' + tr('go_login') + '</a></div>';
-      bindLinks(wrap); return;
-    }
+    if (!state.user) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_dm')) + '</div>'; return; }
     var data = await api('/api/dm/threads');
     var threads = data.threads || [];
     setCounters((typeof data.unread_notif === 'number' ? data.unread_notif : state.unreadNotif), data.unread || 0);
@@ -3586,19 +3833,19 @@ async function loadDMs() {
       return t.other_nick.toLowerCase().includes(q) || (t.other_name || '').toLowerCase().includes(q);
     });
     if (!threads.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('dm_empty')) + '</div>'; return; }
-    wrap.innerHTML = '<div class="dm-list">' + threads.map(function(t){
+    wrap.innerHTML = threads.map(function(t){
       var badge = t.unread > 0 ? '<span class="unread-badge">' + t.unread + '</span>' : '';
-      var mineLabel = t.last_from_me ? '<span class="mine-label">' + escapeHtml(LANG === 'ru' ? 'вы: ' : 'you: ') + '</span>' : '';
-      var dot = t.online ? '<span class="user-dot online"></span>' : '<span class="user-dot"></span>';
-      return '<div class="dm-thread">'
+      var mineLabel = t.last_from_me ? '<span style="color:var(--muted)">' + escapeHtml(LANG === 'ru' ? 'вы: ' : 'you: ') + '</span>' : '';
+      return '<div class="dm-row">'
+        + avatarHtml(t.other_name, t.other_nick, t.online, 'sm')
         + '<a class="info" href="/messages/' + encodeURIComponent(t.other_nick) + '" data-link>'
-        + '<div class="who">' + dot + '@' + escapeHtml(t.other_nick) + '</div>'
+        + '<div class="who">@' + escapeHtml(t.other_nick) + '</div>'
         + '<div class="preview">' + mineLabel + escapeHtml(t.last_message || '') + '</div>'
         + '</a>'
         + '<div class="meta"><span class="time">' + timeAgo(t.last_message_at) + '</span>' + badge + '</div>'
         + '<button class="dm-del-btn" data-del-thread="' + t.id + '" title="' + escapeHtml(tr('dm_delete')) + '">' + ICONS.trash + '</button>'
         + '</div>';
-    }).join('') + '</div>';
+    }).join('');
     bindLinks(wrap);
     wrap.querySelectorAll('[data-del-thread]').forEach(function(b){
       b.addEventListener('click', function(e){
@@ -3615,17 +3862,13 @@ async function loadDMs() {
 
 function renderChatView(el) {
   var nick = state.viewData.nick || '';
-  if (!state.user) {
-    el.innerHTML = '<header class="main-header"><a href="/messages" class="icon-btn" data-link>' + ICONS.back + '</a><div class="title">@' + escapeHtml(nick) + '</div></header>'
-      + '<div class="main-body"><div class="login-prompt"><a href="/login" data-link>' + tr('go_login') + '</a></div></div>';
-    attachThemeBtn(); bindLinks(el); return;
-  }
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/messages" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title"><a href="/u/' + encodeURIComponent(nick) + '" data-link>@' + escapeHtml(nick) + '</a><span class="chat-header-sub" id="chatStatus"></span></div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
+  if (!state.user) { navigate('/login'); return; }
+  var html = '<div class="chat-header">'
+    + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="who"><div class="info"><div class="name" id="chatName">@' + escapeHtml(nick) + '</div>'
+    + '<div class="status" id="chatStatus"></div></div></div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>'
+    + '</div>';
   html += '<div class="main-body"><div class="chat">';
   html += '<div class="chat-body" id="chatBody">' + spinner() + '</div>';
   html += '<div class="chat-composer">';
@@ -3633,12 +3876,13 @@ function renderChatView(el) {
   html += '<button id="dmSend" disabled>' + tr('dm_send') + '</button>';
   html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn();
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/messages'); });
   var inputEl = document.getElementById('dmInput');
   var sendBtn = document.getElementById('dmSend');
-  function updateCounter() { sendBtn.disabled = inputEl.value.trim().length === 0; }
+  function upd() { sendBtn.disabled = inputEl.value.trim().length === 0; }
   inputEl.addEventListener('input', function(){
-    updateCounter();
+    upd();
     var now = Date.now();
     if (now - state.lastTypingSent > 2500 && state.token) {
       state.lastTypingSent = now;
@@ -3649,15 +3893,14 @@ function renderChatView(el) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendDM(); }
   });
   sendBtn.addEventListener('click', sendDM);
-  updateCounter();
+  upd();
   async function sendDM() {
     var text = inputEl.value.trim();
     if (!text) return;
     sendBtn.disabled = true;
-    inputEl.value = '';
-    updateCounter();
+    inputEl.value = ''; upd();
     try { await api('/api/dm/send', { method: 'POST', body: { to: nick, text: text } }); }
-    catch(e) { alert(tr(e.message) || e.message); inputEl.value = text; updateCounter(); }
+    catch(e) { alert(tr(e.message) || e.message); inputEl.value = text; upd(); }
   }
   loadChat(); refreshCounters();
 }
@@ -3668,11 +3911,15 @@ async function loadChat(silent) {
   try {
     var data = await api('/api/dm/with/' + encodeURIComponent(nick));
     var st = document.getElementById('chatStatus');
-    if (st && data.other) {
-      var isOnline = !!data.other.online;
-      if (!st.classList.contains('typing')) {
-        st.textContent = isOnline ? tr('dm_online') : tr('dm_offline');
-        st.className = 'chat-header-sub' + (isOnline ? ' online' : '');
+    var nm = document.getElementById('chatName');
+    if (data.other) {
+      if (nm) nm.textContent = data.other.name + ' · @' + data.other.nick;
+      if (st) {
+        var isOnline = !!data.other.online;
+        if (!st.classList.contains('typing')) {
+          st.textContent = isOnline ? tr('dm_online') : tr('dm_offline');
+          st.className = 'status' + (isOnline ? ' online' : '');
+        }
       }
     }
     if (typeof data.unread_dm === 'number') {
@@ -3696,15 +3943,12 @@ async function loadChat(silent) {
 
 // ============ NOTIFICATIONS ============
 function renderNotificationsView(el) {
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<div class="title">' + tr('notif_title') + '</div>';
-  html += '<button class="icon-btn danger" id="clearNotifsBtn" title="' + escapeHtml(tr('notif_clear')) + '">' + ICONS.trash + '</button>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div id="notifList">' + spinner() + '</div></div>';
+  var html = '<div class="main-header"><div class="title">' + tr('notif_title') + '</div>'
+    + '<button class="icon-btn danger" id="clearNotifsBtn" title="' + escapeHtml(tr('notif_clear')) + '">' + ICONS.trash + '</button>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
+  html += '<div class="main-body"><div class="main-inner"><div id="notifList">' + spinner() + '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
   document.getElementById('clearNotifsBtn').addEventListener('click', function(){
     showConfirm(tr('notif_clear_confirm'), async function(){
       try {
@@ -3728,42 +3972,43 @@ async function loadNotifications() {
       setCounters(0, undefined); renderSidebar();
     }
     if (!items.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('notif_empty')) + '</div>'; return; }
-    wrap.innerHTML = '<div class="notif-list">' + items.map(renderNotifHtml).join('') + '</div>';
+    wrap.innerHTML = items.map(renderNotifHtml).join('');
     bindLinks(wrap);
   } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 function renderNotifHtml(n) {
-  var cls = 'notif' + (n.read ? '' : ' unread');
-  var author = '<span class="notif-author">@' + escapeHtml(n.from_nick || '?') + '</span>';
+  var cls = 'notif-row' + (n.read ? '' : ' unread');
+  var author = '<b>@' + escapeHtml(n.from_nick || '?') + '</b>';
   var text = '', link = null;
   if (n.type === 'follow') {
-    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_follow') + '</span></div>';
+    text = author + ' ' + tr('notif_follow');
     link = '/u/' + encodeURIComponent(n.from_nick);
   } else if (n.type === 'comment' || n.type === 'reply' || n.type === 'mention') {
     var label = n.type === 'comment' ? tr('notif_comment') : n.type === 'reply' ? tr('notif_reply') : tr('notif_mention');
-    text = '<div class="notif-head">' + author + '<span class="notif-text">' + label + '</span></div>';
-    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    text = author + ' ' + label;
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
-  } else if (n.type === 'new_post' || n.type === 'wall_post') {
-    var lbl = n.type === 'new_post' ? tr('notif_new_post') : tr('notif_wall_post');
-    text = '<div class="notif-head">' + author + '<span class="notif-text">' + lbl + '</span></div>';
-    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+  } else if (n.type === 'new_post' || n.type === 'wall_post' || n.type === 'quote') {
+    var lbl = n.type === 'new_post' ? tr('notif_new_post') : n.type === 'wall_post' ? tr('notif_wall_post') : tr('notif_quote');
+    text = author + ' ' + lbl;
     link = n.post_id ? ('/p/' + n.post_id) : null;
   } else if (n.type === 'dm_start') {
-    text = '<div class="notif-head">' + author + '<span class="notif-text">' + tr('notif_dm') + '</span></div>';
-    if (n.text) text += '<div class="notif-snippet">' + escapeHtml(n.text) + '</div>';
+    text = author + ' ' + tr('notif_dm');
     link = '/messages/' + encodeURIComponent(n.from_nick);
   } else {
-    text = '<div class="notif-text">' + author + '</div>';
+    text = author;
   }
-  var inner = text + '<div class="notif-time">' + timeAgo(n.created_at) + '</div>';
-  if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + inner + '</a>';
-  return '<div class="' + cls + '">' + inner + '</div>';
+  var snippet = '';
+  if (n.text) snippet = '<div class="snippet">' + escapeHtml(n.text) + '</div>';
+  var inner = '<div class="info"><div class="line">' + text + '</div>'
+    + snippet
+    + '<div class="time">' + timeAgo(n.created_at) + '</div></div>';
+  if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + avatarHtml(null, n.from_nick, false, 'sm') + inner + '</a>';
+  return '<div class="' + cls + '">' + avatarHtml(null, n.from_nick, false, 'sm') + inner + '</div>';
 }
 
 // ============ SETTINGS ============
 function renderSettingsView(el) {
-  var theme = document.documentElement.getAttribute('data-theme') || 'light';
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var me = state.user || {};
   var allowF = me.allow_followers_view !== false;
   var allowG = me.allow_following_view !== false;
@@ -3771,12 +4016,9 @@ function renderSettingsView(el) {
   var allowW = me.allow_wall_posts !== false;
   var bl = me.blacklist || [];
   var sec = state.settingsSection || 'account';
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('settings_title') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
+
+  var html = '<div class="main-header"><div class="title">' + tr('settings_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="settings-layout">';
   html += '<nav class="settings-nav">';
   html += '<button class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
@@ -3786,19 +4028,18 @@ function renderSettingsView(el) {
   html += '</nav>';
   html += '<div class="settings-content">';
 
-  html += '<div class="settings-section" id="section-account"><h2>' + tr('settings_account') + '</h2>';
+  html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   if (state.user) {
-    html += '<a class="btn-secondary" href="/settings/profile" data-link style="margin-bottom:14px">' + ICONS.edit + ' ' + tr('edit_profile') + '</a>';
+    html += '<a class="pill-action" style="display:inline-block;padding:12px 20px;background:var(--card-2);border-radius:12px;color:var(--text);text-decoration:none;font-weight:600;margin-bottom:14px" href="/settings/profile" data-link>' + tr('edit_profile') + '</a>';
     html += '<div class="toggle-row"><span>' + tr('settings_notify_new_post') + '</span>'
       + '<div class="toggle' + (nnp ? ' on' : '') + '" data-toggle="notify_on_new_post"></div></div>';
-    html += '<div style="margin-top:20px"><button class="btn-danger" id="settingsLogout">' + ICONS.logout + ' ' + tr('settings_logout') + '</button></div>';
+    html += '<div style="margin-top:14px"><button class="modal-btn danger" style="width:auto;padding:0 20px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
   } else {
-    html += '<a class="follow-btn" href="/login" data-link>' + tr('go_login') + '</a> ';
-    html += '<a class="follow-btn secondary" href="/register" data-link style="margin-left:8px">' + tr('nav_register') + '</a>';
+    html += '<a class="pill-action primary" style="display:inline-block;padding:12px 20px;background:var(--accent);color:var(--accent-fg);border-radius:12px;text-decoration:none;font-weight:600" href="/login" data-link>' + tr('go_login') + '</a>';
   }
   html += '</div>';
 
-  html += '<div class="settings-section" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
+  html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   if (state.user) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_followers') + '</span>'
       + '<div class="toggle' + (allowF ? ' on' : '') + '" data-toggle="allow_followers_view"></div></div>';
@@ -3807,50 +4048,52 @@ function renderSettingsView(el) {
     html += '<div class="toggle-row"><span>' + tr('settings_allow_wall') + '</span>'
       + '<div class="toggle' + (allowW ? ' on' : '') + '" data-toggle="allow_wall_posts"></div></div>';
     html += '<p class="settings-desc" style="margin-top:8px">' + escapeHtml(tr('settings_allow_wall_hint')) + '</p>';
-    html += '<div style="margin-top:24px"><h2>' + tr('settings_blacklist') + '</h2>';
+    html += '</div>';
+
+    html += '<div class="settings-block"><h2>' + tr('settings_blacklist') + '</h2>';
     html += '<p class="settings-desc">' + escapeHtml(tr('settings_blacklist_hint')) + '</p>';
     html += '<div class="blacklist-add">';
     html += '<input type="text" id="blInput" placeholder="' + escapeHtml(tr('settings_blacklist_add_ph')) + '" autocomplete="off" />';
-    html += '<button class="btn-secondary" id="blAdd">' + tr('settings_blacklist_add') + '</button>';
+    html += '<button id="blAdd">' + tr('settings_blacklist_add') + '</button>';
     html += '</div>';
     if (bl.length) {
-      html += '<div class="blacklist-list">' + bl.map(function(n){
-        return '<div class="blacklist-item">'
-          + '<span class="bl-nick"><a href="/u/' + encodeURIComponent(n) + '" data-link>@' + escapeHtml(n) + '</a></span>'
-          + '<button data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button></div>';
-      }).join('') + '</div>';
+      html += bl.map(function(n){
+        return '<div class="blacklist-item"><span class="nick"><a href="/u/' + encodeURIComponent(n) + '" data-link>@' + escapeHtml(n) + '</a></span>'
+          + '<button class="rm" data-bl-remove="' + escapeHtml(n) + '">' + tr('delete') + '</button></div>';
+      }).join('');
     } else {
-      html += '<div class="empty" style="padding:14px 0;text-align:left">' + escapeHtml(tr('settings_blacklist_empty')) + '</div>';
+      html += '<p class="settings-desc" style="text-align:center;padding:14px 0">' + escapeHtml(tr('settings_blacklist_empty')) + '</p>';
     }
-    html += '</div>';
   } else {
     html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
   }
   html += '</div>';
 
-  html += '<div class="settings-section" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
-  html += '<div style="margin-bottom:18px"><div style="font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">' + tr('settings_theme') + '</div><div class="opt-row">';
-  html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
+  html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
+  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:8px">' + tr('settings_theme') + '</div>';
+  html += '<div class="opt-row">';
   html += '<button class="opt' + (theme==='dark'?' active':'') + '" data-set-theme="dark">' + tr('theme_dark') + '</button>';
-  html += '</div></div>';
-  html += '<div><div style="font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">' + tr('settings_lang') + '</div><div class="opt-row">';
+  html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
+  html += '</div>';
+  html += '<div style="font-size:13px;color:var(--muted);margin-bottom:8px">' + tr('settings_lang') + '</div>';
+  html += '<div class="opt-row" style="margin-bottom:0">';
   html += '<button class="opt' + (LANG==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
   html += '<button class="opt' + (LANG==='en'?' active':'') + '" data-set-lang="en">English</button>';
-  html += '</div></div></div>';
+  html += '</div></div>';
 
-  html += '<div class="settings-section" id="section-info"><h2>' + tr('settings_info') + '</h2>';
+  html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 14px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
-  html += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">' + tr('settings_authors') + '</div>';
-  html += '<div class="settings-authors">SldShr, DeepSeek</div></div>';
+  html += '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px;font-weight:700">' + tr('settings_authors') + '</div>';
+  html += '<div style="font-size:15px">SldShr, DeepSeek</div></div>';
 
   html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
 
   function applySectionVisibility() {
-    var isMobile = window.matchMedia('(max-width: 767px)').matches;
-    var sections = el.querySelectorAll('.settings-section');
+    var isMobile = window.matchMedia('(max-width: 900px)').matches;
+    var sections = el.querySelectorAll('.settings-block');
     if (isMobile) sections.forEach(function(s){ s.style.display = ''; });
     else sections.forEach(function(s){
       if (!s.id || !s.id.startsWith('section-')) return;
@@ -3865,15 +4108,14 @@ function renderSettingsView(el) {
   el.querySelectorAll('.settings-nav-btn').forEach(function(b){
     b.addEventListener('click', function(){
       state.settingsSection = b.dataset.section;
-      var isMobile = window.matchMedia('(max-width: 767px)').matches;
+      var isMobile = window.matchMedia('(max-width: 900px)').matches;
       if (isMobile) {
         var target = document.getElementById('section-' + state.settingsSection);
         if (target) {
-          var header = el.querySelector('.main-header');
-          var navEl = el.querySelector('.settings-nav');
-          var offset = (header ? header.offsetHeight : 0) + (navEl ? navEl.offsetHeight : 0);
           var bodyEl = el.querySelector('.main-body');
-          if (bodyEl && target) bodyEl.scrollTo({ top: target.offsetTop - offset - 8, behavior: 'smooth' });
+          var hdr = el.querySelector('.main-header');
+          var offset = (hdr ? hdr.offsetHeight : 0);
+          if (bodyEl) bodyEl.scrollTo({ top: target.offsetTop - offset - 60, behavior: 'smooth' });
         }
       }
       applySectionVisibility();
@@ -3933,27 +4175,20 @@ function renderSettingsView(el) {
 }
 
 function renderPolicyView(el) {
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/settings" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('policy_title') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
+  var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
+    + '<div class="title">' + tr('policy_title') + '</div>'
+    + '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button></div>';
   html += '<div class="main-body"><div class="policy"><h1>' + tr('policy_title') + '</h1><p>' + escapeHtml(tr('policy_content')) + '</p></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el);
+  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
 }
 
+// ============ AUTH ============
 function renderRegisterView(el) {
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('reg_title') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div class="auth-wrap">';
-  html += '<h1 class="auth-title">' + tr('reg_title') + '</h1>';
-  html += '<form class="auth-form" id="regForm">';
+  var html = '<div class="main-body"><div class="auth-page"><div class="auth-card">';
+  html += '<h1>' + tr('reg_title') + '</h1>';
+  html += '<form id="regForm">';
   html += '<input type="text" name="name" placeholder="' + escapeHtml(tr('name_ph')) + '" maxlength="50" required />';
   html += '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" maxlength="20" required />';
   html += '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required />';
@@ -3962,9 +4197,8 @@ function renderRegisterView(el) {
   html += '<button type="submit">' + tr('reg_btn') + '</button>';
   html += '</form>';
   html += '<div class="auth-switch"><a id="toLogin">' + tr('to_login') + '</a></div>';
-  html += '</div></div>';
+  html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
   document.getElementById('toLogin').addEventListener('click', function(){ navigate('/login'); });
   var form = document.getElementById('regForm');
   var errEl = document.getElementById('regError');
@@ -3980,24 +4214,17 @@ function renderRegisterView(el) {
 }
 
 function renderLoginView(el) {
-  var html = '';
-  html += '<header class="main-header">';
-  html += '<a href="/" class="icon-btn" data-link>' + ICONS.back + '</a>';
-  html += '<div class="title">' + tr('log_title') + '</div>';
-  html += '<button class="icon-btn" id="mainThemeBtn">' + ICONS.moon + '</button>';
-  html += '</header>';
-  html += '<div class="main-body"><div class="auth-wrap">';
-  html += '<h1 class="auth-title">' + tr('log_title') + '</h1>';
-  html += '<form class="auth-form" id="logForm">';
+  var html = '<div class="main-body"><div class="auth-page"><div class="auth-card">';
+  html += '<h1>' + tr('log_title') + '</h1>';
+  html += '<form id="logForm">';
   html += '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required />';
   html += '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required />';
   html += '<div class="auth-error" id="logError"></div>';
   html += '<button type="submit">' + tr('log_btn') + '</button>';
   html += '</form>';
   html += '<div class="auth-switch"><a id="toReg">' + tr('to_reg') + '</a></div>';
-  html += '</div></div>';
+  html += '</div></div></div>';
   el.innerHTML = html;
-  attachThemeBtn(); bindLinks(el);
   document.getElementById('toReg').addEventListener('click', function(){ navigate('/register'); });
   var form = document.getElementById('logForm');
   var errEl = document.getElementById('logError');
@@ -4009,12 +4236,17 @@ function renderLoginView(el) {
   });
 }
 
+function bindThemeBtn() {
+  var b = document.getElementById('mainThemeBtn');
+  if (b) b.addEventListener('click', toggleTheme);
+}
+
 // ============ POST RENDER ============
 function renderPostHtml(p, showComments) {
   var score = p.upvotes - p.downvotes;
   var upCls = p.user_vote === 1 ? 'active' : '';
   var downCls = p.user_vote === -1 ? 'active' : '';
-  var scCls = scoreClass(p.upvotes, p.downvotes);
+  var scCls = score > 0 ? 'pos' : (score < 0 ? 'neg' : '');
   var displayText = p.text, truncated = false;
   if (!showComments) {
     var res = truncateText(p.text);
@@ -4024,48 +4256,59 @@ function renderPostHtml(p, showComments) {
   var readMore = truncated
     ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>'
     : '';
-  var authorLink = p.author
-    ? '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>'
-    : '';
-  var wallHint = '';
-  if (p.wall_owner) {
-    wallHint = '<span class="post-wall-hint">' + tr('wall_owner_prefix') + ' <a href="/u/' + encodeURIComponent(p.wall_owner) + '" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
-  }
   var isMine = state.user && p.author === state.user.nick;
   var isWallOwner = state.user && p.wall_owner === state.user.nick;
 
-  var commentBtn = '<button class="action-btn" data-action="open-post" data-post-id="' + p.id + '">'
-    + ICONS.comment + '<span class="action-label">' + tr('reply') + '</span></button>';
-  var copyBtn = '<button class="action-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">'
-    + ICONS.copy + '</button>';
-  var translateBtn = '<button class="action-btn" data-action="translate" data-post-id="' + p.id + '" title="' + escapeHtml(tr('translate')) + '">'
-    + ICONS.translate + '</button>';
+  var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
+  var wallHint = '';
+  if (p.wall_owner) {
+    wallHint = '<span class="post-wall-hint">→ <a href="/u/' + encodeURIComponent(p.wall_owner) + '" data-link>@' + escapeHtml(p.wall_owner) + '</a></span>';
+  }
+
+  // quoted
+  var quotedHtml = '';
+  if (p.quoted) {
+    var qHtml = linkifyMentions(escapeHtml(p.quoted.text || ''));
+    quotedHtml = '<div class="quoted-post" data-action="open-post" data-post-id="' + p.quoted.id + '">'
+      + '<div class="q-author">@' + escapeHtml(p.quoted.author || '?') + '</div>'
+      + '<div class="q-text">' + qHtml + '</div>'
+      + '</div>';
+  }
+
   var editBtn = isMine
-    ? '<button class="action-btn" data-action="edit-post" data-post-id="' + p.id + '">' + ICONS.edit + '</button>'
+    ? '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '">' + ICONS.edit + '</button>'
     : '';
   var delBtn = (isMine || isWallOwner)
-    ? '<button class="action-btn danger" data-action="delete-post" data-post-id="' + p.id + '">' + ICONS.trash + '</button>'
+    ? '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '">' + ICONS.trash + '</button>'
     : '';
 
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
     commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id, p.wall_owner) + '</div>';
   }
-  var translatedHtml = '';
-  if (state.translatedPosts[p.id]) {
-    translatedHtml = '<div class="post-translated">' + escapeHtml(tr('translate')) + ': ' + escapeHtml(state.translatedPosts[p.id]) + '</div>';
-  }
+  var viewsHtml = '';
+  if (p.views) viewsHtml = '<span style="color:var(--muted);font-size:13px;margin-left:auto;display:inline-flex;align-items:center;gap:5px">' + ICONS.eye + p.views + '</span>';
+
   return ''
-    + '<div class="post" data-post-id="' + p.id + '">'
-    +   '<div class="post-meta">' + authorLink + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
-    +   '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>'
+    + '<div class="post-card" data-post-id="' + p.id + '">'
+    +   '<div class="post-header">'
+    +     avatarHtml(null, p.author, false)
+    +     '<div class="meta">'
+    +       '<div class="who">' + authorHtml + wallHint + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
+    +     '</div>'
+    +   '</div>'
+    +   (displayText ? '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>' : '')
     +   readMore
-    +   translatedHtml
+    +   quotedHtml
     +   '<div class="post-actions">'
-    +     '<button class="vote-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '</button>'
-    +     '<span class="score ' + scCls + '">' + score + '</span>'
-    +     '<button class="vote-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
-    +     commentBtn + copyBtn + translateBtn + editBtn + delBtn
+    +     '<button class="act-btn up ' + upCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="1">' + ICONS.up + '<span class="num ' + (score>0?'pos':'') + '">' + score + '</span></button>'
+    +     '<button class="act-btn down ' + downCls + '" data-action="vote" data-post-id="' + p.id + '" data-dir="-1">' + ICONS.down + '</button>'
+    +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span class="num">' + (p.comments ? p.comments.length : 0) + '</span></button>'
+    +     '<button class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
+    +     '<button class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
+    +     '<button class="act-btn" data-action="translate" data-post-id="' + p.id + '" title="' + escapeHtml(tr('translate')) + '">' + ICONS.translate + '</button>'
+    +     editBtn + delBtn
+    +     viewsHtml
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -4087,51 +4330,41 @@ function renderCommentHtml(c, postAuthor, postId, isReply, wallOwner) {
   var score = c.upvotes - c.downvotes;
   var upCls = c.user_vote === 1 ? 'active' : '';
   var downCls = c.user_vote === -1 ? 'active' : '';
-  var scCls = scoreClass(c.upvotes, c.downvotes);
   var isAuthor = postAuthor && c.author === postAuthor;
   var isMine = state.user && c.author === state.user.nick;
   var isWallOwner = state.user && wallOwner === state.user.nick;
   var cls = 'comment' + (isReply ? ' reply' : '') + (isAuthor ? ' is-author' : '');
-  var authorHtml = c.author
-    ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>'
-    : '';
+  var authorHtml = c.author ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>' : '';
   var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
   var replyBtn = '';
   if (!isReply && state.user) {
-    replyBtn = '<button class="comment-reply-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
+    replyBtn = '<button class="act-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
   }
-  var editBtn = isMine
-    ? '<button class="comment-edit-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>'
-    : '';
-  var delBtn = (isMine || isWallOwner)
-    ? '<button class="comment-edit-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>'
-    : '';
+  var editBtn = isMine ? '<button class="act-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>' : '';
+  var delBtn = (isMine || isWallOwner) ? '<button class="act-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>' : '';
   var bodyHtml = linkifyMentions(escapeHtml(c.text));
   return ''
     + '<div class="' + cls + '" data-comment-id="' + c.id + '">'
-    +   '<div class="comment-meta">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
+    +   '<div class="comment-head">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
     +   '<div class="comment-text" data-raw="' + escapeHtml(c.text) + '">' + bodyHtml + '</div>'
     +   '<div class="comment-actions">'
-    +     '<button class="vote-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICONS.up + '</button>'
-    +     '<span class="score ' + scCls + '">' + score + '</span>'
-    +     '<button class="vote-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICONS.down + '</button>'
+    +     '<button class="act-btn up ' + upCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="1">' + ICONS.up + '<span class="num">' + score + '</span></button>'
+    +     '<button class="act-btn down ' + downCls + '" data-action="vote-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-dir="-1">' + ICONS.down + '</button>'
     +     replyBtn + editBtn + delBtn
     +   '</div>'
     + '</div>';
 }
 
-function applyTranslations(root) {
-  // Ничего не делаем — переводы вставляются в HTML сразу
-}
-
 function applyVoteUI(targetBtn, dir) {
-  var row = targetBtn.closest('.post-actions, .comment-actions');
-  if (!row) return null;
-  var upBtn = row.querySelector('.vote-btn.up');
-  var downBtn = row.querySelector('.vote-btn.down');
-  var scoreEl = row.querySelector('.score');
-  if (!upBtn || !downBtn || !scoreEl) return null;
-  var oldScore = parseInt(scoreEl.textContent, 10) || 0;
+  var card = targetBtn.closest('.post-card, .comment');
+  if (!card) return null;
+  var container = targetBtn.parentElement;
+  var upBtn = container.querySelector('.act-btn.up');
+  var downBtn = container.querySelector('.act-btn.down');
+  if (!upBtn || !downBtn) return null;
+  var numEl = upBtn.querySelector('.num');
+  if (!numEl) return null;
+  var oldScore = parseInt(numEl.textContent, 10) || 0;
   var wasUp = upBtn.classList.contains('active');
   var wasDown = downBtn.classList.contains('active');
   var newUp = wasUp, newDown = wasDown, newScore = oldScore;
@@ -4144,20 +4377,20 @@ function applyVoteUI(targetBtn, dir) {
     else if (wasUp) { newDown = true; newUp = false; newScore = oldScore - 2; }
     else { newDown = true; newScore = oldScore - 1; }
   }
-  scoreEl.textContent = newScore;
-  scoreEl.classList.remove('up','down');
-  if (newScore > 0) scoreEl.classList.add('up');
-  else if (newScore < 0) scoreEl.classList.add('down');
+  numEl.textContent = newScore;
+  numEl.classList.remove('pos','neg');
+  if (newScore > 0) numEl.classList.add('pos');
+  else if (newScore < 0) numEl.classList.add('neg');
   upBtn.classList.toggle('active', newUp);
   downBtn.classList.toggle('active', newDown);
-  return { upBtn: upBtn, downBtn: downBtn, scoreEl: scoreEl, oldScore: oldScore, wasUp: wasUp, wasDown: wasDown };
+  return { numEl: numEl, oldScore: oldScore, upBtn: upBtn, downBtn: downBtn, wasUp: wasUp, wasDown: wasDown };
 }
 function revertVote(snap) {
   if (!snap) return;
-  snap.scoreEl.textContent = snap.oldScore;
-  snap.scoreEl.classList.remove('up','down');
-  if (snap.oldScore > 0) snap.scoreEl.classList.add('up');
-  else if (snap.oldScore < 0) snap.scoreEl.classList.add('down');
+  snap.numEl.textContent = snap.oldScore;
+  snap.numEl.classList.remove('pos','neg');
+  if (snap.oldScore > 0) snap.numEl.classList.add('pos');
+  else if (snap.oldScore < 0) snap.numEl.classList.add('neg');
   snap.upBtn.classList.toggle('active', snap.wasUp);
   snap.downBtn.classList.toggle('active', snap.wasDown);
 }
@@ -4174,19 +4407,14 @@ function startInlineEdit(container, textEl, initialText, onSave) {
   var ta = editor.querySelector('textarea');
   ta.value = initialText; ta.focus();
   try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch(e) {}
-  var cancelBtn = editor.querySelector('.edit-cancel');
-  var saveBtn = editor.querySelector('.edit-save');
-  function close() {
-    if (editor.parentNode) editor.parentNode.removeChild(editor);
-    textEl.style.display = '';
-  }
-  cancelBtn.addEventListener('click', close);
-  saveBtn.addEventListener('click', async function(){
+  function close() { if (editor.parentNode) editor.parentNode.removeChild(editor); textEl.style.display = ''; }
+  editor.querySelector('.edit-cancel').addEventListener('click', close);
+  editor.querySelector('.edit-save').addEventListener('click', async function(){
     var v = ta.value.trim();
     if (!v) return;
-    saveBtn.disabled = true;
+    var b = editor.querySelector('.edit-save'); b.disabled = true;
     try { await onSave(v); close(); }
-    catch(e) { alert(tr(e.message) || e.message); saveBtn.disabled = false; }
+    catch(e) { alert(tr(e.message) || e.message); b.disabled = false; }
   });
 }
 
@@ -4196,6 +4424,7 @@ function bindPostActions(root) {
     btn.dataset.bound = '1';
     btn.addEventListener('click', async function(e){
       e.preventDefault();
+      e.stopPropagation();
       var action = btn.dataset.action;
       var postId = btn.dataset.postId;
       var commentId = btn.dataset.commentId;
@@ -4217,18 +4446,38 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'open-post') { navigate('/p/' + postId); return; }
-      if (action === 'copy') { await copyPost(postId, btn); return; }
+      if (action === 'copy') { await copyPost(postId); return; }
       if (action === 'translate') { await translatePost(postId, btn); return; }
+      if (action === 'quote') {
+        if (!state.user) { navigate('/login'); return; }
+        try {
+          var p = await api('/api/posts/' + postId);
+          state.quotePostId = postId;
+          state.quotePreview = { author: p.author, text: p.text };
+          state.composerDraft = '';
+          if (state.view !== 'feed') { navigate('/'); return; }
+          // already in feed
+          var qb = document.getElementById('postQuoteBox');
+          if (qb) {
+            renderQuoteBox('post');
+            var inp = document.getElementById('postInput');
+            if (inp) { inp.value = ''; inp.focus(); }
+            var s = document.getElementById('postSend');
+            if (s) s.disabled = false;
+          }
+        } catch(e) { alert(tr(e.message) || e.message); }
+        return;
+      }
       if (action === 'reply') {
         state.replyTo = { id: commentId, author: btn.dataset.author || '' };
         if (state.view !== 'post') { navigate('/p/' + postId); return; }
         if (state._renderReplyBanner) state._renderReplyBanner();
-        var ta = document.getElementById('newComment');
+        var ta = document.getElementById('commentInput');
         if (ta) ta.focus();
         return;
       }
       if (action === 'edit-post') {
-        var postEl = btn.closest('.post');
+        var postEl = btn.closest('.post-card');
         var textEl = postEl.querySelector('.post-text');
         var raw = textEl.getAttribute('data-raw') || '';
         startInlineEdit(postEl, textEl, raw, async function(newText){
@@ -4271,62 +4520,42 @@ function bindPostActions(root) {
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
     a.dataset.linkBound = '1';
-    a.addEventListener('click', function(e){ e.preventDefault(); navigate(a.getAttribute('href')); });
+    a.addEventListener('click', function(e){ e.preventDefault(); e.stopPropagation(); navigate(a.getAttribute('href')); });
   });
 }
 
 async function refreshCurrentView() {
   if (state.view === 'feed') await loadFeed();
   else if (state.view === 'post') await loadPostView();
-  else if (state.view === 'profile') {
-    if (state.profileTab === 'wall') {
-      try {
-        var u = await api('/api/users/' + encodeURIComponent(state.viewData.nick));
-        var isMe = state.user && state.user.nick === u.nick;
-        await loadProfileTab(u, isMe);
-      } catch(e) {}
-    } else {
-      await loadProfile(state.viewData.nick);
-    }
-  }
+  else if (state.view === 'profile') await loadProfile(state.viewData.nick);
 }
 
-async function copyPost(postId, btn) {
+async function copyPost(postId) {
   try {
     var p = await api('/api/posts/' + postId);
     var txt = p.text || '';
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(txt);
-    } else {
+    if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(txt);
+    else {
       var ta = document.createElement('textarea');
       ta.value = txt; ta.style.position='fixed'; ta.style.opacity='0';
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); document.body.removeChild(ta);
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
     }
-    var old = btn.innerHTML;
-    btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>';
-    setTimeout(function(){ btn.innerHTML = old; }, 1200);
   } catch(e) {}
 }
-
 async function translatePost(postId, btn) {
   try {
     var p = await api('/api/posts/' + postId);
     var dst = LANG || 'en';
     var r = await api('/api/translate', { method: 'POST', body: { text: p.text, to: dst } });
-    if (r.translated) {
-      state.translatedPosts[postId] = r.text;
-    } else {
-      state.translatedPosts[postId] = p.text;
-    }
-    var postEl = btn.closest('.post');
-    var old = postEl.querySelector('.post-translated');
+    var card = btn.closest('.post-card');
+    var old = card.querySelector('.quoted-post.translated');
     if (old) old.remove();
     var div = document.createElement('div');
-    div.className = 'post-translated';
-    div.textContent = (r.translated ? tr('translate') : tr('translate_show_original')) + ': ' + state.translatedPosts[postId];
-    var textEl = postEl.querySelector('.post-text');
-    if (textEl) textEl.parentNode.insertBefore(div, textEl.nextSibling);
+    div.className = 'quoted-post translated';
+    div.innerHTML = '<div class="q-author">' + escapeHtml(tr('translate')) + (r.translated ? '' : ' · ' + tr('translate_show_original')) + '</div>'
+      + '<div class="q-text">' + escapeHtml(r.text) + '</div>';
+    var text = card.querySelector('.post-text');
+    if (text) text.parentNode.insertBefore(div, text.nextSibling);
   } catch(e) { alert(tr('translate_failed')); }
 }
 
@@ -4378,15 +4607,18 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_BACK__", json.dumps(I_BACK))
           .replace("__I_SEARCH__", json.dumps(I_SEARCH))
           .replace("__I_MOON__", json.dumps(I_MOON))
-          .replace("__I_SUN__", json.dumps(I_SUN)))
+          .replace("__I_SUN__", json.dumps(I_SUN))
+          .replace("__I_QUOTE__", json.dumps(I_QUOTE))
+          .replace("__I_EYE__", json.dumps(I_EYE))
+          .replace("__I_CAL__", json.dumps(I_CAL)))
     return ('<!DOCTYPE html>\n'
-        f'<html lang="{lang}" data-theme="light">\n'
+        f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
         '<meta charset="utf-8" />\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />\n'
-        '<meta name="color-scheme" content="light dark" />\n'
+        '<meta name="color-scheme" content="dark light" />\n'
         f'<link rel="icon" type="image/svg+xml" href="{FAVICON}" />\n'
-        '<title>sldChat</title>\n'
+        '<title>ИТД</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
         '<body>\n'
