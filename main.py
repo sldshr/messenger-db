@@ -1,18 +1,23 @@
 # main.py
 # pip install fastapi uvicorn
+# Переменные окружения: SUPABASE_URL, SUPABASE_KEY (service_role)
 
 import base64
 import hashlib
 import html as html_module
 import ipaddress
 import json
+import os
 import re
 import secrets
 import struct
 import time
 import zlib
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Dict, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import (FastAPI, Header, HTTPException, Query, Request,
@@ -20,6 +25,58 @@ from fastapi import (FastAPI, Header, HTTPException, Query, Request,
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+
+# ============================================================
+#                    SUPABASE
+# ============================================================
+
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or ""
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _sb_sync(method: str, path: str,
+             json_data=None, params=None, prefer=None):
+    """Синхронный вызов Supabase REST API. Возвращает dict/list или None."""
+    if not SUPABASE_ENABLED:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    if params:
+        url += "?" + urlencode(params)
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    body = json.dumps(json_data).encode("utf-8") if json_data is not None else None
+    req = UrlRequest(url, data=body, method=method, headers=headers)
+    try:
+        with urlopen(req, timeout=10) as r:
+            raw = r.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8"))
+    except HTTPError as e:
+        try:
+            err = e.read().decode("utf-8", errors="ignore")[:300]
+        except Exception:
+            err = ""
+        print(f"[supabase] {method} {path} -> {e.code}: {err}")
+        return None
+    except Exception as e:
+        print(f"[supabase] {method} {path} -> {e}")
+        return None
+
+
+async def sb(method: str, path: str,
+             json_data=None, params=None, prefer=None):
+    return await run_in_threadpool(
+        _sb_sync, method, path, json_data, params, prefer
+    )
+
 
 # ============================================================
 #                    ШИФРОВАНИЕ ЗАПРОСОВ
@@ -41,7 +98,7 @@ def dec_str(s: str) -> str:
 
 
 # ============================================================
-#                    ХРАНИЛИЩЕ (ОПЕРАТИВКА)
+#                    ХРАНИЛИЩЕ (ОПЕРАТИВКА + БД)
 # ============================================================
 
 USERS: Dict[str, dict] = {}
@@ -77,139 +134,142 @@ def normalize_avatar(avatar):
     ]
 
 
-# ============================================================
-#                    PNG-ГЕНЕРАТОР АВАТАРА
-# ============================================================
-
-def make_png(colors, scale: int = 32) -> bytes:
-    """Рендерит 8×8 палитру в PNG (RGB, без внешних зависимостей)."""
-    GRID = 8
-    W = H = GRID * scale
-    raw = bytearray()
-    for y in range(H):
-        raw.append(0)  # filter: none
-        gy = y // scale
-        row_base = gy * GRID
-        for x in range(W):
-            gx = x // scale
-            c = colors[row_base + gx]
-            raw.append(int(c[1:3], 16))
-            raw.append(int(c[3:5], 16))
-            raw.append(int(c[5:7], 16))
-
-    def chunk(ctype: bytes, data: bytes) -> bytes:
-        body = ctype + data
-        return struct.pack(">I", len(data)) + body + \
-               struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-
-    sig = b"\x89PNG\r\n\x1a\n"
-    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    idat = chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    iend = chunk(b"IEND", b"")
-    return sig + ihdr + idat + iend
-
-
-# ============================================================
-#                    OPENGRAPH ПАРСЕР
-# ============================================================
-
-_OG_PATTERNS = [
-    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
-    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
-]
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-_WS_RE = re.compile(r"\s+")
-
-
-def is_safe_url(url: str) -> bool:
+def _parse_ts(s):
+    if isinstance(s, (int, float)):
+        return float(s)
+    if not s:
+        return time.time()
     try:
-        p = urlparse(url)
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
     except Exception:
-        return False
-    if p.scheme not in ("http", "https"):
-        return False
-    host = (p.hostname or "").strip()
-    if not host:
-        return False
-    if host.lower() in ("localhost", "localhost.localdomain"):
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return False
-    except ValueError:
-        pass
-    return True
+        return time.time()
 
 
-def fetch_og(url: str) -> dict:
-    if url in OG_CACHE:
-        return OG_CACHE[url]
-    try:
-        req = UrlRequest(url, headers={
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
-        })
-        with urlopen(req, timeout=6) as r:
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if "html" not in ct and "xml" not in ct:
-                out = {"error": "not_html"}
-                OG_CACHE[url] = out
-                return out
-            body = r.read(300_000)
-        text = body.decode("utf-8", errors="ignore")
-    except Exception as e:
-        out = {"error": str(e)[:120]}
-        OG_CACHE[url] = out
-        return out
+# ============================================================
+#                    DB HELPERS (write-through)
+# ============================================================
 
-    data: Dict[str, str] = {}
-    for pat in _OG_PATTERNS:
-        for m in pat.finditer(text):
-            key = m.group(1).lower()
-            if key not in data:
-                data[key] = m.group(2)
+async def db_save_user(nick: str):
+    u = USERS.get(nick)
+    if not u or not SUPABASE_ENABLED:
+        return
+    await sb("POST", "users",
+             json_data={
+                 "nick": u["nick"],
+                 "name": u["name"],
+                 "password": u["password"],
+                 "avatar": u["avatar"],
+             },
+             prefer="resolution=merge-duplicates,return=minimal")
 
-    # twitter fallback
-    if "og:title" not in data and "twitter:title" in data:
-        data["og:title"] = data["twitter:title"]
-    if "og:description" not in data and "twitter:description" in data:
-        data["og:description"] = data["twitter:description"]
-    if "og:image" not in data and "twitter:image" in data:
-        data["og:image"] = data["twitter:image"]
 
-    # <title> fallback
-    if "og:title" not in data:
-        tm = _TITLE_RE.search(text)
-        if tm:
-            data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
+async def db_add_contact(a: str, b: str):
+    if not SUPABASE_ENABLED:
+        return
+    await sb("POST", "contacts",
+             json_data={"user_nick": a, "contact_nick": b},
+             prefer="resolution=merge-duplicates,return=minimal")
 
-    image = (data.get("og:image") or "").strip()
-    if image and not image.startswith(("http://", "https://")):
-        image = urljoin(url, image)
 
-    out = {
-        "url": url,
-        "title": html_module.unescape((data.get("og:title") or "").strip())[:200],
-        "description": html_module.unescape((data.get("og:description") or "").strip())[:400],
-        "image": image[:1500],
-        "site_name": html_module.unescape((data.get("og:site_name") or "").strip())[:80],
-        "type": (data.get("og:type") or "").strip()[:40],
-    }
-    OG_CACHE[url] = out
-    return out
+async def db_del_contact(a: str, b: str):
+    if not SUPABASE_ENABLED:
+        return
+    await sb("DELETE", "contacts",
+             params={"user_nick": f"eq.{a}", "contact_nick": f"eq.{b}"})
+
+
+async def db_add_blacklist(a: str, b: str):
+    if not SUPABASE_ENABLED:
+        return
+    await sb("POST", "blacklist",
+             json_data={"user_nick": a, "blocked_nick": b},
+             prefer="resolution=merge-duplicates,return=minimal")
+
+
+async def db_del_blacklist(a: str, b: str):
+    if not SUPABASE_ENABLED:
+        return
+    await sb("DELETE", "blacklist",
+             params={"user_nick": f"eq.{a}", "blocked_nick": f"eq.{b}"})
+
+
+async def db_save_message(m: dict):
+    if not SUPABASE_ENABLED:
+        return
+    await sb("POST", "messages",
+             json_data={
+                 "id": m["id"],
+                 "sender": m["from"],
+                 "recipient": m["to"],
+                 "body": m["text"],
+             },
+             prefer="resolution=merge-duplicates,return=minimal")
+
+
+async def db_load_all():
+    if not SUPABASE_ENABLED:
+        print("[direct] Supabase не настроен — работаем полностью в оперативке")
+        return
+
+    print("[direct] Загрузка данных из Supabase...")
+
+    users = await sb("GET", "users", params={"select": "*"})
+    if users:
+        for u in users:
+            USERS[u["nick"]] = {
+                "name": u.get("name", u["nick"]),
+                "nick": u["nick"],
+                "password": u.get("password", ""),
+                "avatar": normalize_avatar(u.get("avatar")),
+                "contacts": set(),
+                "blacklist": set(),
+            }
+
+    contacts = await sb("GET", "contacts", params={"select": "*"})
+    if contacts:
+        for c in contacts:
+            a, b = c.get("user_nick"), c.get("contact_nick")
+            if a in USERS and b in USERS:
+                USERS[a]["contacts"].add(b)
+
+    bl = await sb("GET", "blacklist", params={"select": "*"})
+    if bl:
+        for b in bl:
+            a, c = b.get("user_nick"), b.get("blocked_nick")
+            if a in USERS and c in USERS:
+                USERS[a]["blacklist"].add(c)
+
+    msgs = await sb("GET", "messages",
+                    params={"select": "*", "order": "created_at.asc"})
+    if msgs:
+        for m in msgs:
+            sender = m.get("sender")
+            recipient = m.get("recipient")
+            if sender not in USERS or recipient not in USERS:
+                continue
+            k = chat_key(sender, recipient)
+            CHATS.setdefault(k, []).append({
+                "id": m.get("id"),
+                "from": sender,
+                "to": recipient,
+                "text": m.get("body", ""),
+                "ts": _parse_ts(m.get("created_at")),
+            })
+
+    print(f"[direct] Загружено: users={len(USERS)}, chats={len(CHATS)}")
 
 
 # ============================================================
 #                         FASTAPI
 # ============================================================
 
-app = FastAPI(title="Direct")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db_load_all()
+    yield
+
+
+app = FastAPI(title="Direct", lifespan=lifespan)
 
 
 class EncBody(BaseModel):
@@ -307,6 +367,8 @@ async def register(body: EncBody):
         "avatar": normalize_avatar(d.get("avatar")),
         "contacts": set(), "blacklist": set(),
     }
+    await db_save_user(nick)
+
     token = secrets.token_urlsafe(24)
     SESSIONS[token] = nick
     return {"ok": True, "token": token, "me": user_public(nick)}
@@ -349,7 +411,8 @@ async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
     if "avatar" in d:
         USERS[nick]["avatar"] = normalize_avatar(d.get("avatar"))
 
-    # оповестим контакты
+    await db_save_user(nick)
+
     payload = {"type": "contact_updated", "user": user_public(nick)}
     for c in list(USERS[nick]["contacts"]):
         if c in USERS:
@@ -398,6 +461,9 @@ async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
     USERS[nick]["contacts"].add(peer)
     USERS[peer]["contacts"].add(nick)
 
+    await db_add_contact(nick, peer)
+    await db_add_contact(peer, nick)
+
     await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
     await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
     return {"ok": True, "peer": user_public(peer)}
@@ -426,6 +492,8 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
         "ts": time.time(),
     }
     CHATS.setdefault(chat_key(nick, peer), []).append(msg)
+
+    await db_save_message(msg)
 
     await push_to(peer, {"type": "message", "msg": msg})
     await push_to(nick, {"type": "message", "msg": msg, "self": True})
@@ -458,6 +526,10 @@ async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
         raise HTTPException(400, "Некорректный пользователь")
     USERS[nick]["blacklist"].add(peer)
     USERS[nick]["contacts"].discard(peer)
+
+    await db_add_blacklist(nick, peer)
+    await db_del_contact(nick, peer)
+
     await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
@@ -468,13 +540,138 @@ async def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
     USERS[nick]["blacklist"].discard(peer)
+    await db_del_blacklist(nick, peer)
     await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
 
 
 # ============================================================
-#                       OPENGRAPH
+#                    PNG-ГЕНЕРАТОР АВАТАРА
 # ============================================================
+
+def make_png(colors, scale: int = 32) -> bytes:
+    GRID = 8
+    W = H = GRID * scale
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)
+        gy = y // scale
+        row_base = gy * GRID
+        for x in range(W):
+            gx = x // scale
+            c = colors[row_base + gx]
+            raw.append(int(c[1:3], 16))
+            raw.append(int(c[3:5], 16))
+            raw.append(int(c[5:7], 16))
+
+    def chunk(ctype: bytes, data: bytes) -> bytes:
+        body = ctype + data
+        return struct.pack(">I", len(data)) + body + \
+               struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    idat = chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    iend = chunk(b"IEND", b"")
+    return sig + ihdr + idat + iend
+
+
+# ============================================================
+#                    OPENGRAPH ПАРСЕР
+# ============================================================
+
+_OG_PATTERNS = [
+    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
+    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
+    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
+]
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_WS_RE = re.compile(r"\s+")
+
+
+def is_safe_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.hostname or "").strip()
+    if not host:
+        return False
+    if host.lower() in ("localhost", "localhost.localdomain"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False
+    except ValueError:
+        pass
+    return True
+
+
+def fetch_og(url: str) -> dict:
+    if url in OG_CACHE:
+        return OG_CACHE[url]
+    try:
+        req = UrlRequest(url, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
+        })
+        with urlopen(req, timeout=6) as r:
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "html" not in ct and "xml" not in ct:
+                out = {"error": "not_html"}
+                OG_CACHE[url] = out
+                return out
+            body = r.read(300_000)
+        text = body.decode("utf-8", errors="ignore")
+    except Exception as e:
+        out = {"error": str(e)[:120]}
+        OG_CACHE[url] = out
+        return out
+
+    data: Dict[str, str] = {}
+    for pat in _OG_PATTERNS:
+        for m in pat.finditer(text):
+            key = m.group(1).lower()
+            if key not in data:
+                data[key] = m.group(2)
+
+    if "og:title" not in data and "twitter:title" in data:
+        data["og:title"] = data["twitter:title"]
+    if "og:description" not in data and "twitter:description" in data:
+        data["og:description"] = data["twitter:description"]
+    if "og:image" not in data and "twitter:image" in data:
+        data["og:image"] = data["twitter:image"]
+
+    if "og:title" not in data:
+        tm = _TITLE_RE.search(text)
+        if tm:
+            data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
+
+    image = (data.get("og:image") or "").strip()
+    if image and not image.startswith(("http://", "https://")):
+        image = urljoin(url, image)
+    # защита от javascript:, data: и т.п.
+    if image and not image.startswith(("http://", "https://")):
+        image = ""
+
+    out = {
+        "url": url,
+        "title": html_module.unescape((data.get("og:title") or "").strip())[:200],
+        "description": html_module.unescape((data.get("og:description") or "").strip())[:400],
+        "image": image[:1500],
+        "site_name": html_module.unescape((data.get("og:site_name") or "").strip())[:80],
+        "type": (data.get("og:type") or "").strip()[:40],
+    }
+    OG_CACHE[url] = out
+    return out
+
 
 @app.post("/api/og")
 async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
@@ -547,7 +744,6 @@ body{background:var(--bg);color:var(--fg)}
   #app{position:fixed;top:0;left:0;right:0;height:100vh;height:100dvh}
 }
 
-/* ---------- SCREENS with fade ---------- */
 .screen{
   position:absolute;inset:0;
   display:flex;flex-direction:column;
@@ -556,7 +752,6 @@ body{background:var(--bg);color:var(--fg)}
 }
 .screen.active{opacity:1;visibility:visible;pointer-events:auto}
 
-/* ---------- LOADING ---------- */
 #screen-loading{align-items:center;justify-content:center;background:var(--bg)}
 .spinner{
   width:40px;height:40px;
@@ -568,7 +763,6 @@ body{background:var(--bg);color:var(--fg)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loading-label{margin-top:14px;color:var(--muted);font-size:14px;letter-spacing:.5px}
 
-/* ---------- AUTH ---------- */
 #screen-auth{flex-direction:column;align-items:center;overflow-y:auto}
 .auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%;
   width:100%;max-width:440px}
@@ -613,7 +807,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .icon-sm{width:18px;height:18px}
 #svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
 
-/* ---------- AVATAR EDITOR ---------- */
 .ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);
   padding:14px;border-radius:16px;border:1px solid var(--border)}
 .ava-editor canvas{width:220px;height:220px;border-radius:12px;background:#fff;
@@ -625,7 +818,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .ava-tools{display:flex;gap:8px;width:100%}
 .ava-tools .btn{flex:1}
 
-/* ---------- APP SHELL ---------- */
 #screen-app.active{flex-direction:row}
 .sidebar{display:flex;flex-direction:column;overflow:hidden;background:var(--sidebar);
   border-right:1px solid var(--border)}
@@ -638,19 +830,14 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
   #screen-app.chat-open .sidebar{display:none}
   #screen-app.chat-open .chat-pane{display:flex}
   .back-mobile{display:flex !important}
-  .fab{display:flex !important}
-  .search-inline{display:none}
 }
 @media (min-width: 900px){
   .sidebar{flex:0 0 340px;width:340px}
   .back-mobile{display:none !important}
-  .fab{display:none !important}
-  .search-inline{display:block}
 }
 
-/* ---------- TOPBAR ---------- */
 .topbar{
-  display:flex;align-items:center;gap:10px;padding:10px 12px;
+  display:flex;align-items:center;gap:8px;padding:10px 12px;
   background:var(--card);border-bottom:1px solid var(--border);
   padding-top:max(10px,env(safe-area-inset-top));
   flex-shrink:0;
@@ -667,8 +854,8 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .icon-btn:active{background:var(--border);transform:scale(.94)}
 .icon-btn:hover{background:var(--border)}
 .icon-btn.danger{color:var(--danger)}
+.icon-btn.accent{color:var(--accent)}
 
-/* ---------- CONTACTS ---------- */
 .list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
 .contact{
   display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
@@ -684,19 +871,8 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
   font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
   padding:0 6px;flex-shrink:0;animation:pop .25s ease;
 }
+@keyframes pop{from{transform:scale(.6);opacity:0}to{transform:scale(1);opacity:1}}
 .empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5}
-
-.fab{
-  position:absolute;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;
-  transform:translateX(-50%);
-  width:62px;height:62px;border-radius:50%;border:0;background:var(--accent);color:#fff;
-  cursor:pointer;box-shadow:0 8px 28px rgba(10,132,255,.45);
-  transition:transform .15s,box-shadow .15s;display:flex;align-items:center;justify-content:center;z-index:5;
-}
-.fab:active{transform:translateX(-50%) scale(.9)}
-.fab .icon{width:30px;height:30px}
-
-.search-inline{padding:10px 12px 4px;display:none}
 
 .empty-pane{
   display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;
@@ -709,7 +885,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden;min-width:0;animation:fadeIn .25s ease}
 .chat-content.hidden{display:none}
 
-/* ---------- MESSAGES ---------- */
 .messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px;
   scroll-behavior:smooth}
 .bubble{
@@ -725,7 +900,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
   cursor:pointer}
 .bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.25)}
 
-/* ---------- OG CARD ---------- */
 .og-card{
   display:block;margin-top:8px;padding:0;
   background:rgba(0,0,0,.06);
@@ -751,7 +925,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 .composer input{border-radius:20px}
 .composer .btn{border-radius:50%;width:46px;height:46px;padding:0;flex-shrink:0}
 
-/* ---------- MODALS ---------- */
 .overlay{
   position:absolute;inset:0;background:var(--overlay);display:flex;align-items:flex-end;
   justify-content:center;z-index:50;
@@ -794,7 +967,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
   color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
 .bl-item button .icon{width:16px;height:16px}
 
-/* ---------- TOAST ---------- */
 .toast{
   position:fixed;bottom:40px;left:50%;
   transform:translateX(-50%) translateY(20px);
@@ -859,13 +1031,11 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 
 <div id="app">
 
-  <!-- ============== LOADING ============== -->
   <div class="screen active" id="screen-loading">
     <div class="spinner"></div>
     <div class="loading-label">Direct</div>
   </div>
 
-  <!-- ============== AUTH ============== -->
   <div class="screen" id="screen-auth">
     <div class="auth-wrap">
       <h1 class="logo">Direct</h1>
@@ -901,7 +1071,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     </div>
   </div>
 
-  <!-- ============== APP ============== -->
   <div class="screen" id="screen-app">
 
     <aside class="sidebar">
@@ -911,23 +1080,15 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
           <div class="me-name" id="meName">—</div>
           <div class="me-nick" id="meNick">@—</div>
         </div>
-        <button class="icon-btn" onclick="openSettings()" aria-label="Settings">
+        <button class="icon-btn accent" onclick="openSearch()" aria-label="New chat" title="Найти друга">
+          <svg class="icon"><use href="#i-plus"/></svg>
+        </button>
+        <button class="icon-btn" onclick="openSettings()" aria-label="Settings" title="Настройки">
           <svg class="icon"><use href="#i-gear"/></svg>
         </button>
       </header>
 
-      <div class="search-inline">
-        <button class="btn primary full" onclick="openSearch()">
-          <svg class="icon icon-sm"><use href="#i-plus"/></svg>
-          <span data-i18n="new_chat">Новый чат</span>
-        </button>
-      </div>
-
       <div class="list" id="contactsList"></div>
-
-      <button class="fab" onclick="openSearch()" aria-label="New chat">
-        <svg class="icon"><use href="#i-plus"/></svg>
-      </button>
     </aside>
 
     <section class="chat-pane" id="chatPane">
@@ -965,7 +1126,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     </section>
   </div>
 
-  <!-- SEARCH MODAL -->
   <div class="overlay hidden" id="modal-search" onclick="backdropClose(event,'modal-search')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -987,7 +1147,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     </div>
   </div>
 
-  <!-- SETTINGS MODAL -->
   <div class="overlay hidden" id="modal-settings" onclick="backdropClose(event,'modal-settings')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -1034,7 +1193,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     </div>
   </div>
 
-  <!-- EDIT PROFILE MODAL -->
   <div class="overlay hidden" id="modal-edit" onclick="backdropClose(event,'modal-edit')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -1060,7 +1218,6 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
     </div>
   </div>
 
-  <!-- INFO MODAL -->
   <div class="overlay hidden" id="modal-info" onclick="backdropClose(event,'modal-info')">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head">
@@ -1081,18 +1238,13 @@ input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)
 </div>
 
 <script>
-/* ============================================================
-                        ЗАПРЕТ ПКМ
-   ============================================================ */
+/* ... JS без изменений из предыдущей версии ... */
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('selectstart', e => {
   if (e.target.closest('input,textarea')) return;
   e.preventDefault();
 });
 
-/* ============================================================
-                        ШИФРОВАНИЕ
-   ============================================================ */
 const XK = new TextEncoder().encode("DirectSecret2024");
 function xorBytes(bytes){
   const out = new Uint8Array(bytes.length);
@@ -1107,9 +1259,6 @@ function encStr(str){
   return btoa(bin);
 }
 
-/* ============================================================
-                          I18N
-   ============================================================ */
 const I18N = {
   ru: {
     login:"Вход", register:"Регистрация", create:"Создать аккаунт",
@@ -1153,9 +1302,6 @@ const I18N = {
 let LANG = localStorage.getItem('direct_lang') || 'ru';
 function t(k){ return (I18N[LANG] && I18N[LANG][k]) || k; }
 
-/* ============================================================
-                        STATE
-   ============================================================ */
 let token = localStorage.getItem('direct_token') || null;
 let me = null;
 let contacts = [];
@@ -1169,9 +1315,6 @@ const ogClientCache = {};
 const profileMatch = location.pathname.match(/^\/@([^/]+)$/);
 let pendingTarget = profileMatch ? decodeURIComponent(profileMatch[1]) : null;
 
-/* ============================================================
-                       API
-   ============================================================ */
 async function api(path, payload, method='POST'){
   const headers = {'Content-Type':'application/json'};
   if (token) headers['X-Token'] = token;
@@ -1188,25 +1331,15 @@ async function api(path, payload, method='POST'){
   return res.json();
 }
 
-/* ============================================================
-                     WebSocket
-   ============================================================ */
 function connectWS(){
   if (!token || ws) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   try {
     ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
   } catch(e){ ws = null; return; }
-
-  ws.onmessage = ev => {
-    try { handleWsEvent(JSON.parse(ev.data)); } catch(_){}
-  };
-  ws.onclose = () => {
-    ws = null;
-    if (token) setTimeout(connectWS, 1500);
-  };
+  ws.onmessage = ev => { try { handleWsEvent(JSON.parse(ev.data)); } catch(_){} };
+  ws.onclose = () => { ws = null; if (token) setTimeout(connectWS, 1500); };
   ws.onerror = () => { try { ws && ws.close(); } catch(_){} };
-
   clearInterval(window.__hb);
   window.__hb = setInterval(() => {
     try { if (ws && ws.readyState === 1) ws.send('ping'); } catch(_){}
@@ -1220,15 +1353,12 @@ function disconnectWS(){
 
 function handleWsEvent(ev){
   if (!ev || !ev.type) return;
-
   if (ev.type === 'message'){
     const m = ev.msg;
     const isMine = m.from === me?.nick;
-
     if (currentPeer && (m.from === currentPeer || m.to === currentPeer)){
       appendMessage(m);
     }
-
     if (!isMine){
       const isCurrentChat = currentPeer === m.from;
       const isFocused = document.hasFocus();
@@ -1237,9 +1367,7 @@ function handleWsEvent(ev){
         showDesktopNotification(m.from, m.text);
       }
       if (!isCurrentChat) addUnread(m.from);
-      if (!contacts.find(c => c.nick === m.from)){
-        refreshMe().catch(()=>{});
-      }
+      if (!contacts.find(c => c.nick === m.from)) refreshMe().catch(()=>{});
     }
   } else if (ev.type === 'contact_added'){
     refreshMe().catch(()=>{});
@@ -1257,9 +1385,6 @@ function handleWsEvent(ev){
   }
 }
 
-/* ============================================================
-                     ЗВУК / УВЕДОМЛЕНИЯ
-   ============================================================ */
 let audioCtx = null;
 function playBeep(){
   try {
@@ -1270,16 +1395,13 @@ function playBeep(){
       const o = audioCtx.createOscillator();
       const g = audioCtx.createGain();
       o.connect(g); g.connect(audioCtx.destination);
-      o.type = 'sine';
-      o.frequency.value = freq;
+      o.type = 'sine'; o.frequency.value = freq;
       g.gain.setValueAtTime(0.0001, now + start);
       g.gain.exponentialRampToValueAtTime(0.14, now + start + 0.02);
       g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
-      o.start(now + start);
-      o.stop(now + start + dur + 0.02);
+      o.start(now + start); o.stop(now + start + dur + 0.02);
     };
-    tone(880, 0, 0.12);
-    tone(1320, 0.09, 0.14);
+    tone(880, 0, 0.12); tone(1320, 0.09, 0.14);
   } catch(_){}
 }
 
@@ -1299,8 +1421,7 @@ function showDesktopNotification(fromNick, text){
   try {
     const n = new Notification(title, {
       body: text.length > 80 ? text.slice(0, 80) + '…' : text,
-      tag: 'direct-' + fromNick,
-      silent: true
+      tag: 'direct-' + fromNick, silent: true
     });
     n.onclick = () => { window.focus(); openChat(fromNick); };
   } catch(_){}
@@ -1308,24 +1429,16 @@ function showDesktopNotification(fromNick, text){
 
 function addUnread(nick){
   unread[nick] = (unread[nick] || 0) + 1;
-  renderContacts();
-  updateTitle();
+  renderContacts(); updateTitle();
 }
 function clearUnread(nick){
-  if (unread[nick]){
-    delete unread[nick];
-    renderContacts();
-    updateTitle();
-  }
+  if (unread[nick]){ delete unread[nick]; renderContacts(); updateTitle(); }
 }
 function updateTitle(){
   const total = Object.values(unread).reduce((a,b)=>a+b, 0);
   document.title = total > 0 ? `(${total}) Direct` : 'Direct';
 }
 
-/* ============================================================
-                       TOAST
-   ============================================================ */
 let toastEl = null;
 function toast(msg){
   if (toastEl) toastEl.remove();
@@ -1343,26 +1456,18 @@ function toast(msg){
 }
 
 async function copyText(txt){
-  try {
-    await navigator.clipboard.writeText(txt);
-    return true;
-  } catch(_){
+  try { await navigator.clipboard.writeText(txt); return true; }
+  catch(_){
     try {
       const ta = document.createElement('textarea');
-      ta.value = txt;
-      ta.style.position = 'fixed'; ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
+      ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
       return true;
     } catch(_){ return false; }
   }
 }
 
-/* ============================================================
-                     AVATAR (8x8) — редактор
-   ============================================================ */
 const PALETTE = [
   '#000000','#ffffff','#8e8e93','#c7c7cc',
   '#ff3b30','#ff9500','#ffcc00','#34c759',
@@ -1418,8 +1523,7 @@ function makeAvatarEditor(canvasEl, paletteEl){
   }
 
   canvasEl.addEventListener('pointerdown', e => {
-    e.preventDefault();
-    drawing = true;
+    e.preventDefault(); drawing = true;
     try { canvasEl.setPointerCapture(e.pointerId); } catch(_){}
     paintAt(e.clientX, e.clientY);
   });
@@ -1427,8 +1531,7 @@ function makeAvatarEditor(canvasEl, paletteEl){
   canvasEl.addEventListener('pointerup', () => drawing = false);
   canvasEl.addEventListener('pointercancel', () => drawing = false);
 
-  buildPalette();
-  render();
+  buildPalette(); render();
 
   return {
     getData: () => data.slice(),
@@ -1471,9 +1574,6 @@ function paintAva(canvas, data){
 
 let regEditor, editEditor;
 
-/* ============================================================
-                       UI
-   ============================================================ */
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -1488,9 +1588,6 @@ function openModal(id){ document.getElementById(id).classList.remove('hidden'); 
 function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
 function backdropClose(e, id){ if (e.target.id === id) closeModal(id); }
 
-/* ============================================================
-                       THEME / LANG
-   ============================================================ */
 function applyTheme(th){
   document.body.classList.toggle('dark', th === 'dark');
   localStorage.setItem('direct_theme', th);
@@ -1510,13 +1607,9 @@ function applyLang(l){
   });
   document.querySelectorAll('[data-lang]').forEach(b =>
     b.classList.toggle('active', b.dataset.lang === l));
-  renderContacts();
-  renderBlacklist();
+  renderContacts(); renderBlacklist();
 }
 
-/* ============================================================
-                       AUTH
-   ============================================================ */
 document.querySelectorAll('.tab').forEach(tab => {
   tab.onclick = () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -1571,40 +1664,29 @@ function logout(){
   localStorage.removeItem('direct_token');
   document.getElementById('li-nick').value = '';
   document.getElementById('li-pass').value = '';
-  closeModal('modal-settings');
-  closeModal('modal-edit');
-  closeChat(true);
-  updateTitle();
+  closeModal('modal-settings'); closeModal('modal-edit');
+  closeChat(true); updateTitle();
   showScreen('screen-auth');
 }
 
 async function handlePendingTarget(){
   if (!pendingTarget) return;
-  const target = pendingTarget;
-  pendingTarget = null;
+  const target = pendingTarget; pendingTarget = null;
   try { history.replaceState({}, '', '/'); } catch(_){}
   if (!me || target === me.nick) return;
   try {
     const r = await api('/api/search', { nick: target });
     await startChat(r.user.nick);
-  } catch(e){
-    toast(e.message || 'Не удалось открыть чат');
-  }
+  } catch(e){ toast(e.message || 'Не удалось открыть чат'); }
 }
 
-/* ============================================================
-                       ME / CONTACTS
-   ============================================================ */
 async function refreshMe(){
   const r = await api('/api/me', null, 'GET');
-  me = r.me;
-  contacts = r.contacts;
-  blacklist = r.blacklist;
+  me = r.me; contacts = r.contacts; blacklist = r.blacklist;
   paintAva(document.getElementById('meAva'), me.avatar);
   document.getElementById('meName').textContent = me.name;
   document.getElementById('meNick').textContent = '@' + me.nick;
-  renderContacts();
-  renderBlacklist();
+  renderContacts(); renderBlacklist();
 }
 
 function renderContacts(){
@@ -1647,9 +1729,6 @@ function renderContacts(){
   });
 }
 
-/* ============================================================
-                       SEARCH
-   ============================================================ */
 function openSearch(){
   document.getElementById('searchNick').value = '';
   document.getElementById('searchResult').innerHTML = '';
@@ -1685,15 +1764,11 @@ async function doSearch(){
     box.appendChild(card);
   } catch(e){
     const er = document.createElement('div');
-    er.className = 'err';
-    er.textContent = e.message;
+    er.className = 'err'; er.textContent = e.message;
     box.appendChild(er);
   }
 }
 
-/* ============================================================
-                       CHAT
-   ============================================================ */
 async function startChat(peerNick){
   try {
     await api('/api/chat/start', { nick: peerNick });
@@ -1702,21 +1777,18 @@ async function startChat(peerNick){
   } catch(e){ toast(e.message); }
 }
 
-function resetMessages(peer){
+function resetMessages(){
   document.getElementById('messages').innerHTML = '';
   renderedIds = new Set();
 }
 
 function linkifyInto(container, text){
   const re = /(https?:\/\/[^\s<>"']+)/g;
-  let last = 0;
-  let m;
+  let last = 0, m;
   while ((m = re.exec(text)) !== null){
     if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
     const a = document.createElement('a');
-    a.className = 'msg-link';
-    a.href = m[0];
-    a.textContent = m[0];
+    a.className = 'msg-link'; a.href = m[0]; a.textContent = m[0];
     a.onclick = async (e) => {
       e.preventDefault(); e.stopPropagation();
       const ok = await copyText(m[0]);
@@ -1759,12 +1831,10 @@ async function maybeRenderOg(bubbleEl, url){
     }
   }
   if (!data || data.error || !data.title) return;
-  // защита от повторного рендера
   if (bubbleEl.querySelector('.og-card')) return;
 
   const card = document.createElement('a');
-  card.className = 'og-card';
-  card.href = url;
+  card.className = 'og-card'; card.href = url;
   card.onclick = async (e) => {
     e.preventDefault(); e.stopPropagation();
     const ok = await copyText(url);
@@ -1773,9 +1843,7 @@ async function maybeRenderOg(bubbleEl, url){
 
   if (data.image){
     const img = document.createElement('img');
-    img.src = data.image;
-    img.loading = 'lazy';
-    img.alt = '';
+    img.src = data.image; img.loading = 'lazy'; img.alt = '';
     img.referrerPolicy = 'no-referrer';
     img.onerror = () => img.remove();
     card.appendChild(img);
@@ -1785,18 +1853,15 @@ async function maybeRenderOg(bubbleEl, url){
   body.className = 'og-body';
   if (data.site_name){
     const s = document.createElement('div');
-    s.className = 'og-site';
-    s.textContent = data.site_name;
+    s.className = 'og-site'; s.textContent = data.site_name;
     body.appendChild(s);
   }
   const ttl = document.createElement('div');
-  ttl.className = 'og-title';
-  ttl.textContent = data.title;
+  ttl.className = 'og-title'; ttl.textContent = data.title;
   body.appendChild(ttl);
   if (data.description){
     const d = document.createElement('div');
-    d.className = 'og-desc';
-    d.textContent = data.description;
+    d.className = 'og-desc'; d.textContent = data.description;
     body.appendChild(d);
   }
   card.appendChild(body);
@@ -1817,7 +1882,7 @@ async function openChat(peerNick){
     document.getElementById('peerName').textContent = r.peer.name;
     document.getElementById('peerNick').textContent = '@' + r.peer.nick;
 
-    resetMessages(peerNick);
+    resetMessages();
     r.messages.forEach(m => appendMessage(m, false));
     const box = document.getElementById('messages');
     box.scrollTop = box.scrollHeight;
@@ -1859,14 +1924,8 @@ function closeChat(silent){
   if (!silent) refreshMe().catch(()=>{});
 }
 
-function endChat(){
-  closeModal('modal-info');
-  closeChat();
-}
+function endChat(){ closeModal('modal-info'); closeChat(); }
 
-/* ============================================================
-                       INFO
-   ============================================================ */
 function openInfo(){
   if (!currentPeerData) return;
   paintAva(document.getElementById('infoAva'), currentPeerData.avatar);
@@ -1875,13 +1934,7 @@ function openInfo(){
   openModal('modal-info');
 }
 
-/* ============================================================
-                       SETTINGS
-   ============================================================ */
-function openSettings(){
-  renderBlacklist();
-  openModal('modal-settings');
-}
+function openSettings(){ renderBlacklist(); openModal('modal-settings'); }
 
 function openEditProfile(){
   if (!me) return;
@@ -1896,15 +1949,11 @@ async function saveProfile(){
   const name = document.getElementById('editName').value.trim();
   if (!name){ toast('Введите имя'); return; }
   try {
-    const r = await api('/api/profile/update', {
-      name,
-      avatar: editEditor.getData()
-    });
+    const r = await api('/api/profile/update', { name, avatar: editEditor.getData() });
     me = r.me;
     paintAva(document.getElementById('meAva'), me.avatar);
     document.getElementById('meName').textContent = me.name;
     document.getElementById('meNick').textContent = '@' + me.nick;
-    // обновим себя в списке контактов других — не нужно, они получат WS
     closeModal('modal-edit');
     toast(t('profile_updated'));
   } catch(e){ toast(e.message); }
@@ -1925,8 +1974,7 @@ function renderBlacklist(){
     e.className = 'muted';
     e.style.padding = '6px 2px';
     e.textContent = t('no_bl');
-    box.appendChild(e);
-    return;
+    box.appendChild(e); return;
   }
   blacklist.forEach(u => {
     const el = document.createElement('div');
@@ -1957,23 +2005,15 @@ async function blAdd(){
   const inp = document.getElementById('blNick');
   const nick = inp.value.trim();
   if (!nick) return;
-  try {
-    await api('/api/blacklist/add', { nick });
-    inp.value = '';
-    await refreshMe();
-  } catch(e){ toast(e.message); }
+  try { await api('/api/blacklist/add', { nick }); inp.value = ''; await refreshMe(); }
+  catch(e){ toast(e.message); }
 }
 
 async function blRemove(nick){
-  try {
-    await api('/api/blacklist/remove', { nick });
-    await refreshMe();
-  } catch(e){ toast(e.message); }
+  try { await api('/api/blacklist/remove', { nick }); await refreshMe(); }
+  catch(e){ toast(e.message); }
 }
 
-/* ============================================================
-                 KEYBOARD / VIEWPORT
-   ============================================================ */
 function updateViewport(){
   const vv = window.visualViewport;
   if (!vv){
@@ -1984,7 +2024,6 @@ function updateViewport(){
   document.documentElement.style.setProperty('--app-h', vv.height + 'px');
   document.documentElement.style.setProperty('--app-top', vv.offsetTop + 'px');
 }
-
 if (window.visualViewport){
   window.visualViewport.addEventListener('resize', updateViewport);
   window.visualViewport.addEventListener('scroll', updateViewport);
@@ -1992,7 +2031,6 @@ if (window.visualViewport){
 window.addEventListener('resize', updateViewport);
 window.addEventListener('orientationchange', () => setTimeout(updateViewport, 100));
 
-/* iOS/Android: инпут не должен "убегать" — фиксируем позицию после фокуса */
 function pinViewportAfterFocus(){
   setTimeout(() => {
     try { window.scrollTo(0, 0); } catch(_){}
@@ -2002,9 +2040,6 @@ function pinViewportAfterFocus(){
   }, 80);
 }
 
-/* ============================================================
-                       INIT / BOOT
-   ============================================================ */
 function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function boot(){
@@ -2019,8 +2054,7 @@ async function boot(){
       paintAva(document.getElementById('meAva'), me.avatar);
       document.getElementById('meName').textContent = me.name;
       document.getElementById('meNick').textContent = '@' + me.nick;
-      renderContacts();
-      renderBlacklist();
+      renderContacts(); renderBlacklist();
       const wait = MIN - (Date.now() - t0);
       if (wait > 0) await delay(wait);
       showScreen('screen-app');
