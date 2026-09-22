@@ -1,6 +1,7 @@
 # main.py
-import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request, logging
+import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request, logging, ipaddress
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from typing import Dict, List, Optional, Tuple, Union
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
@@ -11,7 +12,10 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sld")
 
-app = FastAPI(title="SLD")
+START_TIME = time.time()
+VERSION = "1.2.0"
+
+app = FastAPI(title="SLD", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=800)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
@@ -29,7 +33,6 @@ USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
 POSTS_MEM: Dict[str, dict] = {}
 NOTIFS_MEM: Dict[str, List[dict]] = {}
-_VIEW_COOLDOWN: Dict[str, float] = {}
 _OG_CACHE: Dict[str, Optional[dict]] = {}
 _NICK_FAILS: Dict[str, List[float]] = {}
 
@@ -37,7 +40,6 @@ MAX_POST_LEN = 5000
 MAX_COMMENT_LEN = 1500
 MAX_BIO_LEN = 300
 FEED_LIMIT = 100
-VIEW_COOLDOWN_SEC = 8 * 3600
 TRUNCATE_LINES = 15
 TRUNCATE_CHARS = 800
 SESSION_TTL = 30 * 24 * 3600
@@ -45,17 +47,21 @@ MAX_SESSIONS_PER_USER = 10
 USER_CACHE_TTL = 60.0
 RATE_WINDOW = 60.0
 SSE_HEARTBEAT_SEC = 12
+MAX_BODY_BYTES = 1_000_000
 NICK_RE = re.compile(r"^[a-zA-Z0-9_]{3,20}$")
 MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
-RESERVED_NICKS = {"admin","root","system","moderator","mod","sld","слд","support","help","api","null","undefined","me","user","users","login","register","settings","policy","notifications","p","u"}
+RESERVED_NICKS = {"admin","root","system","moderator","mod","sld","слд","support","help","api","null","undefined","me","user","users","login","register","settings","policy","notifications","p","u","static","assets"}
 _lang_cache: Dict[str, str] = {}
 _geo_cache: Dict[str, dict] = {}
 _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
 DEFAULT_EMOJI = "😀"
+
+# Dummy hash for constant-time login (prevents user enumeration by timing)
+_DUMMY_HASH = None  # lazily computed at first request
 
 EMOJI_DATA: List[Tuple[str, str, str]] = [
     ("😀", "Улыбашка", "Grinning"),
@@ -242,6 +248,50 @@ EMOJI_DATA: List[Tuple[str, str, str]] = [
 EMOJIS = [e[0] for e in EMOJI_DATA]
 
 
+# ============ SECURITY MIDDLEWARE ============
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # 1. Ограничение размера тела запроса
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                return JSONResponse({"detail": "payload_too_large"}, status_code=413)
+        except ValueError:
+            return JSONResponse({"detail": "bad_request"}, status_code=400)
+
+    response = await call_next(request)
+
+    # 2. Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+    # 3. CSP для HTML-ответов
+    ct = response.headers.get("content-type", "")
+    if ct.startswith("text/html"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https: http:; "
+            "font-src 'self'; "
+            "connect-src 'self'; "
+            "media-src 'none'; "
+            "object-src 'none'; "
+            "frame-src 'none'; "
+            "worker-src 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'; "
+            "frame-ancestors 'none'"
+        )
+    return response
+
+
 class EventBus:
     def __init__(self):
         self.clients: Dict[str, List[asyncio.Queue]] = {}
@@ -281,8 +331,9 @@ MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 @app.on_event("startup")
 async def _startup():
-    global MAIN_LOOP
+    global MAIN_LOOP, _DUMMY_HASH
     MAIN_LOOP = asyncio.get_running_loop()
+    _DUMMY_HASH = hash_password("dummy_password_for_constant_time_check")
 
 
 def _run_sync(fn, *args):
@@ -303,7 +354,9 @@ def bus_broadcast(room: str, ev: dict, except_nick: Optional[str] = None) -> Non
     _run_sync(bus.broadcast_room, room, ev, except_nick)
 
 
-def broadcast_post_change(post: dict, except_nick: Optional[str] = None) -> None:
+def broadcast_post_change(post: dict, except_nick: Optional[str] = None, feed: bool = False) -> None:
+    """Рассылка изменений поста по релевантным комнатам.
+    feed=True — только при создании нового поста (в остальных случаях лента не перезагружается)."""
     if not post: return
     pid = post.get("id")
     if pid:
@@ -311,16 +364,58 @@ def broadcast_post_change(post: dict, except_nick: Optional[str] = None) -> None
     author = post.get("author")
     if author:
         bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=except_nick)
-    bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
+    if feed:
+        bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
 
 
-def broadcast_view_update(pid: str, author: str, views: int) -> None:
-    ev = {"type": "view_update", "post_id": pid, "views": views}
-    bus_broadcast("post:" + pid, ev)
-    bus_broadcast("feed", ev)
-    if author: bus_broadcast("profile:" + author, ev)
+# ============ SECURITY UTILS ============
+def _is_private_host(host: str) -> bool:
+    """True, если хост — приватный/локальный/метадата (для защиты от SSRF)."""
+    if not host: return True
+    h = host.strip().lower().strip("[]")  # IPv6 в скобках
+    # Общие имена локальных хостов
+    if h in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
+        return True
+    if h.endswith(".local") or h.endswith(".internal") or h.endswith(".lan"):
+        return True
+    # Метадата-эндпоинты облаков
+    if h in ("metadata.google.internal", "metadata.google.com", "metadata"):
+        return True
+    # IP-адреса
+    try:
+        ip = ipaddress.ip_address(h)
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+        # link-local 169.254.0.0/16 уже покрывается is_link_local, но проверим явно
+        if str(ip).startswith("169.254."):
+            return True
+        return False
+    except ValueError:
+        return False
 
 
+def _safe_url(u) -> str:
+    """Проверка URL: только http/https, без javascript:, без локальных хостов."""
+    if not u or not isinstance(u, str):
+        return ""
+    u = u.strip()
+    if not u or len(u) > 500:
+        return ""
+    try:
+        p = urlparse(u)
+    except Exception:
+        return ""
+    if p.scheme not in ("http", "https"):
+        return ""
+    if not p.netloc:
+        return ""
+    if _is_private_host(p.hostname or ""):
+        return ""
+    return u
+
+
+# ============ CORE ============
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     iters = 100_000
@@ -342,8 +437,21 @@ def check_password(password: str, stored: str) -> bool:
         return False
 
 
+def check_password_constant_time(password: str, stored: Optional[str]) -> bool:
+    """Проверка пароля с постоянным временем ответа — защита от enumeration по таймингу."""
+    global _DUMMY_HASH
+    if not stored:
+        # Пользователя нет — всё равно считаем dummy-хеш
+        if _DUMMY_HASH is None:
+            _DUMMY_HASH = hash_password("dummy_password_for_constant_time_check")
+        check_password(password, _DUMMY_HASH)
+        return False
+    return check_password(password, stored)
+
+
 def validate_password(pw: str) -> str:
     if len(pw) < 8: return "err_short_pass"
+    if len(pw) > 200: return "err_short_pass"
     if not re.search(r"[A-Za-z]", pw): return "err_pass_weak"
     if not re.search(r"\d", pw): return "err_pass_weak"
     return ""
@@ -431,13 +539,25 @@ def detect_device(ua: str) -> str:
 
 def fetch_og_data(url: str) -> Optional[dict]:
     if not url: return None
+    # SSRF protection — до кэша, чтобы не закэшировать "плохой" URL
+    safe = _safe_url(url)
+    if not safe:
+        return None
+    url = safe
     if url in _OG_CACHE: return _OG_CACHE[url]
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (compatible; SLDbot/1.0)",
             "Accept": "text/html,application/xhtml+xml",
         })
-        with urllib.request.urlopen(req, timeout=4) as r:
+        # Ручной редирект-хендлер, чтобы редирект не увёл на приватный IP
+        class _NoPrivateRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                if not _safe_url(newurl):
+                    return None
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        opener = urllib.request.build_opener(_NoPrivateRedirect())
+        with opener.open(req, timeout=4) as r:
             raw = r.read(160000)
             html = raw.decode("utf-8", errors="ignore")
     except Exception:
@@ -455,10 +575,10 @@ def fetch_og_data(url: str) -> Optional[dict]:
         return ""
 
     data = {
-        "url": url,
+        "url": _safe_url(url),
         "title": (og("title") or "").strip()[:200],
         "description": (og("description") or "").strip()[:300],
-        "image": (og("image") or "").strip()[:500],
+        "image": _safe_url((og("image") or "").strip()[:500]),
         "site_name": (og("site_name") or "").strip()[:100],
     }
     if not data["title"]:
@@ -750,52 +870,6 @@ def db_get_post(pid: str) -> Optional[dict]:
         except Exception as e:
             log.error("db_get_post: %s", e); return None
     return POSTS_MEM.get(pid)
-
-
-def db_inc_views(pid: str) -> int:
-    if not supabase:
-        p = POSTS_MEM.get(pid)
-        if p:
-            p["views"] = (p.get("views") or 0) + 1
-            return p["views"]
-        return 0
-    try:
-        supabase.rpc("increment_post_views", {"p_id": pid}).execute()
-        r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
-        if r.data: return r.data[0].get("views") or 0
-    except Exception as e:
-        log.error("db_inc_views: %s", e)
-    return 0
-
-
-def view_should_count(pid: str, vid: str) -> bool:
-    key = pid + "|" + vid
-    now = time.time()
-    last = _VIEW_COOLDOWN.get(key, 0)
-    if now - last < VIEW_COOLDOWN_SEC: return False
-    if supabase:
-        try:
-            r = (supabase.table("post_views").select("last_viewed_at")
-                 .eq("post_id", pid).eq("viewer_id", vid).limit(1).execute())
-            if r.data:
-                last_ts = iso_to_ts(r.data[0].get("last_viewed_at"))
-                if now - last_ts < VIEW_COOLDOWN_SEC:
-                    _VIEW_COOLDOWN[key] = last_ts
-                    return False
-        except Exception as e:
-            log.error("view check: %s", e)
-    return True
-
-
-def view_mark_counted(pid: str, vid: str) -> None:
-    now = time.time()
-    _VIEW_COOLDOWN[pid + "|" + vid] = now
-    if supabase:
-        try:
-            supabase.table("post_views").upsert({
-                "post_id": pid, "viewer_id": vid,
-                "last_viewed_at": ts_to_iso(now)}).execute()
-        except Exception as e: log.error("view mark: %s", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
@@ -1154,14 +1228,26 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
 
 
 def normalize_og(raw):
+    """Парсит og_data и санитизирует URL (защита от javascript:, локальных хостов)."""
     if not raw: return None
-    if isinstance(raw, dict): return raw
-    if isinstance(raw, str):
+    v = None
+    if isinstance(raw, dict): v = raw
+    elif isinstance(raw, str):
         try:
-            v = json.loads(raw)
-            return v if isinstance(v, dict) else None
-        except Exception: return None
-    return None
+            val = json.loads(raw)
+            if isinstance(val, dict): v = val
+        except Exception:
+            return None
+    if not v: return None
+    url = _safe_url(v.get("url"))
+    if not url: return None
+    return {
+        "url": url,
+        "title": str(v.get("title") or "")[:200],
+        "description": str(v.get("description") or "")[:300],
+        "image": _safe_url(v.get("image")),
+        "site_name": str(v.get("site_name") or "")[:100],
+    }
 
 
 def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = True) -> List[dict]:
@@ -1227,7 +1313,6 @@ def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = Tru
         out.append({
             "id": p["id"], "text": p["text"], "created_at": p["created_at"],
             "author": p.get("author"),
-            "views": p.get("views") or 0,
             "og_data": normalize_og(p.get("og_data")),
             "device": p.get("device") or None,
             "author_name": author_u.get("name", p.get("author")),
@@ -1304,6 +1389,16 @@ def api_room(data: RoomIn, request: Request):
     return {"ok": True}
 
 
+@app.get("/api/uptime")
+def api_uptime(request: Request):
+    up = time.time() - START_TIME
+    return {
+        "uptime_seconds": int(up),
+        "started_at": ts_to_iso(START_TIME),
+        "version": VERSION,
+    }
+
+
 @app.post("/api/register")
 def api_register(data: RegisterIn, request: Request):
     ip = get_client_ip(request)
@@ -1337,7 +1432,9 @@ def api_login(data: LoginIn, request: Request):
     if not rate_limit("log:" + ip, 10, 300): raise HTTPException(429, "err_rate_limit")
     if not _nick_login_ok(nick): raise HTTPException(429, "err_rate_limit")
     u = db_load_user(nick)
-    if not u or not check_password(data.password, u["password"]):
+    stored = u["password"] if u else None
+    ok = check_password_constant_time(data.password, stored)
+    if not u or not ok:
         _nick_login_fail(nick)
         log.info("[login-fail] %s from %s", nick, ip)
         raise HTTPException(400, "err_bad_login")
@@ -1413,7 +1510,6 @@ def api_set_settings(data: SettingsIn, request: Request):
     if patch:
         db_update_user_fields(me["nick"], patch)
         bus_broadcast("profile:" + me["nick"], {"type": "refresh"})
-        bus_broadcast("feed", {"type": "refresh"})
     return {"ok": True}
 
 
@@ -1543,21 +1639,6 @@ def api_get(pid: str, request: Request):
     return build_posts_full([p], vid, with_comments=True)[0]
 
 
-@app.post("/api/posts/{pid}/view")
-def api_view_post(pid: str, request: Request):
-    p = db_get_post(pid)
-    if not p: raise HTTPException(404, "not found")
-    u = get_current_user(request)
-    if not u: return {"ok": True, "counted": False}
-    if p.get("author") == u["nick"]: return {"ok": True, "counted": False}
-    vid = "u:" + u["nick"]
-    if not view_should_count(pid, vid): return {"ok": True, "counted": False}
-    view_mark_counted(pid, vid)
-    new_views = db_inc_views(pid)
-    broadcast_view_update(pid, p.get("author"), new_views)
-    return {"ok": True, "counted": True, "views": new_views}
-
-
 @app.post("/api/posts")
 def api_create(payload: PostIn, request: Request):
     u = require_user(request)
@@ -1601,7 +1682,8 @@ def api_create(payload: PostIn, request: Request):
                                   "post_id": pid, "text": text[:140]})
     if notifications:
         db_notify_many(notifications)
-    broadcast_post_change(p)
+    # Только создание поста рассылает refresh в ленту
+    broadcast_post_change(p, feed=True)
     return build_posts_full([p], "u:" + u["nick"], with_comments=True)[0]
 
 
@@ -1617,7 +1699,8 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     db_update_post_text(pid, text)
     p["text"] = text
-    broadcast_post_change(p)
+    # Правка поста — не рассылаем в ленту, только в комнату поста и профиль автора
+    broadcast_post_change(p, feed=False)
     return {"ok": True, "text": text}
 
 
@@ -1654,7 +1737,7 @@ def api_like_post(pid: str, request: Request):
         likes = sum(1 for r in allv if r["direction"] == 1)
     except Exception:
         likes = 0
-    broadcast_post_change(p, except_nick=u["nick"])
+    broadcast_post_change(p, except_nick=u["nick"], feed=False)
     return {"ok": True, "likes": likes, "user_like": new}
 
 
@@ -1707,7 +1790,8 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     if notifications:
         db_notify_many(notifications, users_map=mention_users)
 
-    broadcast_post_change(post, except_nick=u["nick"])
+    # Комментарий — не рассылаем в ленту, только в комнату поста и профиль автора
+    broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {
         "ok": True,
         "post_id": pid,
@@ -1732,7 +1816,7 @@ def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Reques
     if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
     db_update_comment_text(cid, text)
     post = db_get_post(pid)
-    broadcast_post_change(post, except_nick=u["nick"])
+    broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {"ok": True, "text": text}
 
 
@@ -1745,7 +1829,7 @@ def api_delete_comment(pid: str, cid: str, request: Request):
     if c["author"] != u["nick"]: raise HTTPException(403, "forbidden")
     db_delete_comment(cid)
     post = db_get_post(pid)
-    broadcast_post_change(post, except_nick=u["nick"])
+    broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {"ok": True}
 
 
@@ -1767,7 +1851,7 @@ def api_like_comment(pid: str, cid: str, request: Request):
         likes = sum(1 for r in allv if r["direction"] == 1)
     except Exception:
         likes = 0
-    broadcast_post_change(p, except_nick=u["nick"])
+    broadcast_post_change(p, except_nick=u["nick"], feed=False)
     return {"ok": True, "likes": likes, "user_like": new}
 
 
@@ -1818,8 +1902,6 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
 
     async def gen():
         try:
-            # Устанавливаем быстрый retry для клиента и сразу шлём hello,
-            # чтобы прокси увидел ответ и не ругался на upstream connect.
             yield "retry: 2000\n\n"
             yield ": connected\n\n"
             yield f"data: {json.dumps({'type':'hello','nick':nick}, ensure_ascii=False)}\n\n"
@@ -1830,7 +1912,6 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
                     ev = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SEC)
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
-                    # Heartbeat — держит соединение живым через прокси
                     yield ": ping\n\n"
         except asyncio.CancelledError:
             pass
@@ -1913,7 +1994,7 @@ TEXTS = {
         "settings_account_desc": "Профиль, подписки, выход",
         "settings_privacy_desc": "Приватность и уведомления",
         "settings_appearance_desc": "Тема, язык, цвета, звук",
-        "settings_info_desc": "О сервисе, политика, устройство",
+        "settings_info_desc": "О сервисе, политика, устройство, аптайм",
         "settings_back": "Назад",
         "settings_theme": "Тема",
         "settings_lang": "Язык",
@@ -1929,6 +2010,9 @@ TEXTS = {
         "settings_device_browser": "Браузер",
         "settings_device_os": "Система",
         "settings_device_city": "Город",
+        "settings_server": "Сервер",
+        "settings_uptime": "Аптайм",
+        "settings_version": "Версия",
         "settings_policy": "Политика конфиденциальности",
         "settings_desc": "СЛД — минималистичная соцсеть: посты и комментарии.",
         "settings_authors": "Авторы",
@@ -1977,7 +2061,7 @@ TEXTS = {
             "## 2. Чего мы НЕ храним\n"
             "• Пароль в открытом виде — только криптографический хеш, восстановить который невозможно даже нам\n"
             "• Ваш IP-адрес (используется в момент запроса для определения города и языка, не сохраняется)\n"
-            "• Историю просмотров постов (только счётчик, обновляется не чаще раза в 8 часов на пользователя)\n"
+            "• Историю просмотров постов\n"
             "• Cookies третьих лиц, аналитику, трекеры, рекламные идентификаторы\n"
             "• Данные о вашем местоположении за пределами города\n"
             "• Список устройств и их характеристики\n\n"
@@ -1991,10 +2075,14 @@ TEXTS = {
             "## 4. Безопасность аккаунта\n"
             "• Пароль минимум 8 символов, обязательно с буквами и цифрами\n"
             "• Хеш pbkdf2-hmac-sha256, 100 000 итераций — не поддаётся перебору за разумное время\n"
+            "• Проверка пароля выполняется за постоянное время — нельзя определить, существует ли аккаунт, по задержке ответа\n"
             "• Сессии привязаны к случайному токену, максимум 10 активных сессий на аккаунт\n"
             "• Ограничение попыток входа по IP и нику защищает от подбора пароля\n"
             "• Все операции изменения данных проверяют владельца на сервере\n"
             "• Зарезервированные ники (admin, root, sld и др.) недоступны для регистрации\n"
+            "• Строгие заголовки безопасности: CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, HSTS и другие\n"
+            "• Защита от SSRF при загрузке превью ссылок — блокируются локальные и приватные адреса\n"
+            "• Ограничение размера тела запроса (1 МБ)\n"
             "• Никаких сторонних скриптов и внешних трекеров на сайте\n\n"
             "## 5. Где хранятся данные\n"
             "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером идёт по HTTPS. Мы не продаём и не передаём ваши данные третьим лицам. Резервные копии делаются автоматически и защищены теми же правилами.\n\n"
@@ -2114,7 +2202,7 @@ TEXTS = {
         "settings_account_desc": "Profile, subscriptions, sign out",
         "settings_privacy_desc": "Privacy and notifications",
         "settings_appearance_desc": "Theme, language, colors, sound",
-        "settings_info_desc": "About, policy, device",
+        "settings_info_desc": "About, policy, device, uptime",
         "settings_back": "Back",
         "settings_theme": "Theme",
         "settings_lang": "Language",
@@ -2130,6 +2218,9 @@ TEXTS = {
         "settings_device_browser": "Browser",
         "settings_device_os": "System",
         "settings_device_city": "City",
+        "settings_server": "Server",
+        "settings_uptime": "Uptime",
+        "settings_version": "Version",
         "settings_policy": "Privacy policy",
         "settings_desc": "SLD — minimalist social network: posts and comments.",
         "settings_authors": "Authors",
@@ -2178,7 +2269,7 @@ TEXTS = {
             "## 2. What we do NOT store\n"
             "• Your password in plain text — only a cryptographic hash, unrecoverable even by us\n"
             "• Your IP address (used at request time for city and language detection, not saved)\n"
-            "• Post view history (only a counter, updated at most once per 8 hours per user)\n"
+            "• Post view history\n"
             "• Third-party cookies, analytics, trackers, ad identifiers\n"
             "• Data about your location beyond city\n"
             "• Device list or fingerprinting data\n\n"
@@ -2192,10 +2283,14 @@ TEXTS = {
             "## 4. Account security\n"
             "• Password min 8 characters, must contain letters and digits\n"
             "• pbkdf2-hmac-sha256 hash, 100 000 iterations — infeasible to brute-force\n"
+            "• Password check runs in constant time — user existence cannot be inferred from response timing\n"
             "• Sessions bound to a random token, max 10 active sessions per account\n"
             "• Login attempts limited per IP and per nick to prevent brute-force\n"
             "• All data modification operations verify the owner on the server\n"
             "• Reserved nicks (admin, root, sld, etc.) unavailable for registration\n"
+            "• Strict security headers: CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, HSTS and more\n"
+            "• SSRF protection when fetching link previews — private and local addresses are blocked\n"
+            "• Request body size limit (1 MB)\n"
             "• No third-party scripts or external trackers on the site\n\n"
             "## 5. Where data is stored\n"
             "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties. Backups are automatic and protected by the same rules.\n\n"
@@ -2292,11 +2387,11 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
     '<line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/>'
     '<line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/>'
     '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
-I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=15)
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 I_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=14, sw=3)
 I_MOBILE = svg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
 I_DESKTOP = svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>', size=12)
+I_SERVER = svg('<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/>', size=14)
 
 
 def _urlenc(svg_str: str) -> str:
@@ -2523,7 +2618,6 @@ a { -webkit-tap-highlight-color: transparent; }
 .like-btn:hover { color: var(--like); }
 .like-btn.active { color: var(--like); }
 .like-btn .num { font-variant-numeric: tabular-nums; }
-.views-badge { margin-left: auto; color: var(--muted-2); font-size: 12.5px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; }
 
 .not-found { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; gap: 18px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; min-height: 320px; }
 .not-found-code { font-size: 76px; font-weight: 900; line-height: 1; color: var(--line-3); letter-spacing: -3px; }
@@ -2575,9 +2669,10 @@ a { -webkit-tap-highlight-color: transparent; }
 .settings-link:hover { text-decoration: underline; }
 
 .device-info { display: flex; flex-direction: column; gap: 6px; }
-.device-info-row { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; background: var(--card-2); border-radius: 10px; font-size: 13.5px; }
-.device-info-row .label { color: var(--muted); font-weight: 500; }
-.device-info-row .value { color: var(--text); font-weight: 700; }
+.device-info-row { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; background: var(--card-2); border-radius: 10px; font-size: 13.5px; gap: 12px; }
+.device-info-row .label { color: var(--muted); font-weight: 500; display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.device-info-row .label svg { opacity: .7; }
+.device-info-row .value { color: var(--text); font-weight: 700; text-align: right; word-break: break-word; }
 
 .color-swatches { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; padding-top: 4px; }
 .color-swatch { width: 34px; height: 34px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; position: relative; transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease; box-shadow: 0 0 0 1px var(--line-2); }
@@ -2811,8 +2906,8 @@ var ICONS = {
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
   back: __I_BACK__, chevron: __I_CHEVRON__, search: __I_SEARCH__,
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
-  eye: __I_EYE__, cal: __I_CAL__, check: __I_CHECK__,
-  mobile: __I_MOBILE__, desktop: __I_DESKTOP__
+  cal: __I_CAL__, check: __I_CHECK__,
+  mobile: __I_MOBILE__, desktop: __I_DESKTOP__, server: __I_SERVER__
 };
 
 var EMOJI_NAMES = __EMOJI_NAMES__;
@@ -2929,6 +3024,11 @@ var state = {
   sseWasConnected: false,
   soundEnabled: localStorage.getItem('SLD_sound') !== '0',
 };
+
+/* Request ids для защиты от race condition */
+var feedReqId = 0;
+var peopleReqId = 0;
+var profileReqId = 0;
 
 /* Quote persistence (sessionStorage) */
 function saveQuoteState() {
@@ -3076,6 +3176,20 @@ function timeAgo(ts) {
 function fmtDate(ts) {
   try { return new Date(ts*1000).toLocaleDateString(LANG === 'ru' ? 'ru-RU' : 'en-US', { year: 'numeric', month: 'long' }); }
   catch(e) { return new Date(ts*1000).toLocaleDateString(); }
+}
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  var d = Math.floor(sec / 86400);
+  var h = Math.floor((sec % 86400) / 3600);
+  var m = Math.floor((sec % 3600) / 60);
+  var s = sec % 60;
+  var parts = [];
+  var ru = (LANG === 'ru');
+  if (d > 0) parts.push(d + (ru ? ' д' : 'd'));
+  if (h > 0) parts.push(h + (ru ? ' ч' : 'h'));
+  if (m > 0) parts.push(m + (ru ? ' мин' : 'm'));
+  if (!parts.length) parts.push(s + (ru ? ' с' : 's'));
+  return parts.join(' ');
 }
 function truncateText(text) {
   var lines = text.split('\n');
@@ -3276,17 +3390,14 @@ function connectSSE() {
   try {
     es = new EventSource(url);
   } catch(e) {
-    // Браузер не поддерживает EventSource — повторим позже
     setTimeout(connectSSE, 5000);
     return;
   }
   state.es = es;
   es.onopen = function() {
     state.sseErrors = 0;
-    // Соединение восстановлено — могли пропустить события. Обновим текущий вид.
     if (state.sseWasConnected) scheduleRefresh();
     state.sseWasConnected = true;
-    // Сбросим rooms локально, чтобы гарантированно переслать их на сервер
     state.currentRooms = [];
     updateRoom();
   };
@@ -3296,8 +3407,6 @@ function connectSSE() {
   };
   es.onerror = function() {
     state.sseErrors = (state.sseErrors || 0) + 1;
-    // Браузер сам пытается переподключиться, но после 3 подряд ошибок
-    // форсим новое EventSource с экспоненциальной задержкой.
     if (state.sseErrors >= 3) {
       try { es.close(); } catch(e) {}
       if (state.es === es) state.es = null;
@@ -3313,24 +3422,10 @@ function scheduleRefresh() {
   if (state.refreshTimer) return;
   state.refreshTimer = setTimeout(function(){
     state.refreshTimer = null;
-    // Если идёт inline-редактирование поста/комментария — не перерисовываем (иначе потеряем ввод).
-    // Перепланируем на короткую задержку.
-    if (document.querySelector('.inline-editor')) {
-      scheduleRefresh();
-      return;
-    }
-    // Если активен ввод в поиске — тоже не перебиваем (иначе сотрём значение и дёрнем лишний раз API).
+    if (document.querySelector('.inline-editor')) { scheduleRefresh(); return; }
     var active = document.activeElement;
-    if (active && active.closest && active.closest('.search-box')) {
-      scheduleRefresh();
-      return;
-    }
-    // Пользовательские действия временно приглушают refresh, чтобы не перебить оптимистичные апдейты.
-    // НО не теряем событие — перепланируем.
-    if (state.suppressRefresh && Date.now() < state.suppressRefresh) {
-      scheduleRefresh();
-      return;
-    }
+    if (active && active.closest && active.closest('.search-box')) { scheduleRefresh(); return; }
+    if (state.suppressRefresh && Date.now() < state.suppressRefresh) { scheduleRefresh(); return; }
     try { refreshCurrentView(); } catch(e) {}
   }, 400);
 }
@@ -3338,15 +3433,11 @@ function handleEvent(ev) {
   if (!ev || !ev.type) return;
   if (ev.type === 'hello') return;
   if (ev.type === 'notif_changed') {
+    // Только звук + счётчик + перезагрузка страницы уведомлений (если открыта).
+    // НЕ вызывает scheduleRefresh — текущая страница пользователя не перезагружается.
     refreshCounters();
     playNotifSound();
     if (state.view === 'notifications') loadNotifications();
-    return;
-  }
-  if (ev.type === 'view_update') {
-    document.querySelectorAll('[data-post-id="' + ev.post_id + '"] [data-views]').forEach(function(el){
-      el.textContent = ev.views;
-    });
     return;
   }
   if (ev.type === 'post_deleted') {
@@ -3354,19 +3445,17 @@ function handleEvent(ev) {
       var main = document.getElementById('main');
       if (main) main.innerHTML = '<div class="main-body"><div class="main-inner">' + notFoundHtml() + '</div></div>';
       bindLinks(main);
+    } else if (state.view === 'feed' || state.view === 'profile') {
+      scheduleRefresh();
     }
     return;
   }
   if (ev.type === 'refresh') { scheduleRefresh(); return; }
 }
 
-/* Догоняем пропущенное при возврате на вкладку */
 document.addEventListener('visibilitychange', function(){
-  if (!document.hidden && state.sseWasConnected) {
-    scheduleRefresh();
-  }
+  if (!document.hidden && state.sseWasConnected) scheduleRefresh();
 });
-/* И при возврате фокуса на окно */
 window.addEventListener('focus', function(){
   if (state.sseWasConnected) scheduleRefresh();
 });
@@ -3646,15 +3735,26 @@ function renderFeedView(el) {
 async function loadFeed() {
   var feedEl = document.getElementById('feed');
   if (!feedEl) return;
+  // Захватываем id запроса и текущий режим в момент запроса
+  var myId = ++feedReqId;
+  var mode = state.feedMode;
+  var q = state.searchQuery.trim();
   try {
-    var q = state.searchQuery.trim();
-    var feed = state.feedMode === 'subs' ? '&feed=subs' : '';
+    var feed = mode === 'subs' ? '&feed=subs' : '';
     var data = await api('/api/posts?q=' + encodeURIComponent(q) + feed);
+    // Если за это время пользователь сделал новый запрос — отбрасываем устаревший ответ
+    if (myId !== feedReqId) return;
+    // Дополнительно проверим, что режим всё ещё тот же, что был в момент запроса
+    if (state.feedMode !== mode) return;
+    // И что элемент ещё в DOM
+    if (!document.getElementById('feed')) return;
     var posts = data.posts || [];
     if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
     feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
-  } catch(e) { feedEl.innerHTML = '<div class="empty">—</div>'; }
+  } catch(e) {
+    if (myId === feedReqId) feedEl.innerHTML = '<div class="empty">—</div>';
+  }
 }
 
 /* ============ POST VIEW ============ */
@@ -3732,11 +3832,9 @@ async function loadPostView() {
   if (!feedEl) return;
   try {
     var p = await api('/api/posts/' + state.viewData.post_id);
+    if (!document.getElementById('feed')) return;
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
-    if (state.user && p.author !== state.user.nick) {
-      api('/api/posts/' + state.viewData.post_id + '/view', { method: 'POST' }).catch(function(){});
-    }
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -3803,8 +3901,11 @@ function renderProfileView(el) {
 async function loadProfile(nick) {
   var root = document.getElementById('profileRoot');
   if (!root) return;
+  var myId = ++profileReqId;
   try {
     var u = await api('/api/users/' + encodeURIComponent(nick));
+    if (myId !== profileReqId) return;
+    if (!document.getElementById('profileRoot')) return;
     var isMe = state.user && state.user.nick === u.nick;
 
     var actionsHtml = '';
@@ -3862,6 +3963,8 @@ async function loadProfile(nick) {
 
     loadProfileContent(u, isMe);
   } catch(e) {
+    if (myId !== profileReqId) return;
+    if (!document.getElementById('profileRoot')) return;
     root.innerHTML = notFoundHtml();
     bindLinks(root);
   }
@@ -3876,6 +3979,7 @@ async function loadProfileContent(u, isMe) {
   }
   try {
     var d = await api('/api/posts?author=' + encodeURIComponent(u.nick));
+    if (!document.getElementById('profileContent')) return;
     var posts = (d.posts || []).slice();
     posts.sort(function(a, b){ return b.created_at - a.created_at; });
     if (!posts.length) html += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
@@ -4025,12 +4129,13 @@ async function loadFollowList(nick, isFollowers) {
       ? ('/api/users/' + encodeURIComponent(nick) + '/followers')
       : ('/api/users/' + encodeURIComponent(nick) + '/following');
     var data = await api(path);
+    if (!document.getElementById('list')) return;
     var users = data.users || [];
     var limitedNote = data.limited ? '<div class="empty" style="margin-bottom:12px;padding:16px">' + escapeHtml(tr('limited_list')) + '</div>' : '';
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(isFollowers ? tr('no_followers') : tr('no_following')) + '</div>'; return; }
     wrap.innerHTML = limitedNote + users.map(userRowHtml).join('');
     bindLinks(wrap); bindUserRows(wrap);
-  } catch(e) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
+  } catch(e) { if (wrap) wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
 }
 
 /* ============ PEOPLE ============ */
@@ -4067,20 +4172,27 @@ function renderUsersView(el) {
 async function loadPeople() {
   var wrap = document.getElementById('list');
   if (!wrap) return;
-  if (!state.user && state.peopleTab === 'subs') {
+  var myId = ++peopleReqId;
+  var tab = state.peopleTab;
+  if (!state.user && tab === 'subs') {
     wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_post')) + '</div>';
     return;
   }
   try {
     var q = (state.peopleQuery || '').trim();
     var url = '/api/users?q=' + encodeURIComponent(q);
-    if (state.peopleTab === 'subs') url += '&only_following=1';
+    if (tab === 'subs') url += '&only_following=1';
     var data = await api(url);
+    if (myId !== peopleReqId) return;
+    if (state.peopleTab !== tab) return;
+    if (!document.getElementById('list')) return;
     var users = data.users || [];
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
     wrap.innerHTML = users.map(userRowHtml).join('');
     bindLinks(wrap); bindUserRows(wrap);
-  } catch(e) { wrap.innerHTML = '<div class="empty">—</div>'; }
+  } catch(e) {
+    if (myId === peopleReqId && wrap) wrap.innerHTML = '<div class="empty">—</div>';
+  }
 }
 
 /* ============ NOTIFICATIONS ============ */
@@ -4106,6 +4218,7 @@ async function loadNotifications() {
   if (!wrap) return;
   try {
     var data = await api('/api/notifications');
+    if (!document.getElementById('notifList')) return;
     var items = data.items || [];
     setNotifCount(data.unread || 0);
     if (data.unread > 0) {
@@ -4155,10 +4268,10 @@ function renderSettingsListView(el) {
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="settings-list-mobile">';
   var rows = [
-    { key: 'account',     icon: ICONS.user,  title: tr('settings_account'),    desc: tr('settings_account_desc') },
-    { key: 'privacy',     icon: ICONS.bell,  title: tr('settings_privacy'),    desc: tr('settings_privacy_desc') },
-    { key: 'appearance',  icon: ICONS.sun,   title: tr('settings_appearance'), desc: tr('settings_appearance_desc') },
-    { key: 'info',        icon: ICONS.gear,  title: tr('settings_info'),       desc: tr('settings_info_desc') },
+    { key: 'account',     icon: ICONS.user,   title: tr('settings_account'),    desc: tr('settings_account_desc') },
+    { key: 'privacy',     icon: ICONS.bell,   title: tr('settings_privacy'),    desc: tr('settings_privacy_desc') },
+    { key: 'appearance',  icon: ICONS.sun,    title: tr('settings_appearance'), desc: tr('settings_appearance_desc') },
+    { key: 'info',        icon: ICONS.server, title: tr('settings_info'),       desc: tr('settings_info_desc') },
   ];
   rows.forEach(function(r){
     html += '<button class="settings-list-row" data-section="' + r.key + '">'
@@ -4204,7 +4317,7 @@ function renderSettingsView(el) {
     html += '<button class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
     html += '<button class="settings-nav-btn' + (sec==='privacy'?' active':'') + '" data-section="privacy">' + ICONS.bell + ' ' + tr('settings_privacy') + '</button>';
     html += '<button class="settings-nav-btn' + (sec==='appearance'?' active':'') + '" data-section="appearance">' + ICONS.sun + ' ' + tr('settings_appearance') + '</button>';
-    html += '<button class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.gear + ' ' + tr('settings_info') + '</button>';
+    html += '<button class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.server + ' ' + tr('settings_info') + '</button>';
     html += '</nav>';
   }
   html += '<div class="settings-content">';
@@ -4280,7 +4393,9 @@ function renderSettingsView(el) {
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 16px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
   html += '<div class="settings-subhead">' + tr('settings_authors') + '</div>';
-  html += '<div style="font-size:14.5px;margin-bottom:4px;color:var(--text)">SldShr, DeepSeek</div>';
+  html += '<div style="font-size:14.5px;margin-bottom:8px;color:var(--text)">SldShr, DeepSeek</div>';
+  html += '<div class="settings-subhead">' + escapeHtml(tr('settings_server')) + '</div>';
+  html += '<div class="device-info" id="serverInfo">' + spinner() + '</div>';
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_device')) + '</div>';
   html += '<div class="device-info" id="deviceInfo">' + spinner() + '</div>';
   html += '</div>';
@@ -4366,6 +4481,21 @@ function renderSettingsView(el) {
       }
     });
   });
+
+  var si = document.getElementById('serverInfo');
+  if (si) {
+    api('/api/uptime').then(function(info){
+      var uptime = fmtUptime(info.uptime_seconds || 0);
+      var version = info.version || '—';
+      si.innerHTML = ''
+        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_uptime')) + '</span>'
+        + '<span class="value">' + escapeHtml(uptime) + '</span></div>'
+        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_version')) + '</span>'
+        + '<span class="value">' + escapeHtml(version) + '</span></div>';
+    }).catch(function(){
+      si.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>';
+    });
+  }
 
   var di = document.getElementById('deviceInfo');
   if (di) {
@@ -4549,8 +4679,6 @@ function renderPostHtml(p, showComments) {
   }
   var cCount = (typeof p.comment_count === 'number') ? p.comment_count
              : (p.comments ? p.comments.length : 0);
-  var viewsHtml = '';
-  if (p.views) viewsHtml = '<span class="views-badge">' + ICONS.eye + '<span data-views>' + p.views + '</span></span>';
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
 
   return ''
@@ -4571,7 +4699,6 @@ function renderPostHtml(p, showComments) {
     +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + cCount + '</span></button>'
     +     '<button class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
     +     '<button class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
-    +     viewsHtml
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -4867,11 +4994,11 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_MOON__", json.dumps(I_MOON))
           .replace("__I_SUN__", json.dumps(I_SUN))
           .replace("__I_QUOTE__", json.dumps(I_QUOTE))
-          .replace("__I_EYE__", json.dumps(I_EYE))
           .replace("__I_CAL__", json.dumps(I_CAL))
           .replace("__I_CHECK__", json.dumps(I_CHECK))
           .replace("__I_MOBILE__", json.dumps(I_MOBILE))
           .replace("__I_DESKTOP__", json.dumps(I_DESKTOP))
+          .replace("__I_SERVER__", json.dumps(I_SERVER))
           .replace("__EMOJI_NAMES__", json.dumps(emoji_names, ensure_ascii=False))
           .replace("__FAVICON_RU_DARK__", FAVICON_RU_DARK)
           .replace("__FAVICON_RU_LIGHT__", FAVICON_RU_LIGHT)
