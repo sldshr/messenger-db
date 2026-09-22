@@ -13,9 +13,7 @@ import secrets
 import struct
 import time
 import zlib
-from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Set
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request as UrlRequest, urlopen
@@ -34,11 +32,12 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or ""
 SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
+if not SUPABASE_ENABLED:
+    raise RuntimeError("SUPABASE_URL и SUPABASE_KEY обязательны")
+
 
 def _sb_sync(method: str, path: str,
              json_data=None, params=None, prefer=None):
-    if not SUPABASE_ENABLED:
-        return None
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     if params:
         url += "?" + urlencode(params)
@@ -78,38 +77,8 @@ async def sb(method: str, path: str,
 
 
 # ============================================================
-#                    ШИФРОВАНИЕ ЗАПРОСОВ
+#                    ХЕЛПЕРЫ ПАРОЛЯ И АВАТАРА
 # ============================================================
-
-XK = b"DirectSecret2024"
-
-
-def _xor(b: bytes) -> bytes:
-    return bytes(c ^ XK[i % len(XK)] for i, c in enumerate(b))
-
-
-def enc_str(s: str) -> str:
-    return base64.b64encode(_xor(s.encode("utf-8"))).decode()
-
-
-def dec_str(s: str) -> str:
-    return _xor(base64.b64decode(s.encode())).decode("utf-8")
-
-
-# ============================================================
-#                    ХРАНИЛИЩЕ (ОПЕРАТИВКА + БД)
-# ============================================================
-
-USERS: Dict[str, dict] = {}
-SESSIONS: Dict[str, str] = {}
-CHATS: Dict[str, list] = {}
-CONNECTIONS: Dict[str, list] = {}
-OG_CACHE: Dict[str, dict] = {}
-
-
-def chat_key(a: str, b: str) -> str:
-    return "|".join(sorted([a, b]))
-
 
 def hash_pw(pw: str) -> str:
     salt = secrets.token_hex(16)
@@ -139,62 +108,143 @@ def _parse_ts(s):
     if not s:
         return time.time()
     try:
+        from datetime import datetime
         return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
     except Exception:
         return time.time()
 
 
 # ============================================================
-#                    DB HELPERS (write-through)
+#                    DB: USERS
 # ============================================================
 
-async def db_save_user(nick: str):
-    u = USERS.get(nick)
-    if not u or not SUPABASE_ENABLED:
-        return
+async def db_get_user(nick: str) -> Optional[dict]:
+    rows = await sb("GET", "users",
+                    params={"select": "nick,name,password,avatar",
+                            "nick": f"eq.{nick}", "limit": "1"})
+    if not rows:
+        return None
+    u = rows[0]
+    return {
+        "nick": u["nick"],
+        "name": u.get("name", u["nick"]),
+        "password": u.get("password", ""),
+        "avatar": normalize_avatar(u.get("avatar")),
+    }
+
+
+async def db_get_users(nicks: List[str]) -> Dict[str, dict]:
+    """Batch-загрузка пользователей по списку ников."""
+    nicks = [n for n in dict.fromkeys(nicks) if n]  # dedupe + keep order
+    if not nicks:
+        return {}
+    rows = await sb("GET", "users",
+                    params={"select": "nick,name,avatar",
+                            "nick": f"in.({','.join(nicks)})"})
+    out = {}
+    for u in (rows or []):
+        out[u["nick"]] = {
+            "nick": u["nick"],
+            "name": u.get("name", u["nick"]),
+            "avatar": normalize_avatar(u.get("avatar")),
+        }
+    return out
+
+
+async def db_create_user(nick: str, name: str, password: str, avatar: list):
     await sb("POST", "users",
              json_data={
-                 "nick": u["nick"],
-                 "name": u["name"],
-                 "password": u["password"],
-                 "avatar": u["avatar"],
+                 "nick": nick,
+                 "name": name,
+                 "password": password,
+                 "avatar": avatar,
              },
-             prefer="resolution=merge-duplicates,return=minimal")
+             prefer="return=minimal")
+
+
+async def db_update_user(nick: str, name: str, avatar: list):
+    await sb("PATCH", "users",
+             params={"nick": f"eq.{nick}"},
+             json_data={"name": name, "avatar": avatar},
+             prefer="return=minimal")
+
+
+# ============================================================
+#                    DB: SESSIONS
+# ============================================================
+
+async def db_create_session(token: str, nick: str):
+    await sb("POST", "sessions",
+             json_data={"token": token, "nick": nick},
+             prefer="return=minimal")
+
+
+async def db_get_session(token: str) -> Optional[str]:
+    rows = await sb("GET", "sessions",
+                    params={"select": "nick",
+                            "token": f"eq.{token}", "limit": "1"})
+    if not rows:
+        return None
+    return rows[0]["nick"]
+
+
+async def db_del_session(token: str):
+    await sb("DELETE", "sessions", params={"token": f"eq.{token}"})
+
+
+async def db_del_sessions_of(nick: str):
+    await sb("DELETE", "sessions", params={"nick": f"eq.{nick}"})
+
+
+# ============================================================
+#                    DB: CONTACTS
+# ============================================================
+
+async def db_get_contacts(nick: str) -> Set[str]:
+    rows = await sb("GET", "contacts",
+                    params={"select": "contact_nick",
+                            "user_nick": f"eq.{nick}"})
+    return {r["contact_nick"] for r in (rows or [])}
 
 
 async def db_add_contact(a: str, b: str):
-    if not SUPABASE_ENABLED:
-        return
     await sb("POST", "contacts",
              json_data={"user_nick": a, "contact_nick": b},
              prefer="resolution=merge-duplicates,return=minimal")
 
 
 async def db_del_contact(a: str, b: str):
-    if not SUPABASE_ENABLED:
-        return
     await sb("DELETE", "contacts",
              params={"user_nick": f"eq.{a}", "contact_nick": f"eq.{b}"})
 
 
+# ============================================================
+#                    DB: BLACKLIST
+# ============================================================
+
+async def db_get_blacklist(nick: str) -> Set[str]:
+    rows = await sb("GET", "blacklist",
+                    params={"select": "blocked_nick",
+                            "user_nick": f"eq.{nick}"})
+    return {r["blocked_nick"] for r in (rows or [])}
+
+
 async def db_add_blacklist(a: str, b: str):
-    if not SUPABASE_ENABLED:
-        return
     await sb("POST", "blacklist",
              json_data={"user_nick": a, "blocked_nick": b},
              prefer="resolution=merge-duplicates,return=minimal")
 
 
 async def db_del_blacklist(a: str, b: str):
-    if not SUPABASE_ENABLED:
-        return
     await sb("DELETE", "blacklist",
              params={"user_nick": f"eq.{a}", "blocked_nick": f"eq.{b}"})
 
 
+# ============================================================
+#                    DB: MESSAGES
+# ============================================================
+
 async def db_save_message(m: dict):
-    if not SUPABASE_ENABLED:
-        return
     await sb("POST", "messages",
              json_data={
                  "id": m["id"],
@@ -202,105 +252,58 @@ async def db_save_message(m: dict):
                  "recipient": m["to"],
                  "body": m["text"],
              },
-             prefer="resolution=merge-duplicates,return=minimal")
+             prefer="return=minimal")
+
+
+async def db_get_messages(a: str, b: str) -> List[dict]:
+    """Возвращает переписку a↔b в порядке возрастания времени."""
+    rows = await sb("GET", "messages", params={
+        "select": "id,sender,recipient,body,created_at",
+        "or": f"(and(sender.eq.{a},recipient.eq.{b}),"
+              f"and(sender.eq.{b},recipient.eq.{a}))",
+        "order": "created_at.asc",
+    })
+    return [
+        {
+            "id": r["id"],
+            "from": r["sender"],
+            "to": r["recipient"],
+            "text": r.get("body", ""),
+            "ts": _parse_ts(r.get("created_at")),
+        }
+        for r in (rows or [])
+    ]
 
 
 async def db_del_messages_between(a: str, b: str):
-    """Удаляет всю переписку между a и b (в обе стороны)."""
-    if not SUPABASE_ENABLED:
-        return
     await sb("DELETE", "messages",
              params={"sender": f"eq.{a}", "recipient": f"eq.{b}"})
     await sb("DELETE", "messages",
              params={"sender": f"eq.{b}", "recipient": f"eq.{a}"})
 
 
-async def db_load_all():
-    if not SUPABASE_ENABLED:
-        print("[direct] Supabase не настроен — работаем полностью в оперативке")
-        return
-
-    print("[direct] Загрузка данных из Supabase...")
-
-    users = await sb("GET", "users", params={"select": "*"})
-    if users:
-        for u in users:
-            USERS[u["nick"]] = {
-                "name": u.get("name", u["nick"]),
-                "nick": u["nick"],
-                "password": u.get("password", ""),
-                "avatar": normalize_avatar(u.get("avatar")),
-                "contacts": set(),
-                "blacklist": set(),
-            }
-
-    contacts = await sb("GET", "contacts", params={"select": "*"})
-    if contacts:
-        for c in contacts:
-            a, b = c.get("user_nick"), c.get("contact_nick")
-            if a in USERS and b in USERS:
-                USERS[a]["contacts"].add(b)
-
-    bl = await sb("GET", "blacklist", params={"select": "*"})
-    if bl:
-        for b in bl:
-            a, c = b.get("user_nick"), b.get("blocked_nick")
-            if a in USERS and c in USERS:
-                USERS[a]["blacklist"].add(c)
-
-    msgs = await sb("GET", "messages",
-                    params={"select": "*", "order": "created_at.asc"})
-    if msgs:
-        for m in msgs:
-            sender = m.get("sender")
-            recipient = m.get("recipient")
-            if sender not in USERS or recipient not in USERS:
-                continue
-            k = chat_key(sender, recipient)
-            CHATS.setdefault(k, []).append({
-                "id": m.get("id"),
-                "from": sender,
-                "to": recipient,
-                "text": m.get("body", ""),
-                "ts": _parse_ts(m.get("created_at")),
-            })
-
-    print(f"[direct] Загружено: users={len(USERS)}, chats={len(CHATS)}")
-
-
 # ============================================================
-#                         FASTAPI
+#                    АВТОРИЗАЦИЯ / СЕССИИ
 # ============================================================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db_load_all()
-    yield
+CONNECTIONS: Dict[str, list] = {}   # только WebSocket — в памяти
+OG_CACHE: Dict[str, dict] = {}      # кэш OG — в памяти (это просто кэш)
 
 
-app = FastAPI(title="Direct", lifespan=lifespan)
-
-
-class EncBody(BaseModel):
-    data: str
-
-
-def parse(body: EncBody) -> dict:
-    try:
-        return json.loads(dec_str(body.data))
-    except Exception:
-        raise HTTPException(400, "Повреждённый запрос")
-
-
-def auth(token: Optional[str]) -> str:
-    if not token or token not in SESSIONS:
+async def auth(token: Optional[str]) -> str:
+    if not token:
         raise HTTPException(401, "Не авторизован")
-    return SESSIONS[token]
+    nick = await db_get_session(token)
+    if not nick:
+        raise HTTPException(401, "Сессия истекла")
+    return nick
 
 
-def user_public(nick: str) -> dict:
-    u = USERS[nick]
-    return {"nick": nick, "name": u["name"], "avatar": u["avatar"]}
+async def user_public(nick: str) -> Optional[dict]:
+    u = await db_get_user(nick)
+    if not u:
+        return None
+    return {"nick": u["nick"], "name": u["name"], "avatar": u["avatar"]}
 
 
 async def push_to(nick: str, event: dict):
@@ -323,10 +326,51 @@ async def push_to(nick: str, event: dict):
         CONNECTIONS.pop(nick, None)
 
 
+# ============================================================
+#                         FASTAPI
+# ============================================================
+
+app = FastAPI(title="Direct")
+
+
+class EncBody(BaseModel):
+    data: str
+
+
+def parse(body: EncBody) -> dict:
+    try:
+        return json.loads(dec_str(body.data))
+    except Exception:
+        raise HTTPException(400, "Повреждённый запрос")
+
+
+# ============================================================
+#                    ШИФРОВАНИЕ ЗАПРОСОВ
+# ============================================================
+
+XK = b"DirectSecret2024"
+
+
+def _xor(b: bytes) -> bytes:
+    return bytes(c ^ XK[i % len(XK)] for i, c in enumerate(b))
+
+
+def enc_str(s: str) -> str:
+    return base64.b64encode(_xor(s.encode("utf-8"))).decode()
+
+
+def dec_str(s: str) -> str:
+    return _xor(base64.b64decode(s.encode())).decode("utf-8")
+
+
+# ============================================================
+#                          WEBSOCKET
+# ============================================================
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     await websocket.accept()
-    nick = SESSIONS.get(token)
+    nick = await db_get_session(token) if token else None
     if not nick:
         await websocket.close(code=4001)
         return
@@ -368,65 +412,96 @@ async def register(body: EncBody):
         raise HTTPException(400, "Пароли не совпадают")
     if len(pw) < 4:
         raise HTTPException(400, "Пароль минимум 4 символа")
-    if nick in USERS:
+
+    # Проверка занятости — всегда из БД
+    existing = await db_get_user(nick)
+    if existing:
         raise HTTPException(400, "Такой ник уже занят")
 
-    USERS[nick] = {
-        "name": name, "nick": nick, "password": hash_pw(pw),
-        "avatar": normalize_avatar(d.get("avatar")),
-        "contacts": set(), "blacklist": set(),
-    }
-    await db_save_user(nick)
+    avatar = normalize_avatar(d.get("avatar"))
+    await db_create_user(nick, name, hash_pw(pw), avatar)
 
     token = secrets.token_urlsafe(24)
-    SESSIONS[token] = nick
-    return {"ok": True, "token": token, "me": user_public(nick)}
+    await db_create_session(token, nick)
+    return {
+        "ok": True,
+        "token": token,
+        "me": {"nick": nick, "name": name, "avatar": avatar},
+    }
 
 
 @app.post("/api/login")
-def login(body: EncBody):
+async def login(body: EncBody):
     d = parse(body)
     nick = (d.get("nick") or "").strip()
     pw = d.get("password") or ""
-    u = USERS.get(nick)
+    u = await db_get_user(nick)
     if not u or not verify_pw(pw, u["password"]):
         raise HTTPException(400, "Неверный ник или пароль")
     token = secrets.token_urlsafe(24)
-    SESSIONS[token] = nick
-    return {"ok": True, "token": token, "me": user_public(nick)}
+    await db_create_session(token, nick)
+    return {
+        "ok": True,
+        "token": token,
+        "me": {"nick": nick, "name": u["name"], "avatar": u["avatar"]},
+    }
+
+
+@app.post("/api/logout")
+async def logout(x_token: Optional[str] = Header(None)):
+    if x_token:
+        await db_del_session(x_token)
+    return {"ok": True}
 
 
 @app.get("/api/me")
-def me(x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
-    u = USERS[nick]
+async def me(x_token: Optional[str] = Header(None)):
+    nick = await auth(x_token)
+    u = await db_get_user(nick)
+    if not u:
+        raise HTTPException(401, "Пользователь не найден")
+
+    contact_nicks = await db_get_contacts(nick)
+    black_nicks = await db_get_blacklist(nick)
+
+    all_nicks = list(contact_nicks | black_nicks)
+    users_map = await db_get_users(all_nicks)
+
+    contacts_out = [users_map[n] for n in contact_nicks if n in users_map]
+    blacklist_out = [users_map[n] for n in black_nicks if n in users_map]
+
     return {
-        "me": user_public(nick),
-        "contacts": [user_public(n) for n in u["contacts"] if n in USERS],
-        "blacklist": [user_public(n) for n in u["blacklist"] if n in USERS],
+        "me": {"nick": nick, "name": u["name"], "avatar": u["avatar"]},
+        "contacts": contacts_out,
+        "blacklist": blacklist_out,
     }
 
 
 @app.post("/api/profile/update")
 async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+    nick = await auth(x_token)
     d = parse(body)
     name = (d.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "Имя не может быть пустым")
     if len(name) > 60:
         raise HTTPException(400, "Имя слишком длинное")
-    USERS[nick]["name"] = name
-    if "avatar" in d:
-        USERS[nick]["avatar"] = normalize_avatar(d.get("avatar"))
 
-    await db_save_user(nick)
+    u = await db_get_user(nick)
+    if not u:
+        raise HTTPException(401, "Пользователь не найден")
 
-    payload = {"type": "contact_updated", "user": user_public(nick)}
-    for c in list(USERS[nick]["contacts"]):
-        if c in USERS:
-            await push_to(c, payload)
-    return {"ok": True, "me": user_public(nick)}
+    avatar = normalize_avatar(d.get("avatar")) if "avatar" in d else u["avatar"]
+    await db_update_user(nick, name, avatar)
+
+    me_pub = {"nick": nick, "name": name, "avatar": avatar}
+
+    # оповещаем контакты
+    contact_nicks = await db_get_contacts(nick)
+    for c in contact_nicks:
+        await push_to(c, {"type": "contact_updated", "user": me_pub})
+
+    return {"ok": True, "me": me_pub}
 
 
 # ============================================================
@@ -434,21 +509,28 @@ async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
 # ============================================================
 
 @app.post("/api/search")
-def search(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+async def search(body: EncBody, x_token: Optional[str] = Header(None)):
+    nick = await auth(x_token)
     d = parse(body)
     q = (d.get("nick") or "").strip().lstrip("@")
     if not q:
         raise HTTPException(400, "Введите ник")
     if q == nick:
         raise HTTPException(400, "Это ваш собственный ник")
-    if q not in USERS:
+
+    target = await db_get_user(q)
+    if not target:
         raise HTTPException(404, "Пользователь не найден")
-    if nick in USERS[q]["blacklist"]:
-        raise HTTPException(403, "Пользователь недоступен")
-    if q in USERS[nick]["blacklist"]:
+
+    my_blacklist = await db_get_blacklist(nick)
+    if q in my_blacklist:
         raise HTTPException(403, "Пользователь в вашем чёрном списке")
-    return {"user": user_public(q)}
+
+    their_blacklist = await db_get_blacklist(q)
+    if nick in their_blacklist:
+        raise HTTPException(403, "Пользователь недоступен")
+
+    return {"user": {"nick": q, "name": target["name"], "avatar": target["avatar"]}}
 
 
 # ============================================================
@@ -457,51 +539,70 @@ def search(body: EncBody, x_token: Optional[str] = Header(None)):
 
 @app.post("/api/chat/start")
 async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+    nick = await auth(x_token)
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer not in USERS or peer == nick:
+    if peer == nick:
         raise HTTPException(400, "Некорректный пользователь")
-    if peer in USERS[nick]["blacklist"]:
-        raise HTTPException(403, "Пользователь в чёрном списке")
-    if nick in USERS[peer]["blacklist"]:
-        raise HTTPException(403, "Пользователь недоступен")
 
-    USERS[nick]["contacts"].add(peer)
-    USERS[peer]["contacts"].add(nick)
+    target = await db_get_user(peer)
+    if not target:
+        raise HTTPException(400, "Некорректный пользователь")
+
+    my_bl = await db_get_blacklist(nick)
+    if peer in my_bl:
+        raise HTTPException(403, "Пользователь в чёрном списке")
+    their_bl = await db_get_blacklist(peer)
+    if nick in their_bl:
+        raise HTTPException(403, "Пользователь недоступен")
 
     await db_add_contact(nick, peer)
     await db_add_contact(peer, nick)
 
-    await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
-    await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
-    return {"ok": True, "peer": user_public(peer)}
+    me_pub = await user_public(nick)
+    peer_pub = {"nick": peer, "name": target["name"], "avatar": target["avatar"]}
+
+    await push_to(peer, {"type": "contact_added", "user": me_pub})
+    await push_to(nick, {"type": "contact_added", "user": peer_pub})
+    return {"ok": True, "peer": peer_pub}
 
 
 @app.post("/api/chat/send")
 async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+    nick = await auth(x_token)
     d = parse(body)
     peer = d.get("to")
     text = (d.get("text") or "").strip()
-    if peer not in USERS or not text:
+    if not peer or not text:
         raise HTTPException(400, "Ошибка отправки")
     if len(text) > 2000:
         raise HTTPException(400, "Сообщение слишком длинное")
-    if peer in USERS[nick]["blacklist"]:
+
+    target = await db_get_user(peer)
+    if not target:
+        raise HTTPException(400, "Пользователь не найден")
+
+    my_bl = await db_get_blacklist(nick)
+    if peer in my_bl:
         raise HTTPException(403, "Вы добавили пользователя в чёрный список")
-    if nick in USERS[peer]["blacklist"]:
+    their_bl = await db_get_blacklist(peer)
+    if nick in their_bl:
         raise HTTPException(403, "Пользователь добавил вас в чёрный список")
 
-    # Авто-восстановление контакта, если один из пары ранее удалил чат
-    if peer not in USERS[nick]["contacts"]:
-        USERS[nick]["contacts"].add(peer)
+    # Авто-восстановление контакта, если один из пары удалил чат
+    my_contacts = await db_get_contacts(nick)
+    if peer not in my_contacts:
         await db_add_contact(nick, peer)
-        await push_to(nick, {"type": "contact_added", "user": user_public(peer)})
-    if nick not in USERS[peer]["contacts"]:
-        USERS[peer]["contacts"].add(nick)
+        await push_to(nick, {"type": "contact_added",
+                             "user": {"nick": peer,
+                                      "name": target["name"],
+                                      "avatar": target["avatar"]}})
+
+    their_contacts = await db_get_contacts(peer)
+    if nick not in their_contacts:
+        me_pub = await user_public(nick)
         await db_add_contact(peer, nick)
-        await push_to(peer, {"type": "contact_added", "user": user_public(nick)})
+        await push_to(peer, {"type": "contact_added", "user": me_pub})
 
     msg = {
         "id": secrets.token_hex(8),
@@ -510,8 +611,6 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
         "text": text,
         "ts": time.time(),
     }
-    CHATS.setdefault(chat_key(nick, peer), []).append(msg)
-
     await db_save_message(msg)
 
     await push_to(peer, {"type": "message", "msg": msg})
@@ -521,17 +620,14 @@ async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
 
 @app.post("/api/chat/end")
 async def end_chat(body: EncBody, x_token: Optional[str] = Header(None)):
-    """Завершает чат: удаляет контакт с обеих сторон и всю переписку."""
-    nick = auth(x_token)
+    """Удаляет контакт с обеих сторон и всю переписку."""
+    nick = await auth(x_token)
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer not in USERS or peer == nick:
+    if peer == nick:
         raise HTTPException(400, "Некорректный пользователь")
-
-    USERS[nick]["contacts"].discard(peer)
-    USERS[peer]["contacts"].discard(nick)
-
-    CHATS.pop(chat_key(nick, peer), None)
+    if not await db_get_user(peer):
+        raise HTTPException(400, "Некорректный пользователь")
 
     await db_del_contact(nick, peer)
     await db_del_contact(peer, nick)
@@ -543,15 +639,18 @@ async def end_chat(body: EncBody, x_token: Optional[str] = Header(None)):
 
 
 @app.post("/api/chat/messages")
-def messages(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+async def messages(body: EncBody, x_token: Optional[str] = Header(None)):
+    nick = await auth(x_token)
     d = parse(body)
     peer = d.get("peer")
-    if peer not in USERS:
+    target = await db_get_user(peer)
+    if not target:
         raise HTTPException(400, "Пользователь не найден")
+
+    msgs = await db_get_messages(nick, peer)
     return {
-        "messages": CHATS.get(chat_key(nick, peer), []),
-        "peer": user_public(peer),
+        "messages": msgs,
+        "peer": {"nick": peer, "name": target["name"], "avatar": target["avatar"]},
     }
 
 
@@ -561,13 +660,13 @@ def messages(body: EncBody, x_token: Optional[str] = Header(None)):
 
 @app.post("/api/blacklist/add")
 async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+    nick = await auth(x_token)
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer not in USERS or peer == nick:
+    if peer == nick:
         raise HTTPException(400, "Некорректный пользователь")
-    USERS[nick]["blacklist"].add(peer)
-    USERS[nick]["contacts"].discard(peer)
+    if not await db_get_user(peer):
+        raise HTTPException(400, "Некорректный пользователь")
 
     await db_add_blacklist(nick, peer)
     await db_del_contact(nick, peer)
@@ -578,10 +677,9 @@ async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
 
 @app.post("/api/blacklist/remove")
 async def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = auth(x_token)
+    nick = await auth(x_token)
     d = parse(body)
     peer = (d.get("nick") or "").strip().lstrip("@")
-    USERS[nick]["blacklist"].discard(peer)
     await db_del_blacklist(nick, peer)
     await push_to(nick, {"type": "blacklist_changed"})
     return {"ok": True}
@@ -616,6 +714,15 @@ def make_png(colors, scale: int = 32) -> bytes:
     idat = chunk(b"IDAT", zlib.compress(bytes(raw), 9))
     iend = chunk(b"IEND", b"")
     return sig + ihdr + idat + iend
+
+
+@app.get("/avatar/{nick}.png")
+async def avatar_png(nick: str):
+    u = await db_get_user(nick)
+    colors = u["avatar"] if u else ["#cfd8dc"] * 64
+    png = make_png(colors, scale=32)
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=600"})
 
 
 # ============================================================
@@ -716,21 +823,12 @@ def fetch_og(url: str) -> dict:
 
 @app.post("/api/og")
 async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
-    auth(x_token)
+    await auth(x_token)
     d = parse(body)
     url = (d.get("url") or "").strip()
     if not is_safe_url(url):
         raise HTTPException(400, "Invalid URL")
     return await run_in_threadpool(fetch_og, url)
-
-
-@app.get("/avatar/{nick}.png")
-def avatar_png(nick: str):
-    u = USERS.get(nick)
-    colors = u["avatar"] if u else ["#cfd8dc"] * 64
-    png = make_png(colors, scale=32)
-    return Response(content=png, media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=600"})
 
 
 # ============================================================
@@ -1765,8 +1863,9 @@ async function doRegister(){
   } catch(e){ showErr('auth-err', e.message); }
 }
 
-function logout(){
+async function logout(){
   if (!confirm(t('confirm_logout'))) return;
+  try { await api('/api/logout', {}); } catch(_){}
   disconnectWS();
   token = null; me = null; contacts = []; blacklist = []; unread = {};
   for (const el of contactEls.values()) el.remove();
@@ -2463,17 +2562,17 @@ def _default_og(base: str) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+async def index(request: Request):
     base = str(request.base_url).rstrip("/")
     return render_page(_default_og(base), "Direct — мессенджер")
 
 
 @app.get("/@{nick}", response_class=HTMLResponse)
-def profile_page(nick: str, request: Request):
+async def profile_page(nick: str, request: Request):
     base = str(request.base_url).rstrip("/")
     safe_nick = html_module.escape(nick)
-    if nick in USERS:
-        u = USERS[nick]
+    u = await db_get_user(nick)
+    if u:
         name = html_module.escape(u["name"])
         og = (
             '<meta property="og:type" content="profile">\n'
