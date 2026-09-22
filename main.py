@@ -1,2738 +1,973 @@
-# main.py
-# pip install fastapi uvicorn pillow
-# Переменные окружения: SUPABASE_URL, SUPABASE_KEY (service_role)
+# -*- coding: utf-8 -*-
+"""
+ВКонтактик 2008 — мини-соцсеть на FastAPI.
+Всё хранится в оперативной памяти (словари), никаких файлов и БД.
 
-import base64
+Запуск:
+    pip install fastapi uvicorn python-multipart
+    python main.py
+Открыть: http://127.0.0.1:8000
+"""
+
+import html
 import hashlib
-import html as html_module
-import ipaddress
-import json
-import os
-import re
 import secrets
-import struct
 import time
-import zlib
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.error import HTTPError
-from urllib.parse import urlencode, urljoin, urlparse
-from urllib.request import Request as UrlRequest, urlopen
+from datetime import datetime
+from typing import Dict, Optional, Set
 
-from fastapi import (FastAPI, Header, HTTPException, Query, Request,
-                     WebSocket, WebSocketDisconnect)
-from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
+import uvicorn
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-# ============================================================
-#                    SUPABASE
-# ============================================================
+app = FastAPI(title="ВКонтактик 2008")
 
-SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or ""
-SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+# =========================================================================
+#  ХРАНИЛИЩЕ (всё в оперативке)
+# =========================================================================
 
-if not SUPABASE_ENABLED:
-    raise RuntimeError("SUPABASE_URL и SUPABASE_KEY обязательны")
+DB: Dict = {
+    "users": {},        # id -> пользователь
+    "logins": {},       # login(lower) -> id
+    "sessions": {},     # sid -> id
+    "posts": {},        # id -> пост
+    "friends": {},      # id -> set(id) друзей
+    "requests": {},     # id -> set(id) входящих заявок в друзья
+    "next_user_id": 1,
+    "next_post_id": 1,
+}
 
 
-def _sb_sync(method: str, path: str,
-             json_data=None, params=None, prefer=None):
-    url = f"{SUPABASE_URL}/rest/v1/{path}"
-    if params:
-        url += "?" + urlencode(params)
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+def friends_of(uid: int) -> Set[int]:
+    return DB["friends"].setdefault(uid, set())
+
+
+def requests_of(uid: int) -> Set[int]:
+    return DB["requests"].setdefault(uid, set())
+
+
+def hash_pw(password: str, salt: str) -> str:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+def create_user(login, password, name, surname, city="", sex="m", about=""):
+    uid = DB["next_user_id"]
+    DB["next_user_id"] += 1
+    salt = secrets.token_hex(8)
+    user = {
+        "id": uid,
+        "login": login,
+        "salt": salt,
+        "pw": hash_pw(password, salt),
+        "name": name,
+        "surname": surname,
+        "city": city,
+        "sex": sex,
+        "about": about,
+        "created": time.time(),
     }
-    if prefer:
-        headers["Prefer"] = prefer
-    body = json.dumps(json_data).encode("utf-8") if json_data is not None else None
-    req = UrlRequest(url, data=body, method=method, headers=headers)
-    try:
-        with urlopen(req, timeout=10) as r:
-            raw = r.read()
-            if not raw:
-                return None
-            return json.loads(raw.decode("utf-8"))
-    except HTTPError as e:
-        try:
-            err = e.read().decode("utf-8", errors="ignore")[:300]
-        except Exception:
-            err = ""
-        print(f"[supabase] {method} {path} -> {e.code}: {err}")
-        return None
-    except Exception as e:
-        print(f"[supabase] {method} {path} -> {e}")
-        return None
-
-
-async def sb(method: str, path: str,
-             json_data=None, params=None, prefer=None):
-    return await run_in_threadpool(
-        _sb_sync, method, path, json_data, params, prefer
-    )
-
-
-# ============================================================
-#                    ХЕЛПЕРЫ
-# ============================================================
-
-def hash_pw(pw: str) -> str:
-    salt = secrets.token_hex(16)
-    return salt + "$" + hashlib.sha256((salt + pw).encode()).hexdigest()
-
-
-def verify_pw(pw: str, stored: str) -> bool:
-    try:
-        salt, h = stored.split("$", 1)
-    except ValueError:
-        return False
-    return hashlib.sha256((salt + pw).encode()).hexdigest() == h
-
-
-def normalize_avatar(avatar):
-    if not isinstance(avatar, list) or len(avatar) != 64:
-        return ["#ffffff"] * 64
-    return [
-        a if isinstance(a, str) and a.startswith("#") and len(a) == 7 else "#ffffff"
-        for a in avatar
-    ]
-
-
-def _parse_ts(s):
-    if isinstance(s, (int, float)):
-        return float(s)
-    if not s:
-        return time.time()
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return time.time()
-
-
-# ============================================================
-#                    DB: USERS
-# ============================================================
-
-async def db_get_user(nick: str) -> Optional[dict]:
-    rows = await sb("GET", "users",
-                    params={"select": "nick,name,password,avatar",
-                            "nick": f"eq.{nick}", "limit": "1"})
-    if not rows:
-        return None
-    u = rows[0]
-    return {
-        "nick": u["nick"],
-        "name": u.get("name", u["nick"]),
-        "password": u.get("password", ""),
-        "avatar": normalize_avatar(u.get("avatar")),
-    }
-
-
-async def db_get_users(nicks: List[str]) -> Dict[str, dict]:
-    nicks = [n for n in dict.fromkeys(nicks) if n]
-    if not nicks:
-        return {}
-    rows = await sb("GET", "users",
-                    params={"select": "nick,name,avatar",
-                            "nick": f"in.({','.join(nicks)})"})
-    out = {}
-    for u in (rows or []):
-        out[u["nick"]] = {
-            "nick": u["nick"],
-            "name": u.get("name", u["nick"]),
-            "avatar": normalize_avatar(u.get("avatar")),
-        }
-    return out
-
-
-async def db_create_user(nick: str, name: str, password: str, avatar: list):
-    await sb("POST", "users",
-             json_data={"nick": nick, "name": name,
-                        "password": password, "avatar": avatar},
-             prefer="return=minimal")
-
-
-async def db_update_user(nick: str, name: str, avatar: list):
-    await sb("PATCH", "users",
-             params={"nick": f"eq.{nick}"},
-             json_data={"name": name, "avatar": avatar},
-             prefer="return=minimal")
-
-
-# ============================================================
-#                    DB: SESSIONS
-# ============================================================
-
-async def db_create_session(token: str, nick: str):
-    await sb("POST", "sessions",
-             json_data={"token": token, "nick": nick},
-             prefer="return=minimal")
-
-
-async def db_get_session(token: str) -> Optional[str]:
-    rows = await sb("GET", "sessions",
-                    params={"select": "nick",
-                            "token": f"eq.{token}", "limit": "1"})
-    if not rows:
-        return None
-    return rows[0]["nick"]
-
-
-async def db_del_session(token: str):
-    await sb("DELETE", "sessions", params={"token": f"eq.{token}"})
-
-
-# ============================================================
-#                    DB: CONTACTS / BLACKLIST / MESSAGES
-# ============================================================
-
-async def db_get_contacts(nick: str) -> Set[str]:
-    rows = await sb("GET", "contacts",
-                    params={"select": "contact_nick",
-                            "user_nick": f"eq.{nick}"})
-    return {r["contact_nick"] for r in (rows or [])}
-
-
-async def db_add_contact(a: str, b: str):
-    await sb("POST", "contacts",
-             json_data={"user_nick": a, "contact_nick": b},
-             prefer="resolution=merge-duplicates,return=minimal")
-
-
-async def db_del_contact(a: str, b: str):
-    await sb("DELETE", "contacts",
-             params={"user_nick": f"eq.{a}", "contact_nick": f"eq.{b}"})
-
-
-async def db_get_blacklist(nick: str) -> Set[str]:
-    rows = await sb("GET", "blacklist",
-                    params={"select": "blocked_nick",
-                            "user_nick": f"eq.{nick}"})
-    return {r["blocked_nick"] for r in (rows or [])}
-
-
-async def db_add_blacklist(a: str, b: str):
-    await sb("POST", "blacklist",
-             json_data={"user_nick": a, "blocked_nick": b},
-             prefer="resolution=merge-duplicates,return=minimal")
-
-
-async def db_del_blacklist(a: str, b: str):
-    await sb("DELETE", "blacklist",
-             params={"user_nick": f"eq.{a}", "blocked_nick": f"eq.{b}"})
-
-
-async def db_save_message(m: dict):
-    await sb("POST", "messages",
-             json_data={"id": m["id"], "sender": m["from"],
-                        "recipient": m["to"], "body": m["text"]},
-             prefer="return=minimal")
-
-
-async def db_get_messages(a: str, b: str) -> List[dict]:
-    rows = await sb("GET", "messages", params={
-        "select": "id,sender,recipient,body,created_at",
-        "or": f"(and(sender.eq.{a},recipient.eq.{b}),"
-              f"and(sender.eq.{b},recipient.eq.{a}))",
-        "order": "created_at.asc",
-    })
-    return [
-        {
-            "id": r["id"],
-            "from": r["sender"],
-            "to": r["recipient"],
-            "text": r.get("body", ""),
-            "ts": _parse_ts(r.get("created_at")),
-        }
-        for r in (rows or [])
-    ]
-
-
-async def db_del_messages_between(a: str, b: str):
-    await sb("DELETE", "messages",
-             params={"sender": f"eq.{a}", "recipient": f"eq.{b}"})
-    await sb("DELETE", "messages",
-             params={"sender": f"eq.{b}", "recipient": f"eq.{a}"})
-
-
-# ============================================================
-#                    АВТОРИЗАЦИЯ / WEBSOCKET
-# ============================================================
-
-CONNECTIONS: Dict[str, list] = {}
-OG_CACHE: Dict[str, Tuple[dict, float]] = {}
-OG_CACHE_TTL = 300
-
-
-async def auth(token: Optional[str]) -> str:
-    if not token:
-        raise HTTPException(401, "Не авторизован")
-    nick = await db_get_session(token)
-    if not nick:
-        raise HTTPException(401, "Сессия истекла")
-    return nick
-
-
-async def user_public(nick: str) -> Optional[dict]:
-    u = await db_get_user(nick)
-    if not u:
-        return None
-    return {"nick": u["nick"], "name": u["name"], "avatar": u["avatar"]}
-
-
-async def push_to(nick: str, event: dict):
-    conns = CONNECTIONS.get(nick)
-    if not conns:
-        return
-    payload = json.dumps(event, ensure_ascii=False)
-    dead = []
-    for ws in list(conns):
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        try:
-            conns.remove(ws)
-        except ValueError:
-            pass
-    if not conns:
-        CONNECTIONS.pop(nick, None)
-
-
-# ============================================================
-#                    ШИФРОВАНИЕ ЗАПРОСОВ
-# ============================================================
-
-XK = b"SldChatSecret2024"
-
-
-def _xor(b: bytes) -> bytes:
-    return bytes(c ^ XK[i % len(XK)] for i, c in enumerate(b))
-
-
-def enc_str(s: str) -> str:
-    return base64.b64encode(_xor(s.encode("utf-8"))).decode()
-
-
-def dec_str(s: str) -> str:
-    return _xor(base64.b64decode(s.encode())).decode("utf-8")
-
-
-# ============================================================
-#                         FASTAPI
-# ============================================================
-
-app = FastAPI(title="sldchat")
-
-
-class EncBody(BaseModel):
-    data: str
-
-
-def parse(body: EncBody) -> dict:
-    try:
-        return json.loads(dec_str(body.data))
-    except Exception:
-        raise HTTPException(400, "Повреждённый запрос")
-
-
-@app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
-    await websocket.accept()
-    nick = await db_get_session(token) if token else None
-    if not nick:
-        await websocket.close(code=4001)
-        return
-    CONNECTIONS.setdefault(nick, []).append(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        conns = CONNECTIONS.get(nick)
-        if conns and websocket in conns:
-            conns.remove(websocket)
-            if not conns:
-                CONNECTIONS.pop(nick, None)
-
-
-# ============================================================
-#                          AUTH API
-# ============================================================
-
-@app.post("/api/register")
-async def register(body: EncBody):
-    d = parse(body)
-    nick = (d.get("nick") or "").strip()
-    name = (d.get("name") or "").strip()
-    pw = d.get("password") or ""
-    pw2 = d.get("password2") or ""
-
-    if not nick or not name or not pw:
-        raise HTTPException(400, "Заполните все поля")
-    if len(nick) < 3:
-        raise HTTPException(400, "Ник минимум 3 символа")
-    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", nick):
-        raise HTTPException(400, "Ник: только буквы, цифры, _ . -")
-    if pw != pw2:
-        raise HTTPException(400, "Пароли не совпадают")
-    if len(pw) < 4:
-        raise HTTPException(400, "Пароль минимум 4 символа")
-
-    existing = await db_get_user(nick)
-    if existing:
-        raise HTTPException(400, "Такой ник уже занят")
-
-    avatar = normalize_avatar(d.get("avatar"))
-    await db_create_user(nick, name, hash_pw(pw), avatar)
-
-    token = secrets.token_urlsafe(24)
-    await db_create_session(token, nick)
-    return {
-        "ok": True,
-        "token": token,
-        "me": {"nick": nick, "name": name, "avatar": avatar},
-    }
-
-
-@app.post("/api/login")
-async def login(body: EncBody):
-    d = parse(body)
-    nick = (d.get("nick") or "").strip()
-    pw = d.get("password") or ""
-    u = await db_get_user(nick)
-    if not u or not verify_pw(pw, u["password"]):
-        raise HTTPException(400, "Неверный ник или пароль")
-    token = secrets.token_urlsafe(24)
-    await db_create_session(token, nick)
-    return {
-        "ok": True,
-        "token": token,
-        "me": {"nick": nick, "name": u["name"], "avatar": u["avatar"]},
-    }
-
-
-@app.post("/api/logout")
-async def logout(x_token: Optional[str] = Header(None)):
-    if x_token:
-        await db_del_session(x_token)
-    return {"ok": True}
-
-
-@app.get("/api/me")
-async def me(x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    u = await db_get_user(nick)
-    if not u:
-        raise HTTPException(401, "Пользователь не найден")
-
-    contact_nicks = await db_get_contacts(nick)
-    black_nicks = await db_get_blacklist(nick)
-    all_nicks = list(contact_nicks | black_nicks)
-    users_map = await db_get_users(all_nicks)
-
-    return {
-        "me": {"nick": nick, "name": u["name"], "avatar": u["avatar"]},
-        "contacts": [users_map[n] for n in contact_nicks if n in users_map],
-        "blacklist": [users_map[n] for n in black_nicks if n in users_map],
-    }
-
-
-@app.post("/api/profile/update")
-async def profile_update(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    name = (d.get("name") or "").strip()
-    if not name:
-        raise HTTPException(400, "Имя не может быть пустым")
-    if len(name) > 60:
-        raise HTTPException(400, "Имя слишком длинное")
-
-    u = await db_get_user(nick)
-    if not u:
-        raise HTTPException(401, "Пользователь не найден")
-
-    avatar = normalize_avatar(d.get("avatar")) if "avatar" in d else u["avatar"]
-    await db_update_user(nick, name, avatar)
-
-    me_pub = {"nick": nick, "name": name, "avatar": avatar}
-    for c in await db_get_contacts(nick):
-        await push_to(c, {"type": "contact_updated", "user": me_pub})
-
-    return {"ok": True, "me": me_pub}
-
-
-# ============================================================
-#                          SEARCH
-# ============================================================
-
-@app.post("/api/search")
-async def search(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    q = (d.get("nick") or "").strip().lstrip("@")
-    if not q:
-        raise HTTPException(400, "Введите ник")
-    if q == nick:
-        raise HTTPException(400, "Это ваш собственный ник")
-
-    target = await db_get_user(q)
-    if not target:
-        raise HTTPException(404, "Пользователь не найден")
-
-    if q in await db_get_blacklist(nick):
-        raise HTTPException(403, "Пользователь в вашем чёрном списке")
-    if nick in await db_get_blacklist(q):
-        raise HTTPException(403, "Пользователь недоступен")
-
-    return {"user": {"nick": q, "name": target["name"], "avatar": target["avatar"]}}
-
-
-# ============================================================
-#                           CHAT
-# ============================================================
-
-@app.post("/api/chat/start")
-async def start_chat(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer == nick:
-        raise HTTPException(400, "Некорректный пользователь")
-
-    target = await db_get_user(peer)
-    if not target:
-        raise HTTPException(400, "Некорректный пользователь")
-
-    if peer in await db_get_blacklist(nick):
-        raise HTTPException(403, "Пользователь в чёрном списке")
-    if nick in await db_get_blacklist(peer):
-        raise HTTPException(403, "Пользователь недоступен")
-
-    await db_add_contact(nick, peer)
-    await db_add_contact(peer, nick)
-
-    me_pub = await user_public(nick)
-    peer_pub = {"nick": peer, "name": target["name"], "avatar": target["avatar"]}
-
-    await push_to(peer, {"type": "contact_added", "user": me_pub})
-    await push_to(nick, {"type": "contact_added", "user": peer_pub})
-    return {"ok": True, "peer": peer_pub}
-
-
-@app.post("/api/chat/send")
-async def send_msg(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = d.get("to")
-    text = (d.get("text") or "").strip()
-    if not peer or not text:
-        raise HTTPException(400, "Ошибка отправки")
-    if len(text) > 2000:
-        raise HTTPException(400, "Сообщение слишком длинное")
-
-    target = await db_get_user(peer)
-    if not target:
-        raise HTTPException(400, "Пользователь не найден")
-
-    if peer in await db_get_blacklist(nick):
-        raise HTTPException(403, "Вы добавили пользователя в чёрный список")
-    if nick in await db_get_blacklist(peer):
-        raise HTTPException(403, "Пользователь добавил вас в чёрный список")
-
-    if peer not in await db_get_contacts(nick):
-        await db_add_contact(nick, peer)
-        await push_to(nick, {"type": "contact_added",
-                             "user": {"nick": peer,
-                                      "name": target["name"],
-                                      "avatar": target["avatar"]}})
-
-    if nick not in await db_get_contacts(peer):
-        me_pub = await user_public(nick)
-        await db_add_contact(peer, nick)
-        await push_to(peer, {"type": "contact_added", "user": me_pub})
-
-    msg = {
-        "id": secrets.token_hex(8),
-        "from": nick,
-        "to": peer,
+    DB["users"][uid] = user
+    DB["logins"][login.lower()] = uid
+    friends_of(uid)
+    requests_of(uid)
+    return user
+
+
+def add_post(author_id: int, owner_id: int, text: str) -> dict:
+    pid = DB["next_post_id"]
+    DB["next_post_id"] += 1
+    post = {
+        "id": pid,
+        "author_id": author_id,
+        "owner_id": owner_id,
         "text": text,
-        "ts": time.time(),
+        "created": time.time(),
+        "likes": set(),
+        "comments": [],
     }
-    await db_save_message(msg)
-
-    await push_to(peer, {"type": "message", "msg": msg})
-    await push_to(nick, {"type": "message", "msg": msg, "self": True})
-    return {"ok": True, "msg": msg}
+    DB["posts"][pid] = post
+    return post
 
 
-@app.post("/api/chat/end")
-async def end_chat(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer == nick:
-        raise HTTPException(400, "Некорректный пользователь")
-    if not await db_get_user(peer):
-        raise HTTPException(400, "Некорректный пользователь")
-
-    await db_del_contact(nick, peer)
-    await db_del_contact(peer, nick)
-    await db_del_messages_between(nick, peer)
-
-    await push_to(peer, {"type": "contact_removed", "nick": nick})
-    await push_to(nick, {"type": "contact_removed", "nick": peer})
-    return {"ok": True}
-
-
-@app.post("/api/chat/messages")
-async def messages(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = d.get("peer")
-    target = await db_get_user(peer)
-    if not target:
-        raise HTTPException(400, "Пользователь не найден")
-
-    msgs = await db_get_messages(nick, peer)
-    return {
-        "messages": msgs,
-        "peer": {"nick": peer, "name": target["name"], "avatar": target["avatar"]},
-    }
-
-
-# ============================================================
-#                        BLACKLIST
-# ============================================================
-
-@app.post("/api/blacklist/add")
-async def bl_add(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = (d.get("nick") or "").strip().lstrip("@")
-    if peer == nick:
-        raise HTTPException(400, "Некорректный пользователь")
-    if not await db_get_user(peer):
-        raise HTTPException(400, "Некорректный пользователь")
-
-    await db_add_blacklist(nick, peer)
-    await db_del_contact(nick, peer)
-    await push_to(nick, {"type": "blacklist_changed"})
-    return {"ok": True}
-
-
-@app.post("/api/blacklist/remove")
-async def bl_remove(body: EncBody, x_token: Optional[str] = Header(None)):
-    nick = await auth(x_token)
-    d = parse(body)
-    peer = (d.get("nick") or "").strip().lstrip("@")
-    await db_del_blacklist(nick, peer)
-    await push_to(nick, {"type": "blacklist_changed"})
-    return {"ok": True}
-
-
-# ============================================================
-#                    PNG-ГЕНЕРАТОР АВАТАРА
-# ============================================================
-
-def make_png(colors, scale: int = 32) -> bytes:
-    GRID = 8
-    W = H = GRID * scale
-    raw = bytearray()
-    for y in range(H):
-        raw.append(0)
-        gy = y // scale
-        row_base = gy * GRID
-        for x in range(W):
-            gx = x // scale
-            c = colors[row_base + gx]
-            raw.append(int(c[1:3], 16))
-            raw.append(int(c[3:5], 16))
-            raw.append(int(c[5:7], 16))
-
-    def chunk(ctype: bytes, data: bytes) -> bytes:
-        body = ctype + data
-        return struct.pack(">I", len(data)) + body + \
-               struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-
-    sig = b"\x89PNG\r\n\x1a\n"
-    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    idat = chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    iend = chunk(b"IEND", b"")
-    return sig + ihdr + idat + iend
-
-
-@app.get("/avatar/{nick}.png")
-async def avatar_png(nick: str):
-    u = await db_get_user(nick)
-    colors = u["avatar"] if u else ["#cfd8dc"] * 64
-    png = make_png(colors, scale=32)
-    return Response(content=png, media_type="image/png",
-                    headers={"Cache-Control": "public, max-age=600"})
-
-
-# ============================================================
-#                    OPENGRAPH
-# ============================================================
-
-try:
-    from PIL import Image as PILImage, ImageDraw, ImageFont
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
-_OG_PATTERNS = [
-    re.compile(r'<meta[^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bproperty=["\'](og:[a-zA-Z0-9:_-]+)["\']', re.I),
-    re.compile(r'<meta[^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\'][^>]*\bcontent=["\']([^"\']*)["\']', re.I),
-    re.compile(r'<meta[^>]*\bcontent=["\']([^"\']*)["\'][^>]*\bname=["\'](twitter:[a-zA-Z0-9:_-]+)["\']', re.I),
-]
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-_WS_RE = re.compile(r"\s+")
-
-
-def is_safe_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-    except Exception:
-        return False
-    if p.scheme not in ("http", "https"):
-        return False
-    host = (p.hostname or "").strip()
-    if not host:
-        return False
-    if host.lower() in ("localhost", "localhost.localdomain"):
-        return False
-    try:
-        ip = ipaddress.ip_address(host)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return False
-    except ValueError:
-        pass
-    return True
-
-
-def _resolve_image(base_url: str, image: str) -> str:
-    image = (image or "").strip()
-    if not image:
-        return ""
-    if not image.startswith(("http://", "https://")):
-        try:
-            image = urljoin(base_url, image)
-        except Exception:
-            return ""
-    if not image.startswith(("http://", "https://")):
-        return ""
-    return image[:1500]
-
-
-def fetch_og(url: str) -> dict:
-    """Тянет OG внешнего сайта + помечает стабильность."""
-    now = time.time()
-    cached = OG_CACHE.get(url)
-    if cached and now - cached[1] < OG_CACHE_TTL:
-        return cached[0]
-
-    result = {
-        "url": url,
-        "status": "unstable",
-        "stable": False,
-        "title": "", "description": "", "image": "", "site_name": "",
-    }
-
-    body_text = ""
-    try:
-        req = UrlRequest(url, method="GET", headers={
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/120.0.0.0 Safari/537.36"),
-            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8,ru;q=0.6",
-        })
-        with urlopen(req, timeout=7) as r:
-            if 200 <= r.status < 400:
-                result["status"] = "stable"
-                result["stable"] = True
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if "html" in ct or "xml" in ct:
-                body_text = r.read(300_000).decode("utf-8", errors="ignore")
-    except Exception:
-        pass
-
-    if body_text:
-        data: Dict[str, str] = {}
-        for pat in _OG_PATTERNS:
-            for m in pat.finditer(body_text):
-                key = m.group(1).lower()
-                if key not in data:
-                    data[key] = m.group(2)
-
-        if "og:title" not in data and "twitter:title" in data:
-            data["og:title"] = data["twitter:title"]
-        if "og:description" not in data and "twitter:description" in data:
-            data["og:description"] = data["twitter:description"]
-        if "og:image" not in data and "twitter:image" in data:
-            data["og:image"] = data["twitter:image"]
-        if "og:title" not in data:
-            tm = _TITLE_RE.search(body_text)
-            if tm:
-                data["og:title"] = _WS_RE.sub(" ", tm.group(1)).strip()[:200]
-
-        result["title"] = html_module.unescape((data.get("og:title") or "").strip())[:200]
-        result["description"] = html_module.unescape((data.get("og:description") or "").strip())[:400]
-        result["image"] = _resolve_image(url, data.get("og:image") or "")
-        result["site_name"] = html_module.unescape((data.get("og:site_name") or "").strip())[:80]
-
-    OG_CACHE[url] = (result, now)
-    return result
-
-
-@app.post("/api/og")
-async def og_endpoint(body: EncBody, x_token: Optional[str] = Header(None)):
-    await auth(x_token)
-    d = parse(body)
-    url = (d.get("url") or "").strip()
-    if not is_safe_url(url):
-        raise HTTPException(400, "Invalid URL")
-    return await run_in_threadpool(fetch_og, url)
-
-
-# ---- Наша собственная картинка для рендера ссылки на наш сайт ----
-
-def _pick_font(size: int, bold: bool = True):
-    if not PIL_AVAILABLE:
+def current_user(request: Request) -> Optional[dict]:
+    sid = request.cookies.get("sid")
+    if not sid:
         return None
-    names = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
-        "arialbd.ttf" if bold else "arial.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold
-        else "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "C:\\Windows\\Fonts\\arialbd.ttf" if bold
-        else "C:\\Windows\\Fonts\\arial.ttf",
-    ]
-    for n in names:
-        try:
-            return ImageFont.truetype(n, size)
-        except Exception:
-            continue
-    try:
-        return ImageFont.load_default()
-    except Exception:
-        return None
+    uid = DB["sessions"].get(sid)
+    return DB["users"].get(uid) if uid else None
 
 
-def make_og_png(status: str) -> bytes:
-    if not PIL_AVAILABLE:
-        return b""
-    from io import BytesIO
-    W, H = 1200, 630
-    stable = (status == "stable")
-    rgb = (34, 197, 94) if stable else (202, 138, 4)
-    label = "stable" if stable else "unstable"
-    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
+# =========================================================================
+#  ВСПОМОГАТЕЛЬНОЕ
+# =========================================================================
 
-    img = PILImage.new("RGB", (W, H), (17, 17, 19))
-    draw = ImageDraw.Draw(img)
+esc = html.escape
 
-    for y in range(240):
-        k = 1 - y / 240
-        c = (int(24 + 10 * k), int(24 + 10 * k), int(27 + 10 * k))
-        draw.line([(0, y), (W, y)], fill=c)
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн",
+          "июл", "авг", "сен", "окт", "ноя", "дек"]
 
-    f_logo = _pick_font(58, bold=True)
-    if f_logo:
-        draw.text((60, 60), "sldchat", fill=(244, 244, 245), font=f_logo)
-
-    draw.ellipse((1110, 68, 1148, 106), fill=rgb)
-
-    f_big = _pick_font(190, bold=True)
-    if f_big:
-        bbox = draw.textbbox((0, 0), label, font=f_big)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        draw.text(((W - tw) / 2 - bbox[0], (H - th) / 2 - bbox[1] - 50),
-                  label, fill=rgb, font=f_big)
-
-    f_time = _pick_font(30, bold=False)
-    if f_time:
-        bbox2 = draw.textbbox((0, 0), now, font=f_time)
-        tw2 = bbox2[2] - bbox2[0]
-        draw.text(((W - tw2) / 2 - bbox2[0], 550),
-                  now, fill=(113, 113, 122), font=f_time)
-
-    buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+AVA_COLORS = ["#45688e", "#5b7fa6", "#6d8ba7", "#7a6d9e",
+              "#8a6a4a", "#4a7c59", "#8a4a5c", "#3f6b8a"]
 
 
-def make_og_svg(status: str) -> str:
-    stable = (status == "stable")
-    color = "#22c55e" if stable else "#ca8a04"
-    label = "stable" if stable else "unstable"
-    now = time.strftime("%H:%M:%S UTC · %d.%m.%Y", time.gmtime())
-    font = "-apple-system,'Segoe UI',Roboto,Ubuntu,sans-serif"
-    mono = "ui-monospace,Menlo,Consolas,monospace"
+def fmt_time(ts: float) -> str:
+    now = datetime.now()
+    d = datetime.fromtimestamp(ts)
+    if d.date() == now.date():
+        return "сегодня в " + d.strftime("%H:%M")
+    if (now.date() - d.date()).days == 1:
+        return "вчера в " + d.strftime("%H:%M")
+    return "{0} {1} {2}".format(d.day, MONTHS[d.month - 1], d.year)
+
+
+def avatar(u: dict, size: int = 50) -> str:
+    color = AVA_COLORS[u["id"] % len(AVA_COLORS)]
+    ini = esc((u["name"][:1] + u["surname"][:1]).upper())
+    fs = max(12, size // 2)
     return (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" '
-        'width="1200" height="630">'
-        '<rect width="1200" height="630" fill="#111113"/>'
-        f'<text x="60" y="100" font-family="{font}" font-size="52" '
-        'font-weight="700" fill="#f4f4f5">sldchat</text>'
-        f'<circle cx="1130" cy="80" r="14" fill="{color}"/>'
-        f'<text x="600" y="380" text-anchor="middle" font-family="{font}" '
-        f'font-size="170" font-weight="800" fill="{color}">{label}</text>'
-        f'<text x="600" y="580" text-anchor="middle" font-family="{mono}" '
-        f'font-size="28" fill="#71717a">{now}</text></svg>'
-    )
+        '<div class="ava" style="width:{w}px;height:{w}px;background:{c};'
+        'line-height:{w}px;font-size:{f}px">{i}</div>'
+    ).format(w=size, c=color, f=fs, i=ini)
 
 
-@app.get("/og-image.png")
-def og_image_png(status: str = "stable"):
-    if status not in ("stable", "unstable"):
-        status = "unstable"
-    png = make_og_png(status)
-    if png:
-        return Response(content=png, media_type="image/png",
-                        headers={"Cache-Control": "no-store, max-age=0"})
-    svg = make_og_svg(status)
-    return Response(content=svg, media_type="image/svg+xml; charset=utf-8",
-                    headers={"Cache-Control": "no-store, max-age=0"})
+def form_button(action: str, label: str, cls: str = "btn") -> str:
+    return (
+        '<form method="post" action="{a}" class="inline">'
+        '<button class="{c}">{l}</button></form>'
+    ).format(a=action, c=cls, l=label)
 
 
-# ============================================================
-#                          FRONTEND
-# ============================================================
+def back_url(request: Request, default: str = "/") -> str:
+    ref = request.headers.get("referer")
+    if ref and ref.startswith("http"):
+        # оставляем только путь
+        try:
+            return "/" + ref.split("//", 1)[1].split("/", 1)[1]
+        except Exception:
+            return default
+    return ref or default
 
-PAGE_TEMPLATE = r"""<!DOCTYPE html>
+
+def go(url: str, sid: Optional[str] = None) -> RedirectResponse:
+    r = RedirectResponse(url, status_code=303)
+    if sid:
+        r.set_cookie("sid", sid, httponly=True, max_age=60 * 60 * 24 * 30)
+    return r
+
+
+# =========================================================================
+#  ВЁРСТКА
+# =========================================================================
+
+CSS = """
+* { box-sizing: border-box; }
+html, body { margin:0; padding:0; }
+body {
+  background:#e8ebf0;
+  font: 11px/1.45 Verdana, Tahoma, Arial, sans-serif;
+  color:#2f2f2f;
+}
+a { color:#2b587a; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.clear { clear:both; }
+.cnt { color:#999; }
+.inline { display:inline; }
+
+/* ---------- шапка ---------- */
+#header { background:#45688e; border-bottom:1px solid #2d4a6b; height:40px; }
+#header .wrap { width:820px; margin:0 auto; height:40px; }
+.logo {
+  float:left; color:#fff; line-height:40px;
+  font:bold 20px Tahoma, Verdana, sans-serif; letter-spacing:-0.5px;
+}
+.logo:hover { text-decoration:none; }
+#header .search { float:left; margin:9px 0 0 30px; }
+#header .search input[type=text] {
+  width:180px; padding:3px 5px; border:1px solid #2d4a6b;
+  font:11px Verdana; background:#fff; color:#000;
+}
+#header .search button {
+  padding:3px 8px; border:1px solid #2d4a6b; background:#5c86b4;
+  color:#fff; font:11px Verdana; cursor:pointer;
+}
+#header .search button:hover { background:#6d95c0; }
+.huser { float:right; color:#dfe7f0; line-height:40px; }
+.huser a { color:#fff; }
+.huser a.logout { color:#c3d3e6; margin-left:8px; }
+
+/* ---------- каркас ---------- */
+.wrap { width:820px; margin:0 auto; }
+#main { margin-top:12px; margin-bottom:40px; }
+#left { float:left; width:160px; }
+#content { margin-left:172px; }
+
+.lmenu { background:#fff; border:1px solid #c9d3de; }
+.lmenu a {
+  display:block; padding:5px 8px; border-bottom:1px solid #eef1f5;
+}
+.lmenu a:last-child { border-bottom:none; }
+.lmenu a:hover { background:#f0f4f9; text-decoration:none; }
+
+/* ---------- блоки ---------- */
+.box { background:#fff; border:1px solid #c9d3de; margin-bottom:12px; }
+.box h2 {
+  margin:0; padding:8px 12px; font:bold 12px Tahoma, Verdana, sans-serif;
+  background:#f0f2f5; border-bottom:1px solid #dde3ea; color:#45688e;
+}
+.box .body { padding:12px; }
+
+/* ---------- формы ---------- */
+input[type=text], input[type=password], textarea, select {
+  font:11px Verdana; border:1px solid #c0c9d3; padding:4px;
+  width:100%; color:#000; background:#fff;
+}
+textarea { resize:vertical; }
+.btn {
+  display:inline-block; padding:4px 12px; background:#5c86b4; color:#fff;
+  border:1px solid #45688e; cursor:pointer; font:11px Verdana;
+}
+.btn:hover { background:#45688e; text-decoration:none; }
+.btn-sm { padding:3px 8px; }
+.linkbtn {
+  background:none; border:none; color:#2b587a; cursor:pointer;
+  font:11px Verdana; padding:0;
+}
+.linkbtn:hover { text-decoration:underline; }
+.lbl { display:block; margin:8px 0 3px; color:#666; }
+.err {
+  background:#ffe9e9; border:1px solid #e0a0a0; color:#a00;
+  padding:6px 8px; margin-bottom:10px;
+}
+
+/* ---------- аватар ---------- */
+.ava {
+  display:block; color:#fff; text-align:center; font-family:Tahoma;
+  font-weight:bold; border-radius:2px; overflow:hidden;
+}
+
+/* ---------- профиль ---------- */
+.profile { background:#fff; border:1px solid #c9d3de; margin-bottom:12px; }
+.ptop { padding:15px; overflow:hidden; }
+.pava { float:left; margin-right:15px; }
+.profile h1 { font:bold 16px Tahoma, Verdana, sans-serif; margin:0 0 10px; color:#2b587a; }
+.pinfo div { padding:2px 0; }
+.pinfo b { color:#777; font-weight:normal; }
+.pbtns { margin-top:12px; }
+
+/* ---------- записи ---------- */
+.post { border-bottom:1px solid #e5e9ee; padding:12px; overflow:hidden; }
+.post:last-child { border-bottom:none; }
+.pava2 { float:left; }
+.pbody { margin-left:62px; }
+.pauthor { font-weight:bold; }
+.ptime { color:#999; }
+.ptext {
+  margin:6px 0; white-space:pre-wrap; word-wrap:break-word;
+  font-size:12px; line-height:1.5;
+}
+.pact { color:#999; padding:2px 0; }
+.comments { margin-top:4px; }
+.comment { border-top:1px solid #eef1f5; padding:6px 0 2px; }
+.cname { font-weight:bold; }
+.cform { margin-top:8px; }
+.cform input { width:70%; display:inline-block; }
+.empty { padding:12px; color:#999; }
+
+/* ---------- авторизация ---------- */
+.authwrap { width:400px; margin:50px auto; }
+.authwrap .lbl { margin-top:10px; }
+.radio { margin:4px 12px 4px 0; }
+"""
+
+PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-content">
-<meta name="theme-color" content="#0a84ff">
-<meta name="color-scheme" content="light dark">
-__OG_TAGS__
-<title>__TITLE__</title>
-<style>
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{
-  margin:0;padding:0;height:100%;width:100%;
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Ubuntu,sans-serif;
-  overscroll-behavior:none;
-  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
-  overflow:hidden;
-}
-input,textarea{user-select:text;-webkit-user-select:text}
-
-:root{
-  --bg:#f2f2f7;--fg:#111;--card:#fff;--muted:#8a8a8e;--border:#e3e3e8;
-  --accent:#0a84ff;--danger:#ff3b30;
-  --in-bub:#fff;--in-fg:#111;--out-bub:#0a84ff;--out-fg:#fff;
-  --overlay:rgba(0,0,0,.45);--sidebar:#f7f7fa;
-}
-body.dark{
-  --bg:#0d0d0f;--fg:#f2f2f7;--card:#1c1c1e;--muted:#8e8e93;--border:#2c2c2e;
-  --accent:#0a84ff;--danger:#ff453a;
-  --in-bub:#2c2c2e;--in-fg:#f2f2f7;--out-bub:#0a84ff;--out-fg:#fff;
-  --overlay:rgba(0,0,0,.65);--sidebar:#141416;
-}
-body{background:var(--bg);color:var(--fg);transition:background .2s,color .2s}
-
-#app{
-  position:fixed;
-  top:var(--app-top,0px);
-  left:0;right:0;
-  height:var(--app-h,100dvh);
-  display:flex;flex-direction:column;
-  overflow:hidden;
-  background:var(--bg);
-  transition:height .18s ease-out;
-}
-@media (min-width:900px){
-  #app{position:fixed;top:0;left:0;right:0;height:100vh;height:100dvh}
-}
-
-.screen{
-  position:absolute;inset:0;
-  display:flex;flex-direction:column;
-  opacity:0;visibility:hidden;pointer-events:none;
-  transition:opacity .28s ease,visibility .28s ease;
-}
-.screen.active{opacity:1;visibility:visible;pointer-events:auto}
-
-#screen-loading{align-items:center;justify-content:center;background:var(--bg)}
-.spinner{
-  width:40px;height:40px;
-  border:3px solid var(--border);
-  border-top-color:var(--accent);
-  border-radius:50%;
-  animation:spin .9s linear infinite;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-.loading-label{margin-top:14px;color:var(--muted);font-size:14px;letter-spacing:.5px}
-
-#screen-auth{flex-direction:column;align-items:center;overflow-y:auto}
-.auth-wrap{padding:28px 22px;display:flex;flex-direction:column;gap:14px;min-height:100%;
-  width:100%;max-width:440px}
-.logo{font-size:38px;font-weight:800;letter-spacing:-1px;text-align:center;margin:14px 0 4px;
-  background:linear-gradient(135deg,#0a84ff,#5856d6);-webkit-background-clip:text;
-  background-clip:text;-webkit-text-fill-color:transparent}
-.tabs{display:flex;background:var(--card);border-radius:12px;padding:4px;gap:4px;border:1px solid var(--border)}
-.tab{flex:1;padding:10px;border:0;background:transparent;color:var(--fg);border-radius:9px;
-  font-size:15px;font-weight:600;cursor:pointer;transition:.2s}
-.tab.active{background:var(--accent);color:#fff}
-.tabpane{display:flex;flex-direction:column;gap:10px;animation:fadeIn .25s ease}
-.tabpane.hidden{display:none}
-@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
-
-input{
-  width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--border);
-  background:var(--card);color:var(--fg);font-size:16px;outline:none;
-  transition:border-color .15s,box-shadow .15s;
-}
-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(10,132,255,.15)}
-.btn{
-  padding:13px 16px;border-radius:12px;border:1px solid var(--border);
-  background:var(--card);color:var(--fg);font-size:15px;font-weight:600;cursor:pointer;
-  transition:transform .1s,background .15s,border-color .15s,color .15s,filter .15s;
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-}
-.btn:active{transform:scale(.97)}
-.btn.primary{background:var(--accent);color:#fff;border-color:transparent}
-.btn.primary:hover{filter:brightness(1.06)}
-.btn.danger{background:var(--danger);color:#fff;border-color:transparent}
-.btn.full{width:100%}
-.btn.small{padding:8px 12px;font-size:13px}
-.btn.icon-only{padding:0;width:46px;height:46px;flex-shrink:0}
-.row{display:flex;gap:8px}
-.row input{flex:1}
-.err{color:var(--danger);font-size:14px;text-align:center;min-height:18px}
-.muted{color:var(--muted);font-size:13px}
-.big-name{font-size:20px;font-weight:700;margin-top:6px}
-.center{text-align:center;align-items:center}
-
-.icon{width:22px;height:22px;display:block;flex-shrink:0;color:currentColor}
-.icon-sm{width:18px;height:18px}
-#svg-sprite{position:absolute;width:0;height:0;overflow:hidden}
-
-.ava-editor{display:flex;flex-direction:column;gap:10px;align-items:center;background:var(--card);
-  padding:14px;border-radius:16px;border:1px solid var(--border)}
-.ava-editor canvas{width:220px;height:220px;border-radius:12px;background:#fff;
-  touch-action:none;cursor:crosshair;image-rendering:pixelated}
-.palette{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;width:100%}
-.swatch{width:100%;aspect-ratio:1;border-radius:8px;border:2px solid transparent;
-  cursor:pointer;transition:.15s}
-.swatch.active{border-color:var(--accent);transform:scale(1.12)}
-.ava-tools{display:flex;gap:8px;width:100%}
-.ava-tools .btn{flex:1}
-
-#screen-app.active{flex-direction:row}
-.sidebar{display:flex;flex-direction:column;overflow:hidden;background:var(--sidebar);
-  border-right:1px solid var(--border)}
-.chat-pane{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);flex:1;min-width:0}
-
-@media (max-width: 899px){
-  #screen-app.active{flex-direction:row}
-  .sidebar{flex:1;border-right:0}
-  .chat-pane{display:none;flex:1}
-  #screen-app.chat-open .sidebar{display:none}
-  #screen-app.chat-open .chat-pane{display:flex}
-  .back-mobile{display:flex !important}
-}
-@media (min-width: 900px){
-  .sidebar{flex:0 0 340px;width:340px}
-  .back-mobile{display:none !important}
-}
-
-.topbar{
-  display:flex;align-items:center;gap:8px;padding:10px 12px;
-  background:var(--card);border-bottom:1px solid var(--border);
-  padding-top:max(10px,env(safe-area-inset-top));
-  flex-shrink:0;
-}
-.ava-small{width:40px;height:40px;border-radius:50%;flex-shrink:0;background:#ddd;image-rendering:pixelated}
-.me-info{flex:1;min-width:0;overflow:hidden}
-.me-name{font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.me-nick{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.icon-btn{
-  width:40px;height:40px;border-radius:50%;border:0;background:transparent;color:var(--fg);
-  cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  transition:background .15s,transform .1s;padding:0;
-}
-.icon-btn:active{background:var(--border);transform:scale(.94)}
-.icon-btn:hover{background:var(--border)}
-.icon-btn.danger{color:var(--danger)}
-.icon-btn.accent{color:var(--accent)}
-
-.list{flex:1;overflow-y:auto;padding:8px;background:var(--sidebar)}
-.contact{
-  display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;
-  background:transparent;margin-bottom:2px;cursor:pointer;
-  transition:background .18s ease,border-color .18s ease,transform .12s ease;
-  border:1px solid transparent;position:relative;
-  will-change:transform,opacity;
-}
-.contact:hover{background:var(--card);border-color:var(--border)}
-.contact:active{transform:scale(.985)}
-.contact.selected{background:var(--card);border-color:var(--border)}
-.contact canvas.ava-small{transition:transform .2s ease}
-.contact.selected canvas.ava-small{transform:scale(1.04)}
-.contact .badge{
-  min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;
-  font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
-  padding:0 6px;flex-shrink:0;
-  will-change:transform,opacity;
-}
-.empty{text-align:center;color:var(--muted);padding:60px 20px;font-size:15px;line-height:1.5;
-  animation:fadeIn .25s ease}
-
-.empty-pane{
-  display:none;flex:1;flex-direction:column;align-items:center;justify-content:center;
-  color:var(--muted);gap:14px;font-size:15px;padding:30px;text-align:center;
-}
-.empty-pane .empty-icon{width:72px;height:72px;opacity:.25}
-.empty-pane.hidden{display:none !important}
-@media (min-width: 900px){ .empty-pane{display:flex} }
-
-.chat-content{display:flex;flex-direction:column;flex:1;overflow:hidden;min-width:0;animation:fadeIn .25s ease}
-.chat-content.hidden{display:none}
-
-.messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px;
-  scroll-behavior:smooth}
-.bubble{
-  max-width:78%;padding:9px 13px;border-radius:18px;font-size:15px;line-height:1.35;
-  word-wrap:break-word;word-break:break-word;white-space:pre-wrap;
-  animation:bubbleIn .22s cubic-bezier(.2,.8,.3,1);
-}
-@keyframes bubbleIn{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
-.bubble.out{align-self:flex-end;background:var(--out-bub);color:var(--out-fg);border-bottom-right-radius:6px}
-.bubble.in{align-self:flex-start;background:var(--in-bub);color:var(--in-fg);
-  border-bottom-left-radius:6px;border:1px solid var(--border)}
-
-/* ---------- ССЫЛКИ в тексте ---------- */
-.bubble .msg-link{
-  color:inherit;
-  text-decoration:underline;
-  text-decoration-thickness:1px;
-  text-underline-offset:2px;
-  text-decoration-color:rgba(255,255,255,.55);
-  cursor:pointer;
-  pointer-events:auto;
-  -webkit-user-select:none;user-select:none;
-  -webkit-touch-callout:none;
-}
-.bubble.in .msg-link{text-decoration-color:rgba(0,0,0,.3)}
-
-/* ---------- OG-КАРТОЧКА ---------- */
-.bubble.has-og{ min-width:280px; max-width:78%; }
-
-.og-card{
-  display:block; width:100%; margin-top:8px;
-  background:rgba(0,0,0,.05);
-  border:1px solid rgba(0,0,0,.08);
-  border-radius:12px; overflow:hidden;
-  cursor:pointer; pointer-events:auto;
-  animation:fadeIn .25s ease; box-sizing:border-box;
-  -webkit-tap-highlight-color:transparent;
-  text-decoration:none; color:inherit;
-}
-.bubble.out .og-card{ background:rgba(255,255,255,.14); border-color:rgba(255,255,255,.18); }
-
-.og-thumb{
-  display:block; width:100%; height:auto; max-height:220px;
-  object-fit:cover; background:rgba(0,0,0,.06);
-  pointer-events:none; user-select:none; -webkit-user-drag:none;
-}
-
-.og-body{ padding:10px 12px; }
-
-.og-site{
-  display:flex; align-items:center; gap:6px;
-  font-size:11px; font-weight:600; text-transform:uppercase;
-  letter-spacing:.5px; opacity:.75; margin-bottom:4px;
-}
-.og-dot{
-  width:8px; height:8px; border-radius:50%; flex-shrink:0;
-}
-.og-dot.stable{ background:#22c55e; }
-.og-dot.unstable{ background:#ca8a04; }
-
-.og-title{
-  font-size:14px; font-weight:700; line-height:1.3; margin-bottom:3px;
-  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
-  overflow:hidden;
-}
-.og-desc{
-  font-size:12px; line-height:1.35; opacity:.8;
-  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
-  overflow:hidden;
-}
-
-.composer{
-  display:flex;gap:8px;padding:10px 12px;padding-bottom:max(10px,env(safe-area-inset-bottom));
-  background:var(--card);border-top:1px solid var(--border);align-items:center;
-}
-.composer input{border-radius:20px}
-.composer .btn{border-radius:50%;width:46px;height:46px;padding:0;flex-shrink:0}
-
-.overlay{
-  position:absolute;inset:0;background:var(--overlay);display:flex;align-items:flex-end;
-  justify-content:center;z-index:50;
-  opacity:1;visibility:visible;
-  transition:opacity .22s ease,visibility .22s ease;
-}
-.overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}
-.modal{
-  background:var(--card);width:100%;max-height:88%;border-radius:22px 22px 0 0;
-  display:flex;flex-direction:column;padding-bottom:env(safe-area-inset-bottom);
-  transform:translateY(0);
-  transition:transform .28s cubic-bezier(.2,.8,.3,1);
-}
-.overlay.hidden .modal{transform:translateY(30px)}
-@media(min-width:700px){
-  .overlay{align-items:center}
-  .modal{max-width:440px;border-radius:20px;max-height:80%}
-  .overlay.hidden .modal{transform:translateY(20px) scale(.98)}
-}
-.modal-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;
-  border-bottom:1px solid var(--border);font-size:17px;font-weight:700}
-.modal-body{padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
-.setting{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.setting-col{display:flex;flex-direction:column;gap:8px}
-.setting-title{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-.seg{display:flex;background:var(--bg);border-radius:10px;padding:3px;gap:3px;border:1px solid var(--border)}
-.seg-btn{padding:7px 14px;border:0;background:transparent;color:var(--fg);border-radius:8px;
-  cursor:pointer;font-size:14px;font-weight:600;transition:.15s}
-.seg-btn.active{background:var(--accent);color:#fff}
-.search-card{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;
-  background:var(--bg);border-radius:16px;border:1px solid var(--border);
-  animation:fadeIn .25s ease}
-.ava-mid{width:96px;height:96px;border-radius:50%;image-rendering:pixelated;background:#ddd}
-#infoAva{width:140px;height:140px;border-radius:50%;image-rendering:pixelated;background:#ddd;margin:0 auto}
-.bl-item{display:flex;align-items:center;gap:10px;padding:8px;background:var(--bg);
-  border-radius:12px;margin-bottom:6px;animation:fadeIn .2s ease}
-.bl-item canvas{width:32px;height:32px;border-radius:50%;image-rendering:pixelated;flex-shrink:0}
-.bl-item .me-info{flex:1}
-.bl-item button{width:32px;height:32px;border-radius:50%;border:0;background:var(--danger);
-  color:#fff;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;padding:0}
-.bl-item button .icon{width:16px;height:16px}
-
-.toast{
-  position:fixed;bottom:40px;left:50%;
-  transform:translateX(-50%) translateY(20px);
-  background:rgba(0,0,0,.88);color:#fff;
-  padding:10px 18px;border-radius:20px;font-size:14px;font-weight:500;
-  opacity:0;transition:opacity .25s,transform .25s;
-  z-index:9999;pointer-events:none;
-  box-shadow:0 8px 24px rgba(0,0,0,.3);
-}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-</style>
+<title>{title}</title>
+<style>{css}</style>
 </head>
 <body>
-
-<svg id="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="3"/>
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-  </symbol>
-  <symbol id="i-arrow-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-    <line x1="19" y1="12" x2="5" y2="12"/>
-    <polyline points="12 19 5 12 12 5"/>
-  </symbol>
-  <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="10"/>
-    <line x1="12" y1="16" x2="12" y2="12"/>
-    <line x1="12" y1="8" x2="12.01" y2="8"/>
-  </symbol>
-  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-    <line x1="18" y1="6" x2="6" y2="18"/>
-    <line x1="6" y1="6" x2="18" y2="18"/>
-  </symbol>
-  <symbol id="i-send" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-    <path d="M3.4 20.4l17.45-7.48a1 1 0 0 0 0-1.84L3.4 3.6a.99.99 0 0 0-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z"/>
-  </symbol>
-  <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-    <line x1="12" y1="5" x2="12" y2="19"/>
-    <line x1="5" y1="12" x2="19" y2="12"/>
-  </symbol>
-  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="11" cy="11" r="7"/>
-    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-  </symbol>
-  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <polyline points="3 6 5 6 21 6"/>
-    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-    <path d="M10 11v6M14 11v6"/>
-    <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
-  </symbol>
-  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
-  </symbol>
-  <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-    <circle cx="12" cy="7" r="4"/>
-  </symbol>
-</svg>
-
-<div id="app">
-
-  <div class="screen active" id="screen-loading">
-    <div class="spinner"></div>
-    <div class="loading-label">sldchat</div>
+<div id="header">
+  <div class="wrap">
+    <a class="logo" href="/">ВКонтактик</a>
+    <form class="search" method="get" action="/people">
+      <input type="text" name="q" value="{q}" placeholder="Поиск людей">
+      <button type="submit">Найти</button>
+    </form>
+    {userbox}
   </div>
-
-  <div class="screen" id="screen-auth">
-    <div class="auth-wrap">
-      <h1 class="logo">sldchat</h1>
-      <div class="tabs">
-        <button class="tab active" data-tab="login" data-i18n="login">Вход</button>
-        <button class="tab" data-tab="reg" data-i18n="register">Регистрация</button>
-      </div>
-
-      <div id="tab-login" class="tabpane">
-        <input id="li-nick" data-i18n-ph="ph_nick" placeholder="Ник" autocomplete="username">
-        <input id="li-pass" type="password" data-i18n-ph="ph_pass" placeholder="Пароль" autocomplete="current-password">
-        <button class="btn primary" onclick="doLogin()" data-i18n="login">Войти</button>
-      </div>
-
-      <div id="tab-reg" class="tabpane hidden">
-        <div class="ava-editor">
-          <canvas id="avaCanvas" width="256" height="256"></canvas>
-          <div class="palette" id="palette"></div>
-          <div class="ava-tools">
-            <button class="btn small" onclick="regEditor.clear()" data-i18n="clear">Очистить</button>
-            <button class="btn small" onclick="regEditor.random()" data-i18n="random">Случайно</button>
-            <button class="btn small" onclick="regEditor.fill()" data-i18n="fill">Залить</button>
-          </div>
-        </div>
-        <input id="rg-name" data-i18n-ph="ph_name" placeholder="Имя">
-        <input id="rg-nick" data-i18n-ph="ph_nick" placeholder="Ник">
-        <input id="rg-pass" type="password" data-i18n-ph="ph_pass" placeholder="Пароль">
-        <input id="rg-pass2" type="password" data-i18n-ph="ph_pass2" placeholder="Повтор пароля">
-        <button class="btn primary" onclick="doRegister()" data-i18n="create">Создать аккаунт</button>
-      </div>
-
-      <div id="auth-err" class="err"></div>
-    </div>
-  </div>
-
-  <div class="screen" id="screen-app">
-
-    <aside class="sidebar">
-      <header class="topbar">
-        <canvas class="ava-small" id="meAva" width="40" height="40"></canvas>
-        <div class="me-info">
-          <div class="me-name" id="meName">—</div>
-          <div class="me-nick" id="meNick">@—</div>
-        </div>
-        <button class="icon-btn accent" onclick="openSearch()" aria-label="New chat" title="Найти друга">
-          <svg class="icon"><use href="#i-plus"/></svg>
-        </button>
-        <button class="icon-btn" onclick="openSettings()" aria-label="Settings" title="Настройки">
-          <svg class="icon"><use href="#i-gear"/></svg>
-        </button>
-      </header>
-
-      <div class="list" id="contactsList"></div>
-    </aside>
-
-    <section class="chat-pane" id="chatPane">
-
-      <div class="empty-pane" id="emptyPane">
-        <svg class="empty-icon"><use href="#i-chat"/></svg>
-        <div data-i18n="select_chat">Выберите чат слева</div>
-      </div>
-
-      <div class="chat-content hidden" id="chatContent">
-        <header class="topbar">
-          <button class="icon-btn back-mobile" onclick="closeChat()" aria-label="Back">
-            <svg class="icon"><use href="#i-arrow-left"/></svg>
-          </button>
-          <canvas class="ava-small" id="peerAva" width="40" height="40"></canvas>
-          <div class="me-info">
-            <div class="me-name" id="peerName">—</div>
-            <div class="me-nick" id="peerNick">@—</div>
-          </div>
-          <button class="icon-btn" onclick="openInfo()" aria-label="Info">
-            <svg class="icon"><use href="#i-info"/></svg>
-          </button>
-          <button class="icon-btn danger" onclick="endChat()" aria-label="End">
-            <svg class="icon"><use href="#i-x"/></svg>
-          </button>
-        </header>
-        <div class="messages" id="messages"></div>
-        <form class="composer" onsubmit="sendMsg(event)">
-          <input id="msgInput" data-i18n-ph="ph_msg" placeholder="Сообщение..." autocomplete="off" enterkeyhint="send">
-          <button class="btn primary" type="submit" aria-label="Send">
-            <svg class="icon"><use href="#i-send"/></svg>
-          </button>
-        </form>
-      </div>
-    </section>
-  </div>
-
-  <div class="overlay hidden" id="modal-search" onclick="backdropClose(event,'modal-search')">
-    <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-head">
-        <span data-i18n="find_user">Найти пользователя</span>
-        <button class="icon-btn" onclick="closeModal('modal-search')" aria-label="Close">
-          <svg class="icon"><use href="#i-x"/></svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="row">
-          <input id="searchNick" data-i18n-ph="ph_nick" placeholder="Ник">
-          <button class="btn primary" onclick="doSearch()">
-            <svg class="icon icon-sm"><use href="#i-search"/></svg>
-            <span data-i18n="find">Найти</span>
-          </button>
-        </div>
-        <div id="searchResult"></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="overlay hidden" id="modal-settings" onclick="backdropClose(event,'modal-settings')">
-    <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-head">
-        <span data-i18n="settings">Настройки</span>
-        <button class="icon-btn" onclick="closeModal('modal-settings')" aria-label="Close">
-          <svg class="icon"><use href="#i-x"/></svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <button class="btn full" onclick="openEditProfile()">
-          <svg class="icon icon-sm"><use href="#i-user"/></svg>
-          <span data-i18n="edit_profile">Редактировать профиль</span>
-        </button>
-        <div class="setting">
-          <span data-i18n="og_rendering">Превью ссылок</span>
-          <div class="seg">
-            <button class="seg-btn" data-og="on" onclick="applyOg('on')" data-i18n="og_on">Вкл</button>
-            <button class="seg-btn" data-og="off" onclick="applyOg('off')" data-i18n="og_off">Выкл</button>
-          </div>
-        </div>
-        <div class="setting">
-          <span data-i18n="theme">Тема</span>
-          <div class="seg">
-            <button class="seg-btn" data-theme="light" onclick="applyTheme('light')" data-i18n="light">Светлая</button>
-            <button class="seg-btn" data-theme="dark" onclick="applyTheme('dark')" data-i18n="dark">Тёмная</button>
-          </div>
-        </div>
-        <div class="setting">
-          <span data-i18n="lang">Язык</span>
-          <div class="seg">
-            <button class="seg-btn" data-lang="ru" onclick="applyLang('ru')">RU</button>
-            <button class="seg-btn" data-lang="en" onclick="applyLang('en')">EN</button>
-          </div>
-        </div>
-        <div class="setting-col">
-          <div class="setting-title" data-i18n="blacklist">Чёрный список</div>
-          <div id="blacklistBox"></div>
-          <div class="row">
-            <input id="blNick" data-i18n-ph="ph_nick" placeholder="Ник">
-            <button class="btn icon-only" onclick="blAdd()" aria-label="Add">
-              <svg class="icon"><use href="#i-plus"/></svg>
-            </button>
-          </div>
-        </div>
-        <button class="btn danger full" onclick="logout()" data-i18n="logout">Выйти</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="overlay hidden" id="modal-edit" onclick="backdropClose(event,'modal-edit')">
-    <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-head">
-        <span data-i18n="edit_profile">Редактировать профиль</span>
-        <button class="icon-btn" onclick="closeModal('modal-edit')" aria-label="Close">
-          <svg class="icon"><use href="#i-x"/></svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="ava-editor">
-          <canvas id="editAvaCanvas" width="256" height="256"></canvas>
-          <div class="palette" id="editPalette"></div>
-          <div class="ava-tools">
-            <button class="btn small" onclick="editEditor.clear()" data-i18n="clear">Очистить</button>
-            <button class="btn small" onclick="editEditor.random()" data-i18n="random">Случайно</button>
-            <button class="btn small" onclick="editEditor.fill()" data-i18n="fill">Залить</button>
-          </div>
-        </div>
-        <input id="editName" data-i18n-ph="ph_name" placeholder="Имя">
-        <div class="muted" style="text-align:center">@<span id="editNick"></span></div>
-        <button class="btn primary full" onclick="saveProfile()" data-i18n="save">Сохранить</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="overlay hidden" id="modal-info" onclick="backdropClose(event,'modal-info')">
-    <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-head">
-        <span data-i18n="about_user">О человеке</span>
-        <button class="icon-btn" onclick="closeModal('modal-info')" aria-label="Close">
-          <svg class="icon"><use href="#i-x"/></svg>
-        </button>
-      </div>
-      <div class="modal-body center">
-        <canvas id="infoAva" width="160" height="160"></canvas>
-        <div id="infoName" class="big-name"></div>
-        <div id="infoNick" class="muted"></div>
-        <button class="btn danger full" onclick="endChat()" data-i18n="end_chat">Завершить чат</button>
-      </div>
-    </div>
-  </div>
-
 </div>
-
-<script>
-document.addEventListener('contextmenu', e => e.preventDefault());
-document.addEventListener('selectstart', e => {
-  if (e.target.closest('input,textarea')) return;
-  e.preventDefault();
-});
-
-/* ============================================================
-                        ШИФРОВАНИЕ
-   ============================================================ */
-const XK = new TextEncoder().encode("SldChatSecret2024");
-function xorBytes(bytes){
-  const out = new Uint8Array(bytes.length);
-  for (let i=0;i<bytes.length;i++) out[i] = bytes[i] ^ XK[i % XK.length];
-  return out;
-}
-function encStr(str){
-  const b = new TextEncoder().encode(str);
-  const x = xorBytes(b);
-  let bin = '';
-  for (let i=0;i<x.length;i++) bin += String.fromCharCode(x[i]);
-  return btoa(bin);
-}
-
-/* ============================================================
-                          I18N
-   ============================================================ */
-const I18N = {
-  ru: {
-    login:"Вход", register:"Регистрация", create:"Создать аккаунт",
-    ph_nick:"Ник", ph_pass:"Пароль", ph_pass2:"Повтор пароля", ph_name:"Имя",
-    ph_msg:"Сообщение...",
-    clear:"Очистить", random:"Случайно", fill:"Залить",
-    settings:"Настройки", theme:"Тема", lang:"Язык", light:"Светлая", dark:"Тёмная",
-    blacklist:"Чёрный список", add:"Добавить", logout:"Выйти",
-    find_user:"Найти пользователя", find:"Найти",
-    start_chat:"Начать общение", about_user:"О человеке", end_chat:"Завершить чат",
-    no_contacts:"Пока нет контактов.\nНажмите + чтобы найти друзей.",
-    no_bl:"Список пуст",
-    confirm_logout:"Выйти из аккаунта?",
-    remove:"Убрать",
-    select_chat:"Выберите чат слева",
-    edit_profile:"Редактировать профиль", save:"Сохранить",
-    link_copied:"Ссылка скопирована",
-    profile_updated:"Профиль обновлён",
-    confirm_end_chat:"Завершить чат?\nВся переписка и контакт будут удалены.",
-    chat_ended:"Чат завершён",
-    og_rendering:"Превью ссылок", og_on:"Вкл", og_off:"Выкл"
-  },
-  en: {
-    login:"Sign in", register:"Sign up", create:"Create account",
-    ph_nick:"Nickname", ph_pass:"Password", ph_pass2:"Repeat password", ph_name:"Name",
-    ph_msg:"Message...",
-    clear:"Clear", random:"Random", fill:"Fill",
-    settings:"Settings", theme:"Theme", lang:"Language", light:"Light", dark:"Dark",
-    blacklist:"Blacklist", add:"Add", logout:"Log out",
-    find_user:"Find user", find:"Find",
-    start_chat:"Start chat", about_user:"About user", end_chat:"End chat",
-    no_contacts:"No contacts yet.\nTap + to find friends.",
-    no_bl:"List is empty",
-    confirm_logout:"Log out?",
-    remove:"Remove",
-    select_chat:"Select a chat on the left",
-    edit_profile:"Edit profile", save:"Save",
-    link_copied:"Link copied",
-    profile_updated:"Profile updated",
-    confirm_end_chat:"End chat?\nAll messages and the contact will be deleted.",
-    chat_ended:"Chat ended",
-    og_rendering:"Link previews", og_on:"On", og_off:"Off"
-  }
-};
-let LANG = localStorage.getItem('sldchat_lang') || 'ru';
-function t(k){ return (I18N[LANG] && I18N[LANG][k]) || k; }
-
-/* ============================================================
-                        STATE
-   ============================================================ */
-let token = localStorage.getItem('sldchat_token') || null;
-let me = null;
-let contacts = [];
-let blacklist = [];
-let currentPeer = null;
-let currentPeerData = null;
-let ws = null;
-let unread = {};
-let renderedIds = new Set();
-const ogClientCache = {};
-let OG_ENABLED = localStorage.getItem('sldchat_og') !== 'off';
-
-const contactEls = new Map();
-
-/* ============================================================
-                       API
-   ============================================================ */
-async function api(path, payload, method='POST'){
-  const headers = {'Content-Type':'application/json'};
-  if (token) headers['X-Token'] = token;
-  const opts = {method, headers};
-  if (method === 'POST'){
-    opts.body = JSON.stringify({ data: encStr(JSON.stringify(payload || {})) });
-  }
-  const res = await fetch(path, opts);
-  if (!res.ok){
-    let msg = 'Ошибка';
-    try { const j = await res.json(); msg = j.detail || msg; } catch(e){}
-    throw new Error(msg);
-  }
-  return res.json();
-}
-
-/* ============================================================
-                     WebSocket
-   ============================================================ */
-function connectWS(){
-  if (!token || ws) return;
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  try {
-    ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(token)}`);
-  } catch(e){ ws = null; return; }
-  ws.onmessage = ev => { try { handleWsEvent(JSON.parse(ev.data)); } catch(_){} };
-  ws.onclose = () => { ws = null; if (token) setTimeout(connectWS, 1500); };
-  ws.onerror = () => { try { ws && ws.close(); } catch(_){} };
-  clearInterval(window.__hb);
-  window.__hb = setInterval(() => {
-    try { if (ws && ws.readyState === 1) ws.send('ping'); } catch(_){}
-  }, 25000);
-}
-
-function disconnectWS(){
-  clearInterval(window.__hb);
-  if (ws){ try { ws.close(); } catch(_){} ws = null; }
-}
-
-function handleWsEvent(ev){
-  if (!ev || !ev.type) return;
-  if (ev.type === 'message'){
-    const m = ev.msg;
-    const isMine = m.from === me?.nick;
-    if (currentPeer && (m.from === currentPeer || m.to === currentPeer)){
-      appendMessage(m);
-    }
-    if (!isMine){
-      const isCurrentChat = currentPeer === m.from;
-      const isFocused = document.hasFocus();
-      if (!isCurrentChat || !isFocused){
-        playBeep();
-        showDesktopNotification(m.from, m.text);
-      }
-      if (!isCurrentChat) addUnread(m.from);
-      if (!contacts.find(c => c.nick === m.from)) refreshMe().catch(()=>{});
-    }
-  } else if (ev.type === 'contact_added'){
-    refreshMe().catch(()=>{});
-  } else if (ev.type === 'contact_updated'){
-    const u = ev.user;
-    const c = contacts.find(x => x.nick === u.nick);
-    if (c){
-      const changed = (c.name !== u.name) ||
-                      (JSON.stringify(c.avatar) !== JSON.stringify(u.avatar));
-      c.name = u.name; c.avatar = u.avatar;
-      if (changed){
-        const el = contactEls.get(u.nick);
-        if (el) updateContactEl(el, c);
-      }
-    }
-    if (currentPeer === u.nick){
-      currentPeerData = u;
-      document.getElementById('peerName').textContent = u.name;
-      const pAva = document.getElementById('peerAva');
-      if (pAva._avaKey !== JSON.stringify(u.avatar)){
-        paintAva(pAva, u.avatar);
-        pAva._avaKey = JSON.stringify(u.avatar);
-      }
-    }
-  } else if (ev.type === 'contact_removed'){
-    removeContactLocal(ev.nick);
-  } else if (ev.type === 'blacklist_changed'){
-    refreshMe().catch(()=>{});
-  }
-}
-
-/* ============================================================
-                     ЗВУК / УВЕДОМЛЕНИЯ
-   ============================================================ */
-let audioCtx = null;
-function playBeep(){
-  try {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    const now = audioCtx.currentTime;
-    const tone = (freq, start, dur) => {
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.connect(g); g.connect(audioCtx.destination);
-      o.type = 'sine'; o.frequency.value = freq;
-      g.gain.setValueAtTime(0.0001, now + start);
-      g.gain.exponentialRampToValueAtTime(0.14, now + start + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
-      o.start(now + start); o.stop(now + start + dur + 0.02);
-    };
-    tone(880, 0, 0.12); tone(1320, 0.09, 0.14);
-  } catch(_){}
-}
-
-function requestNotifPermission(){
-  if (!('Notification' in window)) return;
-  if (Notification.permission === 'default'){
-    try { Notification.requestPermission(); } catch(_){}
-  }
-}
-
-function showDesktopNotification(fromNick, text){
-  if (!('Notification' in window)) return;
-  if (Notification.permission !== 'granted') return;
-  if (document.hasFocus()) return;
-  const u = contacts.find(c => c.nick === fromNick);
-  const title = u ? u.name : fromNick;
-  try {
-    const n = new Notification(title, {
-      body: text.length > 80 ? text.slice(0, 80) + '…' : text,
-      tag: 'sldchat-' + fromNick, silent: true
-    });
-    n.onclick = () => { window.focus(); openChat(fromNick); };
-  } catch(_){}
-}
-
-function addUnread(nick){
-  unread[nick] = (unread[nick] || 0) + 1;
-  const c = contacts.find(x => x.nick === nick);
-  const el = contactEls.get(nick);
-  if (c && el) updateContactEl(el, c);
-  updateTitle();
-}
-
-function clearUnread(nick){
-  if (!unread[nick]) return;
-  delete unread[nick];
-  const c = contacts.find(x => x.nick === nick);
-  const el = contactEls.get(nick);
-  if (c && el) updateContactEl(el, c);
-  updateTitle();
-}
-
-function updateTitle(){
-  const total = Object.values(unread).reduce((a,b)=>a+b, 0);
-  document.title = total > 0 ? `(${total}) sldchat` : 'sldchat';
-}
-
-/* ============================================================
-                       TOAST
-   ============================================================ */
-let toastEl = null;
-function toast(msg){
-  if (toastEl) toastEl.remove();
-  toastEl = document.createElement('div');
-  toastEl.className = 'toast';
-  toastEl.textContent = msg;
-  document.body.appendChild(toastEl);
-  requestAnimationFrame(() => toastEl.classList.add('show'));
-  setTimeout(() => {
-    if (toastEl) {
-      toastEl.classList.remove('show');
-      setTimeout(() => { if (toastEl) { toastEl.remove(); toastEl = null; } }, 300);
-    }
-  }, 2000);
-}
-
-async function copyText(txt){
-  if (navigator.clipboard && window.isSecureContext){
-    try {
-      await navigator.clipboard.writeText(txt);
-      return true;
-    } catch(_){}
-  }
-  try {
-    const ta = document.createElement('textarea');
-    ta.value = txt;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.top = '0';
-    ta.style.left = '0';
-    ta.style.width = '1px';
-    ta.style.height = '1px';
-    ta.style.padding = '0';
-    ta.style.border = 'none';
-    ta.style.outline = 'none';
-    ta.style.boxShadow = 'none';
-    ta.style.background = 'transparent';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    ta.setSelectionRange(0, txt.length);
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  } catch(_){ return false; }
-}
-
-/* ============================================================
-                     AVATAR (8x8)
-   ============================================================ */
-const PALETTE = [
-  '#000000','#ffffff','#8e8e93','#c7c7cc',
-  '#ff3b30','#ff9500','#ffcc00','#34c759',
-  '#00c7be','#0a84ff','#5856d6','#af52de',
-  '#ff2d55','#5c3b1e','#f5c6a5','#b3e5fc'
-];
-const GRID = 8;
-
-function makeAvatarEditor(canvasEl, paletteEl){
-  let data = new Array(64).fill('#ffffff');
-  let color = '#000000';
-  let drawing = false;
-
-  function render(){
-    const ctx = canvasEl.getContext('2d');
-    const W = canvasEl.width;
-    const cell = W / GRID;
-    ctx.clearRect(0, 0, W, W);
-    for (let i = 0; i < 64; i++){
-      ctx.fillStyle = data[i];
-      ctx.fillRect((i % GRID) * cell, Math.floor(i / GRID) * cell, cell, cell);
-    }
-    ctx.strokeStyle = 'rgba(0,0,0,.14)';
-    ctx.lineWidth = 1;
-    for (let i = 1; i < GRID; i++){
-      ctx.beginPath(); ctx.moveTo(i*cell,0); ctx.lineTo(i*cell,W); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(0,i*cell); ctx.lineTo(W,i*cell); ctx.stroke();
-    }
-  }
-
-  function buildPalette(){
-    paletteEl.innerHTML = '';
-    PALETTE.forEach((c, i) => {
-      const b = document.createElement('div');
-      b.className = 'swatch' + (i === 0 ? ' active' : '');
-      b.style.background = c;
-      b.onclick = () => {
-        color = c;
-        paletteEl.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
-        b.classList.add('active');
-      };
-      paletteEl.appendChild(b);
-    });
-  }
-
-  function paintAt(cx, cy){
-    const r = canvasEl.getBoundingClientRect();
-    const x = Math.floor((cx - r.left) / (r.width / GRID));
-    const y = Math.floor((cy - r.top) / (r.height / GRID));
-    if (x < 0 || x > 7 || y < 0 || y > 7) return;
-    data[y*GRID + x] = color;
-    render();
-  }
-
-  canvasEl.addEventListener('pointerdown', e => {
-    e.preventDefault(); drawing = true;
-    try { canvasEl.setPointerCapture(e.pointerId); } catch(_){}
-    paintAt(e.clientX, e.clientY);
-  });
-  canvasEl.addEventListener('pointermove', e => { if (drawing) paintAt(e.clientX, e.clientY); });
-  canvasEl.addEventListener('pointerup', () => drawing = false);
-  canvasEl.addEventListener('pointercancel', () => drawing = false);
-
-  buildPalette(); render();
-
-  return {
-    getData: () => data.slice(),
-    setData: (d) => { if (Array.isArray(d) && d.length === 64){ data = d.slice(); render(); } },
-    clear: () => { data = new Array(64).fill('#ffffff'); render(); },
-    fill:  () => { data = new Array(64).fill(color); render(); },
-    random: () => {
-      const cols = PALETTE.slice(2);
-      const pick = () => cols[Math.floor(Math.random() * cols.length)];
-      const c1 = pick(), c2 = pick(), c3 = pick();
-      const half = [];
-      for (let y = 0; y < 8; y++){
-        const row = [];
-        for (let x = 0; x < 4; x++){
-          const r = Math.random();
-          row.push(r < 0.4 ? c1 : r < 0.7 ? c2 : r < 0.9 ? c3 : '#ffffff');
-        }
-        half.push(row);
-      }
-      data = [];
-      for (let y = 0; y < 8; y++){
-        for (let x = 0; x < 4; x++) data.push(half[y][x]);
-        for (let x = 3; x >= 0; x--) data.push(half[y][x]);
-      }
-      render();
-    }
-  };
-}
-
-function paintAva(canvas, data){
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width;
-  const cell = W / GRID;
-  ctx.clearRect(0, 0, W, W);
-  for (let i = 0; i < 64; i++){
-    ctx.fillStyle = (data && data[i]) || '#ffffff';
-    ctx.fillRect((i % GRID) * cell, Math.floor(i / GRID) * cell, cell, cell);
-  }
-}
-
-let regEditor, editEditor;
-
-/* ============================================================
-                       UI
-   ============================================================ */
-function showScreen(id){
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-}
-function showErr(id, msg){
-  const el = document.getElementById(id);
-  el.textContent = msg;
-  clearTimeout(el._t);
-  el._t = setTimeout(() => { el.textContent = ''; }, 4000);
-}
-function openModal(id){ document.getElementById(id).classList.remove('hidden'); }
-function closeModal(id){ document.getElementById(id).classList.add('hidden'); }
-function backdropClose(e, id){ if (e.target.id === id) closeModal(id); }
-
-/* ============================================================
-                       THEME / LANG / OG
-   ============================================================ */
-function applyTheme(th){
-  document.body.classList.toggle('dark', th === 'dark');
-  localStorage.setItem('sldchat_theme', th);
-  document.querySelectorAll('[data-theme]').forEach(b =>
-    b.classList.toggle('active', b.dataset.theme === th));
-}
-function applyLang(l){
-  LANG = l;
-  localStorage.setItem('sldchat_lang', l);
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    const k = el.dataset.i18n;
-    if (I18N[l][k]) el.textContent = I18N[l][k];
-  });
-  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
-    const k = el.dataset.i18nPh;
-    if (I18N[l][k]) el.placeholder = I18N[l][k];
-  });
-  document.querySelectorAll('[data-lang]').forEach(b =>
-    b.classList.toggle('active', b.dataset.lang === l));
-  renderContacts();
-  renderBlacklist();
-}
-function applyOg(v){
-  OG_ENABLED = (v !== 'off');
-  localStorage.setItem('sldchat_og', OG_ENABLED ? 'on' : 'off');
-  document.querySelectorAll('[data-og]').forEach(b =>
-    b.classList.toggle('active', b.dataset.og === v));
-  if (!OG_ENABLED){
-    document.querySelectorAll('.og-card').forEach(el => el.remove());
-    document.querySelectorAll('.bubble.has-og').forEach(el => el.classList.remove('has-og'));
-  }
-}
-
-/* ============================================================
-                       AUTH
-   ============================================================ */
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.onclick = () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const isLogin = tab.dataset.tab === 'login';
-    document.getElementById('tab-login').classList.toggle('hidden', !isLogin);
-    document.getElementById('tab-reg').classList.toggle('hidden', isLogin);
-    document.getElementById('auth-err').textContent = '';
-  };
-});
-
-async function doLogin(){
-  const nick = document.getElementById('li-nick').value.trim();
-  const password = document.getElementById('li-pass').value;
-  if (!nick || !password){ showErr('auth-err', 'Введите ник и пароль'); return; }
-  try {
-    const r = await api('/api/login', { nick, password });
-    token = r.token; me = r.me;
-    localStorage.setItem('sldchat_token', token);
-    requestNotifPermission();
-    await refreshMe();
-    showScreen('screen-app');
-    connectWS();
-  } catch(e){ showErr('auth-err', e.message); }
-}
-
-async function doRegister(){
-  const name = document.getElementById('rg-name').value.trim();
-  const nick = document.getElementById('rg-nick').value.trim();
-  const password = document.getElementById('rg-pass').value;
-  const password2 = document.getElementById('rg-pass2').value;
-  try {
-    const r = await api('/api/register', {
-      name, nick, password, password2,
-      avatar: regEditor.getData()
-    });
-    token = r.token; me = r.me;
-    localStorage.setItem('sldchat_token', token);
-    requestNotifPermission();
-    await refreshMe();
-    showScreen('screen-app');
-    connectWS();
-  } catch(e){ showErr('auth-err', e.message); }
-}
-
-async function logout(){
-  if (!confirm(t('confirm_logout'))) return;
-  try { await api('/api/logout', {}); } catch(_){}
-  disconnectWS();
-  token = null; me = null; contacts = []; blacklist = []; unread = {};
-  for (const el of contactEls.values()) el.remove();
-  contactEls.clear();
-  document.getElementById('contactsList').innerHTML = '';
-  localStorage.removeItem('sldchat_token');
-  document.getElementById('li-nick').value = '';
-  document.getElementById('li-pass').value = '';
-  closeModal('modal-settings'); closeModal('modal-edit');
-  closeChat(true); updateTitle();
-  showScreen('screen-auth');
-}
-
-/* ============================================================
-                       ME / CONTACTS
-   ============================================================ */
-async function refreshMe(){
-  const r = await api('/api/me', null, 'GET');
-  me = r.me; contacts = r.contacts; blacklist = r.blacklist;
-
-  const meAvaEl = document.getElementById('meAva');
-  const avaKey = JSON.stringify(me.avatar);
-  if (meAvaEl._avaKey !== avaKey){
-    paintAva(meAvaEl, me.avatar);
-    meAvaEl._avaKey = avaKey;
-  }
-  const nameEl = document.getElementById('meName');
-  if (nameEl.textContent !== me.name) nameEl.textContent = me.name;
-  const nickEl = document.getElementById('meNick');
-  const nickTxt = '@' + me.nick;
-  if (nickEl.textContent !== nickTxt) nickEl.textContent = nickTxt;
-
-  renderContacts();
-  renderBlacklist();
-}
-
-function createContactEl(c){
-  const el = document.createElement('div');
-  el.className = 'contact';
-  el.dataset.nick = c.nick;
-
-  const cv = document.createElement('canvas');
-  cv.width = 44; cv.height = 44;
-  cv.className = 'ava-small';
-  paintAva(cv, c.avatar);
-  el.appendChild(cv);
-
-  const info = document.createElement('div');
-  info.className = 'me-info';
-  const nm = document.createElement('div');
-  nm.className = 'me-name';
-  nm.textContent = c.name;
-  const nk = document.createElement('div');
-  nk.className = 'me-nick';
-  nk.textContent = '@' + c.nick;
-  info.appendChild(nm); info.appendChild(nk);
-  el.appendChild(info);
-
-  const badge = document.createElement('span');
-  badge.className = 'badge';
-  badge.style.display = 'none';
-  badge.style.opacity = '1';
-  el.appendChild(badge);
-
-  el._avaKey = JSON.stringify(c.avatar);
-  el._badgeShown = false;
-
-  el.addEventListener('click', () => openChat(el.dataset.nick));
-
-  el.animate(
-    [
-      {opacity: 0, transform: 'translateY(6px)'},
-      {opacity: 1, transform: 'translateY(0)'}
-    ],
-    {duration: 240, easing: 'cubic-bezier(.2,.8,.3,1)'}
-  );
-
-  return el;
-}
-
-function updateContactEl(el, c){
-  const cv = el.querySelector('canvas');
-  const avaKey = JSON.stringify(c.avatar);
-  if (el._avaKey !== avaKey){
-    paintAva(cv, c.avatar);
-    el._avaKey = avaKey;
-  }
-  const nm = el.querySelector('.me-name');
-  if (nm.textContent !== c.name) nm.textContent = c.name;
-  const nk = el.querySelector('.me-nick');
-  const nkTxt = '@' + c.nick;
-  if (nk.textContent !== nkTxt) nk.textContent = nkTxt;
-
-  const badge = el.querySelector('.badge');
-  const count = unread[c.nick] || 0;
-  const wantShow = count > 0;
-  const wantTxt = count > 99 ? '99+' : String(count);
-
-  if (wantShow){
-    if (badge.textContent !== wantTxt) badge.textContent = wantTxt;
-    if (!el._badgeShown){
-      el._badgeShown = true;
-      badge.style.display = 'flex';
-      if (badge._anim){ try { badge._anim.cancel(); } catch(_){} badge._anim = null; }
-      badge._anim = badge.animate(
-        [
-          {transform: 'scale(.45)', opacity: 0},
-          {transform: 'scale(1.18)', opacity: 1, offset: .7},
-          {transform: 'scale(1)', opacity: 1}
-        ],
-        {duration: 280, easing: 'cubic-bezier(.2,.8,.3,1)'}
-      );
-      badge._anim.onfinish = () => { badge._anim = null; };
-    }
-  } else {
-    if (el._badgeShown){
-      el._badgeShown = false;
-      if (badge._anim){ try { badge._anim.cancel(); } catch(_){} badge._anim = null; }
-      const a = badge.animate(
-        [
-          {transform: 'scale(1)', opacity: 1},
-          {transform: 'scale(.5)', opacity: 0}
-        ],
-        {duration: 160, easing: 'ease-in', fill: 'forwards'}
-      );
-      a.onfinish = () => {
-        if (!el._badgeShown) badge.style.display = 'none';
-        try { a.cancel(); } catch(_){}
-      };
-      badge._anim = a;
-    }
-  }
-
-  el.classList.toggle('selected', currentPeer === c.nick);
-}
-
-function renderContacts(){
-  const box = document.getElementById('contactsList');
-  const sorted = [...contacts].sort((a, b) => a.nick.localeCompare(b.nick));
-
-  if (sorted.length === 0){
-    for (const el of contactEls.values()) el.remove();
-    contactEls.clear();
-    let empty = box.querySelector('.empty');
-    if (!empty){
-      empty = document.createElement('div');
-      empty.className = 'empty';
-      box.appendChild(empty);
-    }
-    empty.textContent = t('no_contacts');
-    return;
-  }
-  const empty = box.querySelector('.empty');
-  if (empty) empty.remove();
-
-  const wanted = new Set(sorted.map(c => c.nick));
-  for (const [nick, el] of [...contactEls]){
-    if (!wanted.has(nick)){
-      contactEls.delete(nick);
-      const a = el.animate(
-        [
-          {opacity: 1, transform: 'translateX(0)'},
-          {opacity: 0, transform: 'translateX(-14px)'}
-        ],
-        {duration: 200, easing: 'ease-in', fill: 'forwards'}
-      );
-      a.onfinish = () => el.remove();
-    }
-  }
-
-  for (const c of sorted){
-    let el = contactEls.get(c.nick);
-    if (!el){
-      el = createContactEl(c);
-      contactEls.set(c.nick, el);
-      box.appendChild(el);
-      updateContactEl(el, c);
-    } else {
-      updateContactEl(el, c);
-    }
-  }
-
-  const currentDomOrder = Array.from(box.children)
-    .filter(n => n.classList && n.classList.contains('contact'))
-    .map(n => n.dataset.nick);
-  const wantedOrder = sorted.map(c => c.nick);
-  let orderChanged = currentDomOrder.length !== wantedOrder.length;
-  if (!orderChanged){
-    for (let i = 0; i < wantedOrder.length; i++){
-      if (currentDomOrder[i] !== wantedOrder[i]){ orderChanged = true; break; }
-    }
-  }
-  if (orderChanged){
-    let prev = null;
-    for (const c of sorted){
-      const el = contactEls.get(c.nick);
-      if (!el) continue;
-      if (prev){
-        if (el.previousElementSibling !== prev) prev.after(el);
-      } else {
-        if (box.firstElementChild !== el) box.prepend(el);
-      }
-      prev = el;
-    }
-  }
-}
-
-function removeContactLocal(nick, animate = true){
-  contacts = contacts.filter(c => c.nick !== nick);
-
-  const el = contactEls.get(nick);
-  if (el){
-    contactEls.delete(nick);
-    if (animate){
-      const a = el.animate(
-        [
-          {opacity: 1, transform: 'translateX(0)'},
-          {opacity: 0, transform: 'translateX(-16px)'}
-        ],
-        {duration: 200, easing: 'ease-in', fill: 'forwards'}
-      );
-      a.onfinish = () => el.remove();
-    } else {
-      el.remove();
-    }
-  }
-
-  if (unread[nick]){
-    delete unread[nick];
-    updateTitle();
-  }
-
-  if (currentPeer === nick){
-    closeChat(true);
-  }
-
-  if (contacts.length === 0) renderContacts();
-}
-
-function renderBlacklist(){
-  const box = document.getElementById('blacklistBox');
-  box.innerHTML = '';
-  if (!blacklist.length){
-    const e = document.createElement('div');
-    e.className = 'muted';
-    e.style.padding = '6px 2px';
-    e.textContent = t('no_bl');
-    box.appendChild(e);
-    return;
-  }
-  blacklist.forEach(u => {
-    const el = document.createElement('div');
-    el.className = 'bl-item';
-    const cv = document.createElement('canvas');
-    cv.width = 32; cv.height = 32;
-    paintAva(cv, u.avatar);
-    el.appendChild(cv);
-    const info = document.createElement('div');
-    info.className = 'me-info';
-    const nm = document.createElement('div');
-    nm.className = 'me-name'; nm.textContent = u.name;
-    const nk = document.createElement('div');
-    nk.className = 'me-nick'; nk.textContent = '@' + u.nick;
-    info.appendChild(nm); info.appendChild(nk);
-    el.appendChild(info);
-    const btn = document.createElement('button');
-    btn.title = t('remove');
-    btn.setAttribute('aria-label', t('remove'));
-    btn.innerHTML = '<svg class="icon"><use href="#i-trash"/></svg>';
-    btn.onclick = () => blRemove(u.nick);
-    el.appendChild(btn);
-    box.appendChild(el);
-  });
-}
-
-/* ============================================================
-                       SEARCH
-   ============================================================ */
-function openSearch(){
-  document.getElementById('searchNick').value = '';
-  document.getElementById('searchResult').innerHTML = '';
-  openModal('modal-search');
-  setTimeout(() => document.getElementById('searchNick').focus(), 250);
-}
-
-async function doSearch(){
-  const nick = document.getElementById('searchNick').value.trim();
-  const box = document.getElementById('searchResult');
-  box.innerHTML = '';
-  if (!nick) return;
-  try {
-    const r = await api('/api/search', { nick });
-    const u = r.user;
-    const card = document.createElement('div');
-    card.className = 'search-card';
-    const cv = document.createElement('canvas');
-    cv.width = 96; cv.height = 96;
-    cv.className = 'ava-mid';
-    paintAva(cv, u.avatar);
-    card.appendChild(cv);
-    const nm = document.createElement('div');
-    nm.className = 'big-name'; nm.textContent = u.name;
-    const nk = document.createElement('div');
-    nk.className = 'muted'; nk.textContent = '@' + u.nick;
-    card.appendChild(nm); card.appendChild(nk);
-    const btn = document.createElement('button');
-    btn.className = 'btn primary full';
-    btn.textContent = t('start_chat');
-    btn.onclick = () => { closeModal('modal-search'); startChat(u.nick); };
-    card.appendChild(btn);
-    box.appendChild(card);
-  } catch(e){
-    const er = document.createElement('div');
-    er.className = 'err'; er.textContent = e.message;
-    box.appendChild(er);
-  }
-}
-
-/* ============================================================
-                       CHAT
-   ============================================================ */
-async function startChat(peerNick){
-  try {
-    await api('/api/chat/start', { nick: peerNick });
-    await refreshMe();
-    openChat(peerNick);
-  } catch(e){ toast(e.message); }
-}
-
-function resetMessages(){
-  document.getElementById('messages').innerHTML = '';
-  renderedIds = new Set();
-}
-
-function linkifyInto(container, text){
-  const re = /(https?:\/\/[^\s<>"']+)/g;
-  let last = 0, m;
-  while ((m = re.exec(text)) !== null){
-    if (m.index > last) container.appendChild(document.createTextNode(text.slice(last, m.index)));
-    const url = m[0];
-    const a = document.createElement('a');
-    a.className = 'msg-link';
-    a.href = '#';
-    a.textContent = url;
-    a.addEventListener('click', async (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const ok = await copyText(url);
-      toast(ok ? t('link_copied') : 'Copy failed');
-      return false;
-    });
-    container.appendChild(a);
-    last = re.lastIndex;
-  }
-  if (last < text.length) container.appendChild(document.createTextNode(text.slice(last)));
-}
-
-function appendMessage(m, scroll = true){
-  if (!m || !m.id) return;
-  if (renderedIds.has(m.id)) return;
-  renderedIds.add(m.id);
-
-  const box = document.getElementById('messages');
-  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
-
-  const el = document.createElement('div');
-  el.className = 'bubble ' + (m.from === me.nick ? 'out' : 'in');
-  linkifyInto(el, m.text);
-  box.appendChild(el);
-
-  if (scroll && nearBottom) box.scrollTop = box.scrollHeight;
-
-  const urls = m.text.match(/https?:\/\/[^\s<>"']+/g);
-  if (urls && urls[0] && OG_ENABLED){
-    maybeRenderOg(el, urls[0]);
-  }
-}
-
-async function maybeRenderOg(bubbleEl, url){
-  if (!OG_ENABLED) return;
-  let data = ogClientCache[url];
-  if (!data){
-    try {
-      data = await api('/api/og', { url });
-      ogClientCache[url] = data;
-    } catch(e){
-      ogClientCache[url] = { error: true };
-      return;
-    }
-  }
-  if (!data || data.error) return;
-  if (bubbleEl.querySelector('.og-card')) return;
-
-  let hostname = '';
-  try { hostname = new URL(url).hostname; } catch(_){}
-
-  const hasTitle = !!(data.title || data.description || data.image);
-  if (!hasTitle && !hostname) return;
-
-  bubbleEl.classList.add('has-og');
-
-  const card = document.createElement('div');
-  card.className = 'og-card';
-  card.addEventListener('click', async (ev) => {
-    ev.preventDefault();
-    ev.stopPropagation();
-    const ok = await copyText(url);
-    toast(ok ? t('link_copied') : 'Copy failed');
-    return false;
-  });
-
-  if (data.image){
-    const img = document.createElement('img');
-    img.className = 'og-thumb';
-    img.src = data.image;
-    img.alt = '';
-    img.loading = 'lazy';
-    img.draggable = false;
-    img.referrerPolicy = 'no-referrer';
-    img.onerror = () => img.remove();
-    card.appendChild(img);
-  }
-
-  const body = document.createElement('div');
-  body.className = 'og-body';
-
-  const site = document.createElement('div');
-  site.className = 'og-site';
-  const dot = document.createElement('span');
-  dot.className = 'og-dot ' + (data.stable ? 'stable' : 'unstable');
-  site.appendChild(dot);
-  const siteName = data.site_name || hostname;
-  if (siteName){
-    const sTxt = document.createElement('span');
-    sTxt.textContent = siteName;
-    site.appendChild(sTxt);
-  }
-  body.appendChild(site);
-
-  if (data.title){
-    const ttl = document.createElement('div');
-    ttl.className = 'og-title';
-    ttl.textContent = data.title;
-    body.appendChild(ttl);
-  }
-  if (data.description){
-    const d = document.createElement('div');
-    d.className = 'og-desc';
-    d.textContent = data.description;
-    body.appendChild(d);
-  }
-
-  card.appendChild(body);
-  bubbleEl.appendChild(card);
-
-  const box = document.getElementById('messages');
-  if (box.scrollHeight - box.scrollTop - box.clientHeight < 500){
-    box.scrollTop = box.scrollHeight;
-  }
-}
-
-async function openChat(peerNick){
-  try {
-    const r = await api('/api/chat/messages', { peer: peerNick });
-    currentPeer = peerNick;
-    currentPeerData = r.peer;
-
-    const pAvaEl = document.getElementById('peerAva');
-    const pKey = JSON.stringify(r.peer.avatar);
-    if (pAvaEl._avaKey !== pKey){
-      paintAva(pAvaEl, r.peer.avatar);
-      pAvaEl._avaKey = pKey;
-    }
-    document.getElementById('peerName').textContent = r.peer.name;
-    document.getElementById('peerNick').textContent = '@' + r.peer.nick;
-
-    resetMessages();
-    r.messages.forEach(m => appendMessage(m, false));
-    const box = document.getElementById('messages');
-    box.scrollTop = box.scrollHeight;
-
-    document.getElementById('chatContent').classList.remove('hidden');
-    document.getElementById('emptyPane').classList.add('hidden');
-    document.getElementById('screen-app').classList.add('chat-open');
-    clearUnread(peerNick);
-
-    for (const [nick, el] of contactEls){
-      el.classList.toggle('selected', nick === peerNick);
-    }
-
-    setTimeout(() => document.getElementById('msgInput').focus(), 120);
-  } catch(e){ toast(e.message); }
-}
-
-async function sendMsg(e){
-  e.preventDefault();
-  const inp = document.getElementById('msgInput');
-  const text = inp.value.trim();
-  if (!text || !currentPeer) return;
-  inp.value = '';
-  try {
-    const r = await api('/api/chat/send', { to: currentPeer, text });
-    appendMessage(r.msg);
-    try { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); } catch(_){}
-  } catch(err){
-    toast(err.message);
-    inp.value = text;
-  }
-}
-
-function closeChat(silent){
-  currentPeer = null;
-  currentPeerData = null;
-  renderedIds = new Set();
-  document.getElementById('messages').innerHTML = '';
-  document.getElementById('chatContent').classList.add('hidden');
-  document.getElementById('emptyPane').classList.remove('hidden');
-  document.getElementById('screen-app').classList.remove('chat-open');
-  for (const el of contactEls.values()) el.classList.remove('selected');
-  if (!silent) refreshMe().catch(()=>{});
-}
-
-async function endChat(){
-  if (!currentPeer) return;
-  if (!confirm(t('confirm_end_chat'))) return;
-
-  const peer = currentPeer;
-  try {
-    await api('/api/chat/end', { nick: peer });
-  } catch(e){
-    toast(e.message);
-    return;
-  }
-
-  closeModal('modal-info');
-  removeContactLocal(peer);
-  toast(t('chat_ended'));
-}
-
-function openInfo(){
-  if (!currentPeerData) return;
-  paintAva(document.getElementById('infoAva'), currentPeerData.avatar);
-  document.getElementById('infoName').textContent = currentPeerData.name;
-  document.getElementById('infoNick').textContent = '@' + currentPeerData.nick;
-  openModal('modal-info');
-}
-
-/* ============================================================
-                       SETTINGS
-   ============================================================ */
-function openSettings(){ renderBlacklist(); openModal('modal-settings'); }
-
-function openEditProfile(){
-  if (!me) return;
-  document.getElementById('editName').value = me.name;
-  document.getElementById('editNick').textContent = me.nick;
-  editEditor.setData(me.avatar);
-  closeModal('modal-settings');
-  openModal('modal-edit');
-}
-
-async function saveProfile(){
-  const name = document.getElementById('editName').value.trim();
-  if (!name){ toast('Введите имя'); return; }
-  try {
-    const r = await api('/api/profile/update', { name, avatar: editEditor.getData() });
-    me = r.me;
-    const meAvaEl = document.getElementById('meAva');
-    paintAva(meAvaEl, me.avatar);
-    meAvaEl._avaKey = JSON.stringify(me.avatar);
-    document.getElementById('meName').textContent = me.name;
-    document.getElementById('meNick').textContent = '@' + me.nick;
-    closeModal('modal-edit');
-    toast(t('profile_updated'));
-  } catch(e){ toast(e.message); }
-}
-
-async function blAdd(){
-  const inp = document.getElementById('blNick');
-  const nick = inp.value.trim();
-  if (!nick) return;
-  try { await api('/api/blacklist/add', { nick }); inp.value = ''; await refreshMe(); }
-  catch(e){ toast(e.message); }
-}
-
-async function blRemove(nick){
-  try { await api('/api/blacklist/remove', { nick }); await refreshMe(); }
-  catch(e){ toast(e.message); }
-}
-
-/* ============================================================
-                 KEYBOARD / VIEWPORT
-   ============================================================ */
-function updateViewport(){
-  const vv = window.visualViewport;
-  if (!vv){
-    document.documentElement.style.setProperty('--app-h', window.innerHeight + 'px');
-    document.documentElement.style.setProperty('--app-top', '0px');
-    return;
-  }
-  document.documentElement.style.setProperty('--app-h', vv.height + 'px');
-  document.documentElement.style.setProperty('--app-top', vv.offsetTop + 'px');
-}
-if (window.visualViewport){
-  window.visualViewport.addEventListener('resize', updateViewport);
-  window.visualViewport.addEventListener('scroll', updateViewport);
-}
-window.addEventListener('resize', updateViewport);
-window.addEventListener('orientationchange', () => setTimeout(updateViewport, 100));
-
-function pinViewportAfterFocus(){
-  setTimeout(() => {
-    try { window.scrollTo(0, 0); } catch(_){}
-    updateViewport();
-    const box = document.getElementById('messages');
-    if (box) box.scrollTop = box.scrollHeight;
-  }, 80);
-}
-
-/* ============================================================
-                       INIT / BOOT
-   ============================================================ */
-function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-async function boot(){
-  showScreen('screen-loading');
-  const t0 = Date.now();
-  const MIN = 350;
-
-  if (token){
-    try {
-      const r = await api('/api/me', null, 'GET');
-      me = r.me; contacts = r.contacts; blacklist = r.blacklist;
-      const meAvaEl = document.getElementById('meAva');
-      paintAva(meAvaEl, me.avatar);
-      meAvaEl._avaKey = JSON.stringify(me.avatar);
-      document.getElementById('meName').textContent = me.name;
-      document.getElementById('meNick').textContent = '@' + me.nick;
-      renderContacts(); renderBlacklist();
-      const wait = MIN - (Date.now() - t0);
-      if (wait > 0) await delay(wait);
-      showScreen('screen-app');
-      requestNotifPermission();
-      connectWS();
-      updateViewport();
-      return;
-    } catch(_){
-      token = null;
-      localStorage.removeItem('sldchat_token');
-    }
-  }
-
-  const wait = MIN - (Date.now() - t0);
-  if (wait > 0) await delay(wait);
-  showScreen('screen-auth');
-}
-
-(function init(){
-  applyTheme(localStorage.getItem('sldchat_theme') || 'light');
-  applyLang(LANG);
-  applyOg(OG_ENABLED ? 'on' : 'off');
-
-  regEditor = makeAvatarEditor(
-    document.getElementById('avaCanvas'),
-    document.getElementById('palette')
-  );
-  editEditor = makeAvatarEditor(
-    document.getElementById('editAvaCanvas'),
-    document.getElementById('editPalette')
-  );
-
-  regEditor.random();
-  updateViewport();
-
-  document.getElementById('searchNick').addEventListener('keydown', e => {
-    if (e.key === 'Enter'){ e.preventDefault(); doSearch(); }
-  });
-  document.getElementById('msgInput').addEventListener('focus', pinViewportAfterFocus);
-
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && token && (!ws || ws.readyState > 1)) connectWS();
-  });
-
-  boot();
-})();
-</script>
+<div id="main" class="wrap">
+  {left}
+  <div id="content">{content}</div>
+  <div class="clear"></div>
+</div>
 </body>
-</html>
-"""
+</html>"""
+
+AUTH_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>{css}</style>
+</head>
+<body>
+<div id="header"><div class="wrap"><a class="logo" href="/">ВКонтактик</a></div></div>
+<div class="authwrap">
+  <div class="box">
+    <h2>{title}</h2>
+    <div class="body">{content}</div>
+  </div>
+</div>
+</body>
+</html>"""
 
 
-# ============================================================
-#                       HTML-СТРАНИЦЫ
-# ============================================================
+def layout(title: str, content: str, me: Optional[dict], q: str = "") -> str:
+    if me:
+        userbox = (
+            '<div class="huser"><a href="/u/{uid}">{n} {s}</a>'
+            '<a class="logout" href="/logout">выход</a></div>'
+        ).format(uid=me["id"], n=esc(me["name"]), s=esc(me["surname"]))
 
-def render_page(og_tags: str, title: str) -> str:
-    return (PAGE_TEMPLATE
-            .replace("__OG_TAGS__", og_tags)
-            .replace("__TITLE__", html_module.escape(title)))
+        left = (
+            '<div id="left"><div class="lmenu">'
+            '<a href="/u/{uid}">Моя страница</a>'
+            '<a href="/feed">Новости</a>'
+            '<a href="/friends">Друзья <span class="cnt">{fc}</span></a>'
+            '<a href="/people">Поиск людей</a>'
+            '<a href="/settings">Настройки</a>'
+            '</div></div>'
+        ).format(uid=me["id"], fc=len(friends_of(me["id"])))
+    else:
+        userbox = ('<div class="huser"><a href="/login">Вход</a> | '
+                   '<a href="/register">Регистрация</a></div>')
+        left = ""
 
+    return PAGE.format(title=esc(title), css=CSS, q=esc(q),
+                       userbox=userbox, left=left, content=content)
+
+
+def auth_layout(title: str, content: str) -> str:
+    return AUTH_PAGE.format(title=esc(title), css=CSS, content=content)
+
+
+def render_comment(c: dict, me: dict) -> str:
+    a = DB["users"].get(c["author_id"])
+    name = (a["name"] + " " + a["surname"]) if a else "Удалённый"
+    return (
+        '<div class="comment">'
+        '<a class="cname" href="/u/{uid}">{n}</a> '
+        '<span class="ptime">{t}</span>'
+        '<div>{txt}</div></div>'
+    ).format(uid=c["author_id"], n=esc(name),
+             t=fmt_time(c["created"]), txt=esc(c["text"]))
+
+
+def render_post(p: dict, me: dict) -> str:
+    a = DB["users"].get(p["author_id"])
+    if not a:
+        return ""
+    pid = p["id"]
+    liked = me["id"] in p["likes"]
+    like_txt = "Больше не нравится" if liked else "Мне нравится"
+    can_del = (me["id"] == p["author_id"]) or (me["id"] == p["owner_id"])
+    del_form = ""
+    if can_del:
+        del_form = (
+            '<form method="post" action="/post/{p}/delete" class="inline">'
+            '<button class="linkbtn">удалить</button></form>'
+        ).format(p=pid)
+
+    comments = "".join(render_comment(c, me) for c in p["comments"])
+
+    return (
+        '<div class="post">'
+        '<div class="pava2">{ava}</div>'
+        '<div class="pbody">'
+        '<a class="pauthor" href="/u/{aid}">{an}</a> '
+        '<span class="ptime">{t}</span>'
+        '<div class="ptext">{txt}</div>'
+        '<div class="pact">'
+        '<form method="post" action="/post/{p}/like" class="inline">'
+        '<button class="linkbtn">{lt}</button></form>'
+        ' <span class="cnt">({lc})</span>'
+        ' &nbsp;·&nbsp; {df}'
+        '</div>'
+        '<div class="comments">{cs}</div>'
+        '<form method="post" action="/post/{p}/comment" class="cform">'
+        '<input type="text" name="text" placeholder="Комментарий..." maxlength="500">'
+        '<button class="btn btn-sm">Отправить</button>'
+        '</form>'
+        '</div>'
+        '<div class="clear"></div>'
+        '</div>'
+    ).format(ava=avatar(a, 50), aid=a["id"],
+             an=esc(a["name"] + " " + a["surname"]),
+             t=fmt_time(p["created"]), txt=esc(p["text"]), p=pid,
+             lt=like_txt, lc=len(p["likes"]), df=del_form, cs=comments)
+
+
+def render_posts(posts, me: dict) -> str:
+    if not posts:
+        return '<div class="empty">Записей пока нет.</div>'
+    return "".join(render_post(p, me) for p in posts)
+
+
+def wall_form(owner_id: int) -> str:
+    return (
+        '<form method="post" action="/post">'
+        '<input type="hidden" name="owner_id" value="{uid}">'
+        '<textarea name="text" rows="3" maxlength="1000" '
+        'placeholder="Что у вас нового?"></textarea>'
+        '<div style="margin-top:6px"><button class="btn">Отправить</button></div>'
+        '</form>'
+    ).format(uid=owner_id)
+
+
+# =========================================================================
+#  ПРОФИЛЬ / СТЕНА
+# =========================================================================
+
+def profile_content(u: dict, me: dict) -> str:
+    uid = u["id"]
+
+    posts = [p for p in DB["posts"].values() if p["owner_id"] == uid]
+    posts.sort(key=lambda p: p["created"], reverse=True)
+
+    # кнопки действий
+    btns = []
+    if uid != me["id"]:
+        if uid in friends_of(me["id"]):
+            btns.append(form_button("/friends/remove/" + str(uid), "Удалить из друзей"))
+        elif uid in requests_of(me["id"]):
+            btns.append(form_button("/friends/accept/" + str(uid), "Принять заявку"))
+        elif me["id"] in requests_of(uid):
+            btns.append('<span class="cnt">Заявка отправлена</span>')
+        else:
+            btns.append(form_button("/friends/add/" + str(uid), "Добавить в друзья"))
+
+    info = [
+        ("Город:", u["city"] or "—"),
+        ("Пол:", "мужской" if u["sex"] == "m" else "женский"),
+        ("Друзей:", str(len(friends_of(uid)))),
+        ("На сайте с:", datetime.fromtimestamp(u["created"]).strftime("%d.%m.%Y")),
+    ]
+    info_html = "".join(
+        '<div><b>{k}</b> {v}</div>'.format(k=esc(k), v=esc(v)) for k, v in info
+    )
+
+    post_form = ('<div class="body">' + wall_form(uid) + '</div>') if True else ""
+
+    about_box = ""
+    if u["about"]:
+        about_box = (
+            '<div class="box"><h2>О себе</h2>'
+            '<div class="body">{t}</div></div>'
+        ).format(t=esc(u["about"]))
+
+    return (
+        '<div class="profile"><div class="ptop">'
+        '<div class="pava">{ava}</div>'
+        '<h1>{name}</h1>'
+        '<div class="pinfo">{info}</div>'
+        '<div class="pbtns">{btns}</div>'
+        '</div></div>'
+        '{about}'
+        '<div class="box"><h2>Стена</h2>'
+        '{pf}'
+        '{wall}'
+        '</div>'
+    ).format(ava=avatar(u, 150),
+             name=esc(u["name"] + " " + u["surname"]),
+             info=info_html,
+             btns=" ".join(btns),
+             about=about_box,
+             pf=post_form,
+             wall=render_posts(posts, me))
+
+
+# =========================================================================
+#  МАРШРУТЫ: ГЛАВНАЯ / СТЕНА
+# =========================================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    base = str(request.base_url).rstrip("/")
-    og = (
-        '<meta property="og:type" content="website">\n'
-        '<meta property="og:title" content="SldChat - Direct Messages">\n'
-        '<meta property="og:description" content="SldChat удобное места для передачи сообщения из точки в точку">\n'
-        f'<meta property="og:image" content="{base}/og-image.png?status=stable">\n'
-        '<meta property="og:image:type" content="image/png">\n'
-        '<meta property="og:image:width" content="1200">\n'
-        '<meta property="og:image:height" content="630">\n'
-        f'<meta property="og:url" content="{base}/">\n'
-        '<meta name="twitter:card" content="summary_large_image">\n'
-        '<meta name="twitter:title" content="SldChat - Direct Messages">\n'
-        '<meta name="twitter:description" content="SldChat удобное места для передачи сообщения из точки в точку">\n'
-        f'<meta name="twitter:image" content="{base}/og-image.png?status=stable">\n'
-    )
-    return render_page(og, "sldchat")
+def index(request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    return RedirectResponse("/u/{0}".format(me["id"]), status_code=303)
 
 
-# ============================================================
-#                        ЗАПУСК
-# ============================================================
+@app.get("/u/{uid}", response_class=HTMLResponse)
+def profile(uid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    u = DB["users"].get(uid)
+    if not u:
+        content = ('<div class="box"><div class="body">'
+                   'Пользователь не найден. <a href="/people">Все люди</a>'
+                   '</div></div>')
+        return HTMLResponse(layout("Не найдено", content, me), status_code=404)
+
+    title = u["name"] + " " + u["surname"]
+    return HTMLResponse(layout(title, profile_content(u, me), me))
+
+
+@app.get("/feed", response_class=HTMLResponse)
+def feed(request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    my_friends = friends_of(me["id"])
+    allowed_authors = set(my_friends) | {me["id"]}
+
+    posts = [p for p in DB["posts"].values() if p["author_id"] in allowed_authors]
+    posts.sort(key=lambda p: p["created"], reverse=True)
+    posts = posts[:50]
+
+    content = (
+        '<div class="box"><h2>Новости</h2>{posts}</div>'
+    ).format(posts=render_posts(posts, me))
+
+    return HTMLResponse(layout("Новости", content, me))
+
+
+# =========================================================================
+#  МАРШРУТЫ: ПОСТЫ
+# =========================================================================
+
+@app.post("/post")
+def post_create(request: Request, text: str = Form(""), owner_id: int = Form(0)):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    text = text.strip()
+    if text:
+        if owner_id not in DB["users"]:
+            owner_id = me["id"]
+        add_post(me["id"], owner_id, text[:1000])
+
+    return go(back_url(request, "/u/{0}".format(owner_id or me["id"])))
+
+
+@app.post("/post/{pid}/like")
+def post_like(pid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    p = DB["posts"].get(pid)
+    if p:
+        if me["id"] in p["likes"]:
+            p["likes"].discard(me["id"])
+        else:
+            p["likes"].add(me["id"])
+    return go(back_url(request))
+
+
+@app.post("/post/{pid}/comment")
+def post_comment(pid: int, request: Request, text: str = Form("")):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    p = DB["posts"].get(pid)
+    text = text.strip()
+    if p and text:
+        p["comments"].append({
+            "author_id": me["id"],
+            "text": text[:500],
+            "created": time.time(),
+        })
+    return go(back_url(request))
+
+
+@app.post("/post/{pid}/delete")
+def post_delete(pid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    p = DB["posts"].get(pid)
+    if p and (me["id"] == p["author_id"] or me["id"] == p["owner_id"]):
+        DB["posts"].pop(pid, None)
+    return go(back_url(request))
+
+
+# =========================================================================
+#  МАРШРУТЫ: ДРУЗЬЯ
+# =========================================================================
+
+@app.get("/friends", response_class=HTMLResponse)
+def friends_page(request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    my_friends = sorted(friends_of(me["id"]))
+    incoming = sorted(requests_of(me["id"]))
+    outgoing = sorted(u["id"] for u in DB["users"].values()
+                      if me["id"] in requests_of(u["id"]))
+
+    def user_row(uid, actions=""):
+        u = DB["users"].get(uid)
+        if not u:
+            return ""
+        return (
+            '<div class="post" style="padding:8px 12px">'
+            '<div class="pava2" style="margin-right:10px">{ava}</div>'
+            '<div class="pbody" style="margin-left:52px;padding-top:6px">'
+            '<a class="pauthor" href="/u/{uid}">{n} {s}</a>'
+            '<div class="cnt">{city}</div>'
+            '{act}'
+            '</div><div class="clear"></div></div>'
+        ).format(ava=avatar(u, 40), uid=uid, n=esc(u["name"]), s=esc(u["surname"]),
+                 city=esc(u["city"] or ""), act=actions)
+
+    fr_rows = "".join(
+        user_row(uid, form_button("/friends/remove/" + str(uid),
+                                  "Удалить из друзей", "linkbtn"))
+        for uid in my_friends
+    ) or '<div class="empty">У вас пока нет друзей. <a href="/people">Найти людей</a></div>'
+
+    inc_rows = "".join(
+        user_row(uid, form_button("/friends/accept/" + str(uid), "Принять заявку"))
+        for uid in incoming
+    ) or '<div class="empty">Новых заявок нет.</div>'
+
+    out_rows = "".join(
+        user_row(uid, '<span class="cnt">Заявка отправлена</span>')
+        for uid in outgoing
+    ) or '<div class="empty">Исходящих заявок нет.</div>'
+
+    content = (
+        '<div class="box"><h2>Мои друзья ({fc})</h2>{fr}</div>'
+        '<div class="box"><h2>Заявки в друзья ({ic})</h2>{inc}</div>'
+        '<div class="box"><h2>Я отправил заявки ({oc})</h2>{out}</div>'
+    ).format(fc=len(my_friends), fr=fr_rows,
+             ic=len(incoming), inc=inc_rows,
+             oc=len(outgoing), out=out_rows)
+
+    return HTMLResponse(layout("Друзья", content, me))
+
+
+@app.post("/friends/add/{uid}")
+def friend_add(uid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    if uid in DB["users"] and uid != me["id"] and uid not in friends_of(me["id"]):
+        requests_of(uid).add(me["id"])
+    return go(back_url(request))
+
+
+@app.post("/friends/accept/{uid}")
+def friend_accept(uid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    if uid in DB["users"] and me["id"] in requests_of(uid):
+        requests_of(uid).discard(me["id"])
+        friends_of(me["id"]).add(uid)
+        friends_of(uid).add(me["id"])
+    return go(back_url(request))
+
+
+@app.post("/friends/remove/{uid}")
+def friend_remove(uid: int, request: Request):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+    friends_of(me["id"]).discard(uid)
+    friends_of(uid).discard(me["id"])
+    return go(back_url(request))
+
+
+# =========================================================================
+#  МАРШРУТЫ: ЛЮДИ
+# =========================================================================
+
+@app.get("/people", response_class=HTMLResponse)
+def people(request: Request, q: str = ""):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    q = q.strip()
+    users = sorted(DB["users"].values(), key=lambda u: u["id"])
+    if q:
+        ql = q.lower()
+        users = [u for u in users
+                 if ql in u["name"].lower()
+                 or ql in u["surname"].lower()
+                 or ql in u["login"].lower()]
+
+    rows = []
+    for u in users:
+        act = ""
+        if u["id"] != me["id"]:
+            if u["id"] in friends_of(me["id"]):
+                act = '<span class="cnt">у вас в друзьях</span>'
+            elif u["id"] in requests_of(me["id"]):
+                act = form_button("/friends/accept/" + str(u["id"]), "Принять заявку")
+            elif me["id"] in requests_of(u["id"]):
+                act = '<span class="cnt">заявка отправлена</span>'
+            else:
+                act = form_button("/friends/add/" + str(u["id"]), "Добавить в друзья")
+        else:
+            act = '<span class="cnt">это вы</span>'
+
+        rows.append(
+            '<div class="post" style="padding:10px 12px">'
+            '<div class="pava2" style="margin-right:10px">{ava}</div>'
+            '<div class="pbody" style="margin-left:62px">'
+            '<a class="pauthor" href="/u/{uid}">{n} {s}</a>'
+            '<div class="cnt">{city}</div>'
+            '<div style="margin-top:6px">{act}</div>'
+            '</div><div class="clear"></div></div>'
+        ).format(ava=avatar(u, 50), uid=u["id"], n=esc(u["name"]),
+                 s=esc(u["surname"]), city=esc(u["city"] or ""), act=act))
+
+    body = "".join(rows) or '<div class="empty">Никого не найдено.</div>'
+    title = "Поиск людей" + (": " + q if q else "")
+    content = '<div class="box"><h2>{t}</h2>{b}</div>'.format(t=esc(title), b=body)
+
+    return HTMLResponse(layout(title, content, me, q=q))
+
+
+# =========================================================================
+#  МАРШРУТЫ: НАСТРОЙКИ
+# =========================================================================
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_get(request: Request, ok: int = 0):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    msg = '<div class="err" style="background:#e8f5e9;border-color:#a5d6a7;color:#2e7d32">Изменения сохранены.</div>' if ok else ""
+
+    form = (
+        '{msg}'
+        '<form method="post" action="/settings">'
+        '<span class="lbl">Имя</span>'
+        '<input type="text" name="name" value="{n}" maxlength="40" required>'
+        '<span class="lbl">Фамилия</span>'
+        '<input type="text" name="surname" value="{s}" maxlength="40" required>'
+        '<span class="lbl">Город</span>'
+        '<input type="text" name="city" value="{c}" maxlength="60">'
+        '<span class="lbl">Пол</span>'
+        '<label class="radio"><input type="radio" name="sex" value="m" {cm}> мужской</label>'
+        '<label class="radio"><input type="radio" name="sex" value="f" {cf}> женский</label>'
+        '<span class="lbl">О себе</span>'
+        '<textarea name="about" rows="4" maxlength="500">{a}</textarea>'
+        '<div style="margin-top:10px"><button class="btn">Сохранить</button></div>'
+        '</form>'
+    ).format(msg=msg, n=esc(me["name"]), s=esc(me["surname"]),
+             c=esc(me["city"]), a=esc(me["about"]),
+             cm="checked" if me["sex"] == "m" else "",
+             cf="checked" if me["sex"] == "f" else "")
+
+    content = (
+        '<div class="box"><h2>Настройки</h2><div class="body">{f}</div></div>'
+        '<div class="box"><h2>Аккаунт</h2><div class="body">'
+        'Логин: <b>{login}</b><br>'
+        'Зарегистрирован: {reg}'
+        '</div></div>'
+    ).format(f=form, login=esc(me["login"]),
+             reg=datetime.fromtimestamp(me["created"]).strftime("%d.%m.%Y %H:%M"))
+
+    return HTMLResponse(layout("Настройки", content, me))
+
+
+@app.post("/settings")
+def settings_post(
+    request: Request,
+    name: str = Form(""),
+    surname: str = Form(""),
+    city: str = Form(""),
+    sex: str = Form("m"),
+    about: str = Form(""),
+):
+    me = current_user(request)
+    if not me:
+        return RedirectResponse("/login", status_code=303)
+
+    if name.strip():
+        me["name"] = name.strip()[:40]
+    if surname.strip():
+        me["surname"] = surname.strip()[:40]
+    me["city"] = city.strip()[:60]
+    me["sex"] = "f" if sex == "f" else "m"
+    me["about"] = about.strip()[:500]
+
+    return RedirectResponse("/settings?ok=1", status_code=303)
+
+
+# =========================================================================
+#  МАРШРУТЫ: РЕГИСТРАЦИЯ / ВХОД / ВЫХОД
+# =========================================================================
+
+def register_form(error: str = "", vals: Optional[dict] = None) -> str:
+    v = vals or {}
+    err = '<div class="err">{0}</div>'.format(esc(error)) if error else ""
+    return (
+        '{err}'
+        '<form method="post" action="/register">'
+        '<span class="lbl">Логин (латиница/цифры, 3-20)</span>'
+        '<input type="text" name="login" value="{login}" maxlength="20" required>'
+        '<span class="lbl">Пароль (мин. 4 символа)</span>'
+        '<input type="password" name="password" maxlength="60" required>'
+        '<span class="lbl">Имя</span>'
+        '<input type="text" name="name" value="{name}" maxlength="40" required>'
+        '<span class="lbl">Фамилия</span>'
+        '<input type="text" name="surname" value="{surname}" maxlength="40" required>'
+        '<span class="lbl">Город</span>'
+        '<input type="text" name="city" value="{city}" maxlength="60">'
+        '<span class="lbl">Пол</span>'
+        '<label class="radio"><input type="radio" name="sex" value="m" checked> мужской</label>'
+        '<label class="radio"><input type="radio" name="sex" value="f"> женский</label>'
+        '<div style="margin-top:14px"><button class="btn">Зарегистрироваться</button></div>'
+        '<div style="margin-top:10px">Уже есть аккаунт? <a href="/login">Войти</a></div>'
+        '</form>'
+    ).format(err=err, login=esc(v.get("login", "")), name=esc(v.get("name", "")),
+             surname=esc(v.get("surname", "")), city=esc(v.get("city", "")))
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_get():
+    return HTMLResponse(auth_layout("Регистрация", register_form()))
+
+
+@app.post("/register", response_class=HTMLResponse)
+def register_post(
+    request: Request,
+    login: str = Form(""),
+    password: str = Form(""),
+    name: str = Form(""),
+    surname: str = Form(""),
+    city: str = Form(""),
+    sex: str = Form("m"),
+    about: str = Form(""),
+):
+    login = login.strip()
+    name = name.strip()
+    surname = surname.strip()
+
+    vals = {"login": login, "name": name, "surname": surname, "city": city.strip()}
+
+    error = ""
+    if not (3 <= len(login) <= 20) or not login.replace("_", "").isalnum():
+        error = "Логин: 3-20 символов, только буквы, цифры и подчёркивание."
+    elif login.lower() in DB["logins"]:
+        error = "Такой логин уже занят."
+    elif len(password) < 4:
+        error = "Пароль должен быть не короче 4 символов."
+    elif not name or not surname:
+        error = "Имя и фамилия обязательны."
+
+    if error:
+        return HTMLResponse(auth_layout("Регистрация", register_form(error, vals)),
+                            status_code=400)
+
+    user = create_user(login, password, name, surname,
+                       city.strip()[:60], "f" if sex == "f" else "m",
+                       about.strip()[:500])
+
+    sid = secrets.token_urlsafe(24)
+    DB["sessions"][sid] = user["id"]
+    return go("/u/{0}".format(user["id"]), sid=sid)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_get(request: Request, err: str = ""):
+    if current_user(request):
+        return RedirectResponse("/", status_code=303)
+
+    err_html = '<div class="err">{0}</div>'.format(esc(err)) if err else ""
+    content = (
+        '{err}'
+        '<form method="post" action="/login">'
+        '<span class="lbl">Логин</span>'
+        '<input type="text" name="login" maxlength="20" required>'
+        '<span class="lbl">Пароль</span>'
+        '<input type="password" name="password" maxlength="60" required>'
+        '<div style="margin-top:14px"><button class="btn">Войти</button></div>'
+        '<div style="margin-top:10px">Нет аккаунта? <a href="/register">Регистрация</a></div>'
+        '</form>'
+    ).format(err=err_html)
+    return HTMLResponse(auth_layout("Вход", content))
+
+
+@app.post("/login")
+def login_post(
+    request: Request,
+    login: str = Form(""),
+    password: str = Form(""),
+):
+    uid = DB["logins"].get(login.strip().lower())
+    u = DB["users"].get(uid) if uid else None
+
+    if not u or hash_pw(password, u["salt"]) != u["pw"]:
+        return RedirectResponse("/login?err=Неверный+логин+или+пароль", status_code=303)
+
+    sid = secrets.token_urlsafe(24)
+    DB["sessions"][sid] = u["id"]
+    return go("/u/{0}".format(u["id"]), sid=sid)
+
+
+@app.get("/logout")
+def logout(request: Request):
+    sid = request.cookies.get("sid")
+    if sid:
+        DB["sessions"].pop(sid, None)
+    r = RedirectResponse("/login", status_code=303)
+    r.delete_cookie("sid")
+    return r
+
+
+# =========================================================================
+#  ДЕМО-ДАННЫЕ
+# =========================================================================
+
+def seed():
+    if DB["users"]:
+        return
+    vasya = create_user("vasya", "1234", "Василий", "Пупкин",
+                        "Москва", "m", "Люблю футбол, семечки и подъездную акустику.")
+    masha = create_user("masha", "1234", "Мария", "Иванова",
+                        "Санкт-Петербург", "f", "Кошки, гитара и дождливые вечера.")
+    friends_of(vasya["id"]).add(masha["id"])
+    friends_of(masha["id"]).add(vasya["id"])
+
+    p1 = add_post(vasya["id"], vasya["id"], "Всем привет! Я тут новенький :)")
+    p2 = add_post(masha["id"], masha["id"], "Кто идёт завтра на концерт в клуб?")
+    p3 = add_post(vasya["id"], masha["id"], "Маша, с днём рождения! 🎉")
+
+    p2["likes"].add(vasya["id"])
+    p2["likes"].add(masha["id"])
+    p1["likes"].add(masha["id"])
+
+    p1["comments"].append({"author_id": masha["id"],
+                           "text": "Добро пожаловать!",
+                           "created": time.time()})
+    p2["comments"].append({"author_id": vasya["id"],
+                           "text": "Я иду, беру два билета",
+                           "created": time.time()})
+
+
+seed()
+
+# =========================================================================
+#  ТОЧКА ВХОДА
+# =========================================================================
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("=" * 56)
+    print("  ВКонтактик 2008 запущен: http://127.0.0.1:8000")
+    print("  Демо-аккаунты:  vasya / 1234   и   masha / 1234")
+    print("=" * 56)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
