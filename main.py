@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sld")
 
 START_TIME = time.time()
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 app = FastAPI(title="SLD", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -59,199 +59,105 @@ _USER_CACHE: Dict[str, Tuple[float, dict]] = {}
 _RATE: Dict[str, List[float]] = {}
 
 DEFAULT_EMOJI = "😀"
-
-# Dummy hash for constant-time login (prevents user enumeration by timing)
-_DUMMY_HASH = None  # lazily computed at first request
+_DUMMY_HASH = None
 
 EMOJI_DATA: List[Tuple[str, str, str]] = [
-    ("😀", "Улыбашка", "Grinning"),
-    ("😃", "Улыбка с глазами", "Big smile"),
-    ("😄", "Смех", "Laughing"),
-    ("😁", "Сияющая улыбка", "Beaming"),
-    ("😆", "Хохот", "Grinning squint"),
-    ("😅", "Улыбка с потом", "Nervous laugh"),
-    ("😂", "Слёзы смеха", "Tears of joy"),
-    ("😊", "Смущённая улыбка", "Blush"),
-    ("😇", "Ангел", "Angel"),
-    ("🙂", "Легкая улыбка", "Slight smile"),
-    ("🙃", "Перевёрнутая улыбка", "Upside down"),
-    ("😉", "Подмигивание", "Wink"),
-    ("😌", "Спокойствие", "Relieved"),
-    ("😍", "Влюблённые глаза", "Heart eyes"),
-    ("😘", "Воздушный поцелуй", "Kiss"),
-    ("😗", "Поцелуй", "Kissing"),
-    ("😙", "Поцелуй с улыбкой", "Kissing smile"),
-    ("😚", "Закрытый поцелуй", "Kissing closed eyes"),
-    ("😋", "Вкусно", "Yum"),
-    ("😛", "Язык", "Tongue"),
-    ("😝", "Прищур с языком", "Squint tongue"),
-    ("😜", "Подмигивание с языком", "Wink tongue"),
-    ("😎", "Крутой", "Cool"),
-    ("😏", "Ухмылка", "Smirk"),
-    ("😒", "Недовольство", "Unamused"),
-    ("😞", "Разочарование", "Disappointed"),
-    ("😔", "Печаль", "Pensive"),
-    ("😟", "Тревога", "Worried"),
-    ("😕", "Смущение", "Confused"),
-    ("🙁", "Легкая грусть", "Slight frown"),
-    ("☹️", "Грусть", "Frown"),
-    ("😣", "Мучение", "Persevere"),
-    ("😖", "Замешательство", "Confounded"),
-    ("😫", "Усталость", "Tired"),
-    ("😩", "Изнеможение", "Weary"),
-    ("😢", "Слеза", "Crying"),
-    ("😭", "Громкий плач", "Sobbing"),
-    ("😤", "Пар из носа", "Triumph"),
-    ("😠", "Злость", "Angry"),
-    ("😡", "Ярость", "Rage"),
-    ("😳", "Румянец", "Flushed"),
-    ("😱", "Крик", "Scream"),
-    ("😨", "Испуг", "Fearful"),
-    ("😰", "Тревожный пот", "Anxious"),
-    ("😥", "Грустный пот", "Sad relieved"),
-    ("😓", "Пот", "Downcast"),
-    ("🤗", "Обнимашки", "Hug"),
-    ("🤔", "Размышление", "Thinking"),
-    ("🤐", "Молчание", "Zipper mouth"),
-    ("😶", "Без слов", "No mouth"),
-    ("😐", "Нейтрально", "Neutral"),
-    ("😑", "Без эмоций", "Expressionless"),
-    ("😬", "Стиснутые зубы", "Grimacing"),
-    ("🙄", "Закатывает глаза", "Eye roll"),
-    ("😯", "Удивление", "Hushed"),
-    ("😦", "Открытый рот", "Frowning open"),
-    ("😧", "Изумление", "Anguished"),
-    ("😮", "Ох", "Open mouth"),
-    ("😲", "Потрясение", "Astonished"),
-    ("😴", "Сон", "Sleeping"),
-    ("🤤", "Слюни", "Drooling"),
-    ("😪", "Сонливость", "Sleepy"),
-    ("😵", "Головокружение", "Dizzy"),
-    ("🤢", "Тошнота", "Nauseous"),
-    ("🤧", "Чих", "Sneezing"),
-    ("😷", "Маска", "Mask"),
-    ("🤒", "Термометр", "Sick"),
-    ("🤕", "Повязка", "Injured"),
-    ("😈", "Дьяволёнок", "Devil"),
-    ("👿", "Злой дьявол", "Angry devil"),
-    ("👹", "Огр", "Ogre"),
-    ("👺", "Тэнгу", "Goblin"),
-    ("💩", "Какашка", "Poo"),
-    ("💀", "Череп", "Skull"),
-    ("👻", "Призрак", "Ghost"),
-    ("👽", "Инопланетянин", "Alien"),
-    ("👾", "Космический монстр", "Space invader"),
-    ("🤖", "Робот", "Robot"),
-    ("🎃", "Тыква", "Pumpkin"),
-    ("😺", "Кот улыбается", "Grinning cat"),
-    ("😸", "Кот смеётся", "Grinning cat eyes"),
-    ("😹", "Кот со слезами", "Cat tears of joy"),
-    ("😻", "Кот влюблён", "Heart eyes cat"),
-    ("😼", "Кот ухмыляется", "Wry cat"),
-    ("😽", "Кот целует", "Kissing cat"),
-    ("🙀", "Кот в шоке", "Weary cat"),
-    ("😿", "Кот плачет", "Crying cat"),
-    ("😾", "Кот злится", "Pouting cat"),
-    ("🐶", "Собака", "Dog"),
-    ("🐱", "Кошка", "Cat"),
-    ("🐭", "Мышь", "Mouse"),
-    ("🐹", "Хомяк", "Hamster"),
-    ("🐰", "Кролик", "Rabbit"),
-    ("🐻", "Медведь", "Bear"),
-    ("🐼", "Панда", "Panda"),
-    ("🐨", "Коала", "Koala"),
-    ("🐯", "Тигр", "Tiger"),
-    ("🐮", "Корова", "Cow"),
-    ("🐷", "Свинья", "Pig"),
-    ("🐸", "Лягушка", "Frog"),
-    ("🐵", "Обезьяна", "Monkey"),
-    ("🐔", "Курица", "Chicken"),
-    ("🐧", "Пингвин", "Penguin"),
-    ("🐦", "Птица", "Bird"),
-    ("🐤", "Цыплёнок", "Baby chick"),
-    ("🐺", "Волк", "Wolf"),
-    ("🐴", "Лошадь", "Horse"),
-    ("🐝", "Пчела", "Bee"),
-    ("🐛", "Гусеница", "Bug"),
-    ("🐢", "Черепаха", "Turtle"),
-    ("🐍", "Змея", "Snake"),
-    ("🐙", "Осьминог", "Octopus"),
-    ("🐠", "Тропическая рыба", "Tropical fish"),
-    ("🐟", "Рыба", "Fish"),
-    ("🐬", "Дельфин", "Dolphin"),
-    ("🐳", "Кит", "Whale"),
-    ("🐋", "Кит с фонтанчиком", "Humpback whale"),
-    ("🌵", "Кактус", "Cactus"),
-    ("🎄", "Новогодняя ёлка", "Christmas tree"),
-    ("🌲", "Ёлка", "Evergreen"),
-    ("🌳", "Дерево", "Tree"),
-    ("🌴", "Пальма", "Palm"),
-    ("🌱", "Росток", "Seedling"),
-    ("🌿", "Трава", "Herb"),
-    ("🍀", "Клевер", "Four-leaf clover"),
-    ("🍃", "Листок на ветру", "Leaf fluttering"),
-    ("🍂", "Осенний лист", "Fallen leaf"),
-    ("🍁", "Кленовый лист", "Maple leaf"),
-    ("🍄", "Гриб", "Mushroom"),
-    ("🌾", "Колосья", "Sheaf of rice"),
-    ("🌷", "Тюльпан", "Tulip"),
-    ("🌹", "Роза", "Rose"),
-    ("🌺", "Гибискус", "Hibiscus"),
-    ("🌸", "Сакура", "Cherry blossom"),
-    ("🌼", "Ромашка", "Blossom"),
-    ("🌻", "Подсолнух", "Sunflower"),
-    ("💐", "Букет", "Bouquet"),
-    ("🌞", "Солнце с лицом", "Sun with face"),
-    ("🌝", "Полная луна с лицом", "Full moon face"),
-    ("🌛", "Луна с лицом", "First quarter moon face"),
-    ("🌜", "Луна с лицом (влево)", "Last quarter moon"),
-    ("🌚", "Новая луна с лицом", "New moon face"),
-    ("🌕", "Полная луна", "Full moon"),
-    ("🌙", "Полумесяц", "Crescent moon"),
-    ("🌎", "Земля (Америка)", "Earth Americas"),
-    ("🌍", "Земля (Европа)", "Earth Europe"),
-    ("🌏", "Земля (Азия)", "Earth Asia"),
-    ("⭐", "Звезда", "Star"),
-    ("🌟", "Сияющая звезда", "Glowing star"),
-    ("✨", "Искры", "Sparkles"),
-    ("⚡", "Молния", "Lightning"),
-    ("🔥", "Огонь", "Fire"),
-    ("💥", "Взрыв", "Collision"),
-    ("🌈", "Радуга", "Rainbow"),
-    ("💧", "Капля", "Droplet"),
-    ("🌊", "Волна", "Wave"),
-    ("🍎", "Красное яблоко", "Red apple"),
-    ("🍊", "Мандарин", "Tangerine"),
-    ("🍋", "Лимон", "Lemon"),
-    ("🍌", "Банан", "Banana"),
-    ("🍉", "Арбуз", "Watermelon"),
-    ("🍇", "Виноград", "Grapes"),
-    ("🍓", "Клубника", "Strawberry"),
-    ("🍒", "Вишня", "Cherries"),
-    ("🍑", "Персик", "Peach"),
-    ("🍍", "Ананас", "Pineapple"),
-    ("🍅", "Помидор", "Tomato"),
-    ("🍞", "Хлеб", "Bread"),
-    ("🍔", "Бургер", "Burger"),
-    ("🍟", "Картошка фри", "Fries"),
-    ("🍕", "Пицца", "Pizza"),
-    ("🍜", "Лапша", "Noodles"),
-    ("🍣", "Суши", "Sushi"),
-    ("🍦", "Мороженое", "Ice cream"),
-    ("🍩", "Пончик", "Donut"),
-    ("🍪", "Печенье", "Cookie"),
-    ("🎂", "Торт", "Birthday cake"),
-    ("🍰", "Кусок торта", "Shortcake"),
-    ("🍫", "Шоколад", "Chocolate"),
-    ("🍬", "Конфета", "Candy"),
+    ("😀", "Улыбашка", "Grinning"), ("😃", "Улыбка с глазами", "Big smile"),
+    ("😄", "Смех", "Laughing"), ("😁", "Сияющая улыбка", "Beaming"),
+    ("😆", "Хохот", "Grinning squint"), ("😅", "Улыбка с потом", "Nervous laugh"),
+    ("😂", "Слёзы смеха", "Tears of joy"), ("😊", "Смущённая улыбка", "Blush"),
+    ("😇", "Ангел", "Angel"), ("🙂", "Легкая улыбка", "Slight smile"),
+    ("🙃", "Перевёрнутая улыбка", "Upside down"), ("😉", "Подмигивание", "Wink"),
+    ("😌", "Спокойствие", "Relieved"), ("😍", "Влюблённые глаза", "Heart eyes"),
+    ("😘", "Воздушный поцелуй", "Kiss"), ("😗", "Поцелуй", "Kissing"),
+    ("😙", "Поцелуй с улыбкой", "Kissing smile"), ("😚", "Закрытый поцелуй", "Kissing closed"),
+    ("😋", "Вкусно", "Yum"), ("😛", "Язык", "Tongue"),
+    ("😝", "Прищур с языком", "Squint tongue"), ("😜", "Подмигивание с языком", "Wink tongue"),
+    ("😎", "Крутой", "Cool"), ("😏", "Ухмылка", "Smirk"),
+    ("😒", "Недовольство", "Unamused"), ("😞", "Разочарование", "Disappointed"),
+    ("😔", "Печаль", "Pensive"), ("😟", "Тревога", "Worried"),
+    ("😕", "Смущение", "Confused"), ("🙁", "Легкая грусть", "Slight frown"),
+    ("☹️", "Грусть", "Frown"), ("😣", "Мучение", "Persevere"),
+    ("😖", "Замешательство", "Confounded"), ("😫", "Усталость", "Tired"),
+    ("😩", "Изнеможение", "Weary"), ("😢", "Слеза", "Crying"),
+    ("😭", "Громкий плач", "Sobbing"), ("😤", "Пар из носа", "Triumph"),
+    ("😠", "Злость", "Angry"), ("😡", "Ярость", "Rage"),
+    ("😳", "Румянец", "Flushed"), ("😱", "Крик", "Scream"),
+    ("😨", "Испуг", "Fearful"), ("😰", "Тревожный пот", "Anxious"),
+    ("😥", "Грустный пот", "Sad relieved"), ("😓", "Пот", "Downcast"),
+    ("🤗", "Обнимашки", "Hug"), ("🤔", "Размышление", "Thinking"),
+    ("🤐", "Молчание", "Zipper mouth"), ("😶", "Без слов", "No mouth"),
+    ("😐", "Нейтрально", "Neutral"), ("😑", "Без эмоций", "Expressionless"),
+    ("😬", "Стиснутые зубы", "Grimacing"), ("🙄", "Закатывает глаза", "Eye roll"),
+    ("😯", "Удивление", "Hushed"), ("😦", "Открытый рот", "Frowning open"),
+    ("😧", "Изумление", "Anguished"), ("😮", "Ох", "Open mouth"),
+    ("😲", "Потрясение", "Astonished"), ("😴", "Сон", "Sleeping"),
+    ("🤤", "Слюни", "Drooling"), ("😪", "Сонливость", "Sleepy"),
+    ("😵", "Головокружение", "Dizzy"), ("🤢", "Тошнота", "Nauseous"),
+    ("🤧", "Чих", "Sneezing"), ("😷", "Маска", "Mask"),
+    ("🤒", "Термометр", "Sick"), ("🤕", "Повязка", "Injured"),
+    ("😈", "Дьяволёнок", "Devil"), ("👿", "Злой дьявол", "Angry devil"),
+    ("👹", "Огр", "Ogre"), ("👺", "Тэнгу", "Goblin"),
+    ("💩", "Какашка", "Poo"), ("💀", "Череп", "Skull"),
+    ("👻", "Призрак", "Ghost"), ("👽", "Инопланетянин", "Alien"),
+    ("👾", "Космический монстр", "Space invader"), ("🤖", "Робот", "Robot"),
+    ("🎃", "Тыква", "Pumpkin"), ("😺", "Кот улыбается", "Grinning cat"),
+    ("😸", "Кот смеётся", "Grinning cat eyes"), ("😹", "Кот со слезами", "Cat tears"),
+    ("😻", "Кот влюблён", "Heart eyes cat"), ("😼", "Кот ухмыляется", "Wry cat"),
+    ("😽", "Кот целует", "Kissing cat"), ("🙀", "Кот в шоке", "Weary cat"),
+    ("😿", "Кот плачет", "Crying cat"), ("😾", "Кот злится", "Pouting cat"),
+    ("🐶", "Собака", "Dog"), ("🐱", "Кошка", "Cat"),
+    ("🐭", "Мышь", "Mouse"), ("🐹", "Хомяк", "Hamster"),
+    ("🐰", "Кролик", "Rabbit"), ("🐻", "Медведь", "Bear"),
+    ("🐼", "Панда", "Panda"), ("🐨", "Коала", "Koala"),
+    ("🐯", "Тигр", "Tiger"), ("🐮", "Корова", "Cow"),
+    ("🐷", "Свинья", "Pig"), ("🐸", "Лягушка", "Frog"),
+    ("🐵", "Обезьяна", "Monkey"), ("🐔", "Курица", "Chicken"),
+    ("🐧", "Пингвин", "Penguin"), ("🐦", "Птица", "Bird"),
+    ("🐤", "Цыплёнок", "Baby chick"), ("🐺", "Волк", "Wolf"),
+    ("🐴", "Лошадь", "Horse"), ("🐝", "Пчела", "Bee"),
+    ("🐛", "Гусеница", "Bug"), ("🐢", "Черепаха", "Turtle"),
+    ("🐍", "Змея", "Snake"), ("🐙", "Осьминог", "Octopus"),
+    ("🐠", "Тропическая рыба", "Tropical fish"), ("🐟", "Рыба", "Fish"),
+    ("🐬", "Дельфин", "Dolphin"), ("🐳", "Кит", "Whale"),
+    ("🐋", "Кит с фонтанчиком", "Humpback whale"), ("🌵", "Кактус", "Cactus"),
+    ("🎄", "Новогодняя ёлка", "Christmas tree"), ("🌲", "Ёлка", "Evergreen"),
+    ("🌳", "Дерево", "Tree"), ("🌴", "Пальма", "Palm"),
+    ("🌱", "Росток", "Seedling"), ("🌿", "Трава", "Herb"),
+    ("🍀", "Клевер", "Four-leaf clover"), ("🍃", "Листок на ветру", "Leaf fluttering"),
+    ("🍂", "Осенний лист", "Fallen leaf"), ("🍁", "Кленовый лист", "Maple leaf"),
+    ("🍄", "Гриб", "Mushroom"), ("🌾", "Колосья", "Sheaf of rice"),
+    ("🌷", "Тюльпан", "Tulip"), ("🌹", "Роза", "Rose"),
+    ("🌺", "Гибискус", "Hibiscus"), ("🌸", "Сакура", "Cherry blossom"),
+    ("🌼", "Ромашка", "Blossom"), ("🌻", "Подсолнух", "Sunflower"),
+    ("💐", "Букет", "Bouquet"), ("🌞", "Солнце с лицом", "Sun with face"),
+    ("🌝", "Полная луна с лицом", "Full moon face"), ("🌛", "Луна с лицом", "Moon face"),
+    ("🌜", "Луна с лицом (влево)", "Last quarter moon"), ("🌚", "Новая луна с лицом", "New moon face"),
+    ("🌕", "Полная луна", "Full moon"), ("🌙", "Полумесяц", "Crescent moon"),
+    ("🌎", "Земля (Америка)", "Earth Americas"), ("🌍", "Земля (Европа)", "Earth Europe"),
+    ("🌏", "Земля (Азия)", "Earth Asia"), ("⭐", "Звезда", "Star"),
+    ("🌟", "Сияющая звезда", "Glowing star"), ("✨", "Искры", "Sparkles"),
+    ("⚡", "Молния", "Lightning"), ("🔥", "Огонь", "Fire"),
+    ("💥", "Взрыв", "Collision"), ("🌈", "Радуга", "Rainbow"),
+    ("💧", "Капля", "Droplet"), ("🌊", "Волна", "Wave"),
+    ("🍎", "Красное яблоко", "Red apple"), ("🍊", "Мандарин", "Tangerine"),
+    ("🍋", "Лимон", "Lemon"), ("🍌", "Банан", "Banana"),
+    ("🍉", "Арбуз", "Watermelon"), ("🍇", "Виноград", "Grapes"),
+    ("🍓", "Клубника", "Strawberry"), ("🍒", "Вишня", "Cherries"),
+    ("🍑", "Персик", "Peach"), ("🍍", "Ананас", "Pineapple"),
+    ("🍅", "Помидор", "Tomato"), ("🍞", "Хлеб", "Bread"),
+    ("🍔", "Бургер", "Burger"), ("🍟", "Картошка фри", "Fries"),
+    ("🍕", "Пицца", "Pizza"), ("🍜", "Лапша", "Noodles"),
+    ("🍣", "Суши", "Sushi"), ("🍦", "Мороженое", "Ice cream"),
+    ("🍩", "Пончик", "Donut"), ("🍪", "Печенье", "Cookie"),
+    ("🎂", "Торт", "Birthday cake"), ("🍰", "Кусок торта", "Shortcake"),
+    ("🍫", "Шоколад", "Chocolate"), ("🍬", "Конфета", "Candy"),
 ]
 EMOJIS = [e[0] for e in EMOJI_DATA]
 
 
-# ============ SECURITY MIDDLEWARE ============
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    # 1. Ограничение размера тела запроса
     cl = request.headers.get("content-length")
     if cl:
         try:
@@ -262,7 +168,6 @@ async def security_middleware(request: Request, call_next):
 
     response = await call_next(request)
 
-    # 2. Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
@@ -271,7 +176,6 @@ async def security_middleware(request: Request, call_next):
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
-    # 3. CSP для HTML-ответов
     ct = response.headers.get("content-type", "")
     if ct.startswith("text/html"):
         response.headers["Content-Security-Policy"] = (
@@ -355,8 +259,6 @@ def bus_broadcast(room: str, ev: dict, except_nick: Optional[str] = None) -> Non
 
 
 def broadcast_post_change(post: dict, except_nick: Optional[str] = None, feed: bool = False) -> None:
-    """Рассылка изменений поста по релевантным комнатам.
-    feed=True — только при создании нового поста (в остальных случаях лента не перезагружается)."""
     if not post: return
     pid = post.get("id")
     if pid:
@@ -368,26 +270,20 @@ def broadcast_post_change(post: dict, except_nick: Optional[str] = None, feed: b
         bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
 
 
-# ============ SECURITY UTILS ============
 def _is_private_host(host: str) -> bool:
-    """True, если хост — приватный/локальный/метадата (для защиты от SSRF)."""
     if not host: return True
-    h = host.strip().lower().strip("[]")  # IPv6 в скобках
-    # Общие имена локальных хостов
+    h = host.strip().lower().strip("[]")
     if h in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
         return True
     if h.endswith(".local") or h.endswith(".internal") or h.endswith(".lan"):
         return True
-    # Метадата-эндпоинты облаков
     if h in ("metadata.google.internal", "metadata.google.com", "metadata"):
         return True
-    # IP-адреса
     try:
         ip = ipaddress.ip_address(h)
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return True
-        # link-local 169.254.0.0/16 уже покрывается is_link_local, но проверим явно
         if str(ip).startswith("169.254."):
             return True
         return False
@@ -396,7 +292,6 @@ def _is_private_host(host: str) -> bool:
 
 
 def _safe_url(u) -> str:
-    """Проверка URL: только http/https, без javascript:, без локальных хостов."""
     if not u or not isinstance(u, str):
         return ""
     u = u.strip()
@@ -415,7 +310,6 @@ def _safe_url(u) -> str:
     return u
 
 
-# ============ CORE ============
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     iters = 100_000
@@ -438,10 +332,8 @@ def check_password(password: str, stored: str) -> bool:
 
 
 def check_password_constant_time(password: str, stored: Optional[str]) -> bool:
-    """Проверка пароля с постоянным временем ответа — защита от enumeration по таймингу."""
     global _DUMMY_HASH
     if not stored:
-        # Пользователя нет — всё равно считаем dummy-хеш
         if _DUMMY_HASH is None:
             _DUMMY_HASH = hash_password("dummy_password_for_constant_time_check")
         check_password(password, _DUMMY_HASH)
@@ -539,7 +431,6 @@ def detect_device(ua: str) -> str:
 
 def fetch_og_data(url: str) -> Optional[dict]:
     if not url: return None
-    # SSRF protection — до кэша, чтобы не закэшировать "плохой" URL
     safe = _safe_url(url)
     if not safe:
         return None
@@ -550,7 +441,6 @@ def fetch_og_data(url: str) -> Optional[dict]:
             "User-Agent": "Mozilla/5.0 (compatible; SLDbot/1.0)",
             "Accept": "text/html,application/xhtml+xml",
         })
-        # Ручной редирект-хендлер, чтобы редирект не увёл на приватный IP
         class _NoPrivateRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 if not _safe_url(newurl):
@@ -1228,7 +1118,6 @@ def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
 
 
 def normalize_og(raw):
-    """Парсит og_data и санитизирует URL (защита от javascript:, локальных хостов)."""
     if not raw: return None
     v = None
     if isinstance(raw, dict): v = raw
@@ -1376,6 +1265,20 @@ def _build_og_for_text(text: str, enabled: bool):
     return fetch_og_data(url)
 
 
+@app.get("/api/check_nick")
+def api_check_nick(nick: str, request: Request):
+    ip = get_client_ip(request)
+    if not rate_limit("chknick:" + ip, 90, 60): raise HTTPException(429, "err_rate_limit")
+    n = (nick or "").strip().lstrip("@")
+    if not NICK_RE.match(n):
+        return {"available": False, "reason": "err_bad_nick"}
+    if n.lower() in RESERVED_NICKS:
+        return {"available": False, "reason": "err_nick_reserved"}
+    if db_load_user(n):
+        return {"available": False, "reason": "err_nick_taken"}
+    return {"available": True, "reason": ""}
+
+
 @app.post("/api/room")
 def api_room(data: RoomIn, request: Request):
     u = get_current_user(request)
@@ -1392,11 +1295,7 @@ def api_room(data: RoomIn, request: Request):
 @app.get("/api/uptime")
 def api_uptime(request: Request):
     up = time.time() - START_TIME
-    return {
-        "uptime_seconds": int(up),
-        "started_at": ts_to_iso(START_TIME),
-        "version": VERSION,
-    }
+    return {"uptime_seconds": int(up), "started_at": ts_to_iso(START_TIME), "version": VERSION}
 
 
 @app.post("/api/register")
@@ -1682,7 +1581,6 @@ def api_create(payload: PostIn, request: Request):
                                   "post_id": pid, "text": text[:140]})
     if notifications:
         db_notify_many(notifications)
-    # Только создание поста рассылает refresh в ленту
     broadcast_post_change(p, feed=True)
     return build_posts_full([p], "u:" + u["nick"], with_comments=True)[0]
 
@@ -1699,7 +1597,6 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     db_update_post_text(pid, text)
     p["text"] = text
-    # Правка поста — не рассылаем в ленту, только в комнату поста и профиль автора
     broadcast_post_change(p, feed=False)
     return {"ok": True, "text": text}
 
@@ -1790,7 +1687,6 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     if notifications:
         db_notify_many(notifications, users_map=mention_users)
 
-    # Комментарий — не рассылаем в ленту, только в комнату поста и профиль автора
     broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {
         "ok": True,
@@ -1899,15 +1795,13 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
         bus.set_rooms(nick, ["feed"])
 
     q = await bus.subscribe(nick)
-
     async def gen():
         try:
             yield "retry: 2000\n\n"
             yield ": connected\n\n"
             yield f"data: {json.dumps({'type':'hello','nick':nick}, ensure_ascii=False)}\n\n"
             while True:
-                if await request.is_disconnected():
-                    break
+                if await request.is_disconnected(): break
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SEC)
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
@@ -1919,7 +1813,6 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
             log.warning("[SSE] error for %s: %s", nick, e)
         finally:
             bus.unsubscribe(nick, q)
-
     return StreamingResponse(gen(), media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -1931,6 +1824,15 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
 TEXTS = {
     "ru": {
         "site_name": "СЛД",
+        "auth_tagline": "Минималистичная соцсеть. Посты, комментарии, подписки — без лишнего.",
+        "session_expired": "Сессия истекла. Войдите снова.",
+        "session_expired_hint": "Ваша сессия была завершена на сервере. Войдите заново, чтобы продолжить.",
+        "network_error_hint": "Не удалось связаться с сервером. Проверьте соединение и попробуйте снова.",
+        "booting": "Загрузка…",
+        "check_nick": "Проверить ник",
+        "checking": "Проверка…",
+        "nick_available": "Ник свободен",
+        "refresh": "Обновить",
         "search_ph": "Поиск людей и постов",
         "post_ph": "Что нового?",
         "comment_ph": "Комментарий... Shift+Enter — отправить",
@@ -2074,42 +1976,41 @@ TEXTS = {
             "• Для защиты от спама, ботов и подбора пароля (rate-limit по IP и нику)\n\n"
             "## 4. Безопасность аккаунта\n"
             "• Пароль минимум 8 символов, обязательно с буквами и цифрами\n"
-            "• Хеш pbkdf2-hmac-sha256, 100 000 итераций — не поддаётся перебору за разумное время\n"
-            "• Проверка пароля выполняется за постоянное время — нельзя определить, существует ли аккаунт, по задержке ответа\n"
-            "• Сессии привязаны к случайному токену, максимум 10 активных сессий на аккаунт\n"
-            "• Ограничение попыток входа по IP и нику защищает от подбора пароля\n"
+            "• Хеш pbkdf2-hmac-sha256, 100 000 итераций\n"
+            "• Проверка пароля выполняется за постоянное время\n"
+            "• Сессии привязаны к случайному токену, максимум 10 активных сессий\n"
+            "• Ограничение попыток входа по IP и нику\n"
             "• Все операции изменения данных проверяют владельца на сервере\n"
-            "• Зарезервированные ники (admin, root, sld и др.) недоступны для регистрации\n"
-            "• Строгие заголовки безопасности: CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, HSTS и другие\n"
-            "• Защита от SSRF при загрузке превью ссылок — блокируются локальные и приватные адреса\n"
-            "• Ограничение размера тела запроса (1 МБ)\n"
-            "• Никаких сторонних скриптов и внешних трекеров на сайте\n\n"
+            "• Зарезервированные ники недоступны для регистрации\n"
+            "• Строгие заголовки безопасности: CSP, X-Frame-Options, Referrer-Policy, HSTS и другие\n"
+            "• Защита от SSRF при загрузке превью ссылок\n"
+            "• Ограничение размера тела запроса (1 МБ)\n\n"
             "## 5. Где хранятся данные\n"
-            "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером идёт по HTTPS. Мы не продаём и не передаём ваши данные третьим лицам. Резервные копии делаются автоматически и защищены теми же правилами.\n\n"
+            "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером идёт по HTTPS. Мы не продаём и не передаём ваши данные третьим лицам.\n\n"
             "## 6. Ваши права\n"
-            "• Смотреть и редактировать свой профиль в любой момент\n"
+            "• Смотреть и редактировать свой профиль\n"
             "• Удалять свои посты, комментарии и их ответы\n"
             "• Отписываться от пользователей\n"
             "• Отключать любой тип уведомлений отдельно\n"
             "• Отключать звук уведомлений\n"
             "• Скрывать список подписчиков и подписок\n"
-            "• Отключать показ значка устройства на своих постах\n"
-            "• Полностью удалить аккаунт — напишите нам, данные удаляются в течение 30 дней\n\n"
+            "• Отключать показ значка устройства\n"
+            "• Удалить аккаунт — напишите нам, данные удаляются в течение 30 дней\n\n"
             "## 7. Хранение и удаление\n"
-            "Данные хранятся, пока активен ваш аккаунт. При удалении аккаунта все посты, комментарии, лайки, подписки и уведомления удаляются безвозвратно. Восстановить их будет невозможно.\n\n"
+            "Данные хранятся, пока активен ваш аккаунт. При удалении аккаунта все посты, комментарии, лайки, подписки и уведомления удаляются безвозвратно.\n\n"
             "## 8. Cookies и localStorage\n"
             "Мы используем минимум локального хранения:\n"
-            "• localStorage: SLD_token (токен сессии), SLD_user (кэш профиля), SLD_theme (тема), SLD_lang (язык), SLD_colors (цвета), SLD_sound (звук), SLD_anon_id (анонимный идентификатор для realtime)\n"
+            "• localStorage: SLD_token (токен сессии), SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id\n"
             "• sessionStorage: черновик поста, состояние настроек, цитата\n"
             "• Один cookie: SLD_lang — только чтобы помнить выбранный язык\n"
-            "Сторонних cookies нет. Вы можете очистить эти данные в любой момент в настройках браузера.\n\n"
+            "Сторонних cookies нет.\n\n"
             "## 9. Дети\n"
-            "Сервис не предназначен для лиц младше 13 лет. Мы не собираем данные детей намеренно. Если вам стало известно о таком случае — напишите нам, и мы удалим данные.\n\n"
+            "Сервис не предназначен для лиц младше 13 лет.\n\n"
             "## 10. Изменения политики\n"
-            "Мы можем обновлять эту политику. Существенные изменения мы отражаем датой внизу. Актуальная версия всегда доступна по этой ссылке. Продолжая пользоваться сервисом, вы соглашаетесь с текущей редакцией.\n\n"
+            "Мы можем обновлять эту политику. Актуальная версия всегда доступна по этой ссылке.\n\n"
             "## 11. Контакты\n"
-            "По вопросам приватности, удаления аккаунта или данных — напишите нам через профиль разработчика. Мы отвечаем в течение 7 рабочих дней.\n\n"
-            "Сервис предоставляется «как есть», без гарантий. Мы стараемся делать его безопасным, но не можем гарантировать абсолютную защиту от всех угроз."
+            "По вопросам приватности, удаления аккаунта или данных — напишите нам через профиль разработчика.\n\n"
+            "Сервис предоставляется «как есть», без гарантий."
         ),
         "quote": "Цитировать",
         "avatar_choose": "Выберите эмодзи",
@@ -2123,22 +2024,25 @@ TEXTS = {
         "sent_from_mobile": "Отправлено с телефона",
         "sent_from_desktop": "Отправлено с компьютера",
         "og_img_fallback": "Упсс... не удалось загрузить :(",
-        "page_title_feed": "Лента",
-        "page_title_post": "Пост",
-        "page_title_profile": "Профиль",
-        "page_title_users": "Люди",
-        "page_title_notifications": "Уведомления",
-        "page_title_settings": "Настройки",
-        "page_title_edit_profile": "Изменить профиль",
-        "page_title_policy": "Политика",
-        "page_title_register": "Регистрация",
-        "page_title_login": "Вход",
-        "page_title_followers": "Подписчики",
-        "page_title_following": "Подписки",
+        "page_title_feed": "Лента", "page_title_post": "Пост",
+        "page_title_profile": "Профиль", "page_title_users": "Люди",
+        "page_title_notifications": "Уведомления", "page_title_settings": "Настройки",
+        "page_title_edit_profile": "Изменить профиль", "page_title_policy": "Политика",
+        "page_title_register": "Регистрация", "page_title_login": "Вход",
+        "page_title_followers": "Подписчики", "page_title_following": "Подписки",
         "page_title_notfound": "Не найдено",
     },
     "en": {
         "site_name": "SLD",
+        "auth_tagline": "Minimalist social network. Posts, comments, follows — nothing extra.",
+        "session_expired": "Session expired. Please log in again.",
+        "session_expired_hint": "Your session has ended on the server. Please log in again to continue.",
+        "network_error_hint": "Could not reach the server. Check your connection and try again.",
+        "booting": "Loading…",
+        "check_nick": "Check nick",
+        "checking": "Checking…",
+        "nick_available": "Nick is available",
+        "refresh": "Refresh",
         "search_ph": "Search people and posts",
         "post_ph": "What's new?",
         "comment_ph": "Comment... Shift+Enter to send",
@@ -2213,7 +2117,7 @@ TEXTS = {
         "settings_show_link_previews": "Show link previews (OpenGraph)",
         "settings_show_link_previews_hint": "If enabled, posts with links will show preview cards",
         "settings_show_device_badge": "Show device badge on posts",
-        "settings_show_device_badge_hint": "A phone or desktop icon will appear next to your name on posts, indicating the device used to publish",
+        "settings_show_device_badge_hint": "A phone or desktop icon will appear next to your name on posts",
         "settings_device": "Your device",
         "settings_device_browser": "Browser",
         "settings_device_os": "System",
@@ -2265,10 +2169,10 @@ TEXTS = {
             "• Follows (who follows whom)\n"
             "• Notifications and their read status\n"
             "• Privacy, notification and appearance settings\n"
-            "• Device type (mobile / desktop) at publish time — only to show a badge next to the post\n\n"
+            "• Device type (mobile / desktop) at publish time\n\n"
             "## 2. What we do NOT store\n"
-            "• Your password in plain text — only a cryptographic hash, unrecoverable even by us\n"
-            "• Your IP address (used at request time for city and language detection, not saved)\n"
+            "• Your password in plain text\n"
+            "• Your IP address (used at request time, not saved)\n"
             "• Post view history\n"
             "• Third-party cookies, analytics, trackers, ad identifiers\n"
             "• Data about your location beyond city\n"
@@ -2277,47 +2181,45 @@ TEXTS = {
             "• To display your profile and posts to other users\n"
             "• To show your posts in your subscribers' feeds\n"
             "• To send you notifications about other users' actions\n"
-            "• To verify access rights (you cannot edit others' posts or comments)\n"
+            "• To verify access rights\n"
             "• To detect interface language and show city in your settings\n"
-            "• To protect against spam, bots and brute-force (rate limit by IP and nick)\n\n"
+            "• To protect against spam, bots and brute-force\n\n"
             "## 4. Account security\n"
             "• Password min 8 characters, must contain letters and digits\n"
-            "• pbkdf2-hmac-sha256 hash, 100 000 iterations — infeasible to brute-force\n"
-            "• Password check runs in constant time — user existence cannot be inferred from response timing\n"
+            "• pbkdf2-hmac-sha256 hash, 100 000 iterations\n"
+            "• Password check runs in constant time\n"
             "• Sessions bound to a random token, max 10 active sessions per account\n"
-            "• Login attempts limited per IP and per nick to prevent brute-force\n"
+            "• Login attempts limited per IP and per nick\n"
             "• All data modification operations verify the owner on the server\n"
-            "• Reserved nicks (admin, root, sld, etc.) unavailable for registration\n"
-            "• Strict security headers: CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, HSTS and more\n"
-            "• SSRF protection when fetching link previews — private and local addresses are blocked\n"
-            "• Request body size limit (1 MB)\n"
-            "• No third-party scripts or external trackers on the site\n\n"
+            "• Reserved nicks unavailable for registration\n"
+            "• Strict security headers: CSP, X-Frame-Options, Referrer-Policy, HSTS and more\n"
+            "• SSRF protection when fetching link previews\n"
+            "• Request body size limit (1 MB)\n\n"
             "## 5. Where data is stored\n"
-            "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties. Backups are automatic and protected by the same rules.\n\n"
+            "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties.\n\n"
             "## 6. Your rights\n"
-            "• View and edit your profile at any time\n"
+            "• View and edit your profile\n"
             "• Delete your posts, comments and their replies\n"
             "• Unfollow users\n"
             "• Disable any type of notification individually\n"
             "• Turn off notification sound\n"
             "• Hide your followers / following lists\n"
             "• Disable the device badge on your posts\n"
-            "• Fully delete your account — write to us and data is removed within 30 days\n\n"
+            "• Fully delete your account — write to us\n\n"
             "## 7. Retention and deletion\n"
-            "Data is retained while your account is active. When you delete your account, all posts, comments, likes, follows and notifications are permanently removed. They cannot be recovered.\n\n"
+            "Data is retained while your account is active. When you delete your account, all data is permanently removed.\n\n"
             "## 8. Cookies and localStorage\n"
-            "We use the minimum of local storage:\n"
-            "• localStorage: SLD_token (session), SLD_user (profile cache), SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id (anonymous realtime id)\n"
+            "• localStorage: SLD_token, SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id\n"
             "• sessionStorage: post draft, settings state, quote\n"
             "• One cookie: SLD_lang — only to remember your language choice\n"
-            "No third-party cookies. You can clear these at any time in your browser.\n\n"
+            "No third-party cookies.\n\n"
             "## 9. Children\n"
-            "The service is not intended for users under 13. We do not knowingly collect data from children. If you become aware of such a case — write to us and we will delete the data.\n\n"
+            "The service is not intended for users under 13.\n\n"
             "## 10. Policy changes\n"
-            "We may update this policy. Material changes are reflected in the date below. The current version is always available at this link. By continuing to use the service you agree to the current revision.\n\n"
+            "We may update this policy. The current version is always available at this link.\n\n"
             "## 11. Contact\n"
-            "For privacy, account deletion or data questions — write to us via the developer's profile. We respond within 7 business days.\n\n"
-            "The service is provided \"as is\", without warranties. We do our best to keep it secure but cannot guarantee absolute protection against all threats."
+            "For privacy, account deletion or data questions — write to us via the developer's profile.\n\n"
+            "The service is provided \"as is\", without warranties."
         ),
         "quote": "Quote",
         "avatar_choose": "Choose an emoji",
@@ -2331,18 +2233,12 @@ TEXTS = {
         "sent_from_mobile": "Sent from a phone",
         "sent_from_desktop": "Sent from a computer",
         "og_img_fallback": "Oops... could not load :(",
-        "page_title_feed": "Feed",
-        "page_title_post": "Post",
-        "page_title_profile": "Profile",
-        "page_title_users": "People",
-        "page_title_notifications": "Notifications",
-        "page_title_settings": "Settings",
-        "page_title_edit_profile": "Edit profile",
-        "page_title_policy": "Policy",
-        "page_title_register": "Sign up",
-        "page_title_login": "Log in",
-        "page_title_followers": "Followers",
-        "page_title_following": "Following",
+        "page_title_feed": "Feed", "page_title_post": "Post",
+        "page_title_profile": "Profile", "page_title_users": "People",
+        "page_title_notifications": "Notifications", "page_title_settings": "Settings",
+        "page_title_edit_profile": "Edit profile", "page_title_policy": "Policy",
+        "page_title_register": "Sign up", "page_title_login": "Log in",
+        "page_title_followers": "Followers", "page_title_following": "Following",
         "page_title_notfound": "Not found",
     },
 }
@@ -2359,6 +2255,7 @@ I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
     '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
     '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
 I_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>')
+I_USER_LG = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>', size=18)
 I_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
     '<path d="M13.7 21a2 2 0 0 1-3.4 0"/>')
 I_GEAR = svg('<circle cx="12" cy="12" r="3"/>'
@@ -2389,21 +2286,23 @@ I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/
     '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 I_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=14, sw=3)
+I_CHECK_LG = svg('<polyline points="20 6 9 17 4 12"/>', size=18, sw=3)
+I_X = svg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', size=18, sw=3)
 I_MOBILE = svg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
 I_DESKTOP = svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>', size=12)
 I_SERVER = svg('<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/>', size=14)
+I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=18)
+I_EYE_OFF = svg('<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>', size=18)
+I_LOCK = svg('<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>', size=18)
+I_AT = svg('<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>', size=18)
+I_INFO = svg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>', size=18)
+I_REFRESH = svg('<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>', size=18)
 
 
 def _urlenc(svg_str: str) -> str:
-    return (svg_str
-            .replace("%", "%25")
-            .replace("#", "%23")
-            .replace("<", "%3C")
-            .replace(">", "%3E")
-            .replace("'", "%27")
-            .replace('"', "%22")
-            .replace(" ", "%20")
-            .replace("\n", " "))
+    return (svg_str.replace("%", "%25").replace("#", "%23")
+            .replace("<", "%3C").replace(">", "%3E").replace("'", "%27")
+            .replace('"', "%22").replace(" ", "%20").replace("\n", " "))
 
 
 def _favicon(text: str, bg: str, fg: str, font_size: int) -> str:
@@ -2435,6 +2334,7 @@ CSS = """
   --accent:#3b82f6; --accent-fg:#ffffff;
   --accent-soft:rgba(59,130,246,.12); --accent-soft-2:rgba(59,130,246,.18);
   --like:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
+  --ok:#22c55e;
   --shadow-sm:0 1px 2px rgba(0,0,0,.25); --shadow-md:0 2px 8px rgba(0,0,0,.30);
   --shadow-lg:0 10px 30px rgba(0,0,0,.45);
 }
@@ -2446,6 +2346,7 @@ CSS = """
   --accent:#2563eb; --accent-fg:#ffffff;
   --accent-soft:rgba(37,99,235,.10); --accent-soft-2:rgba(37,99,235,.16);
   --like:#dc2626; --danger:#dc2626; --mention:#2563eb;
+  --ok:#16a34a;
   --shadow-sm:0 1px 2px rgba(15,20,40,.04); --shadow-md:0 2px 8px rgba(15,20,40,.06);
   --shadow-lg:0 10px 30px rgba(15,20,40,.10);
 }
@@ -2464,7 +2365,22 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 button { cursor: pointer; }
 a { -webkit-tap-highlight-color: transparent; }
 
+/* Layout: normal app */
 .layout { display: flex; width: 100%; height: 100vh; height: 100dvh; background: var(--bg); max-width: 1100px; margin: 0 auto; }
+
+/* Layout: auth/boot — full center */
+body[data-mode="auth"] .layout,
+body[data-mode="boot"] .layout {
+  justify-content: center; align-items: center; max-width: 100%;
+}
+body[data-mode="auth"] .sidebar,
+body[data-mode="boot"] .sidebar { display: none !important; }
+body[data-mode="auth"] .main,
+body[data-mode="boot"] .main {
+  max-width: 100%; background: transparent; overflow-y: auto; overflow-x: hidden;
+}
+body[data-mode="auth"] .main::-webkit-scrollbar,
+body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 
 .sidebar { flex: 0 0 232px; width: 232px; background: var(--bg); display: flex; flex-direction: column; padding: 28px 16px 20px; overflow: hidden; }
 .sidebar .logo { font-size: 22px; font-weight: 900; letter-spacing: -0.5px; padding: 0 14px 22px; color: var(--text); user-select: none; }
@@ -2499,6 +2415,7 @@ a { -webkit-tap-highlight-color: transparent; }
 .icon-btn { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-2); cursor: pointer; padding: 0; text-decoration: none; border-radius: 10px; transition: background .15s ease, color .15s ease; flex-shrink: 0; }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn.danger:hover { color: var(--danger); }
+.icon-btn.spinning svg { animation: spin .8s linear infinite; }
 
 .pill-tabs { position: relative; display: flex; gap: 0; padding: 4px; background: var(--card-2); border-radius: 12px; margin-bottom: 16px; isolation: isolate; }
 .pill-tabs .pill-slider { position: absolute; top: 4px; left: 0; height: calc(100% - 8px); background: var(--bg-elev); border-radius: 9px; pointer-events: none; z-index: 0; transition: transform .32s cubic-bezier(.4, 0, .2, 1), width .32s cubic-bezier(.4, 0, .2, 1); box-shadow: var(--shadow-sm); will-change: transform, width; }
@@ -2711,21 +2628,230 @@ a { -webkit-tap-highlight-color: transparent; }
 .emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
 .emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
 
-.auth-page { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 40px 20px; }
-.auth-card { background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 32px; max-width: 400px; width: 100%; box-shadow: var(--shadow-lg); }
-.auth-card h1 { font-size: 24px; font-weight: 800; margin: 0 0 22px; letter-spacing: -0.4px; }
-.auth-card form { display: flex; flex-direction: column; gap: 10px; }
-.auth-card input { padding: 14px 16px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); font-family: inherit; font-size: 15px; outline: none; border-radius: 12px; transition: border-color .15s ease, background .15s ease; }
-.auth-card input:focus { border-color: var(--accent); background: var(--card); }
-.auth-card input::placeholder { color: var(--muted); }
-.auth-card button[type="submit"] { margin-top: 8px; height: 48px; background: var(--accent); color: var(--accent-fg); border: none; border-radius: 12px; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; transition: opacity .15s ease; }
-.auth-card button[type="submit"]:hover { opacity: .9; }
-.auth-card button[type="submit"]:disabled { opacity: .5; cursor: default; }
-.auth-error { color: var(--danger); font-size: 13px; min-height: 18px; }
-.auth-switch { margin-top: 18px; font-size: 13.5px; color: var(--muted); text-align: center; }
-.auth-switch a { color: var(--text); cursor: pointer; text-decoration: none; font-weight: 700; border-bottom: 1px solid transparent; transition: border-color .15s ease, color .15s ease; }
-.auth-switch a:hover { color: var(--accent); border-color: var(--accent); }
+/* ============ BOOT SCREEN ============ */
+.boot-screen {
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 20px;
+  background: var(--bg);
+  padding: 24px;
+}
+.boot-logo {
+  width: 68px; height: 68px;
+  border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 900; font-size: 24px;
+  letter-spacing: -1px;
+  animation: bootPulse 1.8s ease-in-out infinite;
+  box-shadow: 0 8px 24px var(--accent-soft-2);
+}
+@keyframes bootPulse {
+  0%,100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.06); opacity: .85; }
+}
+.boot-text { color: var(--muted); font-size: 13.5px; }
 
+/* ============ AUTH SCREEN ============ */
+.auth-page {
+  position: relative;
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  overflow: hidden;
+  width: 100%;
+}
+.auth-page::before {
+  content: '';
+  position: absolute;
+  width: 60vmax; height: 60vmax;
+  top: -30vmax; left: -20vmax;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-soft-2) 0%, transparent 65%);
+  filter: blur(60px);
+  pointer-events: none;
+  z-index: 0;
+}
+.auth-page::after {
+  content: '';
+  position: absolute;
+  width: 50vmax; height: 50vmax;
+  bottom: -25vmax; right: -15vmax;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-soft) 0%, transparent 65%);
+  filter: blur(60px);
+  pointer-events: none;
+  z-index: 0;
+}
+.auth-card {
+  position: relative; z-index: 1;
+  width: 100%; max-width: 420px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  padding: 32px 28px 28px;
+  box-shadow: var(--shadow-lg);
+}
+.auth-brand {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 12px; margin-bottom: 24px;
+}
+.auth-brand-logo {
+  width: 64px; height: 64px;
+  border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 900; font-size: 22px;
+  letter-spacing: -1px;
+  box-shadow: 0 8px 24px var(--accent-soft-2);
+}
+.auth-brand-name {
+  font-size: 18px; font-weight: 800; color: var(--text);
+  letter-spacing: -0.3px;
+}
+.auth-brand-tagline {
+  font-size: 13px; color: var(--muted); text-align: center;
+  line-height: 1.5; max-width: 320px;
+}
+.auth-tabs {
+  display: flex; gap: 4px; padding: 4px;
+  background: var(--card-2); border-radius: 14px;
+  margin-bottom: 20px;
+}
+.auth-tab {
+  flex: 1; padding: 10px 8px;
+  border: none; background: transparent;
+  color: var(--muted); font: inherit; font-size: 14px; font-weight: 600;
+  cursor: pointer; border-radius: 10px;
+  transition: background .15s ease, color .15s ease;
+}
+.auth-tab:hover { color: var(--text-2); }
+.auth-tab.active {
+  background: var(--bg-elev); color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+[data-theme="dark"] .auth-tab.active { background: var(--card-3); }
+
+.auth-field { position: relative; margin-bottom: 10px; }
+.auth-field .auth-input-icon {
+  position: absolute; left: 14px; top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted); pointer-events: none;
+  display: inline-flex;
+}
+.auth-field input {
+  width: 100%;
+  padding: 14px 44px 14px 46px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-family: inherit; font-size: 15px;
+  outline: none; border-radius: 12px;
+  transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
+}
+.auth-field input:focus {
+  border-color: var(--accent);
+  background: var(--card);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.auth-field input::placeholder { color: var(--muted); }
+.auth-field.no-right input { padding-right: 14px; }
+
+.auth-field-btn {
+  position: absolute; right: 6px; top: 50%;
+  transform: translateY(-50%);
+  width: 34px; height: 34px;
+  background: transparent; border: none;
+  color: var(--muted); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 9px;
+  transition: background .15s ease, color .15s ease;
+}
+.auth-field-btn:hover { background: var(--hover); color: var(--text); }
+.auth-field-btn:disabled { opacity: .5; cursor: default; }
+.auth-field-btn.success { color: var(--ok); }
+.auth-field-btn.error { color: var(--danger); }
+
+.nick-status {
+  font-size: 12.5px; margin: -4px 4px 10px;
+  min-height: 18px; line-height: 1.4;
+  color: var(--muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.nick-status.ok { color: var(--ok); }
+.nick-status.err { color: var(--danger); }
+.nick-status svg { flex-shrink: 0; }
+
+.auth-btn {
+  margin-top: 8px;
+  width: 100%; height: 50px;
+  background: var(--accent); color: var(--accent-fg);
+  border: none; border-radius: 12px;
+  font-family: inherit; font-size: 15px; font-weight: 700;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  transition: opacity .15s ease, transform .1s ease;
+}
+.auth-btn:hover { opacity: .92; }
+.auth-btn:active { transform: scale(.99); }
+.auth-btn:disabled { opacity: .55; cursor: default; }
+.auth-btn-spinner {
+  width: 16px; height: 16px;
+  border: 2px solid rgba(255,255,255,.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+.auth-error {
+  color: var(--danger); font-size: 13px;
+  min-height: 18px; margin: 6px 2px;
+  line-height: 1.4;
+  padding: 0 2px;
+}
+
+.session-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft-2);
+  border-radius: 12px;
+  color: var(--text-2);
+  font-size: 13.5px;
+  margin-bottom: 16px;
+  line-height: 1.45;
+}
+.session-banner svg { color: var(--accent); flex-shrink: 0; }
+
+.toast-container {
+  position: fixed;
+  top: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 2000;
+  display: flex; flex-direction: column; gap: 8px;
+  pointer-events: none;
+  max-width: 90vw;
+}
+.toast {
+  background: var(--card);
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  padding: 10px 16px;
+  font-size: 13.5px; font-weight: 600;
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+  display: inline-flex; align-items: center; gap: 10px;
+  pointer-events: auto;
+  animation: toastIn .25s ease;
+}
+@keyframes toastIn { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: translateY(0); } }
+.toast svg { flex-shrink: 0; }
+.toast.success svg { color: var(--ok); }
+.toast.error svg { color: var(--danger); }
+
+/* ============ POLICY ============ */
 .policy { max-width: 720px; margin: 0 auto; padding: 12px 28px 80px; }
 .policy-h1 {
   font-size: 24px; font-weight: 800; letter-spacing: -0.4px;
@@ -2892,13 +3018,14 @@ a { -webkit-tap-highlight-color: transparent; }
   .settings-layout { padding: 4px 10px 30px; }
   .settings-list-mobile { padding: 4px 10px 30px; }
   .policy { padding: 12px 14px 60px; }
+  .auth-card { padding: 26px 22px 22px; border-radius: 20px; }
 }
 """
 
 
 JS = r"""
 var ICONS = {
-  home: __I_HOME__, users: __I_USERS__, user: __I_USER__,
+  home: __I_HOME__, users: __I_USERS__, user: __I_USER__, userLg: __I_USER_LG__,
   bell: __I_BELL__, gear: __I_GEAR__,
   logout: __I_LOGOUT__, login: __I_LOGIN__, plus: __I_PLUS__,
   send: __I_SEND__,
@@ -2906,8 +3033,10 @@ var ICONS = {
   copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
   back: __I_BACK__, chevron: __I_CHEVRON__, search: __I_SEARCH__,
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
-  cal: __I_CAL__, check: __I_CHECK__,
-  mobile: __I_MOBILE__, desktop: __I_DESKTOP__, server: __I_SERVER__
+  cal: __I_CAL__, check: __I_CHECK__, checkLg: __I_CHECK_LG__, x: __I_X__,
+  mobile: __I_MOBILE__, desktop: __I_DESKTOP__, server: __I_SERVER__,
+  eye: __I_EYE__, eyeOff: __I_EYE_OFF__, lock: __I_LOCK__, at: __I_AT__,
+  info: __I_INFO__, refresh: __I_REFRESH__
 };
 
 var EMOJI_NAMES = __EMOJI_NAMES__;
@@ -2990,17 +3119,24 @@ function setColor(key, id) {
   var c = loadColors(); c[key] = id; saveColors(c); applyColors();
 }
 
-var cachedUser = null;
-try { cachedUser = JSON.parse(localStorage.getItem('SLD_user') || 'null'); } catch(e) { cachedUser = null; }
 var anonId = localStorage.getItem('SLD_anon_id');
 if (!anonId) {
   anonId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   localStorage.setItem('SLD_anon_id', anonId);
 }
 
+/* ==== STATE ====
+ * ВАЖНО: user НЕ восстанавливается из localStorage.
+ * Сначала — booting (сплэш), затем loadMe(). Только по успеху user ставится.
+ * Иначе при протухшем токене юзер на долю секунды видит себя залогиненным.
+ */
 var state = {
-  user: cachedUser,
+  user: null,
   token: localStorage.getItem('SLD_token') || null,
+  booting: false,
+  sessionExpired: false,
+  bootError: null,   // 'network' | 'session' | null
+  authMode: 'login',
   view: VIEW, viewData: VIEW_DATA || {},
   unreadNotif: parseInt(localStorage.getItem('SLD_un') || '0', 10) || 0,
   feedMode: 'all',
@@ -3025,89 +3161,45 @@ var state = {
   soundEnabled: localStorage.getItem('SLD_sound') !== '0',
 };
 
-/* Request ids для защиты от race condition */
 var feedReqId = 0;
 var peopleReqId = 0;
 var profileReqId = 0;
-
-/* Quote persistence (sessionStorage) */
-function saveQuoteState() {
-  try {
-    if (state.quotePostId && state.quotePreview) {
-      sessionStorage.setItem('SLD_q_id', state.quotePostId);
-      sessionStorage.setItem('SLD_q_prev', JSON.stringify(state.quotePreview));
-    } else {
-      sessionStorage.removeItem('SLD_q_id');
-      sessionStorage.removeItem('SLD_q_prev');
-    }
-  } catch(e) {}
-}
-function loadQuoteState() {
-  try {
-    var id = sessionStorage.getItem('SLD_q_id');
-    var p = sessionStorage.getItem('SLD_q_prev');
-    if (id && p) {
-      state.quotePostId = id;
-      state.quotePreview = JSON.parse(p);
-    }
-  } catch(e) {}
-}
-function clearQuoteState() {
-  state.quotePostId = null;
-  state.quotePreview = null;
-  saveQuoteState();
-}
-
-/* Sound */
-var _audioCtx = null;
-function ensureAudioCtx() {
-  if (_audioCtx) return _audioCtx;
-  try {
-    var Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx) _audioCtx = new Ctx();
-  } catch(e) {}
-  return _audioCtx;
-}
-document.addEventListener('pointerdown', function unlockAudio() {
-  ensureAudioCtx();
-  if (_audioCtx && _audioCtx.state === 'suspended') _audioCtx.resume().catch(function(){});
-}, { passive: true });
-
-function playNotifSound() {
-  if (!state.soundEnabled) return;
-  var ctx = ensureAudioCtx();
-  if (!ctx) return;
-  try {
-    if (ctx.state === 'suspended') ctx.resume();
-    var now = ctx.currentTime;
-    var osc1 = ctx.createOscillator();
-    var osc2 = ctx.createOscillator();
-    var gain = ctx.createGain();
-    osc1.connect(gain); osc2.connect(gain); gain.connect(ctx.destination);
-    osc1.type = 'sine';
-    osc2.type = 'sine';
-    osc1.frequency.setValueAtTime(880, now);
-    osc1.frequency.exponentialRampToValueAtTime(1108, now + 0.08);
-    osc2.frequency.setValueAtTime(1320, now + 0.08);
-    osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.22);
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.11, now + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.06, now + 0.10);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
-    osc1.start(now); osc1.stop(now + 0.16);
-    osc2.start(now + 0.08); osc2.stop(now + 0.42);
-  } catch(e) {}
-}
+var fallbackPollTimer = null;
 
 function setUser(u) {
   state.user = u;
-  if (u) localStorage.setItem('SLD_user', JSON.stringify(u));
-  else localStorage.removeItem('SLD_user');
+  if (u) localStorage.setItem('SLD_user_cache', JSON.stringify({ nick: u.nick }));
+  else localStorage.removeItem('SLD_user_cache');
 }
 function setNotifCount(n) {
   if (typeof n === 'number') { state.unreadNotif = n; localStorage.setItem('SLD_un', String(n)); }
 }
 
+/* ============ TOASTS ============ */
+function showToast(text, type) {
+  var cont = document.getElementById('toastContainer');
+  if (!cont) {
+    cont = document.createElement('div');
+    cont.className = 'toast-container';
+    cont.id = 'toastContainer';
+    document.body.appendChild(cont);
+  }
+  var el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  var icon = '';
+  if (type === 'success') icon = ICONS.checkLg;
+  else if (type === 'error') icon = ICONS.info;
+  el.innerHTML = (icon ? icon : '') + '<span>' + escapeHtml(text) + '</span>';
+  cont.appendChild(el);
+  setTimeout(function(){
+    el.style.transition = 'opacity .2s ease, transform .2s ease';
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(-8px)';
+    setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+  }, 3200);
+}
+
+/* ============ API ============ */
 async function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
@@ -3118,9 +3210,17 @@ async function api(path, opts) {
   }
   var r = await fetch(path, opts);
   if (r.status === 401) {
-    setUser(null); state.token = null;
+    var wasAuthed = !!state.token || !!state.user;
+    setUser(null);
+    state.token = null;
     localStorage.removeItem('SLD_token');
     disconnectSSE();
+    if (wasAuthed) {
+      state.sessionExpired = true;
+      state.booting = false;
+      showToast(tr('session_expired'), 'error');
+      try { renderRoot(); } catch(e) {}
+    }
     throw new Error('unauthorized');
   }
   if (!r.ok) {
@@ -3253,7 +3353,68 @@ function toggleTheme() {
 applyTheme(localStorage.getItem('SLD_theme') || 'dark');
 applyColors();
 updateFavicon();
-loadQuoteState();
+
+try {
+  var _qid = sessionStorage.getItem('SLD_q_id');
+  var _qp = sessionStorage.getItem('SLD_q_prev');
+  if (_qid && _qp) { state.quotePostId = _qid; state.quotePreview = JSON.parse(_qp); }
+} catch(e) {}
+
+function saveQuoteState() {
+  try {
+    if (state.quotePostId && state.quotePreview) {
+      sessionStorage.setItem('SLD_q_id', state.quotePostId);
+      sessionStorage.setItem('SLD_q_prev', JSON.stringify(state.quotePreview));
+    } else {
+      sessionStorage.removeItem('SLD_q_id');
+      sessionStorage.removeItem('SLD_q_prev');
+    }
+  } catch(e) {}
+}
+function clearQuoteState() {
+  state.quotePostId = null;
+  state.quotePreview = null;
+  saveQuoteState();
+}
+
+/* Audio for notifications */
+var _audioCtx = null;
+function ensureAudioCtx() {
+  if (_audioCtx) return _audioCtx;
+  try {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) _audioCtx = new Ctx();
+  } catch(e) {}
+  return _audioCtx;
+}
+document.addEventListener('pointerdown', function unlockAudio() {
+  ensureAudioCtx();
+  if (_audioCtx && _audioCtx.state === 'suspended') _audioCtx.resume().catch(function(){});
+}, { passive: true });
+function playNotifSound() {
+  if (!state.soundEnabled) return;
+  var ctx = ensureAudioCtx();
+  if (!ctx) return;
+  try {
+    if (ctx.state === 'suspended') ctx.resume();
+    var now = ctx.currentTime;
+    var osc1 = ctx.createOscillator();
+    var osc2 = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc1.connect(gain); osc2.connect(gain); gain.connect(ctx.destination);
+    osc1.type = 'sine'; osc2.type = 'sine';
+    osc1.frequency.setValueAtTime(880, now);
+    osc1.frequency.exponentialRampToValueAtTime(1108, now + 0.08);
+    osc2.frequency.setValueAtTime(1320, now + 0.08);
+    osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.22);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.11, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.06, now + 0.10);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+    osc1.start(now); osc1.stop(now + 0.16);
+    osc2.start(now + 0.08); osc2.stop(now + 0.42);
+  } catch(e) {}
+}
 
 var PAGE_TITLES = {
   feed: 'page_title_feed', post: 'page_title_post', profile: 'page_title_profile',
@@ -3301,6 +3462,9 @@ function roomsEqual(a, b) {
   return a.slice().sort().join('|') === b.slice().sort().join('|');
 }
 function updateRoom() {
+  if (!state.user && !state.token) {
+    // anon — подписываемся на feed
+  }
   var rooms = computeRooms();
   if (roomsEqual(rooms, state.currentRooms)) return;
   state.currentRooms = rooms;
@@ -3338,36 +3502,320 @@ function handleRoute() {
   if (wasSettings && state.view !== 'settings') {
     state.settingsOpen = false;
   }
-  updateTitle();
-  renderSidebar(); renderMain();
+  renderRoot();
   updateRoom();
 }
 window.addEventListener('popstate', handleRoute);
 
-async function loadMe() {
-  if (!state.token) return;
-  try { var u = await api('/api/me'); setUser(u); }
-  catch(e) { setUser(null); }
+/* ============ ROOT RENDER (auth / app / boot) ============ */
+function renderRoot() {
+  var body = document.body;
+  var sb = document.getElementById('sidebar');
+  var main = document.getElementById('main');
+  if (!main) return;
+
+  if (state.booting) {
+    body.setAttribute('data-mode', 'boot');
+    if (sb) sb.innerHTML = '';
+    main.innerHTML = '<div class="boot-screen">'
+      + '<div class="boot-logo">' + escapeHtml(SITE_NAME) + '</div>'
+      + '<div class="boot-text">' + escapeHtml(tr('booting')) + '</div>'
+      + '</div>';
+    document.title = SITE_NAME;
+    return;
+  }
+
+  if (!state.user) {
+    body.setAttribute('data-mode', 'auth');
+    renderAuthScreen();
+    return;
+  }
+
+  body.setAttribute('data-mode', 'app');
+  updateTitle();
+  renderSidebar();
+  renderMain();
 }
+
+/* ============ AUTH SCREEN ============ */
+function authLoginFormHtml() {
+  return '<form id="authLoginForm" autocomplete="on" novalidate>'
+    + '<div class="auth-field no-right">'
+    +   '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    +   '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
+    + '</div>'
+    + '<div class="auth-field">'
+    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
+    +   '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="current-password" />'
+    +   '<button type="button" class="auth-field-btn" data-toggle-pw title="' + escapeHtml(LANG==='ru'?'Показать пароль':'Show password') + '">' + ICONS.eye + '</button>'
+    + '</div>'
+    + '<div class="auth-error" id="authErr"></div>'
+    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('log_btn')) + '</button>'
+    + '</form>';
+}
+
+function authRegisterFormHtml() {
+  return '<form id="authRegisterForm" autocomplete="on" novalidate>'
+    + '<div class="auth-field no-right">'
+    +   '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    +   '<input type="text" name="name" placeholder="' + escapeHtml(tr('name_ph')) + '" required autocomplete="name" maxlength="50" />'
+    + '</div>'
+    + '<div class="auth-field">'
+    +   '<span class="auth-input-icon">' + ICONS.at + '</span>'
+    +   '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
+    +   '<button type="button" class="auth-field-btn" id="nickCheckBtn" title="' + escapeHtml(tr('check_nick')) + '">' + ICONS.check + '</button>'
+    + '</div>'
+    + '<div class="nick-status" id="nickStatus"></div>'
+    + '<div class="auth-field">'
+    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
+    +   '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="new-password" />'
+    +   '<button type="button" class="auth-field-btn" data-toggle-pw title="' + escapeHtml(LANG==='ru'?'Показать пароль':'Show password') + '">' + ICONS.eye + '</button>'
+    + '</div>'
+    + '<div class="auth-field">'
+    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
+    +   '<input type="password" name="password_confirm" placeholder="' + escapeHtml(tr('pass2_ph')) + '" required autocomplete="new-password" />'
+    +   '<button type="button" class="auth-field-btn" data-toggle-pw title="' + escapeHtml(LANG==='ru'?'Показать пароль':'Show password') + '">' + ICONS.eye + '</button>'
+    + '</div>'
+    + '<div class="auth-error" id="authErr"></div>'
+    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('reg_btn')) + '</button>'
+    + '</form>';
+}
+
+function renderAuthScreen(mode) {
+  if (mode) state.authMode = mode;
+  var m = state.authMode || 'login';
+  var isLogin = (m === 'login');
+  var main = document.getElementById('main');
+  var sb = document.getElementById('sidebar');
+  if (!main) return;
+  if (sb) sb.innerHTML = '';
+
+  var note = '';
+  if (state.sessionExpired) {
+    note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('session_expired_hint')) + '</span></div>';
+  } else if (state.bootError === 'network') {
+    note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('network_error_hint')) + '</span></div>';
+  }
+
+  var html = '<div class="auth-page"><div class="auth-card">';
+  html += '<div class="auth-brand">';
+  html +=   '<div class="auth-brand-logo">' + escapeHtml(SITE_NAME) + '</div>';
+  html +=   '<div class="auth-brand-name">' + escapeHtml(SITE_NAME) + '</div>';
+  html +=   '<div class="auth-brand-tagline">' + escapeHtml(tr('auth_tagline')) + '</div>';
+  html += '</div>';
+
+  if (note) html += note;
+
+  html += '<div class="auth-tabs">';
+  html +=   '<button type="button" class="auth-tab' + (isLogin ? ' active' : '') + '" data-tab="login">' + escapeHtml(tr('log_title')) + '</button>';
+  html +=   '<button type="button" class="auth-tab' + (!isLogin ? ' active' : '') + '" data-tab="register">' + escapeHtml(tr('reg_title')) + '</button>';
+  html += '</div>';
+
+  html += '<div id="authFormWrap">' + (isLogin ? authLoginFormHtml() : authRegisterFormHtml()) + '</div>';
+
+  html += '</div></div>';
+  main.innerHTML = html;
+
+  document.title = SITE_NAME + ' — ' + tr(isLogin ? 'log_title' : 'reg_title');
+
+  // Tabs
+  main.querySelectorAll('.auth-tab').forEach(function(t){
+    t.addEventListener('click', function(){
+      var target = t.dataset.tab;
+      if (target === state.authMode) return;
+      state.sessionExpired = false;
+      state.bootError = null;
+      renderAuthScreen(target);
+    });
+  });
+
+  // Password toggles
+  main.querySelectorAll('[data-toggle-pw]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var inp = btn.parentNode.querySelector('input');
+      if (!inp) return;
+      var show = inp.type === 'password';
+      inp.type = show ? 'text' : 'password';
+      btn.innerHTML = show ? ICONS.eyeOff : ICONS.eye;
+    });
+  });
+
+  if (isLogin) bindAuthLogin();
+  else bindAuthRegister();
+}
+
+function setAuthSubmitting(btn, loading) {
+  if (!btn) return;
+  if (loading) {
+    btn.disabled = true;
+    btn.dataset.orig = btn.innerHTML;
+    btn.innerHTML = '<span class="auth-btn-spinner"></span><span>' + escapeHtml(tr('booting')) + '</span>';
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.orig) { btn.innerHTML = btn.dataset.orig; delete btn.dataset.orig; }
+  }
+}
+
+function bindAuthLogin() {
+  var form = document.getElementById('authLoginForm');
+  if (!form) return;
+  var errEl = document.getElementById('authErr');
+  var btn = document.getElementById('authSubmit');
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    errEl.textContent = '';
+    var fd = new FormData(form);
+    var nick = (fd.get('nick') || '').toString().trim();
+    var pass = (fd.get('password') || '').toString();
+    if (!nick || !pass) { errEl.textContent = tr('err_bad_login'); return; }
+    setAuthSubmitting(btn, true);
+    try {
+      await doLogin({ nick: nick, password: pass });
+    } catch(err) {
+      errEl.textContent = tr(err.message) || err.message;
+    } finally {
+      setAuthSubmitting(btn, false);
+    }
+  });
+}
+
+function bindAuthRegister() {
+  var form = document.getElementById('authRegisterForm');
+  if (!form) return;
+  var errEl = document.getElementById('authErr');
+  var btn = document.getElementById('authSubmit');
+  var nickInp = form.querySelector('input[name="nick"]');
+  var nickBtn = document.getElementById('nickCheckBtn');
+  var nickStatus = document.getElementById('nickStatus');
+
+  function setNickStatus(state_, text) {
+    if (!nickStatus) return;
+    nickStatus.className = 'nick-status' + (state_ ? ' ' + state_ : '');
+    if (state_ === 'ok') nickStatus.innerHTML = ICONS.checkLg + '<span>' + escapeHtml(text) + '</span>';
+    else if (state_ === 'err') nickStatus.innerHTML = ICONS.x + '<span>' + escapeHtml(text) + '</span>';
+    else nickStatus.textContent = text || '';
+  }
+
+  if (nickBtn && nickInp) {
+    nickBtn.addEventListener('click', async function(){
+      var nick = (nickInp.value || '').trim().replace(/^@/, '');
+      if (!nick) { setNickStatus('', ''); return; }
+      nickBtn.disabled = true;
+      setNickStatus('', tr('checking'));
+      try {
+        var data = await api('/api/check_nick?nick=' + encodeURIComponent(nick));
+        if (data.available) {
+          setNickStatus('ok', tr('nick_available'));
+          nickBtn.classList.add('success');
+          nickBtn.classList.remove('error');
+          nickBtn.innerHTML = ICONS.check;
+        } else {
+          setNickStatus('err', tr(data.reason || 'err_nick_taken'));
+          nickBtn.classList.add('error');
+          nickBtn.classList.remove('success');
+          nickBtn.innerHTML = ICONS.x;
+        }
+      } catch(e) {
+        setNickStatus('err', tr(e.message) || e.message);
+      } finally {
+        nickBtn.disabled = false;
+      }
+    });
+  }
+  if (nickInp) {
+    nickInp.addEventListener('input', function(){
+      if (nickStatus && nickStatus.textContent) setNickStatus('', '');
+      if (nickBtn) {
+        nickBtn.classList.remove('success');
+        nickBtn.classList.remove('error');
+        nickBtn.innerHTML = ICONS.check;
+      }
+    });
+  }
+
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    errEl.textContent = '';
+    var fd = new FormData(form);
+    var name = (fd.get('name') || '').toString().trim();
+    var nick = (fd.get('nick') || '').toString().trim().replace(/^@/, '');
+    var pass = (fd.get('password') || '').toString();
+    var pass2 = (fd.get('password_confirm') || '').toString();
+    if (!name) { errEl.textContent = tr('err_bad_name'); return; }
+    if (pass !== pass2) { errEl.textContent = tr('err_pass_mismatch'); return; }
+    setAuthSubmitting(btn, true);
+    try {
+      await doRegister({ name: name, nick: nick, password: pass, password_confirm: pass2 });
+    } catch(err) {
+      errEl.textContent = tr(err.message) || err.message;
+    } finally {
+      setAuthSubmitting(btn, false);
+    }
+  });
+}
+
+/* ============ AUTH ACTIONS ============ */
+async function loadMe() {
+  if (!state.token) {
+    state.booting = false;
+    return;
+  }
+  try {
+    var u = await api('/api/me');
+    setUser(u);
+    state.sessionExpired = false;
+    state.bootError = null;
+  } catch(e) {
+    if (e && e.message === 'unauthorized') {
+      // api() уже обработал 401: выставил sessionExpired, очистил token, дёрнул renderRoot
+    } else {
+      state.bootError = 'network';
+    }
+    setUser(null);
+  } finally {
+    state.booting = false;
+  }
+}
+
 async function doRegister(data) {
   var res = await api('/api/register', { method: 'POST', body: data });
-  state.token = res.token; localStorage.setItem('SLD_token', res.token);
-  setUser(res.user); connectSSE(); navigate('/', true);
+  state.token = res.token;
+  localStorage.setItem('SLD_token', res.token);
+  setUser(res.user);
+  state.sessionExpired = false;
+  state.bootError = null;
+  state.booting = false;
+  connectSSE();
+  navigate('/', true);
 }
+
 async function doLogin(data) {
   var res = await api('/api/login', { method: 'POST', body: data });
-  state.token = res.token; localStorage.setItem('SLD_token', res.token);
-  setUser(res.user); connectSSE(); navigate('/', true);
+  state.token = res.token;
+  localStorage.setItem('SLD_token', res.token);
+  setUser(res.user);
+  state.sessionExpired = false;
+  state.bootError = null;
+  state.booting = false;
+  connectSSE();
+  navigate('/', true);
 }
+
 function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
-    disconnectSSE(); setUser(null); state.token = null;
-    setNotifCount(0); localStorage.removeItem('SLD_token');
+    disconnectSSE();
+    setUser(null);
+    state.token = null;
+    setNotifCount(0);
+    localStorage.removeItem('SLD_token');
+    state.sessionExpired = false;
+    state.bootError = null;
     navigate('/', true);
     connectSSE();
   }, { yesText: tr('confirm_yes') });
 }
+
 function refreshCounters() {
   if (!state.token) return;
   api('/api/counters').then(function(data){
@@ -3376,6 +3824,7 @@ function refreshCounters() {
     if (changed) renderSidebar();
   }).catch(function(){});
 }
+
 function disconnectSSE() {
   if (state.es) { try { state.es.close(); } catch(e) {} state.es = null; }
   state.currentRooms = [];
@@ -3387,12 +3836,8 @@ function connectSSE() {
   if (state.token) url += '?token=' + encodeURIComponent(state.token);
   else url += '?anon=' + encodeURIComponent(anonId);
   var es;
-  try {
-    es = new EventSource(url);
-  } catch(e) {
-    setTimeout(connectSSE, 5000);
-    return;
-  }
+  try { es = new EventSource(url); }
+  catch(e) { setTimeout(connectSSE, 5000); return; }
   state.es = es;
   es.onopen = function() {
     state.sseErrors = 0;
@@ -3411,13 +3856,25 @@ function connectSSE() {
       try { es.close(); } catch(e) {}
       if (state.es === es) state.es = null;
       var delay = Math.min(30000, 1200 * Math.pow(1.6, state.sseErrors - 3));
-      setTimeout(function(){
-        if (state.es === null) connectSSE();
-      }, delay);
+      setTimeout(function(){ if (state.es === null) connectSSE(); }, delay);
     }
   };
   setTimeout(updateRoom, 300);
 }
+
+/* Fallback poll: если SSE не в OPEN, обновляем текущий вид каждые 20 сек */
+function startFallbackPoll() {
+  if (fallbackPollTimer) return;
+  fallbackPollTimer = setInterval(function(){
+    if (document.hidden) return;
+    if (!state.user) return;
+    var connected = state.es && state.es.readyState === 1;
+    if (!connected) {
+      try { refreshCurrentView(); } catch(e) {}
+    }
+  }, 20000);
+}
+
 function scheduleRefresh() {
   if (state.refreshTimer) return;
   state.refreshTimer = setTimeout(function(){
@@ -3433,8 +3890,6 @@ function handleEvent(ev) {
   if (!ev || !ev.type) return;
   if (ev.type === 'hello') return;
   if (ev.type === 'notif_changed') {
-    // Только звук + счётчик + перезагрузка страницы уведомлений (если открыта).
-    // НЕ вызывает scheduleRefresh — текущая страница пользователя не перезагружается.
     refreshCounters();
     playNotifSound();
     if (state.view === 'notifications') loadNotifications();
@@ -3460,6 +3915,7 @@ window.addEventListener('focus', function(){
   if (state.sseWasConnected) scheduleRefresh();
 });
 
+/* ============ SIDEBAR ============ */
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
   var badge = (count && count > 0) ? '<span class="badge">' + (count > 99 ? '99+' : count) + '</span>' : '';
@@ -3469,24 +3925,18 @@ function navBtn(icon, label, active, action, count) {
 function renderSidebar() {
   var el = document.getElementById('sidebar');
   if (!el) return;
+  if (!state.user) { el.innerHTML = ''; return; }
   var html = '<div class="logo">' + SITE_NAME + '</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
-  if (state.user) {
-    html += navBtn(ICONS.bell, tr('nav_notifications'),
-      state.view === 'notifications', 'notifications', state.unreadNotif);
-    html += navBtn(ICONS.user, tr('nav_profile'),
-      state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
-    html += navBtn(ICONS.gear, tr('nav_settings'),
-      state.view === 'settings' || state.view === 'edit_profile', 'settings');
-    html += '</div><div class="spacer"></div>';
-    html += '<button class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
-  } else {
-    html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
-    html += navBtn(ICONS.login, tr('nav_login'), state.view === 'login', 'login');
-    html += navBtn(ICONS.plus, tr('nav_register'), state.view === 'register', 'register');
-    html += '</div><div class="spacer"></div>';
-  }
+  html += navBtn(ICONS.bell, tr('nav_notifications'),
+    state.view === 'notifications', 'notifications', state.unreadNotif);
+  html += navBtn(ICONS.user, tr('nav_profile'),
+    state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
+  html += navBtn(ICONS.gear, tr('nav_settings'),
+    state.view === 'settings' || state.view === 'edit_profile', 'settings');
+  html += '</div><div class="spacer"></div>';
+  html += '<button class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
   el.innerHTML = html;
   el.querySelectorAll('[data-nav]').forEach(function(b){
     b.addEventListener('click', function(){
@@ -3496,8 +3946,6 @@ function renderSidebar() {
       else if (nav === 'profile') navigate('/u/' + encodeURIComponent(state.user.nick));
       else if (nav === 'notifications') navigate('/notifications');
       else if (nav === 'settings') navigate('/settings');
-      else if (nav === 'register') navigate('/register');
-      else if (nav === 'login') navigate('/login');
       else if (nav === 'logout') doLogoutConfirm();
     });
   });
@@ -3526,14 +3974,17 @@ function setupPillSlider(container) {
     slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
   }
   requestAnimationFrame(position);
-  window.addEventListener('resize', function(){
-    requestAnimationFrame(position);
-  });
+  window.addEventListener('resize', function(){ requestAnimationFrame(position); });
   return { position: position };
 }
 
 function renderMain() {
   var el = document.getElementById('main');
+  if (!el) return;
+  if (!state.user) {
+    renderAuthScreen();
+    return;
+  }
   if (state.view === 'not_found') {
     el.innerHTML = '<div class="main-header"><div class="title">' + tr('page_title_notfound') + '</div>'
       + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>'
@@ -3550,11 +4001,10 @@ function renderMain() {
   else if (state.view === 'settings') renderSettingsView(el);
   else if (state.view === 'edit_profile') renderEditProfileView(el);
   else if (state.view === 'policy') renderPolicyView(el);
-  else if (state.view === 'register') renderRegisterView(el);
-  else if (state.view === 'login') renderLoginView(el);
   else renderFeedView(el);
 }
 function bindLinks(root) {
+  if (!root) return;
   root.querySelectorAll('[data-link]').forEach(function(a){
     if (a.dataset.linkBound) return;
     a.dataset.linkBound = '1';
@@ -3562,6 +4012,7 @@ function bindLinks(root) {
   });
 }
 function bindOgImages(root) {
+  if (!root) return;
   root.querySelectorAll('.og-image img').forEach(function(img){
     if (img.dataset.errBound) return;
     img.dataset.errBound = '1';
@@ -3572,6 +4023,19 @@ function bindOgImages(root) {
       fb.textContent = tr('og_img_fallback');
       img.parentNode.replaceChild(fb, img);
     });
+  });
+}
+function bindRefreshBtn(id) {
+  var b = document.getElementById(id || 'refreshBtn');
+  if (!b) return;
+  b.addEventListener('click', async function(){
+    b.classList.add('spinning');
+    b.disabled = true;
+    try { await refreshCurrentView(); } catch(e) {}
+    finally {
+      b.classList.remove('spinning');
+      b.disabled = false;
+    }
   });
 }
 
@@ -3681,6 +4145,7 @@ function bindComposer(opts) {
 /* ============ FEED ============ */
 function renderFeedView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('nav_home') + '</div>'
+    + '<button class="icon-btn" id="refreshBtn" title="' + escapeHtml(tr('refresh')) + '">' + ICONS.refresh + '</button>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
@@ -3688,15 +4153,15 @@ function renderFeedView(el) {
     { key: 'all', label: tr('feed_all'), active: state.feedMode === 'all' },
     { key: 'subs', label: tr('feed_subs'), active: state.feedMode === 'subs' },
   ]);
-  if (state.user) html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
-  else html += '<div class="card" style="text-align:center"><a href="/login" data-link style="color:var(--accent);font-weight:700;text-decoration:none">' + tr('go_login') + '</a></div>';
+  html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
   html += '<div id="feed">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el); bindRefreshBtn('refreshBtn');
   var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
+      if (state.feedMode === t.dataset.key) return;
       state.feedMode = t.dataset.key;
       el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
       if (slider) requestAnimationFrame(slider.position);
@@ -3709,44 +4174,38 @@ function renderFeedView(el) {
     state.searchQuery = searchEl.value;
     clearTimeout(tId); tId = setTimeout(loadFeed, 250);
   });
-  if (state.user) {
-    bindComposer({
-      idPrefix: 'post',
-      onSend: async function(text, quotedId, ogEnabled){
-        state.suppressRefresh = Date.now() + 1500;
-        var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
-        state.searchQuery = '';
-        var feedEl = document.getElementById('feed');
-        if (feedEl) {
-          var wrap = document.createElement('div');
-          wrap.innerHTML = renderPostHtml(p, false);
-          var newEl = wrap.firstChild;
-          var em = feedEl.querySelector('.empty');
-          if (em) em.remove();
-          if (feedEl.firstChild) feedEl.insertBefore(newEl, feedEl.firstChild);
-          else feedEl.appendChild(newEl);
-          bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
-        }
+  bindComposer({
+    idPrefix: 'post',
+    onSend: async function(text, quotedId, ogEnabled){
+      state.suppressRefresh = Date.now() + 1500;
+      var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
+      state.searchQuery = '';
+      var feedEl = document.getElementById('feed');
+      if (feedEl) {
+        var wrap = document.createElement('div');
+        wrap.innerHTML = renderPostHtml(p, false);
+        var newEl = wrap.firstChild;
+        var em = feedEl.querySelector('.empty');
+        if (em) em.remove();
+        if (feedEl.firstChild) feedEl.insertBefore(newEl, feedEl.firstChild);
+        else feedEl.appendChild(newEl);
+        bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
       }
-    });
-  }
+    }
+  });
   loadFeed();
 }
 async function loadFeed() {
   var feedEl = document.getElementById('feed');
   if (!feedEl) return;
-  // Захватываем id запроса и текущий режим в момент запроса
   var myId = ++feedReqId;
   var mode = state.feedMode;
   var q = state.searchQuery.trim();
   try {
     var feed = mode === 'subs' ? '&feed=subs' : '';
     var data = await api('/api/posts?q=' + encodeURIComponent(q) + feed);
-    // Если за это время пользователь сделал новый запрос — отбрасываем устаревший ответ
     if (myId !== feedReqId) return;
-    // Дополнительно проверим, что режим всё ещё тот же, что был в момент запроса
     if (state.feedMode !== mode) return;
-    // И что элемент ещё в DOM
     if (!document.getElementById('feed')) return;
     var posts = data.posts || [];
     if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
@@ -3762,69 +4221,68 @@ function renderPostView(el) {
   var html = '<div class="main-header">'
     + '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
     + '<div class="title">' + tr('page_title_post') + '</div>'
+    + '<button class="icon-btn" id="refreshBtn" title="' + escapeHtml(tr('refresh')) + '">' + ICONS.refresh + '</button>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div id="feed">' + spinner() + '</div>';
-  if (state.user) html += composerHtml({ idPrefix: 'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
+  html += composerHtml({ idPrefix: 'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
   html += '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn();
+  bindThemeBtn(); bindRefreshBtn('refreshBtn');
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/'); });
   bindLinks(el);
-  if (state.user) {
-    var replyBanner = document.createElement('div');
-    replyBanner.id = 'replyBanner';
-    var inputEl = document.getElementById('commentInput');
-    inputEl.parentNode.insertBefore(replyBanner, inputEl);
-    function renderReplyBanner() {
-      if (!state.replyTo) { replyBanner.innerHTML = ''; inputEl.placeholder = tr('comment_ph'); return; }
-      replyBanner.innerHTML = '<div class="quote-preview" style="margin-bottom:8px">'
-        + '<div class="qp-author">' + tr('reply') + ': @' + escapeHtml(state.replyTo.author) + '</div>'
-        + '<button class="qp-close" type="button">✕</button></div>';
-      inputEl.placeholder = tr('reply_ph');
-      replyBanner.querySelector('.qp-close').addEventListener('click', function(){
-        state.replyTo = null; renderReplyBanner();
-      });
-    }
-    renderReplyBanner();
-    state._renderReplyBanner = renderReplyBanner;
-    bindComposer({
-      idPrefix: 'comment',
-      placeholder: tr('comment_ph'),
-      maxLen: MAX_COMMENT_LEN,
-      onSend: async function(text){
-        var parentId = state.replyTo ? state.replyTo.id : null;
-        state.suppressRefresh = Date.now() + 1500;
-        var tempId = 'tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-        var fakeComment = {
-          id: tempId, text: text, author: state.user.nick,
-          parent_id: parentId, created_at: Date.now()/1000,
-          likes: 0, user_like: 0
-        };
-        var postEl = document.querySelector('[data-post-id="' + state.viewData.post_id + '"]');
-        var postAuthor = postEl ? postEl.dataset.author : null;
-        insertCommentIntoDom(state.viewData.post_id, fakeComment, postAuthor);
-        state.replyTo = null; renderReplyBanner();
-        try {
-          var body = { text: text };
-          if (parentId) body.parent_id = parentId;
-          var res = await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
-          var elC = document.querySelector('[data-comment-id="' + tempId + '"]');
-          if (elC && res.comment) {
-            var realId = res.comment.id;
-            elC.setAttribute('data-comment-id', realId);
-            elC.querySelectorAll('[data-comment-id]').forEach(function(b){ b.dataset.commentId = realId; });
-            elC.classList.remove('pending');
-          }
-        } catch(e) {
-          var elC = document.querySelector('[data-comment-id="' + tempId + '"]');
-          if (elC) elC.parentNode.removeChild(elC);
-          decrementCommentCount(state.viewData.post_id);
-          alert(tr(e.message) || e.message);
-        }
-      }
+  var replyBanner = document.createElement('div');
+  replyBanner.id = 'replyBanner';
+  var inputEl = document.getElementById('commentInput');
+  inputEl.parentNode.insertBefore(replyBanner, inputEl);
+  function renderReplyBanner() {
+    if (!state.replyTo) { replyBanner.innerHTML = ''; inputEl.placeholder = tr('comment_ph'); return; }
+    replyBanner.innerHTML = '<div class="quote-preview" style="margin-bottom:8px">'
+      + '<div class="qp-author">' + tr('reply') + ': @' + escapeHtml(state.replyTo.author) + '</div>'
+      + '<button class="qp-close" type="button">✕</button></div>';
+    inputEl.placeholder = tr('reply_ph');
+    replyBanner.querySelector('.qp-close').addEventListener('click', function(){
+      state.replyTo = null; renderReplyBanner();
     });
   }
+  renderReplyBanner();
+  state._renderReplyBanner = renderReplyBanner;
+  bindComposer({
+    idPrefix: 'comment',
+    placeholder: tr('comment_ph'),
+    maxLen: MAX_COMMENT_LEN,
+    onSend: async function(text){
+      var parentId = state.replyTo ? state.replyTo.id : null;
+      state.suppressRefresh = Date.now() + 1500;
+      var tempId = 'tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      var fakeComment = {
+        id: tempId, text: text, author: state.user.nick,
+        parent_id: parentId, created_at: Date.now()/1000,
+        likes: 0, user_like: 0
+      };
+      var postEl = document.querySelector('[data-post-id="' + state.viewData.post_id + '"]');
+      var postAuthor = postEl ? postEl.dataset.author : null;
+      insertCommentIntoDom(state.viewData.post_id, fakeComment, postAuthor);
+      state.replyTo = null; renderReplyBanner();
+      try {
+        var body = { text: text };
+        if (parentId) body.parent_id = parentId;
+        var res = await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
+        var elC = document.querySelector('[data-comment-id="' + tempId + '"]');
+        if (elC && res.comment) {
+          var realId = res.comment.id;
+          elC.setAttribute('data-comment-id', realId);
+          elC.querySelectorAll('[data-comment-id]').forEach(function(b){ b.dataset.commentId = realId; });
+          elC.classList.remove('pending');
+        }
+      } catch(e) {
+        var elC = document.querySelector('[data-comment-id="' + tempId + '"]');
+        if (elC) elC.parentNode.removeChild(elC);
+        decrementCommentCount(state.viewData.post_id);
+        alert(tr(e.message) || e.message);
+      }
+    }
+  });
   loadPostView();
 }
 async function loadPostView() {
@@ -3892,10 +4350,11 @@ function decrementCommentCount(pid, by) {
 /* ============ PROFILE ============ */
 function renderProfileView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('page_title_profile') + '</div>'
+    + '<button class="icon-btn" id="refreshBtn" title="' + escapeHtml(tr('refresh')) + '">' + ICONS.refresh + '</button>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner" id="profileRoot">' + spinner() + '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
+  bindThemeBtn(); bindLinks(el); bindRefreshBtn('refreshBtn');
   loadProfile(state.viewData.nick);
 }
 async function loadProfile(nick) {
@@ -3912,11 +4371,9 @@ async function loadProfile(nick) {
     if (isMe) {
       actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>'
                   + '<a class="pill-action primary" href="/settings/profile" data-link>' + escapeHtml(tr('edit_profile')) + '</a>';
-    } else if (state.user) {
+    } else {
       actionsHtml = '<button class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
                   + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
-    } else {
-      actionsHtml = '<a class="pill-action primary" href="/login" data-link>' + tr('go_login') + '</a>';
     }
 
     var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
@@ -3949,17 +4406,9 @@ async function loadProfile(nick) {
     document.getElementById('followingLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/following');
     });
+
     var btn = document.getElementById('followBtn');
-    if (btn) btn.addEventListener('click', async function(){
-      try {
-        if (btn.textContent.trim() === tr('unfollow')) {
-          await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-        } else {
-          await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-        }
-        loadProfile(nick);
-      } catch(e) { alert(tr(e.message) || e.message); }
-    });
+    if (btn) bindOptimisticFollow(btn, u);
 
     loadProfileContent(u, isMe);
   } catch(e) {
@@ -3969,12 +4418,44 @@ async function loadProfile(nick) {
     bindLinks(root);
   }
 }
+
+function bindOptimisticFollow(btn, u) {
+  // Optimistic follow/unfollow
+  btn.addEventListener('click', async function(){
+    var wasFollowing = btn.textContent.trim() === tr('unfollow');
+    var followersEl = document.querySelector('#followersLink b');
+
+    // Optimistic UI update
+    btn.textContent = wasFollowing ? tr('follow') : tr('unfollow');
+    btn.classList.toggle('primary', wasFollowing);
+    btn.disabled = true;
+    var followersCount = followersEl ? parseInt(followersEl.textContent) || 0 : 0;
+    if (followersEl) followersEl.textContent = Math.max(0, followersCount + (wasFollowing ? -1 : 1));
+
+    try {
+      if (wasFollowing) {
+        await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
+      } else {
+        await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
+      }
+    } catch(e) {
+      // revert
+      btn.textContent = wasFollowing ? tr('unfollow') : tr('follow');
+      btn.classList.toggle('primary', !wasFollowing);
+      if (followersEl) followersEl.textContent = followersCount;
+      alert(tr(e.message) || e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 async function loadProfileContent(u, isMe) {
   var c = document.getElementById('profileContent');
   if (!c) return;
   c.innerHTML = spinner();
   var html = '';
-  if (state.user && isMe) {
+  if (isMe) {
     html += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
   }
   try {
@@ -3986,7 +4467,7 @@ async function loadProfileContent(u, isMe) {
     else html += posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     c.innerHTML = html;
     bindPostActions(c); bindLinks(c); bindOgImages(c);
-    if (state.user && isMe) {
+    if (isMe) {
       bindComposer({
         idPrefix: 'profile_post',
         onSend: async function(text, quotedId, ogEnabled){
@@ -4009,7 +4490,6 @@ async function loadProfileContent(u, isMe) {
 
 /* ============ EDIT PROFILE ============ */
 function renderEditProfileView(el) {
-  if (!state.user) { navigate('/login'); return; }
   var u = state.user;
   state.currentEmoji = u.avatar_emoji || DEFAULT_EMOJI;
 
@@ -4155,6 +4635,7 @@ function renderUsersView(el) {
   var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
+      if (state.peopleTab === t.dataset.key) return;
       state.peopleTab = t.dataset.key;
       el.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === t); });
       if (slider) requestAnimationFrame(slider.position);
@@ -4174,10 +4655,6 @@ async function loadPeople() {
   if (!wrap) return;
   var myId = ++peopleReqId;
   var tab = state.peopleTab;
-  if (!state.user && tab === 'subs') {
-    wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('login_to_post')) + '</div>';
-    return;
-  }
   try {
     var q = (state.peopleQuery || '').trim();
     var url = '/api/users?q=' + encodeURIComponent(q);
@@ -4323,31 +4800,23 @@ function renderSettingsView(el) {
   html += '<div class="settings-content">';
 
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
-  if (state.user) {
-    html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-flex;align-items:center;text-decoration:none;height:42px;padding:0 20px;margin-bottom:12px">' + tr('edit_profile') + '</a>';
-    html += '<div style="margin-top:6px"><button class="modal-btn danger" style="width:auto;padding:0 18px;height:42px;font-size:14px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
-  } else {
-    html += '<a class="publish-btn" href="/login" data-link style="display:inline-flex;align-items:center;text-decoration:none;height:42px;padding:0 20px">' + tr('go_login') + '</a>';
-  }
+  html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-flex;align-items:center;text-decoration:none;height:42px;padding:0 20px;margin-bottom:12px">' + tr('edit_profile') + '</a>';
+  html += '<div style="margin-top:6px"><button class="modal-btn danger" style="width:auto;padding:0 18px;height:42px;font-size:14px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
   html += '</div>';
 
   html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
-  if (state.user) {
-    html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
-    html += settingsToggleRow(tr('settings_allow_followers'), 'allow_followers_view', me.allow_followers_view !== false);
-    html += settingsToggleRow(tr('settings_allow_following'), 'allow_following_view', me.allow_following_view !== false);
-    html += settingsToggleRow(tr('settings_show_device_badge'), 'show_device_badge', me.show_device_badge !== false);
-    html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_device_badge_hint')) + '</p>';
-    html += '<div class="settings-subhead">' + escapeHtml(tr('settings_notifications')) + '</div>';
-    html += settingsToggleRow(tr('notify_new_post'),  'notify_on_new_post',  me.notify_on_new_post  !== false);
-    html += settingsToggleRow(tr('notify_follow'),    'notify_on_follow',    me.notify_on_follow    !== false);
-    html += settingsToggleRow(tr('notify_comment'),   'notify_on_comment',   me.notify_on_comment   !== false);
-    html += settingsToggleRow(tr('notify_reply'),     'notify_on_reply',     me.notify_on_reply     !== false);
-    html += settingsToggleRow(tr('notify_mention'),   'notify_on_mention',   me.notify_on_mention   !== false);
-    html += settingsToggleRow(tr('notify_quote'),     'notify_on_quote',     me.notify_on_quote     !== false);
-  } else {
-    html += '<p class="settings-desc">' + escapeHtml(tr('login_to_post')) + '</p>';
-  }
+  html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
+  html += settingsToggleRow(tr('settings_allow_followers'), 'allow_followers_view', me.allow_followers_view !== false);
+  html += settingsToggleRow(tr('settings_allow_following'), 'allow_following_view', me.allow_following_view !== false);
+  html += settingsToggleRow(tr('settings_show_device_badge'), 'show_device_badge', me.show_device_badge !== false);
+  html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_device_badge_hint')) + '</p>';
+  html += '<div class="settings-subhead">' + escapeHtml(tr('settings_notifications')) + '</div>';
+  html += settingsToggleRow(tr('notify_new_post'),  'notify_on_new_post',  me.notify_on_new_post  !== false);
+  html += settingsToggleRow(tr('notify_follow'),    'notify_on_follow',    me.notify_on_follow    !== false);
+  html += settingsToggleRow(tr('notify_comment'),   'notify_on_comment',   me.notify_on_comment   !== false);
+  html += settingsToggleRow(tr('notify_reply'),     'notify_on_reply',     me.notify_on_reply     !== false);
+  html += settingsToggleRow(tr('notify_mention'),   'notify_on_mention',   me.notify_on_mention   !== false);
+  html += settingsToggleRow(tr('notify_quote'),     'notify_on_quote',     me.notify_on_quote     !== false);
   html += '</div>';
 
   html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
@@ -4361,13 +4830,11 @@ function renderSettingsView(el) {
   html += '<button class="opt' + (LANG==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
   html += '<button class="opt' + (LANG==='en'?' active':'') + '" data-set-lang="en">English</button>';
   html += '</div>';
-  if (state.user) {
-    html += '<div class="settings-subhead">' + (LANG === 'ru' ? 'Прочее' : 'Other') + '</div>';
-    html += settingsToggleRow(tr('settings_sound'), 'sound_enabled', soundOn);
-    html += '<p class="settings-desc">' + escapeHtml(tr('settings_sound_hint')) + '</p>';
-    html += settingsToggleRow(tr('settings_show_link_previews'), 'show_link_previews', me.show_link_previews !== false);
-    html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_link_previews_hint')) + '</p>';
-  }
+  html += '<div class="settings-subhead">' + (LANG === 'ru' ? 'Прочее' : 'Other') + '</div>';
+  html += settingsToggleRow(tr('settings_sound'), 'sound_enabled', soundOn);
+  html += '<p class="settings-desc">' + escapeHtml(tr('settings_sound_hint')) + '</p>';
+  html += settingsToggleRow(tr('settings_show_link_previews'), 'show_link_previews', me.show_link_previews !== false);
+  html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_link_previews_hint')) + '</p>';
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_colors')) + '</div>';
   html += '<p class="settings-desc">' + escapeHtml(tr('settings_colors_hint')) + '</p>';
   html += '<div style="font-size:12.5px;color:var(--muted);margin-bottom:8px;font-weight:600">' + escapeHtml(tr('color_accent')) + '</div>';
@@ -4486,12 +4953,11 @@ function renderSettingsView(el) {
   if (si) {
     api('/api/uptime').then(function(info){
       var uptime = fmtUptime(info.uptime_seconds || 0);
-      var version = info.version || '—';
       si.innerHTML = ''
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_uptime')) + '</span>'
         + '<span class="value">' + escapeHtml(uptime) + '</span></div>'
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_version')) + '</span>'
-        + '<span class="value">' + escapeHtml(version) + '</span></div>';
+        + '<span class="value">' + escapeHtml(info.version || '—') + '</span></div>';
     }).catch(function(){
       si.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>';
     });
@@ -4500,7 +4966,6 @@ function renderSettingsView(el) {
   var di = document.getElementById('deviceInfo');
   if (di) {
     api('/api/whoami').then(function(info){
-      state.whoami = info;
       var city = info.city || '—';
       var country = info.country ? (', ' + info.country) : '';
       var cityFull = (city === '—') ? '—' : (city + country);
@@ -4520,7 +4985,7 @@ function renderSettingsView(el) {
   if (lo) lo.addEventListener('click', doLogoutConfirm);
 }
 
-/* ============ POLICY (structured rendering) ============ */
+/* ============ POLICY ============ */
 function renderPolicyHtml(raw) {
   var lines = String(raw || '').split('\n');
   var html = '';
@@ -4559,57 +5024,6 @@ function renderPolicyView(el) {
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
-}
-
-/* ============ AUTH ============ */
-function renderRegisterView(el) {
-  var html = '<div class="main-body"><div class="auth-page"><div class="auth-card">';
-  html += '<h1>' + tr('reg_title') + '</h1>';
-  html += '<form id="regForm">';
-  html += '<input type="text" name="name" placeholder="' + escapeHtml(tr('name_ph')) + '" maxlength="50" required />';
-  html += '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" maxlength="20" required />';
-  html += '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required />';
-  html += '<input type="password" name="password_confirm" placeholder="' + escapeHtml(tr('pass2_ph')) + '" required />';
-  html += '<div class="auth-error" id="regError"></div>';
-  html += '<button type="submit">' + tr('reg_btn') + '</button>';
-  html += '</form>';
-  html += '<div class="auth-switch"><a id="toLogin">' + tr('to_login') + '</a></div>';
-  html += '</div></div></div>';
-  el.innerHTML = html;
-  document.getElementById('toLogin').addEventListener('click', function(){ navigate('/login'); });
-  var form = document.getElementById('regForm');
-  var errEl = document.getElementById('regError');
-  form.addEventListener('submit', async function(e){
-    e.preventDefault(); errEl.textContent = '';
-    var fd = new FormData(form);
-    try {
-      await doRegister({
-        name: fd.get('name'), nick: fd.get('nick'),
-        password: fd.get('password'), password_confirm: fd.get('password_confirm') });
-    } catch(err) { errEl.textContent = tr(err.message) || err.message; }
-  });
-}
-function renderLoginView(el) {
-  var html = '<div class="main-body"><div class="auth-page"><div class="auth-card">';
-  html += '<h1>' + tr('log_title') + '</h1>';
-  html += '<form id="logForm">';
-  html += '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required />';
-  html += '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required />';
-  html += '<div class="auth-error" id="logError"></div>';
-  html += '<button type="submit">' + tr('log_btn') + '</button>';
-  html += '</form>';
-  html += '<div class="auth-switch"><a id="toReg">' + tr('to_reg') + '</a></div>';
-  html += '</div></div></div>';
-  el.innerHTML = html;
-  document.getElementById('toReg').addEventListener('click', function(){ navigate('/register'); });
-  var form = document.getElementById('logForm');
-  var errEl = document.getElementById('logError');
-  form.addEventListener('submit', async function(e){
-    e.preventDefault(); errEl.textContent = '';
-    var fd = new FormData(form);
-    try { await doLogin({ nick: fd.get('nick'), password: fd.get('password') }); }
-    catch(err) { errEl.textContent = tr(err.message) || err.message; }
-  });
 }
 
 /* ============ POST RENDER ============ */
@@ -4725,7 +5139,7 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
   var authorHtml = c.author ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>' : '';
   var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
   var replyBtn = '';
-  if (!isReply && state.user) {
+  if (!isReply) {
     replyBtn = '<button class="act-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
   }
   var editBtn = isMine ? '<button class="act-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>' : '';
@@ -4786,26 +5200,11 @@ function startInlineEdit(container, textEl, initialText, onSave) {
   });
 }
 
-function removeCommentAndRepliesFromDom(postId, commentId) {
-  var postEl = document.querySelector('[data-post-id="' + postId + '"]');
-  if (!postEl) return 0;
-  var root = postEl.querySelector('.comments');
-  if (!root) return 0;
-  var target = root.querySelector('[data-comment-id="' + commentId + '"]');
-  if (!target) return 0;
-  var removed = 1;
-  var isReply = target.classList.contains('reply');
-  if (!isReply) {
-    var next = target.nextElementSibling;
-    while (next && next.classList && next.classList.contains('reply')) {
-      var toRemove = next;
-      next = next.nextElementSibling;
-      toRemove.parentNode.removeChild(toRemove);
-      removed++;
-    }
+function checkEmptyFeed(parent) {
+  if (!parent || parent.id !== 'feed') return;
+  if (!parent.querySelector('.post-card')) {
+    parent.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>';
   }
-  target.parentNode.removeChild(target);
-  return removed;
 }
 
 function bindPostActions(root) {
@@ -4818,8 +5217,8 @@ function bindPostActions(root) {
       var action = btn.dataset.action;
       var postId = btn.dataset.postId;
       var commentId = btn.dataset.commentId;
+
       if (action === 'like') {
-        if (!state.user) { navigate('/login'); return; }
         var snap = applyLikeUI(btn);
         state.suppressRefresh = Date.now() + 2000;
         try { await api('/api/posts/' + postId + '/like', { method: 'POST', body: {} }); }
@@ -4827,7 +5226,6 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'like-comment') {
-        if (!state.user) { navigate('/login'); return; }
         var snap2 = applyLikeUI(btn);
         state.suppressRefresh = Date.now() + 2000;
         try { await api('/api/posts/' + postId + '/comments/' + commentId + '/like', { method: 'POST', body: {} }); }
@@ -4840,7 +5238,6 @@ function bindPostActions(root) {
         return;
       }
       if (action === 'quote') {
-        if (!state.user) { navigate('/login'); return; }
         try {
           var p = await api('/api/posts/' + postId);
           state.quotePostId = postId;
@@ -4878,12 +5275,23 @@ function bindPostActions(root) {
       }
       if (action === 'delete-post') {
         showConfirm(tr('confirm_delete'), async function(){
+          var postEl = document.querySelector('[data-post-id="' + postId + '"]');
+          var parentEl = postEl ? postEl.parentNode : null;
+          var nextSib = postEl ? postEl.nextSibling : null;
+          // Optimistic: убираем из DOM сразу
+          if (postEl && parentEl) parentEl.removeChild(postEl);
+          state.suppressRefresh = Date.now() + 2000;
           try {
-            state.suppressRefresh = Date.now() + 2000;
             await api('/api/posts/' + postId, { method: 'DELETE' });
-            var postEl = document.querySelector('[data-post-id="' + postId + '"]');
-            if (postEl && postEl.parentNode) postEl.parentNode.removeChild(postEl);
-          } catch(err) { alert(tr(err.message) || err.message); }
+            checkEmptyFeed(parentEl);
+          } catch(err) {
+            // Восстанавливаем
+            if (postEl && parentEl) {
+              if (nextSib && nextSib.parentNode === parentEl) parentEl.insertBefore(postEl, nextSib);
+              else parentEl.appendChild(postEl);
+            }
+            alert(tr(err.message) || err.message);
+          }
         }, { yesText: tr('confirm_delete_yes') });
         return;
       }
@@ -4899,12 +5307,37 @@ function bindPostActions(root) {
       }
       if (action === 'delete-comment') {
         showConfirm(tr('confirm_delete'), async function(){
+          var cEl = document.querySelector('[data-comment-id="' + commentId + '"]');
+          var removed = 0;
+          var postEl = document.querySelector('[data-post-id="' + postId + '"]');
+          var commentsRoot = postEl ? postEl.querySelector('.comments') : null;
+
+          // Optimistic: убираем из DOM сразу
+          if (cEl) {
+            if (!cEl.classList.contains('reply')) {
+              var nx = cEl.nextElementSibling;
+              while (nx && nx.classList && nx.classList.contains('reply')) {
+                var toRemove = nx;
+                nx = nx.nextElementSibling;
+                if (toRemove.parentNode) toRemove.parentNode.removeChild(toRemove);
+                removed++;
+              }
+            }
+            if (cEl.parentNode) cEl.parentNode.removeChild(cEl);
+            removed++;
+          }
+          if (removed > 0) decrementCommentCount(postId, removed);
+          state.suppressRefresh = Date.now() + 2000;
           try {
-            state.suppressRefresh = Date.now() + 2000;
             await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
-            var removed = removeCommentAndRepliesFromDom(postId, commentId);
-            if (removed > 0) decrementCommentCount(postId, removed);
-          } catch(err) { alert(tr(err.message) || err.message); }
+            if (commentsRoot && !commentsRoot.querySelector('.comment')) {
+              // nothing
+            }
+          } catch(err) {
+            // Проще всего перезагрузить вид, чтобы точно восстановить
+            alert(tr(err.message) || err.message);
+            if (state.view === 'post') loadPostView();
+          }
         }, { yesText: tr('confirm_delete_yes') });
         return;
       }
@@ -4935,7 +5368,8 @@ async function copyText(txt) {
   } catch(e) {}
 }
 
-(function init() {
+/* ============ INIT ============ */
+(async function init() {
   try {
     var reloadSettings = sessionStorage.getItem('SLD_reload_settings');
     if (reloadSettings) {
@@ -4948,22 +5382,28 @@ async function copyText(txt) {
     }
   } catch(e) {}
 
-  if (state.user && (state.view === 'login' || state.view === 'register')) {
-    history.replaceState({}, '', '/');
-    state.view = 'feed'; state.viewData = {};
-  }
-  updateTitle();
-  renderSidebar(); renderMain();
-  updateRoom();
-  connectSSE();
-  loadMe().then(function(){
-    if (state.user && (state.view === 'login' || state.view === 'register')) {
-      history.replaceState({}, '', '/');
-      state.view = 'feed'; state.viewData = {};
+  // Правильное поведение: не восстанавливаем user из localStorage.
+  // Если токен есть — сначала booting → loadMe → либо app, либо auth.
+  // Если токена нет — сразу auth, без мигания.
+  if (state.token) {
+    state.booting = true;
+    renderRoot();
+    await loadMe();
+    renderRoot();
+    if (state.user) {
+      connectSSE();
+      refreshCounters();
+      updateRoom();
+    } else {
+      connectSSE(); // anon SSE (feed)
     }
-    renderSidebar(); renderMain();
-    if (state.user) { refreshCounters(); }
-  });
+  } else {
+    state.booting = false;
+    renderRoot();
+    connectSSE(); // anon SSE
+  }
+
+  startFallbackPoll();
 })();
 """
 
@@ -4976,6 +5416,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_HOME__", json.dumps(I_HOME))
           .replace("__I_USERS__", json.dumps(I_USERS))
           .replace("__I_USER__", json.dumps(I_USER))
+          .replace("__I_USER_LG__", json.dumps(I_USER_LG))
           .replace("__I_BELL__", json.dumps(I_BELL))
           .replace("__I_GEAR__", json.dumps(I_GEAR))
           .replace("__I_LOGOUT__", json.dumps(I_LOGOUT))
@@ -4996,9 +5437,17 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_QUOTE__", json.dumps(I_QUOTE))
           .replace("__I_CAL__", json.dumps(I_CAL))
           .replace("__I_CHECK__", json.dumps(I_CHECK))
+          .replace("__I_CHECK_LG__", json.dumps(I_CHECK_LG))
+          .replace("__I_X__", json.dumps(I_X))
           .replace("__I_MOBILE__", json.dumps(I_MOBILE))
           .replace("__I_DESKTOP__", json.dumps(I_DESKTOP))
           .replace("__I_SERVER__", json.dumps(I_SERVER))
+          .replace("__I_EYE__", json.dumps(I_EYE))
+          .replace("__I_EYE_OFF__", json.dumps(I_EYE_OFF))
+          .replace("__I_LOCK__", json.dumps(I_LOCK))
+          .replace("__I_AT__", json.dumps(I_AT))
+          .replace("__I_INFO__", json.dumps(I_INFO))
+          .replace("__I_REFRESH__", json.dumps(I_REFRESH))
           .replace("__EMOJI_NAMES__", json.dumps(emoji_names, ensure_ascii=False))
           .replace("__FAVICON_RU_DARK__", FAVICON_RU_DARK)
           .replace("__FAVICON_RU_LIGHT__", FAVICON_RU_LIGHT)
@@ -5016,7 +5465,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         f'<title>{t["site_name"]}</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
-        '<body>\n'
+        '<body data-mode="boot">\n'
         '<div class="layout">\n'
         '  <aside class="sidebar" id="sidebar"></aside>\n'
         '  <main class="main" id="main"></main>\n'
