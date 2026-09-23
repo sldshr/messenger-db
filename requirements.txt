@@ -10,3 +10,4 @@ itsdangerous
 uvloop 
 supabase
 pillow
+psycopg2-binary
