@@ -1,9 +1,9 @@
 """
-sldchat — веб-чат (IRC/TeamSpeak-like) + поддержка.
-Один файл. Всё в оперативке. Реалтайм через WebSocket.
+sldchat — веб-чат в стиле IRC/Telegram. Один файл. Всё в оперативке.
 
 ENV:
-  ADMIN_PASS   пароль админки. Если пусто — /admin отключён.
+  APP_NAME     название приложения (по умолчанию "sldchat")
+  ADMIN_PASS   пароль админки /admin. Если пусто — админка отключена.
   PORT         порт (по умолчанию 8080)
 """
 from __future__ import annotations
@@ -22,41 +22,32 @@ from fastapi import (
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, field_validator
 
-
 # ============================================================
 #  КОНФИГ
 # ============================================================
+APP_NAME = os.environ.get("APP_NAME", "sldchat").strip() or "sldchat"
 ALLOW_CHANNEL_CREATION = True
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-]{3,24}$")
-MENTION_RE  = re.compile(r"(?<![A-Za-z0-9_\-])@([A-Za-z0-9_\-]{3,24})")
-EMAIL_RE    = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,120}\.[^@\s]{2,20}$")
+MENTION_RE = re.compile(r"(?<![A-Za-z0-9_\-])@([A-Za-z0-9_\-]{3,24})")
 
-LOGIN_WINDOW   = 60
-LOGIN_MAX      = 8
-WS_MSG_WINDOW  = 5
-WS_MSG_MAX     = 12
-
+LOGIN_WINDOW, LOGIN_MAX = 60, 8
+WS_MSG_WINDOW, WS_MSG_MAX = 5, 12
 
 # ============================================================
 #  ХРАНИЛИЩЕ
 # ============================================================
-users:    Dict[str, dict] = {}
-tokens:   Dict[str, str]  = {}
+users: Dict[str, dict] = {}
+tokens: Dict[str, str] = {}
 channels: Dict[str, dict] = {}
 messages: Dict[str, List[dict]] = {}
 
-# connections: ws -> {kind: "chat"|"support"|"admin", username?, channel?, sid?, admin_tok?}
-connections: Dict[WebSocket, dict] = {}
+connections: Dict[WebSocket, dict] = {}  # ws -> {kind:"chat"|"admin", username?, channel?}
 admin_ws: Set[WebSocket] = set()
 
-# support
-support_sessions: Dict[str, dict] = {}     # sid -> session
-support_keys: Dict[str, str] = {}          # sid -> secret key
-
 login_attempts: Dict[str, List[float]] = {}
-msg_attempts:   Dict[str, List[float]] = {}
+msg_attempts: Dict[str, List[float]] = {}
 admin_sessions: Set[str] = set()
 
 _STARTED_AT = time.time()
@@ -86,6 +77,20 @@ def hash_pw(password: str, salt: str) -> str:
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
 
 
+def client_ip(request: Request) -> str:
+    """Реальный IP клиента, даже за прокси."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip", "")
+    if xri:
+        return xri.strip()
+    cf = request.headers.get("cf-connecting-ip", "")
+    if cf:
+        return cf.strip()
+    return request.client.host if request.client else "?"
+
+
 def rate_check(bucket: Dict[str, List[float]], key: str, window: int, limit: int, msg: str) -> None:
     now = _now()
     b = bucket.setdefault(key, [])
@@ -105,9 +110,9 @@ def require_user(x_auth_token: Optional[str] = Header(None)) -> str:
 
 def require_admin(sld_admin: Optional[str] = Cookie(None)) -> None:
     if not ADMIN_PASS:
-        raise HTTPException(403, "Админка отключена")
+        raise HTTPException(403, "Admin disabled")
     if not sld_admin or sld_admin not in admin_sessions:
-        raise HTTPException(401, "Admin unauthorized")
+        raise HTTPException(401, "Unauthorized")
 
 
 def public_user(username: str) -> dict:
@@ -117,29 +122,20 @@ def public_user(username: str) -> dict:
     return {"username": u["username"], "display_name": u.get("display_name") or u["username"]}
 
 
-def _all_online_usernames() -> Set[str]:
-    return {i["username"] for i in connections.values()
-            if i.get("kind") == "chat" and i.get("username")}
+def _online_users() -> List[dict]:
+    seen: Dict[str, dict] = {}
+    for info in connections.values():
+        if info.get("kind") != "chat":
+            continue
+        name = info.get("username")
+        if name and name not in seen:
+            seen[name] = public_user(name)
+    return sorted(seen.values(), key=lambda p: p["display_name"].lower())
 
 
-def _channel_members(cid: str) -> List[str]:
-    return sorted({i["username"] for i in connections.values()
-                   if i.get("kind") == "chat" and i.get("channel") == cid and i.get("username")})
-
-
-def _mentioned_profiles(msgs: List[dict]) -> Dict[str, dict]:
-    mentioned: Set[str] = set()
-    for m in msgs:
-        for nick in MENTION_RE.findall(m["text"]):
-            mentioned.add(nick.lower())
-    return {k: public_user(k) for k in mentioned if k in users}
-
-
-async def _send(ws: WebSocket, payload: dict) -> None:
-    try:
-        await ws.send_json(payload)
-    except Exception:
-        pass
+def _online_usernames() -> Set[str]:
+    return {info["username"] for info in connections.values()
+            if info.get("kind") == "chat" and info.get("username")}
 
 
 async def broadcast_chat(payload: dict) -> None:
@@ -155,18 +151,7 @@ async def broadcast_chat(payload: dict) -> None:
         connections.pop(ws, None)
 
 
-async def broadcast_presence() -> None:
-    online = _all_online_usernames()
-    by_ch = {cid: len(_channel_members(cid)) for cid in channels}
-    await broadcast_chat({
-        "type": "presence",
-        "total": len(online),
-        "channels": by_ch,
-        "online_usernames": sorted(online),
-    })
-
-
-async def broadcast_admin_support(payload: dict) -> None:
+async def broadcast_admin(payload: dict) -> None:
     dead = []
     for ws in list(admin_ws):
         try:
@@ -175,6 +160,16 @@ async def broadcast_admin_support(payload: dict) -> None:
             dead.append(ws)
     for ws in dead:
         admin_ws.discard(ws)
+
+
+async def broadcast_presence() -> None:
+    online = _online_users()
+    await broadcast_chat({
+        "type": "presence",
+        "total": len(online),
+        "users": online,
+        "online_usernames": sorted(_online_usernames()),
+    })
 
 
 # ============================================================
@@ -188,10 +183,10 @@ class RegisterBody(BaseModel):
 
     @field_validator("username")
     @classmethod
-    def v_username(cls, v: str) -> str:
+    def v(cls, v: str) -> str:
         v = v.strip()
         if not USERNAME_RE.match(v):
-            raise ValueError("Юзернейм: 3–24 символа, только a-z A-Z 0-9 _ -")
+            raise ValueError("Юзернейм: 3–24 символа, только A-Z a-z 0-9 _ -")
         return v
 
 
@@ -237,43 +232,10 @@ class AdminMessageEdit(BaseModel):
         return v
 
 
-class SupportStartBody(BaseModel):
-    name: str
-    email: str
-
-    @field_validator("name")
-    @classmethod
-    def v(cls, v: str) -> str:
-        v = (v or "").strip()
-        if not (1 <= len(v) <= 40):
-            raise ValueError("Имя: 1–40 символов")
-        return v
-
-    @field_validator("email")
-    @classmethod
-    def v2(cls, v: str) -> str:
-        v = (v or "").strip()
-        if not EMAIL_RE.match(v):
-            raise ValueError("Некорректный email")
-        return v
-
-
-class SupportMsgBody(BaseModel):
-    text: str
-
-    @field_validator("text")
-    @classmethod
-    def v(cls, v: str) -> str:
-        v = (v or "").strip()
-        if not (1 <= len(v) <= 2000):
-            raise ValueError("Текст: 1–2000 символов")
-        return v
-
-
 # ============================================================
 #  FASTAPI
 # ============================================================
-app = FastAPI(title="sldchat")
+app = FastAPI(title=APP_NAME)
 
 
 # ---------- AUTH ----------
@@ -281,8 +243,8 @@ def _record_login(username: str, request: Request) -> None:
     u = users.get(username.lower())
     if not u:
         return
-    ua = (request.headers.get("user-agent") or "")[:160]
-    ip = request.client.host if request.client else ""
+    ua = (request.headers.get("user-agent") or "")[:220]
+    ip = client_ip(request)
     u.setdefault("logins", []).append({"ts": _now(), "ua": ua, "ip": ip})
     if len(u["logins"]) > 200:
         u["logins"] = u["logins"][-200:]
@@ -291,9 +253,8 @@ def _record_login(username: str, request: Request) -> None:
 
 @app.post("/api/register")
 def register(body: RegisterBody, request: Request):
-    ip = request.client.host if request.client else "?"
-    rate_check(login_attempts, "reg:" + ip, LOGIN_WINDOW, LOGIN_MAX,
-               "Слишком много попыток, попробуйте позже")
+    ip = client_ip(request)
+    rate_check(login_attempts, "reg:" + ip, LOGIN_WINDOW, LOGIN_MAX, "Слишком много попыток")
     if body.password != body.password2:
         raise HTTPException(400, "Пароли не совпадают")
     if len(body.password) < 6:
@@ -319,9 +280,8 @@ def register(body: RegisterBody, request: Request):
 
 @app.post("/api/login")
 def login(body: LoginBody, request: Request):
-    ip = request.client.host if request.client else "?"
-    rate_check(login_attempts, "login:" + ip, LOGIN_WINDOW, LOGIN_MAX,
-               "Слишком много попыток, попробуйте позже")
+    ip = client_ip(request)
+    rate_check(login_attempts, "login:" + ip, LOGIN_WINDOW, LOGIN_MAX, "Слишком много попыток")
     key = body.username.strip().lower()
     u = users.get(key)
     if not u or u["hash"] != hash_pw(body.password, u["salt"]):
@@ -348,7 +308,7 @@ def me(user: str = Depends(require_user)):
 
 @app.get("/api/config")
 def get_config():
-    return {"allow_channel_creation": ALLOW_CHANNEL_CREATION}
+    return {"allow_channel_creation": ALLOW_CHANNEL_CREATION, "app_name": APP_NAME}
 
 
 @app.patch("/api/profile")
@@ -366,6 +326,11 @@ async def update_profile(body: ProfileBody, user: str = Depends(require_user)):
 
 
 # ---------- CHANNELS ----------
+def _online_in_channel(cid: str) -> int:
+    return sum(1 for i in connections.values()
+               if i.get("kind") == "chat" and i.get("channel") == cid)
+
+
 @app.get("/api/channels")
 def list_channels(user: str = Depends(require_user)):
     out = []
@@ -374,12 +339,12 @@ def list_channels(user: str = Depends(require_user)):
         last = lst[-1] if lst else None
         out.append({
             "id": c["id"], "name": c["name"], "owner": c["owner"],
-            "online": len(_channel_members(cid)),
+            "online": _online_in_channel(cid),
             "last_message": ({"user": last["user"], "text": last["text"], "ts": last["ts"]}
                              if last else None),
         })
     out.sort(key=lambda x: (x["last_message"]["ts"] if x["last_message"] else 0), reverse=True)
-    return {"channels": out, "total_online": len(_all_online_usernames())}
+    return {"channels": out, "total_online": len(_online_usernames())}
 
 
 def _slug(raw: str) -> str:
@@ -394,84 +359,18 @@ async def create_channel(body: ChannelBody, user: str = Depends(require_user)):
     if not (1 <= len(raw) <= 32):
         raise HTTPException(400, "Название: 1–32 символа")
     cid = _slug(raw)
-    if not cid or cid in channels:
-        raise HTTPException(409, "Канал уже существует или некорректен")
+    if not cid:
+        raise HTTPException(400, "Некорректное название")
+    if cid in channels:
+        raise HTTPException(409, "Канал уже существует")
     channels[cid] = {"id": cid, "name": raw, "owner": user, "created": _now()}
     messages[cid] = []
     await broadcast_chat({"type": "channels_changed"})
     return {"id": cid, "name": raw}
 
 
-# ---------- SUPPORT (client) ----------
-@app.post("/api/support/start")
-def support_start(body: SupportStartBody, request: Request):
-    ip = request.client.host if request.client else "?"
-    rate_check(login_attempts, "support:" + ip, 300, 6, "Слишком много обращений")
-    sid = secrets.token_hex(8)
-    key = secrets.token_urlsafe(24)
-    ua = (request.headers.get("user-agent") or "")[:180]
-    support_sessions[sid] = {
-        "id": sid,
-        "name": body.name,
-        "email": body.email,
-        "ip": ip,
-        "ua": ua,
-        "created": _now(),
-        "ended": False,
-        "ended_at": None,
-        "messages": [],
-        "unread_admin": 0,
-        "unread_user": 0,
-    }
-    support_keys[sid] = key
-    return {"sid": sid, "key": key, "session": _support_public(sid)}
-
-
-def _support_public(sid: str) -> dict:
-    s = support_sessions.get(sid)
-    if not s:
-        return {}
-    return {
-        "id": s["id"], "name": s["name"], "email": s["email"],
-        "ip": s["ip"], "ua": s["ua"], "created": s["created"],
-        "ended": s["ended"], "ended_at": s["ended_at"],
-        "messages": s["messages"],
-        "unread_admin": s["unread_admin"], "unread_user": s["unread_user"],
-    }
-
-
-@app.get("/api/support/session")
-def support_session(sid: str, key: str):
-    if support_keys.get(sid) != key:
-        raise HTTPException(401, "Unauthorized")
-    return _support_public(sid)
-
-
-@app.post("/api/support/message")
-async def support_message(body: SupportMsgBody, sid: str, key: str):
-    s = support_sessions.get(sid)
-    if not s or support_keys.get(sid) != key:
-        raise HTTPException(401, "Unauthorized")
-    if s["ended"]:
-        raise HTTPException(400, "Чат завершён")
-    msg = {"id": secrets.token_hex(8), "from": "user", "text": body.text, "ts": _now()}
-    s["messages"].append(msg)
-    s["unread_admin"] += 1
-    await _notify_support(sid, msg, "user")
-    return msg
-
-
-async def _notify_support(sid: str, msg: dict, origin: str):
-    payload = {"type": "support_message", "sid": sid, "message": msg, "origin": origin}
-    # отдать клиенту support по WS
-    for ws, info in list(connections.items()):
-        if info.get("kind") == "support" and info.get("sid") == sid:
-            await _send(ws, payload)
-    await broadcast_admin_support(payload)
-
-
 # ============================================================
-#  WEBSOCKET — CHAT
+#  WEBSOCKET
 # ============================================================
 async def _handle_chat_message(cid: str, username: str, text: str) -> None:
     text = (text or "").strip()
@@ -490,7 +389,9 @@ async def _handle_chat_message(cid: str, username: str, text: str) -> None:
     lst.append(msg)
     if len(lst) > 2000:
         del lst[:-2000]
-    users.get(username.lower(), {})["last_seen"] = now
+    u = users.get(username.lower())
+    if u:
+        u["last_seen"] = now
     await broadcast_chat({"type": "message", "message": msg})
 
 
@@ -528,10 +429,15 @@ async def ws_chat(ws: WebSocket):
     token = ws.query_params.get("token")
     username = tokens.get(token) if token else None
     if not username:
-        await _send(ws, {"type": "session_expired"})
+        try:
+            await ws.send_json({"type": "session_expired"})
+        except Exception:
+            pass
         await ws.close(code=1008)
         return
-    users.get(username.lower(), {})["last_seen"] = _now()
+    u = users.get(username.lower())
+    if u:
+        u["last_seen"] = _now()
     connections[ws] = {"kind": "chat", "username": username, "channel": None}
     await broadcast_presence()
     try:
@@ -542,22 +448,37 @@ async def ws_chat(ws: WebSocket):
             if not info:
                 break
             if t == "ping":
-                users.get(username.lower(), {})["last_seen"] = _now()
-                await _send(ws, {"type": "pong"})
+                u = users.get(username.lower())
+                if u:
+                    u["last_seen"] = _now()
+                try:
+                    await ws.send_json({"type": "pong"})
+                except Exception:
+                    pass
             elif t == "join":
                 cid = data.get("channel")
                 if cid not in channels:
-                    await _send(ws, {"type": "channel_not_found", "channel": cid})
+                    try:
+                        await ws.send_json({"type": "channel_not_found", "channel": cid})
+                    except Exception:
+                        pass
                     continue
                 info["channel"] = cid
                 msgs = messages.get(cid, [])[-200:]
-                await _send(ws, {
-                    "type": "channel_joined",
-                    "channel": cid,
-                    "messages": msgs,
-                    "profiles": _mentioned_profiles(msgs),
-                    "members": [public_user(u) for u in _channel_members(cid)],
-                })
+                mentioned: Set[str] = set()
+                for m in msgs:
+                    for nick in MENTION_RE.findall(m["text"]):
+                        mentioned.add(nick.lower())
+                profiles = {k: public_user(k) for k in mentioned if k in users}
+                try:
+                    await ws.send_json({
+                        "type": "channel_joined",
+                        "channel": cid,
+                        "messages": msgs,
+                        "profiles": profiles,
+                    })
+                except Exception:
+                    pass
                 await broadcast_presence()
             elif t == "leave":
                 info["channel"] = None
@@ -582,49 +503,8 @@ async def ws_chat(ws: WebSocket):
             pass
 
 
-# ============================================================
-#  WEBSOCKET — SUPPORT (client)
-# ============================================================
-@app.websocket("/ws/support")
-async def ws_support(ws: WebSocket):
-    await ws.accept()
-    sid = ws.query_params.get("sid")
-    key = ws.query_params.get("key")
-    s = support_sessions.get(sid)
-    if not s or support_keys.get(sid) != key:
-        await ws.close(code=1008)
-        return
-    connections[ws] = {"kind": "support", "sid": sid}
-    await _send(ws, {"type": "support_init", "session": _support_public(sid)})
-    try:
-        while True:
-            data = await ws.receive_json()
-            if data.get("type") == "ping":
-                await _send(ws, {"type": "pong"})
-            elif data.get("type") == "message":
-                if s["ended"]:
-                    await _send(ws, {"type": "error", "error": "ended"})
-                    continue
-                text = (data.get("text") or "").strip()[:2000]
-                if not text:
-                    continue
-                msg = {"id": secrets.token_hex(8), "from": "user", "text": text, "ts": _now()}
-                s["messages"].append(msg)
-                s["unread_admin"] += 1
-                await _notify_support(sid, msg, "user")
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        connections.pop(ws, None)
-
-
-# ============================================================
-#  WEBSOCKET — SUPPORT (admin)
-# ============================================================
-@app.websocket("/ws/admin_support")
-async def ws_admin_support(ws: WebSocket, sld_admin: Optional[str] = Cookie(None)):
+@app.websocket("/ws/admin")
+async def ws_admin(ws: WebSocket, sld_admin: Optional[str] = Cookie(None)):
     await ws.accept()
     if not ADMIN_PASS or not sld_admin or sld_admin not in admin_sessions:
         await ws.close(code=1008)
@@ -635,16 +515,10 @@ async def ws_admin_support(ws: WebSocket, sld_admin: Optional[str] = Cookie(None
         while True:
             data = await ws.receive_json()
             if data.get("type") == "ping":
-                await _send(ws, {"type": "pong"})
-            elif data.get("type") == "reply":
-                sid = data.get("sid")
-                text = (data.get("text") or "").strip()[:2000]
-                s = support_sessions.get(sid)
-                if s and not s["ended"] and text:
-                    msg = {"id": secrets.token_hex(8), "from": "admin", "text": text, "ts": _now()}
-                    s["messages"].append(msg)
-                    s["unread_user"] += 1
-                    await _notify_support(sid, msg, "admin")
+                try:
+                    await ws.send_json({"type": "pong"})
+                except Exception:
+                    pass
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -661,9 +535,8 @@ async def ws_admin_support(ws: WebSocket, sld_admin: Optional[str] = Cookie(None
 def admin_login(body: AdminLoginBody, request: Request, response: Response):
     if not ADMIN_PASS:
         raise HTTPException(403, "Админка отключена")
-    ip = request.client.host if request.client else "?"
-    rate_check(login_attempts, "admin:" + ip, LOGIN_WINDOW, LOGIN_MAX,
-               "Слишком много попыток")
+    ip = client_ip(request)
+    rate_check(login_attempts, "admin:" + ip, LOGIN_WINDOW, LOGIN_MAX, "Слишком много попыток")
     if not secrets.compare_digest(body.password, ADMIN_PASS):
         raise HTTPException(401, "Неверный пароль")
     token = secrets.token_urlsafe(32)
@@ -692,23 +565,20 @@ def admin_stats(_: None = Depends(require_admin)):
         "users": len(users),
         "channels": len(channels),
         "messages": sum(len(v) for v in messages.values()),
-        "online": len(_all_online_usernames()),
+        "online": len(_online_usernames()),
         "tokens": len(tokens),
-        "support_open": sum(1 for s in support_sessions.values() if not s["ended"]),
         "uptime_started": _STARTED_AT,
     }
 
 
-# ---- USERS ----
 @app.get("/api/admin/users")
 def admin_users(_: None = Depends(require_admin)):
-    online = _all_online_usernames()
+    online = _online_usernames()
     out = []
     for u in users.values():
         uname = u["username"]
         msg_count = sum(1 for lst in messages.values() for m in lst if m["user"] == uname)
         token_count = sum(1 for n in tokens.values() if n == uname)
-        online_in = [cid for cid in channels if uname in _channel_members(cid)]
         out.append({
             "username": uname,
             "display_name": u.get("display_name") or uname,
@@ -717,7 +587,6 @@ def admin_users(_: None = Depends(require_admin)):
             "logins_count": len(u.get("logins", [])),
             "tokens": token_count,
             "messages": msg_count,
-            "online_in": online_in,
             "is_online": uname in online,
         })
     out.sort(key=lambda x: x["created"], reverse=True)
@@ -741,7 +610,8 @@ def admin_user_detail(username: str, _: None = Depends(require_admin)):
                 continue
             total += 1
             by_channel[cid] = by_channel.get(cid, 0) + 1
-            per_day[_day_str(m["ts"])] = per_day.get(_day_str(m["ts"]), 0) + 1
+            d = _day_str(m["ts"])
+            per_day[d] = per_day.get(d, 0) + 1
             recent.append({**m, "channel_name": channels.get(cid, {}).get("name", cid)})
     recent.sort(key=lambda m: m["ts"], reverse=True)
 
@@ -761,7 +631,7 @@ def admin_user_detail(username: str, _: None = Depends(require_admin)):
         "display_name": u.get("display_name") or uname,
         "created": u["created"],
         "last_seen": u.get("last_seen", 0),
-        "is_online": uname in _all_online_usernames(),
+        "is_online": uname in _online_usernames(),
         "total_messages": total,
         "messages_by_channel": by_channel,
         "messages_per_day": per_day,
@@ -769,7 +639,6 @@ def admin_user_detail(username: str, _: None = Depends(require_admin)):
         "days": days,
         "logins": list(reversed(logins[-50:])),
         "recent_messages": recent[:25],
-        "online_in": [cid for cid in channels if uname in _channel_members(cid)],
     }
 
 
@@ -805,7 +674,6 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
         raise HTTPException(404, "Нет такого пользователя")
     uname = u["username"]
 
-    # Удаляем все сообщения этого пользователя
     removed: List[tuple] = []
     for cid, lst in messages.items():
         kept = []
@@ -816,7 +684,6 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
                 kept.append(m)
         messages[cid] = kept
 
-    # Кик из WS чата
     kicked = 0
     for ws, info in list(connections.items()):
         if info.get("kind") == "chat" and info.get("username") == uname:
@@ -827,12 +694,10 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
                 pass
             kicked += 1
 
-    # Удаляем аккаунт, токены
     del users[username.lower()]
     for t in [t for t, n in tokens.items() if n == uname]:
         del tokens[t]
 
-    # Оповещаем
     for cid, mid in removed:
         await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
     await broadcast_chat({"type": "user_deleted", "username": uname})
@@ -841,7 +706,6 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
     return {"ok": True, "kicked": kicked, "messages_removed": len(removed)}
 
 
-# ---- CHANNELS ----
 @app.get("/api/admin/channels")
 def admin_channels(_: None = Depends(require_admin)):
     out = []
@@ -850,7 +714,7 @@ def admin_channels(_: None = Depends(require_admin)):
             "id": c["id"], "name": c["name"], "owner": c["owner"],
             "created": c["created"],
             "messages": len(messages.get(cid) or []),
-            "online": len(_channel_members(cid)),
+            "online": _online_in_channel(cid),
         })
     out.sort(key=lambda x: x["created"])
     return {"channels": out}
@@ -862,8 +726,10 @@ async def admin_create_channel(body: ChannelBody, _: None = Depends(require_admi
     if not (1 <= len(raw) <= 32):
         raise HTTPException(400, "Название: 1–32 символа")
     cid = _slug(raw)
-    if not cid or cid in channels:
-        raise HTTPException(409, "Канал уже существует или некорректен")
+    if not cid:
+        raise HTTPException(400, "Некорректное название")
+    if cid in channels:
+        raise HTTPException(409, "Канал уже существует")
     channels[cid] = {"id": cid, "name": raw, "owner": "admin", "created": _now()}
     messages[cid] = []
     await broadcast_chat({"type": "channels_changed"})
@@ -877,7 +743,10 @@ async def admin_delete_channel(cid: str, _: None = Depends(require_admin)):
     for ws, info in list(connections.items()):
         if info.get("kind") == "chat" and info.get("channel") == cid:
             info["channel"] = None
-            await _send(ws, {"type": "channel_removed", "channel": cid})
+            try:
+                await ws.send_json({"type": "channel_removed", "channel": cid})
+            except Exception:
+                pass
     del channels[cid]
     messages.pop(cid, None)
     await broadcast_chat({"type": "channels_changed"})
@@ -885,7 +754,6 @@ async def admin_delete_channel(cid: str, _: None = Depends(require_admin)):
     return {"ok": True}
 
 
-# ---- MESSAGES ----
 @app.get("/api/admin/messages")
 def admin_messages(_: None = Depends(require_admin),
                    channel: Optional[str] = None,
@@ -940,253 +808,246 @@ async def admin_clear_channel(cid: str, _: None = Depends(require_admin)):
     return {"ok": True}
 
 
-# ---- SUPPORT (admin) ----
-@app.get("/api/admin/support")
-def admin_support_list(_: None = Depends(require_admin)):
-    out = []
-    for s in support_sessions.values():
-        last = s["messages"][-1] if s["messages"] else None
-        out.append({
-            "id": s["id"], "name": s["name"], "email": s["email"],
-            "ip": s["ip"], "ua": s["ua"],
-            "created": s["created"], "ended": s["ended"], "ended_at": s["ended_at"],
-            "unread_admin": s["unread_admin"], "messages": len(s["messages"]),
-            "last_message": ({"text": last["text"], "ts": last["ts"], "from": last["from"]}
-                             if last else None),
-        })
-    out.sort(key=lambda x: x["created"], reverse=True)
-    return {"sessions": out}
-
-
-@app.get("/api/admin/support/{sid}")
-def admin_support_session(sid: str, _: None = Depends(require_admin)):
-    s = support_sessions.get(sid)
-    if not s:
-        raise HTTPException(404, "Нет такой сессии")
-    s["unread_admin"] = 0
-    return _support_public(sid)
-
-
-@app.post("/api/admin/support/{sid}/end")
-async def admin_support_end(sid: str, _: None = Depends(require_admin)):
-    s = support_sessions.get(sid)
-    if not s:
-        raise HTTPException(404, "Нет такой сессии")
-    if not s["ended"]:
-        s["ended"] = True
-        s["ended_at"] = _now()
-        sys_msg = {"id": secrets.token_hex(8), "from": "admin",
-                   "text": "— Чат завершён администратором —", "ts": _now()}
-        s["messages"].append(sys_msg)
-        await _notify_support(sid, sys_msg, "admin")
-    await broadcast_admin_support({"type": "support_list_changed"})
-    return {"ok": True}
-
-
-@app.delete("/api/admin/support/{sid}")
-async def admin_support_delete(sid: str, _: None = Depends(require_admin)):
-    if sid not in support_sessions:
-        raise HTTPException(404, "Нет такой сессии")
-    del support_sessions[sid]
-    support_keys.pop(sid, None)
-    await broadcast_admin_support({"type": "support_list_changed"})
-    return {"ok": True}
-
-
 # ============================================================
-#  РОУТЫ
-# ============================================================
-from fastapi.responses import HTMLResponse as _HR  # noqa
-
-
-# Загружаем HTML-страницы из отдельных констант ниже
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return HTML_PAGE
-
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    if not ADMIN_PASS:
-        return HTMLResponse(
-            "<h1 style='font-family:sans-serif;color:#cc0000;padding:40px'>"
-            "Админка отключена: не задан ADMIN_PASS</h1>",
-            status_code=503)
-    return ADMIN_PAGE
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": _now()}
-
-
-# ============================================================
-#  HTML: ЧАТ
+#  HTML: КЛИЕНТ
 # ============================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#517da2">
-<title>sldchat</title>
+<meta name="theme-color" content="#2f5d8a">
+<title>{{APP_NAME}}</title>
 <style>
-:root{--bg:#e6ebee;--panel:#fff;--panel2:#f2f5f8;--border:#dfe5ea;--text:#222;--muted:#9aa5ad;--accent:#517da2;--accent-h:#46708f;--bub-in:#fff;--bub-out:#eeffde;--bub-out-t:#7d8b7d;--shadow:rgba(0,0,0,.08);--chat-bg:#e6ebee;}
-html[data-theme=dark]{--bg:#0f1720;--panel:#17212b;--panel2:#202b36;--border:#24313d;--text:#e7edf3;--muted:#8fa1b3;--accent:#4f87b8;--accent-h:#5c96c8;--bub-in:#1f2c38;--bub-out:#2b5278;--bub-out-t:#b9d0e6;--shadow:rgba(0,0,0,.35);--chat-bg:#0d141b;}
-*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
+:root{
+  --bg:#e4e9ed; --panel:#fff; --panel2:#f2f5f8; --border:#dbe1e6;
+  --text:#1e2429; --muted:#7c8a95; --accent:#2f5d8a; --accent-h:#264c72;
+  --bub-in:#fff; --bub-out:#e3f4d9; --bub-out-t:#5a7a5a;
+  --shadow:0 1px 2px rgba(0,0,0,.08); --chat-bg:#e4e9ed;
+}
+html[data-theme=dark]{
+  --bg:#131820; --panel:#1a2029; --panel2:#212832; --border:#2a323d;
+  --text:#dde5ee; --muted:#8794a1; --accent:#3f79a8; --accent-h:#4f89b8;
+  --bub-in:#1e2731; --bub-out:#2a4d70; --bub-out-t:#a8c3dc;
+  --shadow:0 1px 2px rgba(0,0,0,.4); --chat-bg:#0f141a;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
 input,textarea{-webkit-user-select:text;user-select:text;}
-html,body{height:100vh;height:100dvh;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:14px;color:var(--text);background:var(--bg);}
+html,body{height:100vh;height:100dvh;overflow:hidden;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  font-size:14px;color:var(--text);background:var(--bg);}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 input,textarea{font-family:inherit;}
 svg{display:block;}
-#boot{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;background:linear-gradient(140deg,#5c88ae 0%,#3c6591 55%,#2e5379 100%);}
-#boot .logo{font-size:34px;font-weight:300;letter-spacing:4px;}
-.spinner{margin-top:26px;width:40px;height:40px;border:3px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;}
+
+#boot{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;background:var(--bg);color:var(--muted);}
+#boot .logo{font-size:24px;font-weight:600;color:var(--accent);letter-spacing:1px;}
+.spinner{margin-top:20px;width:28px;height:28px;border:2px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
-#auth-screen{position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;padding:20px;overflow-y:auto;background:linear-gradient(140deg,#5c88ae 0%,#3c6591 55%,#2e5379 100%);}
+
+#auth-screen{position:fixed;inset:0;z-index:100;display:none;
+  align-items:center;justify-content:center;padding:20px;overflow-y:auto;
+  background:var(--bg);}
 #auth-screen.visible{display:flex;}
-.auth-card{width:380px;max-width:100%;background:var(--panel);border-radius:14px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.4);color:var(--text);}
-.auth-head{padding:26px 26px 4px;text-align:center;}
-.auth-logo{font-size:32px;font-weight:300;letter-spacing:3px;color:var(--accent);}
+.auth-card{width:340px;max-width:100%;background:var(--panel);
+  border:1px solid var(--border);border-radius:6px;padding:28px 26px;
+  box-shadow:0 4px 24px rgba(0,0,0,.06);}
+html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
+.auth-head{text-align:center;margin-bottom:20px;}
+.auth-logo{font-size:24px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
 .auth-sub{font-size:12px;color:var(--muted);margin-top:4px;}
-.auth-tabs{display:flex;padding:0 22px;margin-top:18px;border-bottom:1px solid var(--border);}
-.auth-tab{flex:1;padding:12px 0;font-size:13.5px;font-weight:600;color:var(--muted);border-bottom:2px solid transparent;}
+.auth-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.auth-tab{flex:1;padding:10px 0;font-size:13.5px;font-weight:500;
+  color:var(--muted);border-bottom:2px solid transparent;}
 .auth-tab.active{color:var(--accent);border-bottom-color:var(--accent);}
-.auth-body{padding:18px 24px 24px;}
-.auth-body input{width:100%;padding:12px 14px;margin-bottom:12px;border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none;background:var(--panel2);color:var(--text);}
-.auth-body input:focus{border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 3px rgba(81,125,162,.14);}
-.auth-error{color:#d64541;font-size:12px;min-height:16px;margin-bottom:6px;}
-.auth-submit{width:100%;margin-top:6px;padding:12px;background:var(--accent);color:#fff;border-radius:8px;font-size:14px;font-weight:600;}
+.auth-body input{width:100%;padding:10px 12px;margin-bottom:10px;
+  border:1px solid var(--border);border-radius:4px;font-size:14px;outline:none;
+  background:var(--panel);color:var(--text);}
+.auth-body input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,93,138,.15);}
+.auth-error{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
+.auth-submit{width:100%;padding:11px;background:var(--accent);color:#fff;
+  border-radius:4px;font-size:14px;font-weight:500;}
 .auth-submit:hover{background:var(--accent-h);}
-.auth-submit:disabled{opacity:.6;cursor:default;}
+.auth-submit:disabled{opacity:.55;cursor:default;}
 .auth-hint{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
+
 #app{display:none;height:100vh;height:100dvh;}
 #app.visible{display:flex;}
-.sidebar{width:280px;flex-shrink:0;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;}
-.sidebar-header{height:56px;flex-shrink:0;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 14px;}
-.me{display:flex;align-items:center;min-width:0;cursor:pointer;padding:6px 8px;border-radius:6px;}
+
+.sidebar{width:270px;flex-shrink:0;background:var(--panel);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;}
+.sidebar-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:space-between;padding:0 8px 0 14px;}
+.me{display:flex;flex-direction:column;justify-content:center;min-width:0;
+  cursor:pointer;padding:4px 8px;border-radius:4px;}
 .me:hover{background:rgba(255,255,255,.1);}
-#me-name{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#me-name{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;}
 #me-user{font-size:11px;opacity:.75;}
-.icon-btn{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;opacity:.85;flex-shrink:0;}
-.icon-btn:hover{background:rgba(255,255,255,.14);opacity:1;}
-.search-wrap{position:relative;padding:10px 12px;border-bottom:1px solid var(--border);flex-shrink:0;}
-.search-icon{position:absolute;left:22px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;}
-.search-wrap input{width:100%;padding:9px 12px 9px 36px;background:var(--panel2);border:1px solid transparent;border-radius:8px;font-size:13px;outline:none;color:var(--text);}
+.icon-btn{width:34px;height:34px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;opacity:.9;flex-shrink:0;}
+.icon-btn:hover{background:rgba(255,255,255,.15);opacity:1;}
+
+.search-wrap{position:relative;padding:8px 10px;flex-shrink:0;border-bottom:1px solid var(--border);}
+.search-icon{position:absolute;left:20px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;}
+.search-wrap input{width:100%;padding:7px 10px 7px 32px;background:var(--panel2);
+  border:1px solid transparent;border-radius:4px;font-size:13px;outline:none;color:var(--text);}
 .search-wrap input:focus{background:var(--panel);border-color:var(--border);}
-.channel-list{flex:1;overflow-y:auto;padding:6px 0;}
-.channel-item{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;}
+
+.channel-list{flex:1;min-height:0;overflow-y:auto;padding:4px 0;}
+.channel-item{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;}
 .channel-item:hover{background:var(--panel2);}
 .channel-item.active{background:var(--accent);color:#fff;}
-.channel-item.active .channel-last{color:rgba(255,255,255,.8);}
-.channel-hash{width:30px;height:30px;flex-shrink:0;border-radius:50%;background:var(--panel2);color:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px;}
+.channel-item.active .channel-last,.channel-item.active .channel-meta{color:rgba(255,255,255,.8);}
+.channel-hash{width:28px;height:28px;flex-shrink:0;border-radius:50%;
+  background:var(--panel2);color:var(--accent);
+  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;}
 .channel-item.active .channel-hash{background:rgba(255,255,255,.2);color:#fff;}
 .channel-body{flex:1;min-width:0;}
-.channel-name{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.channel-last{font-size:12px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.new-channel{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border);background:var(--panel);flex-shrink:0;}
-.new-channel input{flex:1;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:13px;outline:none;background:var(--panel2);color:var(--text);}
-.new-channel input:focus{border-color:var(--accent);}
-.new-channel button{width:38px;height:38px;border-radius:8px;background:var(--accent);color:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+.channel-row1{display:flex;align-items:baseline;justify-content:space-between;gap:6px;}
+.channel-name{font-weight:500;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.channel-meta{font-size:11px;color:var(--muted);flex-shrink:0;}
+.channel-last{font-size:12px;color:var(--muted);margin-top:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+.new-channel{display:flex;gap:6px;padding:8px 10px;flex-shrink:0;
+  border-top:1px solid var(--border);background:var(--panel);}
+.new-channel input{flex:1;min-width:0;padding:8px 10px;
+  border:1px solid var(--border);border-radius:4px;font-size:13px;
+  outline:none;background:var(--panel2);color:var(--text);}
+.new-channel input:focus{border-color:var(--accent);background:var(--panel);}
+.new-channel button{width:36px;height:36px;border-radius:4px;background:var(--accent);
+  color:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
 .new-channel button:hover{background:var(--accent-h);}
-.chat{flex:1;min-width:0;display:flex;flex-direction:column;}
-.chat-header{height:56px;flex-shrink:0;background:var(--accent);color:#fff;display:flex;align-items:center;padding:0 10px 0 14px;gap:8px;}
-#back-btn{display:none;width:36px;height:36px;align-items:center;justify-content:center;border-radius:8px;color:#fff;}
-#back-btn:hover{background:rgba(255,255,255,.14);}
+
+.chat{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;}
+.chat-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
+  display:flex;align-items:center;padding:0 8px 0 12px;gap:8px;}
+#back-btn{display:none;width:34px;height:34px;align-items:center;justify-content:center;
+  border-radius:6px;color:#fff;flex-shrink:0;}
+#back-btn:hover{background:rgba(255,255,255,.15);}
 .chat-title{display:flex;flex-direction:column;min-width:0;flex:1;}
-#chat-name{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#chat-name{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;}
 .chat-users{font-size:11px;opacity:.85;}
+
 .messages-wrap{flex:1;min-height:0;display:flex;}
-.messages{flex:1;min-height:0;overflow-y:auto;padding:14px 18px 8px;background:var(--chat-bg);}
+.messages{flex:1;min-height:0;overflow-y:auto;padding:14px 16px 8px;background:var(--chat-bg);}
 .empty{text-align:center;color:var(--muted);margin-top:60px;font-size:13px;line-height:1.6;}
-.msg{display:flex;margin-bottom:6px;flex-direction:column;position:relative;}
+.msg{display:flex;margin-bottom:5px;flex-direction:column;position:relative;}
 .msg.in{align-items:flex-start;}
 .msg.out{align-items:flex-end;}
-.msg.same-user{margin-top:-2px;}
+.msg.same-user{margin-top:-1px;}
 .msg.same-user .name{display:none;}
-.bubble{max-width:74%;padding:6px 11px 5px;border-radius:10px;background:var(--bub-in);box-shadow:0 1px 2px var(--shadow);word-wrap:break-word;overflow-wrap:break-word;color:var(--text);position:relative;}
-.msg.in .bubble{border-top-left-radius:3px;}
-.msg.out .bubble{background:var(--bub-out);border-top-right-radius:3px;}
-.msg.same-user.in .bubble,.msg.same-user.out .bubble{border-top-left-radius:10px;border-top-right-radius:10px;}
+.bubble{max-width:74%;padding:6px 10px 5px;border-radius:8px;
+  background:var(--bub-in);box-shadow:var(--shadow);
+  word-wrap:break-word;overflow-wrap:break-word;color:var(--text);}
+.msg.in .bubble{border-top-left-radius:2px;}
+.msg.out .bubble{background:var(--bub-out);border-top-right-radius:2px;}
+.msg.same-user .bubble{border-top-left-radius:8px;border-top-right-radius:8px;}
 .name{font-size:12.5px;font-weight:600;color:var(--accent);margin-bottom:2px;}
 .text{white-space:pre-wrap;line-height:1.35;font-size:14px;}
 .text .mention{color:var(--accent);font-weight:600;}
-.text .mention.self{background:rgba(81,125,162,.25);padding:0 3px;border-radius:4px;}
+.text .mention.self{background:rgba(47,93,138,.2);padding:0 3px;border-radius:3px;}
 .text .edited{color:var(--muted);font-size:11px;margin-left:4px;}
 .time{font-size:10.5px;color:var(--muted);text-align:right;margin-top:2px;margin-left:12px;}
 .msg.out .time{color:var(--bub-out-t);}
-.msg-tools{display:none;position:absolute;top:-4px;gap:4px;}
-.msg.in .msg-tools{right:-64px;}
-.msg.out .msg-tools{left:-64px;}
-.msg:hover .msg-tools{display:flex;}
-.msg-tool{width:26px;height:26px;border-radius:6px;background:var(--panel);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--muted);}
-.msg-tool:hover{color:var(--accent);border-color:var(--accent);}
-.members-panel{width:200px;flex-shrink:0;background:var(--panel);border-left:1px solid var(--border);display:none;flex-direction:column;overflow:hidden;}
+.msg.mine{cursor:context-menu;}
+
+.members-panel{width:200px;flex-shrink:0;background:var(--panel);
+  border-left:1px solid var(--border);display:none;flex-direction:column;min-height:0;}
 .members-panel.visible{display:flex;}
-.members-head{padding:12px 14px;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);}
+.members-head{padding:10px 14px;border-bottom:1px solid var(--border);
+  font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);
+  display:flex;justify-content:space-between;flex-shrink:0;}
 .members-head b{color:var(--text);font-weight:600;}
-.members-list{flex:1;overflow-y:auto;padding:6px 0;}
-.member-item{padding:8px 14px;font-size:13px;display:flex;align-items:center;gap:8px;}
-.member-item .dot{width:7px;height:7px;border-radius:50%;background:#4caf50;flex-shrink:0;}
+.members-list{flex:1;min-height:0;overflow-y:auto;padding:4px 0;}
+.member-item{padding:7px 14px;font-size:13px;display:flex;align-items:center;gap:8px;}
+.member-item .dot{width:6px;height:6px;border-radius:50%;background:#4caf50;flex-shrink:0;}
 .member-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .member-name.self{color:var(--accent);font-weight:600;}
-.composer{display:flex;align-items:flex-end;gap:10px;padding:12px 16px calc(12px + env(safe-area-inset-bottom, 0));background:var(--panel);border-top:1px solid var(--border);flex-shrink:0;position:relative;}
-#msg-input{flex:1;min-width:0;padding:11px 14px;background:var(--panel2);border:1px solid transparent;border-radius:22px;font-size:14px;line-height:1.4;max-height:130px;min-height:44px;resize:none;outline:none;color:var(--text);}
+
+.composer{display:flex;align-items:flex-end;gap:8px;flex-shrink:0;
+  padding:10px 14px calc(10px + env(safe-area-inset-bottom,0));
+  background:var(--panel);border-top:1px solid var(--border);position:relative;}
+#msg-input{flex:1;min-width:0;padding:10px 14px;background:var(--panel2);
+  border:1px solid transparent;border-radius:20px;font-size:14px;line-height:1.4;
+  max-height:120px;min-height:42px;resize:none;outline:none;color:var(--text);}
 #msg-input:focus{background:var(--panel);border-color:var(--border);}
-.send-btn{width:44px;height:44px;flex-shrink:0;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;}
+.send-btn{width:42px;height:42px;flex-shrink:0;border-radius:50%;
+  background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;}
 .send-btn:hover{background:var(--accent-h);}
-.mention-menu{position:absolute;left:12px;right:12px;bottom:calc(100% + 6px);background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px var(--shadow);max-height:220px;overflow-y:auto;z-index:20;display:none;}
+.send-btn:disabled{background:var(--border);cursor:default;}
+
+.mention-menu{position:absolute;left:10px;right:10px;bottom:calc(100% + 4px);
+  background:var(--panel);border:1px solid var(--border);border-radius:6px;
+  box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:200px;overflow-y:auto;
+  z-index:20;display:none;}
 .mention-menu.visible{display:block;}
 .mention-item{padding:8px 12px;cursor:pointer;font-size:13px;}
 .mention-item:hover{background:var(--panel2);}
 .mention-item .u{color:var(--muted);margin-left:6px;}
-.modal-backdrop{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:20px;}
+
+/* context menu */
+.ctx-menu{position:fixed;z-index:400;background:var(--panel);
+  border:1px solid var(--border);border-radius:6px;padding:4px;
+  box-shadow:0 6px 20px rgba(0,0,0,.2);min-width:150px;display:none;}
+.ctx-menu.visible{display:block;}
+.ctx-item{display:flex;align-items:center;gap:8px;padding:8px 12px;
+  border-radius:4px;font-size:13px;cursor:pointer;}
+.ctx-item:hover{background:var(--panel2);}
+.ctx-item.danger{color:#c33;}
+.ctx-item.danger:hover{background:rgba(204,51,51,.1);}
+
+.modal-backdrop{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.5);
+  display:none;align-items:center;justify-content:center;padding:20px;}
 .modal-backdrop.visible{display:flex;}
-.modal{background:var(--panel);border-radius:12px;padding:22px 24px;width:380px;max-width:100%;color:var(--text);box-shadow:0 24px 60px rgba(0,0,0,.4);}
-.modal h3{font-size:16px;margin-bottom:16px;font-weight:600;}
-.modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;}
-.modal input,.modal textarea{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;outline:none;background:var(--panel2);color:var(--text);margin-bottom:12px;font-family:inherit;}
-.modal textarea{min-height:100px;resize:vertical;}
+.modal{background:var(--panel);border-radius:8px;padding:20px 22px;
+  width:380px;max-width:100%;color:var(--text);}
+.modal h3{font-size:15px;margin-bottom:14px;font-weight:600;}
+.modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
+.modal input,.modal textarea{width:100%;padding:9px 11px;border:1px solid var(--border);
+  border-radius:4px;font-size:14px;outline:none;background:var(--panel2);
+  color:var(--text);margin-bottom:10px;font-family:inherit;}
+.modal textarea{min-height:90px;resize:vertical;}
 .modal input:focus,.modal textarea:focus{border-color:var(--accent);background:var(--panel);}
-.modal .row{display:flex;justify-content:flex-end;gap:8px;}
-.modal .btn2{padding:9px 16px;border-radius:8px;font-size:13px;background:var(--panel2);color:var(--text);}
+.modal .row{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
+.modal .btn2{padding:8px 14px;border-radius:4px;font-size:13px;
+  background:var(--panel2);color:var(--text);}
 .modal .btn2:hover{background:var(--border);}
 .modal .btn2.primary{background:var(--accent);color:#fff;}
 .modal .btn2.primary:hover{background:var(--accent-h);}
-.modal-err{color:#d64541;font-size:12px;min-height:16px;margin-bottom:8px;}
-#support-fab{position:fixed;right:20px;bottom:20px;z-index:150;padding:11px 18px;border-radius:24px;background:var(--accent);color:#fff;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,.25);}
-#support-fab:hover{background:var(--accent-h);}
-.support-chat-box{display:flex;flex-direction:column;max-height:420px;}
-.support-msgs{flex:1;overflow-y:auto;padding:10px 0;display:flex;flex-direction:column;gap:8px;min-height:200px;}
-.sp-msg{padding:7px 11px;border-radius:10px;max-width:85%;font-size:13.5px;line-height:1.4;}
-.sp-msg.user{align-self:flex-end;background:var(--bub-out);color:var(--text);}
-.sp-msg.admin{align-self:flex-start;background:var(--bub-in);border:1px solid var(--border);color:var(--text);}
-.sp-msg.sys{align-self:center;color:var(--muted);font-size:11.5px;background:none;}
-.sp-row{display:flex;gap:8px;margin-top:8px;}
-.sp-row input{flex:1;margin:0;}
-.sp-send{padding:0 14px;background:var(--accent);color:#fff;border-radius:8px;}
+.modal-err{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
+
 @media (max-width:800px){
   #app.visible{display:block;position:relative;overflow:hidden;}
   .sidebar{position:absolute;inset:0;width:100%;border-right:none;}
-  .chat{position:absolute;inset:0;background:var(--chat-bg);transform:translateX(100%);transition:transform .24s ease;z-index:5;}
+  .chat{position:absolute;inset:0;background:var(--chat-bg);
+    transform:translateX(100%);transition:transform .22s ease;z-index:5;
+    display:flex;flex-direction:column;min-height:0;}
   #app.chat-open .chat{transform:translateX(0);}
   #back-btn{display:flex;}
   .bubble{max-width:82%;}
-  .members-panel{position:absolute;top:56px;right:0;bottom:0;width:220px;z-index:8;box-shadow:-8px 0 24px var(--shadow);}
+  .members-panel{position:absolute;top:52px;right:0;bottom:0;width:200px;
+    z-index:8;box-shadow:-4px 0 16px rgba(0,0,0,.15);}
 }
-.channel-list::-webkit-scrollbar,.messages::-webkit-scrollbar,.members-list::-webkit-scrollbar,.support-msgs::-webkit-scrollbar{width:8px;height:8px;}
-.channel-list::-webkit-scrollbar-thumb,.messages::-webkit-scrollbar-thumb,.members-list::-webkit-scrollbar-thumb,.support-msgs::-webkit-scrollbar-thumb{background:rgba(0,0,0,.12);border-radius:4px;}
+.channel-list::-webkit-scrollbar,.messages::-webkit-scrollbar,
+.members-list::-webkit-scrollbar,.mention-menu::-webkit-scrollbar{width:6px;height:6px;}
+.channel-list::-webkit-scrollbar-thumb,.messages::-webkit-scrollbar-thumb,
+.members-list::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:3px;}
 </style>
 </head>
 <body>
 
-<div id="boot"><div class="logo">sldchat</div><div class="spinner"></div></div>
+<div id="boot"><div class="logo">{{APP_NAME}}</div><div class="spinner"></div></div>
 
 <div id="auth-screen">
   <div class="auth-card">
     <div class="auth-head">
-      <div class="auth-logo">sldchat</div>
-      <div class="auth-sub">простой веб-чат</div>
+      <div class="auth-logo">{{APP_NAME}}</div>
+      <div class="auth-sub">веб-чат</div>
     </div>
     <div class="auth-tabs">
       <button type="button" class="auth-tab active" data-mode="login">Вход</button>
@@ -1195,77 +1056,85 @@ svg{display:block;}
     <div class="auth-body">
       <div class="auth-error" id="auth-error"></div>
       <input id="reg-display" type="text" placeholder="Отображаемое имя" maxlength="32" style="display:none;">
-      <input id="auth-user" type="text" placeholder="Юзернейм (латиница)" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="24">
-      <input id="auth-pass" type="password" placeholder="Пароль" autocomplete="current-password" maxlength="128">
-      <input id="reg-pass2" type="password" placeholder="Повтор пароля" autocomplete="new-password" maxlength="128" style="display:none;">
+      <input id="auth-user" type="text" placeholder="Юзернейм" autocomplete="username"
+             autocapitalize="none" spellcheck="false" maxlength="24">
+      <input id="auth-pass" type="password" placeholder="Пароль"
+             autocomplete="current-password" maxlength="128">
+      <input id="reg-pass2" type="password" placeholder="Повтор пароля"
+             autocomplete="new-password" maxlength="128" style="display:none;">
       <button type="button" class="auth-submit" id="auth-submit">Войти</button>
-      <div class="auth-hint" id="reg-hint" style="display:none;">Юзернейм: 3–24, только a-z A-Z 0-9 _ -.</div>
+      <div class="auth-hint" id="reg-hint" style="display:none;">
+        Юзернейм: 3–24, латиница, цифры, _ и -. Используется для @упоминаний.
+      </div>
     </div>
   </div>
 </div>
-
-<button id="support-fab" style="display:none;">
-  <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/></svg>
-  Поддержка
-</button>
 
 <div id="app">
   <aside class="sidebar">
     <div class="sidebar-header">
       <div class="me" id="me-block" title="Профиль">
-        <div style="min-width:0;">
-          <div id="me-name">…</div>
-          <div id="me-user"></div>
-        </div>
+        <div id="me-name">…</div>
+        <div id="me-user"></div>
       </div>
       <div style="display:flex;gap:2px;">
-        <button class="icon-btn" id="theme-btn" title="Тема"><svg id="theme-icon" viewBox="0 0 24 24" width="20" height="20"></svg></button>
-        <button class="icon-btn" id="logout-btn" title="Выйти"><svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button>
+        <button class="icon-btn" id="theme-btn" title="Тема"><svg id="theme-icon" viewBox="0 0 24 24" width="18" height="18"></svg></button>
+        <button class="icon-btn" id="logout-btn" title="Выйти"><svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button>
       </div>
     </div>
     <div class="search-wrap">
-      <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <svg class="search-icon" viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
       <input id="search" placeholder="Поиск каналов">
     </div>
     <div class="channel-list" id="channel-list"></div>
     <div class="new-channel" id="new-channel-wrap">
       <input id="new-channel-name" placeholder="Новый канал" maxlength="32">
-      <button id="new-channel-btn" title="Создать"><svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></button>
+      <button id="new-channel-btn" title="Создать"><svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></button>
     </div>
   </aside>
 
   <main class="chat" id="chat">
     <div class="chat-header">
-      <button class="icon-btn" id="back-btn"><svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+      <button class="icon-btn" id="back-btn"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
       <div class="chat-title">
-        <span id="chat-name">Выбери канал</span>
+        <span id="chat-name">Выберите канал</span>
         <span class="chat-users" id="chat-users"></span>
       </div>
       <button class="icon-btn" id="members-btn" title="Участники">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M16 11c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 3-1.34 3-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+        <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M16 11c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 3-1.34 3-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
       </button>
     </div>
     <div class="messages-wrap">
-      <div class="messages" id="messages"><div class="empty">Выбери канал слева</div></div>
+      <div class="messages" id="messages"><div class="empty">Выберите канал слева</div></div>
       <aside class="members-panel" id="members-panel">
-        <div class="members-head">Участники <b id="members-count">0</b></div>
+        <div class="members-head"><span>Онлайн</span><b id="members-count">0</b></div>
         <div class="members-list" id="members-list"></div>
       </aside>
     </div>
     <div class="composer">
       <div class="mention-menu" id="mention-menu"></div>
-      <textarea id="msg-input" placeholder="Написать сообщение..." rows="1" enterkeyhint="send"></textarea>
+      <textarea id="msg-input" placeholder="Сообщение..." rows="1" enterkeyhint="send"></textarea>
       <button class="send-btn" id="send-btn" aria-label="Отправить">
-        <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
       </button>
     </div>
   </main>
 </div>
 
-<!-- MODALS -->
+<div class="ctx-menu" id="ctx-menu">
+  <div class="ctx-item" data-act="edit">
+    <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+    Редактировать
+  </div>
+  <div class="ctx-item danger" data-act="del">
+    <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+    Удалить
+  </div>
+</div>
+
 <div class="modal-backdrop" id="profile-modal">
   <div class="modal">
-    <h3>Редактировать профиль</h3>
+    <h3>Профиль</h3>
     <div class="modal-err" id="profile-err"></div>
     <label>Отображаемое имя</label>
     <input id="profile-display" type="text" maxlength="32">
@@ -1291,63 +1160,35 @@ svg{display:block;}
 <div class="modal-backdrop" id="session-modal">
   <div class="modal">
     <h3 id="session-title">Сессия истекла</h3>
-    <p style="color:var(--muted);font-size:13px;margin-bottom:16px;" id="session-text">
-      Вы были отключены. Войдите заново.
-    </p>
-    <div class="row">
-      <button class="btn2 primary" id="session-ok">Понятно</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-backdrop" id="support-modal">
-  <div class="modal">
-    <h3>Поддержка</h3>
-    <div class="modal-err" id="support-err"></div>
-    <div id="support-start-form">
-      <label>Как к вам обращаться?</label>
-      <input id="support-name" type="text" maxlength="40" placeholder="Ваше имя">
-      <label>Email для связи</label>
-      <input id="support-email" type="email" maxlength="200" placeholder="you@example.com">
-      <div class="row">
-        <button class="btn2" id="support-cancel">Отмена</button>
-        <button class="btn2 primary" id="support-start">Начать чат</button>
-      </div>
-    </div>
-    <div id="support-chat-view" class="support-chat-box" style="display:none;">
-      <div class="support-msgs" id="support-msgs"></div>
-      <div class="sp-row">
-        <input id="support-input" type="text" placeholder="Сообщение..." maxlength="2000">
-        <button class="btn2 primary sp-send" id="support-send">Отправить</button>
-      </div>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn2" id="support-close-chat">Свернуть</button>
-      </div>
-    </div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:16px;" id="session-text">Войдите заново.</p>
+    <div class="row"><button class="btn2 primary" id="session-ok">Ок</button></div>
   </div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
-const LS_TOKEN='sld_token', LS_THEME='sld_theme', LS_SUPPORT='sld_support';
+const LS_TOKEN='sld_token', LS_THEME='sld_theme';
 const state = {
   token: localStorage.getItem(LS_TOKEN) || null,
   username: null, display_name: null,
   channels: [], currentChannel: null,
-  ws: null, wsReady: false, reconnectTimer: null, pingTimer: null,
-  profiles: {}, allowChannelCreation: true, totalOnline: 0,
-  onlineUsernames: new Set(),
-  supportWs: null, supportSid: null, supportKey: null, supportPingTimer: null,
+  ws: null, wsReady: false,
+  reconnectTimer: null, pingTimer: null,
+  profiles: {}, allowChannelCreation: true,
+  totalOnline: 0, onlineUsers: [],
+  _openInFlight: null, _lastOpenChannel: null, _lastOpenAt: 0,
 };
 let authMode = 'login';
 
-document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('contextmenu', e => {
+  if (!e.target.closest('.msg.mine') && !e.target.closest('.ctx-menu')) e.preventDefault();
+});
 
 /* THEME */
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   const ic = $('theme-icon');
-  if (t === 'dark') ic.innerHTML='<path fill="currentColor" d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"/>';
+  if (t === 'dark') ic.innerHTML='<path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>';
   else ic.innerHTML='<path fill="currentColor" d="M20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69zM12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z"/>';
 }
 applyTheme(localStorage.getItem(LS_THEME) || 'light');
@@ -1360,7 +1201,9 @@ $('theme-btn').addEventListener('click', () => {
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   if (state.token) h['X-Auth-Token'] = state.token;
-  if (opts.body && typeof opts.body !== 'string') { h['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
+  if (opts.body && typeof opts.body !== 'string') {
+    h['Content-Type'] = 'application/json'; opts.body = JSON.stringify(opts.body);
+  }
   const r = await fetch(path, Object.assign({}, opts, { headers: h }));
   if (!r.ok) {
     let d = r.statusText;
@@ -1413,7 +1256,7 @@ async function doAuth(){
   const u = $('auth-user').value.trim();
   const p = $('auth-pass').value;
   const e = $('auth-error'); e.textContent = '';
-  if (!u || !p) { e.textContent = 'Заполни все поля'; return; }
+  if (!u || !p) { e.textContent = 'Заполните поля'; return; }
   $('auth-submit').disabled = true;
   try {
     let data;
@@ -1437,13 +1280,11 @@ async function doAuth(){
 function hardLogout(){
   if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch(e){} state.ws = null; }
   if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
-  if (state.supportWs) { try { state.supportWs.close(); } catch(e){} state.supportWs = null; }
   state.token = null; state.username = null; state.display_name = null;
   state.currentChannel = null; state.channels = [];
   localStorage.removeItem(LS_TOKEN);
   $('app').classList.remove('visible','chat-open');
   $('auth-screen').classList.add('visible');
-  $('support-fab').style.display = 'flex';
   $('auth-pass').value = ''; $('reg-pass2').value = ''; $('reg-display').value = '';
   setAuthMode('login');
 }
@@ -1466,7 +1307,6 @@ function showAuth(){
   $('boot').style.display = 'none';
   $('auth-screen').classList.add('visible');
   $('app').classList.remove('visible');
-  $('support-fab').style.display = 'flex';
   setAuthMode('login');
 }
 function paintMe(){
@@ -1481,7 +1321,6 @@ async function enterApp(){
   await loadChannels();
   $('boot').style.display = 'none';
   $('auth-screen').classList.remove('visible');
-  $('support-fab').style.display = 'none';
   $('app').classList.add('visible');
   connectWs();
 }
@@ -1514,17 +1353,21 @@ async function loadChannels(){
     if (state.currentChannel && !state.channels.some(c=>c.id===state.currentChannel)) {
       state.currentChannel = null;
       $('app').classList.remove('chat-open');
-      $('chat-name').textContent = 'Выбери канал';
+      $('chat-name').textContent = 'Выберите канал';
       renderMessages([]);
-      renderMembers([]);
     }
     renderChannels();
     updateHeader();
   } catch(e){}
 }
 function updateHeader(){
-  $('chat-users').textContent = state.currentChannel
-    ? (state.totalOnline + ' онлайн на сервере') : '';
+  if (state.currentChannel) {
+    $('chat-users').textContent = state.totalOnline + ' онлайн';
+  } else {
+    $('chat-users').textContent = '';
+  }
+  $('members-count').textContent = state.onlineUsers.length || state.totalOnline || 0;
+  renderMembers();
 }
 function renderChannels(){
   const list = $('channel-list');
@@ -1540,7 +1383,10 @@ function renderChannels(){
     el.innerHTML =
       `<div class="channel-hash">#</div>
        <div class="channel-body">
-         <div class="channel-name">${escapeHtml(c.name)}</div>
+         <div class="channel-row1">
+           <div class="channel-name">${escapeHtml(c.name)}</div>
+           <div class="channel-meta">${c.online||0}</div>
+         </div>
          ${last}
        </div>`;
     el.addEventListener('click', () => openChannel(c.id));
@@ -1549,6 +1395,12 @@ function renderChannels(){
 }
 
 function openChannel(id){
+  const now = Date.now();
+  if (state._openInFlight === id) return;
+  if (id === state._lastOpenChannel && now - state._lastOpenAt < 600) return;
+  state._lastOpenChannel = id; state._lastOpenAt = now;
+  state._openInFlight = id;
+
   state.currentChannel = id;
   $('app').classList.add('chat-open');
   renderChannels();
@@ -1556,9 +1408,12 @@ function openChannel(id){
   $('chat-name').textContent = ch ? '# '+ch.name : '# '+id;
   updateHeader();
   renderMessages([]);
-  renderMembers([]);
+
   if (state.ws && state.wsReady) {
     state.ws.send(JSON.stringify({type:'join', channel:id}));
+    state._openInFlight = null;
+  } else {
+    state._openInFlight = null;
   }
 }
 
@@ -1567,7 +1422,7 @@ function renderMessages(msgs){
   const box = $('messages');
   box.innerHTML = '';
   if (!msgs || !msgs.length) {
-    box.innerHTML = '<div class="empty">Пока нет сообщений.<br>Напиши первым</div>';
+    box.innerHTML = '<div class="empty">Здесь пока нет сообщений</div>';
     return;
   }
   let prevUser = null;
@@ -1587,41 +1442,60 @@ function appendMessage(m, opts = {}){
   const same = opts.prevUser === m.user;
   const prof = userProfile(m.user);
   const div = document.createElement('div');
-  div.className = 'msg ' + (out ? 'out' : 'in') + (same ? ' same-user' : '');
+  div.className = 'msg ' + (out ? 'out' : 'in') + (same ? ' same-user' : '') + (out ? ' mine' : '');
   div.dataset.user = m.user; div.dataset.id = m.id;
   const nameHtml = out ? '' : `<div class="name">${escapeHtml(prof.display_name||prof.username)}</div>`;
   const edited = m.edited ? ' <span class="edited">(изм.)</span>' : '';
   const textHtml = renderTextWithMentions(m.text, state.username);
-  const tools = out
-    ? `<div class="msg-tools">
-         <button class="msg-tool" data-tool="edit" title="Редактировать">
-           <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
-         </button>
-         <button class="msg-tool" data-tool="del" title="Удалить">
-           <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
-         </button>
-       </div>` : '';
   div.innerHTML =
     `<div class="bubble">${nameHtml}
        <div class="text">${textHtml}${edited}</div>
        <div class="time">${hhmm(m.ts)}</div>
-     </div>${tools}`;
+     </div>`;
+  if (out) {
+    div.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      openCtxMenu(e.clientX, e.clientY, m.id, m.text);
+    });
+  }
   box.appendChild(div);
   if (!opts.skipScroll) box.scrollTop = box.scrollHeight;
-
-  div.querySelectorAll('.msg-tool').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const tool = btn.dataset.tool;
-      if (tool === 'edit') openEditMsg(m.id, m.text);
-      else if (tool === 'del') {
-        if (confirm('Удалить это сообщение?')) {
-          state.ws.send(JSON.stringify({type:'delete_message', id:m.id}));
-        }
-      }
-    });
-  });
 }
+
+/* CONTEXT MENU */
+let ctxTarget = {id:null, text:null};
+function openCtxMenu(x, y, id, text){
+  ctxTarget = {id, text};
+  const menu = $('ctx-menu');
+  menu.classList.add('visible');
+  // Позиционируем с учётом размеров окна
+  const mw = menu.offsetWidth || 160;
+  const mh = menu.offsetHeight || 80;
+  let px = x, py = y;
+  if (px + mw > window.innerWidth - 8) px = window.innerWidth - mw - 8;
+  if (py + mh > window.innerHeight - 8) py = window.innerHeight - mh - 8;
+  menu.style.left = px + 'px';
+  menu.style.top = py + 'px';
+}
+function closeCtxMenu(){ $('ctx-menu').classList.remove('visible'); }
+document.addEventListener('click', e => { if (!e.target.closest('.ctx-menu')) closeCtxMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCtxMenu(); });
+window.addEventListener('blur', closeCtxMenu);
+document.addEventListener('scroll', closeCtxMenu, true);
+
+document.querySelectorAll('#ctx-menu .ctx-item').forEach(it => {
+  it.addEventListener('click', () => {
+    const act = it.dataset.act;
+    const {id, text} = ctxTarget;
+    closeCtxMenu();
+    if (act === 'edit') openEditMsg(id, text);
+    else if (act === 'del') {
+      if (confirm('Удалить это сообщение?')) {
+        state.ws.send(JSON.stringify({type:'delete_message', id}));
+      }
+    }
+  });
+});
 
 /* EDIT MSG */
 let editMsgId = null;
@@ -1640,7 +1514,7 @@ $('edit-msg-save').addEventListener('click', () => {
   $('edit-msg-modal').classList.remove('visible');
 });
 
-/* MEMBERS */
+/* MEMBERS — весь сервер */
 const MEMBERS_LS = 'sld_members_visible';
 if (localStorage.getItem(MEMBERS_LS) === '1') $('members-panel').classList.add('visible');
 $('members-btn').addEventListener('click', () => {
@@ -1648,22 +1522,23 @@ $('members-btn').addEventListener('click', () => {
   p.classList.toggle('visible');
   localStorage.setItem(MEMBERS_LS, p.classList.contains('visible')?'1':'0');
 });
-function renderMembers(members){
-  $('members-count').textContent = members.length;
-  const l = $('members-list');
-  if (!members.length) {
-    l.innerHTML = '<div style="padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;">Пока никого</div>';
+function renderMembers(){
+  const list = $('members-list');
+  const users = state.onlineUsers || [];
+  $('members-count').textContent = users.length;
+  if (!users.length) {
+    list.innerHTML = '<div style="padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;">Пусто</div>';
     return;
   }
-  l.innerHTML = '';
-  for (const m of members) {
+  list.innerHTML = '';
+  for (const m of users) {
     const el = document.createElement('div');
     el.className = 'member-item';
     const self = m.username === state.username;
     el.innerHTML = `<div class="dot"></div><div class="member-name${self?' self':''}">${
       escapeHtml(m.display_name||m.username)}</div>`;
     el.title = '@' + m.username;
-    l.appendChild(el);
+    list.appendChild(el);
   }
 }
 
@@ -1678,9 +1553,7 @@ function connectWs(){
 
   ws.onopen = () => {
     state.wsReady = true;
-    if (state.currentChannel) {
-      ws.send(JSON.stringify({type:'join', channel: state.currentChannel}));
-    }
+    if (state.currentChannel) ws.send(JSON.stringify({type:'join', channel: state.currentChannel}));
     state.pingTimer = setInterval(() => {
       try { ws.send(JSON.stringify({type:'ping'})); } catch(e){}
     }, 25000);
@@ -1705,18 +1578,20 @@ function connectWs(){
 function handleWsEvent(d){
   if (d.type === 'presence') {
     state.totalOnline = d.total || 0;
-    state.onlineUsernames = new Set(d.online_usernames || []);
-    for (const c of state.channels) c.online = (d.channels||{})[c.id] || 0;
+    state.onlineUsers = d.users || [];
+    for (const c of state.channels) {
+      if (c.id === state.currentChannel) {
+        // не пересчитываем здесь — считает сервер
+      }
+    }
     updateHeader();
     renderChannels();
-    if (state.currentChannel) refreshMembers();
   } else if (d.type === 'channel_joined') {
     if (d.channel !== state.currentChannel) return;
     if (d.profiles) Object.values(d.profiles).forEach(p => {
       state.profiles[(p.username||'').toLowerCase()] = p;
     });
     renderMessages(d.messages||[]);
-    renderMembers(d.members||[]);
   } else if (d.type === 'message') {
     const m = d.message;
     const ch = state.channels.find(c=>c.id===m.channel);
@@ -1746,8 +1621,8 @@ function handleWsEvent(d){
     if (d.channel === state.currentChannel) {
       state.currentChannel = null;
       $('app').classList.remove('chat-open');
-      $('chat-name').textContent = 'Выбери канал';
-      renderMessages([]); renderMembers([]);
+      $('chat-name').textContent = 'Выберите канал';
+      renderMessages([]);
     }
     loadChannels();
   } else if (d.type === 'profile_updated') {
@@ -1755,10 +1630,9 @@ function handleWsEvent(d){
     if (d.username === state.username) { state.display_name = d.display_name; paintMe(); }
     document.querySelectorAll(`.msg[data-user="${CSS.escape(d.username)}"] .name`)
       .forEach(el => { el.textContent = d.display_name; });
-    if (state.currentChannel) refreshMembers();
   } else if (d.type === 'user_deleted') {
     if (d.username === state.username) {
-      sessionModal('Аккаунт удалён', 'Ваш аккаунт был удалён администратором.');
+      sessionModal('Аккаунт удалён', 'Ваш аккаунт был удалён.');
       return;
     }
     document.querySelectorAll(`.msg[data-user="${CSS.escape(d.username)}"]`).forEach(el => el.remove());
@@ -1767,26 +1641,9 @@ function handleWsEvent(d){
   } else if (d.type === 'channel_not_found') {
     state.currentChannel = null;
     $('app').classList.remove('chat-open');
-    $('chat-name').textContent = 'Выбери канал';
-    renderMessages([]); renderMembers([]);
+    $('chat-name').textContent = 'Выберите канал';
+    renderMessages([]);
   }
-}
-
-async function refreshMembers(){
-  if (!state.currentChannel) return;
-  const ch = state.channels.find(c=>c.id===state.currentChannel);
-  if (!ch) return;
-  // Используем online_usernames + фильтр? Нет, отдельный запрос.
-  // Просто перезапросим заново через join событие.
-  // На самом деле можно локально: получаем из presence для канала нельзя — там только counts.
-  // Поэтому запросим через отдельный REST.
-  try {
-    // простой способ — включить в presence список users для каждого канала.
-    // У нас только online_usernames общий. Используем его как приближение:
-    // отфильтровать по state.currentChannel невозможно без доп данных.
-    // Оставим только тех, кто реально в канале — их нам пришлёт 'channel_joined'.
-    // На presence просто обновляем online-число.
-  } catch(e){}
 }
 
 /* MENTIONS */
@@ -1826,7 +1683,7 @@ function insertMention(nick){
 }
 $('msg-input').addEventListener('input', e => {
   e.target.style.height = 'auto';
-  e.target.style.height = Math.min(e.target.scrollHeight, 130) + 'px';
+  e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   const q = currentMQ();
   if (q !== null) showMQ(q); else hideMQ();
 });
@@ -1850,118 +1707,25 @@ $('search').addEventListener('input', renderChannels);
 $('new-channel-btn').addEventListener('click', async () => {
   const name = $('new-channel-name').value.trim();
   if (!name) return;
+  $('new-channel-btn').disabled = true;
   try {
     await api('/api/channels', { method:'POST', body:{name} });
     $('new-channel-name').value = '';
     await loadChannels();
   } catch(e){ alert(e.message); }
+  finally { $('new-channel-btn').disabled = false; }
 });
 $('new-channel-name').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('new-channel-btn').click();
 });
-
-/* SUPPORT */
-function openSupportModal(){
-  $('support-modal').classList.add('visible');
-  const saved = localStorage.getItem(LS_SUPPORT);
-  if (saved) {
-    try {
-      const s = JSON.parse(saved);
-      state.supportSid = s.sid; state.supportKey = s.key;
-      showSupportChat();
-      return;
-    } catch(e){}
-  }
-  $('support-start-form').style.display = '';
-  $('support-chat-view').style.display = 'none';
-}
-function closeSupportModal(){ $('support-modal').classList.remove('visible'); }
-
-$('support-fab').addEventListener('click', openSupportModal);
-$('support-cancel').addEventListener('click', closeSupportModal);
-$('support-close-chat').addEventListener('click', closeSupportModal);
-
-$('support-start').addEventListener('click', async () => {
-  const name = $('support-name').value.trim();
-  const email = $('support-email').value.trim();
-  const e = $('support-err'); e.textContent = '';
-  if (!name || !email) { e.textContent = 'Заполните оба поля'; return; }
-  try {
-    const r = await api('/api/support/start', { method:'POST', body:{name, email} });
-    state.supportSid = r.sid; state.supportKey = r.key;
-    localStorage.setItem(LS_SUPPORT, JSON.stringify({sid:r.sid, key:r.key}));
-    showSupportChat();
-  } catch(err){ e.textContent = err.message; }
-});
-
-async function showSupportChat(){
-  $('support-start-form').style.display = 'none';
-  $('support-chat-view').style.display = 'flex';
-  try {
-    const s = await api(`/api/support/session?sid=${encodeURIComponent(state.supportSid)}&key=${encodeURIComponent(state.supportKey)}`);
-    renderSupportMsgs(s.messages || []);
-  } catch(e){
-    localStorage.removeItem(LS_SUPPORT);
-    state.supportSid = state.supportKey = null;
-    $('support-start-form').style.display = '';
-    $('support-chat-view').style.display = 'none';
-    return;
-  }
-  connectSupportWs();
-}
-function renderSupportMsgs(msgs){
-  const box = $('support-msgs');
-  box.innerHTML = '';
-  for (const m of msgs) {
-    const el = document.createElement('div');
-    el.className = 'sp-msg ' + (m.from === 'user' ? 'user' : m.from === 'admin' ? 'admin' : 'sys');
-    el.textContent = m.text;
-    box.appendChild(el);
-  }
-  box.scrollTop = box.scrollHeight;
-}
-function connectSupportWs(){
-  if (state.supportWs) { try { state.supportWs.close(); } catch(e){} state.supportWs = null; }
-  if (state.supportPingTimer) { clearInterval(state.supportPingTimer); state.supportPingTimer = null; }
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws/support?sid=${encodeURIComponent(state.supportSid)}&key=${encodeURIComponent(state.supportKey)}`;
-  const ws = new WebSocket(url);
-  state.supportWs = ws;
-  ws.onopen = () => {
-    state.supportPingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){} }, 25000);
-  };
-  ws.onmessage = (ev) => {
-    let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
-    if (d.type === 'support_init') {
-      renderSupportMsgs((d.session.messages)||[]);
-    } else if (d.type === 'support_message') {
-      const box = $('support-msgs');
-      const el = document.createElement('div');
-      el.className = 'sp-msg ' + (d.message.from === 'user' ? 'user' : d.message.from === 'admin' ? 'admin' : 'sys');
-      el.textContent = d.message.text;
-      box.appendChild(el);
-      box.scrollTop = box.scrollHeight;
-    }
-  };
-  ws.onclose = () => {
-    if (state.supportPingTimer) { clearInterval(state.supportPingTimer); state.supportPingTimer = null; }
-    setTimeout(() => { if (state.supportWs === ws && state.supportSid) connectSupportWs(); }, 2000);
-  };
-}
-$('support-send').addEventListener('click', () => {
-  const inp = $('support-input');
-  const text = inp.value.trim();
-  if (!text || !state.supportWs || state.supportWs.readyState !== 1) return;
-  state.supportWs.send(JSON.stringify({type:'message', text}));
-  inp.value = '';
-});
-$('support-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('support-send').click(); });
 
 boot();
 </script>
 </body>
 </html>
 """
+
+HTML_PAGE = HTML_PAGE.replace("{{APP_NAME}}", APP_NAME)
 
 
 # ============================================================
@@ -1972,21 +1736,24 @@ ADMIN_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=960">
-<title>sldchat · admin</title>
+<title>{{APP_NAME}} · admin</title>
 <style>
 :root{
-  --bg:#f4f5f7;--panel:#fff;--panel2:#f2f5f8;--border:#d9dce1;--border2:#ebedf0;
+  --bg:#f4f5f7;--panel:#fff;--panel2:#f5f6f8;--border:#d9dce1;--border2:#ebedf0;
   --text:#1a1a1a;--muted:#5c6670;--accent:#0066cc;--accent-h:#0055ad;
-  --green:#3db83d;--red:#cc0000;--topbg:#22272e;--topfg:#eaecef;--side:#f4f5f7;--side-h:#e6e8eb;--side-a:#dde1e5;
+  --green:#3db83d;--red:#cc0000;--topbg:#22272e;--topfg:#eaecef;
+  --side:#f4f5f7;--side-h:#e6e8eb;--side-a:#dde1e5;
 }
 html[data-theme=dark]{
   --bg:#161a1f;--panel:#1c2229;--panel2:#232a32;--border:#2e3641;--border2:#262d36;
   --text:#e0e6ed;--muted:#8b96a2;--accent:#3b82f6;--accent-h:#2563eb;
-  --green:#22c55e;--red:#ef4444;--topbg:#0e1216;--topfg:#e0e6ed;--side:#181d23;--side-h:#232a32;--side-a:#2a323b;
+  --green:#22c55e;--red:#ef4444;--topbg:#0e1216;--topfg:#e0e6ed;
+  --side:#181d23;--side-h:#232a32;--side-a:#2a323b;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{height:100%;}
-body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:13px;color:var(--text);background:var(--bg);min-width:760px;}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:13px;
+  color:var(--text);background:var(--bg);min-width:760px;}
 button{font-family:inherit;font-size:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 input,select,textarea{font-family:inherit;}
 svg{display:block;}
@@ -1995,7 +1762,7 @@ a:hover{text-decoration:underline;}
 
 #login-view{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;background:var(--bg);}
 .login-card{width:340px;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:26px 24px;}
-.login-logo{font-size:22px;text-align:center;color:var(--text);}
+.login-logo{font-size:22px;text-align:center;color:var(--text);font-weight:600;}
 .login-sub{font-size:11px;color:var(--muted);text-align:center;margin-top:4px;text-transform:uppercase;letter-spacing:1.4px;}
 .login-fields{margin-top:22px;}
 .login-fields label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
@@ -2026,19 +1793,16 @@ nav a{display:flex;align-items:center;gap:9px;padding:8px 16px;color:var(--text)
 nav a:hover{background:var(--side-h);text-decoration:none;}
 nav a.active{background:var(--side-a);border-left-color:var(--accent);color:var(--accent);font-weight:500;}
 nav a svg{width:15px;height:15px;flex-shrink:0;}
-nav .badge{margin-left:auto;font-size:10px;padding:1px 6px;border-radius:8px;background:var(--accent);color:#fff;font-weight:600;}
-nav .badge.hide{display:none;}
 
 .content{flex:1;padding:18px 22px;background:var(--panel);min-width:0;overflow-x:hidden;}
-.page-title{font-size:19px;font-weight:400;margin:0 0 4px;}
+.page-title{font-size:19px;font-weight:500;margin:0 0 4px;}
 .page-sub{color:var(--muted);font-size:12.5px;margin-bottom:16px;}
 
 .card{background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:16px 18px;margin-bottom:14px;}
 .card h3{font-size:14.5px;font-weight:500;margin:0 0 12px;}
 .grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;}
-.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;}
 .grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;}
-.kv{display:grid;grid-template-columns:130px 1fr;gap:6px 14px;font-size:13px;}
+.kv{display:grid;grid-template-columns:140px 1fr;gap:6px 14px;font-size:13px;}
 .kv .k{color:var(--muted);}
 .metric{font-size:24px;font-weight:400;line-height:1;color:var(--text);}
 .metric-label{font-size:12px;color:var(--muted);margin-top:6px;}
@@ -2050,9 +1814,9 @@ nav .badge.hide{display:none;}
 .usage-bar>span{display:block;height:100%;background:var(--accent);border-radius:4px;}
 .usage-row .val{min-width:90px;text-align:right;color:var(--muted);font-size:12px;}
 
-table{width:100%;border-collapse:collapse;font-size:13px;}
+table{width:100%;border-collapse:collapse;font-size:13px;table-layout:auto;}
 th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:500;font-size:12px;background:var(--side);border-bottom:1px solid var(--border);white-space:nowrap;}
-td{padding:8px 10px;border-bottom:1px solid var(--border2);vertical-align:middle;}
+td{padding:8px 10px;border-bottom:1px solid var(--border2);vertical-align:top;word-break:break-word;}
 tbody tr:hover td{background:var(--side);}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;}
 .muted{color:var(--muted);}
@@ -2064,8 +1828,6 @@ tbody tr:hover td{background:var(--side);}
 html[data-theme=dark] .chip.blue{background:#1e3a5f;color:#90c2f0;border-color:#2c527f;}
 .chip.green{background:#e6f5e6;color:#1a6b1a;border-color:#b8deb8;}
 html[data-theme=dark] .chip.green{background:#16351a;color:#8adf8a;border-color:#2c6b2c;}
-.chip.red{background:#fdeaea;color:#8a1a1a;border-color:#efb8b8;}
-html[data-theme=dark] .chip.red{background:#3a1a1a;color:#f0a0a0;border-color:#7f2828;}
 
 .btn{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:12px;}
 .btn:hover{background:var(--side);}
@@ -2104,33 +1866,6 @@ html[data-theme=dark] .btn.danger:hover{background:#3a1a1a;}
 .toast{padding:10px 14px;border-radius:3px;background:var(--topbg);color:var(--topfg);font-size:12.5px;border-left:3px solid var(--green);box-shadow:0 4px 12px rgba(0,0,0,.15);}
 .toast.err{border-left-color:var(--red);}
 
-/* support */
-.support-layout{display:grid;grid-template-columns:280px 1fr;gap:14px;height:calc(100vh - 130px);min-height:400px;}
-.support-list{background:var(--panel);border:1px solid var(--border);border-radius:3px;overflow:hidden;display:flex;flex-direction:column;}
-.support-list-head{padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;font-weight:500;}
-.support-items{overflow-y:auto;flex:1;}
-.support-item{padding:10px 12px;border-bottom:1px solid var(--border2);cursor:pointer;}
-.support-item:hover{background:var(--side);}
-.support-item.active{background:var(--side-a);}
-.support-item .sname{font-weight:500;font-size:13px;display:flex;justify-content:space-between;}
-.support-item .semail{font-size:11.5px;color:var(--muted);margin-top:2px;}
-.support-item .spreview{font-size:11.5px;color:var(--muted);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.support-item .sbadge{background:var(--accent);color:#fff;font-size:10px;padding:1px 6px;border-radius:8px;font-weight:600;}
-.support-item.ended .sname{color:var(--muted);text-decoration:line-through;}
-.support-chat{background:var(--panel);border:1px solid var(--border);border-radius:3px;display:flex;flex-direction:column;overflow:hidden;}
-.support-chat-head{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:10px;}
-.support-chat-head .info{font-size:12px;color:var(--muted);}
-.support-chat-head .info b{color:var(--text);font-weight:500;font-size:13px;display:block;margin-bottom:2px;}
-.support-chat-body{flex:1;overflow-y:auto;padding:14px;}
-.support-chat-msgs{display:flex;flex-direction:column;gap:8px;}
-.sm{padding:7px 11px;border-radius:10px;max-width:70%;font-size:13px;line-height:1.4;word-wrap:break-word;white-space:pre-wrap;}
-.sm.user{align-self:flex-start;background:var(--side);}
-.sm.admin{align-self:flex-end;background:var(--accent);color:#fff;}
-.sm.sys{align-self:center;color:var(--muted);font-size:11.5px;background:none;padding:0;}
-.support-chat-foot{border-top:1px solid var(--border);padding:10px 12px;display:flex;gap:8px;}
-.support-chat-foot input{flex:1;padding:8px 11px;border:1px solid var(--border);border-radius:3px;font-size:13px;outline:none;background:var(--panel);color:var(--text);}
-.support-chat-foot input:focus{border-color:var(--accent);}
-
 .hidden{display:none !important;}
 ::-webkit-scrollbar{width:9px;height:9px;}
 ::-webkit-scrollbar-track{background:var(--side);}
@@ -2142,7 +1877,7 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
 
 <div id="login-view">
   <div class="login-card">
-    <div class="login-logo">sldchat</div>
+    <div class="login-logo">{{APP_NAME}}</div>
     <div class="login-sub">admin panel</div>
     <div class="login-fields">
       <label>Пароль администратора</label>
@@ -2156,15 +1891,13 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
 <div id="panel-view">
   <header class="topbar">
     <div class="crumb">
-      <span>admin@sldchat</span>
+      <span>admin@{{APP_NAME}}</span>
       <span class="sep">·</span>
       <span id="crumb-section">Обзор</span>
       <span class="tag">admin</span>
     </div>
     <div class="actions">
-      <button class="btn-t" id="theme-btn" title="Тема">
-        <svg id="theme-icon" viewBox="0 0 24 24" width="14" height="14"></svg>
-      </button>
+      <button class="btn-t" id="theme-btn" title="Тема"><svg id="theme-icon" viewBox="0 0 24 24" width="14" height="14"></svg></button>
       <button class="btn-t" id="refresh-btn">
         <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
         Обновить
@@ -2177,9 +1910,7 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
   </header>
   <div class="layout">
     <aside class="sidebar">
-      <div class="side-search">
-        <input id="side-search" placeholder="Поиск">
-      </div>
+      <div class="side-search"><input id="side-search" placeholder="Поиск"></div>
       <nav id="side-nav">
         <a data-tab="dashboard" class="active">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
@@ -2196,11 +1927,6 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
         <a data-tab="messages">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"/></svg>
           Сообщения
-        </a>
-        <a data-tab="support">
-          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z"/></svg>
-          Поддержка
-          <span class="badge hide" id="support-badge">0</span>
         </a>
       </nav>
     </aside>
@@ -2242,15 +1968,14 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
 const $ = id => document.getElementById(id);
 const LS_THEME = 'sld_admin_theme';
 const state = { tab:'dashboard', subId:null, currentUser:null, currentMsg:null,
-                supportList:[], currentSupportSid:null, supportWs:null, supportPingTimer:null,
-                lastSupportCount:0 };
+                _isRendering:false, _lastRender:0 };
 
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtTs(ts){if(!ts)return '—';const d=new Date(ts*1000);const p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;}
 function fmtRel(ts){
   if(!ts) return '—';
   const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
-  if (s < 10) return 'только что';
+  if (s < 15) return 'только что';
   if (s < 60) return s + ' с назад';
   if (s < 3600) return Math.floor(s/60) + ' мин назад';
   if (s < 86400) return Math.floor(s/3600) + ' ч назад';
@@ -2268,7 +1993,7 @@ function toast(msg, kind='ok'){
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   const ic = $('theme-icon');
-  if (t === 'dark') ic.innerHTML='<path fill="currentColor" d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.79 1.42-1.41zM4 10.5H1v2h3v-2zm9-9.95h-2V3.5h2V.55zm7.45 3.91l-1.41-1.41-1.79 1.79 1.41 1.41 1.79-1.79zm-3.21 13.7l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM20 10.5v2h3v-2h-3zm-8-5c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6-2.69-6-6-6zm-1 16.95h2V19.5h-2v2.95zm-7.45-3.91l1.41 1.41 1.79-1.8-1.41-1.41-1.79 1.8z"/>';
+  if (t === 'dark') ic.innerHTML='<path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>';
   else ic.innerHTML='<path fill="currentColor" d="M20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69zM12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6 6 2.69 6 6-2.69 6-6 6z"/>';
 }
 applyTheme(localStorage.getItem(LS_THEME) || 'light');
@@ -2294,7 +2019,7 @@ async function api(path, opts = {}) {
 /* LOGIN */
 async function trySession(){ try { await api('/api/admin/session'); showPanel(); return true; } catch(e){ return false; } }
 function showLogin(){ $('login-view').style.display=''; $('panel-view').classList.remove('visible'); }
-function showPanel(){ $('login-view').style.display='none'; $('panel-view').classList.add('visible'); connectSupportWs(); renderTab(); }
+function showPanel(){ $('login-view').style.display='none'; $('panel-view').classList.add('visible'); renderTab(); }
 $('login-btn').addEventListener('click', doLogin);
 $('admin-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 async function doLogin(){
@@ -2311,10 +2036,9 @@ async function doLogin(){
 }
 $('logout-btn').addEventListener('click', async () => {
   try { await api('/api/admin/logout', { method:'POST' }); } catch(e){}
-  if (state.supportWs) { try { state.supportWs.close(); } catch(e){} state.supportWs=null; }
   showLogin();
 });
-$('refresh-btn').addEventListener('click', () => renderTab());
+$('refresh-btn').addEventListener('click', () => renderTab({ force: true }));
 
 /* NAV */
 function parseHash(){
@@ -2336,21 +2060,8 @@ window.addEventListener('hashchange', () => renderTab());
 function setActiveTab(tab){
   document.querySelectorAll('#side-nav a').forEach(x =>
     x.classList.toggle('active', x.dataset.tab === tab));
-  const label = { dashboard:'Обзор', users:'Пользователи', channels:'Каналы', messages:'Сообщения', support:'Поддержка' }[tab] || tab;
+  const label = { dashboard:'Обзор', users:'Пользователи', channels:'Каналы', messages:'Сообщения' }[tab] || tab;
   $('crumb-section').textContent = label;
-}
-
-/* SNAPSHOT of inputs (для автообновления) */
-function snapshotInputs(root){
-  const out = {};
-  root.querySelectorAll('input,select,textarea').forEach(el => { if (el.id) out[el.id] = el.value; });
-  return out;
-}
-function restoreInputs(root, s){
-  for (const [id, v] of Object.entries(s||{})) {
-    const el = document.getElementById(id);
-    if (el && el.tagName.match(/INPUT|TEXTAREA|SELECT/)) el.value = v;
-  }
 }
 
 function isTyping(){
@@ -2359,55 +2070,60 @@ function isTyping(){
 }
 
 async function renderTab(opts = {}){
+  if (state._isRendering && !opts.force) return;
+  const now = Date.now();
+  if (!opts.force && now - state._lastRender < 500) return;
+  state._lastRender = now;
+  state._isRendering = true;
+
   const { tab, sub } = parseHash();
   state.tab = tab; state.subId = sub;
   setActiveTab(tab);
   const main = $('main');
-  const snap = opts.silent ? snapshotInputs(main) : null;
   try {
-    if (tab === 'dashboard') await renderDashboard(main, opts);
+    if (tab === 'dashboard') await renderDashboard(main);
     else if (tab === 'users') {
-      if (sub) await renderUserDetail(main, sub, opts);
-      else await renderUsers(main, opts);
+      if (sub) await renderUserDetail(main, sub);
+      else await renderUsers(main);
     }
-    else if (tab === 'channels') await renderChannels(main, opts);
-    else if (tab === 'messages') await renderMessages(main, opts);
-    else if (tab === 'support') await renderSupport(main, opts);
+    else if (tab === 'channels') await renderChannels(main);
+    else if (tab === 'messages') await renderMessages(main);
   } catch(e){
     if (e.status === 401) { showLogin(); return; }
     main.innerHTML = `<div class="empty-state">Ошибка: ${escapeHtml(e.message)}</div>`;
   }
-  if (snap) restoreInputs(main, snap);
+  state._isRendering = false;
 }
 
-/* AUTO REFRESH */
-setInterval(async () => {
+/* AUTO REFRESH — раз в 15 сек, не во время печати */
+setInterval(() => {
   if (!$('panel-view').classList.contains('visible')) return;
+  if (state._isRendering) return;
   if (isTyping()) return;
-  await renderTab({ silent: true });
-}, 10000);
+  // Не перерисовываем, если открыта модалка
+  if (document.querySelector('.modal-backdrop.visible')) return;
+  renderTab({ force: true });
+}, 15000);
 
 /* DASHBOARD */
-async function renderDashboard(main, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
+async function renderDashboard(main){
   const s = await api('/api/admin/stats');
   const up = Math.floor(Date.now()/1000 - s.uptime_started);
   const d = Math.floor(up/86400), h = Math.floor((up%86400)/3600),
         m = Math.floor((up%3600)/60), sec = up%60;
   main.innerHTML = `
     <h2 class="page-title">Обзор</h2>
-    <div class="page-sub">Сводка по состоянию сервера sldchat</div>
+    <div class="page-sub">Сводка состояния сервера</div>
     <div class="grid-2">
       <div class="card">
-        <h3>Здоровье</h3>
+        <h3>Состояние</h3>
         <div class="health">
           <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-          <span>Система работает нормально</span>
+          <span>Сервер работает</span>
         </div>
         <div class="kv" style="margin-top:14px;">
-          <div class="k">Сервер</div><div class="v">sldchat · FastAPI</div>
+          <div class="k">Приложение</div><div class="v">{{APP_NAME}} · FastAPI</div>
           <div class="k">Uptime</div><div class="v">${d?d+' дн ':''}${h}ч ${m}м ${sec}с</div>
-          <div class="k">Открытых тикетов</div><div class="v">${s.support_open}</div>
         </div>
       </div>
       <div class="card">
@@ -2432,18 +2148,15 @@ async function renderDashboard(main, opts){
 }
 
 /* USERS */
-async function renderUsers(main, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
+async function renderUsers(main){
   const data = await api('/api/admin/users');
   const rows = data.users.map(u => {
     const status = u.is_online
       ? '<span class="chip green">онлайн</span>'
-      : (u.online_in.length
-          ? u.online_in.map(c=>`<span class="chip green">#${escapeHtml(c)}</span>`).join('')
-          : '<span class="chip">offline</span>');
+      : '<span class="chip">offline</span>';
     const activity = u.is_online ? '<span class="green">сейчас</span>' : fmtRel(u.last_seen);
     return `<tr>
-      <td><a href="#/users/${encodeURIComponent(u.username)}" class="mono accent" data-user="${escapeHtml(u.username)}">${escapeHtml(u.username)}</a></td>
+      <td><a href="#/users/${encodeURIComponent(u.username)}" class="mono accent">${escapeHtml(u.username)}</a></td>
       <td>${escapeHtml(u.display_name)}</td>
       <td class="muted mono">${fmtTs(u.created)}</td>
       <td class="muted">${activity}</td>
@@ -2474,8 +2187,7 @@ async function renderUsers(main, opts){
 }
 
 /* USER DETAIL */
-async function renderUserDetail(main, username, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка профиля…</div>`;
+async function renderUserDetail(main, username){
   const d = await api('/api/admin/users/' + encodeURIComponent(username));
   const days = d.days || [];
   const msgsPerDay = days.map(day => ({ label: day.slice(5), value: d.messages_per_day[day] || 0 }));
@@ -2483,14 +2195,16 @@ async function renderUserDetail(main, username, opts){
   const pie = Object.entries(d.messages_by_channel || {}).sort((a,b)=>b[1]-a[1]);
   const palette = ['#0066cc','#3db83d','#f0ad4e','#d9534f','#9b59b6','#16a085','#e67e22','#34495e'];
   const pieData = pie.map(([ch,n],i) => ({
-    label: '#' + ((window.__chCache||[]).find(c=>c.id===ch)?.name || ch),
+    label: '#' + ch,
     value: n, color: palette[i%palette.length],
   }));
   const status = d.is_online
     ? '<span class="chip green">онлайн сейчас</span>'
-    : (d.online_in.length
-        ? d.online_in.map(c=>`<span class="chip green">#${escapeHtml(c)}</span>`).join('')
-        : '<span class="chip">offline</span>');
+    : '<span class="chip">offline</span>';
+  const activity = d.is_online
+    ? '<span class="green">сейчас</span>'
+    : fmtRel(d.last_seen) + ' <span class="muted">('+fmtTs(d.last_seen)+')</span>';
+
   main.innerHTML = `
     <h2 class="page-title">Профиль: ${escapeHtml(d.display_name)}</h2>
     <div class="page-sub"><a href="#/users">← к списку</a></div>
@@ -2501,8 +2215,7 @@ async function renderUserDetail(main, username, opts){
           <div class="k">Юзернейм</div><div class="v mono">@${escapeHtml(d.username)}</div>
           <div class="k">Имя</div><div class="v">${escapeHtml(d.display_name)}</div>
           <div class="k">Создан</div><div class="v">${fmtTs(d.created)}</div>
-          <div class="k">Последняя активность</div>
-          <div class="v">${d.is_online ? '<span class="green">сейчас</span>' : fmtRel(d.last_seen) + ' <span class="muted">('+fmtTs(d.last_seen)+')</span>'}</div>
+          <div class="k">Последняя активность</div><div class="v">${activity}</div>
           <div class="k">Статус</div><div class="v">${status}</div>
           <div class="k">Сообщений</div><div class="v">${d.total_messages}</div>
           <div class="k">Входов</div><div class="v">${(d.logins||[]).length}</div>
@@ -2529,29 +2242,31 @@ async function renderUserDetail(main, username, opts){
     </div>
     <div class="card"><h3>Сообщения по дням (14 дней)</h3>${barChartSvg(msgsPerDay, 900, 130)}</div>
     <div class="card"><h3>Входы по дням (14 дней)</h3>${barChartSvg(loginsPerDay, 900, 130, '#3db83d')}</div>
-    <div class="grid-2">
-      <div class="card">
-        <h3>История входов</h3>
-        ${(d.logins && d.logins.length) ? `<div style="overflow-x:auto;"><table>
-          <thead><tr><th>Когда</th><th>IP</th><th>UA</th></tr></thead>
-          <tbody>${d.logins.slice(0,20).map(l => `
-            <tr><td class="mono muted" style="white-space:nowrap;">${fmtTs(l.ts)}</td>
-                <td class="mono">${escapeHtml(l.ip||'—')}</td>
-                <td class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(l.ua||'')}">${escapeHtml((l.ua||'—').slice(0,70))}</td>
-            </tr>`).join('')}
-          </tbody></table></div>` : `<div class="muted">Нет записей</div>`}
-      </div>
-      <div class="card">
-        <h3>Последние сообщения</h3>
-        ${(d.recent_messages && d.recent_messages.length) ? `<div style="overflow-x:auto;"><table>
-          <thead><tr><th>Когда</th><th>Канал</th><th>Текст</th></tr></thead>
-          <tbody>${d.recent_messages.slice(0,15).map(m => `
-            <tr><td class="mono muted" style="white-space:nowrap;">${fmtTs(m.ts)}</td>
-                <td><span class="chip blue">#${escapeHtml(m.channel_name)}</span></td>
-                <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(m.text)}">${escapeHtml(m.text)}</td>
-            </tr>`).join('')}
-          </tbody></table></div>` : `<div class="muted">Сообщений нет</div>`}
-      </div>
+    <div class="card">
+      <h3>История входов</h3>
+      ${(d.logins && d.logins.length) ? `<table style="table-layout:fixed;">
+        <colgroup><col style="width:150px;"><col style="width:160px;"><col></colgroup>
+        <thead><tr><th>Когда</th><th>IP</th><th>User-Agent</th></tr></thead>
+        <tbody>${d.logins.slice(0,30).map(l => `
+          <tr>
+            <td class="mono muted">${fmtTs(l.ts)}</td>
+            <td class="mono">${escapeHtml(l.ip||'—')}</td>
+            <td class="muted mono" style="font-size:12px;">${escapeHtml(l.ua||'—')}</td>
+          </tr>`).join('')}
+        </tbody></table>` : `<div class="muted">Нет записей</div>`}
+    </div>
+    <div class="card">
+      <h3>Последние сообщения</h3>
+      ${(d.recent_messages && d.recent_messages.length) ? `<table style="table-layout:fixed;">
+        <colgroup><col style="width:150px;"><col style="width:140px;"><col></colgroup>
+        <thead><tr><th>Когда</th><th>Канал</th><th>Текст</th></tr></thead>
+        <tbody>${d.recent_messages.slice(0,20).map(m => `
+          <tr>
+            <td class="mono muted">${fmtTs(m.ts)}</td>
+            <td><span class="chip blue">#${escapeHtml(m.channel_name)}</span></td>
+            <td>${escapeHtml(m.text)}</td>
+          </tr>`).join('')}
+        </tbody></table>` : `<div class="muted">Сообщений нет</div>`}
     </div>`;
   $('det-edit').addEventListener('click', () => openUserEdit(d.username, d.display_name));
   $('det-del').addEventListener('click', () => deleteUser(d.username));
@@ -2615,25 +2330,23 @@ $('ue-save').addEventListener('click', async () => {
   if (!Object.keys(body).length) { $('user-edit-modal').classList.remove('visible'); return; }
   try {
     await api('/api/admin/users/' + encodeURIComponent(state.currentUser), { method:'PATCH', body });
-    toast('Пользователь обновлён');
+    toast('Сохранено');
     $('user-edit-modal').classList.remove('visible');
-    renderTab();
+    renderTab({ force: true });
   } catch(e){ $('ue-err').textContent = e.message; }
 });
 async function deleteUser(username){
-  if (!confirm(`Удалить пользователя "${username}"?\n\nЭто выкинет его из чата, удалит все его сессии И ВСЕ ЕГО СООБЩЕНИЯ.`)) return;
+  if (!confirm(`Удалить пользователя "${username}"?\n\nВсе его сообщения, сессии и аккаунт будут удалены.`)) return;
   try {
     const r = await api('/api/admin/users/' + encodeURIComponent(username), { method:'DELETE' });
-    toast(`Удалён. Сообщений удалено: ${r.messages_removed}`);
-    renderTab();
+    toast(`Удалён (сообщений: ${r.messages_removed})`);
+    renderTab({ force: true });
   } catch(e){ toast(e.message,'err'); }
 }
 
 /* CHANNELS */
-async function renderChannels(main, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
+async function renderChannels(main){
   const data = await api('/api/admin/channels');
-  window.__chCache = data.channels;
   const rows = data.channels.map(c => `
     <tr>
       <td class="mono">#${escapeHtml(c.id)}</td>
@@ -2649,7 +2362,7 @@ async function renderChannels(main, opts){
     </tr>`).join('');
   main.innerHTML = `
     <h2 class="page-title">Каналы</h2>
-    <div class="page-sub">Изменения видны клиентам мгновенно.</div>
+    <div class="page-sub">Изменения сразу видны клиентам.</div>
     <div class="toolbar">
       <input id="new-ch" placeholder="имя нового канала" maxlength="32">
       <button class="btn primary" id="new-ch-btn">Создать</button>
@@ -2668,25 +2381,23 @@ async function renderChannels(main, opts){
 async function createChannel(){
   const name = $('new-ch').value.trim();
   if (!name) return;
-  try { await api('/api/admin/channels', { method:'POST', body:{name} }); toast('Канал создан'); renderTab(); }
+  try { await api('/api/admin/channels', { method:'POST', body:{name} }); toast('Канал создан'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
 }
 async function deleteChannel(cid){
   if (!confirm(`Удалить канал #${cid}?`)) return;
-  try { await api('/api/admin/channels/'+encodeURIComponent(cid), { method:'DELETE' }); toast('Удалён'); renderTab(); }
+  try { await api('/api/admin/channels/'+encodeURIComponent(cid), { method:'DELETE' }); toast('Удалён'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
 }
 async function clearChannel(cid){
   if (!confirm(`Очистить #${cid}?`)) return;
-  try { await api('/api/admin/channels/'+encodeURIComponent(cid)+'/messages', { method:'DELETE' }); toast('Очищено'); renderTab(); }
+  try { await api('/api/admin/channels/'+encodeURIComponent(cid)+'/messages', { method:'DELETE' }); toast('Очищено'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
 }
 
 /* MESSAGES */
-async function renderMessages(main, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
+async function renderMessages(main){
   const channelsData = await api('/api/admin/channels');
-  window.__chCache = channelsData.channels;
   const options = ['<option value="">— все каналы —</option>']
     .concat(channelsData.channels.map(c => `<option value="${escapeHtml(c.id)}">#${escapeHtml(c.name)}</option>`)).join('');
   main.innerHTML = `
@@ -2710,13 +2421,14 @@ async function renderMessages(main, opts){
     wrap.innerHTML = `<div class="loading">Загрузка…</div>`;
     try {
       const data = await api('/api/admin/messages?'+p.toString());
-      wrap.innerHTML = data.messages.length ? `<table>
+      wrap.innerHTML = data.messages.length ? `<table style="table-layout:fixed;">
+        <colgroup><col style="width:140px;"><col style="width:120px;"><col style="width:140px;"><col><col style="width:170px;"></colgroup>
         <thead><tr><th>Время</th><th>Канал</th><th>Автор</th><th>Текст</th><th></th></tr></thead>
         <tbody>${data.messages.map(m => `<tr>
-          <td class="mono muted" style="white-space:nowrap;">${fmtTs(m.ts)}</td>
+          <td class="mono muted">${fmtTs(m.ts)}</td>
           <td><span class="chip blue">#${escapeHtml(m.channel_name||m.channel)}</span></td>
           <td class="mono accent">${escapeHtml(m.user)}</td>
-          <td style="max-width:520px;word-break:break-word;">${escapeHtml(m.text)}${m.edited?' <span class="muted">(изм.)</span>':''}</td>
+          <td>${escapeHtml(m.text)}${m.edited?' <span class="muted">(изм.)</span>':''}</td>
           <td style="white-space:nowrap;">
             <button class="btn mini" data-medit="${escapeHtml(m.id)}" data-mtext="${escapeHtml(m.text)}">Изменить</button>
             <button class="btn mini danger" data-mdel="${escapeHtml(m.id)}">Удалить</button>
@@ -2732,12 +2444,6 @@ async function renderMessages(main, opts){
   $('flt-apply').addEventListener('click', load);
   $('flt-search').addEventListener('keydown', e => { if (e.key==='Enter') load(); });
   await load();
-  if (opts.silent && state.__fltState) {
-    $('flt-channel').value = state.__fltState.ch || '';
-    $('flt-user').value = state.__fltState.u || '';
-    $('flt-search').value = state.__fltState.q || '';
-  }
-  state.__fltState = { ch: $('flt-channel').value, u: $('flt-user').value, q: $('flt-search').value };
 }
 
 function openMsgEdit(id, text){
@@ -2753,159 +2459,15 @@ $('me-save').addEventListener('click', async () => {
   if (!t) { $('me-err').textContent = 'Пустой текст'; return; }
   try {
     await api('/api/admin/messages/'+encodeURIComponent(state.currentMsg), { method:'PATCH', body:{text:t} });
-    toast('Сообщение обновлено');
+    toast('Обновлено');
     $('msg-edit-modal').classList.remove('visible');
-    renderTab();
+    renderTab({force:true});
   } catch(e){ $('me-err').textContent = e.message; }
 });
 async function deleteMessage(id){
   if (!confirm('Удалить сообщение?')) return;
-  try { await api('/api/admin/messages/'+encodeURIComponent(id), { method:'DELETE' }); toast('Удалено'); renderTab(); }
+  try { await api('/api/admin/messages/'+encodeURIComponent(id), { method:'DELETE' }); toast('Удалено'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
-}
-
-/* SUPPORT */
-let supportBadge = 0;
-async function refreshSupportBadge(){
-  try {
-    const data = await api('/api/admin/support');
-    const open = data.sessions.filter(s=>!s.ended && s.unread_admin>0).length;
-    const totalOpen = data.sessions.filter(s=>!s.ended).length;
-    supportBadge = totalOpen;
-    const b = $('support-badge');
-    if (totalOpen > 0) { b.textContent = totalOpen; b.classList.remove('hide'); }
-    else b.classList.add('hide');
-    state.supportList = data.sessions;
-  } catch(e){}
-}
-
-async function renderSupport(main, opts){
-  if (!opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
-  await refreshSupportBadge();
-  const sessions = state.supportList || [];
-  const itemsHtml = sessions.map(s => `
-    <div class="support-item ${s.ended?'ended':''} ${state.subId===s.id?'active':''}" data-sid="${escapeHtml(s.id)}">
-      <div class="sname">
-        <span>${escapeHtml(s.name)}</span>
-        ${(!s.ended && s.unread_admin>0)?`<span class="sbadge">${s.unread_admin}</span>`:(s.ended?'<span class="chip">закрыт</span>':'')}
-      </div>
-      <div class="semail">${escapeHtml(s.email)}</div>
-      <div class="spreview">${s.last_message?escapeHtml(s.last_message.text.slice(0,60)):'—'}</div>
-    </div>`).join('');
-  main.innerHTML = `
-    <h2 class="page-title">Поддержка</h2>
-    <div class="page-sub">Чаты с пользователями. Всего: ${sessions.length}.</div>
-    <div class="support-layout">
-      <div class="support-list">
-        <div class="support-list-head">Тикеты</div>
-        <div class="support-items">
-          ${sessions.length ? itemsHtml : `<div class="empty-state">Нет обращений</div>`}
-        </div>
-      </div>
-      <div class="support-chat" id="support-chat-pane">
-        <div class="empty-state">Выберите тикет</div>
-      </div>
-    </div>`;
-  main.querySelectorAll('.support-item').forEach(el => {
-    el.addEventListener('click', () => navigate('support', el.dataset.sid));
-  });
-  if (state.subId) await renderSupportChat();
-}
-
-async function renderSupportChat(){
-  const pane = $('support-chat-pane');
-  if (!pane) return;
-  let s;
-  try { s = await api('/api/admin/support/'+encodeURIComponent(state.subId)); }
-  catch(e){
-    pane.innerHTML = `<div class="empty-state">Ошибка: ${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  pane.innerHTML = `
-    <div class="support-chat-head">
-      <div class="info">
-        <b>${escapeHtml(s.name)} · ${escapeHtml(s.email)}</b>
-        IP: <span class="mono">${escapeHtml(s.ip)}</span> · создан: ${fmtTs(s.created)}
-        ${s.ended?' · <span class="red">завершён '+fmtTs(s.ended_at)+'</span>':''}
-      </div>
-      <div style="display:flex;gap:6px;">
-        ${!s.ended ? `<button class="btn" id="sup-end">Завершить</button>`:''}
-        <button class="btn danger" id="sup-del">Удалить</button>
-      </div>
-    </div>
-    <div class="support-chat-body" id="sup-body">
-      <div class="support-chat-msgs" id="sup-msgs">
-        ${s.messages.map(m => `<div class="sm ${escapeHtml(m.from)}">${escapeHtml(m.text)}<div style="font-size:10px;opacity:.6;margin-top:3px;text-align:right;">${new Date(m.ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div></div>`).join('')}
-      </div>
-    </div>
-    ${!s.ended ? `<div class="support-chat-foot">
-      <input id="sup-input" placeholder="Ответ..." maxlength="2000">
-      <button class="btn primary" id="sup-send">Отправить</button>
-    </div>`:''}`;
-  const body = $('sup-body');
-  if (body) body.scrollTop = body.scrollHeight;
-
-  if (!s.ended) {
-    $('sup-send').addEventListener('click', () => {
-      const inp = $('sup-input');
-      const t = inp.value.trim();
-      if (!t || !state.supportWs || state.supportWs.readyState !== 1) return;
-      state.supportWs.send(JSON.stringify({type:'reply', sid: state.subId, text:t}));
-      inp.value = '';
-    });
-    $('sup-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('sup-send').click(); });
-  }
-  const endBtn = $('sup-end');
-  if (endBtn) endBtn.addEventListener('click', async () => {
-    if (!confirm('Завершить чат?')) return;
-    try { await api(`/api/admin/support/${encodeURIComponent(state.subId)}/end`, { method:'POST' }); toast('Завершён'); renderTab(); }
-    catch(e){ toast(e.message,'err'); }
-  });
-  $('sup-del').addEventListener('click', async () => {
-    if (!confirm('Удалить тикет? Сообщения будут потеряны.')) return;
-    try {
-      await api(`/api/admin/support/${encodeURIComponent(state.subId)}`, { method:'DELETE' });
-      navigate('support', null);
-    } catch(e){ toast(e.message,'err'); }
-  });
-}
-
-/* SUPPORT WS */
-function connectSupportWs(){
-  if (state.supportWs) { try { state.supportWs.close(); } catch(e){} state.supportWs = null; }
-  if (state.supportPingTimer) { clearInterval(state.supportPingTimer); state.supportPingTimer = null; }
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/admin_support`);
-  state.supportWs = ws;
-  ws.onopen = () => {
-    state.supportPingTimer = setInterval(()=>{ try{ ws.send(JSON.stringify({type:'ping'})); }catch(e){} }, 25000);
-  };
-  ws.onmessage = (ev) => {
-    let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
-    if (d.type === 'support_message' || d.type === 'support_list_changed') {
-      refreshSupportBadge();
-      if (state.tab === 'support') {
-        if (d.type === 'support_message' && d.sid === state.subId) {
-          // append live
-          const box = $('sup-msgs');
-          if (box) {
-            const el = document.createElement('div');
-            el.className = 'sm ' + d.message.from;
-            el.innerHTML = `${escapeHtml(d.message.text)}<div style="font-size:10px;opacity:.6;margin-top:3px;text-align:right;">${new Date(d.message.ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</div>`;
-            box.appendChild(el);
-            const body = $('sup-body');
-            if (body) body.scrollTop = body.scrollHeight;
-          }
-        } else {
-          renderTab({ silent:true });
-        }
-      }
-    }
-  };
-  ws.onclose = () => {
-    if (state.supportPingTimer) { clearInterval(state.supportPingTimer); state.supportPingTimer = null; }
-    setTimeout(() => { if ($('panel-view').classList.contains('visible')) connectSupportWs(); }, 2000);
-  };
 }
 
 /* SIDE SEARCH */
@@ -2919,12 +2481,36 @@ $('side-search').addEventListener('input', e => {
 /* BOOT */
 (async () => {
   if (!await trySession()) showLogin();
-  refreshSupportBadge();
 })();
 </script>
 </body>
 </html>
 """
+
+ADMIN_PAGE = ADMIN_PAGE.replace("{{APP_NAME}}", APP_NAME)
+
+
+# ============================================================
+#  РОУТЫ
+# ============================================================
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML_PAGE
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    if not ADMIN_PASS:
+        return HTMLResponse(
+            "<h1 style='font-family:sans-serif;color:#c33;padding:40px'>"
+            f"Админка отключена: не задан ADMIN_PASS</h1>",
+            status_code=503)
+    return ADMIN_PAGE
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": _now()}
 
 
 if __name__ == "__main__":
