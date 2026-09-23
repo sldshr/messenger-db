@@ -1,39 +1,40 @@
 """
-Anonymous Imageboard (4chan-style)
+Анонимный форум (в стиле 4chan)
 Python + FastAPI + Uvicorn
-Everything in-memory.
+Всё хранится в оперативной памяти.
 """
 
 import time
 import re
 import hashlib
 import html as _html
-from typing import Optional
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 import uvicorn
 
-# ==================== CONFIG ====================
-SALT = "please_change_this_salt_12345"
-ADMIN_KEY = "admin_secret_change_me"
-MAX_THREADS_PER_BOARD = 50
-MAX_REPLIES_PER_THREAD = 300
-RATE_LIMIT_SEC = 5
-MAX_CONTENT_LEN = 4000
+# ==================== НАСТРОЙКИ ====================
+SALT = "izmeni_etot_sol_12345"          # соль для хеширования
+ADMIN_KEY = "admin_secret_change_me"    # ключ администратора
+MAX_THREADS_PER_BOARD = 60              # максимум тредов на раздел
+MAX_REPLIES_PER_THREAD = 300            # максимум ответов в треде
+RATE_LIMIT_SEC = 5                      # пауза между постами (сек)
+MAX_CONTENT_LEN = 4000                  # макс. длина сообщения
 HOST = "0.0.0.0"
 PORT = 8000
 
-# ==================== STORAGE ====================
+# ==================== ХРАНИЛИЩЕ ====================
 boards: dict = {}
 threads: dict = {}
 posts: dict = {}
 _counter = {"n": 0}
 rate_map: dict = {}
 
-# ==================== HELPERS ====================
+# ==================== ВСПОМОГАТЕЛЬНОЕ ====================
 def now_str() -> str:
-    return time.strftime("%y/%m/%d(%a)%H:%M:%S", time.localtime())
+    days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    t = time.localtime()
+    return f"{t.tm_mday:02d}.{t.tm_mon:02d}.{t.tm_year} ({days[t.tm_wday]}) {t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
 
 def hash_ip(ip: str) -> str:
     return hashlib.sha256((SALT + ip).encode()).hexdigest()[:16]
@@ -95,52 +96,66 @@ def purge_old_threads(board_slug: str) -> None:
             if tid in b["threads"]:
                 b["threads"].remove(tid)
 
-# ==================== APP ====================
-app = FastAPI(title="Anonymous Imageboard", docs_url=None, redoc_url=None)
+# ==================== ПРИЛОЖЕНИЕ ====================
+app = FastAPI(title="Анонимный форум", docs_url=None, redoc_url=None)
 
 CSS = """
 *{box-sizing:border-box}
-body{background:#FFFFEE;color:#800000;font-family:arial,helvetica,sans-serif;font-size:10pt;margin:0;padding:0}
+body{background:#FFFFEE;color:#800000;font-family:arial,helvetica,sans-serif;font-size:11pt;margin:0;padding:0}
 a{color:#0000EE;text-decoration:none}
 a:hover{color:#DD0000}
 a.quotelink{color:#DD0000;text-decoration:underline;cursor:pointer}
-.header{text-align:center;padding:10px 8px 4px}
+.header{text-align:center;padding:12px 8px 6px}
 .header h1{color:#AF0A0F;font-family:Tahoma,sans-serif;font-size:30px;margin:0;letter-spacing:1px}
-.header .sub{color:#800000;font-size:9pt;margin-top:4px}
-.navbar{background:#FEDCBA;padding:5px 8px;text-align:center;border-top:1px solid #D9BFB7;border-bottom:1px solid #D9BFB7}
-.navbar a{margin:0 5px;font-weight:700}
-.boardtitle{text-align:center;color:#AF0A0F;font-size:22px;font-family:Tahoma,sans-serif;font-weight:700;padding:12px 10px 4px}
-.boarddesc{text-align:center;color:#800000;padding-bottom:8px;font-size:9pt}
-.form-box{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 10px;margin:10px auto;max-width:750px}
-.post{background:#F0E0D6;border:1px solid #D9BFB7;padding:6px 8px;margin:4px auto;max-width:900px;word-wrap:break-word}
-.post.reply{margin-left:40px}
-.post.deleted{opacity:.6;font-style:italic}
-.posthead{font-size:10pt;margin-bottom:4px}
-.postername{color:#117743;font-weight:700}
-.postdate{color:#800000;margin-left:4px}
-.postnum{color:#800000;margin-left:4px}
-.postlink{color:#0000EE}
-.postbody{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
-.postimg{max-width:220px;max-height:220px;border:1px solid #D9BFB7;background:#fff}
-.postmessage{margin:0;color:#800000;font-family:arial;font-size:10pt;flex:1;min-width:200px;white-space:normal}
-.quote{color:#789922}
-.thread{margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #D9BFB7}
-.omitted{color:#707070;text-align:center;margin:6px 0;font-size:9pt}
-textarea,input[type=text],input[type=password]{background:#FFFFEE;border:1px solid #D9BFB7;color:#800000;font-family:arial;font-size:10pt;padding:3px}
-textarea{width:100%;resize:vertical}
-button{background:#F0E0D6;border:1px solid #D9BFB7;padding:4px 14px;cursor:pointer;color:#800000;font-size:10pt;font-family:arial}
+.header .sub{color:#800000;font-size:10pt;margin-top:4px}
+.navbar{background:#FEDCBA;padding:6px 8px;text-align:center;border-top:1px solid #D9BFB7;border-bottom:1px solid #D9BFB7;font-size:10pt}
+.navbar a{margin:0 6px;font-weight:700}
+.boardtitle{text-align:center;color:#AF0A0F;font-size:24px;font-family:Tahoma,sans-serif;font-weight:700;padding:14px 10px 4px}
+.boarddesc{text-align:center;color:#800000;padding-bottom:10px;font-size:10pt}
+.form-box{background:#F0E0D6;border:1px solid #D9BFB7;padding:14px 16px;margin:14px auto;max-width:780px;border-radius:3px}
+.form-box h3{margin:0 0 12px;color:#AF0A0F;font-size:14pt;font-family:Tahoma,sans-serif}
+.form-row{margin-bottom:12px}
+.form-row label{display:block;font-weight:700;color:#800000;margin-bottom:4px;font-size:10pt}
+.form-row .hint{font-size:9pt;color:#707070;font-weight:400;margin-left:6px}
+textarea,input[type=text],input[type=password]{background:#FFFFEE;border:1px solid #D9BFB7;color:#800000;font-family:arial;font-size:11pt;padding:6px 8px;width:100%}
+textarea{resize:vertical;min-height:130px}
+button{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 22px;cursor:pointer;color:#800000;font-size:11pt;font-family:arial;font-weight:700;border-radius:3px}
 button:hover{background:#FEDCBA}
-.footer{text-align:center;font-size:9pt;color:#800000;padding:14px 8px}
-.sage{color:#707070;font-size:9pt}
+button.big{padding:10px 30px;font-size:12pt}
+.post{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 10px;margin:6px auto;max-width:920px;word-wrap:break-word;border-radius:3px}
+.post.reply{margin-left:44px}
+.post.deleted{opacity:.6;font-style:italic}
+.posthead{font-size:11pt;margin-bottom:6px}
+.postername{color:#117743;font-weight:700}
+.postdate{color:#800000;margin-left:6px}
+.postnum{color:#800000;margin-left:6px}
+.postlink{color:#0000EE}
+.postbody{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.postimg{max-width:240px;max-height:240px;border:1px solid #D9BFB7;background:#fff}
+.postmessage{margin:0;color:#800000;font-family:arial;font-size:11pt;flex:1;min-width:220px;white-space:normal;line-height:1.45}
+.quote{color:#789922}
+.thread{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #D9BFB7}
+.omitted{color:#707070;text-align:center;margin:8px 0;font-size:10pt}
+.footer{text-align:center;font-size:9pt;color:#800000;padding:18px 8px;border-top:1px solid #D9BFB7;margin-top:20px}
+.sage{color:#707070;font-size:10pt}
 .locked{color:#DD0000;font-weight:700}
 .sticky{color:#DD0000;font-weight:700}
 .subject{color:#AF0A0F;font-weight:700;margin-right:6px}
-.tbl{border-collapse:collapse;width:100%}
-.tbl th,.tbl td{border:1px solid #D9BFB7;padding:5px 8px;text-align:left}
-.tbl th{background:#F0E0D6;color:#AF0A0F}
-.tbl tr:nth-child(even) td{background:#FCF5EE}
-.wrap{max-width:900px;margin:0 auto;padding:0 8px}
+.wrap{max-width:920px;margin:0 auto;padding:0 10px}
 .small{font-size:9pt;color:#707070}
+.btn-row{margin-top:8px}
+.board-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;margin:14px auto;max-width:960px;padding:0 10px}
+.board-card{background:#F0E0D6;border:1px solid #D9BFB7;padding:12px 14px;border-radius:3px;transition:background .15s}
+.board-card:hover{background:#FEDCBA}
+.board-card a{display:block;font-size:12pt;font-weight:700;color:#0000EE}
+.board-card .name{color:#AF0A0F;font-size:11pt;margin-top:2px;font-weight:700}
+.board-card .desc{color:#800000;font-size:10pt;margin-top:6px}
+.board-card .cnt{color:#707070;font-size:9pt;margin-top:6px}
+.group-title{text-align:center;color:#AF0A0F;font-family:Tahoma,sans-serif;font-size:14pt;font-weight:700;margin:22px 10px 6px}
+.help{background:#FCF5EE;border:1px solid #D9BFB7;border-left:4px solid #AF0A0F;padding:10px 14px;margin:12px auto;max-width:780px;font-size:10pt;color:#800000;border-radius:3px}
+.help b{color:#AF0A0F}
+.reply-btn{display:inline-block;background:#F0E0D6;border:1px solid #D9BFB7;padding:4px 12px;margin-right:6px;border-radius:3px;font-size:10pt;font-weight:700}
+.reply-btn:hover{background:#FEDCBA;color:#DD0000}
 """
 
 JS = """
@@ -155,7 +170,7 @@ function quotePost(id){
   try{ta.scrollIntoView({behavior:'smooth',block:'center'});}catch(e){}
 }
 function deletePost(id){
-  var pw=prompt('Password for deletion:');
+  var pw=prompt('Введите пароль, который вы указали при создании поста, для его удаления:');
   if(pw===null)return;
   var f=document.createElement('form');
   f.method='POST';f.action='/post/'+id+'/delete';
@@ -163,16 +178,19 @@ function deletePost(id){
   i.type='hidden';i.name='password';i.value=pw;
   f.appendChild(i);document.body.appendChild(f);f.submit();
 }
+function toggleHelp(id){
+  var e=document.getElementById(id);
+  if(e)e.style.display = (e.style.display==='none' ? 'block' : 'none');
+}
 </script>
 """
 
 def page(title: str, body: str) -> str:
-    nav = '<a href="/">[Home]</a>'
-    for s in boards:
-        nav += f'<a href="/{s}/">[{s}]</a>'
-    nav += '<a href="/api/boards">[API]</a>'
+    nav = '<a href="/">🏠 Главная</a>'
+    nav += '<a href="/help">❓ Помощь</a>'
+    nav += '<a href="/api/boards">📡 API</a>'
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -182,14 +200,14 @@ def page(title: str, body: str) -> str:
 <body>
 <a name="top"></a>
 <div class="header">
-  <h1>Anonymous Imageboard</h1>
-  <div class="sub">All posts are anonymous. No names. No accounts.</div>
+  <h1>Анонимный форум</h1>
+  <div class="sub">Все сообщения анонимны. Никаких имён, регистраций и аккаунтов.</div>
 </div>
 <div class="navbar">{nav}</div>
 {body}
 <div class="footer">
-  All posts are anonymous. Passwords are optional &mdash; set one to enable deletion.<br>
-  Powered by FastAPI &middot; {now_str()}
+  Все сообщения анонимны. Пароль необязателен &mdash; укажите его, чтобы потом удалить свой пост.<br>
+  Работает на FastAPI &middot; {now_str()}
 </div>
 {JS}
 </body>
@@ -197,29 +215,28 @@ def page(title: str, body: str) -> str:
 
 def render_post(p: dict, is_op: bool = False, show_actions: bool = True) -> str:
     if not p or p.get("deleted"):
-        return f'<div class="post reply deleted">Post No.{p["id"] if p else "?"} has been deleted.</div>' if p else ""
+        return f'<div class="post reply deleted">Пост №{p["id"] if p else "?"} удалён.</div>' if p else ""
     cls = "post" + (" op" if is_op else " reply")
     flags = ""
     if is_op:
         t = threads.get(p["id"], {})
-        if t.get("sticky"): flags += ' <span class="sticky">[Sticky]</span>'
-        if t.get("locked"): flags += ' <span class="locked">[Locked]</span>'
-    sage = ' <span class="sage">(sage)</span>' if (p.get("sage") and not is_op) else ""
+        if t.get("sticky"): flags += ' <span class="sticky">[Закреплён]</span>'
+        if t.get("locked"): flags += ' <span class="locked">[Закрыт]</span>'
+    sage = ' <span class="sage">(без поднятия)</span>' if (p.get("sage") and not is_op) else ""
     subj = f'<span class="subject">{esc(p["subject"])}</span> ' if (is_op and p.get("subject")) else ""
-    img = f'<img src="{esc(p["image_url"])}" class="postimg" alt="" loading="lazy">' if p.get("image_url") else ""
+    img = f'<img src="{esc(p["image_url"])}" class="postimg" alt="" loading="lazy" onerror="this.style.display=\'none\'">' if p.get("image_url") else ""
     actions = ""
     if show_actions:
-        actions = ('<div style="margin-top:6px;font-size:9pt;color:#707070">'
-                   f'<a href="javascript:void(0)" onclick="quotePost({p["id"]})">[Reply]</a> '
-                   f'<a href="/{p["board"]}/thread/{p["thread_id"]}#p{p["id"]}">[View]</a> '
-                   f'<a href="javascript:void(0)" onclick="deletePost({p["id"]})">[Delete]</a>'
+        actions = ('<div class="btn-row">'
+                   f'<a class="reply-btn" href="javascript:void(0)" onclick="quotePost({p["id"]})">💬 Ответить</a>'
+                   f'<a class="reply-btn" href="javascript:void(0)" onclick="deletePost({p["id"]})">🗑 Удалить</a>'
                    '</div>')
     return f'''
 <div class="{cls}" id="p{p["id"]}">
   <div class="posthead">
-    {subj}<span class="postername">Anonymous</span>
+    {subj}<span class="postername">Аноним</span>
     <span class="postdate">{p["time"]}</span>
-    <span class="postnum">No.</span><a class="postlink" href="#p{p["id"]}">{p["id"]}</a>{sage}{flags}
+    <span class="postnum">№</span><a class="postlink" href="#p{p["id"]}">{p["id"]}</a>{sage}{flags}
   </div>
   <div class="postbody">
     {img}
@@ -241,31 +258,33 @@ def render_thread_in_index(tid: int, max_replies: int = 3) -> str:
     for pid in shown:
         parts.append(render_post(posts[pid], show_actions=False))
     if omitted > 0:
+        word = "ответ" if omitted == 1 else ("ответа" if 2 <= omitted <= 4 else "ответов")
         parts.append(
-            f'<div class="omitted">{omitted} repl{"y" if omitted==1 else "ies"} omitted. '
-            f'<a href="/{t["board"]}/thread/{tid}">Click here to view.</a></div>'
+            f'<div class="omitted">Пропущено {omitted} {word}. '
+            f'<a href="/{t["board"]}/thread/{tid}">Нажмите, чтобы открыть весь тред.</a></div>'
         )
     parts.append(
-        f'<div style="margin-top:6px;font-size:9pt">'
-        f'<a href="/{t["board"]}/thread/{tid}">[Reply]</a> &middot; '
-        f'<span class="small">{t["reply_count"]} replies, {t["image_count"]} images</span>'
+        f'<div class="btn-row">'
+        f'<a class="reply-btn" href="/{t["board"]}/thread/{tid}">📖 Открыть тред и ответить</a>'
+        f'<span class="small" style="margin-left:8px">Ответов: {t["reply_count"]} &middot; Картинок: {t["image_count"]}</span>'
         f'</div>'
     )
     parts.append('</div>')
     return "".join(parts)
 
-# ==================== EXCEPTION HANDLER ====================
+# ==================== ОБРАБОТЧИК ОШИБОК ====================
 @app.exception_handler(FastAPIHTTPException)
 async def http_exc_handler(request: Request, exc: FastAPIHTTPException):
     if request.url.path.startswith("/api/"):
         return JSONResponse({"error": exc.detail, "status": exc.status_code},
                             status_code=exc.status_code)
-    body = (f'<div class="boardtitle">Error {exc.status_code}</div>'
-            f'<div style="text-align:center;padding:20px">{esc(str(exc.detail))}</div>'
-            f'<div style="text-align:center"><a href="/">[Return Home]</a></div>')
-    return HTMLResponse(page(f"Error {exc.status_code}", body), status_code=exc.status_code)
+    body = (f'<div class="boardtitle">Ошибка {exc.status_code}</div>'
+            f'<div style="text-align:center;padding:24px;font-size:12pt">{esc(str(exc.detail))}</div>'
+            f'<div style="text-align:center;padding-bottom:20px">'
+            f'<a class="reply-btn" href="/">🏠 На главную</a></div>')
+    return HTMLResponse(page(f"Ошибка {exc.status_code}", body), status_code=exc.status_code)
 
-# ==================== ROUTES: API (must be first) ====================
+# ==================== API ====================
 @app.get("/api/boards")
 def api_boards():
     return [
@@ -276,7 +295,7 @@ def api_boards():
 @app.get("/api/{board}/threads")
 def api_threads(board: str):
     if board not in boards:
-        raise HTTPException(404, "Board not found")
+        raise HTTPException(404, "Раздел не найден")
     out = []
     for tid in boards[board]["threads"]:
         t = threads.get(tid)
@@ -299,7 +318,7 @@ def api_threads(board: str):
 def api_thread(tid: int):
     t = threads.get(tid)
     if not t:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тред не найден")
     items = []
     for pid in t["posts"]:
         p = posts.get(pid)
@@ -329,50 +348,156 @@ def api_stats():
         "total_created": _counter["n"],
     }
 
-# ==================== ROUTES: ADMIN ====================
+# ==================== АДМИН ====================
 @app.post("/admin/{board}/{tid}/sticky")
 async def admin_sticky(board: str, tid: int, key: str = Form("")):
     if key != ADMIN_KEY:
-        raise HTTPException(403, "Bad admin key")
+        raise HTTPException(403, "Неверный ключ администратора")
     t = threads.get(tid)
     if not t:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тред не найден")
     t["sticky"] = not t["sticky"]
     return RedirectResponse(f"/{board}/thread/{tid}", status_code=303)
 
 @app.post("/admin/{board}/{tid}/lock")
 async def admin_lock(board: str, tid: int, key: str = Form("")):
     if key != ADMIN_KEY:
-        raise HTTPException(403, "Bad admin key")
+        raise HTTPException(403, "Неверный ключ администратора")
     t = threads.get(tid)
     if not t:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тред не найден")
     t["locked"] = not t["locked"]
     return RedirectResponse(f"/{board}/thread/{tid}", status_code=303)
 
-# ==================== ROUTES: HTML ====================
+# ==================== СТРАНИЦЫ ====================
+BOARD_GROUPS = [
+    ("Общие", ["b", "news", "int", "rnd"]),
+    ("Технологии", ["g", "diy", "prog", "hard", "soft", "web", "sec"]),
+    ("Игры", ["v", "vg", "retro", "vgm", "mmo"]),
+    ("Кино, музыка, книги", ["mu", "tv", "cin", "lit", "an", "a"]),
+    ("Творчество", ["art", "p", "fa", "po", "ph"]),
+    ("Наука и учёба", ["sci", "his", "math", "lang"]),
+    ("Жизнь", ["fit", "ck", "out", "sp", "biz", "adv", "trv", "auto"]),
+    ("Разное", ["pol", "r", "x", "weird", "dev"]),
+]
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    body = '<div class="boardtitle">Anonymous Imageboard</div>'
+    body = '<div class="boardtitle">Добро пожаловать на Анонимный форум</div>'
+    body += '<div class="boarddesc">Выберите раздел — всё как на старом добром 4chan, но на русском.</div>'
+    body += '<div class="help">' \
+            '<b>Как пользоваться:</b> выберите раздел → создайте новую тему или откройте существующую → напишите сообщение. ' \
+            'Имя указывать не нужно, все сообщения анонимны. Если хотите удалить свой пост позже — придумайте пароль и запомните его.</div>'
+
+    # группируем
+    used = set()
+    for group_name, slugs in BOARD_GROUPS:
+        present = [s for s in slugs if s in boards]
+        if not present:
+            continue
+        body += f'<div class="group-title">— {esc(group_name)} —</div>'
+        body += '<div class="board-grid">'
+        for s in present:
+            b = boards[s]
+            used.add(s)
+            body += (
+                f'<div class="board-card">'
+                f'<a href="/{s}/">/{s}/</a>'
+                f'<div class="name">{esc(b["name"])}</div>'
+                f'<div class="desc">{esc(b["desc"])}</div>'
+                f'<div class="cnt">Тем: {len(b["threads"])}</div>'
+                f'</div>'
+            )
+        body += '</div>'
+
+    # оставшиеся разделы
+    rest = [s for s in boards if s not in used]
+    if rest:
+        body += '<div class="group-title">— Прочие разделы —</div>'
+        body += '<div class="board-grid">'
+        for s in rest:
+            b = boards[s]
+            body += (
+                f'<div class="board-card">'
+                f'<a href="/{s}/">/{s}/</a>'
+                f'<div class="name">{esc(b["name"])}</div>'
+                f'<div class="desc">{esc(b["desc"])}</div>'
+                f'<div class="cnt">Тем: {len(b["threads"])}</div>'
+                f'</div>'
+            )
+        body += '</div>'
+
     body += '<div class="wrap">'
-    body += '<div class="boarddesc">Choose a board. All posts are anonymous.</div>'
-    body += '<table class="tbl"><tr><th>Board</th><th>Description</th><th style="width:90px;text-align:center">Threads</th></tr>'
-    for s, b in boards.items():
-        body += (f'<tr>'
-                 f'<td><a href="/{s}/">/{s}/ &mdash; {esc(b["name"])}</a></td>'
-                 f'<td>{esc(b["desc"])}</td>'
-                 f'<td style="text-align:center">{len(b["threads"])}</td>'
-                 f'</tr>')
-    body += '</table>'
-    body += f'<div class="small" style="margin-top:12px">Total boards: {len(boards)} &middot; '
-    body += f'Threads: {len(threads)} &middot; Posts: {len(posts)}</div>'
+    body += f'<div class="small" style="margin-top:20px;text-align:center">' \
+            f'Всего разделов: {len(boards)} &middot; Тем: {len(threads)} &middot; Сообщений: {len(posts)}</div>'
     body += '</div>'
-    return page("Anonymous Imageboard", body)
+    return page("Анонимный форум — Главная", body)
+
+@app.get("/help", response_class=HTMLResponse)
+def help_page():
+    body = '''
+<div class="boardtitle">Помощь</div>
+<div class="wrap" style="max-width:820px">
+<div class="help">
+<b>Что это такое?</b><br>
+Это анонимный форум в стиле классического 4chan. Никаких регистраций, имён, лайков и профилей. Только анонимные сообщения.
+</div>
+
+<div class="help">
+<b>Как создать новую тему?</b><br>
+1. На главной странице выберите любой раздел (например /b/).<br>
+2. На странице раздела сверху будет форма <b>«Создать новую тему»</b>.<br>
+3. Впишите тему (необязательно), текст сообщения и нажмите <b>«Создать тему»</b>.
+</div>
+
+<div class="help">
+<b>Как ответить в существующую тему?</b><br>
+1. Откройте тему, кликнув по ней.<br>
+2. Прокрутите вниз — там будет форма ответа.<br>
+3. Или нажмите кнопку <b>💬 Ответить</b> под любым сообщением.
+</div>
+
+<div class="help">
+<b>Что такое &gt;&gt;123?</b><br>
+Это ссылка на другой пост по его номеру. Если вы впишете в тексте <code>&gt;&gt;123</code>, появится кликабельная ссылка на пост №123. Если строка начинается с <code>&gt;</code> (одного), она станет зелёной — это «цитата».
+</div>
+
+<div class="help">
+<b>Как прикрепить картинку?</b><br>
+Просто вставьте ссылку на изображение в поле «Ссылка на картинку». Прямые ссылки из интернета, оканчивающиеся на .jpg, .png, .gif или .webp.
+</div>
+
+<div class="help">
+<b>Как удалить свой пост?</b><br>
+При создании поста укажите <b>пароль</b> (любой, который запомните). Потом под своим постом нажмите кнопку <b>🗑 Удалить</b> и введите тот же пароль. Если удалить первый пост в теме — вся тема исчезнет.
+</div>
+
+<div class="help">
+<b>Что такое «без поднятия» (sage)?</b><br>
+Если отметить эту галочку при ответе, тема не будет подниматься наверх списка, но ответ всё равно добавится. Так делают, чтобы не «бампать» тему зря.
+</div>
+
+<div class="help">
+<b>Почему мои сообщения не появляются сразу?</b><br>
+Есть ограничение: одно сообщение раз в 5 секунд с одного IP. Просто подождите пару секунд.
+</div>
+
+<div class="help">
+<b>Что-то сломалось / пропало?</b><br>
+Форум работает в оперативной памяти. При перезапуске сервера все данные стираются. Это учебный проект.
+</div>
+
+<div style="text-align:center;margin-top:20px">
+<a class="reply-btn" href="/">🏠 На главную</a>
+</div>
+</div>
+'''
+    return page("Помощь", body)
 
 @app.get("/{board_slug}/", response_class=HTMLResponse)
 def board_index(board_slug: str):
     if board_slug not in boards:
-        raise HTTPException(404, "Board not found")
+        raise HTTPException(404, "Раздел не найден")
     b = boards[board_slug]
     sorted_threads = sorted(
         [threads[tid] for tid in b["threads"] if tid in threads],
@@ -380,74 +505,98 @@ def board_index(board_slug: str):
     )
     form = f'''
 <div class="form-box">
+  <h3>✏️ Создать новую тему</h3>
   <form method="post" action="/{board_slug}/new">
-    <div style="margin-bottom:8px;color:#AF0A0F;font-weight:700">Create New Thread</div>
-    <div style="margin-bottom:6px">Subject: <input type="text" name="subject" size="45" maxlength="120"></div>
-    <div style="margin-bottom:6px">Comment:<br>
-      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}"></textarea>
+    <div class="form-row">
+      <label>Тема <span class="hint">(необязательно — короткое название темы)</span></label>
+      <input type="text" name="subject" maxlength="120" placeholder="Например: Обсуждаем новые игры">
     </div>
-    <div style="margin-bottom:6px">Image URL (optional): <input type="text" name="image_url" size="55" placeholder="https://..."></div>
-    <div style="margin-bottom:6px">Password (for deletion, optional): <input type="password" name="password" size="22" maxlength="100"></div>
-    <div><button type="submit">Post Thread</button></div>
+    <div class="form-row">
+      <label>Сообщение <span class="hint">(обязательно)</span></label>
+      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}" placeholder="Напишите здесь текст. Строка, начинающаяся с > , станет зелёной цитатой."></textarea>
+    </div>
+    <div class="form-row">
+      <label>Ссылка на картинку <span class="hint">(необязательно, прямая ссылка на .jpg/.png/.gif)</span></label>
+      <input type="text" name="image_url" placeholder="https://example.com/cat.jpg">
+    </div>
+    <div class="form-row">
+      <label>Пароль <span class="hint">(необязательно — чтобы потом удалить свой пост)</span></label>
+      <input type="password" name="password" maxlength="100" placeholder="Запомните его, если хотите удалить пост позже">
+    </div>
+    <div><button type="submit" class="big">📨 Создать тему</button></div>
   </form>
 </div>'''
     body = f'<div class="boardtitle">/{board_slug}/ &mdash; {esc(b["name"])}</div>'
     body += f'<div class="boarddesc">{esc(b["desc"])}</div>'
-    body += form
     body += '<div class="wrap">'
+    body += form
     if not sorted_threads:
-        body += '<div style="text-align:center;padding:24px;color:#707070">No threads yet. Be the first to post!</div>'
+        body += '<div style="text-align:center;padding:30px;color:#707070;font-size:12pt">' \
+                'Пока тут пусто. Создайте первую тему — форма выше. ☝️</div>'
     else:
         for t in sorted_threads:
             body += render_thread_in_index(t["id"])
     body += '</div>'
-    return page(f'/{board_slug}/ - {b["name"]}', body)
+    return page(f'/{board_slug}/ — {b["name"]}', body)
 
 @app.get("/{board_slug}/thread/{tid}", response_class=HTMLResponse)
 def thread_view(board_slug: str, tid: int):
     if board_slug not in boards:
-        raise HTTPException(404, "Board not found")
+        raise HTTPException(404, "Раздел не найден")
     t = threads.get(tid)
     if not t or t["board"] != board_slug:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тема не найдена")
     op = posts.get(tid)
     if not op:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тема не найдена")
 
-    body = f'<div class="boardtitle">/{board_slug}/ &mdash; Thread No.{tid}</div>'
-    body += f'<div class="wrap"><a href="/{board_slug}/">[Return to /{board_slug}/]</a></div>'
-    body += '<div class="wrap" style="margin-top:8px">'
+    body = f'<div class="boardtitle">/{board_slug}/ &mdash; Тема №{tid}</div>'
+    body += f'<div class="wrap"><a class="reply-btn" href="/{board_slug}/">← Вернуться в /{board_slug}/</a></div>'
+    body += '<div class="wrap" style="margin-top:10px">'
     body += render_post(op, is_op=True, show_actions=False)
     for pid in t["posts"][1:]:
         p = posts.get(pid)
         if p and not p["deleted"]:
             body += render_post(p, show_actions=False)
         elif p and p["deleted"]:
-            body += f'<div class="post reply deleted">Post No.{pid} has been deleted.</div>'
+            body += f'<div class="post reply deleted">Пост №{pid} удалён.</div>'
     body += '</div>'
 
     if t.get("locked"):
-        body += '<div class="form-box" style="text-align:center;color:#DD0000;font-weight:700">Thread is locked.</div>'
+        body += '<div class="form-box" style="text-align:center;color:#DD0000;font-weight:700;font-size:12pt">' \
+                '🔒 Эта тема закрыта. Новые ответы запрещены.</div>'
     else:
         body += f'''
 <div class="form-box">
+  <h3>💬 Ответить в тему №{tid}</h3>
   <form method="post" action="/{board_slug}/thread/{tid}/reply">
-    <div style="margin-bottom:6px;color:#AF0A0F;font-weight:700">Reply to Thread No.{tid}</div>
-    <div style="margin-bottom:6px">Comment:<br>
-      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}"></textarea>
+    <div class="form-row">
+      <label>Сообщение <span class="hint">(обязательно)</span></label>
+      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}" placeholder="Напишите ответ. Кнопка 💬 под сообщением вставит ссылку &gt;&gt;номер."></textarea>
     </div>
-    <div style="margin-bottom:6px">Image URL (optional): <input type="text" name="image_url" size="55"></div>
-    <div style="margin-bottom:6px">Password (optional): <input type="password" name="password" size="22" maxlength="100"></div>
-    <div style="margin-bottom:6px">
-      <label><input type="checkbox" name="sage" value="1"> Sage (do not bump thread)</label>
+    <div class="form-row">
+      <label>Ссылка на картинку <span class="hint">(необязательно)</span></label>
+      <input type="text" name="image_url" placeholder="https://example.com/pic.png">
     </div>
-    <div><button type="submit">Post Reply</button></div>
+    <div class="form-row">
+      <label>Пароль <span class="hint">(необязательно — чтобы удалить ответ позже)</span></label>
+      <input type="password" name="password" maxlength="100">
+    </div>
+    <div class="form-row">
+      <label style="font-weight:400">
+        <input type="checkbox" name="sage" value="1" style="width:auto;margin-right:6px">
+        <b>Без поднятия темы</b> <span class="hint">— ответ не поднимет тему наверх</span>
+      </label>
+    </div>
+    <div><button type="submit" class="big">📨 Отправить ответ</button></div>
   </form>
 </div>'''
-    body += f'<div class="wrap" style="margin-bottom:20px"><a href="/{board_slug}/">[Return]</a> &middot; <a href="#top">[Top]</a></div>'
-    return page(f'/{board_slug}/ - Thread {tid}', body)
+    body += f'<div class="wrap" style="margin-bottom:24px;text-align:center">' \
+            f'<a class="reply-btn" href="/{board_slug}/">← В раздел</a> ' \
+            f'<a class="reply-btn" href="#top">↑ Наверх</a></div>'
+    return page(f'/{board_slug}/ — Тема {tid}', body)
 
-# ==================== ROUTES: POST ACTIONS ====================
+# ==================== ДЕЙСТВИЯ ====================
 @app.post("/{board_slug}/new")
 async def create_thread(
     board_slug: str, request: Request,
@@ -457,15 +606,15 @@ async def create_thread(
     password: str = Form(""),
 ):
     if board_slug not in boards:
-        raise HTTPException(404, "Board not found")
+        raise HTTPException(404, "Раздел не найден")
     ip = get_ip(request)
     if not check_rate(ip):
-        raise HTTPException(429, "Slow down. Wait a few seconds.")
+        raise HTTPException(429, "Слишком часто. Подождите несколько секунд.")
     content = (content or "").strip()[:MAX_CONTENT_LEN]
     subject = (subject or "").strip()[:120]
     image_url = (image_url or "").strip()[:500]
     if not content and not image_url:
-        raise HTTPException(400, "Comment or image required")
+        raise HTTPException(400, "Нужно написать текст или прикрепить картинку")
     pid = new_id()
     posts[pid] = {
         "id": pid, "thread_id": pid, "board": board_slug,
@@ -493,21 +642,21 @@ async def post_reply(
     sage: str = Form(""),
 ):
     if board_slug not in boards:
-        raise HTTPException(404, "Board not found")
+        raise HTTPException(404, "Раздел не найден")
     t = threads.get(tid)
     if not t or t["board"] != board_slug:
-        raise HTTPException(404, "Thread not found")
+        raise HTTPException(404, "Тема не найдена")
     if t.get("locked"):
-        raise HTTPException(403, "Thread is locked")
+        raise HTTPException(403, "Тема закрыта")
     if len(t["posts"]) >= MAX_REPLIES_PER_THREAD:
-        raise HTTPException(403, "Thread is full")
+        raise HTTPException(403, "Тема переполнена")
     ip = get_ip(request)
     if not check_rate(ip):
-        raise HTTPException(429, "Slow down. Wait a few seconds.")
+        raise HTTPException(429, "Слишком часто. Подождите несколько секунд.")
     content = (content or "").strip()[:MAX_CONTENT_LEN]
     image_url = (image_url or "").strip()[:500]
     if not content and not image_url:
-        raise HTTPException(400, "Comment or image required")
+        raise HTTPException(400, "Нужно написать текст или прикрепить картинку")
     is_sage = bool(sage)
     pid = new_id()
     posts[pid] = {
@@ -529,13 +678,13 @@ async def post_reply(
 async def delete_post(pid: int, password: str = Form("")):
     p = posts.get(pid)
     if not p or p["deleted"]:
-        raise HTTPException(404, "Post not found")
+        raise HTTPException(404, "Пост не найден")
     if not p["pw_hash"] or hash_pw(password) != p["pw_hash"]:
-        raise HTTPException(403, "Incorrect password")
+        raise HTTPException(403, "Неверный пароль")
     board = p["board"]
     tid = p["thread_id"]
     p["deleted"] = True
-    p["content"] = "[deleted]"
+    p["content"] = "[удалено]"
     p["image_url"] = ""
     if p["is_op"]:
         t = threads.pop(tid, None)
@@ -544,14 +693,14 @@ async def delete_post(pid: int, password: str = Form("")):
                 rp = posts.get(rid)
                 if rp:
                     rp["deleted"] = True
-                    rp["content"] = "[deleted]"
+                    rp["content"] = "[удалено]"
                     rp["image_url"] = ""
             if tid in boards.get(board, {}).get("threads", []):
                 boards[board]["threads"].remove(tid)
         return RedirectResponse(f"/{board}/", status_code=303)
     return RedirectResponse(f"/{board}/thread/{tid}", status_code=303)
 
-# ==================== UTILITY PAGES ====================
+# ==================== СЛУЖЕБНОЕ ====================
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
@@ -560,27 +709,75 @@ def healthz():
 def robots():
     return "User-agent: *\nDisallow: /\n"
 
-# ==================== BOOTSTRAP ====================
+# ==================== СПИСОК РАЗДЕЛОВ ====================
 def init_boards():
-    create_board("b", "Random", "The birthplace of Anonymous. Anything goes.")
-    create_board("g", "Technology", "Technology discussion.")
-    create_board("v", "Video Games", "Video games discussion.")
-    create_board("a", "Anime & Manga", "Anime and manga.")
-    create_board("pol", "Politically Incorrect", "Politics.")
-    create_board("fit", "Fitness", "Health, fitness, nutrition.")
-    create_board("mu", "Music", "Music discussion.")
-    create_board("ck", "Food & Cooking", "Recipes, cooking, food.")
-    create_board("sci", "Science & Math", "Science and mathematics.")
-    create_board("int", "International", "International / regional discussion.")
-    create_board("diy", "Do It Yourself", "DIY projects and crafts.")
-    create_board("out", "Outdoors", "Hiking, camping, nature.")
+    # Общие
+    create_board("b",    "Разное",              "Всё подряд. О чём угодно.")
+    create_board("news", "Новости",             "Обсуждение новостей и событий.")
+    create_board("int",  "Международный",       "Разговоры о странах и мире.")
+    create_board("rnd",  "Случайности",         "Случайные темы без правил.")
+
+    # Технологии
+    create_board("g",    "Технологии",          "Гаджеты, компьютеры, техника.")
+    create_board("prog", "Программирование",    "Код, языки, разработка.")
+    create_board("hard", "Железо",              "Комплектующие, сборка ПК.")
+    create_board("soft", "Софт",                "Программы и приложения.")
+    create_board("web",  "Веб-разработка",      "Сайты, HTML/CSS/JS, фреймворки.")
+    create_board("sec",  "Кибербезопасность",   "Хакеры, защита, уязвимости.")
+    create_board("diy",  "Сделай сам",          "Мастерская, самоделки.")
+
+    # Игры
+    create_board("v",    "Видеоигры",           "Обсуждение игр.")
+    create_board("retro","Ретро-игры",          "Старые консоли и DOS-игры.")
+    create_board("vgm",  "Игровая музыка",      "Саундтреки и чиптюн.")
+    create_board("mmo",  "Онлайн-игры",         "MMO, шутеры, кооп.")
+
+    # Кино/музыка/книги
+    create_board("mu",   "Музыка",              "Всё о музыке и группах.")
+    create_board("tv",   "Кино и сериалы",      "Фильмы, сериалы, аниме.")
+    create_board("cin",  "Кинематограф",        "Режиссёры, киноискусство.")
+    create_board("lit",  "Литература",          "Книги, стихи, писатели.")
+    create_board("an",   "Аниме и манга",       "Обсуждение аниме и манги.")
+    create_board("a",    "Аниме-арт",           "Картинки, арт по аниме.")
+
+    # Творчество
+    create_board("art",  "Искусство",           "Рисунки, живопись, галереи.")
+    create_board("p",    "Фотография",         "Фото и техника съёмки.")
+    create_board("fa",   "Рисование",           "Уроки и работы художников.")
+    create_board("po",   "Поэзия",              "Стихи и проза.")
+    create_board("ph",   "Философия",           "Размышления и дискуссии.")
+
+    # Наука и учёба
+    create_board("sci",  "Наука",               "Физика, химия, биология.")
+    create_board("his",  "История",             "История стран и событий.")
+    create_board("math", "Математика",          "Числа, формулы, задачи.")
+    create_board("lang", "Иностранные языки",   "Английский и любые другие.")
+
+    # Жизнь
+    create_board("fit",  "Фитнес и здоровье",   "Спорт, питание, ЗОЖ.")
+    create_board("ck",   "Еда и кулинария",     "Рецепты и готовка.")
+    create_board("out",  "Природа и туризм",    "Походы, рыбалка, кемпинг.")
+    create_board("sp",   "Спорт",               "Футбол, хоккей, единоборства.")
+    create_board("biz",  "Работа и деньги",     "Бизнес, фриланс, зарплаты.")
+    create_board("adv",  "Советы",              "Спроси совета у анонимов.")
+    create_board("trv",  "Путешествия",         "Страны, города, маршруты.")
+    create_board("auto", "Авто",                "Машины, мотоциклы, ремонт.")
+
+    # Разное
+    create_board("pol",  "Политика",            "Политические обсуждения.")
+    create_board("r",    "Религия",             "Вера и религии мира.")
+    create_board("x",    "Взрослое (18+)",      "Раздел для взрослых тем.")
+    create_board("weird","Странное",            "Всё необычное и непонятное.")
+    create_board("dev",  "Разработка форума",   "Обсуждение самого форума.")
 
 init_boards()
 
+# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
-    print("=" * 60)
-    print(" Anonymous Imageboard running")
-    print(f" http://localhost:{PORT}/")
-    print(f" Admin key: {ADMIN_KEY}")
-    print("=" * 60)
+    print("=" * 64)
+    print("  Анонимный форум запущен")
+    print(f"  Открой в браузере:  http://localhost:{PORT}/")
+    print(f"  Ключ администратора: {ADMIN_KEY}")
+    print(f"  Разделов: {len(boards)}")
+    print("=" * 64)
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
