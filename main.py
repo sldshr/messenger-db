@@ -19,6 +19,8 @@ APP_TAGLINE = "Что происходит?"
 MAX_TWEET_LEN = 280
 SESSION_COOKIE = "chirp_session"
 
+app = FastAPI(title=APP_NAME, version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
@@ -691,15 +693,12 @@ font-size:14px;transition:opacity .15s;flex-shrink:0;
 .follow-btn:hover{opacity:.85}
 .follow-btn.following{background:transparent;color:var(--text);border:1px solid var(--border)}
 .follow-btn.following:hover{background:var(--danger-soft);color:var(--danger);border-color:var(--danger)}
-.follow-btn.following:hover .label-following{display:none}
-.follow-btn.following .label-unfollow{display:none}
-.follow-btn.following:hover .label-unfollow{display:inline}
 .profile-head{padding:0 16px}
 .profile-banner{height:200px;background:linear-gradient(135deg,#1d9bf0,#8b5cf6,#f91880);margin:0 -16px;position:relative}
 .profile-banner::after{content:"";position:absolute;inset:0;background:radial-gradient(circle at 30% 40%,rgba(255,255,255,.25),transparent 60%)}
 .profile-top{display:flex;justify-content:space-between;align-items:flex-end;margin-top:-68px;position:relative}
 .profile-actions{display:flex;gap:8px;margin-top:68px}
-.btn-outline{border:1px solid var(--border);border-radius:var(--radius-pill);padding:8px 16px;font-weight:700;font-size:14px;transition:background .15s}
+.btn-outline{border:1px solid var(--border);border-radius:var(--radius-pill);padding:8px 16px;font-weight:700;font-size:14px;transition:background .15s;display:inline-flex;align-items:center;gap:6px}
 .btn-outline:hover{background:var(--bg-hover)}
 .profile-info{margin-top:12px}
 .profile-info h2{font-size:22px;font-weight:800;display:flex;align-items:center;gap:6px}
@@ -750,7 +749,6 @@ border-radius:12px;padding:10px 14px;font-size:14px;margin-bottom:16px;
 }
 .success{background:var(--repost-soft);color:var(--repost);border:1px solid var(--repost);border-radius:12px;padding:10px 14px;font-size:14px;margin-bottom:16px}
 .thread-head{padding:16px}
-.thread-line{position:absolute;left:52px;top:64px;bottom:16px;width:2px;background:var(--border)}
 .thread-wrap{position:relative}
 .tweet.thread{padding:12px 16px 16px}
 .reply-context{padding:8px 16px;color:var(--text-dim);font-size:14px}
@@ -814,9 +812,6 @@ color:#fff;display:none;align-items:center;justify-content:center;box-shadow:0 4
 .link-btn{color:var(--accent);font-weight:600}
 .link-btn:hover{text-decoration:underline}
 .hidden{display:none!important}
-.emoji-pick{display:flex;gap:2px;flex-wrap:wrap;max-width:280px;background:var(--bg-elev);border-radius:12px;padding:8px;border:1px solid var(--border)}
-.emoji-pick button{font-size:20px;padding:4px 6px;border-radius:8px}
-.emoji-pick button:hover{background:var(--bg-hover)}
 @media (max-width:1280px){
 .app{grid-template-columns:88px 600px 1fr}
 .sidebar-left{padding:0 8px;align-items:center}
@@ -868,7 +863,6 @@ window.__toast=(msg)=>{
   window.__toastT=setTimeout(()=>t.classList.remove("show"),1800);
 };
 function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML;}
-function fmtNum(n){if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,"")+"M";if(n>=1e3)return (n/1e3).toFixed(1).replace(/\.0$/,"")+"K";return ""+n;}
 async function api(url,opts){
   opts=opts||{};
   opts.headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});
@@ -991,11 +985,6 @@ document.addEventListener("click",async(e)=>{
     }
     return;
   }
-  if(action==="emoji"){
-    const target=document.querySelector(el.dataset.target||"");
-    if(target){target.value+=el.textContent;target.dispatchEvent(new Event("input"));target.focus();}
-    return;
-  }
 });
 function outlineHeart(){return '<svg class="ic" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10z"/></svg>';}
 function filledHeart(){return '<svg class="ic" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10z"/></svg>';}
@@ -1028,30 +1017,14 @@ document.addEventListener("submit",async(e)=>{
   try{
     const r=await api(url,{method:"POST",body:JSON.stringify(data)});
     if(r.redirect){location.href=r.redirect;return;}
-    if(r.tweet){
-      window.__toast("Опубликовано");
-      form.reset();
-      const modal=form.closest(".modal-backdrop");
-      if(modal)modal.classList.remove("show");
-      if(location.pathname==="/"||location.pathname==="/explore"){
-        setTimeout(()=>location.reload(),300);
-      }else{
-        setTimeout(()=>location.reload(),300);
-      }
-    }
+    if(r.tweet){window.__toast("Опубликовано");form.reset();const modal=form.closest(".modal-backdrop");if(modal)modal.classList.remove("show");setTimeout(()=>location.reload(),300);}
     if(r.message){window.__toast(r.message);}
   }catch(err){window.__toast(err.message);}
   finally{if(submit)submit.disabled=false;}
 });
 document.addEventListener("keydown",(e)=>{
-  if(e.key==="Escape"){
-    document.querySelectorAll(".modal-backdrop.show").forEach(m=>m.classList.remove("show"));
-  }
-  if(e.key==="n"&&(e.ctrlKey||e.metaKey)&&!e.altKey){
-    e.preventDefault();
-    const btn=document.querySelector("[data-action=open-compose]");
-    if(btn)btn.click();
-  }
+  if(e.key==="Escape"){document.querySelectorAll(".modal-backdrop.show").forEach(m=>m.classList.remove("show"));}
+  if(e.key==="n"&&(e.ctrlKey||e.metaKey)&&!e.altKey){e.preventDefault();const btn=document.querySelector("[data-action=open-compose]");if(btn)btn.click();}
 });
 })();
 """
@@ -1070,6 +1043,20 @@ def verified_badge() -> str:
     return f'<span class="verified-badge">{icon("verified", 18)}</span>'
 
 
+def quote_svg(svg: str) -> str:
+    from urllib.parse import quote
+    return quote(svg, safe="")
+
+
+def favicon_svg() -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+        '<rect width="32" height="32" rx="8" fill="#1d9bf0"/>'
+        '<path d="M9 24V8h4l6 9V8h4v16h-4l-6-9v9z" fill="#fff"/>'
+        '</svg>'
+    )
+
+
 def layout(title: str, body: str, current_user: Optional[dict], active: str = "", hide_chrome: bool = False) -> str:
     theme = "dark"
     if current_user and current_user.get("theme") == "light":
@@ -1083,9 +1070,7 @@ def layout(title: str, body: str, current_user: Optional[dict], active: str = ""
         chrome = render_sidebar_left(current_user, active)
         mobile_topbar = render_mobile_topbar(current_user)
         bottom_nav = render_bottom_nav(current_user, active)
-        fab = (
-            f'<button class="fab" data-action="open-compose">{icon("feather", 24)}</button>'
-        )
+        fab = f'<button class="fab" data-action="open-compose">{icon("feather", 24)}</button>'
     return (
         '<!DOCTYPE html>'
         f'<html lang="ru" data-theme="{theme}">'
@@ -1109,20 +1094,6 @@ def layout(title: str, body: str, current_user: Optional[dict], active: str = ""
         '<div class="toast" id="toast"></div>'
         f'<script>{JS}</script>'
         '</body></html>'
-    )
-
-
-def quote_svg(svg: str) -> str:
-    from urllib.parse import quote
-    return quote(svg, safe="")
-
-
-def favicon_svg() -> str:
-    return (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-        '<rect width="32" height="32" rx="8" fill="#1d9bf0"/>'
-        '<path d="M9 24V8h4l6 9V8h4v16h-4l-6-9v9z" fill="#fff"/>'
-        '</svg>'
     )
 
 
@@ -1209,6 +1180,35 @@ def render_bottom_nav(user: Optional[dict], active: str) -> str:
     return "".join(parts)
 
 
+def render_user_card(u: dict, viewer: Optional[dict]) -> str:
+    is_me = viewer and viewer["id"] == u["id"]
+    if is_me:
+        btn = ""
+    elif viewer and is_following(viewer["id"], u["id"]):
+        btn = (
+            f'<button class="follow-btn following" data-action="follow" data-username="{esc(u["username"])}">'
+            '<span class="lbl">Читаю</span></button>'
+        )
+    else:
+        btn = (
+            f'<button class="follow-btn" data-action="follow" data-username="{esc(u["username"])}">'
+            '<span class="lbl">Читать</span></button>'
+        )
+    return (
+        f'<div class="card-item" onclick="location.href=\'/u/{esc(u["username"])}\'">'
+        f'{avatar_html(u)}'
+        f'<div style="flex:1;min-width:0">'
+        f'<div style="font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+        f'{esc(u.get("display_name") or u["username"])}'
+        f'{verified_badge() if u.get("verified") else ""}'
+        f'</div>'
+        f'<div style="color:var(--text-dim);font-size:14px">@{esc(u["username"])}</div>'
+        f'</div>'
+        f'{btn}'
+        '</div>'
+    )
+
+
 def render_sidebar_right(user: Optional[dict], active: str) -> str:
     if not user:
         return "<aside class='sidebar-right'></aside>"
@@ -1255,35 +1255,6 @@ def render_sidebar_right(user: Optional[dict], active: str) -> str:
     return "".join(parts)
 
 
-def render_user_card(u: dict, viewer: Optional[dict]) -> str:
-    is_me = viewer and viewer["id"] == u["id"]
-    if is_me:
-        btn = ""
-    elif viewer and is_following(viewer["id"], u["id"]):
-        btn = (
-            f'<button class="follow-btn following" data-action="follow" data-username="{esc(u["username"])}">'
-            '<span class="lbl">Читаю</span></button>'
-        )
-    else:
-        btn = (
-            f'<button class="follow-btn" data-action="follow" data-username="{esc(u["username"])}">'
-            '<span class="lbl">Читать</span></button>'
-        )
-    return (
-        f'<div class="card-item" onclick="location.href=\'/u/{esc(u["username"])}\'">'
-        f'{avatar_html(u)}'
-        f'<div style="flex:1;min-width:0">'
-        f'<div style="font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
-        f'{esc(u.get("display_name") or u["username"])}'
-        f'{verified_badge() if u.get("verified") else ""}'
-        f'</div>'
-        f'<div style="color:var(--text-dim);font-size:14px">@{esc(u["username"])}</div>'
-        f'</div>'
-        f'{btn}'
-        '</div>'
-    )
-
-
 def render_tweet(
     tweet: dict,
     viewer: Optional[dict],
@@ -1314,20 +1285,15 @@ def render_tweet(
                 f'<a href="/u/{esc(pauthor["username"])}">@{esc(pauthor["username"])}</a></div>'
             )
     if show_context and tweet.get("retweet_of") and tweet["retweet_of"] in TWEETS:
-        parts.append(
-            f'<div class="repost-label">{icon("repost", 16)} Репост</div>'
-        )
+        parts.append(f'<div class="repost-label">{icon("repost", 16)} Репост</div>')
     if is_pinned:
-        parts.append(
-            f'<div class="pin-label">{icon("pin", 14)} Закреплено</div>'
-        )
+        parts.append(f'<div class="pin-label">{icon("pin", 14)} Закреплено</div>')
 
     like_svg = (
         '<svg class="ic" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10z"/></svg>'
         if liked
         else icon("heart", 22)
     )
-    menu = ""
     if is_me:
         menu = (
             f'<div class="menu-wrap" onclick="event.stopPropagation()">'
@@ -1530,10 +1496,7 @@ async def index(request: Request):
             '<p>Начните подписываться на интересных людей или создайте свой первый пост.</p>'
             '</div>'
         )
-    body = (
-        '<div class="topbar"><h1>Главная</h1></div>'
-        f'{composer}{feed_html}'
-    )
+    body = f'<div class="topbar"><h1>Главная</h1></div>{composer}{feed_html}'
     return HTMLResponse(layout("Главная", body, user, active="home"))
 
 
@@ -1542,9 +1505,7 @@ async def login_page(request: Request, error: Optional[str] = None, mode: str = 
     user = get_current_user(request)
     if user:
         return RedirectResponse("/")
-    err_html = ""
-    if error:
-        err_html = f'<div class="error">{esc(error)}</div>'
+    err_html = f'<div class="error">{esc(error)}</div>' if error else ""
     if mode == "register":
         form = (
             '<h1>Создать аккаунт</h1>'
@@ -1560,8 +1521,7 @@ async def login_page(request: Request, error: Optional[str] = None, mode: str = 
             '<input type="password" name="password" required autocomplete="new-password" minlength="6"></div>'
             '<button type="submit" class="btn-primary">Зарегистрироваться</button>'
             '</form>'
-            '<div class="switch">Уже есть аккаунт? '
-            '<a href="/login">Войти</a></div>'
+            '<div class="switch">Уже есть аккаунт? <a href="/login">Войти</a></div>'
         )
         title = "Регистрация"
     else:
@@ -1575,8 +1535,7 @@ async def login_page(request: Request, error: Optional[str] = None, mode: str = 
             '<input type="password" name="password" required autocomplete="current-password"></div>'
             '<button type="submit" class="btn-primary">Войти</button>'
             '</form>'
-            '<div class="switch">Нет аккаунта? '
-            '<a href="/login?mode=register">Создать</a></div>'
+            '<div class="switch">Нет аккаунта? <a href="/login?mode=register">Создать</a></div>'
         )
         title = "Вход"
     body = (
@@ -1595,10 +1554,9 @@ async def explore_page(request: Request):
     if not user:
         return RedirectResponse("/login")
     feed = global_timeline(80)
-    if feed:
-        feed_html = render_tweet_list(feed, user)
-    else:
-        feed_html = '<div class="empty"><h3>Пока пусто</h3><p>Никто ещё не написал ни одного поста.</p></div>'
+    feed_html = render_tweet_list(feed, user) if feed else (
+        '<div class="empty"><h3>Пока пусто</h3><p>Никто ещё не написал ни одного поста.</p></div>'
+    )
     tags = trending_hashtags(12)
     tags_html = ""
     if tags:
@@ -1606,10 +1564,7 @@ async def explore_page(request: Request):
             f'<a class="pill" href="/search?q=%23{esc(t)}">#{esc(t)} · {c}</a>' for t, c in tags
         )
         tags_html = f'<div style="padding:16px;border-bottom:1px solid var(--border)">{pills}</div>'
-    body = (
-        '<div class="topbar"><h1>Обзор</h1></div>'
-        f'{tags_html}{feed_html}'
-    )
+    body = f'<div class="topbar"><h1>Обзор</h1></div>{tags_html}{feed_html}'
     return HTMLResponse(layout("Обзор", body, user, active="search"))
 
 
@@ -1646,12 +1601,10 @@ async def notifications_page(request: Request):
             icon_name, icon_cls, text = "comment", "", "ответил(а) на ваш пост"
         elif n["kind"] == "mention":
             icon_name, icon_cls, text = "at", "", "упомянул(а) вас"
-        preview = ""
-        if tweet:
-            preview = f'<div class="preview">{linkify(tweet["text"])}</div>'
+        preview = f'<div class="preview">{linkify(tweet["text"])}</div>' if tweet else ""
         link = f'/t/{tweet["id"]}' if tweet else f'/u/{actor["username"]}'
         parts.append(
-            f'<a class="notif-row {"unread" if not n.get("read") else ""}" href="{link}">'
+            f'<a class="notif-row" href="{link}">'
             f'<div class="notif-ic {icon_cls}">{icon(icon_name, 24)}</div>'
             f'{avatar_html(actor, "sm")}'
             f'<div class="notif-body">'
@@ -1820,9 +1773,7 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
     tweets_count = len([t for t in TWEETS.values() if t["user_id"] == profile["id"] and not t.get("parent_id")])
 
     if is_me:
-        action_btn = (
-            '<a href="/settings" class="btn-outline">Изменить профиль</a>'
-        )
+        action_btn = '<a href="/settings" class="btn-outline">Изменить профиль</a>'
     elif following:
         action_btn = (
             f'<button class="follow-btn following" data-action="follow" data-username="{esc(profile["username"])}">'
@@ -1838,7 +1789,6 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
         msg_btn = f'<a href="/messages/{esc(profile["username"])}" class="btn-outline">{icon("mail", 18)}</a>'
 
     banner_style = f'style="background:linear-gradient(135deg,{profile["avatar_color"]},#8b5cf6)"'
-
     bio_html = f'<div class="profile-bio">{linkify(profile["bio"])}</div>' if profile["bio"] else ""
     meta_bits = []
     if profile["location"]:
@@ -1850,9 +1800,7 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
         meta_bits.append(
             f'<a href="{esc(website)}" target="_blank" rel="noopener" class="tlink">{esc(profile["website"])}</a>'
         )
-    meta_bits.append(
-        f'{icon("user", 16)} Регистрация: {profile["created_at"].strftime("%b %Y")}'
-    )
+    meta_bits.append(f'{icon("user", 16)} Регистрация: {profile["created_at"].strftime("%b %Y")}')
     meta_html = f'<div class="profile-meta">{"".join(meta_bits)}</div>'
 
     head = (
@@ -1881,7 +1829,6 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
         '</div>'
         '</div>'
     )
-
     tabs = (
         '<div class="tabs">'
         f'<a class="tab {"active" if tab == "posts" else ""}" href="/u/{esc(profile["username"])}?tab=posts">Посты</a>'
@@ -1890,7 +1837,6 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
         f'<a class="tab {"active" if tab == "likes" else ""}" href="/u/{esc(profile["username"])}?tab=likes">Нравится</a>'
         '</div>'
     )
-
     content = ""
     if tab == "posts":
         items = user_tweets(profile["id"])
@@ -1902,32 +1848,19 @@ async def profile_page(request: Request, username: str, tab: str = "posts"):
         )
     elif tab == "replies":
         items = user_replies(profile["id"])
-        content = render_tweet_list(items, user) or (
-            '<div class="empty"><h3>Пока нет ответов</h3></div>'
-        )
+        content = render_tweet_list(items, user) or '<div class="empty"><h3>Пока нет ответов</h3></div>'
     elif tab == "media":
         items = user_media(profile["id"])
-        content = render_tweet_list(items, user) or (
-            '<div class="empty"><h3>Нет медиа</h3></div>'
-        )
+        content = render_tweet_list(items, user) or '<div class="empty"><h3>Нет медиа</h3></div>'
     elif tab == "likes":
         items = user_likes(profile["id"])
-        content = render_tweet_list(items, user) or (
-            '<div class="empty"><h3>Нет лайков</h3></div>'
-        )
+        content = render_tweet_list(items, user) or '<div class="empty"><h3>Нет лайков</h3></div>'
     elif tab == "followers":
         items = [USERS[i] for i in FOLLOWERS.get(profile["id"], set()) if i in USERS]
-        if items:
-            content = "".join(render_user_card(u, user) for u in items)
-        else:
-            content = '<div class="empty"><h3>Нет читателей</h3></div>'
+        content = "".join(render_user_card(u, user) for u in items) if items else '<div class="empty"><h3>Нет читателей</h3></div>'
     elif tab == "following":
         items = [USERS[i] for i in FOLLOWING.get(profile["id"], set()) if i in USERS]
-        if items:
-            content = "".join(render_user_card(u, user) for u in items)
-        else:
-            content = '<div class="empty"><h3>Ни на кого не подписан</h3></div>'
-
+        content = "".join(render_user_card(u, user) for u in items) if items else '<div class="empty"><h3>Ни на кого не подписан</h3></div>'
     body = head + head_html + tabs + content
     return HTMLResponse(layout(f"@{profile['username']}", body, user, active="user"))
 
@@ -1943,19 +1876,10 @@ async def tweet_page(request: Request, tweet_id: str):
     thread = build_thread(tweet_id)
     replies = [TWEETS[i] for i in reply_ids(tweet_id)]
     replies.sort(key=lambda t: t["created_at"])
-
-    thread_html = []
-    for i, t in enumerate(thread):
-        thread_html.append(render_tweet(t, user, thread_mode=True, show_context=False))
-    reply_html = []
-    if replies:
-        for r in replies:
-            reply_html.append(render_tweet(r, user, show_context=True))
-    else:
-        reply_html.append(
-            '<div class="empty"><p style="font-size:14px">Пока нет ответов. Будьте первым!</p></div>'
-        )
-    author = USERS.get(tweet["user_id"])
+    thread_html = [render_tweet(t, user, thread_mode=True, show_context=False) for t in thread]
+    reply_html = [render_tweet(r, user, show_context=True) for r in replies] if replies else [
+        '<div class="empty"><p style="font-size:14px">Пока нет ответов. Будьте первым!</p></div>'
+    ]
     head = (
         '<div class="topbar">'
         '<button class="back-btn" onclick="history.back()">'
@@ -2188,6 +2112,7 @@ def seed_data():
         usr["website"] = site
         usr["verified"] = u in ("chirp", "anna", "dmitry")
         return usr
+
     a = make("anna", "anna@example.com", "password", "Анна Смирнова",
              "Дизайнер интерфейсов. Люблю кофе и минимализм.", "Москва", "anna.design")
     b = make("dmitry", "dmitry@example.com", "password", "Дмитрий Орлов",
@@ -2218,6 +2143,9 @@ def seed_data():
     toggle_follow(a["id"], e["id"])
     toggle_follow(a["id"], f["id"])
     toggle_follow(b["id"], f["id"])
+
+    for u in (a, b, c, d, e, f):
+        NOTIFICATIONS[u["id"]] = []
 
     t1 = create_tweet(d["id"], "Добро пожаловать в Chirp! 🎉\n\nЭто минималистичная соцсеть на FastAPI. Всё работает в памяти, без базы данных.\n\nПопробуйте: #chirp #fastapi")
     t2 = create_tweet(a["id"], "Закончила редизайн личного сайта. Осталось только выложить 😅 #design #дизайн")
@@ -2264,6 +2192,9 @@ def seed_data():
     send_message(a["id"], b["id"], "Звучит круто, покажешь потом?")
     send_message(c["id"], a["id"], "Хочу сходить на выставку, ты со мной?")
 
+    for u in (a, b, c, d, e, f):
+        NOTIFICATIONS[u["id"]] = NOTIFICATIONS.get(u["id"], [])
+
 
 seed_data()
 
@@ -2297,4 +2228,4 @@ async def http_exc_handler(request: Request, exc: HTTPException):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
