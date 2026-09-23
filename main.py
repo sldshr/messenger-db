@@ -2311,6 +2311,92 @@ FAVICON = FAVICON_RU_DARK
 
 
 # ============================================================================
+# Server-side OpenGraph helpers
+# ============================================================================
+def _og_escape(s) -> str:
+    """HTML-escape for use inside an attribute value."""
+    return (str(s or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;"))
+
+
+def _build_og_base(request: Request, lang: str) -> dict:
+    t = TEXTS[lang]
+    url = str(request.url).split("#", 1)[0]
+    return {
+        "site_name": t["site_name"],
+        "url": url,
+        "type": "website",
+        "title": t["site_name"],
+        "description": t["auth_tagline"],
+        "image": None,
+    }
+
+
+def build_og_post(post: dict, request: Request, lang: str) -> dict:
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    author = (post.get("author") or "").strip()
+    text = (post.get("text") or "").strip()
+    first_line = text.split("\n", 1)[0].strip()
+    if len(first_line) > 80:
+        first_line = first_line[:80].rstrip() + "…"
+    if author and first_line:
+        title = f"@{author}: {first_line}"
+    elif author:
+        title = f"@{author} — {t['site_name']}"
+    elif first_line:
+        title = first_line
+    else:
+        title = t["site_name"]
+    description = text[:300]
+    if len(text) > 300:
+        description = description.rstrip() + "…"
+    image = None
+    og_raw = post.get("og_data")
+    if isinstance(og_raw, dict):
+        img = og_raw.get("image")
+        if img:
+            image = _safe_url(img) or None
+        if not description:
+            description = str(og_raw.get("description") or "")[:300]
+    if not description:
+        description = t["auth_tagline"]
+    quoted_id = post.get("quoted_post_id")
+    if quoted_id:
+        try:
+            qp = db_get_post(quoted_id)
+            if qp and qp.get("author"):
+                qline = f"\n↩ @{qp['author']}: {(qp.get('text') or '')[:140]}"
+                description = (description + qline)[:400]
+        except Exception:
+            pass
+    og["title"] = title
+    og["description"] = description
+    og["image"] = image
+    og["type"] = "article"
+    og["url"] = f"{og['url'].split('?')[0].rstrip('/')}"
+    return og
+
+
+def build_og_user(u: dict, request: Request, lang: str) -> dict:
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    nick = (u.get("nick") or "").strip()
+    name = (u.get("name") or nick).strip()
+    bio = (u.get("bio") or "").strip()
+    title = f"{name} (@{nick}) — {t['site_name']}" if nick else name
+    description = bio or f"@{nick}" if nick else t["auth_tagline"]
+    og["title"] = title
+    og["description"] = description[:300]
+    og["type"] = "profile"
+    return og
+
+
+# ============================================================================
 # CSS
 # ============================================================================
 CSS = """
@@ -2673,10 +2759,48 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash { 0% { background: var(--accent-soft-2); } 100% { background: var(--card-2); } }
 .comment.pending { opacity: .65; }
+
+/* ====== Comments tree ====== */
 .comments { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .comment { padding: 10px 14px; background: var(--card-2); border-radius: 12px; margin-top: 6px; }
-.comment.reply { margin-left: 26px; background: transparent; border-left: 2px solid var(--line-2); border-radius: 0; padding-left: 12px; padding-top: 6px; padding-bottom: 6px; }
 .comment.is-author { box-shadow: inset 0 0 0 1px var(--accent-soft-2); }
+
+/* Reply now uses the SAME card style as a normal comment + L-shaped connector */
+.comment.reply {
+  position: relative;
+  margin-left: 34px;
+  margin-top: 6px;
+  padding: 10px 14px;
+  background: var(--card-2);
+  border-radius: 12px;
+}
+/* Vertical + horizontal line (corner) from the parent comment */
+.comment.reply::before {
+  content: '';
+  position: absolute;
+  left: -22px;
+  top: -8px;
+  width: 18px;
+  height: 20px;
+  border-left: 2px solid var(--line-3);
+  border-bottom: 2px solid var(--line-3);
+  border-bottom-left-radius: 10px;
+  pointer-events: none;
+}
+/* Small arrowhead at the end of the horizontal line */
+.comment.reply::after {
+  content: '';
+  position: absolute;
+  left: -5px;
+  top: 7px;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid var(--line-3);
+  pointer-events: none;
+}
+
 .comment-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }
 .comment-author { font-size: 13px; font-weight: 700; color: var(--text); text-decoration: none; }
 .comment-author:hover { color: var(--accent); }
@@ -2740,6 +2864,10 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .publish-btn-desktop { display: none !important; }
   .composer-hint { display: none; }
   .composer-actions { gap: 8px; }
+  /* On narrow screens keep reply connector compact */
+  .comment.reply { margin-left: 26px; }
+  .comment.reply::before { left: -18px; width: 16px; height: 18px; }
+  .comment.reply::after { left: -5px; top: 6px; }
   .settings-layout { flex-direction: column; padding: 4px 12px 40px; gap: 12px; }
   .settings-nav { display: none; }
   .settings-block { padding: 16px; border-radius: 14px; }
@@ -4941,9 +5069,46 @@ UI.registerScreen('following',     renderFollowListView);
 
 
 # ============================================================================
-# Page render
+# Page render (with server-side OpenGraph)
 # ============================================================================
-def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
+def _render_og_meta(og: Optional[dict], t: dict, init_fav: str) -> str:
+    if not og:
+        og = {
+            "site_name": t["site_name"],
+            "title": t["site_name"],
+            "description": t["auth_tagline"],
+            "url": "",
+            "type": "website",
+            "image": None,
+        }
+    title = og.get("title") or og.get("site_name") or t["site_name"]
+    description = og.get("description") or t["auth_tagline"]
+    url = og.get("url") or ""
+    ogtype = og.get("type") or "website"
+    site_name = og.get("site_name") or t["site_name"]
+    image = og.get("image") or ""
+    lines = [
+        f'<meta name="description" content="{_og_escape(description)}" />',
+        f'<meta property="og:site_name" content="{_og_escape(site_name)}" />',
+        f'<meta property="og:type" content="{_og_escape(ogtype)}" />',
+        f'<meta property="og:title" content="{_og_escape(title)}" />',
+        f'<meta property="og:description" content="{_og_escape(description)}" />',
+    ]
+    if url:
+        lines.append(f'<meta property="og:url" content="{_og_escape(url)}" />')
+    if image:
+        lines.append(f'<meta property="og:image" content="{_og_escape(image)}" />')
+        lines.append('<meta name="twitter:card" content="summary_large_image" />')
+        lines.append(f'<meta name="twitter:image" content="{_og_escape(image)}" />')
+    else:
+        lines.append('<meta name="twitter:card" content="summary" />')
+    lines.append(f'<meta name="twitter:title" content="{_og_escape(title)}" />')
+    lines.append(f'<meta name="twitter:description" content="{_og_escape(description)}" />')
+    return "\n".join(lines)
+
+
+def render_page(lang: str, view: str, view_data: Optional[dict] = None,
+                og: Optional[dict] = None) -> str:
     t = TEXTS[lang]
     view_data = view_data or {}
     emoji_names = {e[0]: {"ru": e[1], "en": e[2]} for e in EMOJI_DATA}
@@ -4990,6 +5155,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__FAVICON_EN_DARK__", FAVICON_EN_DARK)
           .replace("__FAVICON_EN_LIGHT__", FAVICON_EN_LIGHT))
     init_fav = FAVICON_RU_DARK if lang == "ru" else FAVICON_EN_DARK
+    og_html = _render_og_meta(og, t, init_fav)
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
@@ -4998,6 +5164,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
         '<meta name="color-scheme" content="dark light" />\n'
         '<meta name="theme-color" content="#0a0a0b" />\n'
         f'<link id="sld-favicon" rel="icon" type="image/svg+xml" href="{init_fav}" />\n'
+        + og_html + '\n'
         f'<title>{t["site_name"]}</title>\n'
         '<style>' + CSS + '</style>\n'
         '</head>\n'
@@ -5050,44 +5217,125 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
 
+# ============================================================================
+# HTML routes
+# ============================================================================
 @app.get("/", response_class=HTMLResponse)
-def page_index(request: Request): return render_page(get_lang(request), "feed")
+def page_index(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['site_name']} — {t['page_title_feed']}"
+    og["description"] = t["auth_tagline"]
+    return render_page(lang, "feed", og=og)
+
 
 @app.get("/p/{post_id}", response_class=HTMLResponse)
 def page_post(post_id: str, request: Request):
-    if not db_get_post(post_id):
+    p = db_get_post(post_id)
+    if not p:
         raise HTTPException(404, "not found")
-    return render_page(get_lang(request), "post", {"post_id": post_id})
+    lang = get_lang(request)
+    og = build_og_post(p, request, lang)
+    return render_page(lang, "post", {"post_id": post_id}, og=og)
+
 
 @app.get("/u/{nick}", response_class=HTMLResponse)
 def page_user(nick: str, request: Request):
-    return render_page(get_lang(request), "profile", {"nick": nick})
+    lang = get_lang(request)
+    u = db_load_user(nick)
+    if u:
+        og = build_og_user(u, request, lang)
+    else:
+        og = _build_og_base(request, lang)
+    return render_page(lang, "profile", {"nick": nick}, og=og)
+
 
 @app.get("/u/{nick}/followers", response_class=HTMLResponse)
 def page_followers(nick: str, request: Request):
-    return render_page(get_lang(request), "followers", {"nick": nick})
+    lang = get_lang(request)
+    u = db_load_user(nick)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_followers']} — @{nick} — {t['site_name']}"
+    if u:
+        og["description"] = (u.get("bio") or "")[:300] or f"@{nick}"
+    return render_page(lang, "followers", {"nick": nick}, og=og)
+
 
 @app.get("/u/{nick}/following", response_class=HTMLResponse)
 def page_following(nick: str, request: Request):
-    return render_page(get_lang(request), "following", {"nick": nick})
+    lang = get_lang(request)
+    u = db_load_user(nick)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_following']} — @{nick} — {t['site_name']}"
+    if u:
+        og["description"] = (u.get("bio") or "")[:300] or f"@{nick}"
+    return render_page(lang, "following", {"nick": nick}, og=og)
+
 
 @app.get("/users", response_class=HTMLResponse)
-def page_users(request: Request): return render_page(get_lang(request), "users")
+def page_users(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_users']} — {t['site_name']}"
+    return render_page(lang, "users", og=og)
+
 
 @app.get("/notifications", response_class=HTMLResponse)
-def page_notifications(request: Request): return render_page(get_lang(request), "notifications")
+def page_notifications(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_notifications']} — {t['site_name']}"
+    return render_page(lang, "notifications", og=og)
+
 
 @app.get("/settings", response_class=HTMLResponse)
-def page_settings(request: Request): return render_page(get_lang(request), "settings")
+def page_settings(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_settings']} — {t['site_name']}"
+    return render_page(lang, "settings", og=og)
+
 
 @app.get("/settings/profile", response_class=HTMLResponse)
-def page_edit_profile(request: Request): return render_page(get_lang(request), "settings")
+def page_edit_profile(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_settings']} — {t['site_name']}"
+    return render_page(lang, "settings", og=og)
+
 
 @app.get("/policy", response_class=HTMLResponse)
-def page_policy(request: Request): return render_page(get_lang(request), "policy")
+def page_policy(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_policy']} — {t['site_name']}"
+    og["description"] = t["policy_content"][:300]
+    return render_page(lang, "policy", og=og)
+
 
 @app.get("/register", response_class=HTMLResponse)
-def page_register(request: Request): return render_page(get_lang(request), "login")
+def page_register(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_register']} — {t['site_name']}"
+    og["description"] = t["auth_tagline"]
+    return render_page(lang, "login", og=og)
+
 
 @app.get("/login", response_class=HTMLResponse)
-def page_login(request: Request): return render_page(get_lang(request), "login")
+def page_login(request: Request):
+    lang = get_lang(request)
+    t = TEXTS[lang]
+    og = _build_og_base(request, lang)
+    og["title"] = f"{t['page_title_login']} — {t['site_name']}"
+    og["description"] = t["auth_tagline"]
+    return render_page(lang, "login", og=og)
