@@ -1,5 +1,5 @@
 """
-sldchat — веб-чат в стиле IRC/Telegram. Один файл. Всё в оперативке.
+sldchat — веб-чат. Один файл. Всё в оперативке.
 
 ENV:
   APP_NAME     название приложения (по умолчанию "sldchat")
@@ -13,13 +13,14 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from typing import Optional, Dict, List, Set
 
 from fastapi import (
     FastAPI, WebSocket, WebSocketDisconnect, HTTPException,
     Header, Depends, Cookie, Response, Request,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 
 # ============================================================
@@ -35,6 +36,7 @@ MENTION_RE = re.compile(r"(?<![A-Za-z0-9_\-])@([A-Za-z0-9_\-]{3,24})")
 LOGIN_WINDOW, LOGIN_MAX = 60, 8
 WS_MSG_WINDOW, WS_MSG_MAX = 5, 12
 MAX_MENTIONS_PER_USER = 200
+LOG_MAXLEN = 5000
 
 # ============================================================
 #  ХРАНИЛИЩЕ
@@ -43,7 +45,7 @@ users: Dict[str, dict] = {}
 tokens: Dict[str, str] = {}
 channels: Dict[str, dict] = {}
 messages: Dict[str, List[dict]] = {}
-user_mentions: Dict[str, List[dict]] = {}  # username_lower -> [mention]
+user_mentions: Dict[str, List[dict]] = {}
 
 connections: Dict[WebSocket, dict] = {}
 admin_ws: Set[WebSocket] = set()
@@ -51,6 +53,8 @@ admin_ws: Set[WebSocket] = set()
 login_attempts: Dict[str, List[float]] = {}
 msg_attempts: Dict[str, List[float]] = {}
 admin_sessions: Set[str] = set()
+
+server_log: deque = deque(maxlen=LOG_MAXLEN)
 
 _STARTED_AT = time.time()
 
@@ -61,7 +65,15 @@ def _seed() -> None:
         messages[cid] = []
 
 
+def log_event(level: str, msg: str) -> None:
+    ts = time.time()
+    server_log.append({"ts": ts, "level": level, "message": msg})
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    print(f"[{stamp}] [{level.upper()}] {msg}")
+
+
 _seed()
+log_event("info", f"{APP_NAME} запущен, каналов: {len(channels)}")
 
 
 # ============================================================
@@ -278,6 +290,7 @@ def register(body: RegisterBody, request: Request):
         raise HTTPException(400, "Пароль: минимум 6 символов")
     key = body.username.lower()
     if key in users:
+        log_event("auth", f"Регистрация отклонена (занят): {body.username} [{ip}]")
         raise HTTPException(409, "Такой юзернейм уже занят")
     salt = secrets.token_hex(8)
     users[key] = {
@@ -290,6 +303,7 @@ def register(body: RegisterBody, request: Request):
         "last_seen": _now(),
     }
     _record_login(body.username, request)
+    log_event("auth", f"Регистрация: {body.username} [{ip}]")
     token = secrets.token_urlsafe(24)
     tokens[token] = body.username
     return {"token": token, **public_user(body.username)}
@@ -302,8 +316,10 @@ def login(body: LoginBody, request: Request):
     key = body.username.strip().lower()
     u = users.get(key)
     if not u or u["hash"] != hash_pw(body.password, u["salt"]):
+        log_event("auth", f"Неудачный вход: {body.username} [{ip}]")
         raise HTTPException(401, "Неверный юзернейм или пароль")
     _record_login(u["username"], request)
+    log_event("auth", f"Вход: {u['username']} [{ip}]")
     token = secrets.token_urlsafe(24)
     tokens[token] = u["username"]
     return {"token": token, **public_user(u["username"])}
@@ -312,7 +328,9 @@ def login(body: LoginBody, request: Request):
 @app.post("/api/logout")
 def logout(x_auth_token: Optional[str] = Header(None)):
     if x_auth_token and x_auth_token in tokens:
+        name = tokens[x_auth_token]
         del tokens[x_auth_token]
+        log_event("auth", f"Выход: {name}")
     return {"ok": True}
 
 
@@ -333,7 +351,9 @@ async def update_profile(body: ProfileBody, user: str = Depends(require_user)):
     u = users.get(user.lower())
     if not u:
         raise HTTPException(401, "Unauthorized")
+    old = u.get("display_name")
     u["display_name"] = body.display_name
+    log_event("info", f"Профиль обновлён: {u['username']} ({old} → {body.display_name})")
     await broadcast_chat({
         "type": "profile_updated",
         "username": u["username"],
@@ -346,9 +366,8 @@ async def update_profile(body: ProfileBody, user: str = Depends(require_user)):
 @app.get("/api/mentions")
 def list_mentions(user: str = Depends(require_user)):
     key = user.lower()
-    lst = user_mentions.get(key, [])
     out = []
-    for m in lst:
+    for m in user_mentions.get(key, []):
         if m["channel"] not in channels:
             continue
         out.append({
@@ -367,9 +386,8 @@ def list_mentions(user: str = Depends(require_user)):
 @app.post("/api/mentions/read")
 async def mentions_read(body: MentionsReadBody, user: str = Depends(require_user)):
     key = user.lower()
-    lst = user_mentions.get(key, [])
     changed = 0
-    for m in lst:
+    for m in user_mentions.get(key, []):
         if m["read"]:
             continue
         if body.channel is None or m["channel"] == body.channel:
@@ -426,12 +444,13 @@ async def create_channel(body: ChannelBody, user: str = Depends(require_user)):
         raise HTTPException(409, "Канал уже существует")
     channels[cid] = {"id": cid, "name": raw, "owner": user, "created": _now()}
     messages[cid] = []
+    log_event("info", f"Канал создан: #{cid} пользователем {user}")
     await broadcast_chat({"type": "channels_changed"})
     return {"id": cid, "name": raw}
 
 
 # ============================================================
-#  WEBSOCKET (чат)
+#  WEBSOCKET
 # ============================================================
 async def _handle_chat_message(cid: str, username: str, text: str) -> None:
     text = (text or "").strip()
@@ -455,17 +474,13 @@ async def _handle_chat_message(cid: str, username: str, text: str) -> None:
         u["last_seen"] = now
     await broadcast_chat({"type": "message", "message": msg})
 
-    # Парсим упоминания
     mentioned = set(MENTION_RE.findall(text))
     for nick in mentioned:
         nk = nick.lower()
         if nk not in users or nk == username.lower():
             continue
-        entry = {
-            "id": msg["id"], "channel": cid,
-            "from": username, "ts": now,
-            "read": False, "text": text,
-        }
+        entry = {"id": msg["id"], "channel": cid, "from": username,
+                 "ts": now, "read": False, "text": text}
         bucket = user_mentions.setdefault(nk, [])
         bucket.append(entry)
         if len(bucket) > MAX_MENTIONS_PER_USER:
@@ -490,15 +505,14 @@ async def _handle_edit_message(mid: str, username: str, text: str) -> None:
                 if m["user"] != username:
                     return
                 lst[i] = {**m, "text": text, "edited": _now()}
-                await broadcast_chat({
-                    "type": "message_edited", "id": mid, "channel": cid,
-                    "text": text, "edited": lst[i]["edited"],
-                })
-                # обновим текст в mentions
                 for bucket in user_mentions.values():
                     for mm in bucket:
                         if mm["id"] == mid:
                             mm["text"] = text
+                await broadcast_chat({
+                    "type": "message_edited", "id": mid, "channel": cid,
+                    "text": text, "edited": lst[i]["edited"],
+                })
                 return
 
 
@@ -593,11 +607,13 @@ def admin_login(body: AdminLoginBody, request: Request, response: Response):
     ip = client_ip(request)
     rate_check(login_attempts, "admin:" + ip, LOGIN_WINDOW, LOGIN_MAX, "Слишком много попыток")
     if not secrets.compare_digest(body.password, ADMIN_PASS):
+        log_event("warn", f"Неудачный вход в админку [{ip}]")
         raise HTTPException(401, "Неверный пароль")
     token = secrets.token_urlsafe(32)
     admin_sessions.add(token)
     response.set_cookie("sld_admin", token, httponly=True, samesite="strict",
                         max_age=60 * 60 * 12)
+    log_event("admin", f"Вход в админку [{ip}]")
     return {"ok": True}
 
 
@@ -606,6 +622,7 @@ def admin_logout(response: Response, sld_admin: Optional[str] = Cookie(None)):
     if sld_admin:
         admin_sessions.discard(sld_admin)
     response.delete_cookie("sld_admin")
+    log_event("admin", "Выход из админки")
     return {"ok": True}
 
 
@@ -616,13 +633,73 @@ def admin_session(_: None = Depends(require_admin)):
 
 @app.get("/api/admin/stats")
 def admin_stats(_: None = Depends(require_admin)):
+    total_users = len(users)
+    total_channels = len(channels)
+    total_messages = sum(len(v) for v in messages.values())
+    online = len(_online_usernames())
+
+    now = _now()
+
+    # Сообщения по дням (14 дней)
+    day_labels: List[str] = []
+    messages_per_day: Dict[str, int] = {}
+    regs_per_day: Dict[str, int] = {}
+    logins_per_day: Dict[str, int] = {}
+    for i in range(13, -1, -1):
+        d = _day_str(now - i * 86400)
+        day_labels.append(d)
+        messages_per_day[d] = 0
+        regs_per_day[d] = 0
+        logins_per_day[d] = 0
+
+    for lst in messages.values():
+        for m in lst:
+            d = _day_str(m["ts"])
+            if d in messages_per_day:
+                messages_per_day[d] += 1
+
+    for u in users.values():
+        d = _day_str(u["created"])
+        if d in regs_per_day:
+            regs_per_day[d] += 1
+        for l in u.get("logins", []):
+            d2 = _day_str(l["ts"])
+            if d2 in logins_per_day:
+                logins_per_day[d2] += 1
+
+    # Сообщения по каналам
+    messages_by_channel: Dict[str, int] = {}
+    for cid, lst in messages.items():
+        name = channels.get(cid, {}).get("name", cid)
+        messages_by_channel[name] = len(lst)
+
+    # Топ-5 авторов
+    user_msg: Dict[str, int] = {}
+    for lst in messages.values():
+        for m in lst:
+            user_msg[m["user"]] = user_msg.get(m["user"], 0) + 1
+    top_users = sorted(user_msg.items(), key=lambda x: -x[1])[:6]
+
+    # Онлайн по каналам
+    online_by_channel: Dict[str, int] = {}
+    for cid in channels:
+        online_by_channel[cid] = _online_in_channel(cid)
+
     return {
-        "users": len(users),
-        "channels": len(channels),
-        "messages": sum(len(v) for v in messages.values()),
-        "online": len(_online_usernames()),
+        "users": total_users,
+        "channels": total_channels,
+        "messages": total_messages,
+        "online": online,
         "tokens": len(tokens),
+        "log_entries": len(server_log),
         "uptime_started": _STARTED_AT,
+        "day_labels": day_labels,
+        "messages_per_day": messages_per_day,
+        "registrations_per_day": regs_per_day,
+        "logins_per_day": logins_per_day,
+        "messages_by_channel": messages_by_channel,
+        "top_users": [{"username": u, "count": c} for u, c in top_users],
+        "online_by_channel": online_by_channel,
     }
 
 
@@ -695,9 +772,6 @@ def admin_user_detail(username: str, _: None = Depends(require_admin)):
         "days": days,
         "logins": list(reversed(logins[-50:])),
         "recent_messages": recent[:25],
-        "mentions_sent": sum(1 for bucket in user_mentions.values()
-                             for m in bucket if m["from"] == uname),
-        "mentions_received": len(user_mentions.get(uname.lower(), [])),
     }
 
 
@@ -718,35 +792,13 @@ async def admin_edit_user(username: str, body: AdminUserEdit, _: None = Depends(
         u["hash"] = hash_pw(body.password, u["salt"])
         for t in [t for t, n in tokens.items() if n == u["username"]]:
             del tokens[t]
+    log_event("admin", f"Пользователь изменён: {u['username']}")
     await broadcast_chat({
         "type": "profile_updated",
         "username": u["username"],
         "display_name": u["display_name"],
     })
     return public_user(u["username"])
-
-
-@app.post("/api/admin/users/{username}/kick")
-async def admin_kick_user(username: str, _: None = Depends(require_admin)):
-    """Отключает все WS-сессии пользователя, но сохраняет аккаунт."""
-    u = users.get(username.lower())
-    if not u:
-        raise HTTPException(404, "Нет такого пользователя")
-    uname = u["username"]
-    kicked = 0
-    for ws, info in list(connections.items()):
-        if info.get("kind") == "chat" and info.get("username") == uname:
-            connections.pop(ws, None)
-            try:
-                await ws.close(code=1008)
-            except Exception:
-                pass
-            kicked += 1
-    # отзываем токены
-    for t in [t for t, n in tokens.items() if n == uname]:
-        del tokens[t]
-    await broadcast_presence()
-    return {"ok": True, "kicked": kicked}
 
 
 @app.delete("/api/admin/users/{username}")
@@ -788,6 +840,7 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
     await broadcast_chat({"type": "user_deleted", "username": uname})
     await broadcast_presence()
 
+    log_event("admin", f"Пользователь удалён: {uname} (сообщений: {len(removed)}, сессий: {kicked})")
     return {"ok": True, "kicked": kicked, "messages_removed": len(removed)}
 
 
@@ -818,6 +871,7 @@ async def admin_create_channel(body: ChannelBody, _: None = Depends(require_admi
         raise HTTPException(409, "Канал уже существует")
     channels[cid] = {"id": cid, "name": raw, "owner": "admin", "created": _now()}
     messages[cid] = []
+    log_event("admin", f"Канал создан через админку: #{cid}")
     await broadcast_chat({"type": "channels_changed"})
     return {"id": cid, "name": raw}
 
@@ -826,23 +880,11 @@ async def admin_create_channel(body: ChannelBody, _: None = Depends(require_admi
 async def admin_rename_channel(cid: str, body: ChannelRenameBody, _: None = Depends(require_admin)):
     if cid not in channels:
         raise HTTPException(404, "Нет такого канала")
+    old = channels[cid]["name"]
     channels[cid]["name"] = body.name
+    log_event("admin", f"Канал переименован: #{cid} ({old} → {body.name})")
     await broadcast_chat({"type": "channels_changed"})
     return {"id": cid, "name": body.name}
-
-
-@app.post("/api/admin/channels/{cid}/kickall")
-async def admin_kick_all_from_channel(cid: str, _: None = Depends(require_admin)):
-    if cid not in channels:
-        raise HTTPException(404, "Нет такого канала")
-    kicked = 0
-    for ws, info in list(connections.items()):
-        if info.get("kind") == "chat" and info.get("channel") == cid:
-            info["channel"] = None
-            await _send(ws, {"type": "channel_removed", "channel": cid})
-            kicked += 1
-    await broadcast_presence()
-    return {"ok": True, "kicked": kicked}
 
 
 @app.delete("/api/admin/channels/{cid}")
@@ -857,34 +899,10 @@ async def admin_delete_channel(cid: str, _: None = Depends(require_admin)):
     messages.pop(cid, None)
     for bucket in user_mentions.values():
         bucket[:] = [m for m in bucket if m["channel"] != cid]
+    log_event("admin", f"Канал удалён: #{cid}")
     await broadcast_chat({"type": "channels_changed"})
     await broadcast_presence()
     return {"ok": True}
-
-
-@app.delete("/api/admin/channels/{cid}/user/{username}")
-async def admin_delete_user_from_channel(cid: str, username: str,
-                                          _: None = Depends(require_admin)):
-    if cid not in channels:
-        raise HTTPException(404, "Нет такого канала")
-    u = users.get(username.lower())
-    if not u:
-        raise HTTPException(404, "Нет такого пользователя")
-    uname = u["username"]
-    lst = messages.get(cid, [])
-    kept = []
-    removed_ids = []
-    for m in lst:
-        if m["user"] == uname:
-            removed_ids.append(m["id"])
-        else:
-            kept.append(m)
-    messages[cid] = kept
-    for bucket in user_mentions.values():
-        bucket[:] = [m for m in bucket if m["id"] not in removed_ids]
-    for mid in removed_ids:
-        await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
-    return {"ok": True, "removed": len(removed_ids)}
 
 
 # ---- MESSAGES ----
@@ -918,6 +936,7 @@ async def admin_edit_message(mid: str, body: AdminMessageEdit, _: None = Depends
                     for mm in bucket:
                         if mm["id"] == mid:
                             mm["text"] = body.text
+                log_event("admin", f"Сообщение изменено: {mid} (автор {m['user']}, #{cid})")
                 await broadcast_chat({
                     "type": "message_edited", "id": mid, "channel": cid,
                     "text": body.text, "edited": lst[i]["edited"],
@@ -934,6 +953,7 @@ async def admin_delete_message(mid: str, _: None = Depends(require_admin)):
                 lst.pop(i)
                 for bucket in user_mentions.values():
                     bucket[:] = [mm for mm in bucket if mm["id"] != mid]
+                log_event("admin", f"Сообщение удалено: {mid} (автор {m['user']}, #{cid})")
                 await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
                 return {"ok": True}
     raise HTTPException(404, "Сообщение не найдено")
@@ -943,11 +963,49 @@ async def admin_delete_message(mid: str, _: None = Depends(require_admin)):
 async def admin_clear_channel(cid: str, _: None = Depends(require_admin)):
     if cid not in messages:
         raise HTTPException(404, "Нет такого канала")
+    count = len(messages[cid])
     messages[cid] = []
     for bucket in user_mentions.values():
         bucket[:] = [m for m in bucket if m["channel"] != cid]
+    log_event("admin", f"История канала #{cid} очищена ({count} сообщений)")
     await broadcast_chat({"type": "channel_cleared", "channel": cid})
     return {"ok": True}
+
+
+# ---- LOGS ----
+@app.get("/api/admin/logs")
+def admin_logs(_: None = Depends(require_admin), limit: int = 1000):
+    entries = list(server_log)[-max(1, min(limit, LOG_MAXLEN)):]
+    return {"logs": entries, "total": len(server_log)}
+
+
+@app.get("/api/admin/logs/download")
+def admin_logs_download(_: None = Depends(require_admin)):
+    lines = []
+    for e in server_log:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
+        lines.append(f"[{ts}] [{e['level'].upper():5}] {e['message']}")
+    content = "\n".join(lines) + "\n"
+    return PlainTextResponse(
+        content,
+        headers={"Content-Disposition": 'attachment; filename="latest.log"'},
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+# ============================================================
+#  SVG ИКОНКА (favicon)
+# ============================================================
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="7" fill="#2f5d8a"/>'
+    '<path d="M8 9.5a1.5 1.5 0 0 1 1.5-1.5h13A1.5 1.5 0 0 1 24 9.5v9a1.5 1.5 0 0 1-1.5 1.5H15l-5 4v-4H9.5A1.5 1.5 0 0 1 8 18.5v-9z" fill="#fff"/>'
+    '<circle cx="12" cy="14" r="1.2" fill="#2f5d8a"/>'
+    '<circle cx="16" cy="14" r="1.2" fill="#2f5d8a"/>'
+    '<circle cx="20" cy="14" r="1.2" fill="#2f5d8a"/>'
+    '</svg>'
+)
+FAVICON_LINK = f'<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,{FAVICON_SVG.replace(chr(34), "%22").replace("<", "%3C").replace(">", "%3E").replace("#", "%23")}">'
 
 
 # ============================================================
@@ -960,6 +1018,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#2f5d8a">
 <title>{{APP_NAME}}</title>
+{{FAVICON}}
 <style>
 :root{
   --bg:#e4e9ed; --panel:#fff; --panel2:#f2f5f8; --border:#dbe1e6;
@@ -988,31 +1047,26 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 input,textarea{font-family:inherit;}
 svg{display:block;}
 
-/* ---------- BOOT ---------- */
 #boot{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;background:var(--bg);color:var(--muted);
-  animation:fadein .2s ease;}
+  align-items:center;justify-content:center;background:var(--bg);color:var(--muted);}
 #boot .logo{font-size:22px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
 .spinner{margin-top:18px;width:26px;height:26px;border:2px solid var(--border);
   border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
-@keyframes fadein{from{opacity:0;}to{opacity:1;}}
 
-/* ---------- AUTH ---------- */
 #auth-screen{position:fixed;inset:0;z-index:100;display:none;
-  align-items:center;justify-content:center;padding:20px;overflow-y:auto;
-  background:var(--bg);}
+  align-items:center;justify-content:center;padding:20px;overflow-y:auto;background:var(--bg);}
 #auth-screen.visible{display:flex;}
 .auth-card{width:340px;max-width:100%;background:var(--panel);
   border:1px solid var(--border);border-radius:6px;padding:26px 24px;
-  box-shadow:0 4px 24px rgba(0,0,0,.06);animation:fadein .18s ease;}
+  box-shadow:0 4px 24px rgba(0,0,0,.06);}
 html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .auth-head{text-align:center;margin-bottom:18px;}
 .auth-logo{font-size:22px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
 .auth-sub{font-size:12px;color:var(--muted);margin-top:4px;}
 .auth-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:14px;}
-.auth-tab{flex:1;padding:10px 0;font-size:13.5px;font-weight:500;
-  color:var(--muted);border-bottom:2px solid transparent;transition:color .12s,border-color .12s;}
+.auth-tab{flex:1;padding:10px 0;font-size:13.5px;font-weight:500;color:var(--muted);
+  border-bottom:2px solid transparent;transition:color .12s,border-color .12s;}
 .auth-tab.active{color:var(--accent);border-bottom-color:var(--accent);}
 .auth-body input{width:100%;padding:10px 12px;margin-bottom:10px;
   border:1px solid var(--border);border-radius:4px;font-size:14px;outline:none;
@@ -1020,30 +1074,28 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .auth-body input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,93,138,.15);}
 .auth-error{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
 .auth-submit{width:100%;padding:11px;background:var(--accent);color:#fff;
-  border-radius:4px;font-size:14px;font-weight:500;
-  transition:background .12s,transform .06s;}
+  border-radius:4px;font-size:14px;font-weight:500;transition:background .12s,transform .06s;}
 .auth-submit:hover{background:var(--accent-h);}
 .auth-submit:active{transform:scale(.985);}
 .auth-submit:disabled{opacity:.55;cursor:default;}
 .auth-hint{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
 
-/* ---------- LAYOUT ---------- */
 #app{display:none;height:var(--app-h);}
 #app.visible{display:flex;}
 
 .sidebar{width:270px;flex-shrink:0;background:var(--panel);
-  border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;}
+  border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;min-width:0;}
 .sidebar-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
   display:flex;align-items:center;justify-content:space-between;padding:0 8px 0 14px;}
 .me{display:flex;flex-direction:column;justify-content:center;min-width:0;
-  cursor:pointer;padding:4px 8px;border-radius:4px;transition:background .12s;}
+  cursor:pointer;padding:4px 8px;border-radius:4px;transition:background .12s;overflow:hidden;}
 .me:hover{background:rgba(255,255,255,.1);}
 #me-name{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;line-height:1.2;}
-#me-user{font-size:11px;opacity:.75;}
-.icon-btn{width:34px;height:34px;border-radius:6px;
-  display:flex;align-items:center;justify-content:center;
-  color:#fff;opacity:.9;flex-shrink:0;transition:background .12s,opacity .12s,transform .08s;}
+#me-user{font-size:11px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.icon-btn{width:34px;height:34px;border-radius:6px;display:flex;align-items:center;
+  justify-content:center;color:#fff;opacity:.9;flex-shrink:0;
+  transition:background .12s,opacity .12s,transform .08s;}
 .icon-btn:hover{background:rgba(255,255,255,.15);opacity:1;}
 .icon-btn:active{transform:scale(.94);}
 
@@ -1057,48 +1109,37 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 
 .channel-list{flex:1;min-height:0;overflow-y:auto;padding:4px 0;}
 .channel-item{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;
-  transition:background .12s;position:relative;}
+  transition:background .12s;position:relative;min-width:0;overflow:hidden;}
 .channel-item:hover{background:var(--panel2);}
 .channel-item.active{background:var(--accent);color:#fff;}
 .channel-item.active .channel-last{color:rgba(255,255,255,.8);}
 .channel-hash{width:28px;height:28px;flex-shrink:0;border-radius:50%;
   background:var(--panel2);color:var(--accent);
-  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;
-  transition:background .12s,color .12s;}
+  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;}
 .channel-item.active .channel-hash{background:rgba(255,255,255,.2);color:#fff;}
-.channel-body{flex:1;min-width:0;}
-.channel-row1{display:flex;align-items:baseline;justify-content:space-between;gap:6px;}
-.channel-name{font-weight:500;font-size:13.5px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.channel-body{flex:1;min-width:0;overflow:hidden;}
+.channel-row1{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0;}
+.channel-name{flex:1;min-width:0;font-weight:500;font-size:13.5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:keep-all;}
 .channel-last{font-size:12px;color:var(--muted);margin-top:2px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 
-.channel-mention{
-  min-width:20px;height:20px;padding:0 6px;border-radius:10px;
-  background:var(--mention);color:#fff;
-  font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;
-  flex-shrink:0;position:relative;
-  animation:mbadge-in .25s ease;
-}
-.channel-mention::before{
-  content:"";position:absolute;inset:0;border-radius:10px;
+.channel-mention{min-width:20px;height:20px;padding:0 6px;border-radius:10px;
+  background:var(--mention);color:#fff;font-size:11px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  position:relative;animation:mbadge-in .25s ease;}
+.channel-mention::before{content:"";position:absolute;inset:0;border-radius:10px;
   background:var(--mention);opacity:.45;
-  animation:mbadge-pulse 2s ease-out infinite;
-  pointer-events:none;
-}
+  animation:mbadge-pulse 2s ease-out infinite;pointer-events:none;}
 @keyframes mbadge-in{from{transform:scale(.4);opacity:0;}to{transform:scale(1);opacity:1;}}
-@keyframes mbadge-pulse{
-  0%{transform:scale(1);opacity:.4;}
-  70%{transform:scale(1.5);opacity:0;}
-  100%{transform:scale(1.5);opacity:0;}
-}
+@keyframes mbadge-pulse{0%{transform:scale(1);opacity:.4;}
+  70%{transform:scale(1.5);opacity:0;}100%{transform:scale(1.5);opacity:0;}}
 
 .new-channel{display:flex;gap:6px;padding:8px 10px;flex-shrink:0;
   border-top:1px solid var(--border);background:var(--panel);}
 .new-channel input{flex:1;min-width:0;padding:8px 10px;
-  border:1px solid var(--border);border-radius:4px;font-size:13px;
-  outline:none;background:var(--panel2);color:var(--text);
-  transition:border-color .12s,background .12s;}
+  border:1px solid var(--border);border-radius:4px;font-size:13px;outline:none;
+  background:var(--panel2);color:var(--text);transition:border-color .12s,background .12s;}
 .new-channel input:focus{border-color:var(--accent);background:var(--panel);}
 .new-channel button{width:36px;height:36px;border-radius:4px;background:var(--accent);
   color:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;
@@ -1106,7 +1147,6 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .new-channel button:hover{background:var(--accent-h);}
 .new-channel button:active{transform:scale(.94);}
 
-/* ---------- CHAT ---------- */
 .chat{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;}
 .chat-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
   display:flex;align-items:center;padding:0 8px 0 12px;gap:8px;
@@ -1123,55 +1163,35 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .messages{flex:1;min-height:0;overflow-y:auto;padding:14px 16px 8px;background:var(--chat-bg);
   scroll-behavior:smooth;}
 .empty{text-align:center;color:var(--muted);margin-top:60px;font-size:13px;line-height:1.6;}
-
 .msg{display:flex;margin-bottom:5px;flex-direction:column;position:relative;
   animation:msg-in .18s ease-out;}
-@keyframes msg-in{
-  from{opacity:0;transform:translateY(4px);}
-  to{opacity:1;transform:none;}
-}
+@keyframes msg-in{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
 .msg.in{align-items:flex-start;}
 .msg.out{align-items:flex-end;}
 .msg.same-user{margin-top:-1px;}
 .msg.same-user .name{display:none;}
 .bubble{max-width:74%;padding:6px 10px 5px;border-radius:8px;
   background:var(--bub-in);box-shadow:var(--shadow);
-  word-wrap:break-word;overflow-wrap:break-word;color:var(--text);
-  transition:box-shadow .15s;}
+  word-wrap:break-word;overflow-wrap:break-word;color:var(--text);transition:box-shadow .15s;}
 .msg.in .bubble{border-top-left-radius:2px;}
 .msg.out .bubble{background:var(--bub-out);border-top-right-radius:2px;}
 .msg.same-user .bubble{border-top-left-radius:8px;border-top-right-radius:8px;}
-
-/* сообщения, где меня упомянули */
-.msg.mentioned-me .bubble{
-  background:var(--bub-mention);
-  border-left:3px solid var(--bub-mention-b);
-}
+.msg.mentioned-me .bubble{background:var(--bub-mention);border-left:3px solid var(--bub-mention-b);}
 .msg.out.mentioned-me .bubble{border-left:none;border-right:3px solid var(--bub-mention-b);}
 .msg.mentioned-me .bubble:hover{box-shadow:0 2px 8px rgba(224,138,30,.35);}
-
-.msg.flash .bubble{
-  animation:flash-hl 1.4s ease-out;
-}
-@keyframes flash-hl{
-  0%{box-shadow:0 0 0 0 rgba(224,138,30,.8);}
-  60%{box-shadow:0 0 0 8px rgba(224,138,30,0);}
-  100%{box-shadow:0 0 0 0 rgba(224,138,30,0);}
-}
-
+.msg.flash .bubble{animation:flash-hl 1.4s ease-out;}
+@keyframes flash-hl{0%{box-shadow:0 0 0 0 rgba(224,138,30,.8);}
+  60%{box-shadow:0 0 0 8px rgba(224,138,30,0);}100%{box-shadow:0 0 0 0 rgba(224,138,30,0);}}
 .name{font-size:12.5px;font-weight:600;color:var(--accent);margin-bottom:2px;}
 .text{white-space:pre-wrap;line-height:1.35;font-size:14px;}
 .text .mention{color:var(--accent);font-weight:600;}
-.text .mention.self{
-  background:rgba(224,138,30,.22);color:var(--mention);
-  padding:0 4px;border-radius:3px;
-}
+.text .mention.self{background:rgba(224,138,30,.22);color:var(--mention);
+  padding:0 4px;border-radius:3px;}
 .text .edited{color:var(--muted);font-size:11px;margin-left:4px;}
 .time{font-size:10.5px;color:var(--muted);text-align:right;margin-top:2px;margin-left:12px;}
 .msg.out .time{color:var(--bub-out-t);}
 .msg.mine{cursor:context-menu;}
 
-/* ---------- MEMBERS ---------- */
 .members-panel{width:200px;flex-shrink:0;background:var(--panel);
   border-left:1px solid var(--border);display:none;flex-direction:column;min-height:0;
   animation:slidein .18s ease;}
@@ -1186,14 +1206,11 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
   animation:msg-in .15s ease-out;}
 .member-item .dot{width:6px;height:6px;border-radius:50%;background:#4caf50;flex-shrink:0;
   box-shadow:0 0 0 0 rgba(76,175,80,.5);animation:dot-pulse 2s ease-in-out infinite;}
-@keyframes dot-pulse{
-  0%,100%{box-shadow:0 0 0 0 rgba(76,175,80,.5);}
-  50%{box-shadow:0 0 0 4px rgba(76,175,80,0);}
-}
+@keyframes dot-pulse{0%,100%{box-shadow:0 0 0 0 rgba(76,175,80,.5);}
+  50%{box-shadow:0 0 0 4px rgba(76,175,80,0);}}
 .member-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .member-name.self{color:var(--accent);font-weight:600;}
 
-/* ---------- COMPOSER ---------- */
 .composer{display:flex;align-items:flex-end;gap:8px;flex-shrink:0;
   padding:10px 14px calc(10px + env(safe-area-inset-bottom,0));
   background:var(--panel);border-top:1px solid var(--border);position:relative;}
@@ -1209,71 +1226,48 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .send-btn:active{transform:scale(.94);}
 .send-btn:disabled{background:var(--border);cursor:default;}
 
-/* Кнопка "перейти к упоминанию" */
-.jump-mention{
-  position:absolute;right:66px;bottom:calc(100% + 8px);
-  width:38px;height:38px;border-radius:50%;
-  background:var(--mention);color:#fff;
+.jump-mention{position:absolute;right:66px;bottom:calc(100% + 8px);
+  width:38px;height:38px;border-radius:50%;background:var(--mention);color:#fff;
   display:none;align-items:center;justify-content:center;
   box-shadow:0 4px 12px rgba(224,138,30,.4);
-  transition:transform .15s,background .12s;
-  z-index:15;
-  animation:mbadge-in .2s ease-out;
-}
+  transition:transform .15s,background .12s;z-index:15;animation:mbadge-in .2s ease-out;}
 .jump-mention.visible{display:flex;}
 .jump-mention:hover{background:#c97a15;transform:translateY(-2px) scale(1.05);}
 .jump-mention:active{transform:scale(.94);}
 .jump-mention svg{pointer-events:none;}
-.jump-mention .jm-count{
-  position:absolute;top:-4px;right:-4px;
+.jump-mention .jm-count{position:absolute;top:-4px;right:-4px;
   background:#c33;color:#fff;font-size:10px;font-weight:700;
   min-width:16px;height:16px;padding:0 4px;border-radius:8px;
-  display:flex;align-items:center;justify-content:center;
-  border:2px solid var(--panel);
-}
+  display:flex;align-items:center;justify-content:center;border:2px solid var(--panel);}
 
-/* ---------- MENTION MENU ---------- */
 .mention-menu{position:absolute;left:10px;right:10px;bottom:calc(100% + 4px);
   background:var(--panel);border:1px solid var(--border);border-radius:6px;
   box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:200px;overflow-y:auto;
   z-index:20;display:none;animation:menu-in .14s ease-out;}
 .mention-menu.visible{display:block;}
-@keyframes menu-in{
-  from{opacity:0;transform:translateY(4px);}
-  to{opacity:1;transform:none;}
-}
+@keyframes menu-in{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
 .mention-item{padding:8px 12px;cursor:pointer;font-size:13px;transition:background .1s;}
 .mention-item:hover{background:var(--panel2);}
 .mention-item .u{color:var(--muted);margin-left:6px;}
 
-/* ---------- CONTEXT MENU ---------- */
 .ctx-menu{position:fixed;z-index:400;background:var(--panel);
   border:1px solid var(--border);border-radius:6px;padding:4px;
   box-shadow:0 6px 20px rgba(0,0,0,.2);min-width:150px;display:none;
   animation:ctx-in .12s ease-out;transform-origin:top left;}
 .ctx-menu.visible{display:block;}
-@keyframes ctx-in{
-  from{opacity:0;transform:scale(.94);}
-  to{opacity:1;transform:scale(1);}
-}
+@keyframes ctx-in{from{opacity:0;transform:scale(.94);}to{opacity:1;transform:scale(1);}}
 .ctx-item{display:flex;align-items:center;gap:8px;padding:8px 12px;
   border-radius:4px;font-size:13px;cursor:pointer;transition:background .1s;}
 .ctx-item:hover{background:var(--panel2);}
 .ctx-item.danger{color:#c33;}
 .ctx-item.danger:hover{background:rgba(204,51,51,.1);}
 
-/* ---------- MODALS ---------- */
 .modal-backdrop{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.5);
-  display:none;align-items:center;justify-content:center;padding:20px;
-  animation:fadein .15s ease;}
+  display:none;align-items:center;justify-content:center;padding:20px;}
 .modal-backdrop.visible{display:flex;}
 .modal{background:var(--panel);border-radius:8px;padding:20px 22px;
-  width:380px;max-width:100%;color:var(--text);
-  animation:modal-in .18s ease-out;}
-@keyframes modal-in{
-  from{opacity:0;transform:translateY(8px) scale(.97);}
-  to{opacity:1;transform:none;}
-}
+  width:380px;max-width:100%;color:var(--text);animation:modal-in .18s ease-out;}
+@keyframes modal-in{from{opacity:0;transform:translateY(8px) scale(.97);}to{opacity:1;transform:none;}}
 .modal h3{font-size:15px;margin-bottom:14px;font-weight:600;}
 .modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
 .modal input,.modal textarea{width:100%;padding:9px 11px;border:1px solid var(--border);
@@ -1290,14 +1284,12 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .modal .btn2.primary:hover{background:var(--accent-h);}
 .modal-err{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
 
-/* ---------- MOBILE ---------- */
 @media (max-width:800px){
   #app.visible{display:block;position:relative;overflow:hidden;}
   .sidebar{position:absolute;inset:0;width:100%;border-right:none;}
   .chat{position:absolute;inset:0;background:var(--chat-bg);
     transform:translateX(100%);transition:transform .22s ease;z-index:5;
-    display:flex;flex-direction:column;min-height:0;
-    height:var(--app-h);}
+    display:flex;flex-direction:column;min-height:0;height:var(--app-h);}
   #app.chat-open .chat{transform:translateX(0);}
   #back-btn{display:flex;}
   .bubble{max-width:82%;}
@@ -1305,7 +1297,6 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
     z-index:8;box-shadow:-4px 0 16px rgba(0,0,0,.15);}
   .jump-mention{bottom:calc(100% + 6px);right:60px;}
 }
-
 .channel-list::-webkit-scrollbar,.messages::-webkit-scrollbar,
 .members-list::-webkit-scrollbar,.mention-menu::-webkit-scrollbar{width:6px;height:6px;}
 .channel-list::-webkit-scrollbar-thumb,.messages::-webkit-scrollbar-thumb,
@@ -1337,7 +1328,7 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
              autocomplete="new-password" maxlength="128" style="display:none;">
       <button type="button" class="auth-submit" id="auth-submit">Войти</button>
       <div class="auth-hint" id="reg-hint" style="display:none;">
-        Юзернейм: 3–24, латиница, цифры, _ и -. Используется для @упоминаний.
+        Юзернейм: 3–24, латиница, цифры, _ и -.
       </div>
     </div>
   </div>
@@ -1461,15 +1452,12 @@ const state = {
   reconnectTimer: null, pingTimer: null,
   profiles: {}, allowChannelCreation: true,
   totalOnline: 0, onlineUsers: [],
-  mentions: [],                    // все упоминания меня
-  mentionByChannel: {},            // channel -> [mention]
-  mentionIds: new Set(),           // ids всех сообщений, где меня упомянули
+  mentions: [], mentionByChannel: {}, mentionIds: new Set(),
   _openInFlight: null, _lastOpenChannel: null, _lastOpenAt: 0,
   _jumpTarget: null,
 };
 let authMode = 'login';
 
-/* ---------- VIEWPORT FIX (mobile keyboard) ---------- */
 function fitViewport(){
   const h = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
   document.documentElement.style.setProperty('--app-h', h + 'px');
@@ -1479,12 +1467,10 @@ window.addEventListener('orientationchange', fitViewport);
 window.addEventListener('resize', fitViewport);
 fitViewport();
 
-/* ---------- Prevent right-click (кроме своих сообщений) ---------- */
 document.addEventListener('contextmenu', e => {
   if (!e.target.closest('.msg.mine') && !e.target.closest('.ctx-menu')) e.preventDefault();
 });
 
-/* ---------- THEME ---------- */
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   const ic = $('theme-icon');
@@ -1497,7 +1483,6 @@ $('theme-btn').addEventListener('click', () => {
   applyTheme(n); localStorage.setItem(LS_THEME, n);
 });
 
-/* ---------- API ---------- */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   if (state.token) h['X-Auth-Token'] = state.token;
@@ -1513,7 +1498,6 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
-/* ---------- UTILS ---------- */
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function hhmm(ts){const t=new Date(ts*1000);if(isNaN(t))return '';return String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0');}
 function renderTextWithMentions(text, self){
@@ -1524,7 +1508,6 @@ function renderTextWithMentions(text, self){
   });
 }
 
-/* ---------- SESSION MODAL ---------- */
 function sessionModal(title, text){
   $('session-title').textContent = title;
   $('session-text').textContent = text;
@@ -1535,7 +1518,6 @@ $('session-ok').addEventListener('click', () => {
   hardLogout();
 });
 
-/* ---------- AUTH ---------- */
 function setAuthMode(m){
   authMode = m;
   document.querySelectorAll('.auth-tab').forEach(t=>t.classList.toggle('active',t.dataset.mode===m));
@@ -1594,7 +1576,6 @@ $('logout-btn').addEventListener('click', async () => {
   hardLogout();
 });
 
-/* ---------- BOOT ---------- */
 async function boot(){
   if (!state.token) { showAuth(); return; }
   try {
@@ -1627,7 +1608,6 @@ async function enterApp(){
   connectWs();
 }
 
-/* ---------- MENTIONS ---------- */
 async function loadMentions(){
   try {
     const d = await api('/api/mentions');
@@ -1640,12 +1620,9 @@ async function loadMentions(){
     updateJumpButton();
   } catch(e){}
 }
-
 function unreadMentionsFor(channel){
-  const lst = state.mentionByChannel[channel] || [];
-  return lst.filter(m => !m.read);
+  return (state.mentionByChannel[channel] || []).filter(m => !m.read);
 }
-
 function updateJumpButton(){
   const c = state.currentChannel;
   if (!c) { $('jump-mention').classList.remove('visible'); return; }
@@ -1657,38 +1634,29 @@ function updateJumpButton(){
     $('jump-mention').classList.remove('visible');
   }
 }
-
 $('jump-mention').addEventListener('click', async () => {
   const c = state.currentChannel;
   if (!c) return;
   const unread = unreadMentionsFor(c);
   if (!unread.length) return;
-  // Переходим к первому непрочитанному
   const target = unread[0];
   const el = $('messages').querySelector(`.msg[data-id="${CSS.escape(target.id)}"]`);
   if (el) {
     el.scrollIntoView({ behavior:'smooth', block:'center' });
-    el.classList.remove('flash');
-    void el.offsetWidth;
-    el.classList.add('flash');
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
     setTimeout(() => el.classList.remove('flash'), 1600);
   } else {
-    // сообщение вне текущего буфера — перезапросим канал
     if (state.ws && state.wsReady) {
       state.ws.send(JSON.stringify({type:'join', channel:c}));
       state._jumpTarget = target.id;
     }
   }
-  // Помечаем прочитанным на сервере
-  try {
-    await api('/api/mentions/read', { method:'POST', body:{ channel: c } });
-  } catch(e){}
+  try { await api('/api/mentions/read', { method:'POST', body:{ channel: c } }); } catch(e){}
   for (const m of unread) m.read = true;
   updateJumpButton();
   renderChannels();
 });
 
-/* ---------- PROFILE ---------- */
 $('me-block').addEventListener('click', () => {
   $('profile-display').value = state.display_name || state.username;
   $('profile-err').textContent = '';
@@ -1707,7 +1675,6 @@ $('profile-save').addEventListener('click', async () => {
   } catch(e){ $('profile-err').textContent = e.message; }
 });
 
-/* ---------- CHANNELS ---------- */
 async function loadChannels(){
   try {
     const data = await api('/api/channels');
@@ -1724,17 +1691,12 @@ async function loadChannels(){
     updateHeader();
   } catch(e){}
 }
-
 function updateHeader(){
-  if (state.currentChannel) {
-    $('chat-users').textContent = state.totalOnline + ' онлайн';
-  } else {
-    $('chat-users').textContent = '';
-  }
+  if (state.currentChannel) $('chat-users').textContent = state.totalOnline + ' онлайн';
+  else $('chat-users').textContent = '';
   $('members-count').textContent = state.onlineUsers.length || state.totalOnline || 0;
   renderMembers();
 }
-
 function renderChannels(){
   const list = $('channel-list');
   const q = $('search').value.toLowerCase().trim();
@@ -1748,7 +1710,7 @@ function renderChannels(){
       ? `<div class="channel-last">${escapeHtml(c.last_message.user)}: ${escapeHtml(c.last_message.text)}</div>` : '';
     const unread = (state.mentionByChannel[c.id] || []).filter(m=>!m.read).length;
     const badge = unread
-      ? `<div class="channel-mention" title="${unread} упоминаний">@ ${unread}</div>` : '';
+      ? `<div class="channel-mention" title="${unread} упоминаний">@${unread}</div>` : '';
     el.innerHTML =
       `<div class="channel-hash">#</div>
        <div class="channel-body">
@@ -1762,14 +1724,12 @@ function renderChannels(){
     list.appendChild(el);
   }
 }
-
 function openChannel(id){
   const now = Date.now();
   if (state._openInFlight === id) return;
   if (id === state._lastOpenChannel && now - state._lastOpenAt < 500) return;
   state._lastOpenChannel = id; state._lastOpenAt = now;
   state._openInFlight = id;
-
   state.currentChannel = id;
   $('app').classList.add('chat-open');
   renderChannels();
@@ -1778,14 +1738,10 @@ function openChannel(id){
   updateHeader();
   updateJumpButton();
   renderMessages([]);
-
-  if (state.ws && state.wsReady) {
-    state.ws.send(JSON.stringify({type:'join', channel:id}));
-  }
+  if (state.ws && state.wsReady) state.ws.send(JSON.stringify({type:'join', channel:id}));
   setTimeout(() => { state._openInFlight = null; }, 200);
 }
 
-/* ---------- MESSAGES ---------- */
 function renderMessages(msgs){
   const box = $('messages');
   box.innerHTML = '';
@@ -1797,14 +1753,12 @@ function renderMessages(msgs){
   for (const m of msgs) { appendMessage(m, {skipScroll:true, prevUser}); prevUser = m.user; }
   box.scrollTop = box.scrollHeight;
 }
-
 function userProfile(name){
   return state.profiles[(name||'').toLowerCase()] ||
     (name === state.username
       ? {username:state.username, display_name:state.display_name}
       : {username:name, display_name:name});
 }
-
 function appendMessage(m, opts = {}){
   const box = $('messages');
   const empty = box.querySelector('.empty'); if (empty) empty.remove();
@@ -1834,8 +1788,6 @@ function appendMessage(m, opts = {}){
   }
   box.appendChild(div);
   if (!opts.skipScroll) box.scrollTop = box.scrollHeight;
-
-  // Если ждали перехода к упоминанию — прыгаем
   if (state._jumpTarget && state._jumpTarget === m.id) {
     state._jumpTarget = null;
     setTimeout(() => {
@@ -1846,29 +1798,24 @@ function appendMessage(m, opts = {}){
   }
 }
 
-/* ---------- CONTEXT MENU ---------- */
 let ctxTarget = {id:null, text:null};
 function openCtxMenu(x, y, id, text){
   ctxTarget = {id, text};
   const menu = $('ctx-menu');
   menu.style.left = '0px'; menu.style.top = '0px';
   menu.classList.add('visible');
-  const mw = menu.offsetWidth || 160;
-  const mh = menu.offsetHeight || 80;
+  const mw = menu.offsetWidth || 160, mh = menu.offsetHeight || 80;
   let px = x, py = y;
   if (px + mw > window.innerWidth - 8) px = window.innerWidth - mw - 8;
   if (py + mh > window.innerHeight - 8) py = window.innerHeight - mh - 8;
-  if (px < 8) px = 8;
-  if (py < 8) py = 8;
-  menu.style.left = px + 'px';
-  menu.style.top = py + 'px';
+  if (px < 8) px = 8; if (py < 8) py = 8;
+  menu.style.left = px + 'px'; menu.style.top = py + 'px';
 }
 function closeCtxMenu(){ $('ctx-menu').classList.remove('visible'); }
 document.addEventListener('click', e => { if (!e.target.closest('.ctx-menu')) closeCtxMenu(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCtxMenu(); });
 window.addEventListener('blur', closeCtxMenu);
 document.addEventListener('scroll', closeCtxMenu, true);
-
 document.querySelectorAll('#ctx-menu .ctx-item').forEach(it => {
   it.addEventListener('click', () => {
     const act = it.dataset.act;
@@ -1876,14 +1823,11 @@ document.querySelectorAll('#ctx-menu .ctx-item').forEach(it => {
     closeCtxMenu();
     if (act === 'edit') openEditMsg(id, text);
     else if (act === 'del') {
-      if (confirm('Удалить это сообщение?')) {
-        state.ws.send(JSON.stringify({type:'delete_message', id}));
-      }
+      if (confirm('Удалить это сообщение?')) state.ws.send(JSON.stringify({type:'delete_message', id}));
     }
   });
 });
 
-/* ---------- EDIT MSG ---------- */
 let editMsgId = null;
 function openEditMsg(id, text){
   editMsgId = id;
@@ -1900,7 +1844,6 @@ $('edit-msg-save').addEventListener('click', () => {
   $('edit-msg-modal').classList.remove('visible');
 });
 
-/* ---------- MEMBERS (весь сервер) ---------- */
 const MEMBERS_LS = 'sld_members_visible';
 if (localStorage.getItem(MEMBERS_LS) === '1') $('members-panel').classList.add('visible');
 $('members-btn').addEventListener('click', () => {
@@ -1928,7 +1871,6 @@ function renderMembers(){
   }
 }
 
-/* ---------- WS ---------- */
 function connectWs(){
   if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
   if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch(e){} state.ws = null; }
@@ -1936,7 +1878,6 @@ function connectWs(){
   const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(state.token)}`;
   const ws = new WebSocket(url);
   state.ws = ws; state.wsReady = false;
-
   ws.onopen = () => {
     state.wsReady = true;
     if (state.currentChannel) ws.send(JSON.stringify({type:'join', channel: state.currentChannel}));
@@ -1944,12 +1885,10 @@ function connectWs(){
       try { ws.send(JSON.stringify({type:'ping'})); } catch(e){}
     }, 25000);
   };
-
   ws.onmessage = (ev) => {
     let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
     handleWsEvent(d);
   };
-
   ws.onclose = (ev) => {
     state.wsReady = false;
     if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
@@ -1985,23 +1924,17 @@ function handleWsEvent(d){
     }
     renderChannels();
   } else if (d.type === 'mentioned') {
-    // меня упомянули
-    const entry = {
-      id: d.message_id, channel: d.channel,
-      from: d.from, ts: d.ts, read: false, text: d.text,
-    };
+    const entry = {id: d.message_id, channel: d.channel,
+      from: d.from, ts: d.ts, read: false, text: d.text};
     state.mentions.push(entry);
     state.mentionIds.add(d.message_id);
     (state.mentionByChannel[d.channel] = state.mentionByChannel[d.channel] || []).push(entry);
-    // пометить существующее сообщение оранжевым
     const el = $('messages').querySelector(`.msg[data-id="${CSS.escape(d.message_id)}"]`);
     if (el) el.classList.add('mentioned-me');
     updateJumpButton();
     renderChannels();
-    // лёгкий звуковой/визуальный сигнал в заголовке
-    if (document.hidden) document.title = '• ' + (state.mentions.length) + ' — {{APP_NAME}}';
+    if (document.hidden) document.title = '• упоминание — {{APP_NAME}}';
   } else if (d.type === 'mentions_read') {
-    // сервер подтвердил — можно ничего не делать
   } else if (d.type === 'message_edited') {
     if (d.channel !== state.currentChannel) return;
     const el = $('messages').querySelector(`.msg[data-id="${d.id}"] .text`);
@@ -2022,18 +1955,15 @@ function handleWsEvent(d){
     loadChannels();
   } else if (d.type === 'channel_cleared') {
     if (d.channel === state.currentChannel) renderMessages([]);
-    loadChannels();
-    loadMentions();
+    loadChannels(); loadMentions();
   } else if (d.type === 'channel_removed') {
     if (d.channel === state.currentChannel) {
       state.currentChannel = null;
       $('app').classList.remove('chat-open');
       $('chat-name').textContent = 'Выберите канал';
-      renderMessages([]);
-      updateJumpButton();
+      renderMessages([]); updateJumpButton();
     }
-    loadChannels();
-    loadMentions();
+    loadChannels(); loadMentions();
   } else if (d.type === 'profile_updated') {
     state.profiles[(d.username||'').toLowerCase()] = {username:d.username, display_name:d.display_name};
     if (d.username === state.username) { state.display_name = d.display_name; paintMe(); }
@@ -2052,12 +1982,10 @@ function handleWsEvent(d){
     state.currentChannel = null;
     $('app').classList.remove('chat-open');
     $('chat-name').textContent = 'Выберите канал';
-    renderMessages([]);
-    updateJumpButton();
+    renderMessages([]); updateJumpButton();
   }
 }
 
-/* ---------- MENTIONS AUTOCOMPLETE ---------- */
 const MQ_RE = /(?:^|\s)@([A-Za-z0-9_\-]{0,24})$/;
 function currentMQ(){
   const ta = $('msg-input');
@@ -2100,7 +2028,6 @@ $('msg-input').addEventListener('input', e => {
 });
 $('msg-input').addEventListener('blur', ()=>setTimeout(hideMQ, 120));
 
-/* ---------- SEND ---------- */
 function sendMessage(){
   const inp = $('msg-input');
   const text = inp.value.trim();
@@ -2108,7 +2035,7 @@ function sendMessage(){
   state.ws.send(JSON.stringify({type:'message', text}));
   inp.value=''; inp.style.height='auto';
   hideMQ();
-  inp.focus();   // фокус остаётся на поле
+  inp.focus();
 }
 $('send-btn').addEventListener('click', sendMessage);
 $('msg-input').addEventListener('keydown', e => {
@@ -2132,18 +2059,18 @@ $('new-channel-btn').addEventListener('click', async () => {
 $('new-channel-name').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('new-channel-btn').click();
 });
-
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) document.title = '{{APP_NAME}}';
 });
-
 boot();
 </script>
 </body>
 </html>
 """
 
-HTML_PAGE = HTML_PAGE.replace("{{APP_NAME}}", APP_NAME)
+HTML_PAGE = (HTML_PAGE
+             .replace("{{APP_NAME}}", APP_NAME)
+             .replace("{{FAVICON}}", FAVICON_LINK))
 
 
 # ============================================================
@@ -2155,23 +2082,28 @@ ADMIN_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=960">
 <title>{{APP_NAME}} · admin</title>
+{{FAVICON}}
 <style>
 :root{
-  --bg:#f4f5f7;--panel:#fff;--panel2:#f5f6f8;--border:#d9dce1;--border2:#ebedf0;
+  --bg:#eef1f4;--panel:#fff;--panel2:#f5f6f8;--border:#d9dce1;--border2:#ebedf0;
   --text:#1a1a1a;--muted:#5c6670;--accent:#0066cc;--accent-h:#0055ad;
-  --green:#3db83d;--red:#cc0000;--topbg:#22272e;--topfg:#eaecef;
+  --green:#3db83d;--red:#cc0000;--warn:#e08a1e;
+  --topbg:#22272e;--topfg:#eaecef;
   --side:#f4f5f7;--side-h:#e6e8eb;--side-a:#dde1e5;
 }
 html[data-theme=dark]{
   --bg:#161a1f;--panel:#1c2229;--panel2:#232a32;--border:#2e3641;--border2:#262d36;
   --text:#e0e6ed;--muted:#8b96a2;--accent:#3b82f6;--accent-h:#2563eb;
-  --green:#22c55e;--red:#ef4444;--topbg:#0e1216;--topfg:#e0e6ed;
+  --green:#22c55e;--red:#ef4444;--warn:#f0a94a;
+  --topbg:#0e1216;--topfg:#e0e6ed;
   --side:#181d23;--side-h:#232a32;--side-a:#2a323b;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{height:100%;}
 body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:13px;
-  color:var(--text);background:var(--bg);min-width:760px;}
+  color:var(--text);background:var(--bg);min-width:760px;
+  -webkit-user-select:none;user-select:none;}
+input,textarea,.log-frame,.log-frame *{-webkit-user-select:text;user-select:text;}
 button{font-family:inherit;font-size:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 input,select,textarea{font-family:inherit;}
 svg{display:block;}
@@ -2218,23 +2150,26 @@ nav a svg{width:15px;height:15px;flex-shrink:0;}
 
 .card{background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:16px 18px;margin-bottom:14px;}
 .card h3{font-size:14.5px;font-weight:500;margin:0 0 12px;}
-.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;}
-.grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;}
+.grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;}
 .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:13px;}
 .kv .k{color:var(--muted);}
-.metric{font-size:24px;font-weight:400;line-height:1;color:var(--text);}
+.metric{font-size:26px;font-weight:400;line-height:1;color:var(--text);}
 .metric-label{font-size:12px;color:var(--muted);margin-top:6px;}
+.metric-sub{font-size:11px;color:var(--muted);margin-top:8px;display:flex;align-items:center;gap:6px;}
 
-.health{color:var(--green);display:flex;align-items:center;gap:8px;font-size:13px;}
-.usage-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:13px;}
-.usage-row .label{width:70px;color:var(--muted);}
+.usage-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:13px;}
+.usage-row .label{width:90px;color:var(--muted);}
 .usage-bar{flex:1;height:8px;background:var(--border2);border-radius:4px;overflow:hidden;}
-.usage-bar>span{display:block;height:100%;background:var(--accent);border-radius:4px;}
-.usage-row .val{min-width:90px;text-align:right;color:var(--muted);font-size:12px;}
+.usage-bar>span{display:block;height:100%;background:var(--accent);border-radius:4px;transition:width .3s;}
+.usage-bar>span.green{background:var(--green);}
+.usage-bar>span.warn{background:var(--warn);}
+.usage-bar>span.red{background:var(--red);}
+.usage-row .val{min-width:70px;text-align:right;color:var(--muted);font-size:12px;}
 
 table{width:100%;border-collapse:collapse;font-size:13px;table-layout:auto;}
 th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:500;font-size:12px;background:var(--side);border-bottom:1px solid var(--border);white-space:nowrap;}
-td{padding:8px 10px;border-bottom:1px solid var(--border2);vertical-align:top;word-break:break-word;}
+td{padding:8px 10px;border-bottom:1px solid var(--border2);vertical-align:middle;word-break:break-word;}
 tbody tr:hover td{background:var(--side);}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;}
 .muted{color:var(--muted);}
@@ -2256,7 +2191,10 @@ html[data-theme=dark] .chip.warn{background:#3a2d12;color:#f0c88a;border-color:#
 .btn.danger{color:var(--red);}
 .btn.danger:hover{background:#fdeaea;}
 html[data-theme=dark] .btn.danger:hover{background:#3a1a1a;}
-.btn.mini{padding:3px 8px;font-size:11.5px;}
+.btn.icon{padding:4px;width:28px;height:28px;justify-content:center;}
+.btn.icon svg{width:15px;height:15px;}
+
+.icon-actions{display:flex;gap:4px;align-items:center;}
 
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;}
 .toolbar input,.toolbar select{padding:6px 10px;border:1px solid var(--border);border-radius:3px;font-size:12.5px;outline:none;background:var(--panel);color:var(--text);min-width:140px;}
@@ -2277,15 +2215,37 @@ html[data-theme=dark] .btn.danger:hover{background:#3a1a1a;}
 .modal-err{color:var(--red);font-size:12px;min-height:16px;margin-bottom:6px;}
 
 .chart-wrap{display:flex;gap:16px;align-items:center;flex-wrap:wrap;}
-.pie-legend{font-size:12px;flex:1;min-width:180px;}
+.pie-legend{font-size:12px;flex:1;min-width:160px;}
 .pie-legend .row2{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
 .pie-legend .swatch{width:12px;height:12px;border-radius:2px;flex-shrink:0;}
 .pie-legend .val{margin-left:auto;color:var(--muted);}
+
+/* LOG */
+.log-toolbar{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center;}
+.log-toolbar .spacer{flex:1;}
+.log-frame{
+  background:#0d1117;color:#c9d1d9;
+  font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:12.5px;line-height:1.55;
+  padding:12px 14px;border-radius:4px;
+  height:calc(100vh - 240px);min-height:340px;
+  overflow-y:auto;border:1px solid #21262d;
+}
+.log-frame .ll{white-space:pre-wrap;word-break:break-word;display:flex;gap:8px;}
+.log-frame .lt{color:#6b7683;flex-shrink:0;}
+.log-frame .lv{font-weight:600;flex-shrink:0;min-width:44px;}
+.log-frame .lm{flex:1;}
+.log-info  .lv{color:#79c0ff;}
+.log-warn  .lv{color:#ffab70;}
+.log-error .lv{color:#ff7b72;}
+.log-admin .lv{color:#d2a8ff;}
+.log-auth  .lv{color:#7ee787;}
 
 #toasts{position:fixed;right:20px;bottom:20px;z-index:300;display:flex;flex-direction:column;gap:8px;}
 .toast{padding:10px 14px;border-radius:3px;background:var(--topbg);color:var(--topfg);font-size:12.5px;border-left:3px solid var(--green);box-shadow:0 4px 12px rgba(0,0,0,.15);animation:toastin .18s ease-out;}
 @keyframes toastin{from{opacity:0;transform:translateX(12px);}to{opacity:1;transform:none;}}
 .toast.err{border-left-color:var(--red);}
+.toast.warn{border-left-color:var(--warn);}
 
 .hidden{display:none !important;}
 ::-webkit-scrollbar{width:9px;height:9px;}
@@ -2349,6 +2309,10 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 9h12v2H6V9zm8 5H6v-2h8v2zm4-6H6V6h12v2z"/></svg>
           Сообщения
         </a>
+        <a data-tab="logs">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+          Логи
+        </a>
       </nav>
     </aside>
     <main class="content" id="main"></main>
@@ -2402,10 +2366,11 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
 const $ = id => document.getElementById(id);
 const LS_THEME = 'sld_admin_theme';
 const state = { tab:'dashboard', subId:null, currentUser:null, currentChan:null, currentMsg:null,
-                _isRendering:false, _lastRender:0 };
+                _isRendering:false, _lastRender:0, _logsCache:[] };
 
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtTs(ts){if(!ts)return '—';const d=new Date(ts*1000);const p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;}
+function fmtTime(ts){if(!ts)return '';const d=new Date(ts*1000);const p=n=>String(n).padStart(2,'0');return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;}
 function fmtRel(ts){
   if(!ts) return '—';
   const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
@@ -2417,11 +2382,21 @@ function fmtRel(ts){
 }
 function toast(msg, kind='ok'){
   const el=document.createElement('div');
-  el.className='toast '+(kind==='err'?'err':'');
+  el.className='toast '+(kind==='err'?'err':kind==='warn'?'warn':'');
   el.textContent=msg;
   $('toasts').appendChild(el);
   setTimeout(()=>el.remove(), 3000);
 }
+
+/* ICONS */
+const ICO = {
+  edit: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.996.996 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>',
+  del: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>',
+  rename: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16z"/></svg>',
+  clear: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M15.14 3c-.51 0-1.02.2-1.41.59L2.59 14.73c-.78.77-.78 2.04 0 2.83L5.03 20h7.66l8.72-8.72c.79-.78.79-2.05 0-2.83l-4.85-4.86A1.99 1.99 0 0 0 15.14 3zM7.03 18l-2.14-2.12L13 7.76l4.24 4.24L9.03 18h-2z"/></svg>',
+  download: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/></svg>',
+  copy: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>',
+};
 
 /* THEME */
 function applyTheme(t){
@@ -2436,7 +2411,6 @@ $('theme-btn').addEventListener('click', () => {
   applyTheme(n); localStorage.setItem(LS_THEME, n);
 });
 
-/* API */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers||{});
   if (opts.body && typeof opts.body !== 'string') { h['Content-Type']='application/json'; opts.body=JSON.stringify(opts.body); }
@@ -2450,7 +2424,6 @@ async function api(path, opts = {}) {
   const t = await r.text(); return t ? JSON.parse(t) : null;
 }
 
-/* LOGIN */
 async function trySession(){ try { await api('/api/admin/session'); showPanel(); return true; } catch(e){ return false; } }
 function showLogin(){ $('login-view').style.display=''; $('panel-view').classList.remove('visible'); }
 function showPanel(){ $('login-view').style.display='none'; $('panel-view').classList.add('visible'); renderTab(); }
@@ -2474,7 +2447,6 @@ $('logout-btn').addEventListener('click', async () => {
 });
 $('refresh-btn').addEventListener('click', () => renderTab({ force: true }));
 
-/* NAV */
 function parseHash(){
   const h = location.hash.replace(/^#\/?/, '');
   const parts = h.split('/').filter(Boolean);
@@ -2494,15 +2466,13 @@ window.addEventListener('hashchange', () => renderTab());
 function setActiveTab(tab){
   document.querySelectorAll('#side-nav a').forEach(x =>
     x.classList.toggle('active', x.dataset.tab === tab));
-  const label = { dashboard:'Обзор', users:'Пользователи', channels:'Каналы', messages:'Сообщения' }[tab] || tab;
+  const label = { dashboard:'Обзор', users:'Пользователи', channels:'Каналы', messages:'Сообщения', logs:'Логи' }[tab] || tab;
   $('crumb-section').textContent = label;
 }
-
 function isTyping(){
   const a = document.activeElement;
   return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT');
 }
-
 async function renderTab(opts = {}){
   if (state._isRendering && !opts.force) return;
   const now = Date.now();
@@ -2521,13 +2491,13 @@ async function renderTab(opts = {}){
     }
     else if (tab === 'channels') await renderChannels(main);
     else if (tab === 'messages') await renderMessages(main);
+    else if (tab === 'logs') await renderLogs(main, opts);
   } catch(e){
     if (e.status === 401) { showLogin(); return; }
     main.innerHTML = `<div class="empty-state">Ошибка: ${escapeHtml(e.message)}</div>`;
   }
   state._isRendering = false;
 }
-
 setInterval(() => {
   if (!$('panel-view').classList.contains('visible')) return;
   if (state._isRendering) return;
@@ -2542,39 +2512,108 @@ async function renderDashboard(main){
   const up = Math.floor(Date.now()/1000 - s.uptime_started);
   const d = Math.floor(up/86400), h = Math.floor((up%86400)/3600),
         m = Math.floor((up%3600)/60), sec = up%60;
+  const days = s.day_labels || [];
+  const msgPerDay = days.map(dd => ({ label: dd.slice(5), value: s.messages_per_day[dd] || 0 }));
+  const regPerDay = days.map(dd => ({ label: dd.slice(5), value: s.registrations_per_day[dd] || 0 }));
+  const chNames = Object.keys(s.messages_by_channel || {});
+  const chVals = chNames.map(n => s.messages_by_channel[n]);
+  const totalMsgs = chVals.reduce((a,b)=>a+b,0) || 1;
+  const palette = ['#0066cc','#3db83d','#e08a1e','#cc0000','#9b59b6','#16a085','#e67e22','#34495e'];
+  const chPie = chNames.map((n,i)=>({ label: '#'+n, value: s.messages_by_channel[n], color: palette[i%palette.length] }));
+  const topUsers = (s.top_users||[]).map((u,i)=>({ label: u.username, value: u.count, color: palette[i%palette.length] }));
+
+  // Проценты (условные, для наглядности)
+  const cap = Math.max(10, s.users * 2);
+  const usersPct = Math.min(100, Math.round(100 * s.users / cap));
+  const onPct = s.users ? Math.round(100 * s.online / s.users) : 0;
+  const msgPerUser = s.users ? Math.round(s.messages / s.users) : 0;
+  const chAvg = s.channels ? Math.round(totalMsgs / s.channels) : 0;
+
   main.innerHTML = `
     <h2 class="page-title">Обзор</h2>
-    <div class="page-sub">Сводка состояния сервера</div>
-    <div class="grid-2">
-      <div class="card">
-        <h3>Состояние</h3>
-        <div class="health">
-          <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
-          <span>Сервер работает</span>
-        </div>
-        <div class="kv" style="margin-top:14px;">
-          <div class="k">Приложение</div><div class="v">{{APP_NAME}} · FastAPI</div>
-          <div class="k">Uptime</div><div class="v">${d?d+' дн ':''}${h}ч ${m}м ${sec}с</div>
-        </div>
+    <div class="page-sub">Сводка состояния сервера и активности</div>
+
+    <div class="grid-4">
+      <div class="card"><div class="metric">${s.users}</div>
+        <div class="metric-label">Пользователей</div>
+        <div class="metric-sub"><span class="chip blue">${usersPct}%</span> заполнено</div>
       </div>
-      <div class="card">
-        <h3>Использование</h3>
-        <div class="usage-row"><div class="label">Онлайн</div>
-          <div class="usage-bar"><span style="width:${Math.min(100, s.online*2)}%"></span></div>
-          <div class="val">${s.online} чел.</div></div>
-        <div class="usage-row"><div class="label">Токены</div>
-          <div class="usage-bar"><span style="width:${Math.min(100, s.tokens*2)}%"></span></div>
-          <div class="val">${s.tokens}</div></div>
-        <div class="usage-row"><div class="label">Сообщ.</div>
-          <div class="usage-bar"><span style="width:${Math.min(100, s.messages/10)}%"></span></div>
-          <div class="val">${s.messages}</div></div>
+      <div class="card"><div class="metric">${s.online}</div>
+        <div class="metric-label">Онлайн</div>
+        <div class="metric-sub"><span class="chip ${onPct>50?'green':'warn'}">${onPct}%</span> от всех</div>
+      </div>
+      <div class="card"><div class="metric">${s.messages}</div>
+        <div class="metric-label">Сообщений</div>
+        <div class="metric-sub"><span class="chip blue">${msgPerUser}</span> в среднем на юзера</div>
+      </div>
+      <div class="card"><div class="metric">${s.channels}</div>
+        <div class="metric-label">Каналов</div>
+        <div class="metric-sub"><span class="chip blue">${chAvg}</span> сообщений на канал</div>
       </div>
     </div>
-    <div class="grid-4" style="margin-top:14px;">
-      <div class="card"><div class="metric">${s.users}</div><div class="metric-label">Пользователей</div></div>
-      <div class="card"><div class="metric">${s.channels}</div><div class="metric-label">Каналов</div></div>
-      <div class="card"><div class="metric">${s.messages}</div><div class="metric-label">Сообщений</div></div>
-      <div class="card"><div class="metric">${s.online}</div><div class="metric-label">Онлайн</div></div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="card">
+        <h3>Загрузка каналов</h3>
+        ${chNames.length ? chNames.slice(0,8).map((n,i) => {
+          const v = s.messages_by_channel[n];
+          const pct = Math.round(100 * v / totalMsgs);
+          const cls = pct > 60 ? 'red' : pct > 30 ? 'warn' : 'green';
+          return `<div class="usage-row">
+            <div class="label">#${escapeHtml(n)}</div>
+            <div class="usage-bar"><span class="${cls}" style="width:${pct}%"></span></div>
+            <div class="val">${pct}% · ${v}</div>
+          </div>`;
+        }).join('') : '<div class="muted">Пока нет данных</div>'}
+      </div>
+      <div class="card">
+        <h3>Состояние</h3>
+        <div class="kv">
+          <div class="k">Приложение</div><div class="v">{{APP_NAME}} · FastAPI</div>
+          <div class="k">Uptime</div><div class="v">${d?d+' дн ':''}${h}ч ${m}м ${sec}с</div>
+          <div class="k">Сессий (токенов)</div><div class="v">${s.tokens}</div>
+          <div class="k">Записей в логе</div><div class="v">${s.log_entries}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Сообщений по дням (14 дней)</h3>
+      ${barChartSvg(msgPerDay, 1000, 160, '#0066cc')}
+    </div>
+
+    <div class="card">
+      <h3>Регистраций по дням (14 дней)</h3>
+      ${barChartSvg(regPerDay, 1000, 160, '#3db83d')}
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Распределение по каналам</h3>
+        ${chPie.length ? `<div class="chart-wrap">
+          <div>${pieChartSvg(chPie, 150)}</div>
+          <div class="pie-legend">
+            ${chPie.map(p=>`<div class="row2">
+              <span class="swatch" style="background:${p.color}"></span>
+              <span>${escapeHtml(p.label)}</span>
+              <span class="val">${p.value}</span>
+            </div>`).join('')}
+          </div>
+        </div>` : '<div class="muted">Пока нет данных</div>'}
+      </div>
+      <div class="card">
+        <h3>Топ авторов</h3>
+        ${topUsers.length ? `<div class="chart-wrap">
+          <div>${pieChartSvg(topUsers, 150)}</div>
+          <div class="pie-legend">
+            ${topUsers.map(p=>`<div class="row2">
+              <span class="swatch" style="background:${p.color}"></span>
+              <span>@${escapeHtml(p.label)}</span>
+              <span class="val">${p.value}</span>
+            </div>`).join('')}
+          </div>
+        </div>` : '<div class="muted">Сообщений пока нет</div>'}
+      </div>
     </div>`;
 }
 
@@ -2594,10 +2633,11 @@ async function renderUsers(main){
       <td class="muted">${u.logins_count}</td>
       <td>${u.messages}</td>
       <td>${status}</td>
-      <td style="white-space:nowrap;">
-        <button class="btn mini" data-edit-user="${escapeHtml(u.username)}" data-edit-name="${escapeHtml(u.display_name)}">Изменить</button>
-        <button class="btn mini" data-kick-user="${escapeHtml(u.username)}">Кик</button>
-        <button class="btn mini danger" data-del-user="${escapeHtml(u.username)}">Удалить</button>
+      <td>
+        <div class="icon-actions">
+          <button class="btn icon" title="Изменить" data-edit-user="${escapeHtml(u.username)}" data-edit-name="${escapeHtml(u.display_name)}">${ICO.edit}</button>
+          <button class="btn icon danger" title="Удалить" data-del-user="${escapeHtml(u.username)}">${ICO.del}</button>
+        </div>
       </td>
     </tr>`;
   }).join('');
@@ -2606,28 +2646,16 @@ async function renderUsers(main){
     <div class="page-sub">Всего: ${data.users.length}. Клик по юзернейму — детали.</div>
     <div class="card" style="padding:0;overflow-x:auto;">
       ${data.users.length ? `<table>
-        <thead><tr><th>Юзернейм</th><th>Имя</th><th>Создан</th><th>Активность</th><th>Входов</th><th>Сообщ.</th><th>Статус</th><th></th></tr></thead>
+        <thead><tr><th>Юзернейм</th><th>Имя</th><th>Создан</th><th>Активность</th><th>Входов</th><th>Сообщ.</th><th>Статус</th><th style="width:80px;"></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>` : `<div class="empty-state">Нет пользователей</div>`}
     </div>`;
   main.querySelectorAll('[data-edit-user]').forEach(b => {
     b.addEventListener('click', e => { e.preventDefault(); openUserEdit(b.dataset.editUser, b.dataset.editName); });
   });
-  main.querySelectorAll('[data-kick-user]').forEach(b => {
-    b.addEventListener('click', () => kickUser(b.dataset.kickUser));
-  });
   main.querySelectorAll('[data-del-user]').forEach(b => {
     b.addEventListener('click', () => deleteUser(b.dataset.delUser));
   });
-}
-
-async function kickUser(username){
-  if (!confirm(`Кикнуть "${username}"? Аккаунт останется, но сессии сбросятся.`)) return;
-  try {
-    const r = await api('/api/admin/users/' + encodeURIComponent(username) + '/kick', { method:'POST' });
-    toast(`Кикнут (${r.kicked} сессий)`);
-    renderTab({force:true});
-  } catch(e){ toast(e.message,'err'); }
 }
 
 /* USER DETAIL */
@@ -2637,7 +2665,7 @@ async function renderUserDetail(main, username){
   const msgsPerDay = days.map(day => ({ label: day.slice(5), value: d.messages_per_day[day] || 0 }));
   const loginsPerDay = days.map(day => ({ label: day.slice(5), value: d.logins_per_day[day] || 0 }));
   const pie = Object.entries(d.messages_by_channel || {}).sort((a,b)=>b[1]-a[1]);
-  const palette = ['#0066cc','#3db83d','#f0ad4e','#d9534f','#9b59b6','#16a085','#e67e22','#34495e'];
+  const palette = ['#0066cc','#3db83d','#e08a1e','#cc0000','#9b59b6','#16a085','#e67e22','#34495e'];
   const pieData = pie.map(([ch,n],i) => ({ label: '#' + ch, value: n, color: palette[i%palette.length] }));
   const status = d.is_online
     ? '<span class="chip green">онлайн сейчас</span>'
@@ -2645,15 +2673,6 @@ async function renderUserDetail(main, username){
   const activity = d.is_online
     ? '<span class="green">сейчас</span>'
     : fmtRel(d.last_seen) + ' <span class="muted">('+fmtTs(d.last_seen)+')</span>';
-
-  const channelBreakdown = pie.length ? pie.map(([cid, n]) => `
-    <tr>
-      <td><span class="chip blue">#${escapeHtml(cid)}</span></td>
-      <td>${n}</td>
-      <td style="text-align:right;">
-        <button class="btn mini danger" data-clear-uch="${escapeHtml(cid)}">Удалить сообщения в этом канале</button>
-      </td>
-    </tr>`).join('') : '';
 
   main.innerHTML = `
     <h2 class="page-title">Профиль: ${escapeHtml(d.display_name)}</h2>
@@ -2669,13 +2688,10 @@ async function renderUserDetail(main, username){
           <div class="k">Статус</div><div class="v">${status}</div>
           <div class="k">Сообщений</div><div class="v">${d.total_messages}</div>
           <div class="k">Входов</div><div class="v">${(d.logins||[]).length}</div>
-          <div class="k">Упоминаний отправил</div><div class="v">${d.mentions_sent||0}</div>
-          <div class="k">Упоминаний получил</div><div class="v">${d.mentions_received||0}</div>
         </div>
-        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn" id="det-edit">Редактировать</button>
-          <button class="btn" id="det-kick">Кикнуть</button>
-          <button class="btn danger" id="det-del">Удалить аккаунт</button>
+        <div style="margin-top:14px;display:flex;gap:8px;">
+          <button class="btn" id="det-edit">${ICO.edit} Редактировать</button>
+          <button class="btn danger" id="det-del">${ICO.del} Удалить аккаунт</button>
         </div>
       </div>
       <div class="card">
@@ -2693,13 +2709,6 @@ async function renderUserDetail(main, username){
           </div>` : `<div class="muted">Пользователь не писал сообщений</div>`}
       </div>
     </div>
-    <div class="card">
-      <h3>Управление сообщениями по каналам</h3>
-      ${channelBreakdown ? `<table>
-        <thead><tr><th>Канал</th><th>Сообщений</th><th></th></tr></thead>
-        <tbody>${channelBreakdown}</tbody>
-      </table>` : `<div class="muted">Нет сообщений</div>`}
-    </div>
     <div class="card"><h3>Сообщения по дням (14 дней)</h3>${barChartSvg(msgsPerDay, 900, 130)}</div>
     <div class="card"><h3>Входы по дням (14 дней)</h3>${barChartSvg(loginsPerDay, 900, 130, '#3db83d')}</div>
     <div class="card">
@@ -2714,36 +2723,9 @@ async function renderUserDetail(main, username){
             <td class="muted mono" style="font-size:12px;">${escapeHtml(l.ua||'—')}</td>
           </tr>`).join('')}
         </tbody></table>` : `<div class="muted">Нет записей</div>`}
-    </div>
-    <div class="card">
-      <h3>Последние сообщения</h3>
-      ${(d.recent_messages && d.recent_messages.length) ? `<table style="table-layout:fixed;">
-        <colgroup><col style="width:150px;"><col style="width:140px;"><col style="width:100px;"><col></colgroup>
-        <thead><tr><th>Когда</th><th>Канал</th><th>ID</th><th>Текст</th></tr></thead>
-        <tbody>${d.recent_messages.slice(0,20).map(m => `
-          <tr>
-            <td class="mono muted">${fmtTs(m.ts)}</td>
-            <td><span class="chip blue">#${escapeHtml(m.channel_name)}</span></td>
-            <td class="mono muted" style="font-size:11px;">${escapeHtml(m.id)}</td>
-            <td>${escapeHtml(m.text)}</td>
-          </tr>`).join('')}
-        </tbody></table>` : `<div class="muted">Сообщений нет</div>`}
     </div>`;
   $('det-edit').addEventListener('click', () => openUserEdit(d.username, d.display_name));
-  $('det-kick').addEventListener('click', () => kickUser(d.username));
   $('det-del').addEventListener('click', () => deleteUser(d.username));
-  main.querySelectorAll('[data-clear-uch]').forEach(b => {
-    b.addEventListener('click', async () => {
-      const cid = b.dataset.clearUch;
-      if (!confirm(`Удалить все сообщения @${d.username} в #${cid}?`)) return;
-      try {
-        const r = await api(`/api/admin/channels/${encodeURIComponent(cid)}/user/${encodeURIComponent(d.username)}`,
-                            { method:'DELETE' });
-        toast(`Удалено сообщений: ${r.removed}`);
-        renderTab({force:true});
-      } catch(e){ toast(e.message,'err'); }
-    });
-  });
 }
 
 /* CHARTS */
@@ -2829,11 +2811,12 @@ async function renderChannels(main){
       <td class="muted mono">${fmtTs(c.created)}</td>
       <td>${c.messages}</td>
       <td>${c.online ? `<span class="chip green">${c.online}</span>` : `<span class="chip">0</span>`}</td>
-      <td style="white-space:nowrap;">
-        <button class="btn mini" data-rename="${escapeHtml(c.id)}" data-rename-name="${escapeHtml(c.name)}">Переименовать</button>
-        <button class="btn mini" data-kickall="${escapeHtml(c.id)}">Кикнуть всех</button>
-        <button class="btn mini" data-clear="${escapeHtml(c.id)}">Очистить</button>
-        <button class="btn mini danger" data-del="${escapeHtml(c.id)}">Удалить</button>
+      <td>
+        <div class="icon-actions">
+          <button class="btn icon" title="Переименовать" data-rename="${escapeHtml(c.id)}" data-rename-name="${escapeHtml(c.name)}">${ICO.rename}</button>
+          <button class="btn icon" title="Очистить историю" data-clear="${escapeHtml(c.id)}">${ICO.clear}</button>
+          <button class="btn icon danger" title="Удалить" data-del="${escapeHtml(c.id)}">${ICO.del}</button>
+        </div>
       </td>
     </tr>`).join('');
   main.innerHTML = `
@@ -2845,13 +2828,12 @@ async function renderChannels(main){
     </div>
     <div class="card" style="padding:0;overflow-x:auto;">
       ${data.channels.length ? `<table>
-        <thead><tr><th>ID</th><th>Название</th><th>Владелец</th><th>Создан</th><th>Сообщ.</th><th>Онлайн</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>Название</th><th>Владелец</th><th>Создан</th><th>Сообщ.</th><th>Онлайн</th><th style="width:120px;"></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>` : `<div class="empty-state">Нет каналов</div>`}
     </div>`;
   main.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', ()=>deleteChannel(b.dataset.del)));
   main.querySelectorAll('[data-clear]').forEach(b => b.addEventListener('click', ()=>clearChannel(b.dataset.clear)));
-  main.querySelectorAll('[data-kickall]').forEach(b => b.addEventListener('click', ()=>kickAll(b.dataset.kickall)));
   main.querySelectorAll('[data-rename]').forEach(b =>
     b.addEventListener('click', ()=>openChanRename(b.dataset.rename, b.dataset.renameName)));
   $('new-ch-btn').addEventListener('click', createChannel);
@@ -2872,14 +2854,6 @@ async function clearChannel(cid){
   if (!confirm(`Очистить #${cid}?`)) return;
   try { await api('/api/admin/channels/'+encodeURIComponent(cid)+'/messages', { method:'DELETE' }); toast('Очищено'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
-}
-async function kickAll(cid){
-  if (!confirm(`Кикнуть всех из #${cid}?`)) return;
-  try {
-    const r = await api('/api/admin/channels/'+encodeURIComponent(cid)+'/kickall', { method:'POST' });
-    toast(`Кикнуто: ${r.kicked}`);
-    renderTab({force:true});
-  } catch(e){ toast(e.message,'err'); }
 }
 function openChanRename(cid, name){
   state.currentChan = cid;
@@ -2928,16 +2902,18 @@ async function renderMessages(main){
     try {
       const data = await api('/api/admin/messages?'+p.toString());
       wrap.innerHTML = data.messages.length ? `<table style="table-layout:fixed;">
-        <colgroup><col style="width:140px;"><col style="width:120px;"><col style="width:130px;"><col><col style="width:170px;"></colgroup>
+        <colgroup><col style="width:140px;"><col style="width:120px;"><col style="width:130px;"><col><col style="width:90px;"></colgroup>
         <thead><tr><th>Время</th><th>Канал</th><th>Автор</th><th>Текст</th><th></th></tr></thead>
         <tbody>${data.messages.map(m => `<tr>
           <td class="mono muted">${fmtTs(m.ts)}</td>
           <td><span class="chip blue">#${escapeHtml(m.channel_name||m.channel)}</span></td>
           <td class="mono accent">${escapeHtml(m.user)}</td>
           <td>${escapeHtml(m.text)}${m.edited?' <span class="muted">(изм.)</span>':''}</td>
-          <td style="white-space:nowrap;">
-            <button class="btn mini" data-medit="${escapeHtml(m.id)}" data-mtext="${escapeHtml(m.text)}">Изменить</button>
-            <button class="btn mini danger" data-mdel="${escapeHtml(m.id)}">Удалить</button>
+          <td>
+            <div class="icon-actions">
+              <button class="btn icon" title="Изменить" data-medit="${escapeHtml(m.id)}" data-mtext="${escapeHtml(m.text)}">${ICO.edit}</button>
+              <button class="btn icon danger" title="Удалить" data-mdel="${escapeHtml(m.id)}">${ICO.del}</button>
+            </div>
           </td>
         </tr>`).join('')}</tbody></table>` : `<div class="empty-state">Ничего не найдено</div>`;
       wrap.querySelectorAll('[data-medit]').forEach(b=>b.addEventListener('click',()=>openMsgEdit(b.dataset.medit, b.dataset.mtext)));
@@ -2976,6 +2952,69 @@ async function deleteMessage(id){
   catch(e){ toast(e.message,'err'); }
 }
 
+/* LOGS */
+async function renderLogs(main, opts){
+  if (!opts || !opts.silent) main.innerHTML = `<div class="loading">Загрузка…</div>`;
+  const data = await api('/api/admin/logs?limit=1000');
+  state._logsCache = data.logs || [];
+
+  // если silent и уже отрисовано — просто перерисовать фрейм, не трогая тулбар
+  if (opts && opts.silent && $('log-frame')) {
+    $('log-frame').innerHTML = renderLogLines(state._logsCache);
+    const frame = $('log-frame');
+    frame.scrollTop = frame.scrollHeight;
+    return;
+  }
+
+  main.innerHTML = `
+    <h2 class="page-title">Логи сервера</h2>
+    <div class="page-sub">Всего записей: ${data.total}, показано: ${data.logs.length}</div>
+    <div class="log-toolbar">
+      <button class="btn" id="log-download">${ICO.download} Скачать latest.log</button>
+      <button class="btn" id="log-copy">${ICO.copy} Скопировать всё</button>
+      <span class="spacer"></span>
+      <button class="btn" id="log-refresh">${ICO.rename} Обновить</button>
+    </div>
+    <div class="log-frame" id="log-frame">${renderLogLines(state._logsCache)}</div>`;
+
+  const frame = $('log-frame');
+  frame.scrollTop = frame.scrollHeight;
+
+  $('log-download').addEventListener('click', () => {
+    const a = document.createElement('a');
+    a.href = '/api/admin/logs/download';
+    a.download = 'latest.log';
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+
+  $('log-copy').addEventListener('click', async () => {
+    const text = state._logsCache.map(e =>
+      `[${fmtTs(e.ts)}] [${(e.level||'info').toUpperCase()}] ${e.message}`
+    ).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Лог скопирован в буфер обмена');
+    } catch(e) {
+      // fallback
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove();
+      toast('Лог скопирован');
+    }
+  });
+
+  $('log-refresh').addEventListener('click', () => renderTab({force:true}));
+}
+
+function renderLogLines(logs){
+  if (!logs.length) return '<div style="color:#6b7683;">Пусто</div>';
+  return logs.map(e => {
+    const lvl = (e.level || 'info').toLowerCase();
+    const ts = fmtTs(e.ts);
+    return `<div class="ll log-${escapeHtml(lvl)}"><span class="lt">${ts}</span><span class="lv">${escapeHtml(lvl.toUpperCase())}</span><span class="lm">${escapeHtml(e.message)}</span></div>`;
+  }).join('');
+}
+
 /* SIDE SEARCH */
 $('side-search').addEventListener('input', e => {
   const q = e.target.value.toLowerCase();
@@ -2984,7 +3023,6 @@ $('side-search').addEventListener('input', e => {
   });
 });
 
-/* BOOT */
 (async () => {
   if (!await trySession()) showLogin();
 })();
@@ -2993,7 +3031,9 @@ $('side-search').addEventListener('input', e => {
 </html>
 """
 
-ADMIN_PAGE = ADMIN_PAGE.replace("{{APP_NAME}}", APP_NAME)
+ADMIN_PAGE = (ADMIN_PAGE
+              .replace("{{APP_NAME}}", APP_NAME)
+              .replace("{{FAVICON}}", FAVICON_LINK))
 
 
 # ============================================================
@@ -3012,6 +3052,11 @@ def admin_page():
             f"Админка отключена: не задан ADMIN_PASS</h1>",
             status_code=503)
     return ADMIN_PAGE
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 
 @app.get("/healthz")
