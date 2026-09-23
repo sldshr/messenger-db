@@ -33,7 +33,7 @@ from supabase import create_client, Client
 # ============================================================
 # Поставь True, если хочешь, чтобы при старте проверялась/чинилась схема БД.
 # Требует SUPABASE_DB_URL и пакет psycopg2-binary. ОПАСНО: удаляет лишние таблицы.
-VERIFICATION = False
+VERIFICATION = True
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
