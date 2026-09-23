@@ -3,6 +3,7 @@ import os, time, uuid, json, hmac, hashlib, secrets, asyncio, re, urllib.request
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -13,21 +14,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sld")
 
 START_TIME = time.time()
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 app = FastAPI(title="SLD", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=800)
 
 # ============================================================================
-# IN-MEMORY STORAGE (no external DB)
-# All data lives in the running process. Server restart = data reset.
+# SUPABASE
 # ============================================================================
-USERS: Dict[str, dict] = {}              # nick.lower() -> user dict
-SESSIONS: Dict[str, dict] = {}           # token -> {nick, created}
-POSTS_MEM: Dict[str, dict] = {}          # pid -> post dict
-NOTIFS_MEM: Dict[str, List[dict]] = {}   # nick -> list of notification dicts
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        log.info("[SLD] Supabase connected")
+    except Exception as e:
+        log.error("[SLD] Supabase init error: %s", e)
+
+# In-memory fallback (если Supabase недоступен)
+USERS: Dict[str, dict] = {}
+SESSIONS: Dict[str, dict] = {}
+POSTS_MEM: Dict[str, dict] = {}
+NOTIFS_MEM: Dict[str, List[dict]] = {}
 _OG_CACHE: Dict[str, Optional[dict]] = {}
 _NICK_FAILS: Dict[str, List[float]] = {}
+_RATE: Dict[str, List[float]] = {}
+_USER_CACHE: Dict[str, Tuple[float, dict]] = {}
+_lang_cache: Dict[str, str] = {}
+_geo_cache: Dict[str, dict] = {}
+_EXECUTOR = ThreadPoolExecutor(max_workers=12)
 
 MAX_POST_LEN = 5000
 MAX_COMMENT_LEN = 1500
@@ -38,6 +55,7 @@ TRUNCATE_CHARS = 800
 SESSION_TTL = 30 * 24 * 3600
 MAX_SESSIONS_PER_USER = 10
 USER_CACHE_TTL = 60.0
+SESSION_USER_TTL = 15.0
 RATE_WINDOW = 60.0
 SSE_HEARTBEAT_SEC = 12
 MAX_BODY_BYTES = 1_000_000
@@ -46,109 +64,94 @@ MENTION_RE = re.compile(r"(?<![a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})")
 URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
 RU_COUNTRIES = {"RU","BY","KZ","UA","KG","TJ","UZ","AM","AZ","MD"}
 RESERVED_NICKS = {"admin","root","system","moderator","mod","sld","слд","support","help","api","null","undefined","me","user","users","login","register","settings","policy","notifications","p","u","static","assets"}
-_lang_cache: Dict[str, str] = {}
-_geo_cache: Dict[str, dict] = {}
-_USER_CACHE: Dict[str, Tuple[float, dict]] = {}
-_RATE: Dict[str, List[float]] = {}
-
 DEFAULT_EMOJI = "😀"
 _DUMMY_HASH = None
 
+
+def _parallel(*fns):
+    if not fns: return []
+    if len(fns) == 1: return [fns[0]()]
+    futures = [_EXECUTOR.submit(f) for f in fns]
+    out = []
+    for fu in futures:
+        try: out.append(fu.result())
+        except Exception as e:
+            log.warning("[parallel] %s", e); out.append(None)
+    return out
+
+
 EMOJI_DATA: List[Tuple[str, str, str]] = [
-    ("😀", "Улыбашка", "Grinning"), ("😃", "Улыбка с глазами", "Big smile"),
-    ("😄", "Смех", "Laughing"), ("😁", "Сияющая улыбка", "Beaming"),
-    ("😆", "Хохот", "Grinning squint"), ("😅", "Улыбка с потом", "Nervous laugh"),
-    ("😂", "Слёзы смеха", "Tears of joy"), ("😊", "Смущённая улыбка", "Blush"),
-    ("😇", "Ангел", "Angel"), ("🙂", "Лёгкая улыбка", "Slight smile"),
-    ("🙃", "Перевёрнутая улыбка", "Upside down"), ("😉", "Подмигивание", "Wink"),
-    ("😌", "Спокойствие", "Relieved"), ("😍", "Влюблённые глаза", "Heart eyes"),
-    ("😘", "Воздушный поцелуй", "Kiss"), ("😗", "Поцелуй", "Kissing"),
-    ("😙", "Поцелуй с улыбкой", "Kissing smile"), ("😚", "Закрытый поцелуй", "Kissing closed"),
-    ("😋", "Вкусно", "Yum"), ("😛", "Язык", "Tongue"),
-    ("😝", "Прищур с языком", "Squint tongue"), ("😜", "Подмигивание с языком", "Wink tongue"),
-    ("😎", "Крутой", "Cool"), ("😏", "Ухмылка", "Smirk"),
-    ("😒", "Недовольство", "Unamused"), ("😞", "Разочарование", "Disappointed"),
-    ("😔", "Печаль", "Pensive"), ("😟", "Тревога", "Worried"),
-    ("😕", "Смущение", "Confused"), ("🙁", "Лёгкая грусть", "Slight frown"),
-    ("☹️", "Грусть", "Frown"), ("😣", "Мучение", "Persevere"),
-    ("😖", "Замешательство", "Confounded"), ("😫", "Усталость", "Tired"),
-    ("😩", "Изнеможение", "Weary"), ("😢", "Слеза", "Crying"),
-    ("😭", "Громкий плач", "Sobbing"), ("😤", "Пар из носа", "Triumph"),
-    ("😠", "Злость", "Angry"), ("😡", "Ярость", "Rage"),
-    ("😳", "Румянец", "Flushed"), ("😱", "Крик", "Scream"),
-    ("😨", "Испуг", "Fearful"), ("😰", "Тревожный пот", "Anxious"),
-    ("😥", "Грустный пот", "Sad relieved"), ("😓", "Пот", "Downcast"),
-    ("🤗", "Обнимашки", "Hug"), ("🤔", "Размышление", "Thinking"),
-    ("🤐", "Молчание", "Zipper mouth"), ("😶", "Без слов", "No mouth"),
-    ("😐", "Нейтрально", "Neutral"), ("😑", "Без эмоций", "Expressionless"),
-    ("😬", "Стиснутые зубы", "Grimacing"), ("🙄", "Закатывает глаза", "Eye roll"),
-    ("😯", "Удивление", "Hushed"), ("😦", "Открытый рот", "Frowning open"),
-    ("😧", "Изумление", "Anguished"), ("😮", "Ох", "Open mouth"),
-    ("😲", "Потрясение", "Astonished"), ("😴", "Сон", "Sleeping"),
-    ("🤤", "Слюни", "Drooling"), ("😪", "Сонливость", "Sleepy"),
-    ("😵", "Головокружение", "Dizzy"), ("🤢", "Тошнота", "Nauseous"),
-    ("🤧", "Чих", "Sneezing"), ("😷", "Маска", "Mask"),
-    ("🤒", "Термометр", "Sick"), ("🤕", "Повязка", "Injured"),
-    ("😈", "Дьяволёнок", "Devil"), ("👿", "Злой дьявол", "Angry devil"),
-    ("👹", "Огр", "Ogre"), ("👺", "Тэнгу", "Goblin"),
-    ("💩", "Какашка", "Poo"), ("💀", "Череп", "Skull"),
-    ("👻", "Призрак", "Ghost"), ("👽", "Инопланетянин", "Alien"),
-    ("👾", "Космический монстр", "Space invader"), ("🤖", "Робот", "Robot"),
-    ("🎃", "Тыква", "Pumpkin"), ("😺", "Кот улыбается", "Grinning cat"),
-    ("😸", "Кот смеётся", "Grinning cat eyes"), ("😹", "Кот со слезами", "Cat tears"),
-    ("😻", "Кот влюблён", "Heart eyes cat"), ("😼", "Кот ухмыляется", "Wry cat"),
-    ("😽", "Кот целует", "Kissing cat"), ("🙀", "Кот в шоке", "Weary cat"),
-    ("😿", "Кот плачет", "Crying cat"), ("😾", "Кот злится", "Pouting cat"),
-    ("🐶", "Собака", "Dog"), ("🐱", "Кошка", "Cat"),
-    ("🐭", "Мышь", "Mouse"), ("🐹", "Хомяк", "Hamster"),
-    ("🐰", "Кролик", "Rabbit"), ("🐻", "Медведь", "Bear"),
-    ("🐼", "Панда", "Panda"), ("🐨", "Коала", "Koala"),
-    ("🐯", "Тигр", "Tiger"), ("🐮", "Корова", "Cow"),
-    ("🐷", "Свинья", "Pig"), ("🐸", "Лягушка", "Frog"),
-    ("🐵", "Обезьяна", "Monkey"), ("🐔", "Курица", "Chicken"),
-    ("🐧", "Пингвин", "Penguin"), ("🐦", "Птица", "Bird"),
-    ("🐤", "Цыплёнок", "Baby chick"), ("🐺", "Волк", "Wolf"),
-    ("🐴", "Лошадь", "Horse"), ("🐝", "Пчела", "Bee"),
-    ("🐛", "Гусеница", "Bug"), ("🐢", "Черепаха", "Turtle"),
-    ("🐍", "Змея", "Snake"), ("🐙", "Осьминог", "Octopus"),
-    ("🐠", "Тропическая рыба", "Tropical fish"), ("🐟", "Рыба", "Fish"),
-    ("🐬", "Дельфин", "Dolphin"), ("🐳", "Кит", "Whale"),
-    ("🐋", "Кит с фонтанчиком", "Humpback whale"), ("🌵", "Кактус", "Cactus"),
-    ("🎄", "Новогодняя ёлка", "Christmas tree"), ("🌲", "Ёлка", "Evergreen"),
-    ("🌳", "Дерево", "Tree"), ("🌴", "Пальма", "Palm"),
-    ("🌱", "Росток", "Seedling"), ("🌿", "Трава", "Herb"),
-    ("🍀", "Клевер", "Four-leaf clover"), ("🍃", "Листок на ветру", "Leaf fluttering"),
-    ("🍂", "Осенний лист", "Fallen leaf"), ("🍁", "Кленовый лист", "Maple leaf"),
-    ("🍄", "Гриб", "Mushroom"), ("🌾", "Колосья", "Sheaf of rice"),
-    ("🌷", "Тюльпан", "Tulip"), ("🌹", "Роза", "Rose"),
-    ("🌺", "Гибискус", "Hibiscus"), ("🌸", "Сакура", "Cherry blossom"),
-    ("🌼", "Ромашка", "Blossom"), ("🌻", "Подсолнух", "Sunflower"),
-    ("💐", "Букет", "Bouquet"), ("🌞", "Солнце с лицом", "Sun with face"),
-    ("🌝", "Полная луна с лицом", "Full moon face"), ("🌛", "Луна с лицом", "Moon face"),
-    ("🌜", "Луна с лицом (влево)", "Last quarter moon"), ("🌚", "Новая луна с лицом", "New moon face"),
-    ("🌕", "Полная луна", "Full moon"), ("🌙", "Полумесяц", "Crescent moon"),
-    ("🌎", "Земля (Америка)", "Earth Americas"), ("🌍", "Земля (Европа)", "Earth Europe"),
-    ("🌏", "Земля (Азия)", "Earth Asia"), ("⭐", "Звезда", "Star"),
-    ("🌟", "Сияющая звезда", "Glowing star"), ("✨", "Искры", "Sparkles"),
-    ("⚡", "Молния", "Lightning"), ("🔥", "Огонь", "Fire"),
-    ("💥", "Взрыв", "Collision"), ("🌈", "Радуга", "Rainbow"),
-    ("💧", "Капля", "Droplet"), ("🌊", "Волна", "Wave"),
-    ("🍎", "Красное яблоко", "Red apple"), ("🍊", "Мандарин", "Tangerine"),
-    ("🍋", "Лимон", "Lemon"), ("🍌", "Банан", "Banana"),
-    ("🍉", "Арбуз", "Watermelon"), ("🍇", "Виноград", "Grapes"),
-    ("🍓", "Клубника", "Strawberry"), ("🍒", "Вишня", "Cherries"),
-    ("🍑", "Персик", "Peach"), ("🍍", "Ананас", "Pineapple"),
-    ("🍅", "Помидор", "Tomato"), ("🍞", "Хлеб", "Bread"),
-    ("🍔", "Бургер", "Burger"), ("🍟", "Картошка фри", "Fries"),
-    ("🍕", "Пицца", "Pizza"), ("🍜", "Лапша", "Noodles"),
-    ("🍣", "Суши", "Sushi"), ("🍦", "Мороженое", "Ice cream"),
-    ("🍩", "Пончик", "Donut"), ("🍪", "Печенье", "Cookie"),
-    ("🎂", "Торт", "Birthday cake"), ("🍰", "Кусок торта", "Shortcake"),
-    ("🍫", "Шоколад", "Chocolate"), ("🍬", "Конфета", "Candy"),
+    ("😀","Улыбашка","Grinning"),("😃","Улыбка с глазами","Big smile"),
+    ("😄","Смех","Laughing"),("😁","Сияющая улыбка","Beaming"),
+    ("😆","Хохот","Grinning squint"),("😅","Улыбка с потом","Nervous laugh"),
+    ("😂","Слёзы смеха","Tears of joy"),("😊","Смущённая улыбка","Blush"),
+    ("😇","Ангел","Angel"),("🙂","Лёгкая улыбка","Slight smile"),
+    ("🙃","Перевёрнутая улыбка","Upside down"),("😉","Подмигивание","Wink"),
+    ("😌","Спокойствие","Relieved"),("😍","Влюблённые глаза","Heart eyes"),
+    ("😘","Воздушный поцелуй","Kiss"),("😎","Крутой","Cool"),
+    ("😏","Ухмылка","Smirk"),("😒","Недовольство","Unamused"),
+    ("😞","Разочарование","Disappointed"),("😔","Печаль","Pensive"),
+    ("😢","Слеза","Crying"),("😭","Громкий плач","Sobbing"),
+    ("😡","Ярость","Rage"),("😱","Крик","Scream"),
+    ("🤗","Обнимашки","Hug"),("🤔","Размышление","Thinking"),
+    ("😐","Нейтрально","Neutral"),("🙄","Закатывает глаза","Eye roll"),
+    ("😴","Сон","Sleeping"),("🤖","Робот","Robot"),
+    ("🎃","Тыква","Pumpkin"),("😺","Кот улыбается","Grinning cat"),
+    ("😻","Кот влюблён","Heart eyes cat"),("😿","Кот плачет","Crying cat"),
+    ("🐶","Собака","Dog"),("🐱","Кошка","Cat"),
+    ("🐭","Мышь","Mouse"),("🐹","Хомяк","Hamster"),
+    ("🐰","Кролик","Rabbit"),("🐻","Медведь","Bear"),
+    ("🐼","Панда","Panda"),("🐨","Коала","Koala"),
+    ("🐯","Тигр","Tiger"),("🦊","Лиса","Fox"),
+    ("🐮","Корова","Cow"),("🐷","Свинья","Pig"),
+    ("🐸","Лягушка","Frog"),("🐵","Обезьяна","Monkey"),
+    ("🐧","Пингвин","Penguin"),("🦉","Сова","Owl"),
+    ("🦄","Единорог","Unicorn"),("🐝","Пчела","Bee"),
+    ("🦋","Бабочка","Butterfly"),("🐢","Черепаха","Turtle"),
+    ("🐙","Осьминог","Octopus"),("🐬","Дельфин","Dolphin"),
+    ("🐳","Кит","Whale"),("🌵","Кактус","Cactus"),
+    ("🎄","Ёлка","Christmas tree"),("🌲","Сосна","Evergreen"),
+    ("🌳","Дерево","Tree"),("🌴","Пальма","Palm"),
+    ("🌱","Росток","Seedling"),("🍀","Клевер","Clover"),
+    ("🍁","Кленовый лист","Maple leaf"),("🌷","Тюльпан","Tulip"),
+    ("🌹","Роза","Rose"),("🌸","Сакура","Blossom"),
+    ("🌻","Подсолнух","Sunflower"),("💐","Букет","Bouquet"),
+    ("🌞","Солнце с лицом","Sun with face"),("🌙","Полумесяц","Crescent"),
+    ("⭐","Звезда","Star"),("🌟","Сияющая звезда","Glowing star"),
+    ("✨","Искры","Sparkles"),("⚡","Молния","Lightning"),
+    ("🔥","Огонь","Fire"),("💥","Взрыв","Collision"),
+    ("🌈","Радуга","Rainbow"),("💧","Капля","Droplet"),
+    ("🌊","Волна","Wave"),("🍎","Яблоко","Apple"),
+    ("🍊","Мандарин","Tangerine"),("🍋","Лимон","Lemon"),
+    ("🍌","Банан","Banana"),("🍉","Арбуз","Watermelon"),
+    ("🍇","Виноград","Grapes"),("🍓","Клубника","Strawberry"),
+    ("🍒","Вишня","Cherries"),("🍑","Персик","Peach"),
+    ("🍍","Ананас","Pineapple"),("🍅","Помидор","Tomato"),
+    ("🍔","Бургер","Burger"),("🍟","Картошка фри","Fries"),
+    ("🍕","Пицца","Pizza"),("🍜","Лапша","Noodles"),
+    ("🍣","Суши","Sushi"),("🍦","Мороженое","Ice cream"),
+    ("🍩","Пончик","Donut"),("🍪","Печенье","Cookie"),
+    ("🎂","Торт","Birthday cake"),("🍰","Кусок торта","Shortcake"),
+    ("🍫","Шоколад","Chocolate"),("🍬","Конфета","Candy"),
+    ("🍺","Пиво","Beer"),("☕","Кофе","Coffee"),
+    ("🚀","Ракета","Rocket"),("✈️","Самолёт","Airplane"),
+    ("🚗","Машина","Car"),("🏠","Дом","House"),
+    ("🎮","Геймпад","Gamepad"),("🎧","Наушники","Headphones"),
+    ("🎸","Гитара","Guitar"),("🎨","Палитра","Palette"),
+    ("📚","Книги","Books"),("💻","Ноутбук","Laptop"),
+    ("📱","Телефон","Phone"),("⌚","Часы","Watch"),
+    ("💎","Алмаз","Diamond"),("🎁","Подарок","Gift"),
+    ("💡","Идея","Idea"),("🏆","Кубок","Trophy"),
+    ("⚽","Футбол","Soccer"),("🏀","Баскетбол","Basketball"),
+    ("🎯","Мишень","Target"),("🎲","Кубик","Dice"),
+    ("🧩","Пазл","Puzzle"),("🕹️","Джойстик","Joystick"),
 ]
 EMOJIS = [e[0] for e in EMOJI_DATA]
 
 
+# ============================================================================
+# SECURITY middleware
+# ============================================================================
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     cl = request.headers.get("content-length")
@@ -162,25 +165,25 @@ async def security_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), payment=(), usb=(), interest-cohort=()"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     ct = response.headers.get("content-type", "")
     if ct.startswith("text/html"):
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: https: http:; "
-            "font-src 'self'; connect-src 'self'; "
-            "media-src 'none'; object-src 'none'; frame-src 'none'; "
-            "worker-src 'none'; base-uri 'self'; form-action 'self'; "
-            "frame-ancestors 'none'"
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; "
+            "font-src 'self'; connect-src 'self'; media-src 'none'; "
+            "object-src 'none'; frame-src 'none'; worker-src 'none'; "
+            "base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
         )
     return response
 
 
+# ============================================================================
+# EventBus (SSE)
+# ============================================================================
 class EventBus:
     def __init__(self):
         self.clients: Dict[str, List[asyncio.Queue]] = {}
@@ -251,20 +254,19 @@ def broadcast_post_change(post: dict, except_nick: Optional[str] = None, feed: b
     if feed: bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
 
 
+# ============================================================================
+# Utils
+# ============================================================================
 def _is_private_host(host: str) -> bool:
     if not host: return True
     h = host.strip().lower().strip("[]")
-    if h in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
-        return True
-    if h.endswith(".local") or h.endswith(".internal") or h.endswith(".lan"):
-        return True
-    if h in ("metadata.google.internal", "metadata.google.com", "metadata"):
-        return True
+    if h in ("localhost","localhost.localdomain","ip6-localhost","ip6-loopback"): return True
+    if h.endswith(".local") or h.endswith(".internal") or h.endswith(".lan"): return True
+    if h in ("metadata.google.internal","metadata.google.com","metadata"): return True
     try:
         ip = ipaddress.ip_address(h)
         if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return True
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified): return True
         if str(ip).startswith("169.254."): return True
         return False
     except ValueError:
@@ -277,7 +279,7 @@ def _safe_url(u) -> str:
     if not u or len(u) > 500: return ""
     try: p = urlparse(u)
     except Exception: return ""
-    if p.scheme not in ("http", "https"): return ""
+    if p.scheme not in ("http","https"): return ""
     if not p.netloc: return ""
     if _is_private_host(p.hostname or ""): return ""
     return u
@@ -326,14 +328,15 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def create_session(nick: str) -> str:
+def create_session(nick: str, user: Optional[dict] = None) -> str:
     existing = [(t, s.get("created", 0)) for t, s in SESSIONS.items() if s.get("nick") == nick]
     if len(existing) >= MAX_SESSIONS_PER_USER:
         existing.sort(key=lambda x: x[1])
         for t, _ in existing[:len(existing) - MAX_SESSIONS_PER_USER + 1]:
             SESSIONS.pop(t, None)
     token = new_token()
-    SESSIONS[token] = {"nick": nick, "created": time.time()}
+    SESSIONS[token] = {"nick": nick, "created": time.time(),
+                       "user": user, "user_ts": time.time()}
     return token
 
 
@@ -395,10 +398,9 @@ def extract_first_url(text: str) -> Optional[str]:
 
 def detect_device(ua: str) -> str:
     ua_l = (ua or "").lower()
-    markers = ("mobile", "android", "iphone", "ipod", "ipad", "windows phone",
-               "webos", "blackberry", "opera mini")
-    if any(x in ua_l for x in markers): return "mobile"
-    return "desktop"
+    markers = ("mobile","android","iphone","ipod","ipad","windows phone",
+               "webos","blackberry","opera mini")
+    return "mobile" if any(x in ua_l for x in markers) else "desktop"
 
 
 def fetch_og_data(url: str) -> Optional[dict]:
@@ -477,7 +479,7 @@ def get_client_ip(request: Request) -> str:
 def _is_private_ip(ip: str) -> bool:
     if not ip: return True
     return (ip.startswith("127.") or ip.startswith("10.") or ip.startswith("192.168.")
-            or ip.startswith("172.") or ip in ("::1", "localhost"))
+            or ip.startswith("172.") or ip in ("::1","localhost"))
 
 
 def get_geo(ip: str) -> dict:
@@ -491,8 +493,8 @@ def get_geo(ip: str) -> dict:
             headers={"User-Agent": "SLD"})
         with urllib.request.urlopen(req, timeout=2) as r:
             data = json.loads(r.read().decode())
-        result = {"city": data.get("city", "") or "",
-                  "country": data.get("country", "") or "",
+        result = {"city": data.get("city","") or "",
+                  "country": data.get("country","") or "",
                   "country_code": (data.get("countryCode") or "").upper()}
         _geo_cache[ip] = result; return result
     except Exception:
@@ -504,7 +506,7 @@ def detect_lang(ip: str, accept_language: str) -> str:
     if key in _lang_cache: return _lang_cache[key]
     lang = None
     geo = get_geo(ip)
-    cc = geo.get("country_code", "")
+    cc = geo.get("country_code","")
     if cc in RU_COUNTRIES: lang = "ru"
     elif cc: lang = "en"
     if not lang:
@@ -531,7 +533,15 @@ def get_current_user(request: Request) -> Optional[dict]:
         SESSIONS.pop(token, None); return None
     nick = sess.get("nick")
     if not nick: return None
-    return db_load_user_cached(nick)
+    now = time.time()
+    cached = sess.get("user")
+    cached_ts = sess.get("user_ts", 0)
+    if cached and now - cached_ts < SESSION_USER_TTL:
+        return cached
+    u = db_load_user_cached(nick)
+    if u:
+        sess["user"] = u; sess["user_ts"] = now
+    return u
 
 
 def require_user(request: Request) -> dict:
@@ -543,6 +553,9 @@ def require_user(request: Request) -> dict:
 def invalidate_user_cache(nick: Optional[str] = None) -> None:
     if nick is None: _USER_CACHE.clear()
     else: _USER_CACHE.pop(nick.lower(), None)
+    for s in SESSIONS.values():
+        if nick is None or (s.get("nick") or "").lower() == nick.lower():
+            s.pop("user", None); s.pop("user_ts", None)
 
 
 def clean_emoji(s: Optional[str]) -> str:
@@ -550,12 +563,45 @@ def clean_emoji(s: Optional[str]) -> str:
     return s.strip()[:8]
 
 
+NOTIFY_FIELDS = [
+    "notify_on_new_post","notify_on_follow","notify_on_comment",
+    "notify_on_reply","notify_on_mention","notify_on_quote",
+]
+NOTIFY_TYPE_TO_FIELD = {
+    "new_post":"notify_on_new_post","follow":"notify_on_follow",
+    "comment":"notify_on_comment","reply":"notify_on_reply",
+    "mention":"notify_on_mention","quote":"notify_on_quote",
+}
+USER_BOOL_DEFAULTS = {
+    "notify_on_new_post":True,"notify_on_follow":True,"notify_on_comment":True,
+    "notify_on_reply":True,"notify_on_mention":True,"notify_on_quote":True,
+    "show_link_previews":True,"allow_followers_view":True,"allow_following_view":True,
+    "show_device_badge":True,
+}
+
+
 # ============================================================================
-# IN-MEMORY DB LAYER
+# DB LAYER (Supabase + memory fallback)
 # ============================================================================
+def _norm_user_row(row: dict) -> dict:
+    row["following"] = set(row.get("following") or [])
+    row["followers"] = set(row.get("followers") or [])
+    row["bio"] = row.get("bio") or ""
+    row["created_at"] = iso_to_ts(row.get("created_at"))
+    for f, d in USER_BOOL_DEFAULTS.items():
+        row[f] = bool(row.get(f, d))
+    row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
+    return row
+
 
 def db_load_user(nick: str) -> Optional[dict]:
     if not nick: return None
+    if supabase:
+        try:
+            r = supabase.table("users").select("*").ilike("nick", nick).limit(1).execute()
+            if r.data: return _norm_user_row(r.data[0])
+        except Exception as e: log.error("db_load_user: %s", e)
+        return None
     return USERS.get(nick.lower())
 
 
@@ -570,78 +616,170 @@ def db_load_user_cached(nick: str) -> Optional[dict]:
 
 def db_load_users_batch(nicks: List[str]) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
+    missing, seen = [], set()
+    now = time.time()
     for n in nicks:
         if not n: continue
         ln = n.lower()
-        if ln in out: continue
-        u = db_load_user_cached(n)
-        if u is not None: out[ln] = u
+        if ln in seen: continue
+        seen.add(ln)
+        e = _USER_CACHE.get(ln)
+        if e and now - e[0] < USER_CACHE_TTL: out[ln] = e[1]
+        else: missing.append(n)
+    if not missing: return out
+    if supabase:
+        try:
+            r = supabase.table("users").select("*").in_("nick", list(set(missing))).execute()
+            for row in (r.data or []):
+                u = _norm_user_row(row)
+                out[u["nick"].lower()] = u
+                _USER_CACHE[u["nick"].lower()] = (now, u)
+        except Exception as e: log.error("db_load_users_batch: %s", e)
+    else:
+        for n in missing:
+            u = USERS.get(n.lower())
+            if u: out[u["nick"].lower()] = u
     return out
 
 
-NOTIFY_FIELDS = [
-    "notify_on_new_post", "notify_on_follow", "notify_on_comment",
-    "notify_on_reply", "notify_on_mention", "notify_on_quote",
-]
-NOTIFY_TYPE_TO_FIELD = {
-    "new_post": "notify_on_new_post", "follow": "notify_on_follow",
-    "comment": "notify_on_comment", "reply": "notify_on_reply",
-    "mention": "notify_on_mention", "quote": "notify_on_quote",
-}
-USER_BOOL_DEFAULTS = {
-    "notify_on_new_post": True, "notify_on_follow": True, "notify_on_comment": True,
-    "notify_on_reply": True, "notify_on_mention": True, "notify_on_quote": True,
-    "show_link_previews": True, "allow_followers_view": True, "allow_following_view": True,
-    "show_device_badge": True,
-}
+def _user_payload(u: dict) -> dict:
+    p = {
+        "nick": u["nick"], "name": u["name"], "bio": u.get("bio",""),
+        "password": u["password"], "created_at": ts_to_iso(u["created_at"]),
+        "following": list(u.get("following") or []),
+        "followers": list(u.get("followers") or []),
+        "allow_followers_view": u.get("allow_followers_view", True),
+        "allow_following_view": u.get("allow_following_view", True),
+        "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
+        "show_link_previews": u.get("show_link_previews", True),
+        "show_device_badge": u.get("show_device_badge", True),
+    }
+    for f in NOTIFY_FIELDS: p[f] = bool(u.get(f, True))
+    return p
 
 
 def db_save_user(u: dict) -> None:
-    key = (u.get("nick") or "").lower()
-    if not key: return
-    # ensure defaults
-    for f, d in USER_BOOL_DEFAULTS.items():
-        u.setdefault(f, d)
-    u.setdefault("avatar_emoji", DEFAULT_EMOJI)
-    u.setdefault("bio", "")
-    u.setdefault("created_at", time.time())
-    USERS[key] = u
+    if not supabase:
+        USERS[u["nick"].lower()] = u; invalidate_user_cache(u["nick"]); return
+    try: supabase.table("users").upsert(_user_payload(u)).execute()
+    except Exception as e: log.error("db_save_user: %s", e)
     invalidate_user_cache(u["nick"])
 
 
 def db_update_user_fields(nick: str, patch: dict) -> None:
-    u = USERS.get(nick.lower())
-    if not u: return
-    u.update(patch)
+    if not supabase:
+        u = USERS.get(nick.lower())
+        if u: u.update(patch)
+        invalidate_user_cache(nick); return
+    try: supabase.table("users").update(patch).eq("nick", nick).execute()
+    except Exception as e: log.error("db_update_user_fields: %s", e)
     invalidate_user_cache(nick)
 
 
 def db_all_users() -> List[dict]:
+    if supabase:
+        try:
+            r = supabase.table("users").select("*").execute()
+            return [_norm_user_row(row) for row in (r.data or [])]
+        except Exception as e: log.error("db_all_users: %s", e); return []
     return list(USERS.values())
 
 
 def db_create_post(p: dict) -> None:
-    POSTS_MEM[p["id"]] = p
+    if not supabase:
+        POSTS_MEM[p["id"]] = p; return
+    payload = {
+        "id": p["id"], "text": p["text"], "author": p["author"],
+        "created_at": ts_to_iso(p["created_at"]),
+        "quoted_post_id": p.get("quoted_post_id"),
+        "og_data": p.get("og_data"),
+    }
+    if p.get("device"): payload["device"] = p["device"]
+    try: supabase.table("posts").insert(payload).execute()
+    except Exception as e:
+        log.error("db_create_post: %s", e)
+        payload.pop("device", None)
+        try: supabase.table("posts").insert(payload).execute()
+        except Exception as e2: log.error("db_create_post retry: %s", e2)
 
 
 def db_update_post_text(pid: str, text: str) -> None:
-    p = POSTS_MEM.get(pid)
-    if p: p["text"] = text
+    if not supabase:
+        p = POSTS_MEM.get(pid)
+        if p: p["text"] = text
+        return
+    try: supabase.table("posts").update({"text": text}).eq("id", pid).execute()
+    except Exception as e: log.error("db_update_post: %s", e)
 
 
 def db_delete_post(pid: str) -> None:
-    POSTS_MEM.pop(pid, None)
-    # remove related notifications
-    for nick, items in list(NOTIFS_MEM.items()):
-        NOTIFS_MEM[nick] = [n for n in items if n.get("post_id") != pid]
+    if not supabase:
+        POSTS_MEM.pop(pid, None); return
+    try:
+        supabase.table("notifications").delete().eq("post_id", pid).execute()
+        supabase.table("posts").delete().eq("id", pid).execute()
+    except Exception as e: log.error("db_delete_post: %s", e)
 
 
 def db_get_post(pid: str) -> Optional[dict]:
+    if supabase:
+        try:
+            r = supabase.table("posts").select("*").eq("id", pid).limit(1).execute()
+            if not r.data: return None
+            row = r.data[0]
+            row["created_at"] = iso_to_ts(row.get("created_at"))
+            return row
+        except Exception as e: log.error("db_get_post: %s", e); return None
     return POSTS_MEM.get(pid)
+
+
+def db_inc_views(pid: str) -> int:
+    if not supabase:
+        p = POSTS_MEM.get(pid)
+        if p:
+            p["views"] = (p.get("views") or 0) + 1
+            return p["views"]
+        return 0
+    try:
+        supabase.rpc("increment_post_views", {"p_id": pid}).execute()
+        r = supabase.table("posts").select("views").eq("id", pid).limit(1).execute()
+        if r.data: return r.data[0].get("views") or 0
+    except Exception as e: log.error("db_inc_views: %s", e)
+    return 0
+
+
+def view_should_count(pid: str, vid: str) -> bool:
+    if not supabase: return True
+    try:
+        r = (supabase.table("post_views").select("last_viewed_at")
+             .eq("post_id", pid).eq("viewer_id", vid).limit(1).execute())
+        if r.data:
+            last_ts = iso_to_ts(r.data[0].get("last_viewed_at"))
+            if time.time() - last_ts < 8 * 3600: return False
+    except Exception as e: log.error("view_should_count: %s", e)
+    return True
+
+
+def view_mark_counted(pid: str, vid: str) -> None:
+    if not supabase: return
+    try:
+        supabase.table("post_views").upsert({
+            "post_id": pid, "viewer_id": vid,
+            "last_viewed_at": ts_to_iso(time.time())}).execute()
+    except Exception as e: log.error("view_mark: %s", e)
 
 
 def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
     out = {}
+    if not post_ids: return out
+    if supabase:
+        try:
+            r = supabase.table("posts").select("*").in_("id", post_ids).execute()
+            for row in r.data or []:
+                row["created_at"] = iso_to_ts(row.get("created_at"))
+                out[row["id"]] = row
+        except Exception as e: log.error("db_get_quotes: %s", e)
+        return out
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
         if p: out[pid] = p
@@ -649,12 +787,26 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
 
 
 def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> List[dict]:
+    if supabase:
+        try:
+            query = supabase.table("posts").select("*")
+            if author: query = query.eq("author", author)
+            if subscriptions_of:
+                u = db_load_user_cached(subscriptions_of)
+                fol = list(u.get("following") or []) if u else []
+                if not fol: return []
+                query = query.in_("author", fol)
+            if q: query = query.ilike("text", f"%{q}%")
+            query = query.order("created_at", desc=True).limit(FEED_LIMIT)
+            rows = query.execute().data or []
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
+        except Exception as e: log.error("db_list_posts: %s", e); return []
     items = list(POSTS_MEM.values())
-    if author:
-        items = [p for p in items if (p.get("author") or "").lower() == author.lower()]
+    if author: items = [p for p in items if (p.get("author") or "").lower() == author.lower()]
     if subscriptions_of:
         u = db_load_user_cached(subscriptions_of)
-        fol = set((x.lower() for x in (u.get("following") or set()))) if u else set()
+        fol = set(x.lower() for x in (u.get("following") or set())) if u else set()
         items = [p for p in items if (p.get("author") or "").lower() in fol]
     if q:
         n = q.lower()
@@ -664,16 +816,30 @@ def db_list_posts(q: str = "", author: str = "", subscriptions_of: str = "") -> 
 
 
 def db_post_votes(post_ids: List[str]) -> List[dict]:
+    if not post_ids: return []
+    if supabase:
+        try:
+            return supabase.table("post_votes").select("*").in_("post_id", post_ids).execute().data or []
+        except Exception as e: log.error("db_post_votes: %s", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
         if p:
-            for vid, d in p.get("votes", {}).items():
+            for vid, d in (p.get("votes") or {}).items():
                 out.append({"post_id": pid, "voter_id": vid, "direction": d})
     return out
 
 
 def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
+    if supabase:
+        try:
+            if direction == 0:
+                supabase.table("post_votes").delete().eq("post_id", post_id).eq("voter_id", voter_id).execute()
+            else:
+                supabase.table("post_votes").upsert({
+                    "post_id": post_id, "voter_id": voter_id, "direction": direction}).execute()
+        except Exception as e: log.error("db_set_post_vote: %s", e)
+        return
     p = POSTS_MEM.get(post_id)
     if not p: return
     p.setdefault("votes", {})
@@ -682,14 +848,32 @@ def db_set_post_vote(post_id: str, voter_id: str, direction: int) -> None:
 
 
 def db_comment_counts(post_ids: List[str]) -> Dict[str, int]:
+    if not post_ids: return {}
+    if supabase:
+        try:
+            r = supabase.table("comments").select("post_id").in_("post_id", post_ids).execute()
+            out: Dict[str, int] = {}
+            for row in r.data or []:
+                pid = row.get("post_id")
+                if pid: out[pid] = out.get(pid, 0) + 1
+            return out
+        except Exception as e: log.error("db_comment_counts: %s", e); return {}
     out = {}
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
-        if p: out[pid] = len(p.get("comments", []))
+        if p: out[pid] = len(p.get("comments") or [])
     return out
 
 
 def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
+    if not post_ids: return []
+    if supabase:
+        try:
+            rows = (supabase.table("comments").select("*").in_("post_id", post_ids)
+                    .order("created_at").execute().data or [])
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
+        except Exception as e: log.error("db_comments_for_posts: %s", e); return []
     out = []
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -702,42 +886,72 @@ def db_comments_for_posts(post_ids: List[str]) -> List[dict]:
 
 
 def db_comment_votes(comment_ids: List[str]) -> List[dict]:
+    if not comment_ids: return []
+    if supabase:
+        try:
+            return supabase.table("comment_votes").select("*").in_("comment_id", comment_ids).execute().data or []
+        except Exception as e: log.error("db_comment_votes: %s", e); return []
     out = []
     for pid, p in POSTS_MEM.items():
         for c in p.get("comments", []):
             if c["id"] in comment_ids:
-                for vid, d in c.get("votes", {}).items():
+                for vid, d in (c.get("votes") or {}).items():
                     out.append({"comment_id": c["id"], "voter_id": vid, "direction": d})
     return out
 
 
 def db_create_comment(c: dict) -> None:
-    p = POSTS_MEM.get(c["post_id"])
-    if p:
-        p.setdefault("comments", []).append({
-            "id": c["id"], "author": c["author"], "parent_id": c.get("parent_id"),
-            "text": c["text"], "created_at": c["created_at"], "votes": {}})
+    if not supabase:
+        p = POSTS_MEM.get(c["post_id"])
+        if p:
+            p.setdefault("comments", []).append({
+                "id": c["id"], "author": c["author"], "parent_id": c.get("parent_id"),
+                "text": c["text"], "created_at": c["created_at"], "votes": {}})
+        return
+    try:
+        supabase.table("comments").insert({
+            "id": c["id"], "post_id": c["post_id"], "author": c["author"],
+            "parent_id": c.get("parent_id"), "text": c["text"],
+            "created_at": ts_to_iso(c["created_at"])}).execute()
+    except Exception as e: log.error("db_create_comment: %s", e)
 
 
 def db_update_comment_text(cid: str, text: str) -> None:
-    for p in POSTS_MEM.values():
-        for c in p.get("comments", []):
-            if c["id"] == cid: c["text"] = text; return
+    if not supabase:
+        for p in POSTS_MEM.values():
+            for c in p.get("comments", []):
+                if c["id"] == cid: c["text"] = text; return
+        return
+    try: supabase.table("comments").update({"text": text}).eq("id", cid).execute()
+    except Exception as e: log.error("db_update_comment: %s", e)
 
 
 def db_delete_comment(cid: str) -> None:
-    for p in POSTS_MEM.values():
-        comments = p.get("comments", [])
-        if not comments: continue
-        to_del = {cid}
-        for c in comments:
-            if c.get("parent_id") == cid: to_del.add(c["id"])
-        p["comments"] = [c for c in comments if c["id"] not in to_del]
-    for nick, items in list(NOTIFS_MEM.items()):
-        NOTIFS_MEM[nick] = [n for n in items if n.get("comment_id") != cid]
+    if not supabase:
+        for p in POSTS_MEM.values():
+            comments = p.get("comments", [])
+            if not comments: continue
+            to_del = {cid}
+            for c in comments:
+                if c.get("parent_id") == cid: to_del.add(c["id"])
+            p["comments"] = [c for c in comments if c["id"] not in to_del]
+        return
+    try:
+        supabase.table("notifications").delete().eq("comment_id", cid).execute()
+        supabase.table("comments").delete().eq("parent_id", cid).execute()
+        supabase.table("comments").delete().eq("id", cid).execute()
+    except Exception as e: log.error("db_delete_comment: %s", e)
 
 
 def db_get_comment(cid: str) -> Optional[dict]:
+    if supabase:
+        try:
+            r = supabase.table("comments").select("*").eq("id", cid).limit(1).execute()
+            if not r.data: return None
+            row = r.data[0]
+            row["created_at"] = iso_to_ts(row.get("created_at"))
+            return row
+        except Exception as e: log.error("db_get_comment: %s", e); return None
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
@@ -748,6 +962,15 @@ def db_get_comment(cid: str) -> Optional[dict]:
 
 
 def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
+    if supabase:
+        try:
+            if direction == 0:
+                supabase.table("comment_votes").delete().eq("comment_id", cid).eq("voter_id", voter_id).execute()
+            else:
+                supabase.table("comment_votes").upsert({
+                    "comment_id": cid, "voter_id": voter_id, "direction": direction}).execute()
+        except Exception as e: log.error("db_set_comment_vote: %s", e)
+        return
     for p in POSTS_MEM.values():
         for c in p.get("comments", []):
             if c["id"] == cid:
@@ -759,7 +982,7 @@ def db_set_comment_vote(cid: str, voter_id: str, direction: int) -> None:
 
 def _should_notify(to_nick: str, ntype: str, from_nick: str,
                    users_map: Optional[Dict[str, dict]] = None) -> bool:
-    if not to_nick or to_nick.lower() == from_nick.lower(): return False
+    if not to_nick or to_nick.lower() == (from_nick or "").lower(): return False
     field = NOTIFY_TYPE_TO_FIELD.get(ntype)
     if not field: return True
     u = None
@@ -774,23 +997,28 @@ def db_notify_many(notifications: List[dict], users_map: Optional[Dict[str, dict
     if users_map is None:
         to_nicks = list(set(n["to_nick"] for n in notifications if n.get("to_nick")))
         users_map = db_load_users_batch(to_nicks)
-    delivered_to = set()
+    valid = []
     for n in notifications:
         if not _should_notify(n["to_nick"], n["ntype"], n["from_nick"], users_map): continue
-        row = {
+        valid.append({
             "id": uuid.uuid4().hex[:10],
             "to_nick": n["to_nick"], "type": n["ntype"],
             "from_nick": n["from_nick"],
-            "post_id": n.get("post_id", "") or "",
+            "post_id": n.get("post_id","") or "",
             "comment_id": n.get("comment_id") or None,
-            "text": n.get("text", "") or "",
+            "text": n.get("text","") or "",
             "read": False,
-            "created_at": time.time(),
-        }
-        NOTIFS_MEM.setdefault(n["to_nick"], []).append(row)
-        delivered_to.add(n["to_nick"])
-    for nick in delivered_to:
-        bus_publish(nick, {"type": "notif_changed"})
+            "created_at": ts_to_iso(time.time()),
+        })
+    if not valid: return
+    if supabase:
+        try: supabase.table("notifications").insert(valid).execute()
+        except Exception as e: log.error("db_notify_many: %s", e)
+    else:
+        for row in valid:
+            NOTIFS_MEM.setdefault(row["to_nick"], []).append({**row, "created_at": time.time()})
+    for row in valid:
+        bus_publish(row["to_nick"], {"type": "notif_changed"})
 
 
 def db_notify(to_nick: str, ntype: str, from_nick: str,
@@ -802,62 +1030,92 @@ def db_notify(to_nick: str, ntype: str, from_nick: str,
 
 
 def db_notifications(nick: str) -> List[dict]:
+    if supabase:
+        try:
+            r = (supabase.table("notifications").select("*").eq("to_nick", nick)
+                 .order("created_at", desc=True).limit(100).execute())
+            rows = r.data or []
+            for row in rows: row["created_at"] = iso_to_ts(row.get("created_at"))
+            return rows
+        except Exception as e: log.error("db_notifications: %s", e); return []
     items = list(NOTIFS_MEM.get(nick, []))
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:100]
 
 
 def db_notifications_unread_count(nick: str) -> int:
+    if supabase:
+        try:
+            r = (supabase.table("notifications").select("id", count="exact")
+                 .eq("to_nick", nick).eq("read", False).limit(1).execute())
+            return r.count or 0
+        except Exception as e: log.error("db_notif_unread: %s", e); return 0
     return sum(1 for n in NOTIFS_MEM.get(nick, []) if not n.get("read"))
 
 
 def db_notifications_mark_read(nick: str) -> None:
+    if supabase:
+        try: supabase.table("notifications").update({"read": True}).eq("to_nick", nick).eq("read", False).execute()
+        except Exception as e: log.error("db_notif_read: %s", e)
+        return
     for n in NOTIFS_MEM.get(nick, []): n["read"] = True
 
 
 def db_notifications_clear(nick: str) -> None:
+    if supabase:
+        try: supabase.table("notifications").delete().eq("to_nick", nick).execute()
+        except Exception as e: log.error("db_notif_clear: %s", e)
+        return
     NOTIFS_MEM[nick] = []
 
 
 def _rename_user_everywhere(old_nick: str, new_nick: str) -> None:
-    old_key = old_nick.lower()
-    new_key = new_nick.lower()
-    old = USERS.pop(old_key, None)
-    if old:
-        old["nick"] = new_nick
-        USERS[new_key] = old
-    for p in POSTS_MEM.values():
-        if (p.get("author") or "").lower() == old_key: p["author"] = new_nick
-        for c in p.get("comments", []):
-            if (c.get("author") or "").lower() == old_key: c["author"] = new_nick
-    for u in USERS.values():
-        fl = u.get("following") or set()
-        if old_key in {x.lower() for x in fl}:
-            u["following"] = set(new_nick if x.lower() == old_key else x for x in fl)
-        fw = u.get("followers") or set()
-        if old_key in {x.lower() for x in fw}:
-            u["followers"] = set(new_nick if x.lower() == old_key else x for x in fw)
-    # notifications
-    old_items = NOTIFS_MEM.pop(old_nick, None)
-    if old_items:
-        new_items = NOTIFS_MEM.setdefault(new_nick, [])
-        for n in old_items:
-            n["to_nick"] = new_nick
-            new_items.append(n)
-    for items in NOTIFS_MEM.values():
-        for n in items:
-            if (n.get("from_nick") or "").lower() == old_key: n["from_nick"] = new_nick
-    # votes: voter_id format "u:nick"
-    old_vid = "u:" + old_nick
-    new_vid = "u:" + new_nick
-    for p in POSTS_MEM.values():
-        votes = p.get("votes") or {}
-        if old_vid in votes:
-            votes[new_vid] = votes.pop(old_vid)
-        for c in p.get("comments", []):
-            cv = c.get("votes") or {}
-            if old_vid in cv:
-                cv[new_vid] = cv.pop(old_vid)
+    if not supabase:
+        old = USERS.pop(old_nick.lower(), None)
+        if old:
+            old["nick"] = new_nick
+            USERS[new_nick.lower()] = old
+        for p in POSTS_MEM.values():
+            if (p.get("author") or "").lower() == old_nick.lower(): p["author"] = new_nick
+            for c in p.get("comments", []):
+                if (c.get("author") or "").lower() == old_nick.lower(): c["author"] = new_nick
+        for u in USERS.values():
+            fl = u.get("following") or set()
+            if old_nick.lower() in {x.lower() for x in fl}:
+                u["following"] = set(new_nick if x.lower() == old_nick.lower() else x for x in fl)
+            fw = u.get("followers") or set()
+            if old_nick.lower() in {x.lower() for x in fw}:
+                u["followers"] = set(new_nick if x.lower() == old_nick.lower() else x for x in fw)
+        old_items = NOTIFS_MEM.pop(old_nick, None)
+        if old_items:
+            new_items = NOTIFS_MEM.setdefault(new_nick, [])
+            for n in old_items: n["to_nick"] = new_nick; new_items.append(n)
+        for items in NOTIFS_MEM.values():
+            for n in items:
+                if (n.get("from_nick") or "").lower() == old_nick.lower(): n["from_nick"] = new_nick
+        invalidate_user_cache(); return
+    try:
+        old = db_load_user(old_nick)
+        if not old: return
+        payload = _user_payload(old); payload["nick"] = new_nick
+        supabase.table("users").insert(payload).execute()
+        supabase.table("users").delete().eq("nick", old_nick).execute()
+        supabase.table("posts").update({"author": new_nick}).eq("author", old_nick).execute()
+        supabase.table("comments").update({"author": new_nick}).eq("author", old_nick).execute()
+        supabase.table("post_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
+        supabase.table("comment_votes").update({"voter_id": "u:" + new_nick}).eq("voter_id", "u:" + old_nick).execute()
+        supabase.table("notifications").update({"to_nick": new_nick}).eq("to_nick", old_nick).execute()
+        supabase.table("notifications").update({"from_nick": new_nick}).eq("from_nick", old_nick).execute()
+        for u in db_all_users():
+            patch = {}
+            fl = u.get("following") or set()
+            if old_nick.lower() in {x.lower() for x in fl}:
+                patch["following"] = [new_nick if x.lower() == old_nick.lower() else x for x in fl]
+            fw = u.get("followers") or set()
+            if old_nick.lower() in {x.lower() for x in fw}:
+                patch["followers"] = [new_nick if x.lower() == old_nick.lower() else x for x in fw]
+            if patch: db_update_user_fields(u["nick"], patch)
+    except Exception as e: log.error("_rename_user_everywhere: %s", e)
     invalidate_user_cache()
 
 
@@ -878,31 +1136,32 @@ def normalize_og(raw):
 def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = True) -> List[dict]:
     if not posts: return []
     post_ids = [p["id"] for p in posts]
-    author_nicks = set()
-    for p in posts:
-        if p.get("author"): author_nicks.add(p["author"])
+    author_nicks = set(p.get("author") for p in posts if p.get("author"))
     quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
-    quotes = db_get_quotes(list(set(quoted_ids))) if quoted_ids else {}
+
+    tasks = [
+        (lambda: db_get_quotes(list(set(quoted_ids))) if quoted_ids else {}),
+        (lambda: db_post_votes(post_ids)),
+        (lambda: db_comments_for_posts(post_ids) if with_comments else []),
+        (lambda: db_comment_counts(post_ids) if not with_comments else {}),
+    ]
+    quotes, votes, comments, ccounts = _parallel(*tasks)
+    quotes = quotes or {}; votes = votes or []; comments = comments or []; ccounts = ccounts or {}
     for q in quotes.values():
         if q.get("author"): author_nicks.add(q["author"])
+
     users_map = db_load_users_batch(list(author_nicks))
 
-    votes = db_post_votes(post_ids)
     vmap: Dict[str, Dict[str, int]] = {}
     for v in votes: vmap.setdefault(v["post_id"], {})[v["voter_id"]] = v["direction"]
 
-    if with_comments:
-        comments = db_comments_for_posts(post_ids)
-        cmap: Dict[str, List[dict]] = {}
-        for c in comments: cmap.setdefault(c["post_id"], []).append(c)
-        comment_ids = [c["id"] for c in comments]
-        cvmap: Dict[str, Dict[str, int]] = {}
-        if comment_ids:
-            cvotes = db_comment_votes(comment_ids)
-            for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
-        ccounts: Dict[str, int] = {}
-    else:
-        ccounts = db_comment_counts(post_ids); cmap = {}; cvmap = {}
+    cmap: Dict[str, List[dict]] = {}
+    for c in comments: cmap.setdefault(c["post_id"], []).append(c)
+    comment_ids = [c["id"] for c in comments]
+    cvmap: Dict[str, Dict[str, int]] = {}
+    if comment_ids:
+        cvotes = db_comment_votes(comment_ids)
+        for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
 
     out = []
     for p in posts:
@@ -933,6 +1192,7 @@ def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = Tru
         out.append({
             "id": p["id"], "text": p["text"], "created_at": p["created_at"],
             "author": p.get("author"),
+            "views": p.get("views") or 0,
             "og_data": normalize_og(p.get("og_data")),
             "device": p.get("device") or None,
             "author_name": author_u.get("name", p.get("author")),
@@ -962,6 +1222,9 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
     return d
 
 
+# ============================================================================
+# Pydantic
+# ============================================================================
 class PostIn(BaseModel):
     text: str
     quoted_post_id: Optional[str] = None
@@ -996,6 +1259,39 @@ def _build_og_for_text(text: str, enabled: bool):
     return fetch_og_data(url)
 
 
+# ============================================================================
+# UI-API manifest
+# ============================================================================
+UI_MANIFEST = {
+    "version": VERSION,
+    "features": {
+        "og_previews": True, "device_badge": True, "sound": True,
+        "link_previews": True, "quote": True, "notifications_sound": True,
+        "views": True,
+    },
+    "screens": ["feed","post","profile","users","notifications","settings","policy","followers","following"],
+    "nav": [
+        {"id":"home","icon":"home","route":"/","i18n":"nav_home","auth":True,"order":10},
+        {"id":"users","icon":"users","route":"/users","i18n":"nav_users","auth":True,"order":20},
+        {"id":"notifs","icon":"bell","route":"/notifications","i18n":"nav_notifications","auth":True,"order":30,"badge":"notif"},
+        {"id":"profile","icon":"user","route":"/u/{nick}","i18n":"nav_profile","auth":True,"order":40},
+        {"id":"settings","icon":"gear","route":"/settings","i18n":"nav_settings","auth":True,"order":50},
+    ],
+    "auth_nav": [
+        {"id":"login","icon":"login","route":"/login","i18n":"nav_login","auth":False,"order":10},
+        {"id":"register","icon":"plus","route":"/register","i18n":"nav_register","auth":False,"order":20},
+    ],
+}
+
+
+@app.get("/api/ui/manifest")
+def api_ui_manifest():
+    return UI_MANIFEST
+
+
+# ============================================================================
+# API: auth
+# ============================================================================
 @app.get("/api/check_nick")
 def api_check_nick(nick: str, request: Request):
     ip = get_client_ip(request)
@@ -1022,7 +1318,8 @@ def api_room(data: RoomIn, request: Request):
 @app.get("/api/uptime")
 def api_uptime(request: Request):
     up = time.time() - START_TIME
-    return {"uptime_seconds": int(up), "started_at": ts_to_iso(START_TIME), "version": VERSION}
+    return {"uptime_seconds": int(up), "started_at": ts_to_iso(START_TIME),
+            "version": VERSION, "db": "supabase" if supabase else "memory"}
 
 
 @app.post("/api/register")
@@ -1045,7 +1342,7 @@ def api_register(data: RegisterIn, request: Request):
          "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True, "show_device_badge": True}
     for f in NOTIFY_FIELDS: u[f] = True
     db_save_user(u)
-    token = create_session(nick)
+    token = create_session(nick, u)
     log.info("[reg] %s from %s", nick, ip)
     return {"token": token, "user": serialize_user(u, nick)}
 
@@ -1064,7 +1361,7 @@ def api_login(data: LoginIn, request: Request):
         log.info("[login-fail] %s from %s", nick, ip)
         raise HTTPException(400, "err_bad_login")
     _nick_login_ok_clear(nick)
-    token = create_session(u["nick"])
+    token = create_session(u["nick"], u)
     log.info("[login] %s from %s", u["nick"], ip)
     return {"token": token, "user": serialize_user(u, u["nick"])}
 
@@ -1072,9 +1369,7 @@ def api_login(data: LoginIn, request: Request):
 @app.post("/api/logout")
 def api_logout(request: Request):
     token = request.headers.get("x-auth")
-    if token:
-        sess = SESSIONS.pop(token, None)
-        if sess: log.info("[logout] %s", sess.get("nick"))
+    if token: SESSIONS.pop(token, None)
     return {"ok": True}
 
 
@@ -1086,12 +1381,12 @@ def api_me(request: Request):
 
 @app.get("/api/whoami")
 def api_whoami(request: Request):
-    ua = request.headers.get("user-agent", "")
+    ua = request.headers.get("user-agent","")
     ip = get_client_ip(request)
     browser, os_name = parse_user_agent(ua)
     geo = get_geo(ip)
     return {"browser": browser, "os": os_name,
-            "city": geo.get("city", ""), "country": geo.get("country", "")}
+            "city": geo.get("city",""), "country": geo.get("country","")}
 
 
 @app.put("/api/users/me")
@@ -1114,7 +1409,7 @@ def api_update_me(data: ProfileUpdateIn, request: Request):
     if nick_changed:
         _rename_user_everywhere(old_nick, nick)
         for t, s in list(SESSIONS.items()):
-            if s.get("nick", "").lower() == old_nick.lower(): s["nick"] = nick
+            if (s.get("nick") or "").lower() == old_nick.lower(): s["nick"] = nick
         invalidate_user_cache()
     u = db_load_user(nick)
     return {"ok": True, "user": serialize_user(u, u["nick"])}
@@ -1217,11 +1512,11 @@ def api_follow(nick: str, request: Request):
     if target["nick"].lower() == me["nick"].lower(): raise HTTPException(400, "self")
     if target["nick"].lower() not in {x.lower() for x in (me.get("following") or set())}:
         nf = set(me.get("following") or set()); nf.add(target["nick"])
-        me["following"] = nf
-        invalidate_user_cache(me["nick"])
+        me["following"] = nf; invalidate_user_cache(me["nick"])
+        db_update_user_fields(me["nick"], {"following": list(nf)})
         nfw = set(target.get("followers") or set()); nfw.add(me["nick"])
-        target["followers"] = nfw
-        invalidate_user_cache(target["nick"])
+        target["followers"] = nfw; invalidate_user_cache(target["nick"])
+        db_update_user_fields(target["nick"], {"followers": list(nfw)})
         db_notify(target["nick"], "follow", me["nick"])
         bus_broadcast("profile:" + target["nick"], {"type": "refresh"})
     target = db_load_user(nick)
@@ -1237,11 +1532,11 @@ def api_unfollow(nick: str, request: Request):
     if not target: raise HTTPException(404, "not found")
     if target["nick"].lower() in {x.lower() for x in (me.get("following") or set())}:
         nf = {x for x in (me.get("following") or set()) if x.lower() != target["nick"].lower()}
-        me["following"] = nf
-        invalidate_user_cache(me["nick"])
+        me["following"] = nf; invalidate_user_cache(me["nick"])
+        db_update_user_fields(me["nick"], {"following": list(nf)})
         nfw = {x for x in (target.get("followers") or set()) if x.lower() != me["nick"].lower()}
-        target["followers"] = nfw
-        invalidate_user_cache(target["nick"])
+        target["followers"] = nfw; invalidate_user_cache(target["nick"])
+        db_update_user_fields(target["nick"], {"followers": list(nfw)})
         bus_broadcast("profile:" + target["nick"], {"type": "refresh"})
     target = db_load_user(nick)
     data = serialize_user(target, me["nick"]); data["is_following"] = False
@@ -1270,6 +1565,23 @@ def api_get(pid: str, request: Request):
     return build_posts_full([p], vid, with_comments=True)[0]
 
 
+@app.post("/api/posts/{pid}/view")
+def api_view_post(pid: str, request: Request):
+    p = db_get_post(pid)
+    if not p: raise HTTPException(404, "not found")
+    u = get_current_user(request)
+    if not u: return {"ok": True, "counted": False}
+    if (p.get("author") or "").lower() == u["nick"].lower():
+        return {"ok": True, "counted": False}
+    vid = "u:" + u["nick"]
+    if not view_should_count(pid, vid): return {"ok": True, "counted": False}
+    view_mark_counted(pid, vid)
+    new_views = db_inc_views(pid)
+    ev = {"type": "view_update", "post_id": pid, "views": new_views}
+    bus_broadcast("post:" + pid, ev); bus_broadcast("feed", ev)
+    return {"ok": True, "counted": True, "views": new_views}
+
+
 @app.post("/api/posts")
 def api_create(payload: PostIn, request: Request):
     u = require_user(request)
@@ -1281,11 +1593,11 @@ def api_create(payload: PostIn, request: Request):
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
     pid = uuid.uuid4().hex[:10]
     og = _build_og_for_text(text, payload.og_enabled)
-    device = detect_device(request.headers.get("user-agent", ""))
+    device = detect_device(request.headers.get("user-agent",""))
     p = {"id": pid, "text": text, "author": u["nick"],
          "created_at": time.time(), "device": device,
-         "quoted_post_id": payload.quoted_post_id or None, "og_data": og, "votes": {},
-         "comments": []}
+         "quoted_post_id": payload.quoted_post_id or None, "og_data": og,
+         "votes": {}, "comments": []}
     db_create_post(p)
 
     mentions = extract_mentions(text)
@@ -1294,22 +1606,20 @@ def api_create(payload: PostIn, request: Request):
     notifications: List[dict] = []; notified = set()
     for m in mention_nicks:
         k = m.lower()
-        if k in notified: continue
-        if k not in mention_users: continue
+        if k in notified or k not in mention_users: continue
         notifications.append({"to_nick": m, "ntype": "mention", "from_nick": u["nick"],
                               "post_id": pid, "text": text[:140]})
         notified.add(k)
     for f in (u.get("followers") or set()):
-        if f.lower() == u["nick"].lower(): continue
-        if f.lower() in notified: continue
+        if f.lower() == u["nick"].lower() or f.lower() in notified: continue
         notifications.append({"to_nick": f, "ntype": "new_post", "from_nick": u["nick"],
                               "post_id": pid, "text": text[:140]})
         notified.add(f.lower())
     if payload.quoted_post_id:
         qp = db_get_post(payload.quoted_post_id)
         if qp and qp.get("author") and qp["author"].lower() != u["nick"].lower():
-            notifications.append({"to_nick": qp["author"], "ntype": "quote", "from_nick": u["nick"],
-                                  "post_id": pid, "text": text[:140]})
+            notifications.append({"to_nick": qp["author"], "ntype": "quote",
+                                  "from_nick": u["nick"], "post_id": pid, "text": text[:140]})
     if notifications: db_notify_many(notifications)
     broadcast_post_change(p, feed=True)
     return build_posts_full([p], "u:" + u["nick"], with_comments=True)[0]
@@ -1321,7 +1631,7 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     if not rate_limit("edit:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
-    if p["author"].lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
+    if (p["author"] or "").lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
     text = payload.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
@@ -1336,7 +1646,7 @@ def api_delete_post(pid: str, request: Request):
     if not rate_limit("del:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
     p = db_get_post(pid)
     if not p: raise HTTPException(404, "not found")
-    if p["author"].lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
+    if (p["author"] or "").lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
     author = p.get("author")
     db_delete_post(pid)
     bus_broadcast("post:" + pid, {"type": "post_deleted", "post_id": pid})
@@ -1382,7 +1692,6 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     now_ts = time.time()
     db_create_comment({"id": cid, "post_id": pid, "author": u["nick"],
                        "parent_id": parent_id, "text": text, "created_at": now_ts})
-
     mentions = extract_mentions(text)
     notifications: List[dict] = []; notified = set()
     if parent_id and parent:
@@ -1401,8 +1710,7 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     mention_users = db_load_users_batch(mention_nicks) if mention_nicks else {}
     for m in mention_nicks:
         k = m.lower()
-        if k in notified: continue
-        if k not in mention_users: continue
+        if k in notified or k not in mention_users: continue
         notifications.append({"to_nick": m, "ntype": "mention", "from_nick": u["nick"],
                               "post_id": pid, "comment_id": cid, "text": text[:140]})
         notified.add(k)
@@ -1410,11 +1718,9 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
     broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {
         "ok": True, "post_id": pid, "post_author": post["author"],
-        "comment": {
-            "id": cid, "text": text, "author": u["nick"],
-            "parent_id": parent_id, "created_at": ts_to_iso(now_ts),
-            "likes": 0, "user_like": 0,
-        }
+        "comment": {"id": cid, "text": text, "author": u["nick"],
+                    "parent_id": parent_id, "created_at": ts_to_iso(now_ts),
+                    "likes": 0, "user_like": 0}
     }
 
 
@@ -1424,7 +1730,7 @@ def api_edit_comment(pid: str, cid: str, payload: CommentEditIn, request: Reques
     if not rate_limit("editc:" + u["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     c = db_get_comment(cid)
     if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
-    if c["author"].lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
+    if (c["author"] or "").lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
     text = payload.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_COMMENT_LEN: raise HTTPException(400, "too long")
@@ -1440,7 +1746,7 @@ def api_delete_comment(pid: str, cid: str, request: Request):
     if not rate_limit("delc:" + u["nick"], 60, 60): raise HTTPException(429, "err_rate_limit")
     c = db_get_comment(cid)
     if not c or c["post_id"] != pid: raise HTTPException(404, "not found")
-    if c["author"].lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
+    if (c["author"] or "").lower() != u["nick"].lower(): raise HTTPException(403, "forbidden")
     db_delete_comment(cid)
     post = db_get_post(pid)
     broadcast_post_change(post, except_nick=u["nick"], feed=False)
@@ -1454,15 +1760,16 @@ def api_like_comment(pid: str, cid: str, request: Request):
     u = require_user(request)
     if not rate_limit("like:" + u["nick"], 120, 60): raise HTTPException(429, "err_rate_limit")
     vid = "u:" + u["nick"]
-    target = None
-    for c in p.get("comments", []):
-        if c["id"] == cid: target = c; break
-    if not target: raise HTTPException(404, "not found")
-    votes = target.setdefault("votes", {})
-    cur = votes.get(vid, 0)
+    existing = db_comment_votes([cid])
+    cur = 0
+    for row in existing:
+        if row["voter_id"] == vid: cur = row["direction"]; break
     new = 0 if cur == 1 else 1
     db_set_comment_vote(cid, vid, new)
-    likes = sum(1 for d in votes.values() if d == 1)
+    try:
+        allv = db_comment_votes([cid])
+        likes = sum(1 for r in allv if r["direction"] == 1)
+    except Exception: likes = 0
     broadcast_post_change(p, except_nick=u["nick"], feed=False)
     return {"ok": True, "likes": likes, "user_like": new}
 
@@ -1500,8 +1807,7 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
         sess = SESSIONS.get(token)
         if not sess: raise HTTPException(401, "unauthorized")
         nick = sess["nick"]
-        u = db_load_user_cached(nick)
-        if not u: raise HTTPException(401, "unauthorized")
+        if not db_load_user_cached(nick): raise HTTPException(401, "unauthorized")
     elif anon:
         clean = re.sub(r"[^a-zA-Z0-9]", "", anon)[:32]
         nick = "anon:" + (clean or uuid.uuid4().hex[:12])
@@ -1523,7 +1829,7 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
         except asyncio.CancelledError: pass
-        except Exception as e: log.warning("[SSE] error for %s: %s", nick, e)
+        except Exception as e: log.warning("[SSE] %s: %s", nick, e)
         finally: bus.unsubscribe(nick, q)
     return StreamingResponse(gen(), media_type="text/event-stream",
         headers={
@@ -1533,6 +1839,9 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
         })
 
 
+# ============================================================================
+# TEXTS
+# ============================================================================
 TEXTS = {
     "ru": {
         "site_name": "СЛД",
@@ -1540,35 +1849,23 @@ TEXTS = {
         "session_expired": "Сессия истекла. Войдите снова.",
         "session_expired_hint": "Ваша сессия была завершена на сервере. Войдите заново, чтобы продолжить.",
         "network_error_hint": "Не удалось связаться с сервером. Проверьте соединение и попробуйте снова.",
-        "booting": "Загрузка…",
-        "loading": "Загрузка…",
-        "check_nick": "Проверить ник",
-        "checking": "Проверка…",
-        "nick_available": "Ник свободен",
-        "refresh": "Обновить",
-        "change_lang": "Язык",
-        "change_theme": "Тема",
-        "search_ph": "Поиск людей и постов",
-        "post_ph": "Что нового?",
-        "comment_ph": "Комментарий... Shift+Enter — отправить",
-        "reply_ph": "Ответ...",
-        "publish": "Опубликовать",
-        "send_comment": "Отправить",
+        "booting": "Загрузка…", "loading": "Загрузка…",
+        "check_nick": "Проверить ник", "checking": "Проверка…", "nick_available": "Ник свободен",
+        "refresh": "Обновить", "change_lang": "Язык", "change_theme": "Тема",
+        "search_ph": "Поиск людей и постов", "post_ph": "Что нового?",
+        "comment_ph": "Комментарий... Shift+Enter — отправить", "reply_ph": "Ответ...",
+        "publish": "Опубликовать", "send_comment": "Отправить",
         "reply": "Ответить", "cancel_reply": "Отмена",
-        "no_posts": "Здесь пока пусто",
-        "not_found": "Ничего не найдено",
-        "page_not_found": "Страница не найдена или была удалена",
-        "back_home": "На главную",
+        "no_posts": "Здесь пока пусто", "not_found": "Ничего не найдено",
+        "page_not_found": "Страница не найдена или была удалена", "back_home": "На главную",
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
-        "read_more": "Показать полностью",
-        "copy": "Копировать",
+        "read_more": "Показать полностью", "copy": "Копировать",
         "edit": "Редактировать", "delete": "Удалить", "save": "Сохранить", "cancel": "Отмена",
         "confirm_delete": "Удалить без возможности восстановления?",
         "confirm_delete_yes": "Да, удалить",
         "confirm_logout": "Вы действительно хотите выйти?",
         "confirm_yes": "Да, выйти", "confirm_no": "Отмена",
-        "notif_clear": "Очистить",
-        "notif_clear_confirm": "Удалить все уведомления?",
+        "notif_clear": "Очистить", "notif_clear_confirm": "Удалить все уведомления?",
         "author_badge": "автор",
         "feed_all": "Для вас", "feed_subs": "Подписки",
         "nav_home": "Лента", "nav_users": "Люди",
@@ -1579,8 +1876,7 @@ TEXTS = {
         "name_ph": "Имя", "nick_ph": "Ник (без @)",
         "pass_ph": "Пароль", "pass2_ph": "Повтор пароля",
         "reg_btn": "Зарегистрироваться", "log_btn": "Войти",
-        "to_login": "Уже зарегистрированы? Войти",
-        "to_reg": "Нет аккаунта? Зарегистрироваться",
+        "to_login": "Уже зарегистрированы? Войти", "to_reg": "Нет аккаунта? Зарегистрироваться",
         "err_bad_nick": "Ник: 3-20 символов, латиница, цифры, _",
         "err_nick_reserved": "Этот ник зарезервирован",
         "err_bad_name": "Имя: от 1 до 50 символов",
@@ -1594,27 +1890,19 @@ TEXTS = {
         "err_private_following": "Пользователь скрыл подписки",
         "err_bio_too_long": "Описание слишком длинное (до 300 символов)",
         "login_to_post": "Войдите, чтобы публиковать",
-        "login_to_comment": "Войдите, чтобы комментировать",
-        "go_login": "Войти",
+        "login_to_comment": "Войдите, чтобы комментировать", "go_login": "Войти",
         "profile_followers": "подписчиков", "profile_following": "подписок",
         "follow": "Подписаться", "unfollow": "Отписаться",
-        "edit_profile": "Редактировать",
-        "edit_profile_title": "Изменить профиль",
+        "edit_profile": "Редактировать", "edit_profile_title": "Изменить профиль",
         "no_user_posts": "Здесь пока пусто",
-        "tab_posts": "Посты",
-        "settings_title": "Настройки",
-        "settings_account": "Аккаунт",
-        "settings_privacy": "Конфиденциальность",
-        "settings_notifications": "Уведомления",
-        "settings_appearance": "Внешний вид",
-        "settings_info": "О приложении",
+        "settings_title": "Настройки", "settings_account": "Аккаунт",
+        "settings_privacy": "Конфиденциальность", "settings_notifications": "Уведомления",
+        "settings_appearance": "Внешний вид", "settings_info": "О приложении",
         "settings_account_desc": "Профиль, аватар, выход",
         "settings_privacy_desc": "Приватность и уведомления",
         "settings_appearance_desc": "Тема, язык, цвета, звук",
         "settings_info_desc": "О сервисе, политика, устройство, аптайм",
-        "settings_back": "Назад",
-        "settings_theme": "Тема",
-        "settings_lang": "Язык",
+        "settings_theme": "Тема", "settings_lang": "Язык",
         "settings_colors": "Основные цвета",
         "settings_colors_hint": "Цвет кнопок, переключателей и подсветок",
         "settings_allow_followers": "Показывать список подписчиков",
@@ -1622,46 +1910,30 @@ TEXTS = {
         "settings_show_link_previews": "Показывать превью ссылок (OpenGraph)",
         "settings_show_link_previews_hint": "Если включено, к постам со ссылками будут добавляться карточки предпросмотра",
         "settings_show_device_badge": "Показывать значок устройства на постах",
-        "settings_show_device_badge_hint": "Рядом с вашим именем будет отображаться иконка телефона или компьютера, с которого был опубликован пост",
-        "settings_device": "Ваше устройство",
-        "settings_device_browser": "Браузер",
-        "settings_device_os": "Система",
-        "settings_device_city": "Город",
-        "settings_server": "Сервер",
-        "settings_uptime": "Аптайм",
-        "settings_version": "Версия",
+        "settings_show_device_badge_hint": "Рядом с вашим именем будет отображаться иконка телефона или компьютера",
+        "settings_device": "Ваше устройство", "settings_device_browser": "Браузер",
+        "settings_device_os": "Система", "settings_device_city": "Город",
+        "settings_server": "Сервер", "settings_uptime": "Аптайм", "settings_version": "Версия",
         "settings_policy": "Политика конфиденциальности",
         "settings_desc": "СЛД — минималистичная соцсеть: посты и комментарии.",
-        "settings_authors": "Авторы",
-        "settings_logout": "Выйти",
-        "settings_sound": "Звук уведомлений",
-        "settings_sound_hint": "Проигрывать лёгкий звук при новом уведомлении",
-        "settings_profile_section": "Профиль",
-        "settings_session_section": "Сессия",
+        "settings_authors": "Авторы", "settings_logout": "Выйти",
+        "settings_sound": "Звук уведомлений", "settings_sound_hint": "Проигрывать лёгкий звук при новом уведомлении",
+        "settings_profile_section": "Профиль", "settings_session_section": "Сессия",
         "settings_saved": "Сохранено",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
         "notif_title": "Уведомления", "notif_empty": "Здесь пока пусто",
-        "notif_follow": "подписался на вас",
-        "notif_comment": "оставил комментарий",
-        "notif_reply": "ответил на ваш комментарий",
-        "notif_mention": "упомянул вас",
-        "notif_new_post": "опубликовал новый пост",
-        "notif_quote": "процитировал ваш пост",
-        "notify_new_post": "Новые посты подписок",
-        "notify_follow": "Новые подписчики",
-        "notify_comment": "Комментарии к моим постам",
-        "notify_reply": "Ответы на мои комментарии",
-        "notify_mention": "Упоминания меня",
-        "notify_quote": "Цитаты моих постов",
-        "back": "Назад",
-        "bio_ph": "О себе (до 300 символов)...",
+        "notif_follow": "подписался на вас", "notif_comment": "оставил комментарий",
+        "notif_reply": "ответил на ваш комментарий", "notif_mention": "упомянул вас",
+        "notif_new_post": "опубликовал новый пост", "notif_quote": "процитировал ваш пост",
+        "notify_new_post": "Новые посты подписок", "notify_follow": "Новые подписчики",
+        "notify_comment": "Комментарии к моим постам", "notify_reply": "Ответы на мои комментарии",
+        "notify_mention": "Упоминания меня", "notify_quote": "Цитаты моих постов",
+        "back": "Назад", "bio_ph": "О себе (до 300 символов)...",
         "followers_title": "Подписчики", "following_title": "Подписки",
         "no_followers": "Подписчиков пока нет", "no_following": "Подписок пока нет",
         "limited_list": "Список скрыт. Вам виден только ваш аккаунт.",
-        "people_title": "Люди",
-        "people_search_ph": "Поиск людей",
-        "people_all": "Все", "people_subs": "Подписки",
-        "no_users": "Никого не найдено",
+        "people_title": "Люди", "people_search_ph": "Поиск людей",
+        "people_all": "Все", "people_subs": "Подписки", "no_users": "Никого не найдено",
         "policy_title": "Политика конфиденциальности",
         "policy_content": (
             "# Политика конфиденциальности\n"
@@ -1681,28 +1953,26 @@ TEXTS = {
             "## 2. Чего мы НЕ храним\n"
             "• Пароль в открытом виде — только криптографический хеш\n"
             "• Ваш IP-адрес (используется в момент запроса, не сохраняется)\n"
-            "• Историю просмотров постов\n"
             "• Cookies третьих лиц, аналитику, трекеры, рекламные идентификаторы\n"
-            "• Данные о вашем местоположении за пределами города\n"
-            "• Список устройств и их характеристики\n\n"
+            "• Данные о вашем местоположении за пределами города\n\n"
             "## 3. Где хранятся данные\n"
-            "ВСЕ данные хранятся ТОЛЬКО в оперативной памяти (RAM) сервера. Мы не используем никакие базы данных, файлы или сторонние сервисы. Когда сервер останавливается или перезапускается, все данные (аккаунты, посты, комментарии, лайки, подписки, уведомления) удаляются навсегда и безвозвратно. Восстановить их невозможно.\n\n"
+            "Все данные хранятся на серверах Supabase (PostgreSQL). Обмен между клиентом и сервером идёт по HTTPS. Мы не продаём и не передаём ваши данные третьим лицам. Резервные копии делаются автоматически и защищены теми же правилами.\n\n"
             "## 4. Как мы используем данные\n"
             "• Для отображения вашего профиля и постов другим пользователям\n"
             "• Для показа ваших постов в лентах ваших подписчиков\n"
             "• Для отправки уведомлений о действиях других пользователей\n"
-            "• Для проверки прав доступа (нельзя редактировать чужие посты и комментарии)\n"
+            "• Для проверки прав доступа\n"
             "• Для определения языка интерфейса и отображения города в ваших настройках\n"
-            "• Для защиты от спама, ботов и подбора пароля (rate-limit по IP и нику)\n\n"
+            "• Для защиты от спама, ботов и подбора пароля\n\n"
             "## 5. Безопасность аккаунта\n"
             "• Пароль минимум 8 символов, обязательно с буквами и цифрами\n"
             "• Хеш pbkdf2-hmac-sha256, 100 000 итераций\n"
-            "• Проверка пароля выполняется за постоянное время — нельзя определить, существует ли аккаунт, по задержке ответа\n"
-            "• Сессии привязаны к случайному токену, максимум 10 активных сессий на аккаунт\n"
+            "• Проверка пароля выполняется за постоянное время\n"
+            "• Сессии привязаны к случайному токену, максимум 10 активных сессий\n"
             "• Ограничение попыток входа по IP и нику\n"
             "• Все операции изменения данных проверяют владельца на сервере\n"
             "• Зарезервированные ники недоступны для регистрации\n"
-            "• Строгие заголовки безопасности: CSP, X-Frame-Options, Referrer-Policy, HSTS и другие\n"
+            "• Строгие заголовки безопасности: CSP, X-Frame-Options, Referrer-Policy, HSTS\n"
             "• Защита от SSRF при загрузке превью ссылок\n"
             "• Ограничение размера тела запроса (1 МБ)\n\n"
             "## 6. Ваши права\n"
@@ -1713,27 +1983,24 @@ TEXTS = {
             "• Отключать звук уведомлений\n"
             "• Скрывать список подписчиков и подписок\n"
             "• Отключать показ значка устройства\n"
-            "• Удалить аккаунт — напишите нам, или просто дождитесь перезапуска сервера (данные удалятся автоматически)\n\n"
+            "• Удалить аккаунт — напишите нам, данные удаляются в течение 30 дней\n\n"
             "## 7. Хранение и удаление\n"
-            "Данные существуют, пока работает процесс сервера. При перезапуске контейнера, деплое новой версии или остановке сервиса — вся память очищается. Это особенность архитектуры: мы принципиально не пишем на диск и не передаём данные никому.\n\n"
+            "Данные хранятся, пока активен ваш аккаунт. При удалении аккаунта все посты, комментарии, лайки, подписки и уведомления удаляются безвозвратно.\n\n"
             "## 8. Cookies и localStorage\n"
-            "Мы используем минимум локального хранения:\n"
-            "• localStorage: SLD_token (токен сессии), SLD_theme (тема), SLD_lang (язык), SLD_colors (цвета), SLD_sound (звук), SLD_anon_id (анонимный идентификатор для realtime), SLD_welcome_seen (флаг показа приветствия)\n"
+            "• localStorage: SLD_token, SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id, SLD_welcome_seen\n"
             "• sessionStorage: черновик поста, состояние настроек, цитата\n"
-            "• Один cookie: SLD_lang — только чтобы помнить выбранный язык\n"
-            "Сторонних cookies нет. Вы можете очистить эти данные в любой момент в настройках браузера.\n\n"
+            "• Один cookie: SLD_lang — только чтобы помнить язык\n"
+            "Сторонних cookies нет.\n\n"
             "## 9. Дети\n"
-            "Сервис не предназначен для лиц младше 13 лет. Мы не собираем данные детей намеренно.\n\n"
+            "Сервис не предназначен для лиц младше 13 лет.\n\n"
             "## 10. Изменения политики\n"
-            "Мы можем обновлять эту политику. Актуальная версия всегда доступна по этой ссылке. Продолжая пользоваться сервисом, вы соглашаетесь с текущей редакцией.\n\n"
+            "Мы можем обновлять эту политику. Актуальная версия всегда доступна по этой ссылке.\n\n"
             "## 11. Контакты\n"
             "По вопросам приватности, удаления аккаунта или данных — напишите нам через профиль разработчика.\n\n"
-            "Сервис предоставляется «как есть», без гарантий. Мы стараемся делать его безопасным, но не можем гарантировать абсолютную защиту от всех угроз."
+            "Сервис предоставляется «как есть», без гарантий."
         ),
-        "quote": "Цитировать",
-        "avatar_choose": "Выберите эмодзи",
-        "avatar_current": "Текущий аватар",
-        "og_enable": "Превью ссылок",
+        "quote": "Цитировать", "avatar_choose": "Выберите эмодзи",
+        "avatar_current": "Текущий аватар", "og_enable": "Превью ссылок",
         "color_blue": "Синий", "color_green": "Зелёный", "color_purple": "Фиолетовый",
         "color_pink": "Розовый", "color_orange": "Оранжевый", "color_red": "Красный",
         "color_teal": "Бирюзовый", "color_indigo": "Индиго",
@@ -1761,7 +2028,7 @@ TEXTS = {
             "• Не продаём данные третьим лицам\n"
             "• Не храним пароль в открытом виде\n\n"
             "Безопасность:\n"
-            "Пароль хешируется через pbkdf2-hmac-sha256 (100 000 итераций). Проверка выполняется за постоянное время — вас нельзя идентифицировать по задержке ответа. Сессии привязаны к случайному токену, количество активных сессий ограничено.\n\n"
+            "Пароль хешируется через pbkdf2-hmac-sha256 (100 000 итераций). Проверка выполняется за постоянное время. Сессии привязаны к случайному токену, количество активных сессий ограничено.\n\n"
             "Всё, что вы публикуете, можно в любой момент отредактировать или удалить. Профиль, подписки, посты, комментарии — всё под вашим контролем.\n\n"
             "Приятного общения! Если что-то пойдёт не так — напишите через профиль разработчика."
         ),
@@ -1779,35 +2046,22 @@ TEXTS = {
         "session_expired": "Session expired. Please log in again.",
         "session_expired_hint": "Your session has ended on the server. Please log in again to continue.",
         "network_error_hint": "Could not reach the server. Check your connection and try again.",
-        "booting": "Loading…",
-        "loading": "Loading…",
-        "check_nick": "Check nick",
-        "checking": "Checking…",
-        "nick_available": "Nick is available",
-        "refresh": "Refresh",
-        "change_lang": "Language",
-        "change_theme": "Theme",
-        "search_ph": "Search people and posts",
-        "post_ph": "What's new?",
-        "comment_ph": "Comment... Shift+Enter to send",
-        "reply_ph": "Reply...",
-        "publish": "Publish",
-        "send_comment": "Send",
+        "booting": "Loading…", "loading": "Loading…",
+        "check_nick": "Check nick", "checking": "Checking…", "nick_available": "Nick is available",
+        "refresh": "Refresh", "change_lang": "Language", "change_theme": "Theme",
+        "search_ph": "Search people and posts", "post_ph": "What's new?",
+        "comment_ph": "Comment... Shift+Enter to send", "reply_ph": "Reply...",
+        "publish": "Publish", "send_comment": "Send",
         "reply": "Reply", "cancel_reply": "Cancel",
-        "no_posts": "Nothing here yet",
-        "not_found": "Not found",
-        "page_not_found": "Page not found or was deleted",
-        "back_home": "Back to home",
+        "no_posts": "Nothing here yet", "not_found": "Not found",
+        "page_not_found": "Page not found or was deleted", "back_home": "Back to home",
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
-        "read_more": "Show more",
-        "copy": "Copy",
+        "read_more": "Show more", "copy": "Copy",
         "edit": "Edit", "delete": "Delete", "save": "Save", "cancel": "Cancel",
-        "confirm_delete": "Delete permanently?",
-        "confirm_delete_yes": "Yes, delete",
+        "confirm_delete": "Delete permanently?", "confirm_delete_yes": "Yes, delete",
         "confirm_logout": "Are you sure you want to log out?",
         "confirm_yes": "Yes, log out", "confirm_no": "Cancel",
-        "notif_clear": "Clear",
-        "notif_clear_confirm": "Clear all notifications?",
+        "notif_clear": "Clear", "notif_clear_confirm": "Clear all notifications?",
         "author_badge": "author",
         "feed_all": "For you", "feed_subs": "Subscriptions",
         "nav_home": "Feed", "nav_users": "People",
@@ -1818,8 +2072,7 @@ TEXTS = {
         "name_ph": "Name", "nick_ph": "Nick (no @)",
         "pass_ph": "Password", "pass2_ph": "Confirm password",
         "reg_btn": "Sign up", "log_btn": "Log in",
-        "to_login": "Already have an account? Log in",
-        "to_reg": "No account? Sign up",
+        "to_login": "Already have an account? Log in", "to_reg": "No account? Sign up",
         "err_bad_nick": "Nick: 3-20 chars, letters/digits/_",
         "err_nick_reserved": "This nick is reserved",
         "err_bad_name": "Name: 1-50 chars",
@@ -1832,28 +2085,20 @@ TEXTS = {
         "err_private_followers": "User hid their followers",
         "err_private_following": "User hid their following",
         "err_bio_too_long": "Bio is too long (max 300 chars)",
-        "login_to_post": "Log in to publish",
-        "login_to_comment": "Log in to comment",
+        "login_to_post": "Log in to publish", "login_to_comment": "Log in to comment",
         "go_login": "Log in",
         "profile_followers": "followers", "profile_following": "following",
         "follow": "Follow", "unfollow": "Unfollow",
-        "edit_profile": "Edit",
-        "edit_profile_title": "Edit profile",
+        "edit_profile": "Edit", "edit_profile_title": "Edit profile",
         "no_user_posts": "Nothing here yet",
-        "tab_posts": "Posts",
-        "settings_title": "Settings",
-        "settings_account": "Account",
-        "settings_privacy": "Privacy",
-        "settings_notifications": "Notifications",
-        "settings_appearance": "Appearance",
-        "settings_info": "About",
+        "settings_title": "Settings", "settings_account": "Account",
+        "settings_privacy": "Privacy", "settings_notifications": "Notifications",
+        "settings_appearance": "Appearance", "settings_info": "About",
         "settings_account_desc": "Profile, avatar, sign out",
         "settings_privacy_desc": "Privacy and notifications",
         "settings_appearance_desc": "Theme, language, colors, sound",
         "settings_info_desc": "About, policy, device, uptime",
-        "settings_back": "Back",
-        "settings_theme": "Theme",
-        "settings_lang": "Language",
+        "settings_theme": "Theme", "settings_lang": "Language",
         "settings_colors": "Accent colors",
         "settings_colors_hint": "Color of buttons, toggles and highlights",
         "settings_allow_followers": "Show followers list",
@@ -1862,45 +2107,29 @@ TEXTS = {
         "settings_show_link_previews_hint": "If enabled, posts with links will show preview cards",
         "settings_show_device_badge": "Show device badge on posts",
         "settings_show_device_badge_hint": "A phone or desktop icon will appear next to your name on posts",
-        "settings_device": "Your device",
-        "settings_device_browser": "Browser",
-        "settings_device_os": "System",
-        "settings_device_city": "City",
-        "settings_server": "Server",
-        "settings_uptime": "Uptime",
-        "settings_version": "Version",
+        "settings_device": "Your device", "settings_device_browser": "Browser",
+        "settings_device_os": "System", "settings_device_city": "City",
+        "settings_server": "Server", "settings_uptime": "Uptime", "settings_version": "Version",
         "settings_policy": "Privacy policy",
         "settings_desc": "SLD — minimalist social network: posts and comments.",
-        "settings_authors": "Authors",
-        "settings_logout": "Log out",
-        "settings_sound": "Notification sound",
-        "settings_sound_hint": "Play a soft sound on new notification",
-        "settings_profile_section": "Profile",
-        "settings_session_section": "Session",
+        "settings_authors": "Authors", "settings_logout": "Log out",
+        "settings_sound": "Notification sound", "settings_sound_hint": "Play a soft sound on new notification",
+        "settings_profile_section": "Profile", "settings_session_section": "Session",
         "settings_saved": "Saved",
         "theme_light": "Light", "theme_dark": "Dark",
         "notif_title": "Notifications", "notif_empty": "Nothing here yet",
-        "notif_follow": "followed you",
-        "notif_comment": "commented",
-        "notif_reply": "replied to your comment",
-        "notif_mention": "mentioned you",
-        "notif_new_post": "published a new post",
-        "notif_quote": "quoted your post",
-        "notify_new_post": "New posts from subscriptions",
-        "notify_follow": "New followers",
-        "notify_comment": "Comments on my posts",
-        "notify_reply": "Replies to my comments",
-        "notify_mention": "Mentions of me",
-        "notify_quote": "Quotes of my posts",
-        "back": "Back",
-        "bio_ph": "Bio (max 300 chars)...",
+        "notif_follow": "followed you", "notif_comment": "commented",
+        "notif_reply": "replied to your comment", "notif_mention": "mentioned you",
+        "notif_new_post": "published a new post", "notif_quote": "quoted your post",
+        "notify_new_post": "New posts from subscriptions", "notify_follow": "New followers",
+        "notify_comment": "Comments on my posts", "notify_reply": "Replies to my comments",
+        "notify_mention": "Mentions of me", "notify_quote": "Quotes of my posts",
+        "back": "Back", "bio_ph": "Bio (max 300 chars)...",
         "followers_title": "Followers", "following_title": "Following",
         "no_followers": "No followers yet", "no_following": "No following yet",
         "limited_list": "List is hidden. You can see only your account.",
-        "people_title": "People",
-        "people_search_ph": "Search people",
-        "people_all": "All", "people_subs": "Subscriptions",
-        "no_users": "No users found",
+        "people_title": "People", "people_search_ph": "Search people",
+        "people_all": "All", "people_subs": "Subscriptions", "no_users": "No users found",
         "policy_title": "Privacy Policy",
         "policy_content": (
             "# Privacy Policy\n"
@@ -1920,12 +2149,10 @@ TEXTS = {
             "## 2. What we do NOT store\n"
             "• Your password in plain text\n"
             "• Your IP address (used at request time, not saved)\n"
-            "• Post view history\n"
             "• Third-party cookies, analytics, trackers, ad identifiers\n"
-            "• Data about your location beyond city\n"
-            "• Device list or fingerprinting data\n\n"
+            "• Data about your location beyond city\n\n"
             "## 3. Where data is stored\n"
-            "ALL data is stored ONLY in the server's RAM. We do not use any database, file, or third-party service. When the server stops or restarts, all data (accounts, posts, comments, likes, follows, notifications) is permanently and irreversibly deleted. It cannot be recovered.\n\n"
+            "All data is stored on Supabase servers (PostgreSQL). Client-server communication uses HTTPS. We never sell or share your data with third parties. Backups are automatic and protected by the same rules.\n\n"
             "## 4. How we use data\n"
             "• To display your profile and posts to other users\n"
             "• To show your posts in your subscribers' feeds\n"
@@ -1941,7 +2168,7 @@ TEXTS = {
             "• Login attempts limited per IP and per nick\n"
             "• All data modification operations verify the owner on the server\n"
             "• Reserved nicks unavailable for registration\n"
-            "• Strict security headers: CSP, X-Frame-Options, Referrer-Policy, HSTS and more\n"
+            "• Strict security headers: CSP, X-Frame-Options, Referrer-Policy, HSTS\n"
             "• SSRF protection when fetching link previews\n"
             "• Request body size limit (1 MB)\n\n"
             "## 6. Your rights\n"
@@ -1952,12 +2179,11 @@ TEXTS = {
             "• Turn off notification sound\n"
             "• Hide your followers / following lists\n"
             "• Disable the device badge on your posts\n"
-            "• Delete your account — write to us, or just wait for a server restart (data is wiped automatically)\n\n"
+            "• Delete your account — write to us\n\n"
             "## 7. Retention and deletion\n"
-            "Data exists only while the server process is running. When the container restarts, a new version is deployed, or the service is stopped, memory is wiped. This is by design: we deliberately do not write to disk and never share data with anyone.\n\n"
+            "Data is retained while your account is active. When you delete your account, all data is permanently removed.\n\n"
             "## 8. Cookies and localStorage\n"
-            "We use the minimum of local storage:\n"
-            "• localStorage: SLD_token (session), SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id (anonymous realtime id), SLD_welcome_seen\n"
+            "• localStorage: SLD_token, SLD_theme, SLD_lang, SLD_colors, SLD_sound, SLD_anon_id, SLD_welcome_seen\n"
             "• sessionStorage: post draft, settings state, quote\n"
             "• One cookie: SLD_lang — only to remember your language choice\n"
             "No third-party cookies.\n\n"
@@ -1969,17 +2195,14 @@ TEXTS = {
             "For privacy, account deletion or data questions — write to us via the developer's profile.\n\n"
             "The service is provided \"as is\", without warranties."
         ),
-        "quote": "Quote",
-        "avatar_choose": "Choose an emoji",
-        "avatar_current": "Current avatar",
-        "og_enable": "Link previews",
+        "quote": "Quote", "avatar_choose": "Choose an emoji",
+        "avatar_current": "Current avatar", "og_enable": "Link previews",
         "color_blue": "Blue", "color_green": "Green", "color_purple": "Purple",
         "color_pink": "Pink", "color_orange": "Orange", "color_red": "Red",
         "color_teal": "Teal", "color_indigo": "Indigo",
         "color_accent": "Accent", "color_likes": "Likes",
         "reset_colors": "Reset colors",
-        "sent_from_mobile": "Sent from a phone",
-        "sent_from_desktop": "Sent from a computer",
+        "sent_from_mobile": "Sent from a phone", "sent_from_desktop": "Sent from a computer",
         "og_img_fallback": "Oops... could not load :(",
         "welcome_title": "Welcome!",
         "welcome_continue": "Continue",
@@ -1995,12 +2218,11 @@ TEXTS = {
             "• Control notifications — toggle each type individually\n"
             "• Change theme, accent colors and notification sound\n\n"
             "What we do NOT do:\n"
-            "• No ads\n"
-            "• No trackers or analytics\n"
+            "• No ads\n• No trackers or analytics\n"
             "• No selling your data to third parties\n"
             "• No storing your password in plain text\n\n"
             "Security:\n"
-            "Password is hashed with pbkdf2-hmac-sha256 (100 000 iterations). Verification runs in constant time — you can't be identified by response delay. Sessions are bound to a random token, and the number of active sessions is limited.\n\n"
+            "Password is hashed with pbkdf2-hmac-sha256 (100 000 iterations). Verification runs in constant time. Sessions are bound to a random token, and the number of active sessions is limited.\n\n"
             "Everything you publish can be edited or deleted at any time. Profile, follows, posts, comments — all under your control.\n\n"
             "Enjoy! If something goes wrong — reach out via the developer's profile."
         ),
@@ -2015,6 +2237,9 @@ TEXTS = {
 }
 
 
+# ============================================================================
+# SVG icons
+# ============================================================================
 def svg(paths: str, size: int = 20, sw: float = 2) -> str:
     return (f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
             f'stroke="currentColor" stroke-width="{sw}" stroke-linecap="round" '
@@ -2022,19 +2247,13 @@ def svg(paths: str, size: int = 20, sw: float = 2) -> str:
 
 
 I_HOME = svg('<path d="M3 10l9-7 9 7v11a2 2 0 0 1-2 2h-4v-8h-6v8H5a2 2 0 0 1-2-2z"/>')
-I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>'
-    '<circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/>'
-    '<path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
+I_USERS = svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>')
 I_USER = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>')
 I_USER_LG = svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>', size=18)
-I_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>'
-    '<path d="M13.7 21a2 2 0 0 1-3.4 0"/>')
-I_GEAR = svg('<circle cx="12" cy="12" r="3"/>'
-    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>')
-I_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>'
-    '<polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>')
-I_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>'
-    '<polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>')
+I_BELL = svg('<path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>')
+I_GEAR = svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>')
+I_LOGOUT = svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>')
+I_LOGIN = svg('<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>')
 I_PLUS = svg('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>')
 I_SEND = svg('<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>', size=20)
 I_HEART = svg('<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>', size=16)
@@ -2043,18 +2262,12 @@ I_COMMENT = svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 
 I_QUOTE = svg('<path d="M6 17h3l2-4V7H5v6h3z"/><path d="M14 17h3l2-4V7h-6v6h3z"/>', size=16)
 I_COPY = svg('<rect x="9" y="9" width="12" height="12"/><path d="M5 15H3V3h12v2"/>', size=16)
 I_EDIT = svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>', size=16)
-I_TRASH = svg('<polyline points="3 6 5 6 21 6"/>'
-    '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>'
-    '<path d="M10 11v6M14 11v6"/>', size=16)
+I_TRASH = svg('<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/>', size=16)
 I_BACK = svg('<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>')
 I_CHEVRON = svg('<polyline points="9 18 15 12 9 6"/>', size=18)
 I_SEARCH = svg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
 I_MOON = svg('<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>')
-I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/>'
-    '<line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/>'
-    '<line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/>'
-    '<line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/>'
-    '<line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
+I_SUN = svg('<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/>')
 I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>', size=14)
 I_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=14, sw=3)
 I_CHECK_LG = svg('<polyline points="20 6 9 17 4 12"/>', size=18, sw=3)
@@ -2097,6 +2310,9 @@ FAVICON_EN_LIGHT = _favicon("SLD", "#ffffff", "#000000", 40)
 FAVICON = FAVICON_RU_DARK
 
 
+# ============================================================================
+# CSS
+# ============================================================================
 CSS = """
 :root, [data-theme="dark"] {
   --bg:#0a0a0b; --bg-elev:#101012; --card:#141417; --card-2:#1a1a1e; --card-3:#202025;
@@ -2105,8 +2321,7 @@ CSS = """
   --hover:rgba(255,255,255,.045); --hover-2:rgba(255,255,255,.075);
   --accent:#3b82f6; --accent-fg:#ffffff;
   --accent-soft:rgba(59,130,246,.12); --accent-soft-2:rgba(59,130,246,.18);
-  --like:#ef4444; --danger:#ef4444; --mention:#7aa2ff;
-  --ok:#22c55e;
+  --like:#ef4444; --danger:#ef4444; --mention:#7aa2ff; --ok:#22c55e;
   --shadow-sm:0 1px 2px rgba(0,0,0,.25); --shadow-md:0 2px 8px rgba(0,0,0,.30);
   --shadow-lg:0 10px 30px rgba(0,0,0,.45);
 }
@@ -2117,8 +2332,7 @@ CSS = """
   --hover:rgba(0,0,0,.035); --hover-2:rgba(0,0,0,.06);
   --accent:#2563eb; --accent-fg:#ffffff;
   --accent-soft:rgba(37,99,235,.10); --accent-soft-2:rgba(37,99,235,.16);
-  --like:#dc2626; --danger:#dc2626; --mention:#2563eb;
-  --ok:#16a34a;
+  --like:#dc2626; --danger:#dc2626; --mention:#2563eb; --ok:#16a34a;
   --shadow-sm:0 1px 2px rgba(15,20,40,.04); --shadow-md:0 2px 8px rgba(15,20,40,.06);
   --shadow-lg:0 10px 30px rgba(15,20,40,.10);
 }
@@ -2168,11 +2382,9 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
 .main-inner { max-width: 680px; margin: 0 auto; padding: 8px 24px 60px; }
-
 .main-header { display: flex; align-items: center; gap: 10px; padding: 20px 24px 12px; max-width: 680px; margin: 0 auto; width: 100%; }
 .main-header.wide { max-width: 100%; padding-left: 20px; padding-right: 20px; }
 .main-header .title { flex: 1; font-size: 21px; font-weight: 800; letter-spacing: -0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.main-header .icon-btn { margin-left: 0; }
 
 .icon-btn { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-2); cursor: pointer; padding: 0; text-decoration: none; border-radius: 10px; transition: background .15s ease, color .15s ease; flex-shrink: 0; }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
@@ -2203,14 +2415,12 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .composer-body textarea::placeholder { color: var(--muted); }
 .composer-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .composer-hint { font-size: 11px; color: var(--muted-2); letter-spacing: .2px; }
-
 .og-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; transition: color .15s ease; }
 .og-toggle:hover { color: var(--text-2); }
 .og-toggle input { position: absolute; opacity: 0; pointer-events: none; }
 .og-toggle .cb { width: 18px; height: 18px; flex-shrink: 0; border: 1.5px solid var(--line-2); border-radius: 5px; background: transparent; display: inline-flex; align-items: center; justify-content: center; transition: background .15s ease, border-color .15s ease; color: transparent; }
 .og-toggle input:checked + .cb { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 .og-toggle .cb svg { display: block; }
-
 .composer-actions .spacer { flex: 1; }
 .publish-btn { height: 38px; padding: 0 18px; background: var(--accent); color: var(--accent-fg); border: none; border-radius: 10px; font-family: inherit; font-size: 14px; font-weight: 700; cursor: pointer; transition: opacity .15s ease, transform .1s ease; }
 .publish-btn:hover { opacity: .9; }
@@ -2265,7 +2475,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .device-badge svg { display: block; }
 .post-menu { display: flex; gap: 2px; margin-left: auto; flex-shrink: 0; align-self: flex-start; }
 .post-menu .act-btn { height: 30px; width: 30px; padding: 0; justify-content: center; }
-
 .post-text { font-size: 15px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); margin-bottom: 4px; }
 .mention { color: var(--mention); text-decoration: none; font-weight: 600; }
 .mention:hover { text-decoration: underline; }
@@ -2299,6 +2508,7 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .like-btn:hover { color: var(--like); }
 .like-btn.active { color: var(--like); }
 .like-btn .num { font-variant-numeric: tabular-nums; }
+.views-badge { margin-left: auto; color: var(--muted-2); font-size: 12.5px; display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; }
 
 .not-found { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; gap: 18px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; min-height: 320px; }
 .not-found-code { font-size: 76px; font-weight: 900; line-height: 1; color: var(--line-3); letter-spacing: -3px; }
@@ -2337,39 +2547,32 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .opt { height: 38px; padding: 0 18px; background: var(--card-2); color: var(--text-2); border: 1px solid var(--line); border-radius: 10px; font-family: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer; transition: background .15s ease, color .15s ease, border-color .15s ease; }
 .opt:hover { background: var(--hover); color: var(--text); }
 .opt.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-
 .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 13px 0; font-size: 14.5px; gap: 16px; }
 .toggle-row + .toggle-row { border-top: 1px solid var(--line); }
 .toggle { position: relative; width: 42px; height: 24px; background: var(--card-3); cursor: pointer; border: 1px solid var(--line-2); flex-shrink: 0; border-radius: 12px; transition: background .2s ease, border-color .2s ease; padding: 0; }
 .toggle::after { content: ''; position: absolute; left: 2px; top: 1px; width: 18px; height: 18px; background: #fff; transition: transform .2s ease; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 .toggle.on { background: var(--accent); border-color: var(--accent); }
 .toggle.on::after { transform: translateX(18px); }
-
 .settings-desc { font-size: 13px; line-height: 1.55; color: var(--muted); margin: 0 0 14px; padding-top: 4px; }
 .settings-link { display: inline-block; color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 600; }
 .settings-link:hover { text-decoration: underline; }
-
 .device-info { display: flex; flex-direction: column; gap: 6px; }
 .device-info-row { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; background: var(--card-2); border-radius: 10px; font-size: 13.5px; gap: 12px; }
 .device-info-row .label { color: var(--muted); font-weight: 500; display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .device-info-row .value { color: var(--text); font-weight: 700; text-align: right; word-break: break-word; }
-
 .color-swatches { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; padding-top: 4px; }
 .color-swatch { width: 34px; height: 34px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; position: relative; transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease; box-shadow: 0 0 0 1px var(--line-2); }
 .color-swatch:hover { transform: scale(1.1); }
 .color-swatch.active { border-color: var(--bg); box-shadow: 0 0 0 2px var(--text); }
-
 .account-hero { display: flex; align-items: center; gap: 14px; padding: 14px; background: var(--card-2); border-radius: 14px; margin-bottom: 16px; }
 .account-hero-avatar { flex-shrink: 0; }
 .account-hero-info { flex: 1; min-width: 0; }
 .account-hero-name { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-hero-nick { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
 .account-emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 4px; max-height: 180px; overflow-y: auto; padding: 6px; background: var(--card-2); border-radius: 12px; }
 .account-emoji-opt { aspect-ratio: 1 / 1; background: transparent; border: 2px solid transparent; border-radius: 10px; font-size: 22px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .15s ease, border-color .15s ease, transform .1s ease; padding: 0; }
 .account-emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
 .account-emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
-
 .settings-list-mobile { display: flex; flex-direction: column; gap: 8px; padding: 4px 16px 40px; max-width: 680px; margin: 0 auto; width: 100%; }
 .settings-list-row { display: flex; align-items: center; gap: 14px; background: var(--card); border: 1px solid var(--line); padding: 16px; border-radius: 16px; cursor: pointer; text-align: left; color: var(--text); transition: background .15s ease, border-color .15s ease; width: 100%; font-family: inherit; }
 .settings-list-row:hover { background: var(--hover-2); border-color: var(--line-2); }
@@ -2379,7 +2582,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .settings-list-row .sl-title { font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 2px; }
 .settings-list-row .sl-desc { font-size: 12.5px; color: var(--muted); line-height: 1.3; }
 .settings-list-row .sl-chevron { color: var(--muted-2); flex-shrink: 0; }
-
 .emoji-current { display: flex; align-items: center; gap: 14px; padding: 14px 16px; background: var(--card-2); border-radius: 12px; margin-bottom: 14px; }
 .emoji-current .preview { font-size: 36px; line-height: 1; }
 .emoji-current .label-wrap { display: flex; flex-direction: column; gap: 2px; }
@@ -2389,32 +2591,26 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .emoji-opt { aspect-ratio: 1 / 1; background: transparent; border: 2px solid transparent; border-radius: 10px; font-size: 24px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .15s ease, border-color .15s ease, transform .1s ease; padding: 0; }
 .emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
 .emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
-
 .boot-screen { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; background: var(--bg); padding: 24px; }
 .boot-logo { width: 68px; height: 68px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-fg); font-weight: 900; font-size: 24px; letter-spacing: -1px; animation: bootPulse 1.8s ease-in-out infinite; box-shadow: 0 8px 24px var(--accent-soft-2); }
 @keyframes bootPulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.06); opacity: .85; } }
 .boot-text { color: var(--muted); font-size: 13.5px; }
-
 .auth-page { position: relative; min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--bg); overflow: hidden; width: 100%; }
 .auth-page::before { content: ''; position: absolute; width: 60vmax; height: 60vmax; top: -30vmax; left: -20vmax; border-radius: 50%; background: radial-gradient(circle, var(--accent-soft-2) 0%, transparent 65%); filter: blur(60px); pointer-events: none; z-index: 0; }
 .auth-page::after { content: ''; position: absolute; width: 50vmax; height: 50vmax; bottom: -25vmax; right: -15vmax; border-radius: 50%; background: radial-gradient(circle, var(--accent-soft) 0%, transparent 65%); filter: blur(60px); pointer-events: none; z-index: 0; }
 .auth-card { position: relative; z-index: 1; width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line); border-radius: 24px; padding: 32px 28px 28px; box-shadow: var(--shadow-lg); }
-
 .auth-topbar { position: absolute; top: 14px; left: 14px; right: 14px; display: flex; align-items: center; justify-content: space-between; pointer-events: none; }
 .auth-topbar > * { pointer-events: auto; }
 .auth-topbar-btn { height: 34px; min-width: 34px; padding: 0 10px; background: transparent; border: 1px solid transparent; color: var(--muted); cursor: pointer; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; transition: background .15s ease, color .15s ease, border-color .15s ease; font-weight: 700; font-size: 12px; letter-spacing: .5px; font-family: inherit; }
 .auth-topbar-btn:hover { background: var(--hover); color: var(--text); border-color: var(--line-2); }
 .auth-topbar-btn svg { display: block; }
 .auth-lang-btn { font-size: 11px; font-weight: 900; letter-spacing: .8px; }
-
 .auth-brand { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-bottom: 22px; padding-top: 12px; }
 .auth-brand-logo { width: 64px; height: 64px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-fg); font-weight: 900; font-size: 22px; letter-spacing: -1px; box-shadow: 0 8px 24px var(--accent-soft-2); }
 .auth-brand-name { font-size: 18px; font-weight: 800; color: var(--text); letter-spacing: -0.3px; }
 .auth-brand-tagline { font-size: 13px; color: var(--muted); text-align: center; line-height: 1.5; max-width: 320px; }
-
 .auth-pill-tabs { margin-bottom: 18px; }
 .auth-pill-tabs .pill-tab { font-size: 13px; padding: 10px 8px; }
-
 .auth-field { position: relative; margin-bottom: 10px; }
 .auth-field .auth-input-icon { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; display: inline-flex; }
 .auth-field input { width: 100%; padding: 14px 44px 14px 46px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); font-family: inherit; font-size: 15px; outline: none; border-radius: 12px; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
@@ -2426,30 +2622,24 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .auth-field-btn:disabled { opacity: .5; cursor: default; }
 .auth-field-btn.success { color: var(--ok); }
 .auth-field-btn.error { color: var(--danger); }
-
 .nick-status { font-size: 12.5px; margin: -4px 4px 10px; min-height: 18px; line-height: 1.4; color: var(--muted); display: flex; align-items: center; gap: 6px; }
 .nick-status.ok { color: var(--ok); }
 .nick-status.err { color: var(--danger); }
 .nick-status svg { flex-shrink: 0; }
-
 .auth-btn { margin-top: 8px; width: 100%; height: 50px; background: var(--accent); color: var(--accent-fg); border: none; border-radius: 12px; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px; transition: opacity .15s ease, transform .1s ease; }
 .auth-btn:hover { opacity: .92; }
 .auth-btn:active { transform: scale(.99); }
 .auth-btn:disabled { opacity: .55; cursor: default; }
 .auth-btn-spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
-
 .auth-error { color: var(--danger); font-size: 13px; min-height: 18px; margin: 6px 2px; line-height: 1.4; padding: 0 2px; }
-
 .session-banner { display: flex; align-items: center; gap: 10px; padding: 12px 14px; background: var(--accent-soft); border: 1px solid var(--accent-soft-2); border-radius: 12px; color: var(--text-2); font-size: 13.5px; margin-bottom: 16px; line-height: 1.45; }
 .session-banner svg { color: var(--accent); flex-shrink: 0; }
-
 .toast-container { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 2000; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: 90vw; }
 .toast { background: var(--card); border: 1px solid var(--line-2); border-radius: 12px; padding: 10px 16px; font-size: 13.5px; font-weight: 600; color: var(--text); box-shadow: var(--shadow-lg); display: inline-flex; align-items: center; gap: 10px; pointer-events: auto; animation: toastIn .25s ease; }
 @keyframes toastIn { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: translateY(0); } }
 .toast svg { flex-shrink: 0; }
 .toast.success svg { color: var(--ok); }
 .toast.error svg { color: var(--danger); }
-
 .policy { max-width: 720px; margin: 0 auto; padding: 12px 28px 80px; }
 .policy-h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.4px; margin: 0 0 12px; color: var(--text); padding-bottom: 14px; border-bottom: 1px solid var(--line); }
 .policy-h2 { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; margin: 32px 0 10px; color: var(--text); display: flex; align-items: baseline; gap: 10px; }
@@ -2460,12 +2650,9 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .policy-list li::before { content: ''; position: absolute; left: 6px; top: 10px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .8; }
 .policy-gap { height: 4px; }
 .policy-footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted-2); text-align: center; line-height: 1.6; }
-
 .empty { padding: 56px 20px; text-align: center; color: var(--muted); font-size: 13.5px; background: var(--card); border: 1px dashed var(--line-2); border-radius: 16px; }
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner { display: inline-block; width: 26px; height: 26px; border: 2.5px solid var(--line-2); border-top-color: var(--accent); animation: spin .7s linear infinite; border-radius: 50%; }
-
-/* MODALS */
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; animation: fadeIn .14s ease; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .modal { background: var(--card); border: 1px solid var(--line-2); border-radius: 18px; padding: 24px; max-width: 380px; width: 100%; box-shadow: var(--shadow-lg); animation: popIn .16s ease; }
@@ -2477,31 +2664,15 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .modal-btn.secondary:hover { background: var(--hover-2); }
 .modal-btn.danger { background: var(--danger); color: #fff; }
 .modal-btn.danger:hover { opacity: .9; }
-
-/* WELCOME modal */
 .modal.welcome { max-width: 520px; padding: 28px 26px 24px; }
 .welcome-title { font-size: 22px; font-weight: 800; letter-spacing: -0.3px; text-align: center; margin: 0 0 14px; color: var(--text); }
-.welcome-text {
-  font-size: 14.5px; line-height: 1.7; color: var(--text-2);
-  white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;
-  margin-bottom: 22px;
-  max-height: 55vh; overflow-y: auto;
-  padding-right: 6px;
-}
-.welcome-btn {
-  width: 100%; height: 52px;
-  background: var(--accent); color: var(--accent-fg);
-  border: none; border-radius: 12px;
-  font-family: inherit; font-size: 15px; font-weight: 700;
-  cursor: pointer; transition: opacity .15s ease, transform .1s ease;
-}
+.welcome-text { font-size: 14.5px; line-height: 1.7; color: var(--text-2); white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; margin-bottom: 22px; max-height: 55vh; overflow-y: auto; padding-right: 6px; }
+.welcome-btn { width: 100%; height: 52px; background: var(--accent); color: var(--accent-fg); border: none; border-radius: 12px; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; transition: opacity .15s ease, transform .1s ease; }
 .welcome-btn:hover { opacity: .92; }
 .welcome-btn:active { transform: scale(.99); }
-
 .comment.highlight { animation: flash 1.6s ease-out; }
 @keyframes flash { 0% { background: var(--accent-soft-2); } 100% { background: var(--card-2); } }
 .comment.pending { opacity: .65; }
-
 .comments { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .comment { padding: 10px 14px; background: var(--card-2); border-radius: 12px; margin-top: 6px; }
 .comment.reply { margin-left: 26px; background: transparent; border-left: 2px solid var(--line-2); border-radius: 0; padding-left: 12px; padding-top: 6px; padding-bottom: 6px; }
@@ -2514,7 +2685,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .comment-text { font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; color: var(--text); margin-bottom: 4px; }
 .comment-actions { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin-left: -6px; }
 .comment-actions .act-btn { height: 26px; padding: 0 8px; font-size: 11.5px; }
-
 .inline-editor { margin-top: 8px; }
 .inline-editor textarea { width: 100%; padding: 12px 14px; min-height: 90px; border: 1px solid var(--line); background: var(--card-2); color: var(--text); font-family: inherit; font-size: 15px; line-height: 1.5; outline: none; resize: none; border-radius: 12px; transition: border-color .15s ease; }
 .inline-editor textarea:focus { border-color: var(--accent); }
@@ -2522,7 +2692,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .inline-editor .edit-actions button { height: 36px; padding: 0 14px; font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; border: 1px solid var(--line); border-radius: 10px; background: var(--card-2); color: var(--text); transition: background .15s ease; }
 .inline-editor .edit-actions button:hover { background: var(--hover-2); }
 .inline-editor .edit-actions button.edit-save { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-
 .edit-bio-textarea { padding: 14px 16px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); font-family: inherit; font-size: 15px; outline: none; border-radius: 12px; min-height: 60px; max-height: 200px; resize: none; line-height: 1.5; transition: border-color .15s ease; }
 .edit-bio-textarea:focus { border-color: var(--accent); }
 
@@ -2537,7 +2706,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .sidebar-logout span { font-size: 10.5px; line-height: 1.1; word-break: break-word; white-space: normal; }
   .sidebar-logout svg { width: 20px; height: 20px; }
 }
-
 @media (max-width: 900px) {
   .layout { flex-direction: column; max-width: 100%; }
   .main { order: 1; height: calc(100vh - 64px - env(safe-area-inset-bottom, 0px)); height: calc(100dvh - 64px - env(safe-area-inset-bottom, 0px)); }
@@ -2564,7 +2732,6 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .profile-line { gap: 6px; margin-bottom: 8px; }
   .profile-stats { font-size: 12px; gap: 14px; }
   .profile-meta { margin-top: 6px; font-size: 11.5px; }
-
   .composer-avatar-row { gap: 10px; }
   .composer-avatar-col { gap: 6px; }
   .composer-body textarea { min-height: 40px; font-size: 15px; }
@@ -2573,34 +2740,27 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .publish-btn-desktop { display: none !important; }
   .composer-hint { display: none; }
   .composer-actions { gap: 8px; }
-
   .settings-layout { flex-direction: column; padding: 4px 12px 40px; gap: 12px; }
   .settings-nav { display: none; }
   .settings-block { padding: 16px; border-radius: 14px; }
-
   .modal { padding: 22px 18px 18px; border-radius: 16px; max-width: 100%; }
   .modal-text { font-size: 15.5px; margin-bottom: 20px; }
   .modal-actions { flex-direction: column-reverse; gap: 10px; }
   .modal-btn { height: 56px; font-size: 16px; border-radius: 14px; flex: 0 0 auto; width: 100%; font-weight: 700; }
-
   .modal.welcome { padding: 24px 20px 20px; border-radius: 18px; }
   .welcome-title { font-size: 20px; margin-bottom: 12px; }
   .welcome-text { font-size: 14.5px; line-height: 1.65; max-height: 58vh; margin-bottom: 20px; }
   .welcome-btn { height: 56px; font-size: 16px; border-radius: 14px; }
-
   .emoji-grid { grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 3px; max-height: 300px; }
   .emoji-opt { font-size: 22px; }
   .og-image { height: 160px; }
-
   .not-found { padding: 60px 16px; min-height: 260px; }
   .not-found-code { font-size: 64px; }
   .post-time::before { content: ''; margin-right: 0; }
   .post-header .who { gap: 8px; }
-
   .policy { padding: 12px 18px 60px; }
   .policy-h1 { font-size: 21px; }
   .policy-h2 { font-size: 16px; margin-top: 26px; }
-
   .auth-page { padding: 16px; }
   .auth-card { padding: 30px 22px 24px; border-radius: 22px; }
   .auth-topbar { top: 10px; left: 10px; right: 10px; }
@@ -2621,14 +2781,12 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .settings-layout { padding: 4px 10px 30px; }
   .settings-list-mobile { padding: 4px 10px 30px; }
   .policy { padding: 12px 14px 60px; }
-
   .modal { padding: 20px 16px 16px; border-radius: 16px; }
   .modal-btn { height: 58px; font-size: 16px; }
   .modal.welcome { padding: 22px 18px 18px; }
   .welcome-title { font-size: 19px; }
   .welcome-text { font-size: 14px; line-height: 1.65; max-height: 60vh; }
   .welcome-btn { height: 58px; font-size: 16px; }
-
   .auth-page { padding: 10px; align-items: stretch; }
   .auth-card { padding: 28px 18px 22px; border-radius: 20px; max-width: 100%; margin: auto 0; align-self: center; }
   .auth-topbar { top: 8px; left: 8px; right: 8px; }
@@ -2647,6 +2805,9 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 """
 
 
+# ============================================================================
+# JS
+# ============================================================================
 JS = r"""
 var ICONS = {
   home: __I_HOME__, users: __I_USERS__, user: __I_USER__, userLg: __I_USER_LG__,
@@ -2662,7 +2823,6 @@ var ICONS = {
   eye: __I_EYE__, eyeOff: __I_EYE_OFF__, lock: __I_LOCK__, at: __I_AT__,
   info: __I_INFO__, refresh: __I_REFRESH__, globe: __I_GLOBE__
 };
-
 var EMOJI_NAMES = __EMOJI_NAMES__;
 var EMOJIS = Object.keys(EMOJI_NAMES);
 var DEFAULT_EMOJI = '😀';
@@ -2675,55 +2835,46 @@ function faviconFor(theme) {
   if (LANG === 'ru') return theme === 'light' ? FAVICON_RU_LIGHT : FAVICON_RU_DARK;
   return theme === 'light' ? FAVICON_EN_LIGHT : FAVICON_EN_DARK;
 }
-
 var COLOR_PRESETS = {
   accent: [
-    { id: 'blue',    ru: 'Синий',     en: 'Blue',     dark: '#3b82f6', light: '#2563eb' },
-    { id: 'green',   ru: 'Зелёный',   en: 'Green',    dark: '#22c55e', light: '#16a34a' },
-    { id: 'purple',  ru: 'Фиолетовый',en: 'Purple',   dark: '#a855f7', light: '#9333ea' },
-    { id: 'pink',    ru: 'Розовый',   en: 'Pink',     dark: '#ec4899', light: '#db2777' },
-    { id: 'orange',  ru: 'Оранжевый', en: 'Orange',   dark: '#f97316', light: '#ea580c' },
-    { id: 'teal',    ru: 'Бирюзовый', en: 'Teal',     dark: '#14b8a6', light: '#0d9488' },
-    { id: 'indigo',  ru: 'Индиго',    en: 'Indigo',   dark: '#6366f1', light: '#4f46e5' },
+    { id:'blue',ru:'Синий',en:'Blue',dark:'#3b82f6',light:'#2563eb' },
+    { id:'green',ru:'Зелёный',en:'Green',dark:'#22c55e',light:'#16a34a' },
+    { id:'purple',ru:'Фиолетовый',en:'Purple',dark:'#a855f7',light:'#9333ea' },
+    { id:'pink',ru:'Розовый',en:'Pink',dark:'#ec4899',light:'#db2777' },
+    { id:'orange',ru:'Оранжевый',en:'Orange',dark:'#f97316',light:'#ea580c' },
+    { id:'teal',ru:'Бирюзовый',en:'Teal',dark:'#14b8a6',light:'#0d9488' },
+    { id:'indigo',ru:'Индиго',en:'Indigo',dark:'#6366f1',light:'#4f46e5' },
   ],
   like: [
-    { id: 'red',    ru: 'Красный',   en: 'Red',     dark: '#ef4444', light: '#dc2626' },
-    { id: 'pink',   ru: 'Розовый',   en: 'Pink',    dark: '#ec4899', light: '#db2777' },
-    { id: 'orange', ru: 'Оранжевый', en: 'Orange',  dark: '#f97316', light: '#ea580c' },
-    { id: 'purple', ru: 'Фиолетовый',en: 'Purple',  dark: '#a855f7', light: '#9333ea' },
-    { id: 'blue',   ru: 'Синий',     en: 'Blue',    dark: '#3b82f6', light: '#2563eb' },
+    { id:'red',ru:'Красный',en:'Red',dark:'#ef4444',light:'#dc2626' },
+    { id:'pink',ru:'Розовый',en:'Pink',dark:'#ec4899',light:'#db2777' },
+    { id:'orange',ru:'Оранжевый',en:'Orange',dark:'#f97316',light:'#ea580c' },
+    { id:'purple',ru:'Фиолетовый',en:'Purple',dark:'#a855f7',light:'#9333ea' },
+    { id:'blue',ru:'Синий',en:'Blue',dark:'#3b82f6',light:'#2563eb' },
   ]
 };
-
 function hexToRgb(hex) {
   hex = hex.replace('#','');
   if (hex.length === 3) hex = hex.split('').map(function(c){return c+c;}).join('');
-  return [parseInt(hex.slice(0,2),16), parseInt(hex.slice(2,4),16), parseInt(hex.slice(4,6),16)];
+  return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16)];
 }
-function rgba(hex, a) {
-  var c = hexToRgb(hex);
-  return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
-}
-function loadColors() {
-  try { return JSON.parse(localStorage.getItem('SLD_colors') || '{}') || {}; }
-  catch(e) { return {}; }
-}
-function saveColors(c) { localStorage.setItem('SLD_colors', JSON.stringify(c)); }
-
+function rgba(hex,a){var c=hexToRgb(hex);return 'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
+function loadColors(){try{return JSON.parse(localStorage.getItem('SLD_colors')||'{}')||{};}catch(e){return {};}}
+function saveColors(c){localStorage.setItem('SLD_colors',JSON.stringify(c));}
 function applyColors() {
   var c = loadColors();
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var root = document.documentElement.style;
   var accentVal = null;
   if (c.accent) {
-    var p = COLOR_PRESETS.accent.find(function(x){ return x.id === c.accent; });
+    var p = COLOR_PRESETS.accent.find(function(x){return x.id === c.accent;});
     if (p) accentVal = theme === 'dark' ? p.dark : p.light;
   }
   if (accentVal) {
     root.setProperty('--accent', accentVal);
     root.setProperty('--accent-fg', '#ffffff');
-    root.setProperty('--accent-soft', rgba(accentVal, theme === 'dark' ? 0.14 : 0.10));
-    root.setProperty('--accent-soft-2', rgba(accentVal, theme === 'dark' ? 0.22 : 0.16));
+    root.setProperty('--accent-soft', rgba(accentVal, theme==='dark'?0.14:0.10));
+    root.setProperty('--accent-soft-2', rgba(accentVal, theme==='dark'?0.22:0.16));
     root.setProperty('--mention', accentVal);
   } else {
     root.removeProperty('--accent'); root.removeProperty('--accent-fg');
@@ -2731,68 +2882,32 @@ function applyColors() {
     root.removeProperty('--mention');
   }
   if (c.like) {
-    var pl = COLOR_PRESETS.like.find(function(x){ return x.id === c.like; });
-    if (pl) root.setProperty('--like', theme === 'dark' ? pl.dark : pl.light);
-  } else {
-    root.removeProperty('--like');
-  }
+    var pl = COLOR_PRESETS.like.find(function(x){return x.id === c.like;});
+    if (pl) root.setProperty('--like', theme==='dark'?pl.dark:pl.light);
+  } else root.removeProperty('--like');
 }
-function setColor(key, id) {
-  var c = loadColors(); c[key] = id; saveColors(c); applyColors();
-}
-
+function setColor(key,id){var c=loadColors();c[key]=id;saveColors(c);applyColors();}
 var anonId = localStorage.getItem('SLD_anon_id');
-if (!anonId) {
-  anonId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-  localStorage.setItem('SLD_anon_id', anonId);
-}
+if (!anonId) { anonId = Math.random().toString(36).slice(2,10) + Date.now().toString(36); localStorage.setItem('SLD_anon_id', anonId); }
 
 var state = {
-  user: null,
-  token: localStorage.getItem('SLD_token') || null,
-  booting: false,
-  sessionExpired: false,
-  bootError: null,
-  authMode: 'login',
+  user: null, token: localStorage.getItem('SLD_token') || null,
+  booting: false, sessionExpired: false, bootError: null, authMode: 'login',
   view: VIEW, viewData: VIEW_DATA || {},
-  unreadNotif: parseInt(localStorage.getItem('SLD_un') || '0', 10) || 0,
-  feedMode: 'all',
-  peopleTab: 'all',
-  peopleQuery: '',
-  searchQuery: '',
-  composerDraft: '',
-  quotePostId: null,
-  quotePreview: null,
-  replyTo: null,
-  highlightComment: null,
-  suppressRefresh: 0,
-  settingsSection: 'account',
-  settingsOpen: false,
-  es: null,
-  currentEmoji: DEFAULT_EMOJI,
-  whoami: null,
-  currentRooms: [],
-  refreshTimer: null,
-  sseErrors: 0,
-  sseWasConnected: false,
+  unreadNotif: parseInt(localStorage.getItem('SLD_un')||'0',10)||0,
+  feedMode: 'all', peopleTab: 'all', peopleQuery: '', searchQuery: '',
+  composerDraft: '', quotePostId: null, quotePreview: null, replyTo: null,
+  highlightComment: null, suppressRefresh: 0, settingsSection: 'account',
+  settingsOpen: false, es: null, currentEmoji: DEFAULT_EMOJI, whoami: null,
+  currentRooms: [], refreshTimer: null, sseErrors: 0, sseWasConnected: false,
   soundEnabled: localStorage.getItem('SLD_sound') !== '0',
-  welcomeShown: false,
+  welcomeShown: false
 };
-
-var feedCache = {
-  all: { posts: null, query: null },
-  subs: { posts: null, query: null },
-};
-
-var feedReqId = 0;
-var peopleReqId = 0;
-var profileReqId = 0;
-var fallbackPollTimer = null;
+var feedCache = { all:{posts:null,query:null}, subs:{posts:null,query:null} };
+var feedReqId = 0, peopleReqId = 0, profileReqId = 0, fallbackPollTimer = null;
 
 function setUser(u) { state.user = u; }
-function setNotifCount(n) {
-  if (typeof n === 'number') { state.unreadNotif = n; localStorage.setItem('SLD_un', String(n)); }
-}
+function setNotifCount(n) { if (typeof n === 'number') { state.unreadNotif = n; localStorage.setItem('SLD_un', String(n)); } }
 
 function showToast(text, type) {
   var cont = document.getElementById('toastContainer');
@@ -2807,7 +2922,7 @@ function showToast(text, type) {
   var icon = '';
   if (type === 'success') icon = ICONS.checkLg;
   else if (type === 'error') icon = ICONS.info;
-  el.innerHTML = (icon ? icon : '') + '<span>' + escapeHtml(text) + '</span>';
+  el.innerHTML = (icon || '') + '<span>' + escapeHtml(text) + '</span>';
   cont.appendChild(el);
   setTimeout(function(){
     el.style.transition = 'opacity .2s ease, transform .2s ease';
@@ -2835,10 +2950,8 @@ function showWelcomeModal() {
   modal.querySelector('[data-modal-continue]').addEventListener('click', close);
   modal.addEventListener('click', function(e){ if (e.target === modal) close(); });
 }
-
 function maybeShowWelcome() {
-  if (!state.user) return;
-  if (state.welcomeShown) return;
+  if (!state.user || state.welcomeShown) return;
   var seen = '0';
   try { seen = localStorage.getItem('SLD_welcome_seen') || '0'; } catch(e) {}
   if (seen === '1') return;
@@ -2860,8 +2973,7 @@ async function api(path, opts) {
     localStorage.removeItem('SLD_token');
     disconnectSSE();
     if (wasAuthed) {
-      state.sessionExpired = true;
-      state.booting = false;
+      state.sessionExpired = true; state.booting = false;
       showToast(tr('session_expired'), 'error');
       try { renderRoot(); } catch(e) {}
     }
@@ -2874,28 +2986,25 @@ async function api(path, opts) {
   }
   return r.json();
 }
-
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
 }
 function linkifyMentions(escaped) {
-  return escaped.replace(/(^|[^a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})/g, function(_, pre, nick){
+  return escaped.replace(/(^|[^a-zA-Z0-9_])@([a-zA-Z0-9_]{3,20})/g, function(_,pre,nick){
     return pre + '<a class="mention" href="/u/' + encodeURIComponent(nick) + '" data-link>@' + nick + '</a>';
   });
 }
 function linkifyText(raw) {
   if (!raw) return '';
-  var parts = [];
-  var re = /(https?:\/\/[^\s<>"']+)/g;
-  var last = 0, m;
+  var parts = []; var re = /(https?:\/\/[^\s<>"']+)/g; var last = 0, m;
   while ((m = re.exec(raw)) !== null) {
-    if (m.index > last) parts.push({ type: 'text', v: raw.slice(last, m.index) });
-    parts.push({ type: 'url', v: m[0] });
+    if (m.index > last) parts.push({type:'text', v: raw.slice(last, m.index)});
+    parts.push({type:'url', v: m[0]});
     last = m.index + m[0].length;
   }
-  if (last < raw.length) parts.push({ type: 'text', v: raw.slice(last) });
+  if (last < raw.length) parts.push({type:'text', v: raw.slice(last)});
   return parts.map(function(p){
     if (p.type === 'url') {
       var safe = escapeHtml(p.v);
@@ -2909,48 +3018,38 @@ function timeAgo(ts) {
   var d = Math.floor(Date.now()/1000 - ts);
   if (d < 5) return tr('just_now');
   if (d < 60) return d + ' ' + tr('sec_ago');
-  var m = Math.floor(d/60);
-  if (m < 60) return m + ' ' + tr('min_ago');
-  var h = Math.floor(m/60);
-  if (h < 24) return h + ' ' + tr('hour_ago');
-  var days = Math.floor(h/24);
-  if (days < 30) return days + ' ' + tr('day_ago');
+  var m = Math.floor(d/60); if (m < 60) return m + ' ' + tr('min_ago');
+  var h = Math.floor(m/60); if (h < 24) return h + ' ' + tr('hour_ago');
+  var days = Math.floor(h/24); if (days < 30) return days + ' ' + tr('day_ago');
   return new Date(ts*1000).toLocaleDateString();
 }
 function fmtDate(ts) {
-  try { return new Date(ts*1000).toLocaleDateString(LANG === 'ru' ? 'ru-RU' : 'en-US', { year: 'numeric', month: 'long' }); }
+  try { return new Date(ts*1000).toLocaleDateString(LANG==='ru'?'ru-RU':'en-US', {year:'numeric',month:'long'}); }
   catch(e) { return new Date(ts*1000).toLocaleDateString(); }
 }
 function fmtUptime(sec) {
   sec = Math.max(0, Math.floor(sec));
-  var d = Math.floor(sec / 86400);
-  var h = Math.floor((sec % 86400) / 3600);
-  var m = Math.floor((sec % 3600) / 60);
-  var s = sec % 60;
-  var parts = [];
-  var ru = (LANG === 'ru');
-  if (d > 0) parts.push(d + (ru ? ' д' : 'd'));
-  if (h > 0) parts.push(h + (ru ? ' ч' : 'h'));
-  if (m > 0) parts.push(m + (ru ? ' мин' : 'm'));
-  if (!parts.length) parts.push(s + (ru ? ' с' : 's'));
+  var d = Math.floor(sec/86400), h = Math.floor((sec%86400)/3600);
+  var m = Math.floor((sec%3600)/60), s = sec % 60;
+  var parts = []; var ru = (LANG === 'ru');
+  if (d > 0) parts.push(d + (ru?' д':'d'));
+  if (h > 0) parts.push(h + (ru?' ч':'h'));
+  if (m > 0) parts.push(m + (ru?' мин':'m'));
+  if (!parts.length) parts.push(s + (ru?' с':'s'));
   return parts.join(' ');
 }
 function truncateText(text) {
-  var lines = text.split('\n');
-  var out = text, truncated = false;
-  if (lines.length > TRUNCATE_LINES) { out = lines.slice(0, TRUNCATE_LINES).join('\n'); truncated = true; }
-  if (out.length > TRUNCATE_CHARS) { out = out.slice(0, TRUNCATE_CHARS); truncated = true; }
+  var lines = text.split('\n'); var out = text, truncated = false;
+  if (lines.length > TRUNCATE_LINES) { out = lines.slice(0,TRUNCATE_LINES).join('\n'); truncated = true; }
+  if (out.length > TRUNCATE_CHARS) { out = out.slice(0,TRUNCATE_CHARS); truncated = true; }
   if (truncated) out = out.replace(/\s+$/, '') + '…';
   return { text: out, truncated: truncated };
 }
 function spinner() { return '<div class="spinner-wrap"><div class="spinner"></div></div>'; }
-
 function notFoundHtml() {
-  return '<div class="not-found">'
-    + '<div class="not-found-code">404</div>'
+  return '<div class="not-found"><div class="not-found-code">404</div>'
     + '<div class="not-found-text">' + escapeHtml(tr('page_not_found')) + '</div>'
-    + '<a class="pill-action primary" href="/" data-link>' + escapeHtml(tr('back_home')) + '</a>'
-    + '</div>';
+    + '<a class="pill-action primary" href="/" data-link>' + escapeHtml(tr('back_home')) + '</a></div>';
 }
 function autoGrow(el) {
   if (!el) return;
@@ -2977,18 +3076,15 @@ function showConfirm(text, onConfirm, opts) {
   modal.querySelector('[data-modal-confirm]').addEventListener('click', function(){ close(); onConfirm(); });
   modal.addEventListener('click', function(e){ if (e.target === modal) close(); });
 }
-
 function updateFavicon() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var link = document.getElementById('sld-favicon');
-  if (!link) return;
-  link.href = faviconFor(theme);
+  if (link) link.href = faviconFor(theme);
 }
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('SLD_theme', theme);
-  applyColors();
-  updateFavicon();
+  applyColors(); updateFavicon();
 }
 function toggleTheme() {
   var cur = document.documentElement.getAttribute('data-theme') || 'dark';
@@ -3003,15 +3099,12 @@ try {
   var _qp = sessionStorage.getItem('SLD_q_prev');
   if (_qid && _qp) { state.quotePostId = _qid; state.quotePreview = JSON.parse(_qp); }
 } catch(e) {}
-
 function saveQuoteState() {
   try {
     if (state.quotePostId && state.quotePreview) {
       sessionStorage.setItem('SLD_q_id', state.quotePostId);
       sessionStorage.setItem('SLD_q_prev', JSON.stringify(state.quotePreview));
-    } else {
-      sessionStorage.removeItem('SLD_q_id'); sessionStorage.removeItem('SLD_q_prev');
-    }
+    } else { sessionStorage.removeItem('SLD_q_id'); sessionStorage.removeItem('SLD_q_prev'); }
   } catch(e) {}
 }
 function clearQuoteState() { state.quotePostId = null; state.quotePreview = null; saveQuoteState(); }
@@ -3019,10 +3112,7 @@ function clearQuoteState() { state.quotePostId = null; state.quotePreview = null
 var _audioCtx = null;
 function ensureAudioCtx() {
   if (_audioCtx) return _audioCtx;
-  try {
-    var Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx) _audioCtx = new Ctx();
-  } catch(e) {}
+  try { var Ctx = window.AudioContext || window.webkitAudioContext; if (Ctx) _audioCtx = new Ctx(); } catch(e) {}
   return _audioCtx;
 }
 document.addEventListener('pointerdown', function unlockAudio() {
@@ -3036,9 +3126,7 @@ function playNotifSound() {
   try {
     if (ctx.state === 'suspended') ctx.resume();
     var now = ctx.currentTime;
-    var osc1 = ctx.createOscillator();
-    var osc2 = ctx.createOscillator();
-    var gain = ctx.createGain();
+    var osc1 = ctx.createOscillator(), osc2 = ctx.createOscillator(), gain = ctx.createGain();
     osc1.connect(gain); osc2.connect(gain); gain.connect(ctx.destination);
     osc1.type = 'sine'; osc2.type = 'sine';
     osc1.frequency.setValueAtTime(880, now);
@@ -3055,19 +3143,17 @@ function playNotifSound() {
 }
 
 var PAGE_TITLES = {
-  feed: 'page_title_feed', post: 'page_title_post', profile: 'page_title_profile',
-  users: 'page_title_users', notifications: 'page_title_notifications',
-  settings: 'page_title_settings', edit_profile: 'page_title_edit_profile',
-  policy: 'page_title_policy', register: 'page_title_register', login: 'page_title_login',
-  followers: 'page_title_followers', following: 'page_title_following',
-  not_found: 'page_title_notfound',
+  feed:'page_title_feed',post:'page_title_post',profile:'page_title_profile',
+  users:'page_title_users',notifications:'page_title_notifications',
+  settings:'page_title_settings',edit_profile:'page_title_edit_profile',
+  policy:'page_title_policy',register:'page_title_register',login:'page_title_login',
+  followers:'page_title_followers',following:'page_title_following',
+  not_found:'page_title_notfound'
 };
 function updateTitle() {
-  var key = PAGE_TITLES[state.view];
-  var sub = key ? tr(key) : '';
+  var key = PAGE_TITLES[state.view]; var sub = key ? tr(key) : '';
   document.title = sub ? (SITE_NAME + ' — ' + sub) : SITE_NAME;
 }
-
 function themeIconHtml() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   return theme === 'dark' ? ICONS.sun : ICONS.moon;
@@ -3080,16 +3166,11 @@ function bindThemeBtn() {
   var b = document.getElementById('mainThemeBtn');
   if (!b) return;
   b.innerHTML = themeIconHtml();
-  b.addEventListener('click', function(){
-    toggleTheme();
-    updateAllThemeIcons();
-  });
+  b.addEventListener('click', function(){ toggleTheme(); updateAllThemeIcons(); });
 }
-
 function navigate(url, force) {
   if (!force && location.pathname + location.hash === url) return;
-  history.pushState({}, '', url);
-  handleRoute();
+  history.pushState({}, '', url); handleRoute();
 }
 function computeRooms() {
   var rooms = [];
@@ -3098,9 +3179,8 @@ function computeRooms() {
   else if (state.view === 'profile') rooms.push('profile:' + (state.viewData.nick || ''));
   return rooms;
 }
-function roomsEqual(a, b) {
-  if (!a || !b) return false;
-  if (a.length !== b.length) return false;
+function roomsEqual(a,b) {
+  if (!a || !b || a.length !== b.length) return false;
   return a.slice().sort().join('|') === b.slice().sort().join('|');
 }
 function updateRoom() {
@@ -3109,9 +3189,8 @@ function updateRoom() {
   state.currentRooms = rooms;
   var body = { rooms: rooms };
   if (!state.token) body.anon_id = anonId;
-  api('/api/room', { method: 'POST', body: body }).catch(function(){});
+  api('/api/room', { method:'POST', body: body }).catch(function(){});
 }
-
 function handleRoute() {
   var path = location.pathname, m;
   var wasSettings = (state.view === 'settings');
@@ -3138,166 +3217,213 @@ function handleRoute() {
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'not_found'; state.viewData = {}; }
   if (wasSettings && state.view !== 'settings') state.settingsOpen = false;
-  renderRoot();
-  updateRoom();
+  renderRoot(); updateRoom();
 }
 window.addEventListener('popstate', handleRoute);
 
 function renderRoot() {
-  var body = document.body;
-  var sb = document.getElementById('sidebar');
-  var main = document.getElementById('main');
+  var body = document.body, sb = document.getElementById('sidebar'), main = document.getElementById('main');
   if (!main) return;
   if (state.booting) {
     body.setAttribute('data-mode', 'boot');
     if (sb) sb.innerHTML = '';
-    main.innerHTML = '<div class="boot-screen">'
-      + '<div class="boot-logo">' + escapeHtml(SITE_NAME) + '</div>'
-      + '<div class="boot-text">' + escapeHtml(tr('booting')) + '</div>'
-      + '</div>';
+    main.innerHTML = '<div class="boot-screen"><div class="boot-logo">' + escapeHtml(SITE_NAME) + '</div>'
+      + '<div class="boot-text">' + escapeHtml(tr('booting')) + '</div></div>';
     document.title = SITE_NAME;
     return;
   }
-  if (!state.user) {
-    body.setAttribute('data-mode', 'auth');
-    renderAuthScreen();
-    return;
-  }
+  if (!state.user) { body.setAttribute('data-mode', 'auth'); renderAuthScreen(); return; }
   body.setAttribute('data-mode', 'app');
-  updateTitle();
-  renderSidebar();
-  renderMain();
+  updateTitle(); renderSidebar(); renderMain();
 }
 
+/* ============ UI-API ============ */
+var UI = (function() {
+  function el(tag, attrs, children) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      var v = attrs[k]; if (v == null) continue;
+      if (k === 'class') e.className = v;
+      else if (k === 'html') e.innerHTML = v;
+      else if (k === 'text') e.textContent = v;
+      else if (k.indexOf('on') === 0 && typeof v === 'function') e.addEventListener(k.slice(2).toLowerCase(), v);
+      else e.setAttribute(k, v);
+    }
+    if (children) (Array.isArray(children)?children:[children]).forEach(function(c){
+      if (c == null) return;
+      if (typeof c === 'string') e.appendChild(document.createTextNode(c));
+      else if (c instanceof Node) e.appendChild(c);
+    });
+    return e;
+  }
+  function html(str) { var t = document.createElement('template'); t.innerHTML = (str||'').trim(); return t.content; }
+  function card(opts) {
+    opts = opts || {};
+    return el('div', { class: 'card' + (opts.class ? ' ' + opts.class : '') }, [
+      opts.title ? el('h3', { class:'ui-card-title', text: opts.title }) : null,
+      opts.body || opts.html || ''
+    ]);
+  }
+  function btn(opts) {
+    opts = opts || {};
+    return el('button', {
+      type: opts.type || 'button',
+      class: 'ui-btn ' + (opts.variant ? 'ui-btn-' + opts.variant : '') + (opts.class ? ' ' + opts.class : ''),
+      onclick: opts.onClick,
+      disabled: opts.disabled ? '' : null
+    }, [opts.icon || '', opts.label ? el('span', { text: opts.label }) : '']);
+  }
+  function input(opts) {
+    opts = opts || {};
+    var iconHtml = opts.icon ? '<span class="auth-input-icon">' + opts.icon + '</span>' : '';
+    var btnHtml = opts.button ? '<button type="button" class="auth-field-btn">' + opts.button + '</button>' : '';
+    return html('<div class="auth-field ' + (opts.noRight?'no-right':'') + '">' + iconHtml
+      + '<input type="' + (opts.type||'text') + '" name="' + (opts.name||'') + '"'
+      + ' placeholder="' + escapeHtml(opts.placeholder||'') + '"'
+      + (opts.value != null ? ' value="' + escapeHtml(opts.value) + '"' : '')
+      + (opts.required?' required':'') + (opts.maxlength?' maxlength="'+opts.maxlength+'"':'')
+      + ' />' + btnHtml + '</div>');
+  }
+  function modal(opts) {
+    opts = opts || {};
+    var overlay = el('div', { class:'modal-overlay' });
+    var m = el('div', { class:'modal' + (opts.class ? ' ' + opts.class : '') });
+    if (opts.title) m.appendChild(el('div', { class:'modal-text', text: opts.title }));
+    if (opts.body) {
+      if (typeof opts.body === 'string') m.appendChild(html('<div>' + opts.body + '</div>'));
+      else m.appendChild(opts.body);
+    }
+    var actions = el('div', { class:'modal-actions' });
+    if (opts.cancel) actions.appendChild(btn({ variant:'secondary', label: opts.cancel.label || tr('confirm_no'), onClick: function(){ close(); opts.cancel.onClick && opts.cancel.onClick(); } }));
+    if (opts.confirm) actions.appendChild(btn({ variant:'danger', label: opts.confirm.label || tr('confirm_yes'), onClick: function(){ close(); opts.confirm.onClick && opts.confirm.onClick(); } }));
+    if (actions.childNodes.length) m.appendChild(actions);
+    overlay.appendChild(m);
+    document.body.appendChild(overlay);
+    function close() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+    overlay.addEventListener('click', function(e){ if (e.target === overlay) close(); });
+    return { el: overlay, close: close };
+  }
+  function toast(text, type) { showToast(text, type); }
+  var screens = {};
+  function registerScreen(name, fn) { screens[name] = fn; }
+  function getScreen(name) { return screens[name]; }
+  var features = {};
+  function setFeatures(f) { features = f || {}; }
+  function hasFeature(name) { return !!features[name]; }
+  var extraNav = [];
+  function addNavItem(item) { extraNav.push(item); }
+  function getExtraNav() { return extraNav.slice(); }
+  return {
+    el:el, html:html, card:card, btn:btn, input:input, modal:modal, toast:toast,
+    registerScreen:registerScreen, getScreen:getScreen, screens:screens,
+    setFeatures:setFeatures, hasFeature:hasFeature, features:features,
+    addNavItem:addNavItem, getExtraNav:getExtraNav
+  };
+})();
+
+async function loadUIManifest() {
+  try {
+    var m = await fetch('/api/ui/manifest').then(function(r){ return r.json(); });
+    UI.setFeatures(m.features || {});
+    window.__UI_MANIFEST = m;
+  } catch(e) {}
+}
+
+/* ============ AUTH SCREEN ============ */
 function authLoginFormHtml() {
   return '<form id="authLoginForm" autocomplete="on" novalidate>'
-    + '<div class="auth-field no-right">'
-    +   '<span class="auth-input-icon">' + ICONS.at + '</span>'
-    +   '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
-    + '</div>'
-    + '<div class="auth-field">'
-    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
-    +   '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="current-password" />'
-    +   '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button>'
-    + '</div>'
+    + '<div class="auth-field no-right"><span class="auth-input-icon">' + ICONS.at + '</span>'
+    + '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" /></div>'
+    + '<div class="auth-field"><span class="auth-input-icon">' + ICONS.lock + '</span>'
+    + '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="current-password" />'
+    + '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button></div>'
     + '<div class="auth-error" id="authErr"></div>'
-    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('log_btn')) + '</button>'
-    + '</form>';
+    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('log_btn')) + '</button></form>';
 }
 function authRegisterFormHtml() {
   return '<form id="authRegisterForm" autocomplete="on" novalidate>'
-    + '<div class="auth-field no-right">'
-    +   '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
-    +   '<input type="text" name="name" placeholder="' + escapeHtml(tr('name_ph')) + '" required autocomplete="name" maxlength="50" />'
-    + '</div>'
-    + '<div class="auth-field">'
-    +   '<span class="auth-input-icon">' + ICONS.at + '</span>'
-    +   '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
-    +   '<button type="button" class="auth-field-btn" id="nickCheckBtn">' + ICONS.check + '</button>'
-    + '</div>'
+    + '<div class="auth-field no-right"><span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    + '<input type="text" name="name" placeholder="' + escapeHtml(tr('name_ph')) + '" required autocomplete="name" maxlength="50" /></div>'
+    + '<div class="auth-field"><span class="auth-input-icon">' + ICONS.at + '</span>'
+    + '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
+    + '<button type="button" class="auth-field-btn" id="nickCheckBtn">' + ICONS.check + '</button></div>'
     + '<div class="nick-status" id="nickStatus"></div>'
-    + '<div class="auth-field">'
-    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
-    +   '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="new-password" />'
-    +   '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button>'
-    + '</div>'
-    + '<div class="auth-field">'
-    +   '<span class="auth-input-icon">' + ICONS.lock + '</span>'
-    +   '<input type="password" name="password_confirm" placeholder="' + escapeHtml(tr('pass2_ph')) + '" required autocomplete="new-password" />'
-    +   '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button>'
-    + '</div>'
+    + '<div class="auth-field"><span class="auth-input-icon">' + ICONS.lock + '</span>'
+    + '<input type="password" name="password" placeholder="' + escapeHtml(tr('pass_ph')) + '" required autocomplete="new-password" />'
+    + '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button></div>'
+    + '<div class="auth-field"><span class="auth-input-icon">' + ICONS.lock + '</span>'
+    + '<input type="password" name="password_confirm" placeholder="' + escapeHtml(tr('pass2_ph')) + '" required autocomplete="new-password" />'
+    + '<button type="button" class="auth-field-btn" data-toggle-pw>' + ICONS.eye + '</button></div>'
     + '<div class="auth-error" id="authErr"></div>'
-    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('reg_btn')) + '</button>'
-    + '</form>';
+    + '<button type="submit" class="auth-btn" id="authSubmit">' + escapeHtml(tr('reg_btn')) + '</button></form>';
 }
 function authPillTabsHtml() {
-  var m = state.authMode || 'login';
-  var isLogin = (m === 'login');
+  var m = state.authMode || 'login'; var isLogin = (m === 'login');
   return '<div class="pill-tabs auth-pill-tabs"><div class="pill-slider"></div>'
-    + '<button type="button" class="pill-tab' + (isLogin ? ' active' : '') + '" data-auth-tab="login">' + escapeHtml(tr('log_title')) + '</button>'
-    + '<button type="button" class="pill-tab' + (!isLogin ? ' active' : '') + '" data-auth-tab="register">' + escapeHtml(tr('reg_title')) + '</button>'
-    + '</div>';
+    + '<button type="button" class="pill-tab' + (isLogin?' active':'') + '" data-auth-tab="login">' + escapeHtml(tr('log_title')) + '</button>'
+    + '<button type="button" class="pill-tab' + (!isLogin?' active':'') + '" data-auth-tab="register">' + escapeHtml(tr('reg_title')) + '</button></div>';
 }
-
 function renderAuthScreen() {
-  var main = document.getElementById('main');
-  var sb = document.getElementById('sidebar');
+  var main = document.getElementById('main'), sb = document.getElementById('sidebar');
   if (!main) return;
   if (sb) sb.innerHTML = '';
-
   var note = '';
-  if (state.sessionExpired) {
-    note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('session_expired_hint')) + '</span></div>';
-  } else if (state.bootError === 'network') {
-    note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('network_error_hint')) + '</span></div>';
-  }
-
-  var currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-  var themeIcon = currentTheme === 'dark' ? ICONS.sun : ICONS.moon;
-
+  if (state.sessionExpired) note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('session_expired_hint')) + '</span></div>';
+  else if (state.bootError === 'network') note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('network_error_hint')) + '</span></div>';
+  var theme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var themeIcon = theme === 'dark' ? ICONS.sun : ICONS.moon;
   var html = '<div class="auth-page"><div class="auth-card">';
   html += '<div class="auth-topbar">';
-  html +=   '<button type="button" class="auth-topbar-btn auth-lang-btn" id="authLangBtn">' + (LANG === 'ru' ? 'RU' : 'EN') + '</button>';
-  html +=   '<button type="button" class="auth-topbar-btn" id="authThemeBtn">' + themeIcon + '</button>';
+  html += '<button type="button" class="auth-topbar-btn auth-lang-btn" id="authLangBtn">' + (LANG==='ru'?'RU':'EN') + '</button>';
+  html += '<button type="button" class="auth-topbar-btn" id="authThemeBtn">' + themeIcon + '</button>';
   html += '</div>';
-  html += '<div class="auth-brand">';
-  html +=   '<div class="auth-brand-logo">' + escapeHtml(SITE_NAME) + '</div>';
-  html +=   '<div class="auth-brand-name">' + escapeHtml(SITE_NAME) + '</div>';
-  html +=   '<div class="auth-brand-tagline">' + escapeHtml(tr('auth_tagline')) + '</div>';
-  html += '</div>';
+  html += '<div class="auth-brand"><div class="auth-brand-logo">' + escapeHtml(SITE_NAME) + '</div>'
+    + '<div class="auth-brand-name">' + escapeHtml(SITE_NAME) + '</div>'
+    + '<div class="auth-brand-tagline">' + escapeHtml(tr('auth_tagline')) + '</div></div>';
   if (note) html += note;
   html += authPillTabsHtml();
-  html += '<div id="authFormWrap">' + ((state.authMode === 'login') ? authLoginFormHtml() : authRegisterFormHtml()) + '</div>';
+  html += '<div id="authFormWrap">' + ((state.authMode==='login')?authLoginFormHtml():authRegisterFormHtml()) + '</div>';
   html += '</div></div>';
   main.innerHTML = html;
-  document.title = SITE_NAME + ' — ' + tr(state.authMode === 'login' ? 'log_title' : 'reg_title');
+  document.title = SITE_NAME + ' — ' + tr(state.authMode==='login'?'log_title':'reg_title');
 
   var langBtn = document.getElementById('authLangBtn');
   if (langBtn) langBtn.addEventListener('click', function(){
-    var next = (LANG === 'ru') ? 'en' : 'ru';
+    var next = (LANG==='ru')?'en':'ru';
     document.cookie = 'SLD_lang=' + next + '; path=/; max-age=' + (60*60*24*365);
-    location.href = (state.authMode === 'register') ? '/register' : '/login';
+    location.href = (state.authMode==='register')?'/register':'/login';
     location.reload();
   });
   var themeBtn = document.getElementById('authThemeBtn');
-  if (themeBtn) themeBtn.addEventListener('click', function(){
-    toggleTheme(); updateAllThemeIcons();
-  });
+  if (themeBtn) themeBtn.addEventListener('click', function(){ toggleTheme(); updateAllThemeIcons(); });
 
   var pt = main.querySelector('.pill-tabs');
   var slider = pt ? pt.querySelector('.pill-slider') : null;
   function positionSlider() {
     if (!pt || !slider) return;
-    var active = pt.querySelector('.pill-tab.active');
-    if (!active) return;
+    var active = pt.querySelector('.pill-tab.active'); if (!active) return;
     slider.style.width = active.offsetWidth + 'px';
     slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
   }
   requestAnimationFrame(positionSlider);
   window.addEventListener('resize', function(){ requestAnimationFrame(positionSlider); });
-
   main.querySelectorAll('[data-auth-tab]').forEach(function(b){
     b.addEventListener('click', function(){
       var mode = b.dataset.authTab;
       if (mode === state.authMode) return;
-      state.authMode = mode;
-      state.sessionExpired = false;
-      state.bootError = null;
+      state.authMode = mode; state.sessionExpired = false; state.bootError = null;
       pt.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === b); });
       requestAnimationFrame(positionSlider);
       var wrap = document.getElementById('authFormWrap');
       if (wrap) {
-        wrap.innerHTML = (mode === 'login') ? authLoginFormHtml() : authRegisterFormHtml();
-        wrap.style.animation = 'none'; void wrap.offsetWidth;
-        wrap.style.animation = 'fadeIn .22s ease';
+        wrap.innerHTML = (mode==='login')?authLoginFormHtml():authRegisterFormHtml();
+        wrap.style.animation = 'none'; void wrap.offsetWidth; wrap.style.animation = 'fadeIn .22s ease';
       }
-      document.title = SITE_NAME + ' — ' + tr(mode === 'login' ? 'log_title' : 'reg_title');
+      document.title = SITE_NAME + ' — ' + tr(mode==='login'?'log_title':'reg_title');
       if (mode === 'login') bindAuthLogin(); else bindAuthRegister();
-      // Rebind password toggles for the new form
       main.querySelectorAll('[data-toggle-pw]').forEach(function(btn){
         btn.addEventListener('click', function(){
-          var inp = btn.parentNode.querySelector('input');
-          if (!inp) return;
+          var inp = btn.parentNode.querySelector('input'); if (!inp) return;
           var show = inp.type === 'password';
           inp.type = show ? 'text' : 'password';
           btn.innerHTML = show ? ICONS.eyeOff : ICONS.eye;
@@ -3305,20 +3431,16 @@ function renderAuthScreen() {
       });
     });
   });
-
   main.querySelectorAll('[data-toggle-pw]').forEach(function(btn){
     btn.addEventListener('click', function(){
-      var inp = btn.parentNode.querySelector('input');
-      if (!inp) return;
+      var inp = btn.parentNode.querySelector('input'); if (!inp) return;
       var show = inp.type === 'password';
       inp.type = show ? 'text' : 'password';
       btn.innerHTML = show ? ICONS.eyeOff : ICONS.eye;
     });
   });
-
   if (state.authMode === 'login') bindAuthLogin(); else bindAuthRegister();
 }
-
 function setAuthSubmitting(btn, loading) {
   if (!btn) return;
   if (loading) {
@@ -3331,16 +3453,13 @@ function setAuthSubmitting(btn, loading) {
   }
 }
 function bindAuthLogin() {
-  var form = document.getElementById('authLoginForm');
-  if (!form) return;
-  var errEl = document.getElementById('authErr');
-  var btn = document.getElementById('authSubmit');
+  var form = document.getElementById('authLoginForm'); if (!form) return;
+  var errEl = document.getElementById('authErr'), btn = document.getElementById('authSubmit');
   form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
+    e.preventDefault(); errEl.textContent = '';
     var fd = new FormData(form);
-    var nick = (fd.get('nick') || '').toString().trim();
-    var pass = (fd.get('password') || '').toString();
+    var nick = (fd.get('nick')||'').toString().trim();
+    var pass = (fd.get('password')||'').toString();
     if (!nick || !pass) { errEl.textContent = tr('err_bad_login'); return; }
     setAuthSubmitting(btn, true);
     try { await doLogin({ nick: nick, password: pass }); }
@@ -3349,14 +3468,11 @@ function bindAuthLogin() {
   });
 }
 function bindAuthRegister() {
-  var form = document.getElementById('authRegisterForm');
-  if (!form) return;
-  var errEl = document.getElementById('authErr');
-  var btn = document.getElementById('authSubmit');
+  var form = document.getElementById('authRegisterForm'); if (!form) return;
+  var errEl = document.getElementById('authErr'), btn = document.getElementById('authSubmit');
   var nickInp = form.querySelector('input[name="nick"]');
   var nickBtn = document.getElementById('nickCheckBtn');
   var nickStatus = document.getElementById('nickStatus');
-
   function setNickStatus(st, text) {
     if (!nickStatus) return;
     nickStatus.className = 'nick-status' + (st ? ' ' + st : '');
@@ -3368,8 +3484,7 @@ function bindAuthRegister() {
     nickBtn.addEventListener('click', async function(){
       var nick = (nickInp.value || '').trim().replace(/^@/, '');
       if (!nick) { setNickStatus('', ''); return; }
-      nickBtn.disabled = true;
-      setNickStatus('', tr('checking'));
+      nickBtn.disabled = true; setNickStatus('', tr('checking'));
       try {
         var data = await api('/api/check_nick?nick=' + encodeURIComponent(nick));
         if (data.available) {
@@ -3395,13 +3510,12 @@ function bindAuthRegister() {
     });
   }
   form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
+    e.preventDefault(); errEl.textContent = '';
     var fd = new FormData(form);
-    var name = (fd.get('name') || '').toString().trim();
-    var nick = (fd.get('nick') || '').toString().trim().replace(/^@/, '');
-    var pass = (fd.get('password') || '').toString();
-    var pass2 = (fd.get('password_confirm') || '').toString();
+    var name = (fd.get('name')||'').toString().trim();
+    var nick = (fd.get('nick')||'').toString().trim().replace(/^@/, '');
+    var pass = (fd.get('password')||'').toString();
+    var pass2 = (fd.get('password_confirm')||'').toString();
     if (!name) { errEl.textContent = tr('err_bad_name'); return; }
     if (pass !== pass2) { errEl.textContent = tr('err_pass_mismatch'); return; }
     setAuthSubmitting(btn, true);
@@ -3411,53 +3525,42 @@ function bindAuthRegister() {
   });
 }
 
+/* ============ AUTH ACTIONS ============ */
 async function loadMe() {
   if (!state.token) { state.booting = false; return; }
   try {
     var u = await api('/api/me');
-    setUser(u);
-    state.sessionExpired = false; state.bootError = null;
+    setUser(u); state.sessionExpired = false; state.bootError = null;
   } catch(e) {
     if (e && e.message === 'unauthorized') {}
-    else { state.bootError = 'network'; }
+    else state.bootError = 'network';
     setUser(null);
   } finally { state.booting = false; }
 }
-
 async function doRegister(data) {
-  var res = await api('/api/register', { method: 'POST', body: data });
-  state.token = res.token;
-  localStorage.setItem('SLD_token', res.token);
-  setUser(res.user);
-  state.sessionExpired = false; state.bootError = null; state.booting = false;
+  var res = await api('/api/register', { method:'POST', body:data });
+  state.token = res.token; localStorage.setItem('SLD_token', res.token);
+  setUser(res.user); state.sessionExpired = false; state.bootError = null; state.booting = false;
   try { localStorage.removeItem('SLD_welcome_seen'); } catch(e) {}
   state.welcomeShown = false;
-  connectSSE(); navigate('/', true);
-  maybeShowWelcome();
+  connectSSE(); navigate('/', true); maybeShowWelcome();
 }
 async function doLogin(data) {
-  var res = await api('/api/login', { method: 'POST', body: data });
-  state.token = res.token;
-  localStorage.setItem('SLD_token', res.token);
-  setUser(res.user);
-  state.sessionExpired = false; state.bootError = null; state.booting = false;
-  connectSSE(); navigate('/', true);
-  maybeShowWelcome();
+  var res = await api('/api/login', { method:'POST', body:data });
+  state.token = res.token; localStorage.setItem('SLD_token', res.token);
+  setUser(res.user); state.sessionExpired = false; state.bootError = null; state.booting = false;
+  connectSSE(); navigate('/', true); maybeShowWelcome();
 }
 function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
-    try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
-    disconnectSSE();
-    setUser(null); state.token = null;
+    try { await api('/api/logout', { method:'POST' }); } catch(e) {}
+    disconnectSSE(); setUser(null); state.token = null;
     setNotifCount(0); localStorage.removeItem('SLD_token');
-    state.sessionExpired = false; state.bootError = null;
-    state.welcomeShown = false;
-    feedCache = { all: { posts: null, query: null }, subs: { posts: null, query: null } };
-    navigate('/', true);
-    connectSSE();
+    state.sessionExpired = false; state.bootError = null; state.welcomeShown = false;
+    feedCache = { all:{posts:null,query:null}, subs:{posts:null,query:null} };
+    navigate('/', true); connectSSE();
   }, { yesText: tr('confirm_yes') });
 }
-
 function refreshCounters() {
   if (!state.token) return;
   api('/api/counters').then(function(data){
@@ -3476,20 +3579,14 @@ function connectSSE() {
   if (state.token) url += '?token=' + encodeURIComponent(state.token);
   else url += '?anon=' + encodeURIComponent(anonId);
   var es;
-  try { es = new EventSource(url); }
-  catch(e) { setTimeout(connectSSE, 5000); return; }
+  try { es = new EventSource(url); } catch(e) { setTimeout(connectSSE, 5000); return; }
   state.es = es;
   es.onopen = function() {
     state.sseErrors = 0;
     if (state.sseWasConnected) scheduleRefresh();
-    state.sseWasConnected = true;
-    state.currentRooms = [];
-    updateRoom();
+    state.sseWasConnected = true; state.currentRooms = []; updateRoom();
   };
-  es.onmessage = function(e) {
-    state.sseErrors = 0;
-    try { handleEvent(JSON.parse(e.data)); } catch(err) {}
-  };
+  es.onmessage = function(e) { state.sseErrors = 0; try { handleEvent(JSON.parse(e.data)); } catch(err) {} };
   es.onerror = function() {
     state.sseErrors = (state.sseErrors || 0) + 1;
     if (state.sseErrors >= 3) {
@@ -3504,8 +3601,7 @@ function connectSSE() {
 function startFallbackPoll() {
   if (fallbackPollTimer) return;
   fallbackPollTimer = setInterval(function(){
-    if (document.hidden) return;
-    if (!state.user) return;
+    if (document.hidden || !state.user) return;
     var connected = state.es && state.es.readyState === 1;
     if (!connected) { try { refreshCurrentView(); } catch(e) {} }
   }, 20000);
@@ -3529,25 +3625,24 @@ function handleEvent(ev) {
     if (state.view === 'notifications') loadNotifications();
     return;
   }
+  if (ev.type === 'view_update') {
+    document.querySelectorAll('[data-post-id="' + ev.post_id + '"] [data-views]').forEach(function(el){ el.textContent = ev.views; });
+    return;
+  }
   if (ev.type === 'post_deleted') {
     if (state.view === 'post' && state.viewData.post_id === ev.post_id) {
       var main = document.getElementById('main');
       if (main) main.innerHTML = '<div class="main-body"><div class="main-inner">' + notFoundHtml() + '</div></div>';
       bindLinks(main);
-    } else if (state.view === 'feed' || state.view === 'profile') {
-      scheduleRefresh();
-    }
+    } else if (state.view === 'feed' || state.view === 'profile') scheduleRefresh();
     return;
   }
   if (ev.type === 'refresh') { scheduleRefresh(); return; }
 }
-document.addEventListener('visibilitychange', function(){
-  if (!document.hidden && state.sseWasConnected) scheduleRefresh();
-});
-window.addEventListener('focus', function(){
-  if (state.sseWasConnected) scheduleRefresh();
-});
+document.addEventListener('visibilitychange', function(){ if (!document.hidden && state.sseWasConnected) scheduleRefresh(); });
+window.addEventListener('focus', function(){ if (state.sseWasConnected) scheduleRefresh(); });
 
+/* ============ SIDEBAR ============ */
 function navBtn(icon, label, active, action, count) {
   var cls = 'nav-btn' + (active ? ' active' : '');
   var badge = (count && count > 0) ? '<span class="badge">' + (count > 99 ? '99+' : count) + '</span>' : '';
@@ -3555,18 +3650,18 @@ function navBtn(icon, label, active, action, count) {
     + icon + '<span>' + escapeHtml(label) + '</span>' + badge + '</button>';
 }
 function renderSidebar() {
-  var el = document.getElementById('sidebar');
-  if (!el) return;
+  var el = document.getElementById('sidebar'); if (!el) return;
   if (!state.user) { el.innerHTML = ''; return; }
   var html = '<div class="logo">' + SITE_NAME + '</div><div class="nav">';
   html += navBtn(ICONS.home, tr('nav_home'), state.view === 'feed', 'home');
   html += navBtn(ICONS.users, tr('nav_users'), state.view === 'users', 'users');
-  html += navBtn(ICONS.bell, tr('nav_notifications'),
-    state.view === 'notifications', 'notifications', state.unreadNotif);
-  html += navBtn(ICONS.user, tr('nav_profile'),
-    state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
-  html += navBtn(ICONS.gear, tr('nav_settings'),
-    state.view === 'settings', 'settings');
+  html += navBtn(ICONS.bell, tr('nav_notifications'), state.view === 'notifications', 'notifications', state.unreadNotif);
+  html += navBtn(ICONS.user, tr('nav_profile'), state.view === 'profile' && state.viewData.nick === state.user.nick, 'profile');
+  html += navBtn(ICONS.gear, tr('nav_settings'), state.view === 'settings', 'settings');
+  UI.getExtraNav().forEach(function(item){
+    html += '<button type="button" class="nav-btn" data-nav-extra="' + escapeHtml(item.id) + '">'
+      + (ICONS[item.icon] || '') + '<span>' + escapeHtml(item.label) + '</span></button>';
+  });
   html += '</div><div class="spacer"></div>';
   html += '<button type="button" class="sidebar-logout" data-nav="logout">' + ICONS.logout + '<span>' + tr('nav_logout') + '</span></button>';
   el.innerHTML = html;
@@ -3581,35 +3676,33 @@ function renderSidebar() {
       else if (nav === 'logout') doLogoutConfirm();
     });
   });
+  el.querySelectorAll('[data-nav-extra]').forEach(function(b){
+    b.addEventListener('click', function(){
+      var item = UI.getExtraNav().find(function(x){ return x.id === b.dataset.navExtra; });
+      if (item && item.onClick) item.onClick();
+    });
+  });
 }
-
 function pillTabsHtml(items) {
   var html = '<div class="pill-tabs"><div class="pill-slider"></div>';
   items.forEach(function(it){
-    html += '<button type="button" class="pill-tab' + (it.active ? ' active' : '') + '" data-key="' + it.key + '">' + escapeHtml(it.label) + '</button>';
+    html += '<button type="button" class="pill-tab' + (it.active?' active':'') + '" data-key="' + it.key + '">' + escapeHtml(it.label) + '</button>';
   });
-  html += '</div>';
-  return html;
+  html += '</div>'; return html;
 }
 function pillGroupHtml(groupKey, items, activeKey) {
   var html = '<div class="pill-tabs" data-pill-group="' + groupKey + '"><div class="pill-slider"></div>';
   items.forEach(function(it){
-    html += '<button type="button" class="pill-tab' + (it.key === activeKey ? ' active' : '') + '" data-pill="' + it.key + '">' + escapeHtml(it.label) + '</button>';
+    html += '<button type="button" class="pill-tab' + (it.key === activeKey?' active':'') + '" data-pill="' + it.key + '">' + escapeHtml(it.label) + '</button>';
   });
-  html += '</div>';
-  return html;
+  html += '</div>'; return html;
 }
 function setupPillSlider(container) {
   if (!container) return;
-  var tabsRoot = container.querySelector('.pill-tabs');
-  if (!tabsRoot) return;
-  var slider = tabsRoot.querySelector('.pill-slider');
-  if (!slider) return;
-  var tabs = tabsRoot.querySelectorAll('.pill-tab');
-  if (!tabs.length) return;
+  var tabsRoot = container.querySelector('.pill-tabs'); if (!tabsRoot) return;
+  var slider = tabsRoot.querySelector('.pill-slider'); if (!slider) return;
   function position() {
-    var active = tabsRoot.querySelector('.pill-tab.active');
-    if (!active) return;
+    var active = tabsRoot.querySelector('.pill-tab.active'); if (!active) return;
     slider.style.width = active.offsetWidth + 'px';
     slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
   }
@@ -3617,10 +3710,8 @@ function setupPillSlider(container) {
   window.addEventListener('resize', function(){ requestAnimationFrame(position); });
   return { position: position };
 }
-
 function renderMain() {
-  var el = document.getElementById('main');
-  if (!el) return;
+  var el = document.getElementById('main'); if (!el) return;
   if (!state.user) { renderAuthScreen(); return; }
   if (state.view === 'not_found') {
     el.innerHTML = '<div class="main-header"><div class="title">' + tr('page_title_notfound') + '</div>'
@@ -3629,6 +3720,8 @@ function renderMain() {
     bindThemeBtn(); bindLinks(el);
     return;
   }
+  var fn = UI.getScreen(state.view);
+  if (fn) { fn(el); return; }
   if (state.view === 'feed') renderFeedView(el);
   else if (state.view === 'post') renderPostView(el);
   else if (state.view === 'profile') renderProfileView(el);
@@ -3661,52 +3754,40 @@ function bindOgImages(root) {
     });
   });
 }
-
 function avatarHtml(emoji, size) {
   var cls = 'avatar' + (size ? ' ' + size : '');
   var e = emoji || DEFAULT_EMOJI;
   return '<div class="' + cls + '">' + escapeHtml(e) + '</div>';
 }
-
 function composerHtml(opts) {
   opts = opts || {};
-  var u = state.user;
-  if (!u) return '';
+  var u = state.user; if (!u) return '';
   var placeholder = opts.placeholder || tr('post_ph');
   var sendLabel = opts.sendLabel || tr('publish');
   var idPrefix = opts.idPrefix || 'post';
   var ogOn = (u.show_link_previews !== false);
-  return '<div class="card">'
-    + '<div class="composer-avatar-row">'
-    + '<div class="composer-avatar-col">'
-    +   avatarHtml(u.avatar_emoji, 'sm')
-    +   '<button type="button" class="publish-btn publish-btn-mobile" id="' + idPrefix + 'SendMobile" disabled>' + ICONS.send + '</button>'
-    + '</div>'
+  return '<div class="card"><div class="composer-avatar-row">'
+    + '<div class="composer-avatar-col">' + avatarHtml(u.avatar_emoji, 'sm')
+    + '<button type="button" class="publish-btn publish-btn-mobile" id="' + idPrefix + 'SendMobile" disabled>' + ICONS.send + '</button></div>'
     + '<div class="composer-body">'
     + '<textarea id="' + idPrefix + 'Input" maxlength="' + MAX_POST_LEN + '" placeholder="' + escapeHtml(placeholder) + '">' + escapeHtml(state.composerDraft || '') + '</textarea>'
     + '<div id="' + idPrefix + 'QuoteBox"></div>'
     + '<div class="composer-actions">'
-    + '<label class="og-toggle"><input type="checkbox" id="' + idPrefix + 'OgEnabled"' + (ogOn ? ' checked' : '') + '/><span class="cb">' + ICONS.check + '</span><span>' + tr('og_enable') + '</span></label>'
-    + '<div class="spacer"></div>'
-    + '<span class="composer-hint">Shift+Enter</span>'
+    + '<label class="og-toggle"><input type="checkbox" id="' + idPrefix + 'OgEnabled"' + (ogOn?' checked':'') + '/><span class="cb">' + ICONS.check + '</span><span>' + tr('og_enable') + '</span></label>'
+    + '<div class="spacer"></div><span class="composer-hint">Shift+Enter</span>'
     + '<span id="' + idPrefix + 'Counter" style="font-size:12px;color:var(--muted-2)">0 / ' + MAX_POST_LEN + '</span>'
     + '<button type="button" class="publish-btn publish-btn-desktop" id="' + idPrefix + 'Send" disabled>' + escapeHtml(sendLabel) + '</button>'
     + '</div></div></div></div>';
 }
 function renderQuoteBox(idPrefix) {
-  var el = document.getElementById(idPrefix + 'QuoteBox');
-  if (!el) return;
+  var el = document.getElementById(idPrefix + 'QuoteBox'); if (!el) return;
   if (!state.quotePreview) { el.innerHTML = ''; return; }
-  el.innerHTML = '<div class="quote-preview">'
-    + '<div class="qp-author">@' + escapeHtml(state.quotePreview.author) + '</div>'
+  el.innerHTML = '<div class="quote-preview"><div class="qp-author">@' + escapeHtml(state.quotePreview.author) + '</div>'
     + '<div class="qp-text">' + escapeHtml(state.quotePreview.text) + '</div>'
-    + '<button type="button" class="qp-close">✕</button>'
-    + '</div>';
+    + '<button type="button" class="qp-close">✕</button></div>';
   el.querySelector('.qp-close').addEventListener('click', function(){
-    clearQuoteState();
-    renderQuoteBox(idPrefix);
-    var s = document.getElementById(idPrefix + 'Send');
-    var sm = document.getElementById(idPrefix + 'SendMobile');
+    clearQuoteState(); renderQuoteBox(idPrefix);
+    var s = document.getElementById(idPrefix + 'Send'), sm = document.getElementById(idPrefix + 'SendMobile');
     var inp = document.getElementById(idPrefix + 'Input');
     if (s) s.disabled = (!inp || !inp.value.trim());
     if (sm) sm.disabled = (!inp || !inp.value.trim());
@@ -3745,45 +3826,35 @@ function bindComposer(opts) {
     if (sendBtnMobile) sendBtnMobile.disabled = true;
     try {
       await onSend(text, state.quotePostId, ogEnabled);
-      inputEl.value = '';
-      state.composerDraft = '';
-      clearQuoteState();
-      renderQuoteBox(idPrefix);
-      upd();
+      inputEl.value = ''; state.composerDraft = '';
+      clearQuoteState(); renderQuoteBox(idPrefix); upd();
     } catch(e) { alert(tr(e.message) || e.message); }
     finally { upd(); }
   }
   if (sendBtn) sendBtn.addEventListener('click', trigger);
   if (sendBtnMobile) sendBtnMobile.addEventListener('click', trigger);
-  renderQuoteBox(idPrefix);
-  upd();
-  autoGrow(inputEl);
+  renderQuoteBox(idPrefix); upd(); autoGrow(inputEl);
 }
-
 function renderFeedPosts(feedEl, posts) {
-  if (!posts || !posts.length) {
-    feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>';
-    return;
-  }
+  if (!posts || !posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
   feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
   bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
 }
 function renderFeedView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('nav_home') + '</div>'
-    + '<button type="button" class="icon-btn" id="refreshBtn" title="' + escapeHtml(tr('refresh')) + '">' + ICONS.refresh + '</button>'
+    + '<button type="button" class="icon-btn" id="refreshBtn">' + ICONS.refresh + '</button>'
     + '<button type="button" class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div class="search-box">' + ICONS.search + '<input id="search" type="search" placeholder="' + escapeHtml(tr('search_ph')) + '" value="' + escapeHtml(state.searchQuery) + '" /></div>';
   html += pillTabsHtml([
-    { key: 'all', label: tr('feed_all'), active: state.feedMode === 'all' },
-    { key: 'subs', label: tr('feed_subs'), active: state.feedMode === 'subs' },
+    { key:'all', label: tr('feed_all'), active: state.feedMode === 'all' },
+    { key:'subs', label: tr('feed_subs'), active: state.feedMode === 'subs' },
   ]);
-  html += composerHtml({ idPrefix: 'post', placeholder: tr('post_ph') });
+  html += composerHtml({ idPrefix:'post', placeholder: tr('post_ph') });
   html += '<div id="feed">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
-  bindRefreshBtn('refreshBtn');
+  bindThemeBtn(); bindLinks(el); bindRefreshBtn('refreshBtn');
   var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
@@ -3794,8 +3865,7 @@ function renderFeedView(el) {
       loadFeed();
     });
   });
-  var searchEl = document.getElementById('search');
-  var tId;
+  var searchEl = document.getElementById('search'); var tId;
   searchEl.addEventListener('input', function(){
     state.searchQuery = searchEl.value;
     clearTimeout(tId); tId = setTimeout(loadFeed, 250);
@@ -3804,17 +3874,16 @@ function renderFeedView(el) {
     idPrefix: 'post',
     onSend: async function(text, quotedId, ogEnabled){
       state.suppressRefresh = Date.now() + 1500;
-      var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
+      var p = await api('/api/posts', { method:'POST', body:{ text:text, quoted_post_id:quotedId, og_enabled:ogEnabled } });
       state.searchQuery = '';
-      feedCache.all = { posts: null, query: null };
-      feedCache.subs = { posts: null, query: null };
+      feedCache.all = { posts:null, query:null };
+      feedCache.subs = { posts:null, query:null };
       var feedEl = document.getElementById('feed');
       if (feedEl) {
         var wrap = document.createElement('div');
         wrap.innerHTML = renderPostHtml(p, false);
         var newEl = wrap.firstChild;
-        var em = feedEl.querySelector('.empty');
-        if (em) em.remove();
+        var em = feedEl.querySelector('.empty'); if (em) em.remove();
         if (feedEl.firstChild) feedEl.insertBefore(newEl, feedEl.firstChild);
         else feedEl.appendChild(newEl);
         bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
@@ -3825,19 +3894,16 @@ function renderFeedView(el) {
 }
 async function loadFeed(opts) {
   opts = opts || {};
-  var feedEl = document.getElementById('feed');
-  if (!feedEl) return;
+  var feedEl = document.getElementById('feed'); if (!feedEl) return;
   var myId = ++feedReqId;
-  var mode = state.feedMode;
-  var q = state.searchQuery.trim();
+  var mode = state.feedMode, q = state.searchQuery.trim();
   var cache = feedCache[mode];
   var hasCache = cache.posts !== null && cache.query === q && !opts.force;
   if (hasCache) renderFeedPosts(feedEl, cache.posts);
   try {
     var feed = mode === 'subs' ? '&feed=subs' : '';
     var data = await api('/api/posts?q=' + encodeURIComponent(q) + feed);
-    if (myId !== feedReqId) return;
-    if (state.feedMode !== mode) return;
+    if (myId !== feedReqId || state.feedMode !== mode) return;
     if (!document.getElementById('feed')) return;
     var posts = data.posts || [];
     feedCache[mode] = { posts: posts, query: q };
@@ -3845,11 +3911,8 @@ async function loadFeed(opts) {
         JSON.stringify((cache.posts || []).map(function(p){return p.id;}))) {
       renderFeedPosts(feedEl, posts);
     }
-  } catch(e) {
-    if (myId === feedReqId && !hasCache) feedEl.innerHTML = '<div class="empty">—</div>';
-  }
+  } catch(e) { if (myId === feedReqId && !hasCache) feedEl.innerHTML = '<div class="empty">—</div>'; }
 }
-
 function renderPostView(el) {
   var html = '<div class="main-header">'
     + '<button type="button" class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
@@ -3858,7 +3921,7 @@ function renderPostView(el) {
     + '<button type="button" class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div id="feed">' + spinner() + '</div>';
-  html += composerHtml({ idPrefix: 'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
+  html += composerHtml({ idPrefix:'comment', placeholder: tr('comment_ph'), sendLabel: tr('send_comment') });
   html += '</div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindRefreshBtn('refreshBtn');
@@ -3874,33 +3937,24 @@ function renderPostView(el) {
       + '<div class="qp-author">' + tr('reply') + ': @' + escapeHtml(state.replyTo.author) + '</div>'
       + '<button type="button" class="qp-close">✕</button></div>';
     inputEl.placeholder = tr('reply_ph');
-    replyBanner.querySelector('.qp-close').addEventListener('click', function(){
-      state.replyTo = null; renderReplyBanner();
-    });
+    replyBanner.querySelector('.qp-close').addEventListener('click', function(){ state.replyTo = null; renderReplyBanner(); });
   }
   renderReplyBanner();
   state._renderReplyBanner = renderReplyBanner;
   bindComposer({
-    idPrefix: 'comment',
-    placeholder: tr('comment_ph'),
-    maxLen: MAX_COMMENT_LEN,
+    idPrefix: 'comment', placeholder: tr('comment_ph'), maxLen: MAX_COMMENT_LEN,
     onSend: async function(text){
       var parentId = state.replyTo ? state.replyTo.id : null;
       state.suppressRefresh = Date.now() + 1500;
-      var tempId = 'tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      var fakeComment = {
-        id: tempId, text: text, author: state.user.nick,
-        parent_id: parentId, created_at: Date.now()/1000,
-        likes: 0, user_like: 0
-      };
+      var tempId = 'tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+      var fakeComment = { id: tempId, text: text, author: state.user.nick, parent_id: parentId, created_at: Date.now()/1000, likes: 0, user_like: 0 };
       var postEl = document.querySelector('[data-post-id="' + state.viewData.post_id + '"]');
       var postAuthor = postEl ? postEl.dataset.author : null;
       insertCommentIntoDom(state.viewData.post_id, fakeComment, postAuthor);
       state.replyTo = null; renderReplyBanner();
       try {
-        var body = { text: text };
-        if (parentId) body.parent_id = parentId;
-        var res = await api('/api/posts/' + state.viewData.post_id + '/comments', { method: 'POST', body: body });
+        var body = { text: text }; if (parentId) body.parent_id = parentId;
+        var res = await api('/api/posts/' + state.viewData.post_id + '/comments', { method:'POST', body:body });
         var elC = document.querySelector('[data-comment-id="' + tempId + '"]');
         if (elC && res.comment) {
           var realId = res.comment.id;
@@ -3919,13 +3973,21 @@ function renderPostView(el) {
   loadPostView();
 }
 async function loadPostView() {
-  var feedEl = document.getElementById('feed');
-  if (!feedEl) return;
+  var feedEl = document.getElementById('feed'); if (!feedEl) return;
   try {
     var p = await api('/api/posts/' + state.viewData.post_id);
     if (!document.getElementById('feed')) return;
     feedEl.innerHTML = renderPostHtml(p, true);
     bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
+    if (state.user && p.author !== state.user.nick) {
+      api('/api/posts/' + state.viewData.post_id + '/view', { method:'POST' })
+        .then(function(res){
+          if (res && res.counted) {
+            var viewsEl = feedEl.querySelector('[data-views]');
+            if (viewsEl) viewsEl.textContent = (parseInt(viewsEl.textContent, 10) || 0) + 1;
+          }
+        }).catch(function(){});
+    }
     if (state.highlightComment) {
       var node = feedEl.querySelector('[data-comment-id="' + state.highlightComment + '"]');
       if (node) {
@@ -3937,14 +3999,9 @@ async function loadPostView() {
   } catch(e) { feedEl.innerHTML = notFoundHtml(); bindLinks(feedEl); }
 }
 function insertCommentIntoDom(pid, c, postAuthor) {
-  var postEl = document.querySelector('[data-post-id="' + pid + '"]');
-  if (!postEl) return;
+  var postEl = document.querySelector('[data-post-id="' + pid + '"]'); if (!postEl) return;
   var commentsEl = postEl.querySelector('.comments');
-  if (!commentsEl) {
-    commentsEl = document.createElement('div');
-    commentsEl.className = 'comments';
-    postEl.appendChild(commentsEl);
-  }
+  if (!commentsEl) { commentsEl = document.createElement('div'); commentsEl.className = 'comments'; postEl.appendChild(commentsEl); }
   var html = renderCommentHtml(c, postAuthor, pid, !!c.parent_id);
   if (c.parent_id) {
     var parentEl = commentsEl.querySelector('[data-comment-id="' + c.parent_id + '"]');
@@ -3956,25 +4013,17 @@ function insertCommentIntoDom(pid, c, postAuthor) {
     } else commentsEl.insertAdjacentHTML('beforeend', html);
   } else commentsEl.insertAdjacentHTML('beforeend', html);
   var btn = postEl.querySelector('button[data-action="open-post"]');
-  if (btn) {
-    var span = btn.querySelector('span');
-    if (span) span.textContent = (parseInt(span.textContent) || 0) + 1;
-  }
+  if (btn) { var span = btn.querySelector('span'); if (span) span.textContent = (parseInt(span.textContent) || 0) + 1; }
   var added = commentsEl.querySelector('[data-comment-id="' + c.id + '"]');
   if (added) added.classList.add('pending');
   bindPostActions(commentsEl); bindLinks(commentsEl);
 }
 function decrementCommentCount(pid, by) {
   by = by || 1;
-  var postEl = document.querySelector('[data-post-id="' + pid + '"]');
-  if (!postEl) return;
+  var postEl = document.querySelector('[data-post-id="' + pid + '"]'); if (!postEl) return;
   var btn = postEl.querySelector('button[data-action="open-post"]');
-  if (btn) {
-    var span = btn.querySelector('span');
-    if (span) span.textContent = Math.max(0, (parseInt(span.textContent) || 0) - by);
-  }
+  if (btn) { var span = btn.querySelector('span'); if (span) span.textContent = Math.max(0, (parseInt(span.textContent) || 0) - by); }
 }
-
 function renderProfileView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('page_title_profile') + '</div>'
     + '<button type="button" class="icon-btn" id="refreshBtn">' + ICONS.refresh + '</button>'
@@ -3985,8 +4034,7 @@ function renderProfileView(el) {
   loadProfile(state.viewData.nick);
 }
 async function loadProfile(nick) {
-  var root = document.getElementById('profileRoot');
-  if (!root) return;
+  var root = document.getElementById('profileRoot'); if (!root) return;
   var myId = ++profileReqId;
   try {
     var u = await api('/api/users/' + encodeURIComponent(nick));
@@ -3997,8 +4045,8 @@ async function loadProfile(nick) {
     if (isMe) {
       actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>';
     } else {
-      actionsHtml = '<button type="button" class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
-                  + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
+      actionsHtml = '<button type="button" class="pill-action ' + (u.is_following?'':'primary') + '" id="followBtn">'
+        + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
     }
     var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
     var lineClass = u.bio ? 'profile-line' : 'profile-line only-nick';
@@ -4015,27 +4063,22 @@ async function loadProfile(nick) {
     html += '<div class="profile-stat" id="followersLink"><b>' + u.followers + '</b><span>' + tr('profile_followers') + '</span></div>';
     html += '<div class="profile-stat" id="followingLink"><b>' + u.following + '</b><span>' + tr('profile_following') + '</span></div>';
     html += '</div>';
-    html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG === 'ru' ? 'Регистрация: ' : 'Joined: ') + fmtDate(u.created_at) + '</span></div>';
+    html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG==='ru'?'Регистрация: ':'Joined: ') + fmtDate(u.created_at) + '</span></div>';
     html += '</div></div>';
     html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
     html += '</div>';
     html += '<div id="profileContent">' + spinner() + '</div>';
     root.innerHTML = html;
     bindLinks(root);
-    document.getElementById('followersLink').addEventListener('click', function(){
-      navigate('/u/' + encodeURIComponent(u.nick) + '/followers');
-    });
-    document.getElementById('followingLink').addEventListener('click', function(){
-      navigate('/u/' + encodeURIComponent(u.nick) + '/following');
-    });
+    document.getElementById('followersLink').addEventListener('click', function(){ navigate('/u/' + encodeURIComponent(u.nick) + '/followers'); });
+    document.getElementById('followingLink').addEventListener('click', function(){ navigate('/u/' + encodeURIComponent(u.nick) + '/following'); });
     var btn = document.getElementById('followBtn');
     if (btn) bindOptimisticFollow(btn, u);
     loadProfileContent(u, isMe);
   } catch(e) {
     if (myId !== profileReqId) return;
     if (!document.getElementById('profileRoot')) return;
-    root.innerHTML = notFoundHtml();
-    bindLinks(root);
+    root.innerHTML = notFoundHtml(); bindLinks(root);
   }
 }
 function bindOptimisticFollow(btn, u) {
@@ -4048,9 +4091,9 @@ function bindOptimisticFollow(btn, u) {
     var followersCount = followersEl ? parseInt(followersEl.textContent) || 0 : 0;
     if (followersEl) followersEl.textContent = Math.max(0, followersCount + (wasFollowing ? -1 : 1));
     try {
-      if (wasFollowing) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-      else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-      feedCache.subs = { posts: null, query: null };
+      if (wasFollowing) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method:'POST' });
+      else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method:'POST' });
+      feedCache.subs = { posts:null, query:null };
     } catch(e) {
       btn.textContent = wasFollowing ? tr('unfollow') : tr('follow');
       btn.classList.toggle('primary', !wasFollowing);
@@ -4060,16 +4103,15 @@ function bindOptimisticFollow(btn, u) {
   });
 }
 async function loadProfileContent(u, isMe) {
-  var c = document.getElementById('profileContent');
-  if (!c) return;
+  var c = document.getElementById('profileContent'); if (!c) return;
   c.innerHTML = spinner();
   var html = '';
-  if (isMe) html += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
+  if (isMe) html += composerHtml({ idPrefix:'profile_post', placeholder: tr('post_ph') });
   try {
     var d = await api('/api/posts?author=' + encodeURIComponent(u.nick));
     if (!document.getElementById('profileContent')) return;
     var posts = (d.posts || []).slice();
-    posts.sort(function(a, b){ return b.created_at - a.created_at; });
+    posts.sort(function(a,b){ return b.created_at - a.created_at; });
     if (!posts.length) html += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
     else html += posts.map(function(p){ return renderPostHtml(p, false); }).join('');
     c.innerHTML = html;
@@ -4079,15 +4121,14 @@ async function loadProfileContent(u, isMe) {
         idPrefix: 'profile_post',
         onSend: async function(text, quotedId, ogEnabled){
           state.suppressRefresh = Date.now() + 1500;
-          var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
-          feedCache.all = { posts: null, query: null };
-          feedCache.subs = { posts: null, query: null };
+          var p = await api('/api/posts', { method:'POST', body:{ text:text, quoted_post_id:quotedId, og_enabled:ogEnabled } });
+          feedCache.all = { posts:null, query:null };
+          feedCache.subs = { posts:null, query:null };
           var wrap = document.createElement('div');
           wrap.innerHTML = renderPostHtml(p, false);
           var newEl = wrap.firstChild;
           var composerEl = c.querySelector('.card');
-          var em = c.querySelector('.empty');
-          if (em) em.remove();
+          var em = c.querySelector('.empty'); if (em) em.remove();
           if (composerEl && composerEl.nextSibling) c.insertBefore(newEl, composerEl.nextSibling);
           else c.appendChild(newEl);
           bindPostActions(c); bindLinks(c); bindOgImages(c);
@@ -4096,7 +4137,6 @@ async function loadProfileContent(u, isMe) {
     }
   } catch(e) { c.innerHTML = html + '<div class="empty">—</div>'; }
 }
-
 function renderFollowListView(el) {
   var nick = state.viewData.nick;
   var isFollowers = state.view === 'followers';
@@ -4113,10 +4153,8 @@ function renderFollowListView(el) {
 function userRowHtml(u) {
   return '<div class="user-row" data-link-row="/u/' + encodeURIComponent(u.nick) + '">'
     + avatarHtml(u.avatar_emoji, 'sm')
-    + '<div class="info">'
-    + '<a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
-    + '<div class="name">' + escapeHtml(u.name) + '</div>'
-    + '</div></div>';
+    + '<div class="info"><a class="nick" href="/u/' + encodeURIComponent(u.nick) + '" data-link>@' + escapeHtml(u.nick) + '</a>'
+    + '<div class="name">' + escapeHtml(u.name) + '</div></div></div>';
 }
 function bindUserRows(root) {
   root.querySelectorAll('[data-link-row]').forEach(function(r){
@@ -4141,15 +4179,14 @@ async function loadFollowList(nick, isFollowers) {
     bindLinks(wrap); bindUserRows(wrap);
   } catch(e) { if (wrap) wrap.innerHTML = '<div class="empty">' + escapeHtml(tr(e.message) || '—') + '</div>'; }
 }
-
 function renderUsersView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('people_title') + '</div>'
     + '<button type="button" class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="main-inner">';
   html += '<div class="search-box">' + ICONS.search + '<input id="peopleSearch" type="text" placeholder="' + escapeHtml(tr('people_search_ph')) + '" value="' + escapeHtml(state.peopleQuery) + '" /></div>';
   html += pillTabsHtml([
-    { key: 'all', label: tr('people_all'), active: state.peopleTab === 'all' },
-    { key: 'subs', label: tr('people_subs'), active: state.peopleTab === 'subs' },
+    { key:'all', label: tr('people_all'), active: state.peopleTab === 'all' },
+    { key:'subs', label: tr('people_subs'), active: state.peopleTab === 'subs' },
   ]);
   html += '<div id="list">' + spinner() + '</div>';
   html += '</div></div>';
@@ -4165,8 +4202,7 @@ function renderUsersView(el) {
       loadPeople();
     });
   });
-  var searchEl = document.getElementById('peopleSearch');
-  var tId;
+  var searchEl = document.getElementById('peopleSearch'); var tId;
   searchEl.addEventListener('input', function(){
     state.peopleQuery = searchEl.value;
     clearTimeout(tId); tId = setTimeout(loadPeople, 250);
@@ -4174,8 +4210,7 @@ function renderUsersView(el) {
   loadPeople();
 }
 async function loadPeople() {
-  var wrap = document.getElementById('list');
-  if (!wrap) return;
+  var wrap = document.getElementById('list'); if (!wrap) return;
   var myId = ++peopleReqId;
   var tab = state.peopleTab;
   try {
@@ -4183,8 +4218,7 @@ async function loadPeople() {
     var url = '/api/users?q=' + encodeURIComponent(q);
     if (tab === 'subs') url += '&only_following=1';
     var data = await api(url);
-    if (myId !== peopleReqId) return;
-    if (state.peopleTab !== tab) return;
+    if (myId !== peopleReqId || state.peopleTab !== tab) return;
     if (!document.getElementById('list')) return;
     var users = data.users || [];
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
@@ -4192,7 +4226,6 @@ async function loadPeople() {
     bindLinks(wrap); bindUserRows(wrap);
   } catch(e) { if (myId === peopleReqId && wrap) wrap.innerHTML = '<div class="empty">—</div>'; }
 }
-
 function renderNotificationsView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('notif_title') + '</div>'
     + '<button type="button" class="icon-btn danger" id="clearNotifsBtn">' + ICONS.trash + '</button>'
@@ -4203,7 +4236,7 @@ function renderNotificationsView(el) {
   document.getElementById('clearNotifsBtn').addEventListener('click', function(){
     showConfirm(tr('notif_clear_confirm'), async function(){
       try {
-        await api('/api/notifications/clear', { method: 'POST' });
+        await api('/api/notifications/clear', { method:'POST' });
         setNotifCount(0); renderSidebar(); loadNotifications();
       } catch(e) { alert(tr(e.message) || e.message); }
     }, { yesText: tr('notif_clear') });
@@ -4211,15 +4244,14 @@ function renderNotificationsView(el) {
   loadNotifications();
 }
 async function loadNotifications() {
-  var wrap = document.getElementById('notifList');
-  if (!wrap) return;
+  var wrap = document.getElementById('notifList'); if (!wrap) return;
   try {
     var data = await api('/api/notifications');
     if (!document.getElementById('notifList')) return;
     var items = data.items || [];
     setNotifCount(data.unread || 0);
     if (data.unread > 0) {
-      api('/api/notifications/read', { method: 'POST' }).catch(function(){});
+      api('/api/notifications/read', { method:'POST' }).catch(function(){});
       items.forEach(function(n){ n.read = true; });
       setNotifCount(0); renderSidebar();
     }
@@ -4242,34 +4274,31 @@ function renderNotifHtml(n) {
     text = author + ' ' + lbl;
     link = n.post_id ? ('/p/' + n.post_id) : null;
   } else text = author;
-  var snippet = '';
-  if (n.text) snippet = '<div class="snippet">' + escapeHtml(n.text) + '</div>';
+  var snippet = n.text ? '<div class="snippet">' + escapeHtml(n.text) + '</div>' : '';
   var inner = '<div class="info"><div class="line">' + text + '</div>' + snippet + '<div class="time">' + timeAgo(n.created_at) + '</div></div>';
   if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + avatarHtml(null, 'sm') + inner + '</a>';
   return '<div class="' + cls + '">' + avatarHtml(null, 'sm') + inner + '</div>';
 }
-
 function settingsToggleRow(label, key, on) {
   return '<div class="toggle-row"><span>' + escapeHtml(label) + '</span>'
-    + '<div class="toggle' + (on ? ' on' : '') + '" data-toggle="' + key + '"></div></div>';
+    + '<div class="toggle' + (on?' on':'') + '" data-toggle="' + key + '"></div></div>';
 }
 function renderSettingsListView(el) {
   var html = '<div class="main-header wide"><div class="title">' + tr('settings_title') + '</div>'
     + '<button type="button" class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="settings-list-mobile">';
   var rows = [
-    { key: 'account',     icon: ICONS.user,   title: tr('settings_account'),    desc: tr('settings_account_desc') },
-    { key: 'privacy',     icon: ICONS.bell,   title: tr('settings_privacy'),    desc: tr('settings_privacy_desc') },
-    { key: 'appearance',  icon: ICONS.sun,    title: tr('settings_appearance'), desc: tr('settings_appearance_desc') },
-    { key: 'info',        icon: ICONS.server, title: tr('settings_info'),       desc: tr('settings_info_desc') },
+    { key:'account', icon: ICONS.user, title: tr('settings_account'), desc: tr('settings_account_desc') },
+    { key:'privacy', icon: ICONS.bell, title: tr('settings_privacy'), desc: tr('settings_privacy_desc') },
+    { key:'appearance', icon: ICONS.sun, title: tr('settings_appearance'), desc: tr('settings_appearance_desc') },
+    { key:'info', icon: ICONS.server, title: tr('settings_info'), desc: tr('settings_info_desc') },
   ];
   rows.forEach(function(r){
     html += '<button type="button" class="settings-list-row" data-section="' + r.key + '">'
       + '<div class="sl-icon">' + r.icon + '</div>'
       + '<div class="sl-info"><div class="sl-title">' + escapeHtml(r.title) + '</div>'
       + '<div class="sl-desc">' + escapeHtml(r.desc) + '</div></div>'
-      + '<div class="sl-chevron">' + ICONS.chevron + '</div>'
-      + '</button>';
+      + '<div class="sl-chevron">' + ICONS.chevron + '</div></button>';
   });
   html += '</div></div>';
   el.innerHTML = html;
@@ -4286,30 +4315,21 @@ function renderAccountSection(me) {
   var avatarEmoji = me.avatar_emoji || DEFAULT_EMOJI;
   var emojiOpts = '';
   EMOJIS.forEach(function(e){
-    emojiOpts += '<button type="button" class="account-emoji-opt' + (e === avatarEmoji ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '" title="' + escapeHtml(emojiNameOf(e)) + '">' + e + '</button>';
+    emojiOpts += '<button type="button" class="account-emoji-opt' + (e === avatarEmoji?' active':'') + '" data-emoji="' + escapeHtml(e) + '" title="' + escapeHtml(emojiNameOf(e)) + '">' + e + '</button>';
   });
   return ''
-    + '<div class="account-hero">'
-    +   '<div class="account-hero-avatar" id="acctAvatarPreview">' + avatarHtml(avatarEmoji, 'lg') + '</div>'
-    +   '<div class="account-hero-info">'
-    +     '<div class="account-hero-name">' + escapeHtml(me.name) + '</div>'
-    +     '<div class="account-hero-nick">@' + escapeHtml(me.nick) + '</div>'
-    +   '</div>'
-    + '</div>'
+    + '<div class="account-hero"><div class="account-hero-avatar" id="acctAvatarPreview">' + avatarHtml(avatarEmoji, 'lg') + '</div>'
+    + '<div class="account-hero-info"><div class="account-hero-name">' + escapeHtml(me.name) + '</div>'
+    + '<div class="account-hero-nick">@' + escapeHtml(me.nick) + '</div></div></div>'
     + '<div class="settings-subhead">' + escapeHtml(tr('settings_profile_section')) + '</div>'
     + '<form id="accountForm" autocomplete="off" novalidate style="display:flex;flex-direction:column;gap:10px">'
-    +   '<div class="auth-field no-right">'
-    +     '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
-    +     '<input type="text" name="name" maxlength="50" value="' + escapeHtml(me.name) + '" placeholder="' + escapeHtml(tr('name_ph')) + '" required />'
-    +   '</div>'
-    +   '<div class="auth-field no-right">'
-    +     '<span class="auth-input-icon">' + ICONS.at + '</span>'
-    +     '<input type="text" name="nick" maxlength="20" value="' + escapeHtml(me.nick) + '" placeholder="' + escapeHtml(tr('nick_ph')) + '" required />'
-    +   '</div>'
-    +   '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" class="edit-bio-textarea">' + escapeHtml(me.bio || '') + '</textarea>'
-    +   '<div class="auth-error" id="acctErr"></div>'
-    +   '<button type="submit" class="publish-btn" style="height:44px">' + escapeHtml(tr('save')) + '</button>'
-    + '</form>'
+    + '<div class="auth-field no-right"><span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    + '<input type="text" name="name" maxlength="50" value="' + escapeHtml(me.name) + '" placeholder="' + escapeHtml(tr('name_ph')) + '" required /></div>'
+    + '<div class="auth-field no-right"><span class="auth-input-icon">' + ICONS.at + '</span>'
+    + '<input type="text" name="nick" maxlength="20" value="' + escapeHtml(me.nick) + '" placeholder="' + escapeHtml(tr('nick_ph')) + '" required /></div>'
+    + '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" class="edit-bio-textarea">' + escapeHtml(me.bio || '') + '</textarea>'
+    + '<div class="auth-error" id="acctErr"></div>'
+    + '<button type="submit" class="publish-btn" style="height:44px">' + escapeHtml(tr('save')) + '</button></form>'
     + '<div class="settings-subhead">' + escapeHtml(tr('avatar_choose')) + '</div>'
     + '<div class="account-emoji-grid" id="acctEmojiGrid">' + emojiOpts + '</div>'
     + '<div class="settings-subhead">' + escapeHtml(tr('settings_session_section')) + '</div>'
@@ -4324,7 +4344,6 @@ function renderSettingsView(el) {
   var sec = state.settingsSection || 'account';
   var soundOn = state.soundEnabled !== false;
   var headerLeft = isMobile ? '<button type="button" class="icon-btn" id="settingsBackBtn">' + ICONS.back + '</button>' : '';
-
   var html = '<div class="main-header wide">' + headerLeft
     + '<div class="title">' + tr('settings_title') + '</div>'
     + '<button type="button" class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
@@ -4338,11 +4357,9 @@ function renderSettingsView(el) {
     html += '</nav>';
   }
   html += '<div class="settings-content">';
-
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
   html += renderAccountSection(me);
   html += '</div>';
-
   html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
   html += settingsToggleRow(tr('settings_allow_followers'), 'allow_followers_view', me.allow_followers_view !== false);
@@ -4350,26 +4367,25 @@ function renderSettingsView(el) {
   html += settingsToggleRow(tr('settings_show_device_badge'), 'show_device_badge', me.show_device_badge !== false);
   html += '<p class="settings-desc">' + escapeHtml(tr('settings_show_device_badge_hint')) + '</p>';
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_notifications')) + '</div>';
-  html += settingsToggleRow(tr('notify_new_post'),  'notify_on_new_post',  me.notify_on_new_post  !== false);
-  html += settingsToggleRow(tr('notify_follow'),    'notify_on_follow',    me.notify_on_follow    !== false);
-  html += settingsToggleRow(tr('notify_comment'),   'notify_on_comment',   me.notify_on_comment   !== false);
-  html += settingsToggleRow(tr('notify_reply'),     'notify_on_reply',     me.notify_on_reply     !== false);
-  html += settingsToggleRow(tr('notify_mention'),   'notify_on_mention',   me.notify_on_mention   !== false);
-  html += settingsToggleRow(tr('notify_quote'),     'notify_on_quote',     me.notify_on_quote     !== false);
+  html += settingsToggleRow(tr('notify_new_post'), 'notify_on_new_post', me.notify_on_new_post !== false);
+  html += settingsToggleRow(tr('notify_follow'), 'notify_on_follow', me.notify_on_follow !== false);
+  html += settingsToggleRow(tr('notify_comment'), 'notify_on_comment', me.notify_on_comment !== false);
+  html += settingsToggleRow(tr('notify_reply'), 'notify_on_reply', me.notify_on_reply !== false);
+  html += settingsToggleRow(tr('notify_mention'), 'notify_on_mention', me.notify_on_mention !== false);
+  html += settingsToggleRow(tr('notify_quote'), 'notify_on_quote', me.notify_on_quote !== false);
   html += '</div>';
-
   html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div class="settings-subhead">' + tr('settings_theme') + '</div>';
   html += pillGroupHtml('theme', [
-    { key: 'dark', label: tr('theme_dark') },
-    { key: 'light', label: tr('theme_light') },
+    { key:'dark', label: tr('theme_dark') },
+    { key:'light', label: tr('theme_light') }
   ], theme);
   html += '<div class="settings-subhead">' + tr('settings_lang') + '</div>';
   html += pillGroupHtml('lang', [
-    { key: 'ru', label: 'Русский' },
-    { key: 'en', label: 'English' },
+    { key:'ru', label:'Русский' },
+    { key:'en', label:'English' }
   ], LANG);
-  html += '<div class="settings-subhead">' + (LANG === 'ru' ? 'Прочее' : 'Other') + '</div>';
+  html += '<div class="settings-subhead">' + (LANG==='ru'?'Прочее':'Other') + '</div>';
   html += settingsToggleRow(tr('settings_sound'), 'sound_enabled', soundOn);
   html += '<p class="settings-desc">' + escapeHtml(tr('settings_sound_hint')) + '</p>';
   html += settingsToggleRow(tr('settings_show_link_previews'), 'show_link_previews', me.show_link_previews !== false);
@@ -4381,7 +4397,7 @@ function renderSettingsView(el) {
   COLOR_PRESETS.accent.forEach(function(p){
     var isActive = (colors.accent || 'blue') === p.id;
     var val = theme === 'dark' ? p.dark : p.light;
-    html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG === 'ru' ? p.ru : p.en) + '" style="background:' + val + '"></button>';
+    html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG==='ru'?p.ru:p.en) + '" style="background:' + val + '"></button>';
   });
   html += '</div>';
   html += '<div style="font-size:12.5px;color:var(--muted);margin-bottom:8px;font-weight:600">' + escapeHtml(tr('color_likes')) + '</div>';
@@ -4389,12 +4405,11 @@ function renderSettingsView(el) {
   COLOR_PRESETS.like.forEach(function(p){
     var isActive = (colors.like || 'red') === p.id;
     var val = theme === 'dark' ? p.dark : p.light;
-    html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG === 'ru' ? p.ru : p.en) + '" style="background:' + val + '"></button>';
+    html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG==='ru'?p.ru:p.en) + '" style="background:' + val + '"></button>';
   });
   html += '</div>';
   html += '<button type="button" class="opt" id="resetColors" style="margin-top:4px">' + escapeHtml(tr('reset_colors')) + '</button>';
   html += '</div>';
-
   html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 16px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
@@ -4405,16 +4420,13 @@ function renderSettingsView(el) {
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_device')) + '</div>';
   html += '<div class="device-info" id="deviceInfo">' + spinner() + '</div>';
   html += '</div>';
-
   html += '</div></div></div>';
   el.innerHTML = html;
   bindThemeBtn(); bindLinks(el);
-
   if (isMobile) {
     var bb = document.getElementById('settingsBackBtn');
     if (bb) bb.addEventListener('click', function(){ state.settingsOpen = false; renderSettingsView(el); });
   }
-
   function applySectionVisibility() {
     var sections = el.querySelectorAll('.settings-block');
     sections.forEach(function(s){
@@ -4426,14 +4438,9 @@ function renderSettingsView(el) {
     });
   }
   applySectionVisibility();
-
   el.querySelectorAll('.settings-nav-btn').forEach(function(b){
-    b.addEventListener('click', function(){
-      state.settingsSection = b.dataset.section;
-      applySectionVisibility();
-    });
+    b.addEventListener('click', function(){ state.settingsSection = b.dataset.section; applySectionVisibility(); });
   });
-
   el.querySelectorAll('.pill-tabs[data-pill-group]').forEach(function(group){
     var slider = group.querySelector('.pill-slider');
     function position() {
@@ -4450,23 +4457,17 @@ function renderSettingsView(el) {
         if (b.classList.contains('active')) return;
         group.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === b); });
         requestAnimationFrame(position);
-        if (groupKey === 'theme') {
-          applyTheme(b.dataset.pill);
-          updateAllThemeIcons();
-        } else if (groupKey === 'lang') {
+        if (groupKey === 'theme') { applyTheme(b.dataset.pill); updateAllThemeIcons(); }
+        else if (groupKey === 'lang') {
           document.cookie = 'SLD_lang=' + b.dataset.pill + '; path=/; max-age=' + (60*60*24*365);
           try {
-            sessionStorage.setItem('SLD_reload_settings', JSON.stringify({
-              open: !!state.settingsOpen, section: state.settingsSection || 'account'
-            }));
+            sessionStorage.setItem('SLD_reload_settings', JSON.stringify({ open: !!state.settingsOpen, section: state.settingsSection || 'account' }));
           } catch(e) {}
-          location.href = '/settings';
-          location.reload();
+          location.href = '/settings'; location.reload();
         }
       });
     });
   });
-
   el.querySelectorAll('[data-color-group]').forEach(function(group){
     var groupKey = group.dataset.colorGroup;
     group.querySelectorAll('.color-swatch').forEach(function(sw){
@@ -4482,7 +4483,6 @@ function renderSettingsView(el) {
   var acctForm = document.getElementById('accountForm');
   var acctErr = document.getElementById('acctErr');
   var acctEmojiGrid = document.getElementById('acctEmojiGrid');
-  var acctAvatarPreview = document.getElementById('acctAvatarPreview');
   var acctCurrentEmoji = me.avatar_emoji || DEFAULT_EMOJI;
   if (acctEmojiGrid) {
     acctEmojiGrid.querySelectorAll('.account-emoji-opt').forEach(function(b){
@@ -4490,9 +4490,7 @@ function renderSettingsView(el) {
         acctCurrentEmoji = b.dataset.emoji;
         var prev = document.getElementById('acctAvatarPreview');
         if (prev) prev.outerHTML = '<div class="account-hero-avatar" id="acctAvatarPreview">' + avatarHtml(acctCurrentEmoji, 'lg') + '</div>';
-        acctEmojiGrid.querySelectorAll('.account-emoji-opt').forEach(function(x){
-          x.classList.toggle('active', x === b);
-        });
+        acctEmojiGrid.querySelectorAll('.account-emoji-opt').forEach(function(x){ x.classList.toggle('active', x === b); });
       });
     });
   }
@@ -4502,15 +4500,15 @@ function renderSettingsView(el) {
       if (acctErr) acctErr.textContent = '';
       var fd = new FormData(acctForm);
       var body = {
-        name: (fd.get('name') || '').toString().trim(),
-        nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
-        bio: (fd.get('bio') || '').toString().trim(),
+        name: (fd.get('name')||'').toString().trim(),
+        nick: (fd.get('nick')||'').toString().trim().replace(/^@/, ''),
+        bio: (fd.get('bio')||'').toString().trim(),
         avatar_emoji: acctCurrentEmoji || DEFAULT_EMOJI
       };
       var sb = acctForm.querySelector('button[type="submit"]');
       if (sb) sb.disabled = true;
       try {
-        var r = await api('/api/users/me', { method: 'PUT', body: body });
+        var r = await api('/api/users/me', { method:'PUT', body:body });
         setUser(r.user); renderSidebar();
         showToast(tr('settings_saved'), 'success');
         renderSettingsView(el);
@@ -4522,7 +4520,6 @@ function renderSettingsView(el) {
   }
   var lo = document.getElementById('settingsLogout');
   if (lo) lo.addEventListener('click', doLogoutConfirm);
-
   el.querySelectorAll('[data-toggle]').forEach(function(t){
     t.addEventListener('click', async function(){
       var key = t.dataset.toggle;
@@ -4536,7 +4533,7 @@ function renderSettingsView(el) {
       }
       var patch = {}; patch[key] = newVal;
       var meNow = state.user || {}; meNow[key] = newVal; setUser(meNow);
-      try { await api('/api/users/me/settings', { method: 'POST', body: patch }); }
+      try { await api('/api/users/me/settings', { method:'POST', body:patch }); }
       catch(e) {
         t.classList.toggle('on', !newVal);
         meNow[key] = !newVal; setUser(meNow);
@@ -4544,13 +4541,11 @@ function renderSettingsView(el) {
       }
     });
   });
-
   var si = document.getElementById('serverInfo');
   if (si) {
     api('/api/uptime').then(function(info){
       var uptime = fmtUptime(info.uptime_seconds || 0);
-      si.innerHTML = ''
-        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_uptime')) + '</span>'
+      si.innerHTML = '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_uptime')) + '</span>'
         + '<span class="value">' + escapeHtml(uptime) + '</span></div>'
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_version')) + '</span>'
         + '<span class="value">' + escapeHtml(info.version || '—') + '</span></div>';
@@ -4562,8 +4557,7 @@ function renderSettingsView(el) {
       var city = info.city || '—';
       var country = info.country ? (', ' + info.country) : '';
       var cityFull = (city === '—') ? '—' : (city + country);
-      di.innerHTML = ''
-        + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_browser')) + '</span>'
+      di.innerHTML = '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_browser')) + '</span>'
         + '<span class="value">' + escapeHtml(info.browser || '—') + '</span></div>'
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_os')) + '</span>'
         + '<span class="value">' + escapeHtml(info.os || '—') + '</span></div>'
@@ -4577,10 +4571,8 @@ function emojiNameOf(e) {
   if (!m) return '';
   return LANG === 'ru' ? m.ru : m.en;
 }
-
 function renderPolicyHtml(raw) {
-  var lines = String(raw || '').split('\n');
-  var html = ''; var inList = false;
+  var lines = String(raw || '').split('\n'); var html = ''; var inList = false;
   function closeList() { if (inList) { html += '</ul>'; inList = false; } }
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
@@ -4592,8 +4584,7 @@ function renderPolicyHtml(raw) {
     } else if (line.trim() === '') { closeList(); html += '<div class="policy-gap"></div>'; }
     else { closeList(); html += '<p>' + escapeHtml(line) + '</p>'; }
   }
-  closeList();
-  return html;
+  closeList(); return html;
 }
 function renderPolicyView(el) {
   var html = '<div class="main-header"><button type="button" class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
@@ -4607,7 +4598,6 @@ function renderPolicyView(el) {
   bindThemeBtn(); bindLinks(el);
   document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
 }
-
 function renderOgCard(og) {
   if (!og) return '';
   if (state.user && state.user.show_link_previews === false) return '';
@@ -4615,8 +4605,7 @@ function renderOgCard(og) {
   if (!site) { try { site = new URL(og.url).hostname; } catch(e) {} }
   var imgHtml = og.image ? '<div class="og-image"><img src="' + escapeHtml(og.image) + '" alt="" loading="lazy" /></div>' : '';
   return '<a class="og-card" href="' + escapeHtml(og.url) + '" target="_blank" rel="noopener noreferrer">'
-    + imgHtml
-    + '<div class="og-body">'
+    + imgHtml + '<div class="og-body">'
     + (site ? '<div class="og-site">' + escapeHtml(site) + '</div>' : '')
     + (og.title ? '<div class="og-title">' + escapeHtml(og.title) + '</div>' : '')
     + (og.description ? '<div class="og-desc">' + escapeHtml(og.description) + '</div>' : '')
@@ -4626,14 +4615,9 @@ function renderPostHtml(p, showComments) {
   var liked = p.user_like === 1;
   var likeCls = liked ? 'active' : '';
   var displayText = p.text, truncated = false;
-  if (!showComments) {
-    var res = truncateText(p.text);
-    displayText = res.text; truncated = res.truncated;
-  }
+  if (!showComments) { var res = truncateText(p.text); displayText = res.text; truncated = res.truncated; }
   var bodyHtml = linkifyText(displayText);
-  var readMore = truncated
-    ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>'
-    : '';
+  var readMore = truncated ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>' : '';
   var isMine = state.user && p.author && p.author.toLowerCase() === state.user.nick.toLowerCase();
   var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
   var deviceBadge = '';
@@ -4648,15 +4632,13 @@ function renderPostHtml(p, showComments) {
     var qHtml = linkifyText(p.quoted.text || '');
     quotedHtml = '<div class="quoted-post" data-action="open-post" data-post-id="' + p.quoted.id + '">'
       + '<div class="q-author">@' + escapeHtml(p.quoted.author || '?') + '</div>'
-      + '<div class="q-text">' + qHtml + '</div>'
-      + '</div>';
+      + '<div class="q-text">' + qHtml + '</div></div>';
   }
   var menuHtml = '';
   if (isMine) {
     menuHtml = '<div class="post-menu">'
-      + '<button type="button" class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
-      + '<button type="button" class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
-      + '</div>';
+      + '<button type="button" class="act-btn" data-action="edit-post" data-post-id="' + p.id + '">' + ICONS.edit + '</button>'
+      + '<button type="button" class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '">' + ICONS.trash + '</button></div>';
   }
   var ogHtml = renderOgCard(p.og_data);
   var commentsHtml = '';
@@ -4664,23 +4646,22 @@ function renderPostHtml(p, showComments) {
     commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id) + '</div>';
   }
   var cCount = (typeof p.comment_count === 'number') ? p.comment_count : (p.comments ? p.comments.length : 0);
+  var viewsHtml = p.views ? '<span class="views-badge">' + ICONS.eye + '<span data-views>' + p.views + '</span></span>' : '';
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
   return ''
     + '<div class="post-card" data-post-id="' + p.id + '" data-author="' + escapeHtml(p.author || '') + '">'
-    +   '<div class="post-header">'
-    +     avatarHtml(p.author_avatar_emoji)
+    +   '<div class="post-header">' + avatarHtml(p.author_avatar_emoji)
     +     '<div class="meta"><div class="who">' + authorHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div></div>'
     +     menuHtml
     +   '</div>'
     +   (displayText ? '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>' : '')
-    +   readMore
-    +   ogHtml
-    +   quotedHtml
+    +   readMore + ogHtml + quotedHtml
     +   '<div class="post-actions">'
     +     '<button type="button" class="act-btn like-btn ' + likeCls + '" data-action="like" data-post-id="' + p.id + '">' + heartIcon + '<span class="num">' + (p.likes || 0) + '</span></button>'
     +     '<button type="button" class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + cCount + '</span></button>'
-    +     '<button type="button" class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
-    +     '<button type="button" class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
+    +     '<button type="button" class="act-btn" data-action="quote" data-post-id="' + p.id + '">' + ICONS.quote + '</button>'
+    +     '<button type="button" class="act-btn" data-action="copy" data-post-id="' + p.id + '">' + ICONS.copy + '</button>'
+    +     viewsHtml
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -4719,10 +4700,8 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
     +   '<div class="comment-actions">'
     +     '<button type="button" class="act-btn like-btn ' + likeCls + '" data-action="like-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + heartIcon + '<span class="num">' + (c.likes || 0) + '</span></button>'
     +     replyBtn + editBtn + delBtn
-    +   '</div>'
-    + '</div>';
+    +   '</div></div>';
 }
-
 function applyLikeUI(btn) {
   var was = btn.classList.contains('active');
   var numEl = btn.querySelector('.num');
@@ -4739,11 +4718,9 @@ function revertLike(btn, snap) {
 function startInlineEdit(container, textEl, initialText, onSave) {
   var editor = document.createElement('div');
   editor.className = 'inline-editor';
-  editor.innerHTML = '<textarea></textarea>'
-    + '<div class="edit-actions">'
+  editor.innerHTML = '<textarea></textarea><div class="edit-actions">'
     + '<button type="button" class="edit-cancel">' + escapeHtml(tr('cancel')) + '</button>'
-    + '<button type="button" class="edit-save">' + escapeHtml(tr('save')) + '</button>'
-    + '</div>';
+    + '<button type="button" class="edit-save">' + escapeHtml(tr('save')) + '</button></div>';
   textEl.style.display = 'none';
   container.insertBefore(editor, textEl);
   var ta = editor.querySelector('textarea');
@@ -4752,8 +4729,7 @@ function startInlineEdit(container, textEl, initialText, onSave) {
   function close() { if (editor.parentNode) editor.parentNode.removeChild(editor); textEl.style.display = ''; }
   editor.querySelector('.edit-cancel').addEventListener('click', close);
   editor.querySelector('.edit-save').addEventListener('click', async function(){
-    var v = ta.value.trim();
-    if (!v) return;
+    var v = ta.value.trim(); if (!v) return;
     var b = editor.querySelector('.edit-save'); b.disabled = true;
     try {
       await onSave(v);
@@ -4779,14 +4755,14 @@ function bindPostActions(root) {
       if (action === 'like') {
         var snap = applyLikeUI(btn);
         state.suppressRefresh = Date.now() + 2000;
-        try { await api('/api/posts/' + postId + '/like', { method: 'POST', body: {} }); }
+        try { await api('/api/posts/' + postId + '/like', { method:'POST', body:{} }); }
         catch(err) { revertLike(btn, snap); alert(tr(err.message) || err.message); }
         return;
       }
       if (action === 'like-comment') {
         var snap2 = applyLikeUI(btn);
         state.suppressRefresh = Date.now() + 2000;
-        try { await api('/api/posts/' + postId + '/comments/' + commentId + '/like', { method: 'POST', body: {} }); }
+        try { await api('/api/posts/' + postId + '/comments/' + commentId + '/like', { method:'POST', body:{} }); }
         catch(err) { revertLike(btn, snap2); alert(tr(err.message) || err.message); }
         return;
       }
@@ -4805,8 +4781,7 @@ function bindPostActions(root) {
           renderQuoteBox('post');
           var inp = document.getElementById('postInput');
           if (inp) { inp.value = inp.value; inp.focus(); autoGrow(inp); }
-          var s = document.getElementById('postSend');
-          var sm = document.getElementById('postSendMobile');
+          var s = document.getElementById('postSend'), sm = document.getElementById('postSendMobile');
           if (s) s.disabled = false;
           if (sm) sm.disabled = false;
         } catch(e) { alert(tr(e.message) || e.message); }
@@ -4816,20 +4791,18 @@ function bindPostActions(root) {
         state.replyTo = { id: commentId, author: btn.dataset.author || '' };
         if (state.view !== 'post') { navigate('/p/' + postId); return; }
         if (state._renderReplyBanner) state._renderReplyBanner();
-        var ta = document.getElementById('commentInput');
-        if (ta) ta.focus();
+        var ta = document.getElementById('commentInput'); if (ta) ta.focus();
         return;
       }
       if (action === 'edit-post') {
         var postEl = btn.closest('.post-card');
-        var textEl = postEl.querySelector('.post-text');
-        if (!textEl) return;
+        var textEl = postEl.querySelector('.post-text'); if (!textEl) return;
         var raw = textEl.getAttribute('data-raw') || '';
         state.suppressRefresh = Date.now() + 2000;
         startInlineEdit(postEl, textEl, raw, async function(newText){
-          await api('/api/posts/' + postId, { method: 'PUT', body: { text: newText } });
-          feedCache.all = { posts: null, query: null };
-          feedCache.subs = { posts: null, query: null };
+          await api('/api/posts/' + postId, { method:'PUT', body:{ text:newText } });
+          feedCache.all = { posts:null, query:null };
+          feedCache.subs = { posts:null, query:null };
         });
         return;
       }
@@ -4840,10 +4813,10 @@ function bindPostActions(root) {
           var nextSib = postEl ? postEl.nextSibling : null;
           if (postEl && parentEl) parentEl.removeChild(postEl);
           state.suppressRefresh = Date.now() + 2000;
-          feedCache.all = { posts: null, query: null };
-          feedCache.subs = { posts: null, query: null };
+          feedCache.all = { posts:null, query:null };
+          feedCache.subs = { posts:null, query:null };
           try {
-            await api('/api/posts/' + postId, { method: 'DELETE' });
+            await api('/api/posts/' + postId, { method:'DELETE' });
             checkEmptyFeed(parentEl);
           } catch(err) {
             if (postEl && parentEl) {
@@ -4861,7 +4834,7 @@ function bindPostActions(root) {
         var cRaw = cTextEl.getAttribute('data-raw') || '';
         state.suppressRefresh = Date.now() + 2000;
         startInlineEdit(cEl, cTextEl, cRaw, async function(newText){
-          await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'PUT', body: { text: newText } });
+          await api('/api/posts/' + postId + '/comments/' + commentId, { method:'PUT', body:{ text:newText } });
         });
         return;
       }
@@ -4883,7 +4856,7 @@ function bindPostActions(root) {
           }
           if (removed > 0) decrementCommentCount(postId, removed);
           state.suppressRefresh = Date.now() + 2000;
-          try { await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' }); }
+          try { await api('/api/posts/' + postId + '/comments/' + commentId, { method:'DELETE' }); }
           catch(err) { alert(tr(err.message) || err.message); if (state.view === 'post') loadPostView(); }
         }, { yesText: tr('confirm_delete_yes') });
         return;
@@ -4897,21 +4870,16 @@ function bindPostActions(root) {
   });
   bindOgImages(root);
 }
-
 function bindRefreshBtn(id) {
-  var b = document.getElementById(id || 'refreshBtn');
-  if (!b) return;
+  var b = document.getElementById(id || 'refreshBtn'); if (!b) return;
   b.addEventListener('click', async function(){
     if (b.disabled) return;
-    b.classList.add('spinning');
-    b.disabled = true;
+    b.classList.add('spinning'); b.disabled = true;
     var start = Date.now();
-    try { await refreshCurrentView({ force: true }); } catch(e) {}
-    var elapsed = Date.now() - start;
-    var minMs = 600;
+    try { await refreshCurrentView({ force:true }); } catch(e) {}
+    var elapsed = Date.now() - start; var minMs = 600;
     if (elapsed < minMs) await new Promise(function(r){ setTimeout(r, minMs - elapsed); });
-    b.classList.remove('spinning');
-    b.disabled = false;
+    b.classList.remove('spinning'); b.disabled = false;
   });
 }
 async function refreshCurrentView(opts) {
@@ -4931,6 +4899,17 @@ async function copyText(txt) {
   } catch(e) {}
 }
 
+/* Регистрация экранов в UI-API */
+UI.registerScreen('feed',          renderFeedView);
+UI.registerScreen('post',          renderPostView);
+UI.registerScreen('profile',       renderProfileView);
+UI.registerScreen('users',         renderUsersView);
+UI.registerScreen('notifications', renderNotificationsView);
+UI.registerScreen('settings',      renderSettingsView);
+UI.registerScreen('policy',        renderPolicyView);
+UI.registerScreen('followers',     renderFollowListView);
+UI.registerScreen('following',     renderFollowListView);
+
 (async function init() {
   try {
     var rs = sessionStorage.getItem('SLD_reload_settings');
@@ -4943,6 +4922,7 @@ async function copyText(txt) {
       sessionStorage.removeItem('SLD_reload_settings');
     }
   } catch(e) {}
+  await loadUIManifest();
   if (state.token) {
     state.booting = true;
     renderRoot();
@@ -4960,6 +4940,9 @@ async function copyText(txt) {
 """
 
 
+# ============================================================================
+# Page render
+# ============================================================================
 def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
     t = TEXTS[lang]
     view_data = view_data or {}
