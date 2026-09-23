@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sld")
 
 START_TIME = time.time()
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 app = FastAPI(title="SLD", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -33,7 +33,6 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         log.error("[SLD] Supabase init error: %s", e)
 
-# In-memory fallback (если Supabase недоступен)
 USERS: Dict[str, dict] = {}
 SESSIONS: Dict[str, dict] = {}
 POSTS_MEM: Dict[str, dict] = {}
@@ -397,10 +396,21 @@ def extract_first_url(text: str) -> Optional[str]:
 
 
 def detect_device(ua: str) -> str:
+    """Return 'mobile', 'tablet' or 'desktop'."""
     ua_l = (ua or "").lower()
-    markers = ("mobile","android","iphone","ipod","ipad","windows phone",
-               "webos","blackberry","opera mini")
-    return "mobile" if any(x in ua_l for x in markers) else "desktop"
+    # Tablet markers first
+    if "ipad" in ua_l:
+        return "tablet"
+    if "tablet" in ua_l or "kindle" in ua_l or "silk/" in ua_l or "playbook" in ua_l:
+        return "tablet"
+    if "android" in ua_l and "mobile" not in ua_l:
+        return "tablet"
+    # Mobile markers
+    mobile_markers = ("mobile","iphone","ipod","windows phone",
+                      "webos","blackberry","opera mini","opera mobi")
+    if any(x in ua_l for x in mobile_markers):
+        return "mobile"
+    return "desktop"
 
 
 def fetch_og_data(url: str) -> Optional[dict]:
@@ -591,6 +601,7 @@ def _norm_user_row(row: dict) -> dict:
     for f, d in USER_BOOL_DEFAULTS.items():
         row[f] = bool(row.get(f, d))
     row["avatar_emoji"] = row.get("avatar_emoji") or DEFAULT_EMOJI
+    row["pinned_post_id"] = row.get("pinned_post_id") or None
     return row
 
 
@@ -653,6 +664,7 @@ def _user_payload(u: dict) -> dict:
         "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI),
         "show_link_previews": u.get("show_link_previews", True),
         "show_device_badge": u.get("show_device_badge", True),
+        "pinned_post_id": u.get("pinned_post_id") or None,
     }
     for f in NOTIFY_FIELDS: p[f] = bool(u.get(f, True))
     return p
@@ -714,11 +726,17 @@ def db_update_post_text(pid: str, text: str) -> None:
 
 def db_delete_post(pid: str) -> None:
     if not supabase:
+        for u in USERS.values():
+            if u.get("pinned_post_id") == pid:
+                u["pinned_post_id"] = None
         POSTS_MEM.pop(pid, None); return
     try:
+        # clear pinned_post_id on any user that pinned this post
+        supabase.table("users").update({"pinned_post_id": None}).eq("pinned_post_id", pid).execute()
         supabase.table("notifications").delete().eq("post_id", pid).execute()
         supabase.table("posts").delete().eq("id", pid).execute()
     except Exception as e: log.error("db_delete_post: %s", e)
+    invalidate_user_cache()
 
 
 def db_get_post(pid: str) -> Optional[dict]:
@@ -1212,6 +1230,7 @@ def serialize_user(u: dict, viewer_nick: Optional[str] = None) -> dict:
          "followers": len(u.get("followers") or []),
          "following": len(u.get("following") or []),
          "is_me": is_me,
+         "pinned_post_id": u.get("pinned_post_id") or None,
          "avatar_emoji": u.get("avatar_emoji", DEFAULT_EMOJI) or DEFAULT_EMOJI}
     if is_me:
         d["allow_followers_view"] = u.get("allow_followers_view", True)
@@ -1267,7 +1286,7 @@ UI_MANIFEST = {
     "features": {
         "og_previews": True, "device_badge": True, "sound": True,
         "link_previews": True, "quote": True, "notifications_sound": True,
-        "views": True,
+        "views": True, "pin_post": True, "tablet_badge": True,
     },
     "screens": ["feed","post","profile","users","notifications","settings","policy","followers","following"],
     "nav": [
@@ -1339,7 +1358,8 @@ def api_register(data: RegisterIn, request: Request):
          "password": hash_password(data.password), "created_at": time.time(),
          "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
-         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True, "show_device_badge": True}
+         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True, "show_device_badge": True,
+         "pinned_post_id": None}
     for f in NOTIFY_FIELDS: u[f] = True
     db_save_user(u)
     token = create_session(nick, u)
@@ -1655,6 +1675,26 @@ def api_delete_post(pid: str, request: Request):
     return {"ok": True}
 
 
+@app.post("/api/posts/{pid}/pin")
+def api_pin_post(pid: str, request: Request):
+    """Toggle pin: если пост уже закреплён — открепить, иначе закрепить (заменив старый)."""
+    u = require_user(request)
+    if not rate_limit("pin:" + u["nick"], 30, 60): raise HTTPException(429, "err_rate_limit")
+    p = db_get_post(pid)
+    if not p: raise HTTPException(404, "not found")
+    if (p["author"] or "").lower() != u["nick"].lower():
+        raise HTTPException(403, "forbidden")
+    me = db_load_user(u["nick"])
+    cur = (me.get("pinned_post_id") if me else None) or None
+    if cur == pid:
+        db_update_user_fields(u["nick"], {"pinned_post_id": None})
+        bus_broadcast("profile:" + u["nick"], {"type": "refresh"})
+        return {"ok": True, "pinned": False, "pinned_post_id": None}
+    db_update_user_fields(u["nick"], {"pinned_post_id": pid})
+    bus_broadcast("profile:" + u["nick"], {"type": "refresh"})
+    return {"ok": True, "pinned": True, "pinned_post_id": pid}
+
+
 @app.post("/api/posts/{pid}/like")
 def api_like_post(pid: str, request: Request):
     p = db_get_post(pid)
@@ -1861,6 +1901,7 @@ TEXTS = {
         "just_now": "только что", "sec_ago": "с", "min_ago": "мин", "hour_ago": "ч", "day_ago": "д",
         "read_more": "Показать полностью", "copy": "Копировать",
         "edit": "Редактировать", "delete": "Удалить", "save": "Сохранить", "cancel": "Отмена",
+        "pin": "Закрепить", "unpin": "Открепить", "pinned": "Закреплено",
         "confirm_delete": "Удалить без возможности восстановления?",
         "confirm_delete_yes": "Да, удалить",
         "confirm_logout": "Вы действительно хотите выйти?",
@@ -1910,7 +1951,7 @@ TEXTS = {
         "settings_show_link_previews": "Показывать превью ссылок (OpenGraph)",
         "settings_show_link_previews_hint": "Если включено, к постам со ссылками будут добавляться карточки предпросмотра",
         "settings_show_device_badge": "Показывать значок устройства на постах",
-        "settings_show_device_badge_hint": "Рядом с вашим именем будет отображаться иконка телефона или компьютера",
+        "settings_show_device_badge_hint": "Рядом с вашим именем будет отображаться иконка телефона, планшета или компьютера",
         "settings_device": "Ваше устройство", "settings_device_browser": "Браузер",
         "settings_device_os": "Система", "settings_device_city": "Город",
         "settings_server": "Сервер", "settings_uptime": "Аптайм", "settings_version": "Версия",
@@ -1949,7 +1990,7 @@ TEXTS = {
             "• Подписки (кто на кого подписан)\n"
             "• Уведомления и их прочтение\n"
             "• Настройки приватности, уведомлений и внешнего вида\n"
-            "• Тип устройства (телефон / компьютер) в момент публикации поста\n\n"
+            "• Тип устройства (телефон / планшет / компьютер) в момент публикации поста\n\n"
             "## 2. Чего мы НЕ храним\n"
             "• Пароль в открытом виде — только криптографический хеш\n"
             "• Ваш IP-адрес (используется в момент запроса, не сохраняется)\n"
@@ -1983,6 +2024,7 @@ TEXTS = {
             "• Отключать звук уведомлений\n"
             "• Скрывать список подписчиков и подписок\n"
             "• Отключать показ значка устройства\n"
+            "• Закреплять один свой пост в профиле\n"
             "• Удалить аккаунт — напишите нам, данные удаляются в течение 30 дней\n\n"
             "## 7. Хранение и удаление\n"
             "Данные хранятся, пока активен ваш аккаунт. При удалении аккаунта все посты, комментарии, лайки, подписки и уведомления удаляются безвозвратно.\n\n"
@@ -2007,6 +2049,7 @@ TEXTS = {
         "color_accent": "Акцент", "color_likes": "Лайки",
         "reset_colors": "Сбросить цвета",
         "sent_from_mobile": "Отправлено с телефона",
+        "sent_from_tablet": "Отправлено с планшета",
         "sent_from_desktop": "Отправлено с компьютера",
         "og_img_fallback": "Упсс... не удалось загрузить :(",
         "welcome_title": "Добро пожаловать!",
@@ -2019,6 +2062,7 @@ TEXTS = {
             "• Комментировать и отвечать на комментарии\n"
             "• Ставить лайки постам и комментариям\n"
             "• Подписываться на интересных людей и читать их ленту\n"
+            "• Закреплять свой пост в профиле\n"
             "• Настраивать эмодзи-аватар и описание профиля\n"
             "• Управлять уведомлениями — включать и отключать каждый тип отдельно\n"
             "• Менять тему, цвета акцента и звук уведомлений\n\n"
@@ -2058,6 +2102,7 @@ TEXTS = {
         "just_now": "just now", "sec_ago": "s", "min_ago": "min", "hour_ago": "h", "day_ago": "d",
         "read_more": "Show more", "copy": "Copy",
         "edit": "Edit", "delete": "Delete", "save": "Save", "cancel": "Cancel",
+        "pin": "Pin", "unpin": "Unpin", "pinned": "Pinned",
         "confirm_delete": "Delete permanently?", "confirm_delete_yes": "Yes, delete",
         "confirm_logout": "Are you sure you want to log out?",
         "confirm_yes": "Yes, log out", "confirm_no": "Cancel",
@@ -2106,7 +2151,7 @@ TEXTS = {
         "settings_show_link_previews": "Show link previews (OpenGraph)",
         "settings_show_link_previews_hint": "If enabled, posts with links will show preview cards",
         "settings_show_device_badge": "Show device badge on posts",
-        "settings_show_device_badge_hint": "A phone or desktop icon will appear next to your name on posts",
+        "settings_show_device_badge_hint": "A phone, tablet or desktop icon will appear next to your name on posts",
         "settings_device": "Your device", "settings_device_browser": "Browser",
         "settings_device_os": "System", "settings_device_city": "City",
         "settings_server": "Server", "settings_uptime": "Uptime", "settings_version": "Version",
@@ -2145,7 +2190,7 @@ TEXTS = {
             "• Follows (who follows whom)\n"
             "• Notifications and their read status\n"
             "• Privacy, notification and appearance settings\n"
-            "• Device type (mobile / desktop) at publish time\n\n"
+            "• Device type (mobile / tablet / desktop) at publish time\n\n"
             "## 2. What we do NOT store\n"
             "• Your password in plain text\n"
             "• Your IP address (used at request time, not saved)\n"
@@ -2179,6 +2224,7 @@ TEXTS = {
             "• Turn off notification sound\n"
             "• Hide your followers / following lists\n"
             "• Disable the device badge on your posts\n"
+            "• Pin one of your posts on your profile\n"
             "• Delete your account — write to us\n\n"
             "## 7. Retention and deletion\n"
             "Data is retained while your account is active. When you delete your account, all data is permanently removed.\n\n"
@@ -2202,7 +2248,9 @@ TEXTS = {
         "color_teal": "Teal", "color_indigo": "Indigo",
         "color_accent": "Accent", "color_likes": "Likes",
         "reset_colors": "Reset colors",
-        "sent_from_mobile": "Sent from a phone", "sent_from_desktop": "Sent from a computer",
+        "sent_from_mobile": "Sent from a phone",
+        "sent_from_tablet": "Sent from a tablet",
+        "sent_from_desktop": "Sent from a computer",
         "og_img_fallback": "Oops... could not load :(",
         "welcome_title": "Welcome!",
         "welcome_continue": "Continue",
@@ -2214,6 +2262,7 @@ TEXTS = {
             "• Comment and reply to comments\n"
             "• Like posts and comments\n"
             "• Follow interesting people and read their feed\n"
+            "• Pin one of your posts on your profile\n"
             "• Set up your emoji avatar and bio\n"
             "• Control notifications — toggle each type individually\n"
             "• Change theme, accent colors and notification sound\n\n"
@@ -2272,7 +2321,8 @@ I_CAL = svg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="
 I_CHECK = svg('<polyline points="20 6 9 17 4 12"/>', size=14, sw=3)
 I_CHECK_LG = svg('<polyline points="20 6 9 17 4 12"/>', size=18, sw=3)
 I_X = svg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', size=18, sw=3)
-I_MOBILE = svg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
+I_MOBILE = svg('<rect x="6" y="2" width="12" height="20" rx="2.5"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
+I_TABLET = svg('<rect x="4" y="2" width="16" height="20" rx="2.5"/><line x1="12" y1="18" x2="12.01" y2="18"/>', size=12)
 I_DESKTOP = svg('<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>', size=12)
 I_SERVER = svg('<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/>', size=14)
 I_EYE = svg('<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/>', size=18)
@@ -2282,6 +2332,7 @@ I_AT = svg('<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 
 I_INFO = svg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>', size=18)
 I_REFRESH = svg('<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>', size=18)
 I_GLOBE = svg('<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>', size=16)
+I_PIN = svg('<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14l-1.6-3.2V5.5A1.5 1.5 0 0 0 15.9 4H8.1A1.5 1.5 0 0 0 6.6 5.5V13.8z"/>', size=16)
 
 
 def _urlenc(svg_str: str) -> str:
@@ -2314,7 +2365,6 @@ FAVICON = FAVICON_RU_DARK
 # Server-side OpenGraph helpers
 # ============================================================================
 def _og_escape(s) -> str:
-    """HTML-escape for use inside an attribute value."""
     return (str(s or "")
             .replace("&", "&amp;")
             .replace("<", "&lt;")
@@ -2389,7 +2439,7 @@ def build_og_user(u: dict, request: Request, lang: str) -> dict:
     name = (u.get("name") or nick).strip()
     bio = (u.get("bio") or "").strip()
     title = f"{name} (@{nick}) — {t['site_name']}" if nick else name
-    description = bio or f"@{nick}" if nick else t["auth_tagline"]
+    description = bio or (f"@{nick}" if nick else t["auth_tagline"])
     og["title"] = title
     og["description"] = description[:300]
     og["type"] = "profile"
@@ -2524,8 +2574,9 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .avatar.sm { width: 36px; height: 36px; font-size: 18px; }
 .avatar.lg { width: 76px; height: 76px; font-size: 42px; border-width: 2px; }
 
-.profile-hero { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 20px; margin-bottom: 16px; }
-.profile-hero-row { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 14px; }
+.profile-hero { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 20px; margin-bottom: 16px; }
+.profile-hero .profile-settings-btn { position: absolute; top: 14px; right: 14px; z-index: 2; }
+.profile-hero-row { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 14px; padding-right: 48px; }
 .profile-hero-avatar { flex-shrink: 0; }
 .profile-hero-info { flex: 1; min-width: 0; }
 .profile-name { font-size: 22px; font-weight: 800; letter-spacing: -0.3px; margin: 0 0 4px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2548,13 +2599,18 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .round-action { width: 36px; height: 36px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); border-radius: 10px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; transition: background .15s ease; }
 .round-action:hover { background: var(--hover); }
 
-.post-card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; margin-bottom: 12px; transition: border-color .15s ease; }
+.post-card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; margin-bottom: 12px; transition: border-color .15s ease; }
 .post-card:hover { border-color: var(--line-2); }
+.post-card.is-pinned { border-color: var(--accent-soft-2); }
+.pinned-indicator { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 800; color: var(--muted); letter-spacing: .6px; text-transform: uppercase; margin-bottom: 10px; }
+.pinned-indicator svg { width: 12px; height: 12px; }
 .post-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
 .post-header .meta { flex: 1; min-width: 0; }
-.post-header .who { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14px; line-height: 1.3; }
-.post-author { font-weight: 700; color: var(--text); text-decoration: none; letter-spacing: -0.1px; }
-.post-author:hover { color: var(--accent); }
+.post-header .who { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14.5px; line-height: 1.3; }
+.post-author-name { font-weight: 700; color: var(--text); text-decoration: none; letter-spacing: -0.1px; }
+.post-author-name:hover { color: var(--accent); }
+.post-nick { display: inline-block; font-size: 12.5px; color: var(--muted); text-decoration: none; margin-top: 1px; line-height: 1.25; }
+.post-nick:hover { color: var(--accent); }
 .post-time { color: var(--muted); font-size: 12.5px; }
 .post-time::before { content: '·'; margin-right: 5px; color: var(--muted-2); }
 .device-badge { display: inline-flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; line-height: 0; opacity: .75; }
@@ -2588,6 +2644,7 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 .post-actions { display: flex; align-items: center; gap: 2px; margin-top: 10px; margin-left: -8px; flex-wrap: wrap; }
 .act-btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; background: transparent; border: none; color: var(--muted); cursor: pointer; font-family: inherit; font-size: 12.5px; font-weight: 600; border-radius: 9px; transition: background .15s ease, color .15s ease; }
 .act-btn:hover { background: var(--hover); color: var(--text); }
+.act-btn.active { color: var(--accent); }
 .act-btn svg { display: block; }
 .act-btn.danger:hover { color: var(--danger); }
 .like-btn { display: inline-flex; align-items: center; gap: 6px; }
@@ -2760,45 +2817,56 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
 @keyframes flash { 0% { background: var(--accent-soft-2); } 100% { background: var(--card-2); } }
 .comment.pending { opacity: .65; }
 
-/* ====== Comments tree ====== */
+/* ==========================================================================
+   Comments tree with proper L-shaped reply connector
+   ========================================================================== */
 .comments { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-.comment { padding: 10px 14px; background: var(--card-2); border-radius: 12px; margin-top: 6px; }
+.comment { padding: 10px 14px; background: var(--card-2); border-radius: 12px; margin-top: 6px; position: relative; }
 .comment.is-author { box-shadow: inset 0 0 0 1px var(--accent-soft-2); }
 
-/* Reply now uses the SAME card style as a normal comment + L-shaped connector */
-.comment.reply {
+/* Container that holds replies of a particular top-level comment.
+   It draws the vertical trunk on its left edge, extending from the parent
+   comment downward. Each reply inside gets a horizontal stub with arrow. */
+.comment-replies {
   position: relative;
-  margin-left: 34px;
+  margin-left: 26px;
+  padding-left: 24px;
   margin-top: 6px;
-  padding: 10px 14px;
-  background: var(--card-2);
-  border-radius: 12px;
 }
-/* Vertical + horizontal line (corner) from the parent comment */
+.comment-replies::before {
+  /* vertical trunk connecting parent to the last reply */
+  content: '';
+  position: absolute;
+  left: 0;
+  top: -6px;
+  bottom: 0;
+  width: 2px;
+  background: var(--line-3);
+  border-radius: 2px;
+}
+.comment.reply { position: relative; }
 .comment.reply::before {
+  /* horizontal connector: from the trunk to just before the reply */
   content: '';
   position: absolute;
-  left: -22px;
-  top: -8px;
-  width: 18px;
-  height: 20px;
-  border-left: 2px solid var(--line-3);
-  border-bottom: 2px solid var(--line-3);
-  border-bottom-left-radius: 10px;
-  pointer-events: none;
+  left: -24px;
+  top: 22px;
+  width: 20px;
+  height: 2px;
+  background: var(--line-3);
+  border-radius: 1px;
 }
-/* Small arrowhead at the end of the horizontal line */
 .comment.reply::after {
+  /* arrow head pointing right into the reply */
   content: '';
   position: absolute;
-  left: -5px;
-  top: 7px;
+  left: -6px;
+  top: 19px;
   width: 0;
   height: 0;
   border-top: 4px solid transparent;
   border-bottom: 4px solid transparent;
-  border-left: 5px solid var(--line-3);
-  pointer-events: none;
+  border-left: 6px solid var(--line-3);
 }
 
 .comment-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap; }
@@ -2850,6 +2918,7 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .main-inner { padding: 4px 12px 40px; }
   .card, .post-card, .profile-hero { border-radius: 16px; padding: 14px; }
   .profile-hero { padding: 16px; }
+  .profile-hero-row { padding-right: 44px; }
   .profile-name { font-size: 19px; }
   .profile-hero-row { margin-bottom: 10px; gap: 12px; }
   .avatar.lg { width: 64px; height: 64px; font-size: 36px; }
@@ -2864,10 +2933,10 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .publish-btn-desktop { display: none !important; }
   .composer-hint { display: none; }
   .composer-actions { gap: 8px; }
-  /* On narrow screens keep reply connector compact */
-  .comment.reply { margin-left: 26px; }
-  .comment.reply::before { left: -18px; width: 16px; height: 18px; }
-  .comment.reply::after { left: -5px; top: 6px; }
+  /* On narrow screens compress the reply connector */
+  .comment-replies { margin-left: 16px; padding-left: 18px; }
+  .comment.reply::before { left: -18px; width: 14px; top: 20px; }
+  .comment.reply::after { left: -6px; top: 17px; }
   .settings-layout { flex-direction: column; padding: 4px 12px 40px; gap: 12px; }
   .settings-nav { display: none; }
   .settings-block { padding: 16px; border-radius: 14px; }
@@ -2904,6 +2973,7 @@ body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflo
   .main-inner { padding: 4px 10px 30px; }
   .card, .post-card { border-radius: 14px; padding: 12px; }
   .profile-hero { border-radius: 14px; padding: 14px; }
+  .profile-hero-row { padding-right: 40px; }
   .profile-stats { font-size: 12px; gap: 12px; }
   .og-image { height: 140px; }
   .settings-layout { padding: 4px 10px 30px; }
@@ -2943,11 +3013,11 @@ var ICONS = {
   logout: __I_LOGOUT__, login: __I_LOGIN__, plus: __I_PLUS__,
   send: __I_SEND__,
   heart: __I_HEART__, heart_filled: __I_HEART_FILLED__, comment: __I_COMMENT__,
-  copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__,
+  copy: __I_COPY__, edit: __I_EDIT__, trash: __I_TRASH__, pin: __I_PIN__,
   back: __I_BACK__, chevron: __I_CHEVRON__, search: __I_SEARCH__,
   moon: __I_MOON__, sun: __I_SUN__, quote: __I_QUOTE__,
   cal: __I_CAL__, check: __I_CHECK__, checkLg: __I_CHECK_LG__, x: __I_X__,
-  mobile: __I_MOBILE__, desktop: __I_DESKTOP__, server: __I_SERVER__,
+  mobile: __I_MOBILE__, tablet: __I_TABLET__, desktop: __I_DESKTOP__, server: __I_SERVER__,
   eye: __I_EYE__, eyeOff: __I_EYE_OFF__, lock: __I_LOCK__, at: __I_AT__,
   info: __I_INFO__, refresh: __I_REFRESH__, globe: __I_GLOBE__
 };
@@ -4131,15 +4201,23 @@ function insertCommentIntoDom(pid, c, postAuthor) {
   var commentsEl = postEl.querySelector('.comments');
   if (!commentsEl) { commentsEl = document.createElement('div'); commentsEl.className = 'comments'; postEl.appendChild(commentsEl); }
   var html = renderCommentHtml(c, postAuthor, pid, !!c.parent_id);
+
   if (c.parent_id) {
     var parentEl = commentsEl.querySelector('[data-comment-id="' + c.parent_id + '"]');
-    if (parentEl) {
-      var next = parentEl.nextElementSibling;
-      while (next && next.classList && next.classList.contains('reply')) next = next.nextElementSibling;
-      if (next) next.insertAdjacentHTML('beforebegin', html);
-      else commentsEl.insertAdjacentHTML('beforeend', html);
-    } else commentsEl.insertAdjacentHTML('beforeend', html);
-  } else commentsEl.insertAdjacentHTML('beforeend', html);
+    if (!parentEl) {
+      commentsEl.insertAdjacentHTML('beforeend', html);
+    } else {
+      var container = parentEl.nextElementSibling;
+      if (!container || !container.classList.contains('comment-replies')) {
+        parentEl.insertAdjacentHTML('afterend', '<div class="comment-replies"></div>');
+        container = parentEl.nextElementSibling;
+      }
+      container.insertAdjacentHTML('beforeend', html);
+    }
+  } else {
+    commentsEl.insertAdjacentHTML('beforeend', html);
+  }
+
   var btn = postEl.querySelector('button[data-action="open-post"]');
   if (btn) { var span = btn.querySelector('span'); if (span) span.textContent = (parseInt(span.textContent) || 0) + 1; }
   var added = commentsEl.querySelector('[data-comment-id="' + c.id + '"]');
@@ -4169,16 +4247,19 @@ async function loadProfile(nick) {
     if (myId !== profileReqId) return;
     if (!document.getElementById('profileRoot')) return;
     var isMe = state.user && state.user.nick.toLowerCase() === u.nick.toLowerCase();
-    var actionsHtml = '';
-    if (isMe) {
-      actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>';
-    } else {
-      actionsHtml = '<button type="button" class="pill-action ' + (u.is_following?'':'primary') + '" id="followBtn">'
-        + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
-    }
     var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
     var lineClass = u.bio ? 'profile-line' : 'profile-line only-nick';
+    var settingsBtnHtml = isMe
+      ? '<a class="round-action profile-settings-btn" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>'
+      : '';
+    var followHtml = '';
+    if (!isMe) {
+      followHtml = '<div class="profile-hero-actions">'
+        + '<button type="button" class="pill-action ' + (u.is_following?'':'primary') + '" id="followBtn">'
+        + (u.is_following ? tr('unfollow') : tr('follow')) + '</button></div>';
+    }
     var html = '<div class="profile-hero">';
+    html += settingsBtnHtml;
     html += '<div class="profile-hero-row">';
     html += '<div class="profile-hero-avatar">' + avatarHtml(u.avatar_emoji, 'lg') + '</div>';
     html += '<div class="profile-hero-info">';
@@ -4193,7 +4274,7 @@ async function loadProfile(nick) {
     html += '</div>';
     html += '<div class="profile-meta">' + ICONS.cal + '<span>' + (LANG==='ru'?'Регистрация: ':'Joined: ') + fmtDate(u.created_at) + '</span></div>';
     html += '</div></div>';
-    html += '<div class="profile-hero-actions">' + actionsHtml + '</div>';
+    html += followHtml;
     html += '</div>';
     html += '<div id="profileContent">' + spinner() + '</div>';
     root.innerHTML = html;
@@ -4239,9 +4320,25 @@ async function loadProfileContent(u, isMe) {
     var d = await api('/api/posts?author=' + encodeURIComponent(u.nick));
     if (!document.getElementById('profileContent')) return;
     var posts = (d.posts || []).slice();
+
+    // --- Pinned post ---
+    var pinnedPost = null;
+    if (u.pinned_post_id) {
+      pinnedPost = posts.find(function(p){ return p.id === u.pinned_post_id; }) || null;
+      if (!pinnedPost) {
+        try { pinnedPost = await api('/api/posts/' + u.pinned_post_id); } catch(e) { pinnedPost = null; }
+      }
+      if (pinnedPost) {
+        posts = posts.filter(function(p){ return p.id !== pinnedPost.id; });
+        pinnedPost._pinned = true;
+      }
+    }
     posts.sort(function(a,b){ return b.created_at - a.created_at; });
-    if (!posts.length) html += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
-    else html += posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+
+    if (pinnedPost) html += renderPostHtml(pinnedPost, false);
+    if (posts.length) html += posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+    if (!posts.length && !pinnedPost) html += '<div class="empty">' + escapeHtml(tr('no_user_posts')) + '</div>';
+
     c.innerHTML = html;
     bindPostActions(c); bindLinks(c); bindOgImages(c);
     if (isMe) {
@@ -4747,12 +4844,16 @@ function renderPostHtml(p, showComments) {
   var bodyHtml = linkifyText(displayText);
   var readMore = truncated ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>' : '';
   var isMine = state.user && p.author && p.author.toLowerCase() === state.user.nick.toLowerCase();
-  var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
+  var displayName = p.author_name || p.author || '';
+  var nameHtml = '<a class="post-author-name" href="/u/' + encodeURIComponent(p.author) + '" data-link>' + escapeHtml(displayName) + '</a>';
+  var nickHtml = '<a class="post-nick" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
+
   var deviceBadge = '';
   if (p.device && p.author_show_device !== false) {
-    var isMob = p.device === 'mobile';
-    var icon = isMob ? ICONS.mobile : ICONS.desktop;
-    var title = isMob ? tr('sent_from_mobile') : tr('sent_from_desktop');
+    var icon, title;
+    if (p.device === 'mobile') { icon = ICONS.mobile; title = tr('sent_from_mobile'); }
+    else if (p.device === 'tablet') { icon = ICONS.tablet; title = tr('sent_from_tablet'); }
+    else { icon = ICONS.desktop; title = tr('sent_from_desktop'); }
     deviceBadge = '<span class="device-badge" title="' + escapeHtml(title) + '">' + icon + '</span>';
   }
   var quotedHtml = '';
@@ -4762,9 +4863,15 @@ function renderPostHtml(p, showComments) {
       + '<div class="q-author">@' + escapeHtml(p.quoted.author || '?') + '</div>'
       + '<div class="q-text">' + qHtml + '</div></div>';
   }
+  // Pin button only when viewing own profile
+  var onOwnProfile = isMine && state.view === 'profile' && state.user &&
+    state.viewData.nick && state.viewData.nick.toLowerCase() === state.user.nick.toLowerCase();
   var menuHtml = '';
   if (isMine) {
-    menuHtml = '<div class="post-menu">'
+    var pinBtn = onOwnProfile
+      ? '<button type="button" class="act-btn' + (p._pinned ? ' active' : '') + '" data-action="pin-post" data-post-id="' + p.id + '" title="' + escapeHtml(p._pinned ? tr('unpin') : tr('pin')) + '">' + ICONS.pin + '</button>'
+      : '';
+    menuHtml = '<div class="post-menu">' + pinBtn
       + '<button type="button" class="act-btn" data-action="edit-post" data-post-id="' + p.id + '">' + ICONS.edit + '</button>'
       + '<button type="button" class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '">' + ICONS.trash + '</button></div>';
   }
@@ -4776,10 +4883,15 @@ function renderPostHtml(p, showComments) {
   var cCount = (typeof p.comment_count === 'number') ? p.comment_count : (p.comments ? p.comments.length : 0);
   var viewsHtml = p.views ? '<span class="views-badge">' + ICONS.eye + '<span data-views>' + p.views + '</span></span>' : '';
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
+  var pinnedIndicator = p._pinned
+    ? '<div class="pinned-indicator">' + ICONS.pin + '<span>' + escapeHtml(tr('pinned')) + '</span></div>'
+    : '';
   return ''
-    + '<div class="post-card" data-post-id="' + p.id + '" data-author="' + escapeHtml(p.author || '') + '">'
+    + '<div class="post-card' + (p._pinned ? ' is-pinned' : '') + '" data-post-id="' + p.id + '" data-author="' + escapeHtml(p.author || '') + '">'
+    +   pinnedIndicator
     +   '<div class="post-header">' + avatarHtml(p.author_avatar_emoji)
-    +     '<div class="meta"><div class="who">' + authorHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div></div>'
+    +     '<div class="meta"><div class="who">' + nameHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
+    +     nickHtml + '</div>'
     +     menuHtml
     +   '</div>'
     +   (displayText ? '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>' : '')
@@ -4802,8 +4914,12 @@ function renderCommentsTree(comments, postAuthor, postId) {
   tops.forEach(function(c){
     html += renderCommentHtml(c, postAuthor, postId, false);
     var reps = repliesBy[c.id] || [];
-    reps.sort(function(a,b){ return a.created_at - b.created_at; });
-    reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true); });
+    if (reps.length) {
+      reps.sort(function(a,b){ return a.created_at - b.created_at; });
+      html += '<div class="comment-replies">';
+      reps.forEach(function(r){ html += renderCommentHtml(r, postAuthor, postId, true); });
+      html += '</div>';
+    }
   });
   return html;
 }
@@ -4899,6 +5015,22 @@ function bindPostActions(root) {
         try { var pp = await api('/api/posts/' + postId); copyText(pp.text || ''); } catch(e) {}
         return;
       }
+      if (action === 'pin-post') {
+        state.suppressRefresh = Date.now() + 2000;
+        try {
+          var res = await api('/api/posts/' + postId + '/pin', { method:'POST', body:{} });
+          if (state.user) state.user.pinned_post_id = res.pinned_post_id || null;
+          if (state.view === 'profile') {
+            // Full reload to reposition pinned post and toggle button state
+            loadProfile(state.viewData.nick);
+          } else {
+            var wasPinned = btn.classList.contains('active');
+            btn.classList.toggle('active', !wasPinned);
+            btn.title = !wasPinned ? tr('unpin') : tr('pin');
+          }
+        } catch(err) { alert(tr(err.message) || err.message); }
+        return;
+      }
       if (action === 'quote') {
         try {
           var p = await api('/api/posts/' + postId);
@@ -4971,16 +5103,20 @@ function bindPostActions(root) {
           var cEl = document.querySelector('[data-comment-id="' + commentId + '"]');
           var removed = 0;
           if (cEl) {
-            if (!cEl.classList.contains('reply')) {
+            var isReply = cEl.classList.contains('reply');
+            var repliesContainer = isReply ? cEl.closest('.comment-replies') : null;
+            if (!isReply) {
               var nx = cEl.nextElementSibling;
-              while (nx && nx.classList && nx.classList.contains('reply')) {
-                var toRemove = nx; nx = nx.nextElementSibling;
-                if (toRemove.parentNode) toRemove.parentNode.removeChild(toRemove);
-                removed++;
+              if (nx && nx.classList && nx.classList.contains('comment-replies')) {
+                removed += nx.querySelectorAll('.comment').length;
+                nx.parentNode.removeChild(nx);
               }
             }
             if (cEl.parentNode) cEl.parentNode.removeChild(cEl);
             removed++;
+            if (repliesContainer && !repliesContainer.querySelector('.comment')) {
+              if (repliesContainer.parentNode) repliesContainer.parentNode.removeChild(repliesContainer);
+            }
           }
           if (removed > 0) decrementCommentCount(postId, removed);
           state.suppressRefresh = Date.now() + 2000;
@@ -5071,7 +5207,7 @@ UI.registerScreen('following',     renderFollowListView);
 # ============================================================================
 # Page render (with server-side OpenGraph)
 # ============================================================================
-def _render_og_meta(og: Optional[dict], t: dict, init_fav: str) -> str:
+def _render_og_meta(og: Optional[dict], t: dict) -> str:
     if not og:
         og = {
             "site_name": t["site_name"],
@@ -5129,6 +5265,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None,
           .replace("__I_COPY__", json.dumps(I_COPY))
           .replace("__I_EDIT__", json.dumps(I_EDIT))
           .replace("__I_TRASH__", json.dumps(I_TRASH))
+          .replace("__I_PIN__", json.dumps(I_PIN))
           .replace("__I_BACK__", json.dumps(I_BACK))
           .replace("__I_CHEVRON__", json.dumps(I_CHEVRON))
           .replace("__I_SEARCH__", json.dumps(I_SEARCH))
@@ -5140,6 +5277,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None,
           .replace("__I_CHECK_LG__", json.dumps(I_CHECK_LG))
           .replace("__I_X__", json.dumps(I_X))
           .replace("__I_MOBILE__", json.dumps(I_MOBILE))
+          .replace("__I_TABLET__", json.dumps(I_TABLET))
           .replace("__I_DESKTOP__", json.dumps(I_DESKTOP))
           .replace("__I_SERVER__", json.dumps(I_SERVER))
           .replace("__I_EYE__", json.dumps(I_EYE))
@@ -5155,7 +5293,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None,
           .replace("__FAVICON_EN_DARK__", FAVICON_EN_DARK)
           .replace("__FAVICON_EN_LIGHT__", FAVICON_EN_LIGHT))
     init_fav = FAVICON_RU_DARK if lang == "ru" else FAVICON_EN_DARK
-    og_html = _render_og_meta(og, t, init_fav)
+    og_html = _render_og_meta(og, t)
     return ('<!DOCTYPE html>\n'
         f'<html lang="{lang}" data-theme="dark">\n'
         '<head>\n'
