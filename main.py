@@ -14,14 +14,97 @@ from fastapi.exceptions import HTTPException as FastAPIHTTPException
 import uvicorn
 
 # ==================== НАСТРОЙКИ ====================
-SALT = "izmeni_etot_sol_12345"          # соль для хеширования
-ADMIN_KEY = "admin_secret_change_me"    # ключ администратора
-MAX_THREADS_PER_BOARD = 60              # максимум тредов на раздел
-MAX_REPLIES_PER_THREAD = 300            # максимум ответов в треде
-RATE_LIMIT_SEC = 5                      # пауза между постами (сек)
-MAX_CONTENT_LEN = 4000                  # макс. длина сообщения
+SALT = "izmeni_etot_sol_12345"
+ADMIN_KEY = "admin_secret_change_me"
+MAX_THREADS_PER_BOARD = 60
+MAX_REPLIES_PER_THREAD = 300
+RATE_LIMIT_SEC = 5
+MAX_CONTENT_LEN = 4000
 HOST = "0.0.0.0"
 PORT = 8000
+
+# ==================== SVG ИКОНКИ ====================
+_ICON_COMMON = (
+    'fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round" '
+    'style="vertical-align:-2px;margin-right:4px;flex-shrink:0"'
+)
+
+ICON_HOME = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<path d="M3 9.5L12 2l9 7.5"/>'
+    '<path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/>'
+    '</svg>'
+)
+ICON_HELP = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<circle cx="12" cy="12" r="10"/>'
+    '<path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>'
+    '<line x1="12" y1="17" x2="12.01" y2="17"/>'
+    '</svg>'
+)
+ICON_API = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<polyline points="16 18 22 12 16 6"/>'
+    '<polyline points="8 6 2 12 8 18"/>'
+    '</svg>'
+)
+ICON_PENCIL = (
+    '<svg viewBox="0 0 24 24" width="16" height="16" ' + _ICON_COMMON + '>'
+    '<path d="M12 20h9"/>'
+    '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>'
+    '</svg>'
+)
+ICON_REPLY = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'
+    '</svg>'
+)
+ICON_TRASH = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<polyline points="3 6 5 6 21 6"/>'
+    '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>'
+    '<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'
+    '</svg>'
+)
+ICON_BOOK = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>'
+    '<path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>'
+    '</svg>'
+)
+ICON_SEND = (
+    '<svg viewBox="0 0 24 24" width="16" height="16" ' + _ICON_COMMON + '>'
+    '<line x1="22" y1="2" x2="11" y2="13"/>'
+    '<polygon points="22 2 15 22 11 13 2 9 22 2"/>'
+    '</svg>'
+)
+ICON_LOCK = (
+    '<svg viewBox="0 0 24 24" width="18" height="18" ' + _ICON_COMMON + '>'
+    '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>'
+    '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>'
+    '</svg>'
+)
+ICON_BACK = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<line x1="19" y1="12" x2="5" y2="12"/>'
+    '<polyline points="12 19 5 12 12 5"/>'
+    '</svg>'
+)
+ICON_TOP = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" ' + _ICON_COMMON + '>'
+    '<line x1="12" y1="19" x2="12" y2="5"/>'
+    '<polyline points="5 12 12 5 19 12"/>'
+    '</svg>'
+)
+ICON_BOARD = (
+    '<svg viewBox="0 0 24 24" width="16" height="16" ' + _ICON_COMMON + '>'
+    '<rect x="3" y="3" width="7" height="7"/>'
+    '<rect x="14" y="3" width="7" height="7"/>'
+    '<rect x="14" y="14" width="7" height="7"/>'
+    '<rect x="3" y="14" width="7" height="7"/>'
+    '</svg>'
+)
 
 # ==================== ХРАНИЛИЩЕ ====================
 boards: dict = {}
@@ -34,7 +117,8 @@ rate_map: dict = {}
 def now_str() -> str:
     days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     t = time.localtime()
-    return f"{t.tm_mday:02d}.{t.tm_mon:02d}.{t.tm_year} ({days[t.tm_wday]}) {t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+    return (f"{t.tm_mday:02d}.{t.tm_mon:02d}.{t.tm_year} "
+            f"({days[t.tm_wday]}) {t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}")
 
 def hash_ip(ip: str) -> str:
     return hashlib.sha256((SALT + ip).encode()).hexdigest()[:16]
@@ -69,9 +153,12 @@ def format_content(text: str) -> str:
     lines = text.split("\n")
     out = []
     for line in lines:
-        line = re.sub(r'&gt;&gt;(\d+)',
-                      r'<a href="#p\1" class="quotelink" onclick="quotePost(\1);return false;">&gt;&gt;\1</a>',
-                      line)
+        line = re.sub(
+            r'&gt;&gt;(\d+)',
+            r'<a href="#p\1" class="quotelink" '
+            r'onclick="quotePost(\1);return false;">&gt;&gt;\1</a>',
+            line,
+        )
         if line.startswith("&gt;") and not line.startswith("&gt;&gt;") and "<a" not in line[:4]:
             line = f'<span class="quote">{line}</span>'
         out.append(line)
@@ -108,18 +195,18 @@ a.quotelink{color:#DD0000;text-decoration:underline;cursor:pointer}
 .header{text-align:center;padding:12px 8px 6px}
 .header h1{color:#AF0A0F;font-family:Tahoma,sans-serif;font-size:30px;margin:0;letter-spacing:1px}
 .header .sub{color:#800000;font-size:10pt;margin-top:4px}
-.navbar{background:#FEDCBA;padding:6px 8px;text-align:center;border-top:1px solid #D9BFB7;border-bottom:1px solid #D9BFB7;font-size:10pt}
-.navbar a{margin:0 6px;font-weight:700}
+.navbar{background:#FEDCBA;padding:6px 8px;text-align:center;border-top:1px solid #D9BFB7;border-bottom:1px solid #D9BFB7;font-size:10pt;display:flex;justify-content:center;gap:14px;flex-wrap:wrap}
+.navbar a{font-weight:700;display:inline-flex;align-items:center}
 .boardtitle{text-align:center;color:#AF0A0F;font-size:24px;font-family:Tahoma,sans-serif;font-weight:700;padding:14px 10px 4px}
 .boarddesc{text-align:center;color:#800000;padding-bottom:10px;font-size:10pt}
 .form-box{background:#F0E0D6;border:1px solid #D9BFB7;padding:14px 16px;margin:14px auto;max-width:780px;border-radius:3px}
-.form-box h3{margin:0 0 12px;color:#AF0A0F;font-size:14pt;font-family:Tahoma,sans-serif}
+.form-box h3{margin:0 0 12px;color:#AF0A0F;font-size:14pt;font-family:Tahoma,sans-serif;display:flex;align-items:center}
 .form-row{margin-bottom:12px}
 .form-row label{display:block;font-weight:700;color:#800000;margin-bottom:4px;font-size:10pt}
 .form-row .hint{font-size:9pt;color:#707070;font-weight:400;margin-left:6px}
 textarea,input[type=text],input[type=password]{background:#FFFFEE;border:1px solid #D9BFB7;color:#800000;font-family:arial;font-size:11pt;padding:6px 8px;width:100%}
 textarea{resize:vertical;min-height:130px}
-button{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 22px;cursor:pointer;color:#800000;font-size:11pt;font-family:arial;font-weight:700;border-radius:3px}
+button{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 22px;cursor:pointer;color:#800000;font-size:11pt;font-family:arial;font-weight:700;border-radius:3px;display:inline-flex;align-items:center}
 button:hover{background:#FEDCBA}
 button.big{padding:10px 30px;font-size:12pt}
 .post{background:#F0E0D6;border:1px solid #D9BFB7;padding:8px 10px;margin:6px auto;max-width:920px;word-wrap:break-word;border-radius:3px}
@@ -143,19 +230,20 @@ button.big{padding:10px 30px;font-size:12pt}
 .subject{color:#AF0A0F;font-weight:700;margin-right:6px}
 .wrap{max-width:920px;margin:0 auto;padding:0 10px}
 .small{font-size:9pt;color:#707070}
-.btn-row{margin-top:8px}
+.btn-row{margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
 .board-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px;margin:14px auto;max-width:960px;padding:0 10px}
 .board-card{background:#F0E0D6;border:1px solid #D9BFB7;padding:12px 14px;border-radius:3px;transition:background .15s}
 .board-card:hover{background:#FEDCBA}
-.board-card a{display:block;font-size:12pt;font-weight:700;color:#0000EE}
+.board-card a{display:flex;align-items:center;font-size:12pt;font-weight:700;color:#0000EE}
 .board-card .name{color:#AF0A0F;font-size:11pt;margin-top:2px;font-weight:700}
 .board-card .desc{color:#800000;font-size:10pt;margin-top:6px}
 .board-card .cnt{color:#707070;font-size:9pt;margin-top:6px}
 .group-title{text-align:center;color:#AF0A0F;font-family:Tahoma,sans-serif;font-size:14pt;font-weight:700;margin:22px 10px 6px}
-.help{background:#FCF5EE;border:1px solid #D9BFB7;border-left:4px solid #AF0A0F;padding:10px 14px;margin:12px auto;max-width:780px;font-size:10pt;color:#800000;border-radius:3px}
+.help{background:#FCF5EE;border:1px solid #D9BFB7;border-left:4px solid #AF0A0F;padding:10px 14px;margin:12px auto;max-width:820px;font-size:10pt;color:#800000;border-radius:3px}
 .help b{color:#AF0A0F}
-.reply-btn{display:inline-block;background:#F0E0D6;border:1px solid #D9BFB7;padding:4px 12px;margin-right:6px;border-radius:3px;font-size:10pt;font-weight:700}
+.reply-btn{display:inline-flex;align-items:center;background:#F0E0D6;border:1px solid #D9BFB7;padding:5px 12px;border-radius:3px;font-size:10pt;font-weight:700;color:#0000EE}
 .reply-btn:hover{background:#FEDCBA;color:#DD0000}
+.lockbox{text-align:center;color:#DD0000;font-weight:700;font-size:12pt;display:flex;align-items:center;justify-content:center;gap:8px}
 """
 
 JS = """
@@ -178,17 +266,15 @@ function deletePost(id){
   i.type='hidden';i.name='password';i.value=pw;
   f.appendChild(i);document.body.appendChild(f);f.submit();
 }
-function toggleHelp(id){
-  var e=document.getElementById(id);
-  if(e)e.style.display = (e.style.display==='none' ? 'block' : 'none');
-}
 </script>
 """
 
 def page(title: str, body: str) -> str:
-    nav = '<a href="/">🏠 Главная</a>'
-    nav += '<a href="/help">❓ Помощь</a>'
-    nav += '<a href="/api/boards">📡 API</a>'
+    nav = (
+        f'<a href="/">{ICON_HOME}Главная</a>'
+        f'<a href="/help">{ICON_HELP}Помощь</a>'
+        f'<a href="/api/boards">{ICON_API}API</a>'
+    )
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -215,22 +301,33 @@ def page(title: str, body: str) -> str:
 
 def render_post(p: dict, is_op: bool = False, show_actions: bool = True) -> str:
     if not p or p.get("deleted"):
-        return f'<div class="post reply deleted">Пост №{p["id"] if p else "?"} удалён.</div>' if p else ""
+        if p:
+            return f'<div class="post reply deleted">Пост №{p["id"]} удалён.</div>'
+        return ""
     cls = "post" + (" op" if is_op else " reply")
     flags = ""
     if is_op:
         t = threads.get(p["id"], {})
-        if t.get("sticky"): flags += ' <span class="sticky">[Закреплён]</span>'
-        if t.get("locked"): flags += ' <span class="locked">[Закрыт]</span>'
+        if t.get("sticky"):
+            flags += ' <span class="sticky">[Закреплён]</span>'
+        if t.get("locked"):
+            flags += ' <span class="locked">[Закрыт]</span>'
     sage = ' <span class="sage">(без поднятия)</span>' if (p.get("sage") and not is_op) else ""
     subj = f'<span class="subject">{esc(p["subject"])}</span> ' if (is_op and p.get("subject")) else ""
-    img = f'<img src="{esc(p["image_url"])}" class="postimg" alt="" loading="lazy" onerror="this.style.display=\'none\'">' if p.get("image_url") else ""
+    img = ""
+    if p.get("image_url"):
+        img = (f'<img src="{esc(p["image_url"])}" class="postimg" alt="" '
+               f'loading="lazy" onerror="this.style.display=\'none\'">')
     actions = ""
     if show_actions:
-        actions = ('<div class="btn-row">'
-                   f'<a class="reply-btn" href="javascript:void(0)" onclick="quotePost({p["id"]})">💬 Ответить</a>'
-                   f'<a class="reply-btn" href="javascript:void(0)" onclick="deletePost({p["id"]})">🗑 Удалить</a>'
-                   '</div>')
+        actions = (
+            '<div class="btn-row">'
+            f'<a class="reply-btn" href="javascript:void(0)" '
+            f'onclick="quotePost({p["id"]})">{ICON_REPLY}Ответить</a>'
+            f'<a class="reply-btn" href="javascript:void(0)" '
+            f'onclick="deletePost({p["id"]})">{ICON_TRASH}Удалить</a>'
+            '</div>'
+        )
     return f'''
 <div class="{cls}" id="p{p["id"]}">
   <div class="posthead">
@@ -247,9 +344,11 @@ def render_post(p: dict, is_op: bool = False, show_actions: bool = True) -> str:
 
 def render_thread_in_index(tid: int, max_replies: int = 3) -> str:
     t = threads.get(tid)
-    if not t: return ""
+    if not t:
+        return ""
     op = posts.get(tid)
-    if not op or op["deleted"]: return ""
+    if not op or op["deleted"]:
+        return ""
     parts = ['<div class="thread">']
     parts.append(render_post(op, is_op=True, show_actions=False))
     replies = [pid for pid in t["posts"][1:] if pid in posts and not posts[pid]["deleted"]]
@@ -258,15 +357,21 @@ def render_thread_in_index(tid: int, max_replies: int = 3) -> str:
     for pid in shown:
         parts.append(render_post(posts[pid], show_actions=False))
     if omitted > 0:
-        word = "ответ" if omitted == 1 else ("ответа" if 2 <= omitted <= 4 else "ответов")
+        if omitted == 1:
+            word = "ответ"
+        elif 2 <= omitted <= 4:
+            word = "ответа"
+        else:
+            word = "ответов"
         parts.append(
             f'<div class="omitted">Пропущено {omitted} {word}. '
             f'<a href="/{t["board"]}/thread/{tid}">Нажмите, чтобы открыть весь тред.</a></div>'
         )
     parts.append(
         f'<div class="btn-row">'
-        f'<a class="reply-btn" href="/{t["board"]}/thread/{tid}">📖 Открыть тред и ответить</a>'
-        f'<span class="small" style="margin-left:8px">Ответов: {t["reply_count"]} &middot; Картинок: {t["image_count"]}</span>'
+        f'<a class="reply-btn" href="/{t["board"]}/thread/{tid}">'
+        f'{ICON_BOOK}Открыть тред и ответить</a>'
+        f'<span class="small">Ответов: {t["reply_count"]} &middot; Картинок: {t["image_count"]}</span>'
         f'</div>'
     )
     parts.append('</div>')
@@ -276,12 +381,16 @@ def render_thread_in_index(tid: int, max_replies: int = 3) -> str:
 @app.exception_handler(FastAPIHTTPException)
 async def http_exc_handler(request: Request, exc: FastAPIHTTPException):
     if request.url.path.startswith("/api/"):
-        return JSONResponse({"error": exc.detail, "status": exc.status_code},
-                            status_code=exc.status_code)
-    body = (f'<div class="boardtitle">Ошибка {exc.status_code}</div>'
-            f'<div style="text-align:center;padding:24px;font-size:12pt">{esc(str(exc.detail))}</div>'
-            f'<div style="text-align:center;padding-bottom:20px">'
-            f'<a class="reply-btn" href="/">🏠 На главную</a></div>')
+        return JSONResponse(
+            {"error": exc.detail, "status": exc.status_code},
+            status_code=exc.status_code,
+        )
+    body = (
+        f'<div class="boardtitle">Ошибка {exc.status_code}</div>'
+        f'<div style="text-align:center;padding:24px;font-size:12pt">{esc(str(exc.detail))}</div>'
+        f'<div style="text-align:center;padding-bottom:20px">'
+        f'<a class="reply-btn" href="/">{ICON_HOME}На главную</a></div>'
+    )
     return HTMLResponse(page(f"Ошибка {exc.status_code}", body), status_code=exc.status_code)
 
 # ==================== API ====================
@@ -299,7 +408,8 @@ def api_threads(board: str):
     out = []
     for tid in boards[board]["threads"]:
         t = threads.get(tid)
-        if not t: continue
+        if not t:
+            continue
         op = posts.get(tid)
         out.append({
             "id": tid,
@@ -322,7 +432,8 @@ def api_thread(tid: int):
     items = []
     for pid in t["posts"]:
         p = posts.get(pid)
-        if not p: continue
+        if not p:
+            continue
         items.append({
             "id": p["id"],
             "content": p["content"],
@@ -369,11 +480,11 @@ async def admin_lock(board: str, tid: int, key: str = Form("")):
     t["locked"] = not t["locked"]
     return RedirectResponse(f"/{board}/thread/{tid}", status_code=303)
 
-# ==================== СТРАНИЦЫ ====================
+# ==================== ГРУППЫ РАЗДЕЛОВ ====================
 BOARD_GROUPS = [
     ("Общие", ["b", "news", "int", "rnd"]),
     ("Технологии", ["g", "diy", "prog", "hard", "soft", "web", "sec"]),
-    ("Игры", ["v", "vg", "retro", "vgm", "mmo"]),
+    ("Игры", ["v", "retro", "vgm", "mmo"]),
     ("Кино, музыка, книги", ["mu", "tv", "cin", "lit", "an", "a"]),
     ("Творчество", ["art", "p", "fa", "po", "ph"]),
     ("Наука и учёба", ["sci", "his", "math", "lang"]),
@@ -381,28 +492,33 @@ BOARD_GROUPS = [
     ("Разное", ["pol", "r", "x", "weird", "dev"]),
 ]
 
+# ==================== СТРАНИЦЫ ====================
 @app.get("/", response_class=HTMLResponse)
 def home():
     body = '<div class="boardtitle">Добро пожаловать на Анонимный форум</div>'
-    body += '<div class="boarddesc">Выберите раздел — всё как на старом добром 4chan, но на русском.</div>'
-    body += '<div class="help">' \
-            '<b>Как пользоваться:</b> выберите раздел → создайте новую тему или откройте существующую → напишите сообщение. ' \
-            'Имя указывать не нужно, все сообщения анонимны. Если хотите удалить свой пост позже — придумайте пароль и запомните его.</div>'
+    body += '<div class="boarddesc">Выберите раздел &mdash; всё как на старом добром 4chan, но на русском.</div>'
+    body += (
+        '<div class="help">'
+        '<b>Как пользоваться:</b> выберите раздел &rarr; создайте новую тему '
+        'или откройте существующую &rarr; напишите сообщение. '
+        'Имя указывать не нужно, все сообщения анонимны. '
+        'Если хотите удалить свой пост позже &mdash; придумайте пароль и запомните его.'
+        '</div>'
+    )
 
-    # группируем
     used = set()
     for group_name, slugs in BOARD_GROUPS:
         present = [s for s in slugs if s in boards]
         if not present:
             continue
-        body += f'<div class="group-title">— {esc(group_name)} —</div>'
+        body += f'<div class="group-title">&mdash; {esc(group_name)} &mdash;</div>'
         body += '<div class="board-grid">'
         for s in present:
             b = boards[s]
             used.add(s)
             body += (
                 f'<div class="board-card">'
-                f'<a href="/{s}/">/{s}/</a>'
+                f'<a href="/{s}/">{ICON_BOARD}/{s}/</a>'
                 f'<div class="name">{esc(b["name"])}</div>'
                 f'<div class="desc">{esc(b["desc"])}</div>'
                 f'<div class="cnt">Тем: {len(b["threads"])}</div>'
@@ -410,16 +526,15 @@ def home():
             )
         body += '</div>'
 
-    # оставшиеся разделы
     rest = [s for s in boards if s not in used]
     if rest:
-        body += '<div class="group-title">— Прочие разделы —</div>'
+        body += '<div class="group-title">&mdash; Прочие разделы &mdash;</div>'
         body += '<div class="board-grid">'
         for s in rest:
             b = boards[s]
             body += (
                 f'<div class="board-card">'
-                f'<a href="/{s}/">/{s}/</a>'
+                f'<a href="/{s}/">{ICON_BOARD}/{s}/</a>'
                 f'<div class="name">{esc(b["name"])}</div>'
                 f'<div class="desc">{esc(b["desc"])}</div>'
                 f'<div class="cnt">Тем: {len(b["threads"])}</div>'
@@ -428,53 +543,65 @@ def home():
         body += '</div>'
 
     body += '<div class="wrap">'
-    body += f'<div class="small" style="margin-top:20px;text-align:center">' \
-            f'Всего разделов: {len(boards)} &middot; Тем: {len(threads)} &middot; Сообщений: {len(posts)}</div>'
+    body += (
+        f'<div class="small" style="margin-top:20px;text-align:center">'
+        f'Всего разделов: {len(boards)} &middot; Тем: {len(threads)} &middot; '
+        f'Сообщений: {len(posts)}</div>'
+    )
     body += '</div>'
     return page("Анонимный форум — Главная", body)
 
 @app.get("/help", response_class=HTMLResponse)
 def help_page():
-    body = '''
+    body = """
 <div class="boardtitle">Помощь</div>
 <div class="wrap" style="max-width:820px">
+
 <div class="help">
 <b>Что это такое?</b><br>
-Это анонимный форум в стиле классического 4chan. Никаких регистраций, имён, лайков и профилей. Только анонимные сообщения.
+Это анонимный форум в стиле классического 4chan. Никаких регистраций, имён, лайков
+и профилей. Только анонимные сообщения.
 </div>
 
 <div class="help">
 <b>Как создать новую тему?</b><br>
 1. На главной странице выберите любой раздел (например /b/).<br>
 2. На странице раздела сверху будет форма <b>«Создать новую тему»</b>.<br>
-3. Впишите тему (необязательно), текст сообщения и нажмите <b>«Создать тему»</b>.
+3. Впишите тему (необязательно), текст сообщения и нажмите кнопку отправки.
 </div>
 
 <div class="help">
 <b>Как ответить в существующую тему?</b><br>
 1. Откройте тему, кликнув по ней.<br>
-2. Прокрутите вниз — там будет форма ответа.<br>
-3. Или нажмите кнопку <b>💬 Ответить</b> под любым сообщением.
+2. Прокрутите вниз &mdash; там будет форма ответа.<br>
+3. Или нажмите кнопку «Ответить» под любым сообщением.
 </div>
 
 <div class="help">
 <b>Что такое &gt;&gt;123?</b><br>
-Это ссылка на другой пост по его номеру. Если вы впишете в тексте <code>&gt;&gt;123</code>, появится кликабельная ссылка на пост №123. Если строка начинается с <code>&gt;</code> (одного), она станет зелёной — это «цитата».
+Это ссылка на другой пост по его номеру. Если вы впишете в тексте
+<code>&gt;&gt;123</code>, появится кликабельная ссылка на пост №123.
+Если строка начинается с <code>&gt;</code> (одного), она станет зелёной &mdash;
+это «цитата».
 </div>
 
 <div class="help">
 <b>Как прикрепить картинку?</b><br>
-Просто вставьте ссылку на изображение в поле «Ссылка на картинку». Прямые ссылки из интернета, оканчивающиеся на .jpg, .png, .gif или .webp.
+Просто вставьте ссылку на изображение в поле «Ссылка на картинку».
+Подойдут прямые ссылки из интернета, оканчивающиеся на .jpg, .png, .gif или .webp.
 </div>
 
 <div class="help">
 <b>Как удалить свой пост?</b><br>
-При создании поста укажите <b>пароль</b> (любой, который запомните). Потом под своим постом нажмите кнопку <b>🗑 Удалить</b> и введите тот же пароль. Если удалить первый пост в теме — вся тема исчезнет.
+При создании поста укажите <b>пароль</b> (любой, который запомните). Потом под своим
+постом нажмите кнопку «Удалить» и введите тот же пароль. Если удалить первый пост
+в теме &mdash; вся тема исчезнет.
 </div>
 
 <div class="help">
 <b>Что такое «без поднятия» (sage)?</b><br>
-Если отметить эту галочку при ответе, тема не будет подниматься наверх списка, но ответ всё равно добавится. Так делают, чтобы не «бампать» тему зря.
+Если отметить эту галочку при ответе, тема не будет подниматься наверх списка,
+но ответ всё равно добавится. Так делают, чтобы не «бампать» тему зря.
 </div>
 
 <div class="help">
@@ -484,14 +611,15 @@ def help_page():
 
 <div class="help">
 <b>Что-то сломалось / пропало?</b><br>
-Форум работает в оперативной памяти. При перезапуске сервера все данные стираются. Это учебный проект.
+Форум работает в оперативной памяти. При перезапуске сервера все данные стираются.
+Это учебный проект.
 </div>
 
 <div style="text-align:center;margin-top:20px">
-<a class="reply-btn" href="/">🏠 На главную</a>
+<a class="reply-btn" href="/">На главную</a>
 </div>
 </div>
-'''
+"""
     return page("Помощь", body)
 
 @app.get("/{board_slug}/", response_class=HTMLResponse)
@@ -501,38 +629,44 @@ def board_index(board_slug: str):
     b = boards[board_slug]
     sorted_threads = sorted(
         [threads[tid] for tid in b["threads"] if tid in threads],
-        key=lambda t: (not t.get("sticky", False), -t["bumped"])
+        key=lambda t: (not t.get("sticky", False), -t["bumped"]),
     )
+
     form = f'''
 <div class="form-box">
-  <h3>✏️ Создать новую тему</h3>
+  <h3>{ICON_PENCIL}Создать новую тему</h3>
   <form method="post" action="/{board_slug}/new">
     <div class="form-row">
-      <label>Тема <span class="hint">(необязательно — короткое название темы)</span></label>
+      <label>Тема <span class="hint">(необязательно &mdash; короткое название темы)</span></label>
       <input type="text" name="subject" maxlength="120" placeholder="Например: Обсуждаем новые игры">
     </div>
     <div class="form-row">
       <label>Сообщение <span class="hint">(обязательно)</span></label>
-      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}" placeholder="Напишите здесь текст. Строка, начинающаяся с > , станет зелёной цитатой."></textarea>
+      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}"
+        placeholder="Напишите здесь текст. Строка, начинающаяся с символа &gt;, станет зелёной цитатой."></textarea>
     </div>
     <div class="form-row">
       <label>Ссылка на картинку <span class="hint">(необязательно, прямая ссылка на .jpg/.png/.gif)</span></label>
       <input type="text" name="image_url" placeholder="https://example.com/cat.jpg">
     </div>
     <div class="form-row">
-      <label>Пароль <span class="hint">(необязательно — чтобы потом удалить свой пост)</span></label>
-      <input type="password" name="password" maxlength="100" placeholder="Запомните его, если хотите удалить пост позже">
+      <label>Пароль <span class="hint">(необязательно &mdash; чтобы потом удалить свой пост)</span></label>
+      <input type="password" name="password" maxlength="100"
+        placeholder="Запомните его, если хотите удалить пост позже">
     </div>
-    <div><button type="submit" class="big">📨 Создать тему</button></div>
+    <div><button type="submit" class="big">{ICON_SEND}Создать тему</button></div>
   </form>
 </div>'''
+
     body = f'<div class="boardtitle">/{board_slug}/ &mdash; {esc(b["name"])}</div>'
     body += f'<div class="boarddesc">{esc(b["desc"])}</div>'
     body += '<div class="wrap">'
     body += form
     if not sorted_threads:
-        body += '<div style="text-align:center;padding:30px;color:#707070;font-size:12pt">' \
-                'Пока тут пусто. Создайте первую тему — форма выше. ☝️</div>'
+        body += (
+            '<div style="text-align:center;padding:30px;color:#707070;font-size:12pt">'
+            'Пока тут пусто. Создайте первую тему &mdash; форма выше.</div>'
+        )
     else:
         for t in sorted_threads:
             body += render_thread_in_index(t["id"])
@@ -551,7 +685,11 @@ def thread_view(board_slug: str, tid: int):
         raise HTTPException(404, "Тема не найдена")
 
     body = f'<div class="boardtitle">/{board_slug}/ &mdash; Тема №{tid}</div>'
-    body += f'<div class="wrap"><a class="reply-btn" href="/{board_slug}/">← Вернуться в /{board_slug}/</a></div>'
+    body += (
+        f'<div class="wrap">'
+        f'<a class="reply-btn" href="/{board_slug}/">{ICON_BACK}Вернуться в /{board_slug}/</a>'
+        f'</div>'
+    )
     body += '<div class="wrap" style="margin-top:10px">'
     body += render_post(op, is_op=True, show_actions=False)
     for pid in t["posts"][1:]:
@@ -563,37 +701,44 @@ def thread_view(board_slug: str, tid: int):
     body += '</div>'
 
     if t.get("locked"):
-        body += '<div class="form-box" style="text-align:center;color:#DD0000;font-weight:700;font-size:12pt">' \
-                '🔒 Эта тема закрыта. Новые ответы запрещены.</div>'
+        body += (
+            f'<div class="form-box lockbox">'
+            f'{ICON_LOCK}Эта тема закрыта. Новые ответы запрещены.'
+            f'</div>'
+        )
     else:
         body += f'''
 <div class="form-box">
-  <h3>💬 Ответить в тему №{tid}</h3>
+  <h3>{ICON_REPLY}Ответить в тему №{tid}</h3>
   <form method="post" action="/{board_slug}/thread/{tid}/reply">
     <div class="form-row">
       <label>Сообщение <span class="hint">(обязательно)</span></label>
-      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}" placeholder="Напишите ответ. Кнопка 💬 под сообщением вставит ссылку &gt;&gt;номер."></textarea>
+      <textarea id="reply-text" name="content" rows="7" maxlength="{MAX_CONTENT_LEN}"
+        placeholder="Напишите ответ. Кнопка «Ответить» под сообщением вставит ссылку &gt;&gt;номер."></textarea>
     </div>
     <div class="form-row">
       <label>Ссылка на картинку <span class="hint">(необязательно)</span></label>
       <input type="text" name="image_url" placeholder="https://example.com/pic.png">
     </div>
     <div class="form-row">
-      <label>Пароль <span class="hint">(необязательно — чтобы удалить ответ позже)</span></label>
+      <label>Пароль <span class="hint">(необязательно &mdash; чтобы удалить ответ позже)</span></label>
       <input type="password" name="password" maxlength="100">
     </div>
     <div class="form-row">
-      <label style="font-weight:400">
-        <input type="checkbox" name="sage" value="1" style="width:auto;margin-right:6px">
-        <b>Без поднятия темы</b> <span class="hint">— ответ не поднимет тему наверх</span>
+      <label style="font-weight:400;display:flex;align-items:center;gap:8px">
+        <input type="checkbox" name="sage" value="1" style="width:auto">
+        <span><b>Без поднятия темы</b>
+        <span class="hint">— ответ не поднимет тему наверх</span></span>
       </label>
     </div>
-    <div><button type="submit" class="big">📨 Отправить ответ</button></div>
+    <div><button type="submit" class="big">{ICON_SEND}Отправить ответ</button></div>
   </form>
 </div>'''
-    body += f'<div class="wrap" style="margin-bottom:24px;text-align:center">' \
-            f'<a class="reply-btn" href="/{board_slug}/">← В раздел</a> ' \
-            f'<a class="reply-btn" href="#top">↑ Наверх</a></div>'
+    body += (
+        f'<div class="wrap" style="margin-bottom:24px;text-align:center">'
+        f'<a class="reply-btn" href="/{board_slug}/">{ICON_BACK}В раздел</a> '
+        f'<a class="reply-btn" href="#top">{ICON_TOP}Наверх</a></div>'
+    )
     return page(f'/{board_slug}/ — Тема {tid}', body)
 
 # ==================== ДЕЙСТВИЯ ====================
@@ -732,7 +877,7 @@ def init_boards():
     create_board("vgm",  "Игровая музыка",      "Саундтреки и чиптюн.")
     create_board("mmo",  "Онлайн-игры",         "MMO, шутеры, кооп.")
 
-    # Кино/музыка/книги
+    # Кино / музыка / книги
     create_board("mu",   "Музыка",              "Всё о музыке и группах.")
     create_board("tv",   "Кино и сериалы",      "Фильмы, сериалы, аниме.")
     create_board("cin",  "Кинематограф",        "Режиссёры, киноискусство.")
@@ -742,7 +887,7 @@ def init_boards():
 
     # Творчество
     create_board("art",  "Искусство",           "Рисунки, живопись, галереи.")
-    create_board("p",    "Фотография",         "Фото и техника съёмки.")
+    create_board("p",    "Фотография",          "Фото и техника съёмки.")
     create_board("fa",   "Рисование",           "Уроки и работы художников.")
     create_board("po",   "Поэзия",              "Стихи и проза.")
     create_board("ph",   "Философия",           "Размышления и дискуссии.")
