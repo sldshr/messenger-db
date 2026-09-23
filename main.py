@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sld")
 
 START_TIME = time.time()
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 app = FastAPI(title="SLD", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -165,9 +165,7 @@ async def security_middleware(request: Request, call_next):
                 return JSONResponse({"detail": "payload_too_large"}, status_code=413)
         except ValueError:
             return JSONResponse({"detail": "bad_request"}, status_code=400)
-
     response = await call_next(request)
-
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
@@ -175,7 +173,6 @@ async def security_middleware(request: Request, call_next):
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-
     ct = response.headers.get("content-type", "")
     if ct.startswith("text/html"):
         response.headers["Content-Security-Policy"] = (
@@ -183,14 +180,9 @@ async def security_middleware(request: Request, call_next):
             "script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: https: http:; "
-            "font-src 'self'; "
-            "connect-src 'self'; "
-            "media-src 'none'; "
-            "object-src 'none'; "
-            "frame-src 'none'; "
-            "worker-src 'none'; "
-            "base-uri 'self'; "
-            "form-action 'self'; "
+            "font-src 'self'; connect-src 'self'; "
+            "media-src 'none'; object-src 'none'; frame-src 'none'; "
+            "worker-src 'none'; base-uri 'self'; form-action 'self'; "
             "frame-ancestors 'none'"
         )
     return response
@@ -242,8 +234,7 @@ async def _startup():
 
 def _run_sync(fn, *args):
     if MAIN_LOOP and not MAIN_LOOP.is_closed():
-        try:
-            MAIN_LOOP.call_soon_threadsafe(fn, *args); return
+        try: MAIN_LOOP.call_soon_threadsafe(fn, *args); return
         except RuntimeError: pass
     fn(*args)
 
@@ -261,13 +252,10 @@ def bus_broadcast(room: str, ev: dict, except_nick: Optional[str] = None) -> Non
 def broadcast_post_change(post: dict, except_nick: Optional[str] = None, feed: bool = False) -> None:
     if not post: return
     pid = post.get("id")
-    if pid:
-        bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=except_nick)
+    if pid: bus_broadcast("post:" + pid, {"type": "refresh"}, except_nick=except_nick)
     author = post.get("author")
-    if author:
-        bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=except_nick)
-    if feed:
-        bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
+    if author: bus_broadcast("profile:" + author, {"type": "refresh"}, except_nick=except_nick)
+    if feed: bus_broadcast("feed", {"type": "refresh"}, except_nick=except_nick)
 
 
 def _is_private_host(host: str) -> bool:
@@ -284,29 +272,21 @@ def _is_private_host(host: str) -> bool:
         if (ip.is_private or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return True
-        if str(ip).startswith("169.254."):
-            return True
+        if str(ip).startswith("169.254."): return True
         return False
     except ValueError:
         return False
 
 
 def _safe_url(u) -> str:
-    if not u or not isinstance(u, str):
-        return ""
+    if not u or not isinstance(u, str): return ""
     u = u.strip()
-    if not u or len(u) > 500:
-        return ""
-    try:
-        p = urlparse(u)
-    except Exception:
-        return ""
-    if p.scheme not in ("http", "https"):
-        return ""
-    if not p.netloc:
-        return ""
-    if _is_private_host(p.hostname or ""):
-        return ""
+    if not u or len(u) > 500: return ""
+    try: p = urlparse(u)
+    except Exception: return ""
+    if p.scheme not in ("http", "https"): return ""
+    if not p.netloc: return ""
+    if _is_private_host(p.hostname or ""): return ""
     return u
 
 
@@ -376,8 +356,7 @@ def _nick_login_ok(nick: str) -> bool:
     now = time.time()
     arr = [t for t in _NICK_FAILS.get(nick.lower(), []) if now - t < 900]
     if len(arr) >= 10:
-        _NICK_FAILS[nick.lower()] = arr
-        return False
+        _NICK_FAILS[nick.lower()] = arr; return False
     return True
 
 
@@ -432,8 +411,7 @@ def detect_device(ua: str) -> str:
 def fetch_og_data(url: str) -> Optional[dict]:
     if not url: return None
     safe = _safe_url(url)
-    if not safe:
-        return None
+    if not safe: return None
     url = safe
     if url in _OG_CACHE: return _OG_CACHE[url]
     try:
@@ -443,8 +421,7 @@ def fetch_og_data(url: str) -> Optional[dict]:
         })
         class _NoPrivateRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
-                if not _safe_url(newurl):
-                    return None
+                if not _safe_url(newurl): return None
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
         opener = urllib.request.build_opener(_NoPrivateRedirect())
         with opener.open(req, timeout=4) as r:
@@ -634,18 +611,15 @@ def db_load_users_batch(nicks: List[str]) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     if not nicks: return out
     now = time.time()
-    missing = []
-    seen = set()
+    missing = []; seen = set()
     for n in nicks:
         if not n: continue
         ln = n.lower()
         if ln in seen: continue
         seen.add(ln)
         e = _USER_CACHE.get(ln)
-        if e and now - e[0] < USER_CACHE_TTL:
-            out[ln] = e[1]
-        else:
-            missing.append(n)
+        if e and now - e[0] < USER_CACHE_TTL: out[ln] = e[1]
+        else: missing.append(n)
     if not missing: return out
     if supabase:
         try:
@@ -654,13 +628,11 @@ def db_load_users_batch(nicks: List[str]) -> Dict[str, dict]:
                 u = _norm_user_row(row)
                 out[u["nick"].lower()] = u
                 _USER_CACHE[u["nick"].lower()] = (now, u)
-        except Exception as e:
-            log.error("db_load_users_batch error: %s", e)
+        except Exception as e: log.error("db_load_users_batch error: %s", e)
     else:
         for n in missing:
             for u in USERS.values():
-                if u["nick"].lower() == n.lower():
-                    out[u["nick"].lower()] = u
+                if u["nick"].lower() == n.lower(): out[u["nick"].lower()] = u
     return out
 
 
@@ -684,10 +656,8 @@ def db_save_user(u: dict) -> None:
     USERS[u["nick"]] = u
     if not supabase:
         invalidate_user_cache(u["nick"]); return
-    try:
-        supabase.table("users").upsert(_user_payload(u)).execute()
-    except Exception as e:
-        log.error("db_save_user error: %s", e)
+    try: supabase.table("users").upsert(_user_payload(u)).execute()
+    except Exception as e: log.error("db_save_user error: %s", e)
     USERS.pop(u["nick"], None)
     invalidate_user_cache(u["nick"])
 
@@ -696,10 +666,8 @@ def db_update_user_fields(nick: str, patch: dict) -> None:
     if not supabase:
         if nick in USERS: USERS[nick].update(patch)
         invalidate_user_cache(nick); return
-    try:
-        supabase.table("users").update(patch).eq("nick", nick).execute()
-    except Exception as e:
-        log.error("db_update_user_fields error: %s", e)
+    try: supabase.table("users").update(patch).eq("nick", nick).execute()
+    except Exception as e: log.error("db_update_user_fields error: %s", e)
     invalidate_user_cache(nick)
 
 
@@ -723,8 +691,7 @@ def db_create_post(p: dict) -> None:
         "og_data": json.dumps(p.get("og_data")) if p.get("og_data") else "",
     }
     if p.get("device"): payload["device"] = p["device"]
-    try:
-        supabase.table("posts").insert(payload).execute()
+    try: supabase.table("posts").insert(payload).execute()
     except Exception as e:
         log.error("db_create_post error: %s", e)
         payload.pop("device", None)
@@ -771,8 +738,7 @@ def db_get_quotes(post_ids: List[str]) -> Dict[str, dict]:
             for row in r.data or []:
                 row["created_at"] = iso_to_ts(row.get("created_at"))
                 out[row["id"]] = row
-        except Exception as e:
-            log.error("db_get_quotes: %s", e)
+        except Exception as e: log.error("db_get_quotes: %s", e)
         return out
     for pid in post_ids:
         p = POSTS_MEM.get(pid)
@@ -931,8 +897,7 @@ def db_delete_comment(cid: str) -> None:
             if not comments: continue
             to_del = {cid}
             for c in comments:
-                if c.get("parent_id") == cid:
-                    to_del.add(c["id"])
+                if c.get("parent_id") == cid: to_del.add(c["id"])
             p["comments"] = [c for c in comments if c["id"] not in to_del]
         return
     try:
@@ -985,10 +950,8 @@ def _should_notify(to_nick: str, ntype: str, from_nick: str,
     field = NOTIFY_TYPE_TO_FIELD.get(ntype)
     if not field: return True
     u = None
-    if users_map is not None:
-        u = users_map.get(to_nick.lower())
-    else:
-        u = db_load_user_cached(to_nick)
+    if users_map is not None: u = users_map.get(to_nick.lower())
+    else: u = db_load_user_cached(to_nick)
     if u is None: return True
     return bool(u.get(field, True))
 
@@ -1000,8 +963,7 @@ def db_notify_many(notifications: List[dict], users_map: Optional[Dict[str, dict
         users_map = db_load_users_batch(to_nicks)
     valid = []
     for n in notifications:
-        if not _should_notify(n["to_nick"], n["ntype"], n["from_nick"], users_map):
-            continue
+        if not _should_notify(n["to_nick"], n["ntype"], n["from_nick"], users_map): continue
         valid.append({
             "id": uuid.uuid4().hex[:10],
             "to_nick": n["to_nick"], "type": n["ntype"],
@@ -1009,19 +971,15 @@ def db_notify_many(notifications: List[dict], users_map: Optional[Dict[str, dict
             "post_id": n.get("post_id", "") or "",
             "comment_id": n.get("comment_id") or None,
             "text": n.get("text", "") or "",
-            "read": False,
-            "created_at": ts_to_iso(time.time()),
+            "read": False, "created_at": ts_to_iso(time.time()),
         })
     if not valid: return
     if supabase:
-        try:
-            supabase.table("notifications").insert(valid).execute()
-        except Exception as e:
-            log.error("db_notify_many: %s", e)
+        try: supabase.table("notifications").insert(valid).execute()
+        except Exception as e: log.error("db_notify_many: %s", e)
     else:
         for row in valid:
-            NOTIFS_MEM.setdefault(row["to_nick"], []).append({
-                **row, "created_at": time.time()})
+            NOTIFS_MEM.setdefault(row["to_nick"], []).append({**row, "created_at": time.time()})
     for row in valid:
         bus_publish(row["to_nick"], {"type": "notif_changed"})
 
@@ -1125,8 +1083,7 @@ def normalize_og(raw):
         try:
             val = json.loads(raw)
             if isinstance(val, dict): v = val
-        except Exception:
-            return None
+        except Exception: return None
     if not v: return None
     url = _safe_url(v.get("url"))
     if not url: return None
@@ -1142,16 +1099,13 @@ def normalize_og(raw):
 def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = True) -> List[dict]:
     if not posts: return []
     post_ids = [p["id"] for p in posts]
-
     author_nicks = set()
     for p in posts:
         if p.get("author"): author_nicks.add(p["author"])
-
     quoted_ids = [p.get("quoted_post_id") for p in posts if p.get("quoted_post_id")]
     quotes = db_get_quotes(list(set(quoted_ids))) if quoted_ids else {}
     for q in quotes.values():
         if q.get("author"): author_nicks.add(q["author"])
-
     users_map = db_load_users_batch(list(author_nicks))
 
     votes = db_post_votes(post_ids)
@@ -1169,8 +1123,7 @@ def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = Tru
             for v in cvotes: cvmap.setdefault(v["comment_id"], {})[v["voter_id"]] = v["direction"]
         ccounts: Dict[str, int] = {}
     else:
-        ccounts = db_comment_counts(post_ids)
-        cmap = {}; cvmap = {}
+        ccounts = db_comment_counts(post_ids); cmap = {}; cvmap = {}
 
     out = []
     for p in posts:
@@ -1188,8 +1141,7 @@ def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = Tru
                               "author": c.get("author"), "parent_id": c.get("parent_id"),
                               "likes": clikes, "user_like": cuv})
             comment_count = len(clist)
-        else:
-            comment_count = ccounts.get(p["id"], 0)
+        else: comment_count = ccounts.get(p["id"], 0)
 
         quoted = None
         qid = p.get("quoted_post_id")
@@ -1209,8 +1161,7 @@ def build_posts_full(posts: List[dict], voter_id: str, with_comments: bool = Tru
             "author_show_device": bool(author_u.get("show_device_badge", True)),
             "quoted_post_id": qid, "quoted": quoted,
             "likes": likes, "user_like": uv,
-            "comments": clist,
-            "comment_count": comment_count,
+            "comments": clist, "comment_count": comment_count,
         })
     return out
 
@@ -1270,20 +1221,16 @@ def api_check_nick(nick: str, request: Request):
     ip = get_client_ip(request)
     if not rate_limit("chknick:" + ip, 90, 60): raise HTTPException(429, "err_rate_limit")
     n = (nick or "").strip().lstrip("@")
-    if not NICK_RE.match(n):
-        return {"available": False, "reason": "err_bad_nick"}
-    if n.lower() in RESERVED_NICKS:
-        return {"available": False, "reason": "err_nick_reserved"}
-    if db_load_user(n):
-        return {"available": False, "reason": "err_nick_taken"}
+    if not NICK_RE.match(n): return {"available": False, "reason": "err_bad_nick"}
+    if n.lower() in RESERVED_NICKS: return {"available": False, "reason": "err_nick_reserved"}
+    if db_load_user(n): return {"available": False, "reason": "err_nick_taken"}
     return {"available": True, "reason": ""}
 
 
 @app.post("/api/room")
 def api_room(data: RoomIn, request: Request):
     u = get_current_user(request)
-    if u:
-        bus.set_rooms(u["nick"], data.rooms or []); return {"ok": True}
+    if u: bus.set_rooms(u["nick"], data.rooms or []); return {"ok": True}
     if data.anon_id:
         nick = "anon:" + re.sub(r"[^a-zA-Z0-9]", "", data.anon_id)[:32]
         if nick != "anon:":
@@ -1315,8 +1262,7 @@ def api_register(data: RegisterIn, request: Request):
          "password": hash_password(data.password), "created_at": time.time(),
          "following": set(), "followers": set(),
          "allow_followers_view": True, "allow_following_view": True,
-         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True,
-         "show_device_badge": True}
+         "avatar_emoji": DEFAULT_EMOJI, "show_link_previews": True, "show_device_badge": True}
     for f in NOTIFY_FIELDS: u[f] = True
     db_save_user(u)
     token = create_session(nick)
@@ -1552,15 +1498,13 @@ def api_create(payload: PostIn, request: Request):
     device = detect_device(request.headers.get("user-agent", ""))
     p = {"id": pid, "text": text, "author": u["nick"],
          "created_at": time.time(), "device": device,
-         "quoted_post_id": payload.quoted_post_id or None,
-         "og_data": og}
+         "quoted_post_id": payload.quoted_post_id or None, "og_data": og}
     db_create_post(p)
 
     mentions = extract_mentions(text)
     mention_nicks = [m for m in mentions if m.lower() != u["nick"].lower()]
     mention_users = db_load_users_batch(mention_nicks) if mention_nicks else {}
-    notifications: List[dict] = []
-    notified = set()
+    notifications: List[dict] = []; notified = set()
     for m in mention_nicks:
         k = m.lower()
         if k in notified: continue
@@ -1579,8 +1523,7 @@ def api_create(payload: PostIn, request: Request):
         if qp and qp.get("author") and qp["author"].lower() != u["nick"].lower():
             notifications.append({"to_nick": qp["author"], "ntype": "quote", "from_nick": u["nick"],
                                   "post_id": pid, "text": text[:140]})
-    if notifications:
-        db_notify_many(notifications)
+    if notifications: db_notify_many(notifications)
     broadcast_post_change(p, feed=True)
     return build_posts_full([p], "u:" + u["nick"], with_comments=True)[0]
 
@@ -1595,8 +1538,7 @@ def api_edit_post(pid: str, payload: PostEditIn, request: Request):
     text = payload.text.strip()
     if not text: raise HTTPException(400, "empty")
     if len(text) > MAX_POST_LEN: raise HTTPException(400, "too long")
-    db_update_post_text(pid, text)
-    p["text"] = text
+    db_update_post_text(pid, text); p["text"] = text
     broadcast_post_change(p, feed=False)
     return {"ok": True, "text": text}
 
@@ -1623,8 +1565,7 @@ def api_like_post(pid: str, request: Request):
     u = require_user(request)
     if not rate_limit("like:" + u["nick"], 120, 60): raise HTTPException(429, "err_rate_limit")
     vid = "u:" + u["nick"]
-    existing = db_post_votes([pid])
-    cur = 0
+    existing = db_post_votes([pid]); cur = 0
     for row in existing:
         if row["voter_id"] == vid: cur = row["direction"]; break
     new = 0 if cur == 1 else 1
@@ -1632,8 +1573,7 @@ def api_like_post(pid: str, request: Request):
     try:
         allv = db_post_votes([pid])
         likes = sum(1 for r in allv if r["direction"] == 1)
-    except Exception:
-        likes = 0
+    except Exception: likes = 0
     broadcast_post_change(p, except_nick=u["nick"], feed=False)
     return {"ok": True, "likes": likes, "user_like": new}
 
@@ -1661,8 +1601,7 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
                        "parent_id": parent_id, "text": text, "created_at": now_ts})
 
     mentions = extract_mentions(text)
-    notifications: List[dict] = []
-    notified = set()
+    notifications: List[dict] = []; notified = set()
     if parent_id and parent:
         if parent["author"].lower() != u["nick"].lower():
             notifications.append({"to_nick": parent["author"], "ntype": "reply",
@@ -1684,14 +1623,10 @@ def api_add_comment(pid: str, c: CommentIn, request: Request):
         notifications.append({"to_nick": m, "ntype": "mention", "from_nick": u["nick"],
                               "post_id": pid, "comment_id": cid, "text": text[:140]})
         notified.add(k)
-    if notifications:
-        db_notify_many(notifications, users_map=mention_users)
-
+    if notifications: db_notify_many(notifications, users_map=mention_users)
     broadcast_post_change(post, except_nick=u["nick"], feed=False)
     return {
-        "ok": True,
-        "post_id": pid,
-        "post_author": post["author"],
+        "ok": True, "post_id": pid, "post_author": post["author"],
         "comment": {
             "id": cid, "text": text, "author": u["nick"],
             "parent_id": parent_id, "created_at": ts_to_iso(now_ts),
@@ -1736,8 +1671,7 @@ def api_like_comment(pid: str, cid: str, request: Request):
     u = require_user(request)
     if not rate_limit("like:" + u["nick"], 120, 60): raise HTTPException(429, "err_rate_limit")
     vid = "u:" + u["nick"]
-    existing = db_comment_votes([cid])
-    cur = 0
+    existing = db_comment_votes([cid]); cur = 0
     for row in existing:
         if row["voter_id"] == vid: cur = row["direction"]; break
     new = 0 if cur == 1 else 1
@@ -1745,8 +1679,7 @@ def api_like_comment(pid: str, cid: str, request: Request):
     try:
         allv = db_comment_votes([cid])
         likes = sum(1 for r in allv if r["direction"] == 1)
-    except Exception:
-        likes = 0
+    except Exception: likes = 0
     broadcast_post_change(p, except_nick=u["nick"], feed=False)
     return {"ok": True, "likes": likes, "user_like": new}
 
@@ -1793,7 +1726,6 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
     else:
         nick = "anon:" + uuid.uuid4().hex[:12]
         bus.set_rooms(nick, ["feed"])
-
     q = await bus.subscribe(nick)
     async def gen():
         try:
@@ -1807,12 +1739,9 @@ async def api_events(request: Request, token: str = "", anon: str = ""):
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.warning("[SSE] error for %s: %s", nick, e)
-        finally:
-            bus.unsubscribe(nick, q)
+        except asyncio.CancelledError: pass
+        except Exception as e: log.warning("[SSE] error for %s: %s", nick, e)
+        finally: bus.unsubscribe(nick, q)
     return StreamingResponse(gen(), media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -1829,10 +1758,13 @@ TEXTS = {
         "session_expired_hint": "Ваша сессия была завершена на сервере. Войдите заново, чтобы продолжить.",
         "network_error_hint": "Не удалось связаться с сервером. Проверьте соединение и попробуйте снова.",
         "booting": "Загрузка…",
+        "loading": "Загрузка…",
         "check_nick": "Проверить ник",
         "checking": "Проверка…",
         "nick_available": "Ник свободен",
         "refresh": "Обновить",
+        "change_lang": "Язык",
+        "change_theme": "Тема",
         "search_ph": "Поиск людей и постов",
         "post_ph": "Что нового?",
         "comment_ph": "Комментарий... Shift+Enter — отправить",
@@ -1921,6 +1853,9 @@ TEXTS = {
         "settings_logout": "Выйти",
         "settings_sound": "Звук уведомлений",
         "settings_sound_hint": "Проигрывать лёгкий звук при новом уведомлении",
+        "settings_profile_section": "Профиль",
+        "settings_session_section": "Сессия",
+        "settings_saved": "Сохранено",
         "theme_light": "Светлая", "theme_dark": "Тёмная",
         "notif_title": "Уведомления", "notif_empty": "Здесь пока пусто",
         "notif_follow": "подписался на вас",
@@ -2039,10 +1974,13 @@ TEXTS = {
         "session_expired_hint": "Your session has ended on the server. Please log in again to continue.",
         "network_error_hint": "Could not reach the server. Check your connection and try again.",
         "booting": "Loading…",
+        "loading": "Loading…",
         "check_nick": "Check nick",
         "checking": "Checking…",
         "nick_available": "Nick is available",
         "refresh": "Refresh",
+        "change_lang": "Language",
+        "change_theme": "Theme",
         "search_ph": "Search people and posts",
         "post_ph": "What's new?",
         "comment_ph": "Comment... Shift+Enter to send",
@@ -2131,6 +2069,9 @@ TEXTS = {
         "settings_logout": "Log out",
         "settings_sound": "Notification sound",
         "settings_sound_hint": "Play a soft sound on new notification",
+        "settings_profile_section": "Profile",
+        "settings_session_section": "Session",
+        "settings_saved": "Saved",
         "theme_light": "Light", "theme_dark": "Dark",
         "notif_title": "Notifications", "notif_empty": "Nothing here yet",
         "notif_follow": "followed you",
@@ -2297,6 +2238,7 @@ I_LOCK = svg('<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7
 I_AT = svg('<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/>', size=18)
 I_INFO = svg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>', size=18)
 I_REFRESH = svg('<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>', size=18)
+I_GLOBE = svg('<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>', size=16)
 
 
 def _urlenc(svg_str: str) -> str:
@@ -2365,23 +2307,15 @@ input, textarea { user-select: text; -webkit-user-select: text; font-size: 16px;
 button { cursor: pointer; }
 a { -webkit-tap-highlight-color: transparent; }
 
-/* Layout: normal app */
 .layout { display: flex; width: 100%; height: 100vh; height: 100dvh; background: var(--bg); max-width: 1100px; margin: 0 auto; }
-
-/* Layout: auth/boot — full center */
 body[data-mode="auth"] .layout,
-body[data-mode="boot"] .layout {
-  justify-content: center; align-items: center; max-width: 100%;
-}
+body[data-mode="boot"] .layout { justify-content: center; align-items: center; max-width: 100%; }
 body[data-mode="auth"] .sidebar,
 body[data-mode="boot"] .sidebar { display: none !important; }
 body[data-mode="auth"] .main,
-body[data-mode="boot"] .main {
-  max-width: 100%; background: transparent; overflow-y: auto; overflow-x: hidden;
-}
-body[data-mode="auth"] .main::-webkit-scrollbar,
-body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
+body[data-mode="boot"] .main { max-width: 100%; background: transparent; overflow-y: auto; overflow-x: hidden; }
 
+/* ============ SIDEBAR ============ */
 .sidebar { flex: 0 0 232px; width: 232px; background: var(--bg); display: flex; flex-direction: column; padding: 28px 16px 20px; overflow: hidden; }
 .sidebar .logo { font-size: 22px; font-weight: 900; letter-spacing: -0.5px; padding: 0 14px 22px; color: var(--text); user-select: none; }
 .sidebar .logo::after { content: '.'; color: var(--accent); }
@@ -2402,6 +2336,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .sidebar-logout svg { color: currentColor; opacity: .8; flex-shrink: 0; }
 .sidebar-logout span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ============ MAIN ============ */
 .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; }
 .main-body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; }
 .main-inner { max-width: 680px; margin: 0 auto; padding: 8px 24px 60px; }
@@ -2409,14 +2344,19 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .main-header { display: flex; align-items: center; gap: 10px; padding: 20px 24px 12px; max-width: 680px; margin: 0 auto; width: 100%; }
 .main-header.wide { max-width: 100%; padding-left: 20px; padding-right: 20px; }
 .main-header .title { flex: 1; font-size: 21px; font-weight: 800; letter-spacing: -0.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.main-header .icon-btn { margin-left: auto; }
-.main-header .icon-btn + .icon-btn { margin-left: 0; }
+.main-header .icon-btn { margin-left: 0; }
+.main-header .icon-btn:last-child { margin-left: 0; }
+.main-header .title + .icon-btn { margin-left: auto; }
 
 .icon-btn { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; color: var(--text-2); cursor: pointer; padding: 0; text-decoration: none; border-radius: 10px; transition: background .15s ease, color .15s ease; flex-shrink: 0; }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn.danger:hover { color: var(--danger); }
-.icon-btn.spinning svg { animation: spin .8s linear infinite; }
+.icon-btn svg { transition: opacity .15s ease; }
+.icon-btn.spinning { color: var(--accent); pointer-events: none; }
+.icon-btn.spinning svg { animation: spin .6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
+/* ============ PILL TABS ============ */
 .pill-tabs { position: relative; display: flex; gap: 0; padding: 4px; background: var(--card-2); border-radius: 12px; margin-bottom: 16px; isolation: isolate; }
 .pill-tabs .pill-slider { position: absolute; top: 4px; left: 0; height: calc(100% - 8px); background: var(--bg-elev); border-radius: 9px; pointer-events: none; z-index: 0; transition: transform .32s cubic-bezier(.4, 0, .2, 1), width .32s cubic-bezier(.4, 0, .2, 1); box-shadow: var(--shadow-sm); will-change: transform, width; }
 [data-theme="dark"] .pill-tabs .pill-slider { background: var(--card-3); }
@@ -2432,6 +2372,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; margin-bottom: 14px; }
 
+/* ============ COMPOSER ============ */
 .composer-avatar-row { display: flex; gap: 14px; align-items: flex-start; }
 .composer-avatar-col { display: flex; flex-direction: column; gap: 8px; align-items: center; flex-shrink: 0; }
 .composer-body { flex: 1; min-width: 0; }
@@ -2464,6 +2405,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .avatar.sm { width: 36px; height: 36px; font-size: 18px; }
 .avatar.lg { width: 76px; height: 76px; font-size: 42px; border-width: 2px; }
 
+/* ============ PROFILE ============ */
 .profile-hero { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 20px; margin-bottom: 16px; }
 .profile-hero-row { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 14px; }
 .profile-hero-avatar { flex-shrink: 0; }
@@ -2488,6 +2430,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .round-action { width: 36px; height: 36px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); border-radius: 10px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; transition: background .15s ease; }
 .round-action:hover { background: var(--hover); }
 
+/* ============ POST ============ */
 .post-card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 18px; margin-bottom: 12px; transition: border-color .15s ease; }
 .post-card:hover { border-color: var(--line-2); }
 .post-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 10px; }
@@ -2557,6 +2500,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .notif-row .snippet { margin-top: 8px; padding: 8px 12px; background: var(--card-3); border-radius: 10px; font-size: 13px; color: var(--muted); white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere; line-height: 1.5; }
 .notif-row .time { font-size: 12px; color: var(--muted-2); margin-top: 6px; }
 
+/* ============ SETTINGS ============ */
 .settings-layout { display: flex; gap: 24px; max-width: 100%; margin: 0 auto; width: 100%; padding: 4px 24px 40px; min-height: 100%; }
 .settings-nav { flex: 0 0 200px; display: flex; flex-direction: column; gap: 2px; padding-top: 4px; }
 .settings-nav-btn { display: flex; align-items: center; gap: 12px; padding: 11px 14px; text-align: left; background: transparent; border: none; color: var(--text-2); cursor: pointer; border-radius: 10px; font: inherit; font-size: 14.5px; font-weight: 500; transition: background .15s ease, color .15s ease; }
@@ -2596,6 +2540,19 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .color-swatch:hover { transform: scale(1.1); }
 .color-swatch.active { border-color: var(--bg); box-shadow: 0 0 0 2px var(--text); }
 
+/* ============ ACCOUNT SECTION ============ */
+.account-hero { display: flex; align-items: center; gap: 14px; padding: 14px; background: var(--card-2); border-radius: 14px; margin-bottom: 16px; }
+.account-hero-avatar { flex-shrink: 0; }
+.account-hero-info { flex: 1; min-width: 0; }
+.account-hero-name { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-hero-nick { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.account-emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); gap: 4px; max-height: 180px; overflow-y: auto; padding: 6px; background: var(--card-2); border-radius: 12px; }
+.account-emoji-opt { aspect-ratio: 1 / 1; background: transparent; border: 2px solid transparent; border-radius: 10px; font-size: 22px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background .15s ease, border-color .15s ease, transform .1s ease; padding: 0; }
+.account-emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
+.account-emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
+
+/* ============ SETTINGS LIST MOBILE ============ */
 .settings-list-mobile { display: flex; flex-direction: column; gap: 8px; padding: 4px 16px 40px; max-width: 680px; margin: 0 auto; width: 100%; }
 .settings-list-row {
   display: flex; align-items: center; gap: 14px;
@@ -2628,32 +2585,13 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .emoji-opt:hover { background: var(--hover); transform: scale(1.05); }
 .emoji-opt.active { background: var(--accent-soft); border-color: var(--accent); }
 
-/* ============ BOOT SCREEN ============ */
-.boot-screen {
-  min-height: 100vh; min-height: 100dvh;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 20px;
-  background: var(--bg);
-  padding: 24px;
-}
-.boot-logo {
-  width: 68px; height: 68px;
-  border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--accent);
-  color: var(--accent-fg);
-  font-weight: 900; font-size: 24px;
-  letter-spacing: -1px;
-  animation: bootPulse 1.8s ease-in-out infinite;
-  box-shadow: 0 8px 24px var(--accent-soft-2);
-}
-@keyframes bootPulse {
-  0%,100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.06); opacity: .85; }
-}
+/* ============ BOOT ============ */
+.boot-screen { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; background: var(--bg); padding: 24px; }
+.boot-logo { width: 68px; height: 68px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-fg); font-weight: 900; font-size: 24px; letter-spacing: -1px; animation: bootPulse 1.8s ease-in-out infinite; box-shadow: 0 8px 24px var(--accent-soft-2); }
+@keyframes bootPulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.06); opacity: .85; } }
 .boot-text { color: var(--muted); font-size: 13.5px; }
 
-/* ============ AUTH SCREEN ============ */
+/* ============ AUTH ============ */
 .auth-page {
   position: relative;
   min-height: 100vh; min-height: 100dvh;
@@ -2663,28 +2601,9 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   overflow: hidden;
   width: 100%;
 }
-.auth-page::before {
-  content: '';
-  position: absolute;
-  width: 60vmax; height: 60vmax;
-  top: -30vmax; left: -20vmax;
-  border-radius: 50%;
-  background: radial-gradient(circle, var(--accent-soft-2) 0%, transparent 65%);
-  filter: blur(60px);
-  pointer-events: none;
-  z-index: 0;
-}
-.auth-page::after {
-  content: '';
-  position: absolute;
-  width: 50vmax; height: 50vmax;
-  bottom: -25vmax; right: -15vmax;
-  border-radius: 50%;
-  background: radial-gradient(circle, var(--accent-soft) 0%, transparent 65%);
-  filter: blur(60px);
-  pointer-events: none;
-  z-index: 0;
-}
+.auth-page::before { content: ''; position: absolute; width: 60vmax; height: 60vmax; top: -30vmax; left: -20vmax; border-radius: 50%; background: radial-gradient(circle, var(--accent-soft-2) 0%, transparent 65%); filter: blur(60px); pointer-events: none; z-index: 0; }
+.auth-page::after { content: ''; position: absolute; width: 50vmax; height: 50vmax; bottom: -25vmax; right: -15vmax; border-radius: 50%; background: radial-gradient(circle, var(--accent-soft) 0%, transparent 65%); filter: blur(60px); pointer-events: none; z-index: 0; }
+
 .auth-card {
   position: relative; z-index: 1;
   width: 100%; max-width: 420px;
@@ -2694,46 +2613,35 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   padding: 32px 28px 28px;
   box-shadow: var(--shadow-lg);
 }
-.auth-brand {
-  display: flex; flex-direction: column; align-items: center;
-  gap: 12px; margin-bottom: 24px;
+
+.auth-topbar {
+  position: absolute;
+  top: 14px; left: 14px; right: 14px;
+  display: flex; align-items: center; justify-content: space-between;
+  pointer-events: none;
 }
-.auth-brand-logo {
-  width: 64px; height: 64px;
-  border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--accent);
-  color: var(--accent-fg);
-  font-weight: 900; font-size: 22px;
-  letter-spacing: -1px;
-  box-shadow: 0 8px 24px var(--accent-soft-2);
+.auth-topbar > * { pointer-events: auto; }
+.auth-topbar-btn {
+  height: 34px; min-width: 34px; padding: 0 10px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--muted); cursor: pointer;
+  border-radius: 10px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+  font-weight: 700; font-size: 12px; letter-spacing: .5px;
+  font-family: inherit;
 }
-.auth-brand-name {
-  font-size: 18px; font-weight: 800; color: var(--text);
-  letter-spacing: -0.3px;
-}
-.auth-brand-tagline {
-  font-size: 13px; color: var(--muted); text-align: center;
-  line-height: 1.5; max-width: 320px;
-}
-.auth-tabs {
-  display: flex; gap: 4px; padding: 4px;
-  background: var(--card-2); border-radius: 14px;
-  margin-bottom: 20px;
-}
-.auth-tab {
-  flex: 1; padding: 10px 8px;
-  border: none; background: transparent;
-  color: var(--muted); font: inherit; font-size: 14px; font-weight: 600;
-  cursor: pointer; border-radius: 10px;
-  transition: background .15s ease, color .15s ease;
-}
-.auth-tab:hover { color: var(--text-2); }
-.auth-tab.active {
-  background: var(--bg-elev); color: var(--text);
-  box-shadow: var(--shadow-sm);
-}
-[data-theme="dark"] .auth-tab.active { background: var(--card-3); }
+.auth-topbar-btn:hover { background: var(--hover); color: var(--text); border-color: var(--line-2); }
+.auth-topbar-btn svg { display: block; }
+.auth-lang-btn { font-size: 11px; font-weight: 900; letter-spacing: .8px; }
+
+.auth-brand { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-bottom: 22px; padding-top: 12px; }
+.auth-brand-logo { width: 64px; height: 64px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--accent); color: var(--accent-fg); font-weight: 900; font-size: 22px; letter-spacing: -1px; box-shadow: 0 8px 24px var(--accent-soft-2); }
+.auth-brand-name { font-size: 18px; font-weight: 800; color: var(--text); letter-spacing: -0.3px; }
+.auth-brand-tagline { font-size: 13px; color: var(--muted); text-align: center; line-height: 1.5; max-width: 320px; }
+
+.auth-pill-tabs { margin-bottom: 18px; }
+.auth-pill-tabs .pill-tab { font-size: 13px; padding: 10px 8px; }
 
 .auth-field { position: relative; margin-bottom: 10px; }
 .auth-field .auth-input-icon {
@@ -2752,11 +2660,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   outline: none; border-radius: 12px;
   transition: border-color .15s ease, background .15s ease, box-shadow .15s ease;
 }
-.auth-field input:focus {
-  border-color: var(--accent);
-  background: var(--card);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
+.auth-field input:focus { border-color: var(--accent); background: var(--card); box-shadow: 0 0 0 3px var(--accent-soft); }
 .auth-field input::placeholder { color: var(--muted); }
 .auth-field.no-right input { padding-right: 14px; }
 
@@ -2798,20 +2702,9 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .auth-btn:hover { opacity: .92; }
 .auth-btn:active { transform: scale(.99); }
 .auth-btn:disabled { opacity: .55; cursor: default; }
-.auth-btn-spinner {
-  width: 16px; height: 16px;
-  border: 2px solid rgba(255,255,255,.4);
-  border-top-color: #fff;
-  border-radius: 50%;
-  animation: spin .7s linear infinite;
-}
+.auth-btn-spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
 
-.auth-error {
-  color: var(--danger); font-size: 13px;
-  min-height: 18px; margin: 6px 2px;
-  line-height: 1.4;
-  padding: 0 2px;
-}
+.auth-error { color: var(--danger); font-size: 13px; min-height: 18px; margin: 6px 2px; line-height: 1.4; padding: 0 2px; }
 
 .session-banner {
   display: flex; align-items: center; gap: 10px;
@@ -2826,14 +2719,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 }
 .session-banner svg { color: var(--accent); flex-shrink: 0; }
 
-.toast-container {
-  position: fixed;
-  top: 20px; left: 50%; transform: translateX(-50%);
-  z-index: 2000;
-  display: flex; flex-direction: column; gap: 8px;
-  pointer-events: none;
-  max-width: 90vw;
-}
+.toast-container { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 2000; display: flex; flex-direction: column; gap: 8px; pointer-events: none; max-width: 90vw; }
 .toast {
   background: var(--card);
   border: 1px solid var(--line-2);
@@ -2853,51 +2739,19 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 
 /* ============ POLICY ============ */
 .policy { max-width: 720px; margin: 0 auto; padding: 12px 28px 80px; }
-.policy-h1 {
-  font-size: 24px; font-weight: 800; letter-spacing: -0.4px;
-  margin: 0 0 12px; color: var(--text);
-  padding-bottom: 14px; border-bottom: 1px solid var(--line);
-}
-.policy-h2 {
-  font-size: 17px; font-weight: 800; letter-spacing: -0.2px;
-  margin: 32px 0 10px; color: var(--text);
-  display: flex; align-items: baseline; gap: 10px;
-}
-.policy-h2::before {
-  content: ''; width: 4px; height: 16px;
-  background: var(--accent); border-radius: 2px;
-  display: inline-block; flex-shrink: 0;
-  align-self: center;
-}
-.policy p {
-  font-size: 14.5px; line-height: 1.75; color: var(--text-2);
-  margin: 0 0 12px;
-}
-.policy-list {
-  list-style: none; padding: 0; margin: 4px 0 16px;
-  display: flex; flex-direction: column; gap: 6px;
-}
-.policy-list li {
-  position: relative; padding-left: 22px;
-  font-size: 14px; line-height: 1.65; color: var(--text-2);
-}
-.policy-list li::before {
-  content: ''; position: absolute; left: 6px; top: 10px;
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--accent); opacity: .8;
-}
+.policy-h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.4px; margin: 0 0 12px; color: var(--text); padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.policy-h2 { font-size: 17px; font-weight: 800; letter-spacing: -0.2px; margin: 32px 0 10px; color: var(--text); display: flex; align-items: baseline; gap: 10px; }
+.policy-h2::before { content: ''; width: 4px; height: 16px; background: var(--accent); border-radius: 2px; display: inline-block; flex-shrink: 0; align-self: center; }
+.policy p { font-size: 14.5px; line-height: 1.75; color: var(--text-2); margin: 0 0 12px; }
+.policy-list { list-style: none; padding: 0; margin: 4px 0 16px; display: flex; flex-direction: column; gap: 6px; }
+.policy-list li { position: relative; padding-left: 22px; font-size: 14px; line-height: 1.65; color: var(--text-2); }
+.policy-list li::before { content: ''; position: absolute; left: 6px; top: 10px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .8; }
 .policy-gap { height: 4px; }
-.policy-footer {
-  margin-top: 40px; padding-top: 20px;
-  border-top: 1px solid var(--line);
-  font-size: 12.5px; color: var(--muted-2);
-  text-align: center; line-height: 1.6;
-}
+.policy-footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted-2); text-align: center; line-height: 1.6; }
 
 .empty { padding: 56px 20px; text-align: center; color: var(--muted); font-size: 13.5px; background: var(--card); border: 1px dashed var(--line-2); border-radius: 16px; }
 .spinner-wrap { padding: 60px 0; text-align: center; }
 .spinner { display: inline-block; width: 26px; height: 26px; border: 2.5px solid var(--line-2); border-top-color: var(--accent); animation: spin .7s linear infinite; border-radius: 50%; }
-@keyframes spin { to { transform: rotate(360deg); } }
 
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; animation: fadeIn .14s ease; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
@@ -2940,6 +2794,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
 .edit-bio-textarea { padding: 14px 16px; background: var(--card-2); border: 1px solid var(--line); color: var(--text); font-family: inherit; font-size: 15px; outline: none; border-radius: 12px; min-height: 60px; max-height: 200px; resize: none; line-height: 1.5; transition: border-color .15s ease; }
 .edit-bio-textarea:focus { border-color: var(--accent); }
 
+/* ============ TABLET ============ */
 @media (max-width: 1100px) and (min-width: 901px) {
   .layout { max-width: 100%; }
   .sidebar { flex: 0 0 76px; width: 76px; padding: 20px 8px 16px; }
@@ -2952,6 +2807,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   .sidebar-logout svg { width: 20px; height: 20px; }
 }
 
+/* ============ MOBILE ============ */
 @media (max-width: 900px) {
   .layout { flex-direction: column; max-width: 100%; }
   .main { order: 1; height: calc(100vh - 64px - env(safe-area-inset-bottom, 0px)); height: calc(100dvh - 64px - env(safe-area-inset-bottom, 0px)); }
@@ -2967,7 +2823,7 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   .nav-btn.active svg { color: var(--accent); }
   .nav-btn.active span { color: var(--text); }
   .nav-btn .badge { position: absolute; top: 4px; right: 22%; min-width: 16px; height: 16px; line-height: 16px; font-size: 9.5px; padding: 0 4px; border-radius: 8px; }
-  .main-header { padding: 14px 16px 8px; }
+  .main-header { padding: 14px 16px 8px; gap: 6px; }
   .main-header .title { font-size: 19px; }
   .main-inner { padding: 4px 12px 40px; }
   .card, .post-card, .profile-hero { border-radius: 16px; padding: 14px; }
@@ -3008,7 +2864,20 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   .policy { padding: 12px 18px 60px; }
   .policy-h1 { font-size: 21px; }
   .policy-h2 { font-size: 16px; margin-top: 26px; }
+
+  /* Auth on tablet/mobile */
+  .auth-page { padding: 16px; }
+  .auth-card { padding: 30px 22px 24px; border-radius: 22px; }
+  .auth-topbar { top: 10px; left: 10px; right: 10px; }
+  .auth-topbar-btn { height: 32px; min-width: 32px; padding: 0 8px; }
+  .auth-brand { padding-top: 16px; gap: 8px; margin-bottom: 18px; }
+  .auth-brand-logo { width: 58px; height: 58px; font-size: 20px; }
+  .auth-brand-name { font-size: 17px; }
+  .auth-brand-tagline { font-size: 12.5px; }
+  .auth-field input { padding: 13px 42px 13px 44px; font-size: 15px; }
+  .auth-btn { height: 48px; font-size: 15px; }
 }
+
 @media (max-width: 500px) {
   .main-inner { padding: 4px 10px 30px; }
   .card, .post-card { border-radius: 14px; padding: 12px; }
@@ -3018,7 +2887,27 @@ body[data-mode="boot"] .main::-webkit-scrollbar { display: none; }
   .settings-layout { padding: 4px 10px 30px; }
   .settings-list-mobile { padding: 4px 10px 30px; }
   .policy { padding: 12px 14px 60px; }
-  .auth-card { padding: 26px 22px 22px; border-radius: 20px; }
+
+  .auth-page { padding: 10px; align-items: stretch; }
+  .auth-card {
+    padding: 28px 18px 22px;
+    border-radius: 20px;
+    max-width: 100%;
+    margin: auto 0;
+    align-self: center;
+  }
+  .auth-topbar { top: 8px; left: 8px; right: 8px; }
+  .auth-topbar-btn { height: 30px; min-width: 30px; padding: 0 8px; font-size: 11px; }
+  .auth-brand { padding-top: 18px; gap: 6px; margin-bottom: 16px; }
+  .auth-brand-logo { width: 52px; height: 52px; font-size: 18px; }
+  .auth-brand-name { font-size: 16px; }
+  .auth-brand-tagline { font-size: 12px; max-width: 280px; }
+  .auth-field input { padding: 12px 40px 12px 42px; font-size: 15px; border-radius: 11px; }
+  .auth-field .auth-input-icon { left: 12px; }
+  .auth-field-btn { right: 4px; width: 32px; height: 32px; }
+  .auth-btn { height: 46px; font-size: 14.5px; }
+  .auth-pill-tabs .pill-tab { font-size: 12.5px; padding: 9px 6px; }
+  .session-banner { font-size: 12.5px; padding: 10px 12px; }
 }
 """
 
@@ -3036,7 +2925,7 @@ var ICONS = {
   cal: __I_CAL__, check: __I_CHECK__, checkLg: __I_CHECK_LG__, x: __I_X__,
   mobile: __I_MOBILE__, desktop: __I_DESKTOP__, server: __I_SERVER__,
   eye: __I_EYE__, eyeOff: __I_EYE_OFF__, lock: __I_LOCK__, at: __I_AT__,
-  info: __I_INFO__, refresh: __I_REFRESH__
+  info: __I_INFO__, refresh: __I_REFRESH__, globe: __I_GLOBE__
 };
 
 var EMOJI_NAMES = __EMOJI_NAMES__;
@@ -3125,17 +3014,12 @@ if (!anonId) {
   localStorage.setItem('SLD_anon_id', anonId);
 }
 
-/* ==== STATE ====
- * ВАЖНО: user НЕ восстанавливается из localStorage.
- * Сначала — booting (сплэш), затем loadMe(). Только по успеху user ставится.
- * Иначе при протухшем токене юзер на долю секунды видит себя залогиненным.
- */
 var state = {
   user: null,
   token: localStorage.getItem('SLD_token') || null,
   booting: false,
   sessionExpired: false,
-  bootError: null,   // 'network' | 'session' | null
+  bootError: null,
   authMode: 'login',
   view: VIEW, viewData: VIEW_DATA || {},
   unreadNotif: parseInt(localStorage.getItem('SLD_un') || '0', 10) || 0,
@@ -3161,6 +3045,12 @@ var state = {
   soundEnabled: localStorage.getItem('SLD_sound') !== '0',
 };
 
+/* Feed caches */
+var feedCache = {
+  all: { posts: null, query: null },
+  subs: { posts: null, query: null },
+};
+
 var feedReqId = 0;
 var peopleReqId = 0;
 var profileReqId = 0;
@@ -3168,14 +3058,11 @@ var fallbackPollTimer = null;
 
 function setUser(u) {
   state.user = u;
-  if (u) localStorage.setItem('SLD_user_cache', JSON.stringify({ nick: u.nick }));
-  else localStorage.removeItem('SLD_user_cache');
 }
 function setNotifCount(n) {
   if (typeof n === 'number') { state.unreadNotif = n; localStorage.setItem('SLD_un', String(n)); }
 }
 
-/* ============ TOASTS ============ */
 function showToast(text, type) {
   var cont = document.getElementById('toastContainer');
   if (!cont) {
@@ -3199,7 +3086,6 @@ function showToast(text, type) {
   }, 3200);
 }
 
-/* ============ API ============ */
 async function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
@@ -3372,12 +3258,9 @@ function saveQuoteState() {
   } catch(e) {}
 }
 function clearQuoteState() {
-  state.quotePostId = null;
-  state.quotePreview = null;
-  saveQuoteState();
+  state.quotePostId = null; state.quotePreview = null; saveQuoteState();
 }
 
-/* Audio for notifications */
 var _audioCtx = null;
 function ensureAudioCtx() {
   if (_audioCtx) return _audioCtx;
@@ -3434,13 +3317,17 @@ function themeIconHtml() {
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   return theme === 'dark' ? ICONS.sun : ICONS.moon;
 }
+function updateAllThemeIcons() {
+  var h = themeIconHtml();
+  document.querySelectorAll('#mainThemeBtn, #authThemeBtn').forEach(function(x){ x.innerHTML = h; });
+}
 function bindThemeBtn() {
   var b = document.getElementById('mainThemeBtn');
   if (!b) return;
   b.innerHTML = themeIconHtml();
   b.addEventListener('click', function(){
     toggleTheme();
-    document.querySelectorAll('#mainThemeBtn').forEach(function(x){ x.innerHTML = themeIconHtml(); });
+    updateAllThemeIcons();
   });
 }
 
@@ -3462,9 +3349,6 @@ function roomsEqual(a, b) {
   return a.slice().sort().join('|') === b.slice().sort().join('|');
 }
 function updateRoom() {
-  if (!state.user && !state.token) {
-    // anon — подписываемся на feed
-  }
   var rooms = computeRooms();
   if (roomsEqual(rooms, state.currentRooms)) return;
   state.currentRooms = rooms;
@@ -3498,16 +3382,13 @@ function handleRoute() {
   else if (path === '/register') { state.view = 'register'; state.viewData = {}; }
   else if (path === '/login') { state.view = 'login'; state.viewData = {}; }
   else { state.view = 'not_found'; state.viewData = {}; }
-
-  if (wasSettings && state.view !== 'settings') {
-    state.settingsOpen = false;
-  }
+  if (wasSettings && state.view !== 'settings') state.settingsOpen = false;
   renderRoot();
   updateRoom();
 }
 window.addEventListener('popstate', handleRoute);
 
-/* ============ ROOT RENDER (auth / app / boot) ============ */
+/* ============ ROOT RENDER ============ */
 function renderRoot() {
   var body = document.body;
   var sb = document.getElementById('sidebar');
@@ -3541,7 +3422,7 @@ function renderRoot() {
 function authLoginFormHtml() {
   return '<form id="authLoginForm" autocomplete="on" novalidate>'
     + '<div class="auth-field no-right">'
-    +   '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    +   '<span class="auth-input-icon">' + ICONS.at + '</span>'
     +   '<input type="text" name="nick" placeholder="' + escapeHtml(tr('nick_ph')) + '" required autocomplete="username" maxlength="20" />'
     + '</div>'
     + '<div class="auth-field">'
@@ -3581,10 +3462,16 @@ function authRegisterFormHtml() {
     + '</form>';
 }
 
-function renderAuthScreen(mode) {
-  if (mode) state.authMode = mode;
+function authPillTabsHtml() {
   var m = state.authMode || 'login';
   var isLogin = (m === 'login');
+  return '<div class="pill-tabs auth-pill-tabs"><div class="pill-slider"></div>'
+    + '<button type="button" class="pill-tab' + (isLogin ? ' active' : '') + '" data-auth-tab="login">' + escapeHtml(tr('log_title')) + '</button>'
+    + '<button type="button" class="pill-tab' + (!isLogin ? ' active' : '') + '" data-auth-tab="register">' + escapeHtml(tr('reg_title')) + '</button>'
+    + '</div>';
+}
+
+function renderAuthScreen() {
   var main = document.getElementById('main');
   var sb = document.getElementById('sidebar');
   if (!main) return;
@@ -3597,7 +3484,17 @@ function renderAuthScreen(mode) {
     note = '<div class="session-banner">' + ICONS.info + '<span>' + escapeHtml(tr('network_error_hint')) + '</span></div>';
   }
 
+  var currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  var themeIcon = currentTheme === 'dark' ? ICONS.sun : ICONS.moon;
+
   var html = '<div class="auth-page"><div class="auth-card">';
+
+  /* Topbar: language left, theme right */
+  html += '<div class="auth-topbar">';
+  html +=   '<button type="button" class="auth-topbar-btn auth-lang-btn" id="authLangBtn" title="' + escapeHtml(tr('change_lang')) + '">' + (LANG === 'ru' ? 'RU' : 'EN') + '</button>';
+  html +=   '<button type="button" class="auth-topbar-btn" id="authThemeBtn" title="' + escapeHtml(tr('change_theme')) + '">' + themeIcon + '</button>';
+  html += '</div>';
+
   html += '<div class="auth-brand">';
   html +=   '<div class="auth-brand-logo">' + escapeHtml(SITE_NAME) + '</div>';
   html +=   '<div class="auth-brand-name">' + escapeHtml(SITE_NAME) + '</div>';
@@ -3606,30 +3503,65 @@ function renderAuthScreen(mode) {
 
   if (note) html += note;
 
-  html += '<div class="auth-tabs">';
-  html +=   '<button type="button" class="auth-tab' + (isLogin ? ' active' : '') + '" data-tab="login">' + escapeHtml(tr('log_title')) + '</button>';
-  html +=   '<button type="button" class="auth-tab' + (!isLogin ? ' active' : '') + '" data-tab="register">' + escapeHtml(tr('reg_title')) + '</button>';
-  html += '</div>';
-
-  html += '<div id="authFormWrap">' + (isLogin ? authLoginFormHtml() : authRegisterFormHtml()) + '</div>';
-
+  html += authPillTabsHtml();
+  html += '<div id="authFormWrap">' + ((state.authMode === 'login') ? authLoginFormHtml() : authRegisterFormHtml()) + '</div>';
   html += '</div></div>';
+
   main.innerHTML = html;
+  document.title = SITE_NAME + ' — ' + tr(state.authMode === 'login' ? 'log_title' : 'reg_title');
 
-  document.title = SITE_NAME + ' — ' + tr(isLogin ? 'log_title' : 'reg_title');
+  /* topbar bindings */
+  var langBtn = document.getElementById('authLangBtn');
+  if (langBtn) langBtn.addEventListener('click', function(){
+    var next = (LANG === 'ru') ? 'en' : 'ru';
+    document.cookie = 'SLD_lang=' + next + '; path=/; max-age=' + (60*60*24*365);
+    location.href = '/login';
+    location.reload();
+  });
+  var themeBtn = document.getElementById('authThemeBtn');
+  if (themeBtn) themeBtn.addEventListener('click', function(){
+    toggleTheme();
+    updateAllThemeIcons();
+  });
 
-  // Tabs
-  main.querySelectorAll('.auth-tab').forEach(function(t){
-    t.addEventListener('click', function(){
-      var target = t.dataset.tab;
-      if (target === state.authMode) return;
+  /* pill-tabs binding */
+  var pt = main.querySelector('.pill-tabs');
+  var slider = pt ? pt.querySelector('.pill-slider') : null;
+  function positionSlider() {
+    if (!pt || !slider) return;
+    var active = pt.querySelector('.pill-tab.active');
+    if (!active) return;
+    slider.style.width = active.offsetWidth + 'px';
+    slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+  }
+  requestAnimationFrame(positionSlider);
+  window.addEventListener('resize', function(){ requestAnimationFrame(positionSlider); });
+
+  main.querySelectorAll('[data-auth-tab]').forEach(function(b){
+    b.addEventListener('click', function(){
+      var mode = b.dataset.authTab;
+      if (mode === state.authMode) return;
+      state.authMode = mode;
       state.sessionExpired = false;
       state.bootError = null;
-      renderAuthScreen(target);
+      // Обновим классы и слайдер
+      pt.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === b); });
+      requestAnimationFrame(positionSlider);
+      // Заменим форму
+      var wrap = document.getElementById('authFormWrap');
+      if (wrap) {
+        wrap.innerHTML = (mode === 'login') ? authLoginFormHtml() : authRegisterFormHtml();
+        /* Анимация появления */
+        wrap.style.animation = 'none';
+        void wrap.offsetWidth;
+        wrap.style.animation = 'fadeIn .22s ease';
+      }
+      document.title = SITE_NAME + ' — ' + tr(mode === 'login' ? 'log_title' : 'reg_title');
+      if (mode === 'login') bindAuthLogin(); else bindAuthRegister();
     });
   });
 
-  // Password toggles
+  /* Password eye toggles */
   main.querySelectorAll('[data-toggle-pw]').forEach(function(btn){
     btn.addEventListener('click', function(){
       var inp = btn.parentNode.querySelector('input');
@@ -3640,7 +3572,7 @@ function renderAuthScreen(mode) {
     });
   });
 
-  if (isLogin) bindAuthLogin();
+  if (state.authMode === 'login') bindAuthLogin();
   else bindAuthRegister();
 }
 
@@ -3648,8 +3580,8 @@ function setAuthSubmitting(btn, loading) {
   if (!btn) return;
   if (loading) {
     btn.disabled = true;
-    btn.dataset.orig = btn.innerHTML;
-    btn.innerHTML = '<span class="auth-btn-spinner"></span><span>' + escapeHtml(tr('booting')) + '</span>';
+    if (!btn.dataset.orig) btn.dataset.orig = btn.innerHTML;
+    btn.innerHTML = '<span class="auth-btn-spinner"></span><span>' + escapeHtml(tr('loading')) + '</span>';
   } else {
     btn.disabled = false;
     if (btn.dataset.orig) { btn.innerHTML = btn.dataset.orig; delete btn.dataset.orig; }
@@ -3688,11 +3620,11 @@ function bindAuthRegister() {
   var nickBtn = document.getElementById('nickCheckBtn');
   var nickStatus = document.getElementById('nickStatus');
 
-  function setNickStatus(state_, text) {
+  function setNickStatus(st, text) {
     if (!nickStatus) return;
-    nickStatus.className = 'nick-status' + (state_ ? ' ' + state_ : '');
-    if (state_ === 'ok') nickStatus.innerHTML = ICONS.checkLg + '<span>' + escapeHtml(text) + '</span>';
-    else if (state_ === 'err') nickStatus.innerHTML = ICONS.x + '<span>' + escapeHtml(text) + '</span>';
+    nickStatus.className = 'nick-status' + (st ? ' ' + st : '');
+    if (st === 'ok') nickStatus.innerHTML = ICONS.checkLg + '<span>' + escapeHtml(text) + '</span>';
+    else if (st === 'err') nickStatus.innerHTML = ICONS.x + '<span>' + escapeHtml(text) + '</span>';
     else nickStatus.textContent = text || '';
   }
 
@@ -3706,13 +3638,11 @@ function bindAuthRegister() {
         var data = await api('/api/check_nick?nick=' + encodeURIComponent(nick));
         if (data.available) {
           setNickStatus('ok', tr('nick_available'));
-          nickBtn.classList.add('success');
-          nickBtn.classList.remove('error');
+          nickBtn.classList.add('success'); nickBtn.classList.remove('error');
           nickBtn.innerHTML = ICONS.check;
         } else {
           setNickStatus('err', tr(data.reason || 'err_nick_taken'));
-          nickBtn.classList.add('error');
-          nickBtn.classList.remove('success');
+          nickBtn.classList.add('error'); nickBtn.classList.remove('success');
           nickBtn.innerHTML = ICONS.x;
         }
       } catch(e) {
@@ -3726,8 +3656,7 @@ function bindAuthRegister() {
     nickInp.addEventListener('input', function(){
       if (nickStatus && nickStatus.textContent) setNickStatus('', '');
       if (nickBtn) {
-        nickBtn.classList.remove('success');
-        nickBtn.classList.remove('error');
+        nickBtn.classList.remove('success'); nickBtn.classList.remove('error');
         nickBtn.innerHTML = ICONS.check;
       }
     });
@@ -3756,21 +3685,14 @@ function bindAuthRegister() {
 
 /* ============ AUTH ACTIONS ============ */
 async function loadMe() {
-  if (!state.token) {
-    state.booting = false;
-    return;
-  }
+  if (!state.token) { state.booting = false; return; }
   try {
     var u = await api('/api/me');
     setUser(u);
-    state.sessionExpired = false;
-    state.bootError = null;
+    state.sessionExpired = false; state.bootError = null;
   } catch(e) {
-    if (e && e.message === 'unauthorized') {
-      // api() уже обработал 401: выставил sessionExpired, очистил token, дёрнул renderRoot
-    } else {
-      state.bootError = 'network';
-    }
+    if (e && e.message === 'unauthorized') {}
+    else { state.bootError = 'network'; }
     setUser(null);
   } finally {
     state.booting = false;
@@ -3782,35 +3704,25 @@ async function doRegister(data) {
   state.token = res.token;
   localStorage.setItem('SLD_token', res.token);
   setUser(res.user);
-  state.sessionExpired = false;
-  state.bootError = null;
-  state.booting = false;
-  connectSSE();
-  navigate('/', true);
+  state.sessionExpired = false; state.bootError = null; state.booting = false;
+  connectSSE(); navigate('/', true);
 }
-
 async function doLogin(data) {
   var res = await api('/api/login', { method: 'POST', body: data });
   state.token = res.token;
   localStorage.setItem('SLD_token', res.token);
   setUser(res.user);
-  state.sessionExpired = false;
-  state.bootError = null;
-  state.booting = false;
-  connectSSE();
-  navigate('/', true);
+  state.sessionExpired = false; state.bootError = null; state.booting = false;
+  connectSSE(); navigate('/', true);
 }
-
 function doLogoutConfirm() {
   showConfirm(tr('confirm_logout'), async function(){
     try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
     disconnectSSE();
-    setUser(null);
-    state.token = null;
-    setNotifCount(0);
-    localStorage.removeItem('SLD_token');
-    state.sessionExpired = false;
-    state.bootError = null;
+    setUser(null); state.token = null;
+    setNotifCount(0); localStorage.removeItem('SLD_token');
+    state.sessionExpired = false; state.bootError = null;
+    feedCache = { all: { posts: null, query: null }, subs: { posts: null, query: null } };
     navigate('/', true);
     connectSSE();
   }, { yesText: tr('confirm_yes') });
@@ -3824,11 +3736,9 @@ function refreshCounters() {
     if (changed) renderSidebar();
   }).catch(function(){});
 }
-
 function disconnectSSE() {
   if (state.es) { try { state.es.close(); } catch(e) {} state.es = null; }
-  state.currentRooms = [];
-  state.sseErrors = 0;
+  state.currentRooms = []; state.sseErrors = 0;
 }
 function connectSSE() {
   disconnectSSE();
@@ -3861,20 +3771,15 @@ function connectSSE() {
   };
   setTimeout(updateRoom, 300);
 }
-
-/* Fallback poll: если SSE не в OPEN, обновляем текущий вид каждые 20 сек */
 function startFallbackPoll() {
   if (fallbackPollTimer) return;
   fallbackPollTimer = setInterval(function(){
     if (document.hidden) return;
     if (!state.user) return;
     var connected = state.es && state.es.readyState === 1;
-    if (!connected) {
-      try { refreshCurrentView(); } catch(e) {}
-    }
+    if (!connected) { try { refreshCurrentView(); } catch(e) {} }
   }, 20000);
 }
-
 function scheduleRefresh() {
   if (state.refreshTimer) return;
   state.refreshTimer = setTimeout(function(){
@@ -3890,8 +3795,7 @@ function handleEvent(ev) {
   if (!ev || !ev.type) return;
   if (ev.type === 'hello') return;
   if (ev.type === 'notif_changed') {
-    refreshCounters();
-    playNotifSound();
+    refreshCounters(); playNotifSound();
     if (state.view === 'notifications') loadNotifications();
     return;
   }
@@ -3907,7 +3811,6 @@ function handleEvent(ev) {
   }
   if (ev.type === 'refresh') { scheduleRefresh(); return; }
 }
-
 document.addEventListener('visibilitychange', function(){
   if (!document.hidden && state.sseWasConnected) scheduleRefresh();
 });
@@ -3954,7 +3857,15 @@ function renderSidebar() {
 function pillTabsHtml(items) {
   var html = '<div class="pill-tabs"><div class="pill-slider"></div>';
   items.forEach(function(it){
-    html += '<button class="pill-tab' + (it.active ? ' active' : '') + '" data-key="' + it.key + '">' + escapeHtml(it.label) + '</button>';
+    html += '<button type="button" class="pill-tab' + (it.active ? ' active' : '') + '" data-key="' + it.key + '">' + escapeHtml(it.label) + '</button>';
+  });
+  html += '</div>';
+  return html;
+}
+function pillGroupHtml(groupKey, items, activeKey) {
+  var html = '<div class="pill-tabs" data-pill-group="' + groupKey + '"><div class="pill-slider"></div>';
+  items.forEach(function(it){
+    html += '<button type="button" class="pill-tab' + (it.key === activeKey ? ' active' : '') + '" data-pill="' + it.key + '">' + escapeHtml(it.label) + '</button>';
   });
   html += '</div>';
   return html;
@@ -3981,10 +3892,7 @@ function setupPillSlider(container) {
 function renderMain() {
   var el = document.getElementById('main');
   if (!el) return;
-  if (!state.user) {
-    renderAuthScreen();
-    return;
-  }
+  if (!state.user) { renderAuthScreen(); return; }
   if (state.view === 'not_found') {
     el.innerHTML = '<div class="main-header"><div class="title">' + tr('page_title_notfound') + '</div>'
       + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>'
@@ -4023,19 +3931,6 @@ function bindOgImages(root) {
       fb.textContent = tr('og_img_fallback');
       img.parentNode.replaceChild(fb, img);
     });
-  });
-}
-function bindRefreshBtn(id) {
-  var b = document.getElementById(id || 'refreshBtn');
-  if (!b) return;
-  b.addEventListener('click', async function(){
-    b.classList.add('spinning');
-    b.disabled = true;
-    try { await refreshCurrentView(); } catch(e) {}
-    finally {
-      b.classList.remove('spinning');
-      b.disabled = false;
-    }
   });
 }
 
@@ -4113,10 +4008,7 @@ function bindComposer(opts) {
   }
   inputEl.addEventListener('input', upd);
   inputEl.addEventListener('keydown', function(e){
-    if (e.key === 'Enter' && e.shiftKey && !e.isComposing) {
-      e.preventDefault();
-      trigger();
-    }
+    if (e.key === 'Enter' && e.shiftKey && !e.isComposing) { e.preventDefault(); trigger(); }
   });
   async function trigger(){
     var text = inputEl.value.trim();
@@ -4143,6 +4035,15 @@ function bindComposer(opts) {
 }
 
 /* ============ FEED ============ */
+function renderFeedPosts(feedEl, posts) {
+  if (!posts || !posts.length) {
+    feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>';
+    return;
+  }
+  feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
+  bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
+}
+
 function renderFeedView(el) {
   var html = '<div class="main-header"><div class="title">' + tr('nav_home') + '</div>'
     + '<button class="icon-btn" id="refreshBtn" title="' + escapeHtml(tr('refresh')) + '">' + ICONS.refresh + '</button>'
@@ -4157,7 +4058,8 @@ function renderFeedView(el) {
   html += '<div id="feed">' + spinner() + '</div>';
   html += '</div></div>';
   el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el); bindRefreshBtn('refreshBtn');
+  bindThemeBtn(); bindLinks(el);
+  bindRefreshBtn('refreshBtn');
   var slider = setupPillSlider(el);
   el.querySelectorAll('.pill-tab').forEach(function(t){
     t.addEventListener('click', function(){
@@ -4180,6 +4082,9 @@ function renderFeedView(el) {
       state.suppressRefresh = Date.now() + 1500;
       var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
       state.searchQuery = '';
+      // Инвалидируем кэши
+      feedCache.all = { posts: null, query: null };
+      feedCache.subs = { posts: null, query: null };
       var feedEl = document.getElementById('feed');
       if (feedEl) {
         var wrap = document.createElement('div');
@@ -4195,12 +4100,22 @@ function renderFeedView(el) {
   });
   loadFeed();
 }
-async function loadFeed() {
+
+async function loadFeed(opts) {
+  opts = opts || {};
   var feedEl = document.getElementById('feed');
   if (!feedEl) return;
   var myId = ++feedReqId;
   var mode = state.feedMode;
   var q = state.searchQuery.trim();
+  var cache = feedCache[mode];
+  var hasCache = cache.posts !== null && cache.query === q && !opts.force;
+
+  // Мгновенно показываем кэш
+  if (hasCache) {
+    renderFeedPosts(feedEl, cache.posts);
+  }
+
   try {
     var feed = mode === 'subs' ? '&feed=subs' : '';
     var data = await api('/api/posts?q=' + encodeURIComponent(q) + feed);
@@ -4208,11 +4123,14 @@ async function loadFeed() {
     if (state.feedMode !== mode) return;
     if (!document.getElementById('feed')) return;
     var posts = data.posts || [];
-    if (!posts.length) { feedEl.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>'; return; }
-    feedEl.innerHTML = posts.map(function(p){ return renderPostHtml(p, false); }).join('');
-    bindPostActions(feedEl); bindLinks(feedEl); bindOgImages(feedEl);
+    feedCache[mode] = { posts: posts, query: q };
+    // Перерисовываем только если контент реально отличается или не было кэша
+    if (!hasCache || JSON.stringify(posts.map(function(p){return p.id;})) !==
+        JSON.stringify((cache.posts || []).map(function(p){return p.id;}))) {
+      renderFeedPosts(feedEl, posts);
+    }
   } catch(e) {
-    if (myId === feedReqId) feedEl.innerHTML = '<div class="empty">—</div>';
+    if (myId === feedReqId && !hasCache) feedEl.innerHTML = '<div class="empty">—</div>';
   }
 }
 
@@ -4303,7 +4221,6 @@ async function loadPostView() {
     }
   } catch(e) { feedEl.innerHTML = notFoundHtml(); bindLinks(feedEl); }
 }
-
 function insertCommentIntoDom(pid, c, postAuthor) {
   var postEl = document.querySelector('[data-post-id="' + pid + '"]');
   if (!postEl) return;
@@ -4321,12 +4238,8 @@ function insertCommentIntoDom(pid, c, postAuthor) {
       while (next && next.classList && next.classList.contains('reply')) next = next.nextElementSibling;
       if (next) next.insertAdjacentHTML('beforebegin', html);
       else commentsEl.insertAdjacentHTML('beforeend', html);
-    } else {
-      commentsEl.insertAdjacentHTML('beforeend', html);
-    }
-  } else {
-    commentsEl.insertAdjacentHTML('beforeend', html);
-  }
+    } else commentsEl.insertAdjacentHTML('beforeend', html);
+  } else commentsEl.insertAdjacentHTML('beforeend', html);
   var btn = postEl.querySelector('button[data-action="open-post"]');
   if (btn) {
     var span = btn.querySelector('span');
@@ -4366,16 +4279,13 @@ async function loadProfile(nick) {
     if (myId !== profileReqId) return;
     if (!document.getElementById('profileRoot')) return;
     var isMe = state.user && state.user.nick === u.nick;
-
     var actionsHtml = '';
     if (isMe) {
-      actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>'
-                  + '<a class="pill-action primary" href="/settings/profile" data-link>' + escapeHtml(tr('edit_profile')) + '</a>';
+      actionsHtml = '<a class="round-action" href="/settings" data-link title="' + escapeHtml(tr('nav_settings')) + '">' + ICONS.gear + '</a>';
     } else {
       actionsHtml = '<button class="pill-action ' + (u.is_following ? '' : 'primary') + '" id="followBtn">'
                   + (u.is_following ? tr('unfollow') : tr('follow')) + '</button>';
     }
-
     var bioHtml = u.bio ? '<span class="profile-bio-inline">' + escapeHtml(u.bio) + '</span>' : '';
     var lineClass = u.bio ? 'profile-line' : 'profile-line only-nick';
 
@@ -4399,17 +4309,14 @@ async function loadProfile(nick) {
     html += '<div id="profileContent">' + spinner() + '</div>';
     root.innerHTML = html;
     bindLinks(root);
-
     document.getElementById('followersLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/followers');
     });
     document.getElementById('followingLink').addEventListener('click', function(){
       navigate('/u/' + encodeURIComponent(u.nick) + '/following');
     });
-
     var btn = document.getElementById('followBtn');
     if (btn) bindOptimisticFollow(btn, u);
-
     loadProfileContent(u, isMe);
   } catch(e) {
     if (myId !== profileReqId) return;
@@ -4418,28 +4325,21 @@ async function loadProfile(nick) {
     bindLinks(root);
   }
 }
-
 function bindOptimisticFollow(btn, u) {
-  // Optimistic follow/unfollow
   btn.addEventListener('click', async function(){
     var wasFollowing = btn.textContent.trim() === tr('unfollow');
     var followersEl = document.querySelector('#followersLink b');
-
-    // Optimistic UI update
     btn.textContent = wasFollowing ? tr('follow') : tr('unfollow');
     btn.classList.toggle('primary', wasFollowing);
     btn.disabled = true;
     var followersCount = followersEl ? parseInt(followersEl.textContent) || 0 : 0;
     if (followersEl) followersEl.textContent = Math.max(0, followersCount + (wasFollowing ? -1 : 1));
-
     try {
-      if (wasFollowing) {
-        await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
-      } else {
-        await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
-      }
+      if (wasFollowing) await api('/api/users/' + encodeURIComponent(u.nick) + '/unfollow', { method: 'POST' });
+      else await api('/api/users/' + encodeURIComponent(u.nick) + '/follow', { method: 'POST' });
+      // После действий подписок лента subs устарела
+      feedCache.subs = { posts: null, query: null };
     } catch(e) {
-      // revert
       btn.textContent = wasFollowing ? tr('unfollow') : tr('follow');
       btn.classList.toggle('primary', !wasFollowing);
       if (followersEl) followersEl.textContent = followersCount;
@@ -4449,15 +4349,12 @@ function bindOptimisticFollow(btn, u) {
     }
   });
 }
-
 async function loadProfileContent(u, isMe) {
   var c = document.getElementById('profileContent');
   if (!c) return;
   c.innerHTML = spinner();
   var html = '';
-  if (isMe) {
-    html += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
-  }
+  if (isMe) html += composerHtml({ idPrefix: 'profile_post', placeholder: tr('post_ph') });
   try {
     var d = await api('/api/posts?author=' + encodeURIComponent(u.nick));
     if (!document.getElementById('profileContent')) return;
@@ -4473,6 +4370,8 @@ async function loadProfileContent(u, isMe) {
         onSend: async function(text, quotedId, ogEnabled){
           state.suppressRefresh = Date.now() + 1500;
           var p = await api('/api/posts', { method: 'POST', body: { text: text, quoted_post_id: quotedId, og_enabled: ogEnabled } });
+          feedCache.all = { posts: null, query: null };
+          feedCache.subs = { posts: null, query: null };
           var wrap = document.createElement('div');
           wrap.innerHTML = renderPostHtml(p, false);
           var newEl = wrap.firstChild;
@@ -4488,88 +4387,11 @@ async function loadProfileContent(u, isMe) {
   } catch(e) { c.innerHTML = html + '<div class="empty">—</div>'; }
 }
 
-/* ============ EDIT PROFILE ============ */
+/* ============ EDIT PROFILE (legacy route) ============ */
 function renderEditProfileView(el) {
-  var u = state.user;
-  state.currentEmoji = u.avatar_emoji || DEFAULT_EMOJI;
-
-  var html = '<div class="main-header"><button class="icon-btn" id="backBtn">' + ICONS.back + '</button>'
-    + '<div class="title">' + tr('edit_profile_title') + '</div>'
-    + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
-  html += '<div class="main-body"><div class="main-inner">';
-
-  html += '<div class="card">';
-  html += '<div class="emoji-current">'
-    + '<div class="preview" id="emojiPreview">' + escapeHtml(state.currentEmoji) + '</div>'
-    + '<div class="label-wrap">'
-    +   '<div class="label-cap">' + escapeHtml(tr('avatar_current')) + '</div>'
-    +   '<div class="label" id="emojiName">' + escapeHtml(emojiNameOf(state.currentEmoji)) + '</div>'
-    + '</div>'
-    + '</div>';
-  html += '<div style="font-size:13px;font-weight:700;margin-bottom:10px;color:var(--text-2)">' + escapeHtml(tr('avatar_choose')) + '</div>';
-  html += '<div class="emoji-grid" id="emojiGrid">';
-  for (var i = 0; i < EMOJIS.length; i++) {
-    var e = EMOJIS[i];
-    html += '<button type="button" class="emoji-opt' + (e === state.currentEmoji ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '" title="' + escapeHtml(emojiNameOf(e)) + '">' + e + '</button>';
-  }
-  html += '</div></div>';
-
-  html += '<div class="card"><form id="editForm" style="display:flex;flex-direction:column;gap:10px">'
-    + '<input type="text" name="name" maxlength="50" placeholder="' + escapeHtml(tr('name_ph')) + '" value="' + escapeHtml(u.name) + '" required style="padding:14px 16px;background:var(--card-2);border:1px solid var(--line);color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:12px" />'
-    + '<input type="text" name="nick" maxlength="20" placeholder="' + escapeHtml(tr('nick_ph')) + '" value="' + escapeHtml(u.nick) + '" required style="padding:14px 16px;background:var(--card-2);border:1px solid var(--line);color:var(--text);font-family:inherit;font-size:15px;outline:none;border-radius:12px" />'
-    + '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" class="edit-bio-textarea">' + escapeHtml(u.bio || '') + '</textarea>'
-    + '<div class="auth-error" id="editError"></div>'
-    + '<button type="submit" class="publish-btn" style="height:48px;font-size:15px;width:100%">' + tr('save') + '</button>'
-    + '</form></div>';
-
-  html += '</div></div>';
-  el.innerHTML = html;
-  bindThemeBtn(); bindLinks(el);
-  document.getElementById('backBtn').addEventListener('click', function(){ navigate('/settings'); });
-
-  var previewEl = document.getElementById('emojiPreview');
-  var nameEl = document.getElementById('emojiName');
-  var gridEl = document.getElementById('emojiGrid');
-  gridEl.querySelectorAll('.emoji-opt').forEach(function(b){
-    b.addEventListener('click', function(e){
-      e.preventDefault();
-      state.currentEmoji = b.dataset.emoji;
-      previewEl.textContent = state.currentEmoji;
-      if (nameEl) nameEl.textContent = emojiNameOf(state.currentEmoji);
-      gridEl.querySelectorAll('.emoji-opt').forEach(function(x){
-        x.classList.toggle('active', x.dataset.emoji === state.currentEmoji);
-      });
-    });
-  });
-
-  var form = document.getElementById('editForm');
-  var errEl = document.getElementById('editError');
-  form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    errEl.textContent = '';
-    var fd = new FormData(form);
-    var body = {
-      name: (fd.get('name') || '').toString().trim(),
-      nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
-      bio: (fd.get('bio') || '').toString().trim(),
-      avatar_emoji: state.currentEmoji || DEFAULT_EMOJI
-    };
-    var btn = form.querySelector('button[type="submit"]');
-    btn.disabled = true;
-    try {
-      var r = await api('/api/users/me', { method: 'PUT', body: body });
-      setUser(r.user); renderSidebar();
-      navigate('/u/' + encodeURIComponent(r.user.nick), true);
-    } catch(err) {
-      errEl.textContent = tr(err.message) || err.message;
-      btn.disabled = false;
-    }
-  });
-}
-function emojiNameOf(e) {
-  var m = EMOJI_NAMES[e];
-  if (!m) return '';
-  return LANG === 'ru' ? m.ru : m.en;
+  // Просто редирект в /settings (раздел Аккаунт)
+  navigate('/settings', true);
+  setTimeout(function(){ state.settingsSection = 'account'; state.settingsOpen = true; renderRoot(); }, 0);
 }
 
 /* ============ FOLLOWERS/FOLLOWING ============ */
@@ -4667,9 +4489,7 @@ async function loadPeople() {
     if (!users.length) { wrap.innerHTML = '<div class="empty">' + escapeHtml(tr('no_users')) + '</div>'; return; }
     wrap.innerHTML = users.map(userRowHtml).join('');
     bindLinks(wrap); bindUserRows(wrap);
-  } catch(e) {
-    if (myId === peopleReqId && wrap) wrap.innerHTML = '<div class="empty">—</div>';
-  }
+  } catch(e) { if (myId === peopleReqId && wrap) wrap.innerHTML = '<div class="empty">—</div>'; }
 }
 
 /* ============ NOTIFICATIONS ============ */
@@ -4712,10 +4532,8 @@ function renderNotifHtml(n) {
   var cls = 'notif-row' + (n.read ? '' : ' unread');
   var author = '<b>@' + escapeHtml(n.from_nick || '?') + '</b>';
   var text = '', link = null;
-  if (n.type === 'follow') {
-    text = author + ' ' + tr('notif_follow');
-    link = '/u/' + encodeURIComponent(n.from_nick);
-  } else if (n.type === 'comment' || n.type === 'reply' || n.type === 'mention') {
+  if (n.type === 'follow') { text = author + ' ' + tr('notif_follow'); link = '/u/' + encodeURIComponent(n.from_nick); }
+  else if (n.type === 'comment' || n.type === 'reply' || n.type === 'mention') {
     var label = n.type === 'comment' ? tr('notif_comment') : n.type === 'reply' ? tr('notif_reply') : tr('notif_mention');
     text = author + ' ' + label;
     link = n.post_id ? ('/p/' + n.post_id + (n.comment_id ? ('#c-' + n.comment_id) : '')) : null;
@@ -4723,14 +4541,10 @@ function renderNotifHtml(n) {
     var lbl = n.type === 'new_post' ? tr('notif_new_post') : tr('notif_quote');
     text = author + ' ' + lbl;
     link = n.post_id ? ('/p/' + n.post_id) : null;
-  } else {
-    text = author;
-  }
+  } else text = author;
   var snippet = '';
   if (n.text) snippet = '<div class="snippet">' + escapeHtml(n.text) + '</div>';
-  var inner = '<div class="info"><div class="line">' + text + '</div>'
-    + snippet
-    + '<div class="time">' + timeAgo(n.created_at) + '</div></div>';
+  var inner = '<div class="info"><div class="line">' + text + '</div>' + snippet + '<div class="time">' + timeAgo(n.created_at) + '</div></div>';
   if (link) return '<a class="' + cls + '" href="' + link + '" data-link>' + avatarHtml(null, 'sm') + inner + '</a>';
   return '<div class="' + cls + '">' + avatarHtml(null, 'sm') + inner + '</div>';
 }
@@ -4751,7 +4565,7 @@ function renderSettingsListView(el) {
     { key: 'info',        icon: ICONS.server, title: tr('settings_info'),       desc: tr('settings_info_desc') },
   ];
   rows.forEach(function(r){
-    html += '<button class="settings-list-row" data-section="' + r.key + '">'
+    html += '<button type="button" class="settings-list-row" data-section="' + r.key + '">'
       + '<div class="sl-icon">' + r.icon + '</div>'
       + '<div class="sl-info"><div class="sl-title">' + escapeHtml(r.title) + '</div>'
       + '<div class="sl-desc">' + escapeHtml(r.desc) + '</div></div>'
@@ -4769,41 +4583,70 @@ function renderSettingsListView(el) {
     });
   });
 }
+function renderAccountSection(me) {
+  var avatarEmoji = me.avatar_emoji || DEFAULT_EMOJI;
+  var emojiOpts = '';
+  EMOJIS.forEach(function(e){
+    emojiOpts += '<button type="button" class="account-emoji-opt' + (e === avatarEmoji ? ' active' : '') + '" data-emoji="' + escapeHtml(e) + '" title="' + escapeHtml(emojiNameOf(e)) + '">' + e + '</button>';
+  });
+  return ''
+    + '<div class="account-hero">'
+    +   '<div class="account-hero-avatar" id="acctAvatarPreview">' + avatarHtml(avatarEmoji, 'lg') + '</div>'
+    +   '<div class="account-hero-info">'
+    +     '<div class="account-hero-name">' + escapeHtml(me.name) + '</div>'
+    +     '<div class="account-hero-nick">@' + escapeHtml(me.nick) + '</div>'
+    +   '</div>'
+    + '</div>'
+    + '<div class="settings-subhead">' + escapeHtml(tr('settings_profile_section')) + '</div>'
+    + '<form id="accountForm" autocomplete="off" novalidate style="display:flex;flex-direction:column;gap:10px">'
+    +   '<div class="auth-field no-right">'
+    +     '<span class="auth-input-icon">' + ICONS.userLg + '</span>'
+    +     '<input type="text" name="name" maxlength="50" value="' + escapeHtml(me.name) + '" placeholder="' + escapeHtml(tr('name_ph')) + '" required />'
+    +   '</div>'
+    +   '<div class="auth-field no-right">'
+    +     '<span class="auth-input-icon">' + ICONS.at + '</span>'
+    +     '<input type="text" name="nick" maxlength="20" value="' + escapeHtml(me.nick) + '" placeholder="' + escapeHtml(tr('nick_ph')) + '" required />'
+    +   '</div>'
+    +   '<textarea name="bio" maxlength="' + MAX_BIO_LEN + '" placeholder="' + escapeHtml(tr('bio_ph')) + '" class="edit-bio-textarea">' + escapeHtml(me.bio || '') + '</textarea>'
+    +   '<div class="auth-error" id="acctErr"></div>'
+    +   '<button type="submit" class="publish-btn" style="height:44px">' + escapeHtml(tr('save')) + '</button>'
+    + '</form>'
+    + '<div class="settings-subhead">' + escapeHtml(tr('avatar_choose')) + '</div>'
+    + '<div class="account-emoji-grid" id="acctEmojiGrid">' + emojiOpts + '</div>'
+    + '<div class="settings-subhead">' + escapeHtml(tr('settings_session_section')) + '</div>'
+    + '<button class="modal-btn danger" style="width:auto;padding:0 18px;height:42px;font-size:14px" id="settingsLogout">' + escapeHtml(tr('settings_logout')) + '</button>';
+}
+
 function renderSettingsView(el) {
   var isMobile = window.matchMedia('(max-width: 900px)').matches;
-  if (isMobile && !state.settingsOpen) {
-    renderSettingsListView(el);
-    return;
-  }
+  if (isMobile && !state.settingsOpen) { renderSettingsListView(el); return; }
   var theme = document.documentElement.getAttribute('data-theme') || 'dark';
   var me = state.user || {};
   var colors = loadColors();
   var sec = state.settingsSection || 'account';
   var soundOn = state.soundEnabled !== false;
+  var headerLeft = isMobile ? '<button class="icon-btn" id="settingsBackBtn">' + ICONS.back + '</button>' : '';
 
-  var headerLeft = '';
-  if (isMobile) headerLeft = '<button class="icon-btn" id="settingsBackBtn">' + ICONS.back + '</button>';
-
-  var html = '<div class="main-header wide">'
-    + headerLeft
+  var html = '<div class="main-header wide">' + headerLeft
     + '<div class="title">' + tr('settings_title') + '</div>'
     + '<button class="icon-btn" id="mainThemeBtn">' + themeIconHtml() + '</button></div>';
   html += '<div class="main-body"><div class="settings-layout">';
   if (!isMobile) {
     html += '<nav class="settings-nav">';
-    html += '<button class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
-    html += '<button class="settings-nav-btn' + (sec==='privacy'?' active':'') + '" data-section="privacy">' + ICONS.bell + ' ' + tr('settings_privacy') + '</button>';
-    html += '<button class="settings-nav-btn' + (sec==='appearance'?' active':'') + '" data-section="appearance">' + ICONS.sun + ' ' + tr('settings_appearance') + '</button>';
-    html += '<button class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.server + ' ' + tr('settings_info') + '</button>';
+    html += '<button type="button" class="settings-nav-btn' + (sec==='account'?' active':'') + '" data-section="account">' + ICONS.user + ' ' + tr('settings_account') + '</button>';
+    html += '<button type="button" class="settings-nav-btn' + (sec==='privacy'?' active':'') + '" data-section="privacy">' + ICONS.bell + ' ' + tr('settings_privacy') + '</button>';
+    html += '<button type="button" class="settings-nav-btn' + (sec==='appearance'?' active':'') + '" data-section="appearance">' + ICONS.sun + ' ' + tr('settings_appearance') + '</button>';
+    html += '<button type="button" class="settings-nav-btn' + (sec==='info'?' active':'') + '" data-section="info">' + ICONS.server + ' ' + tr('settings_info') + '</button>';
     html += '</nav>';
   }
   html += '<div class="settings-content">';
 
+  /* ACCOUNT */
   html += '<div class="settings-block" id="section-account"><h2>' + tr('settings_account') + '</h2>';
-  html += '<a class="publish-btn" href="/settings/profile" data-link style="display:inline-flex;align-items:center;text-decoration:none;height:42px;padding:0 20px;margin-bottom:12px">' + tr('edit_profile') + '</a>';
-  html += '<div style="margin-top:6px"><button class="modal-btn danger" style="width:auto;padding:0 18px;height:42px;font-size:14px" id="settingsLogout">' + tr('settings_logout') + '</button></div>';
+  html += renderAccountSection(me);
   html += '</div>';
 
+  /* PRIVACY */
   html += '<div class="settings-block" id="section-privacy"><h2>' + tr('settings_privacy') + '</h2>';
   html += '<div class="settings-subhead">' + escapeHtml(tr('settings_privacy')) + '</div>';
   html += settingsToggleRow(tr('settings_allow_followers'), 'allow_followers_view', me.allow_followers_view !== false);
@@ -4819,17 +4662,18 @@ function renderSettingsView(el) {
   html += settingsToggleRow(tr('notify_quote'),     'notify_on_quote',     me.notify_on_quote     !== false);
   html += '</div>';
 
+  /* APPEARANCE */
   html += '<div class="settings-block" id="section-appearance"><h2>' + tr('settings_appearance') + '</h2>';
   html += '<div class="settings-subhead">' + tr('settings_theme') + '</div>';
-  html += '<div class="opt-row">';
-  html += '<button class="opt' + (theme==='dark'?' active':'') + '" data-set-theme="dark">' + tr('theme_dark') + '</button>';
-  html += '<button class="opt' + (theme==='light'?' active':'') + '" data-set-theme="light">' + tr('theme_light') + '</button>';
-  html += '</div>';
+  html += pillGroupHtml('theme', [
+    { key: 'dark', label: tr('theme_dark') },
+    { key: 'light', label: tr('theme_light') },
+  ], theme);
   html += '<div class="settings-subhead">' + tr('settings_lang') + '</div>';
-  html += '<div class="opt-row">';
-  html += '<button class="opt' + (LANG==='ru'?' active':'') + '" data-set-lang="ru">Русский</button>';
-  html += '<button class="opt' + (LANG==='en'?' active':'') + '" data-set-lang="en">English</button>';
-  html += '</div>';
+  html += pillGroupHtml('lang', [
+    { key: 'ru', label: 'Русский' },
+    { key: 'en', label: 'English' },
+  ], LANG);
   html += '<div class="settings-subhead">' + (LANG === 'ru' ? 'Прочее' : 'Other') + '</div>';
   html += settingsToggleRow(tr('settings_sound'), 'sound_enabled', soundOn);
   html += '<p class="settings-desc">' + escapeHtml(tr('settings_sound_hint')) + '</p>';
@@ -4853,9 +4697,10 @@ function renderSettingsView(el) {
     html += '<button type="button" class="color-swatch' + (isActive?' active':'') + '" data-color="' + p.id + '" title="' + escapeHtml(LANG === 'ru' ? p.ru : p.en) + '" style="background:' + val + '"></button>';
   });
   html += '</div>';
-  html += '<button class="opt" id="resetColors" style="margin-top:4px">' + escapeHtml(tr('reset_colors')) + '</button>';
+  html += '<button type="button" class="opt" id="resetColors" style="margin-top:4px">' + escapeHtml(tr('reset_colors')) + '</button>';
   html += '</div>';
 
+  /* INFO */
   html += '<div class="settings-block" id="section-info"><h2>' + tr('settings_info') + '</h2>';
   html += '<p class="settings-desc">' + tr('settings_desc') + '</p>';
   html += '<p style="margin:0 0 16px"><a class="settings-link" href="/policy" data-link>' + tr('settings_policy') + '</a></p>';
@@ -4872,11 +4717,8 @@ function renderSettingsView(el) {
   bindThemeBtn(); bindLinks(el);
 
   if (isMobile) {
-    var backBtn = document.getElementById('settingsBackBtn');
-    if (backBtn) backBtn.addEventListener('click', function(){
-      state.settingsOpen = false;
-      renderSettingsView(el);
-    });
+    var bb = document.getElementById('settingsBackBtn');
+    if (bb) bb.addEventListener('click', function(){ state.settingsOpen = false; renderSettingsView(el); });
   }
 
   function applySectionVisibility() {
@@ -4897,22 +4739,43 @@ function renderSettingsView(el) {
       applySectionVisibility();
     });
   });
-  el.querySelectorAll('[data-set-theme]').forEach(function(b){
-    b.addEventListener('click', function(){ applyTheme(b.dataset.setTheme); renderSettingsView(el); });
-  });
-  el.querySelectorAll('[data-set-lang]').forEach(function(b){
-    b.addEventListener('click', function(){
-      document.cookie = 'SLD_lang=' + b.dataset.setLang + '; path=/; max-age=' + (60*60*24*365);
-      try {
-        sessionStorage.setItem('SLD_reload_settings', JSON.stringify({
-          open: !!state.settingsOpen,
-          section: state.settingsSection || 'account'
-        }));
-      } catch(e) {}
-      location.href = '/settings';
-      location.reload();
+
+  /* Pill groups (theme, lang) */
+  el.querySelectorAll('.pill-tabs[data-pill-group]').forEach(function(group){
+    var slider = group.querySelector('.pill-slider');
+    function position() {
+      var active = group.querySelector('.pill-tab.active');
+      if (slider && active) {
+        slider.style.width = active.offsetWidth + 'px';
+        slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+      }
+    }
+    requestAnimationFrame(position);
+    group.querySelectorAll('[data-pill]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var groupKey = group.dataset.pillGroup;
+        if (b.classList.contains('active')) return;
+        group.querySelectorAll('.pill-tab').forEach(function(x){ x.classList.toggle('active', x === b); });
+        requestAnimationFrame(position);
+        if (groupKey === 'theme') {
+          applyTheme(b.dataset.pill);
+          updateAllThemeIcons();
+        } else if (groupKey === 'lang') {
+          document.cookie = 'SLD_lang=' + b.dataset.pill + '; path=/; max-age=' + (60*60*24*365);
+          try {
+            sessionStorage.setItem('SLD_reload_settings', JSON.stringify({
+              open: !!state.settingsOpen,
+              section: state.settingsSection || 'account'
+            }));
+          } catch(e) {}
+          location.href = '/settings';
+          location.reload();
+        }
+      });
     });
   });
+
+  /* Color groups */
   el.querySelectorAll('[data-color-group]').forEach(function(group){
     var groupKey = group.dataset.colorGroup;
     group.querySelectorAll('.color-swatch').forEach(function(sw){
@@ -4923,10 +4786,56 @@ function renderSettingsView(el) {
     });
   });
   var rc = document.getElementById('resetColors');
-  if (rc) rc.addEventListener('click', function(){
-    saveColors({}); applyColors(); renderSettingsView(el);
-  });
+  if (rc) rc.addEventListener('click', function(){ saveColors({}); applyColors(); renderSettingsView(el); });
 
+  /* Account form */
+  var acctForm = document.getElementById('accountForm');
+  var acctErr = document.getElementById('acctErr');
+  var acctEmojiGrid = document.getElementById('acctEmojiGrid');
+  var acctAvatarPreview = document.getElementById('acctAvatarPreview');
+  var acctCurrentEmoji = me.avatar_emoji || DEFAULT_EMOJI;
+  if (acctEmojiGrid) {
+    acctEmojiGrid.querySelectorAll('.account-emoji-opt').forEach(function(b){
+      b.addEventListener('click', function(){
+        acctCurrentEmoji = b.dataset.emoji;
+        if (acctAvatarPreview) acctAvatarPreview.outerHTML = '<div class="account-hero-avatar" id="acctAvatarPreview">' + avatarHtml(acctCurrentEmoji, 'lg') + '</div>';
+        acctAvatarPreview = document.getElementById('acctAvatarPreview');
+        acctEmojiGrid.querySelectorAll('.account-emoji-opt').forEach(function(x){
+          x.classList.toggle('active', x === b);
+        });
+      });
+    });
+  }
+  if (acctForm) {
+    acctForm.addEventListener('submit', async function(e){
+      e.preventDefault();
+      if (acctErr) acctErr.textContent = '';
+      var fd = new FormData(acctForm);
+      var body = {
+        name: (fd.get('name') || '').toString().trim(),
+        nick: (fd.get('nick') || '').toString().trim().replace(/^@/, ''),
+        bio: (fd.get('bio') || '').toString().trim(),
+        avatar_emoji: acctCurrentEmoji || DEFAULT_EMOJI
+      };
+      var sb = acctForm.querySelector('button[type="submit"]');
+      if (sb) sb.disabled = true;
+      try {
+        var r = await api('/api/users/me', { method: 'PUT', body: body });
+        setUser(r.user);
+        renderSidebar();
+        showToast(tr('settings_saved'), 'success');
+        // Обновим херо внутри настроек
+        renderSettingsView(el);
+      } catch(err) {
+        if (acctErr) acctErr.textContent = tr(err.message) || err.message;
+        if (sb) sb.disabled = false;
+      }
+    });
+  }
+  var lo = document.getElementById('settingsLogout');
+  if (lo) lo.addEventListener('click', doLogoutConfirm);
+
+  /* Toggles */
   el.querySelectorAll('[data-toggle]').forEach(function(t){
     t.addEventListener('click', async function(){
       var key = t.dataset.toggle;
@@ -4958,11 +4867,8 @@ function renderSettingsView(el) {
         + '<span class="value">' + escapeHtml(uptime) + '</span></div>'
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_version')) + '</span>'
         + '<span class="value">' + escapeHtml(info.version || '—') + '</span></div>';
-    }).catch(function(){
-      si.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>';
-    });
+    }).catch(function(){ si.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>'; });
   }
-
   var di = document.getElementById('deviceInfo');
   if (di) {
     api('/api/whoami').then(function(info){
@@ -4976,39 +4882,29 @@ function renderSettingsView(el) {
         + '<span class="value">' + escapeHtml(info.os || '—') + '</span></div>'
         + '<div class="device-info-row"><span class="label">' + escapeHtml(tr('settings_device_city')) + '</span>'
         + '<span class="value">' + escapeHtml(cityFull) + '</span></div>';
-    }).catch(function(){
-      di.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>';
-    });
+    }).catch(function(){ di.innerHTML = '<div class="device-info-row"><span class="label">—</span></div>'; });
   }
-
-  var lo = document.getElementById('settingsLogout');
-  if (lo) lo.addEventListener('click', doLogoutConfirm);
+}
+function emojiNameOf(e) {
+  var m = EMOJI_NAMES[e];
+  if (!m) return '';
+  return LANG === 'ru' ? m.ru : m.en;
 }
 
 /* ============ POLICY ============ */
 function renderPolicyHtml(raw) {
   var lines = String(raw || '').split('\n');
-  var html = '';
-  var inList = false;
+  var html = ''; var inList = false;
   function closeList() { if (inList) { html += '</ul>'; inList = false; } }
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
-    if (line.indexOf('# ') === 0) {
-      closeList();
-      html += '<h2 class="policy-h1">' + escapeHtml(line.slice(2)) + '</h2>';
-    } else if (line.indexOf('## ') === 0) {
-      closeList();
-      html += '<h3 class="policy-h2">' + escapeHtml(line.slice(3)) + '</h3>';
-    } else if (line.indexOf('• ') === 0) {
+    if (line.indexOf('# ') === 0) { closeList(); html += '<h2 class="policy-h1">' + escapeHtml(line.slice(2)) + '</h2>'; }
+    else if (line.indexOf('## ') === 0) { closeList(); html += '<h3 class="policy-h2">' + escapeHtml(line.slice(3)) + '</h3>'; }
+    else if (line.indexOf('• ') === 0) {
       if (!inList) { html += '<ul class="policy-list">'; inList = true; }
       html += '<li>' + escapeHtml(line.slice(2)) + '</li>';
-    } else if (line.trim() === '') {
-      closeList();
-      html += '<div class="policy-gap"></div>';
-    } else {
-      closeList();
-      html += '<p>' + escapeHtml(line) + '</p>';
-    }
+    } else if (line.trim() === '') { closeList(); html += '<div class="policy-gap"></div>'; }
+    else { closeList(); html += '<p>' + escapeHtml(line) + '</p>'; }
   }
   closeList();
   return html;
@@ -5032,9 +4928,7 @@ function renderOgCard(og) {
   if (state.user && state.user.show_link_previews === false) return '';
   var site = og.site_name || '';
   if (!site) { try { site = new URL(og.url).hostname; } catch(e) {} }
-  var imgHtml = og.image
-    ? '<div class="og-image"><img src="' + escapeHtml(og.image) + '" alt="" loading="lazy" /></div>'
-    : '';
+  var imgHtml = og.image ? '<div class="og-image"><img src="' + escapeHtml(og.image) + '" alt="" loading="lazy" /></div>' : '';
   return '<a class="og-card" href="' + escapeHtml(og.url) + '" target="_blank" rel="noopener noreferrer">'
     + imgHtml
     + '<div class="og-body">'
@@ -5057,9 +4951,7 @@ function renderPostHtml(p, showComments) {
     ? '<span class="read-more" data-action="open-post" data-post-id="' + p.id + '">' + escapeHtml(tr('read_more')) + '</span>'
     : '';
   var isMine = state.user && p.author === state.user.nick;
-
   var authorHtml = '<a class="post-author" href="/u/' + encodeURIComponent(p.author) + '" data-link>@' + escapeHtml(p.author) + '</a>';
-
   var deviceBadge = '';
   if (p.device && p.author_show_device !== false) {
     var isMob = p.device === 'mobile';
@@ -5067,7 +4959,6 @@ function renderPostHtml(p, showComments) {
     var title = isMob ? tr('sent_from_mobile') : tr('sent_from_desktop');
     deviceBadge = '<span class="device-badge" title="' + escapeHtml(title) + '">' + icon + '</span>';
   }
-
   var quotedHtml = '';
   if (p.quoted) {
     var qHtml = linkifyText(p.quoted.text || '');
@@ -5076,32 +4967,25 @@ function renderPostHtml(p, showComments) {
       + '<div class="q-text">' + qHtml + '</div>'
       + '</div>';
   }
-
   var menuHtml = '';
   if (isMine) {
     menuHtml = '<div class="post-menu">'
-      + '<button class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
-      + '<button class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
+      + '<button type="button" class="act-btn" data-action="edit-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('edit')) + '">' + ICONS.edit + '</button>'
+      + '<button type="button" class="act-btn danger" data-action="delete-post" data-post-id="' + p.id + '" title="' + escapeHtml(tr('delete')) + '">' + ICONS.trash + '</button>'
       + '</div>';
   }
-
   var ogHtml = renderOgCard(p.og_data);
-
   var commentsHtml = '';
   if (showComments && p.comments && p.comments.length) {
     commentsHtml = '<div class="comments">' + renderCommentsTree(p.comments, p.author, p.id) + '</div>';
   }
-  var cCount = (typeof p.comment_count === 'number') ? p.comment_count
-             : (p.comments ? p.comments.length : 0);
+  var cCount = (typeof p.comment_count === 'number') ? p.comment_count : (p.comments ? p.comments.length : 0);
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
-
   return ''
     + '<div class="post-card" data-post-id="' + p.id + '" data-author="' + escapeHtml(p.author || '') + '">'
     +   '<div class="post-header">'
     +     avatarHtml(p.author_avatar_emoji)
-    +     '<div class="meta">'
-    +       '<div class="who">' + authorHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div>'
-    +     '</div>'
+    +     '<div class="meta"><div class="who">' + authorHtml + deviceBadge + '<span class="post-time">' + timeAgo(p.created_at) + '</span></div></div>'
     +     menuHtml
     +   '</div>'
     +   (displayText ? '<div class="post-text" data-raw="' + escapeHtml(p.text) + '">' + bodyHtml + '</div>' : '')
@@ -5109,10 +4993,10 @@ function renderPostHtml(p, showComments) {
     +   ogHtml
     +   quotedHtml
     +   '<div class="post-actions">'
-    +     '<button class="act-btn like-btn ' + likeCls + '" data-action="like" data-post-id="' + p.id + '">' + heartIcon + '<span class="num">' + (p.likes || 0) + '</span></button>'
-    +     '<button class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + cCount + '</span></button>'
-    +     '<button class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
-    +     '<button class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
+    +     '<button type="button" class="act-btn like-btn ' + likeCls + '" data-action="like" data-post-id="' + p.id + '">' + heartIcon + '<span class="num">' + (p.likes || 0) + '</span></button>'
+    +     '<button type="button" class="act-btn" data-action="open-post" data-post-id="' + p.id + '">' + ICONS.comment + '<span>' + cCount + '</span></button>'
+    +     '<button type="button" class="act-btn" data-action="quote" data-post-id="' + p.id + '" title="' + escapeHtml(tr('quote')) + '">' + ICONS.quote + '</button>'
+    +     '<button type="button" class="act-btn" data-action="copy" data-post-id="' + p.id + '" title="' + escapeHtml(tr('copy')) + '">' + ICONS.copy + '</button>'
     +   '</div>'
     +   commentsHtml
     + '</div>';
@@ -5139,11 +5023,9 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
   var authorHtml = c.author ? '<a class="comment-author" href="/u/' + encodeURIComponent(c.author) + '" data-link>@' + escapeHtml(c.author) + '</a>' : '';
   var badge = isAuthor ? '<span class="comment-author-badge">' + escapeHtml(tr('author_badge')) + '</span>' : '';
   var replyBtn = '';
-  if (!isReply) {
-    replyBtn = '<button class="act-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
-  }
-  var editBtn = isMine ? '<button class="act-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>' : '';
-  var delBtn = isMine ? '<button class="act-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>' : '';
+  if (!isReply) replyBtn = '<button type="button" class="act-btn" data-action="reply" data-post-id="' + postId + '" data-comment-id="' + c.id + '" data-author="' + escapeHtml(c.author || '') + '">' + tr('reply') + '</button>';
+  var editBtn = isMine ? '<button type="button" class="act-btn" data-action="edit-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.edit + '</button>' : '';
+  var delBtn = isMine ? '<button type="button" class="act-btn danger" data-action="delete-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + ICONS.trash + '</button>' : '';
   var bodyHtml = linkifyText(c.text);
   var heartIcon = liked ? ICONS.heart_filled : ICONS.heart;
   return ''
@@ -5151,7 +5033,7 @@ function renderCommentHtml(c, postAuthor, postId, isReply) {
     +   '<div class="comment-head">' + authorHtml + badge + '<span class="comment-time">' + timeAgo(c.created_at) + '</span></div>'
     +   '<div class="comment-text" data-raw="' + escapeHtml(c.text) + '">' + bodyHtml + '</div>'
     +   '<div class="comment-actions">'
-    +     '<button class="act-btn like-btn ' + likeCls + '" data-action="like-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + heartIcon + '<span class="num">' + (c.likes || 0) + '</span></button>'
+    +     '<button type="button" class="act-btn like-btn ' + likeCls + '" data-action="like-comment" data-post-id="' + postId + '" data-comment-id="' + c.id + '">' + heartIcon + '<span class="num">' + (c.likes || 0) + '</span></button>'
     +     replyBtn + editBtn + delBtn
     +   '</div>'
     + '</div>';
@@ -5176,8 +5058,8 @@ function startInlineEdit(container, textEl, initialText, onSave) {
   editor.className = 'inline-editor';
   editor.innerHTML = '<textarea></textarea>'
     + '<div class="edit-actions">'
-    + '<button class="edit-cancel">' + escapeHtml(tr('cancel')) + '</button>'
-    + '<button class="edit-save">' + escapeHtml(tr('save')) + '</button>'
+    + '<button type="button" class="edit-cancel">' + escapeHtml(tr('cancel')) + '</button>'
+    + '<button type="button" class="edit-save">' + escapeHtml(tr('save')) + '</button>'
     + '</div>';
   textEl.style.display = 'none';
   container.insertBefore(editor, textEl);
@@ -5195,16 +5077,13 @@ function startInlineEdit(container, textEl, initialText, onSave) {
       textEl.setAttribute('data-raw', v);
       textEl.innerHTML = linkifyText(v);
       close();
-    }
-    catch(e) { alert(tr(e.message) || e.message); b.disabled = false; }
+    } catch(e) { alert(tr(e.message) || e.message); b.disabled = false; }
   });
 }
 
 function checkEmptyFeed(parent) {
   if (!parent || parent.id !== 'feed') return;
-  if (!parent.querySelector('.post-card')) {
-    parent.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>';
-  }
+  if (!parent.querySelector('.post-card')) parent.innerHTML = '<div class="empty">' + escapeHtml(tr('no_posts')) + '</div>';
 }
 
 function bindPostActions(root) {
@@ -5212,12 +5091,10 @@ function bindPostActions(root) {
     if (btn.dataset.bound) return;
     btn.dataset.bound = '1';
     btn.addEventListener('click', async function(e){
-      e.preventDefault();
-      e.stopPropagation();
+      e.preventDefault(); e.stopPropagation();
       var action = btn.dataset.action;
       var postId = btn.dataset.postId;
       var commentId = btn.dataset.commentId;
-
       if (action === 'like') {
         var snap = applyLikeUI(btn);
         state.suppressRefresh = Date.now() + 2000;
@@ -5270,6 +5147,8 @@ function bindPostActions(root) {
         state.suppressRefresh = Date.now() + 2000;
         startInlineEdit(postEl, textEl, raw, async function(newText){
           await api('/api/posts/' + postId, { method: 'PUT', body: { text: newText } });
+          feedCache.all = { posts: null, query: null };
+          feedCache.subs = { posts: null, query: null };
         });
         return;
       }
@@ -5278,14 +5157,14 @@ function bindPostActions(root) {
           var postEl = document.querySelector('[data-post-id="' + postId + '"]');
           var parentEl = postEl ? postEl.parentNode : null;
           var nextSib = postEl ? postEl.nextSibling : null;
-          // Optimistic: убираем из DOM сразу
           if (postEl && parentEl) parentEl.removeChild(postEl);
           state.suppressRefresh = Date.now() + 2000;
+          feedCache.all = { posts: null, query: null };
+          feedCache.subs = { posts: null, query: null };
           try {
             await api('/api/posts/' + postId, { method: 'DELETE' });
             checkEmptyFeed(parentEl);
           } catch(err) {
-            // Восстанавливаем
             if (postEl && parentEl) {
               if (nextSib && nextSib.parentNode === parentEl) parentEl.insertBefore(postEl, nextSib);
               else parentEl.appendChild(postEl);
@@ -5310,15 +5189,11 @@ function bindPostActions(root) {
           var cEl = document.querySelector('[data-comment-id="' + commentId + '"]');
           var removed = 0;
           var postEl = document.querySelector('[data-post-id="' + postId + '"]');
-          var commentsRoot = postEl ? postEl.querySelector('.comments') : null;
-
-          // Optimistic: убираем из DOM сразу
           if (cEl) {
             if (!cEl.classList.contains('reply')) {
               var nx = cEl.nextElementSibling;
               while (nx && nx.classList && nx.classList.contains('reply')) {
-                var toRemove = nx;
-                nx = nx.nextElementSibling;
+                var toRemove = nx; nx = nx.nextElementSibling;
                 if (toRemove.parentNode) toRemove.parentNode.removeChild(toRemove);
                 removed++;
               }
@@ -5328,16 +5203,8 @@ function bindPostActions(root) {
           }
           if (removed > 0) decrementCommentCount(postId, removed);
           state.suppressRefresh = Date.now() + 2000;
-          try {
-            await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' });
-            if (commentsRoot && !commentsRoot.querySelector('.comment')) {
-              // nothing
-            }
-          } catch(err) {
-            // Проще всего перезагрузить вид, чтобы точно восстановить
-            alert(tr(err.message) || err.message);
-            if (state.view === 'post') loadPostView();
-          }
+          try { await api('/api/posts/' + postId + '/comments/' + commentId, { method: 'DELETE' }); }
+          catch(err) { alert(tr(err.message) || err.message); if (state.view === 'post') loadPostView(); }
         }, { yesText: tr('confirm_delete_yes') });
         return;
       }
@@ -5351,8 +5218,27 @@ function bindPostActions(root) {
   bindOgImages(root);
 }
 
-async function refreshCurrentView() {
-  if (state.view === 'feed') await loadFeed();
+/* ============ REFRESH ============ */
+function bindRefreshBtn(id) {
+  var b = document.getElementById(id || 'refreshBtn');
+  if (!b) return;
+  b.addEventListener('click', async function(){
+    if (b.disabled) return;
+    b.classList.add('spinning');
+    b.disabled = true;
+    var start = Date.now();
+    try { await refreshCurrentView({ force: true }); } catch(e) {}
+    var elapsed = Date.now() - start;
+    var minMs = 600;
+    if (elapsed < minMs) await new Promise(function(r){ setTimeout(r, minMs - elapsed); });
+    b.classList.remove('spinning');
+    b.disabled = false;
+  });
+}
+
+async function refreshCurrentView(opts) {
+  opts = opts || {};
+  if (state.view === 'feed') await loadFeed(opts);
   else if (state.view === 'post') await loadPostView();
   else if (state.view === 'profile') await loadProfile(state.viewData.nick);
 }
@@ -5371,9 +5257,9 @@ async function copyText(txt) {
 /* ============ INIT ============ */
 (async function init() {
   try {
-    var reloadSettings = sessionStorage.getItem('SLD_reload_settings');
-    if (reloadSettings) {
-      var obj = JSON.parse(reloadSettings);
+    var rs = sessionStorage.getItem('SLD_reload_settings');
+    if (rs) {
+      var obj = JSON.parse(rs);
       if (obj && typeof obj === 'object') {
         state.settingsOpen = !!obj.open;
         if (obj.section) state.settingsSection = obj.section;
@@ -5382,27 +5268,18 @@ async function copyText(txt) {
     }
   } catch(e) {}
 
-  // Правильное поведение: не восстанавливаем user из localStorage.
-  // Если токен есть — сначала booting → loadMe → либо app, либо auth.
-  // Если токена нет — сразу auth, без мигания.
   if (state.token) {
     state.booting = true;
     renderRoot();
     await loadMe();
     renderRoot();
-    if (state.user) {
-      connectSSE();
-      refreshCounters();
-      updateRoom();
-    } else {
-      connectSSE(); // anon SSE (feed)
-    }
+    if (state.user) { connectSSE(); refreshCounters(); updateRoom(); }
+    else { connectSSE(); }
   } else {
     state.booting = false;
     renderRoot();
-    connectSSE(); // anon SSE
+    connectSSE();
   }
-
   startFallbackPoll();
 })();
 """
@@ -5448,6 +5325,7 @@ def render_page(lang: str, view: str, view_data: Optional[dict] = None) -> str:
           .replace("__I_AT__", json.dumps(I_AT))
           .replace("__I_INFO__", json.dumps(I_INFO))
           .replace("__I_REFRESH__", json.dumps(I_REFRESH))
+          .replace("__I_GLOBE__", json.dumps(I_GLOBE))
           .replace("__EMOJI_NAMES__", json.dumps(emoji_names, ensure_ascii=False))
           .replace("__FAVICON_RU_DARK__", FAVICON_RU_DARK)
           .replace("__FAVICON_RU_LIGHT__", FAVICON_RU_LIGHT)
@@ -5545,13 +5423,13 @@ def page_notifications(request: Request): return render_page(get_lang(request), 
 def page_settings(request: Request): return render_page(get_lang(request), "settings")
 
 @app.get("/settings/profile", response_class=HTMLResponse)
-def page_edit_profile(request: Request): return render_page(get_lang(request), "edit_profile")
+def page_edit_profile(request: Request): return render_page(get_lang(request), "settings")
 
 @app.get("/policy", response_class=HTMLResponse)
 def page_policy(request: Request): return render_page(get_lang(request), "policy")
 
 @app.get("/register", response_class=HTMLResponse)
-def page_register(request: Request): return render_page(get_lang(request), "register")
+def page_register(request: Request): return render_page(get_lang(request), "login")
 
 @app.get("/login", response_class=HTMLResponse)
 def page_login(request: Request): return render_page(get_lang(request), "login")
