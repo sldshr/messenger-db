@@ -34,6 +34,7 @@ MENTION_RE = re.compile(r"(?<![A-Za-z0-9_\-])@([A-Za-z0-9_\-]{3,24})")
 
 LOGIN_WINDOW, LOGIN_MAX = 60, 8
 WS_MSG_WINDOW, WS_MSG_MAX = 5, 12
+MAX_MENTIONS_PER_USER = 200
 
 # ============================================================
 #  ХРАНИЛИЩЕ
@@ -42,8 +43,9 @@ users: Dict[str, dict] = {}
 tokens: Dict[str, str] = {}
 channels: Dict[str, dict] = {}
 messages: Dict[str, List[dict]] = {}
+user_mentions: Dict[str, List[dict]] = {}  # username_lower -> [mention]
 
-connections: Dict[WebSocket, dict] = {}  # ws -> {kind:"chat"|"admin", username?, channel?}
+connections: Dict[WebSocket, dict] = {}
 admin_ws: Set[WebSocket] = set()
 
 login_attempts: Dict[str, List[float]] = {}
@@ -78,20 +80,17 @@ def hash_pw(password: str, salt: str) -> str:
 
 
 def client_ip(request: Request) -> str:
-    """Реальный IP клиента, даже за прокси."""
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
-    xri = request.headers.get("x-real-ip", "")
-    if xri:
-        return xri.strip()
-    cf = request.headers.get("cf-connecting-ip", "")
-    if cf:
-        return cf.strip()
+    for h in ("x-real-ip", "cf-connecting-ip"):
+        v = request.headers.get(h, "")
+        if v:
+            return v.strip()
     return request.client.host if request.client else "?"
 
 
-def rate_check(bucket: Dict[str, List[float]], key: str, window: int, limit: int, msg: str) -> None:
+def rate_check(bucket, key, window, limit, msg):
     now = _now()
     b = bucket.setdefault(key, [])
     while b and b[0] < now - window:
@@ -134,8 +133,15 @@ def _online_users() -> List[dict]:
 
 
 def _online_usernames() -> Set[str]:
-    return {info["username"] for info in connections.values()
-            if info.get("kind") == "chat" and info.get("username")}
+    return {i["username"] for i in connections.values()
+            if i.get("kind") == "chat" and i.get("username")}
+
+
+async def _send(ws: WebSocket, payload: dict) -> None:
+    try:
+        await ws.send_json(payload)
+    except Exception:
+        pass
 
 
 async def broadcast_chat(payload: dict) -> None:
@@ -151,15 +157,11 @@ async def broadcast_chat(payload: dict) -> None:
         connections.pop(ws, None)
 
 
-async def broadcast_admin(payload: dict) -> None:
-    dead = []
-    for ws in list(admin_ws):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        admin_ws.discard(ws)
+async def notify_user(username: str, payload: dict) -> None:
+    key = username.lower()
+    for ws, info in list(connections.items()):
+        if info.get("kind") == "chat" and (info.get("username") or "").lower() == key:
+            await _send(ws, payload)
 
 
 async def broadcast_presence() -> None:
@@ -168,7 +170,6 @@ async def broadcast_presence() -> None:
         "type": "presence",
         "total": len(online),
         "users": online,
-        "online_usernames": sorted(_online_usernames()),
     })
 
 
@@ -197,6 +198,18 @@ class LoginBody(BaseModel):
 
 class ChannelBody(BaseModel):
     name: str
+
+
+class ChannelRenameBody(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def v(cls, v: str) -> str:
+        v = (v or "").strip().lstrip("#").strip()
+        if not (1 <= len(v) <= 32):
+            raise ValueError("Название: 1–32 символа")
+        return v
 
 
 class AdminLoginBody(BaseModel):
@@ -230,6 +243,10 @@ class AdminMessageEdit(BaseModel):
         if not (1 <= len(v) <= 4000):
             raise ValueError("Текст: 1–4000 символов")
         return v
+
+
+class MentionsReadBody(BaseModel):
+    channel: Optional[str] = None
 
 
 # ============================================================
@@ -325,6 +342,44 @@ async def update_profile(body: ProfileBody, user: str = Depends(require_user)):
     return public_user(u["username"])
 
 
+# ---------- MENTIONS ----------
+@app.get("/api/mentions")
+def list_mentions(user: str = Depends(require_user)):
+    key = user.lower()
+    lst = user_mentions.get(key, [])
+    out = []
+    for m in lst:
+        if m["channel"] not in channels:
+            continue
+        out.append({
+            "id": m["id"], "channel": m["channel"],
+            "from": m["from"], "ts": m["ts"],
+            "read": m["read"], "text": m["text"],
+        })
+    out.sort(key=lambda x: x["ts"])
+    unread_by_channel: Dict[str, int] = {}
+    for m in out:
+        if not m["read"]:
+            unread_by_channel[m["channel"]] = unread_by_channel.get(m["channel"], 0) + 1
+    return {"mentions": out, "unread_by_channel": unread_by_channel}
+
+
+@app.post("/api/mentions/read")
+async def mentions_read(body: MentionsReadBody, user: str = Depends(require_user)):
+    key = user.lower()
+    lst = user_mentions.get(key, [])
+    changed = 0
+    for m in lst:
+        if m["read"]:
+            continue
+        if body.channel is None or m["channel"] == body.channel:
+            m["read"] = True
+            changed += 1
+    if changed:
+        await notify_user(user, {"type": "mentions_read", "channel": body.channel})
+    return {"ok": True, "changed": changed}
+
+
 # ---------- CHANNELS ----------
 def _online_in_channel(cid: str) -> int:
     return sum(1 for i in connections.values()
@@ -333,13 +388,19 @@ def _online_in_channel(cid: str) -> int:
 
 @app.get("/api/channels")
 def list_channels(user: str = Depends(require_user)):
+    key = user.lower()
+    unread_by_channel: Dict[str, int] = {}
+    for m in user_mentions.get(key, []):
+        if not m["read"]:
+            unread_by_channel[m["channel"]] = unread_by_channel.get(m["channel"], 0) + 1
+
     out = []
     for cid, c in channels.items():
         lst = messages.get(cid) or []
         last = lst[-1] if lst else None
         out.append({
             "id": c["id"], "name": c["name"], "owner": c["owner"],
-            "online": _online_in_channel(cid),
+            "mention_count": unread_by_channel.get(cid, 0),
             "last_message": ({"user": last["user"], "text": last["text"], "ts": last["ts"]}
                              if last else None),
         })
@@ -370,7 +431,7 @@ async def create_channel(body: ChannelBody, user: str = Depends(require_user)):
 
 
 # ============================================================
-#  WEBSOCKET
+#  WEBSOCKET (чат)
 # ============================================================
 async def _handle_chat_message(cid: str, username: str, text: str) -> None:
     text = (text or "").strip()
@@ -394,6 +455,30 @@ async def _handle_chat_message(cid: str, username: str, text: str) -> None:
         u["last_seen"] = now
     await broadcast_chat({"type": "message", "message": msg})
 
+    # Парсим упоминания
+    mentioned = set(MENTION_RE.findall(text))
+    for nick in mentioned:
+        nk = nick.lower()
+        if nk not in users or nk == username.lower():
+            continue
+        entry = {
+            "id": msg["id"], "channel": cid,
+            "from": username, "ts": now,
+            "read": False, "text": text,
+        }
+        bucket = user_mentions.setdefault(nk, [])
+        bucket.append(entry)
+        if len(bucket) > MAX_MENTIONS_PER_USER:
+            del bucket[:-MAX_MENTIONS_PER_USER]
+        await notify_user(nick, {
+            "type": "mentioned",
+            "channel": cid,
+            "message_id": msg["id"],
+            "from": username,
+            "text": text,
+            "ts": now,
+        })
+
 
 async def _handle_edit_message(mid: str, username: str, text: str) -> None:
     text = (text or "").strip()
@@ -409,6 +494,11 @@ async def _handle_edit_message(mid: str, username: str, text: str) -> None:
                     "type": "message_edited", "id": mid, "channel": cid,
                     "text": text, "edited": lst[i]["edited"],
                 })
+                # обновим текст в mentions
+                for bucket in user_mentions.values():
+                    for mm in bucket:
+                        if mm["id"] == mid:
+                            mm["text"] = text
                 return
 
 
@@ -419,6 +509,8 @@ async def _handle_delete_message(mid: str, username: str) -> None:
                 if m["user"] != username:
                     return
                 lst.pop(i)
+                for bucket in user_mentions.values():
+                    bucket[:] = [mm for mm in bucket if mm["id"] != mid]
                 await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
                 return
 
@@ -429,10 +521,7 @@ async def ws_chat(ws: WebSocket):
     token = ws.query_params.get("token")
     username = tokens.get(token) if token else None
     if not username:
-        try:
-            await ws.send_json({"type": "session_expired"})
-        except Exception:
-            pass
+        await _send(ws, {"type": "session_expired"})
         await ws.close(code=1008)
         return
     u = users.get(username.lower())
@@ -451,17 +540,11 @@ async def ws_chat(ws: WebSocket):
                 u = users.get(username.lower())
                 if u:
                     u["last_seen"] = _now()
-                try:
-                    await ws.send_json({"type": "pong"})
-                except Exception:
-                    pass
+                await _send(ws, {"type": "pong"})
             elif t == "join":
                 cid = data.get("channel")
                 if cid not in channels:
-                    try:
-                        await ws.send_json({"type": "channel_not_found", "channel": cid})
-                    except Exception:
-                        pass
+                    await _send(ws, {"type": "channel_not_found", "channel": cid})
                     continue
                 info["channel"] = cid
                 msgs = messages.get(cid, [])[-200:]
@@ -470,15 +553,12 @@ async def ws_chat(ws: WebSocket):
                     for nick in MENTION_RE.findall(m["text"]):
                         mentioned.add(nick.lower())
                 profiles = {k: public_user(k) for k in mentioned if k in users}
-                try:
-                    await ws.send_json({
-                        "type": "channel_joined",
-                        "channel": cid,
-                        "messages": msgs,
-                        "profiles": profiles,
-                    })
-                except Exception:
-                    pass
+                await _send(ws, {
+                    "type": "channel_joined",
+                    "channel": cid,
+                    "messages": msgs,
+                    "profiles": profiles,
+                })
                 await broadcast_presence()
             elif t == "leave":
                 info["channel"] = None
@@ -501,31 +581,6 @@ async def ws_chat(ws: WebSocket):
             await broadcast_presence()
         except Exception:
             pass
-
-
-@app.websocket("/ws/admin")
-async def ws_admin(ws: WebSocket, sld_admin: Optional[str] = Cookie(None)):
-    await ws.accept()
-    if not ADMIN_PASS or not sld_admin or sld_admin not in admin_sessions:
-        await ws.close(code=1008)
-        return
-    admin_ws.add(ws)
-    connections[ws] = {"kind": "admin"}
-    try:
-        while True:
-            data = await ws.receive_json()
-            if data.get("type") == "ping":
-                try:
-                    await ws.send_json({"type": "pong"})
-                except Exception:
-                    pass
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        admin_ws.discard(ws)
-        connections.pop(ws, None)
 
 
 # ============================================================
@@ -571,6 +626,7 @@ def admin_stats(_: None = Depends(require_admin)):
     }
 
 
+# ---- USERS ----
 @app.get("/api/admin/users")
 def admin_users(_: None = Depends(require_admin)):
     online = _online_usernames()
@@ -639,6 +695,9 @@ def admin_user_detail(username: str, _: None = Depends(require_admin)):
         "days": days,
         "logins": list(reversed(logins[-50:])),
         "recent_messages": recent[:25],
+        "mentions_sent": sum(1 for bucket in user_mentions.values()
+                             for m in bucket if m["from"] == uname),
+        "mentions_received": len(user_mentions.get(uname.lower(), [])),
     }
 
 
@@ -665,6 +724,29 @@ async def admin_edit_user(username: str, body: AdminUserEdit, _: None = Depends(
         "display_name": u["display_name"],
     })
     return public_user(u["username"])
+
+
+@app.post("/api/admin/users/{username}/kick")
+async def admin_kick_user(username: str, _: None = Depends(require_admin)):
+    """Отключает все WS-сессии пользователя, но сохраняет аккаунт."""
+    u = users.get(username.lower())
+    if not u:
+        raise HTTPException(404, "Нет такого пользователя")
+    uname = u["username"]
+    kicked = 0
+    for ws, info in list(connections.items()):
+        if info.get("kind") == "chat" and info.get("username") == uname:
+            connections.pop(ws, None)
+            try:
+                await ws.close(code=1008)
+            except Exception:
+                pass
+            kicked += 1
+    # отзываем токены
+    for t in [t for t, n in tokens.items() if n == uname]:
+        del tokens[t]
+    await broadcast_presence()
+    return {"ok": True, "kicked": kicked}
 
 
 @app.delete("/api/admin/users/{username}")
@@ -697,6 +779,9 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
     del users[username.lower()]
     for t in [t for t, n in tokens.items() if n == uname]:
         del tokens[t]
+    user_mentions.pop(uname.lower(), None)
+    for bucket in user_mentions.values():
+        bucket[:] = [m for m in bucket if m["from"] != uname]
 
     for cid, mid in removed:
         await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
@@ -706,6 +791,7 @@ async def admin_delete_user(username: str, _: None = Depends(require_admin)):
     return {"ok": True, "kicked": kicked, "messages_removed": len(removed)}
 
 
+# ---- CHANNELS ----
 @app.get("/api/admin/channels")
 def admin_channels(_: None = Depends(require_admin)):
     out = []
@@ -736,6 +822,29 @@ async def admin_create_channel(body: ChannelBody, _: None = Depends(require_admi
     return {"id": cid, "name": raw}
 
 
+@app.patch("/api/admin/channels/{cid}")
+async def admin_rename_channel(cid: str, body: ChannelRenameBody, _: None = Depends(require_admin)):
+    if cid not in channels:
+        raise HTTPException(404, "Нет такого канала")
+    channels[cid]["name"] = body.name
+    await broadcast_chat({"type": "channels_changed"})
+    return {"id": cid, "name": body.name}
+
+
+@app.post("/api/admin/channels/{cid}/kickall")
+async def admin_kick_all_from_channel(cid: str, _: None = Depends(require_admin)):
+    if cid not in channels:
+        raise HTTPException(404, "Нет такого канала")
+    kicked = 0
+    for ws, info in list(connections.items()):
+        if info.get("kind") == "chat" and info.get("channel") == cid:
+            info["channel"] = None
+            await _send(ws, {"type": "channel_removed", "channel": cid})
+            kicked += 1
+    await broadcast_presence()
+    return {"ok": True, "kicked": kicked}
+
+
 @app.delete("/api/admin/channels/{cid}")
 async def admin_delete_channel(cid: str, _: None = Depends(require_admin)):
     if cid not in channels:
@@ -743,17 +852,42 @@ async def admin_delete_channel(cid: str, _: None = Depends(require_admin)):
     for ws, info in list(connections.items()):
         if info.get("kind") == "chat" and info.get("channel") == cid:
             info["channel"] = None
-            try:
-                await ws.send_json({"type": "channel_removed", "channel": cid})
-            except Exception:
-                pass
+            await _send(ws, {"type": "channel_removed", "channel": cid})
     del channels[cid]
     messages.pop(cid, None)
+    for bucket in user_mentions.values():
+        bucket[:] = [m for m in bucket if m["channel"] != cid]
     await broadcast_chat({"type": "channels_changed"})
     await broadcast_presence()
     return {"ok": True}
 
 
+@app.delete("/api/admin/channels/{cid}/user/{username}")
+async def admin_delete_user_from_channel(cid: str, username: str,
+                                          _: None = Depends(require_admin)):
+    if cid not in channels:
+        raise HTTPException(404, "Нет такого канала")
+    u = users.get(username.lower())
+    if not u:
+        raise HTTPException(404, "Нет такого пользователя")
+    uname = u["username"]
+    lst = messages.get(cid, [])
+    kept = []
+    removed_ids = []
+    for m in lst:
+        if m["user"] == uname:
+            removed_ids.append(m["id"])
+        else:
+            kept.append(m)
+    messages[cid] = kept
+    for bucket in user_mentions.values():
+        bucket[:] = [m for m in bucket if m["id"] not in removed_ids]
+    for mid in removed_ids:
+        await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
+    return {"ok": True, "removed": len(removed_ids)}
+
+
+# ---- MESSAGES ----
 @app.get("/api/admin/messages")
 def admin_messages(_: None = Depends(require_admin),
                    channel: Optional[str] = None,
@@ -780,6 +914,10 @@ async def admin_edit_message(mid: str, body: AdminMessageEdit, _: None = Depends
         for i, m in enumerate(lst):
             if m["id"] == mid:
                 lst[i] = {**m, "text": body.text, "edited": _now()}
+                for bucket in user_mentions.values():
+                    for mm in bucket:
+                        if mm["id"] == mid:
+                            mm["text"] = body.text
                 await broadcast_chat({
                     "type": "message_edited", "id": mid, "channel": cid,
                     "text": body.text, "edited": lst[i]["edited"],
@@ -794,6 +932,8 @@ async def admin_delete_message(mid: str, _: None = Depends(require_admin)):
         for i, m in enumerate(lst):
             if m["id"] == mid:
                 lst.pop(i)
+                for bucket in user_mentions.values():
+                    bucket[:] = [mm for mm in bucket if mm["id"] != mid]
                 await broadcast_chat({"type": "message_deleted", "id": mid, "channel": cid})
                 return {"ok": True}
     raise HTTPException(404, "Сообщение не найдено")
@@ -804,6 +944,8 @@ async def admin_clear_channel(cid: str, _: None = Depends(require_admin)):
     if cid not in messages:
         raise HTTPException(404, "Нет такого канала")
     messages[cid] = []
+    for bucket in user_mentions.values():
+        bucket[:] = [m for m in bucket if m["channel"] != cid]
     await broadcast_chat({"type": "channel_cleared", "channel": cid})
     return {"ok": True}
 
@@ -823,58 +965,70 @@ HTML_PAGE = r"""<!DOCTYPE html>
   --bg:#e4e9ed; --panel:#fff; --panel2:#f2f5f8; --border:#dbe1e6;
   --text:#1e2429; --muted:#7c8a95; --accent:#2f5d8a; --accent-h:#264c72;
   --bub-in:#fff; --bub-out:#e3f4d9; --bub-out-t:#5a7a5a;
+  --bub-mention:#ffe8c2; --bub-mention-b:#ffb86b;
+  --mention:#e08a1e;
   --shadow:0 1px 2px rgba(0,0,0,.08); --chat-bg:#e4e9ed;
+  --app-h: 100vh;
 }
 html[data-theme=dark]{
   --bg:#131820; --panel:#1a2029; --panel2:#212832; --border:#2a323d;
   --text:#dde5ee; --muted:#8794a1; --accent:#3f79a8; --accent-h:#4f89b8;
   --bub-in:#1e2731; --bub-out:#2a4d70; --bub-out-t:#a8c3dc;
+  --bub-mention:#4a3512; --bub-mention-b:#a87a2f;
+  --mention:#f0a94a;
   --shadow:0 1px 2px rgba(0,0,0,.4); --chat-bg:#0f141a;
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;
   -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}
 input,textarea{-webkit-user-select:text;user-select:text;}
-html,body{height:100vh;height:100dvh;overflow:hidden;
+html,body{height:var(--app-h);overflow:hidden;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   font-size:14px;color:var(--text);background:var(--bg);}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 input,textarea{font-family:inherit;}
 svg{display:block;}
 
+/* ---------- BOOT ---------- */
 #boot{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;background:var(--bg);color:var(--muted);}
-#boot .logo{font-size:24px;font-weight:600;color:var(--accent);letter-spacing:1px;}
-.spinner{margin-top:20px;width:28px;height:28px;border:2px solid var(--border);
+  align-items:center;justify-content:center;background:var(--bg);color:var(--muted);
+  animation:fadein .2s ease;}
+#boot .logo{font-size:22px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
+.spinner{margin-top:18px;width:26px;height:26px;border:2px solid var(--border);
   border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
+@keyframes fadein{from{opacity:0;}to{opacity:1;}}
 
+/* ---------- AUTH ---------- */
 #auth-screen{position:fixed;inset:0;z-index:100;display:none;
   align-items:center;justify-content:center;padding:20px;overflow-y:auto;
   background:var(--bg);}
 #auth-screen.visible{display:flex;}
 .auth-card{width:340px;max-width:100%;background:var(--panel);
-  border:1px solid var(--border);border-radius:6px;padding:28px 26px;
-  box-shadow:0 4px 24px rgba(0,0,0,.06);}
+  border:1px solid var(--border);border-radius:6px;padding:26px 24px;
+  box-shadow:0 4px 24px rgba(0,0,0,.06);animation:fadein .18s ease;}
 html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
-.auth-head{text-align:center;margin-bottom:20px;}
-.auth-logo{font-size:24px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
+.auth-head{text-align:center;margin-bottom:18px;}
+.auth-logo{font-size:22px;font-weight:600;color:var(--accent);letter-spacing:.5px;}
 .auth-sub{font-size:12px;color:var(--muted);margin-top:4px;}
-.auth-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:16px;}
+.auth-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:14px;}
 .auth-tab{flex:1;padding:10px 0;font-size:13.5px;font-weight:500;
-  color:var(--muted);border-bottom:2px solid transparent;}
+  color:var(--muted);border-bottom:2px solid transparent;transition:color .12s,border-color .12s;}
 .auth-tab.active{color:var(--accent);border-bottom-color:var(--accent);}
 .auth-body input{width:100%;padding:10px 12px;margin-bottom:10px;
   border:1px solid var(--border);border-radius:4px;font-size:14px;outline:none;
-  background:var(--panel);color:var(--text);}
+  background:var(--panel);color:var(--text);transition:border-color .12s,box-shadow .12s;}
 .auth-body input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(47,93,138,.15);}
 .auth-error{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
 .auth-submit{width:100%;padding:11px;background:var(--accent);color:#fff;
-  border-radius:4px;font-size:14px;font-weight:500;}
+  border-radius:4px;font-size:14px;font-weight:500;
+  transition:background .12s,transform .06s;}
 .auth-submit:hover{background:var(--accent-h);}
+.auth-submit:active{transform:scale(.985);}
 .auth-submit:disabled{opacity:.55;cursor:default;}
 .auth-hint{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
 
-#app{display:none;height:100vh;height:100dvh;}
+/* ---------- LAYOUT ---------- */
+#app{display:none;height:var(--app-h);}
 #app.visible{display:flex;}
 
 .sidebar{width:270px;flex-shrink:0;background:var(--panel);
@@ -882,157 +1036,276 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
 .sidebar-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
   display:flex;align-items:center;justify-content:space-between;padding:0 8px 0 14px;}
 .me{display:flex;flex-direction:column;justify-content:center;min-width:0;
-  cursor:pointer;padding:4px 8px;border-radius:4px;}
+  cursor:pointer;padding:4px 8px;border-radius:4px;transition:background .12s;}
 .me:hover{background:rgba(255,255,255,.1);}
-#me-name{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;}
+#me-name{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;line-height:1.2;}
 #me-user{font-size:11px;opacity:.75;}
 .icon-btn{width:34px;height:34px;border-radius:6px;
   display:flex;align-items:center;justify-content:center;
-  color:#fff;opacity:.9;flex-shrink:0;}
+  color:#fff;opacity:.9;flex-shrink:0;transition:background .12s,opacity .12s,transform .08s;}
 .icon-btn:hover{background:rgba(255,255,255,.15);opacity:1;}
+.icon-btn:active{transform:scale(.94);}
 
 .search-wrap{position:relative;padding:8px 10px;flex-shrink:0;border-bottom:1px solid var(--border);}
-.search-icon{position:absolute;left:20px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;}
+.search-icon{position:absolute;left:20px;top:50%;transform:translateY(-50%);
+  color:var(--muted);pointer-events:none;}
 .search-wrap input{width:100%;padding:7px 10px 7px 32px;background:var(--panel2);
-  border:1px solid transparent;border-radius:4px;font-size:13px;outline:none;color:var(--text);}
+  border:1px solid transparent;border-radius:4px;font-size:13px;outline:none;
+  color:var(--text);transition:border-color .12s,background .12s;}
 .search-wrap input:focus{background:var(--panel);border-color:var(--border);}
 
 .channel-list{flex:1;min-height:0;overflow-y:auto;padding:4px 0;}
-.channel-item{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;}
+.channel-item{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;
+  transition:background .12s;position:relative;}
 .channel-item:hover{background:var(--panel2);}
 .channel-item.active{background:var(--accent);color:#fff;}
-.channel-item.active .channel-last,.channel-item.active .channel-meta{color:rgba(255,255,255,.8);}
+.channel-item.active .channel-last{color:rgba(255,255,255,.8);}
 .channel-hash{width:28px;height:28px;flex-shrink:0;border-radius:50%;
   background:var(--panel2);color:var(--accent);
-  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;}
+  display:flex;align-items:center;justify-content:center;font-weight:600;font-size:13px;
+  transition:background .12s,color .12s;}
 .channel-item.active .channel-hash{background:rgba(255,255,255,.2);color:#fff;}
 .channel-body{flex:1;min-width:0;}
 .channel-row1{display:flex;align-items:baseline;justify-content:space-between;gap:6px;}
-.channel-name{font-weight:500;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.channel-meta{font-size:11px;color:var(--muted);flex-shrink:0;}
+.channel-name{font-weight:500;font-size:13.5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .channel-last{font-size:12px;color:var(--muted);margin-top:2px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+.channel-mention{
+  min-width:20px;height:20px;padding:0 6px;border-radius:10px;
+  background:var(--mention);color:#fff;
+  font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;position:relative;
+  animation:mbadge-in .25s ease;
+}
+.channel-mention::before{
+  content:"";position:absolute;inset:0;border-radius:10px;
+  background:var(--mention);opacity:.45;
+  animation:mbadge-pulse 2s ease-out infinite;
+  pointer-events:none;
+}
+@keyframes mbadge-in{from{transform:scale(.4);opacity:0;}to{transform:scale(1);opacity:1;}}
+@keyframes mbadge-pulse{
+  0%{transform:scale(1);opacity:.4;}
+  70%{transform:scale(1.5);opacity:0;}
+  100%{transform:scale(1.5);opacity:0;}
+}
 
 .new-channel{display:flex;gap:6px;padding:8px 10px;flex-shrink:0;
   border-top:1px solid var(--border);background:var(--panel);}
 .new-channel input{flex:1;min-width:0;padding:8px 10px;
   border:1px solid var(--border);border-radius:4px;font-size:13px;
-  outline:none;background:var(--panel2);color:var(--text);}
+  outline:none;background:var(--panel2);color:var(--text);
+  transition:border-color .12s,background .12s;}
 .new-channel input:focus{border-color:var(--accent);background:var(--panel);}
 .new-channel button{width:36px;height:36px;border-radius:4px;background:var(--accent);
-  color:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+  color:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;
+  transition:background .12s,transform .08s;}
 .new-channel button:hover{background:var(--accent-h);}
+.new-channel button:active{transform:scale(.94);}
 
+/* ---------- CHAT ---------- */
 .chat{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;}
 .chat-header{height:52px;flex-shrink:0;background:var(--accent);color:#fff;
-  display:flex;align-items:center;padding:0 8px 0 12px;gap:8px;}
+  display:flex;align-items:center;padding:0 8px 0 12px;gap:8px;
+  z-index:2;box-shadow:0 1px 0 rgba(0,0,0,.06);}
 #back-btn{display:none;width:34px;height:34px;align-items:center;justify-content:center;
-  border-radius:6px;color:#fff;flex-shrink:0;}
+  border-radius:6px;color:#fff;flex-shrink:0;transition:background .12s;}
 #back-btn:hover{background:rgba(255,255,255,.15);}
 .chat-title{display:flex;flex-direction:column;min-width:0;flex:1;}
-#chat-name{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2;}
+#chat-name{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;line-height:1.2;}
 .chat-users{font-size:11px;opacity:.85;}
 
 .messages-wrap{flex:1;min-height:0;display:flex;}
-.messages{flex:1;min-height:0;overflow-y:auto;padding:14px 16px 8px;background:var(--chat-bg);}
+.messages{flex:1;min-height:0;overflow-y:auto;padding:14px 16px 8px;background:var(--chat-bg);
+  scroll-behavior:smooth;}
 .empty{text-align:center;color:var(--muted);margin-top:60px;font-size:13px;line-height:1.6;}
-.msg{display:flex;margin-bottom:5px;flex-direction:column;position:relative;}
+
+.msg{display:flex;margin-bottom:5px;flex-direction:column;position:relative;
+  animation:msg-in .18s ease-out;}
+@keyframes msg-in{
+  from{opacity:0;transform:translateY(4px);}
+  to{opacity:1;transform:none;}
+}
 .msg.in{align-items:flex-start;}
 .msg.out{align-items:flex-end;}
 .msg.same-user{margin-top:-1px;}
 .msg.same-user .name{display:none;}
 .bubble{max-width:74%;padding:6px 10px 5px;border-radius:8px;
   background:var(--bub-in);box-shadow:var(--shadow);
-  word-wrap:break-word;overflow-wrap:break-word;color:var(--text);}
+  word-wrap:break-word;overflow-wrap:break-word;color:var(--text);
+  transition:box-shadow .15s;}
 .msg.in .bubble{border-top-left-radius:2px;}
 .msg.out .bubble{background:var(--bub-out);border-top-right-radius:2px;}
 .msg.same-user .bubble{border-top-left-radius:8px;border-top-right-radius:8px;}
+
+/* сообщения, где меня упомянули */
+.msg.mentioned-me .bubble{
+  background:var(--bub-mention);
+  border-left:3px solid var(--bub-mention-b);
+}
+.msg.out.mentioned-me .bubble{border-left:none;border-right:3px solid var(--bub-mention-b);}
+.msg.mentioned-me .bubble:hover{box-shadow:0 2px 8px rgba(224,138,30,.35);}
+
+.msg.flash .bubble{
+  animation:flash-hl 1.4s ease-out;
+}
+@keyframes flash-hl{
+  0%{box-shadow:0 0 0 0 rgba(224,138,30,.8);}
+  60%{box-shadow:0 0 0 8px rgba(224,138,30,0);}
+  100%{box-shadow:0 0 0 0 rgba(224,138,30,0);}
+}
+
 .name{font-size:12.5px;font-weight:600;color:var(--accent);margin-bottom:2px;}
 .text{white-space:pre-wrap;line-height:1.35;font-size:14px;}
 .text .mention{color:var(--accent);font-weight:600;}
-.text .mention.self{background:rgba(47,93,138,.2);padding:0 3px;border-radius:3px;}
+.text .mention.self{
+  background:rgba(224,138,30,.22);color:var(--mention);
+  padding:0 4px;border-radius:3px;
+}
 .text .edited{color:var(--muted);font-size:11px;margin-left:4px;}
 .time{font-size:10.5px;color:var(--muted);text-align:right;margin-top:2px;margin-left:12px;}
 .msg.out .time{color:var(--bub-out-t);}
 .msg.mine{cursor:context-menu;}
 
+/* ---------- MEMBERS ---------- */
 .members-panel{width:200px;flex-shrink:0;background:var(--panel);
-  border-left:1px solid var(--border);display:none;flex-direction:column;min-height:0;}
+  border-left:1px solid var(--border);display:none;flex-direction:column;min-height:0;
+  animation:slidein .18s ease;}
 .members-panel.visible{display:flex;}
+@keyframes slidein{from{transform:translateX(20px);opacity:0;}to{transform:none;opacity:1;}}
 .members-head{padding:10px 14px;border-bottom:1px solid var(--border);
   font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);
   display:flex;justify-content:space-between;flex-shrink:0;}
 .members-head b{color:var(--text);font-weight:600;}
 .members-list{flex:1;min-height:0;overflow-y:auto;padding:4px 0;}
-.member-item{padding:7px 14px;font-size:13px;display:flex;align-items:center;gap:8px;}
-.member-item .dot{width:6px;height:6px;border-radius:50%;background:#4caf50;flex-shrink:0;}
+.member-item{padding:7px 14px;font-size:13px;display:flex;align-items:center;gap:8px;
+  animation:msg-in .15s ease-out;}
+.member-item .dot{width:6px;height:6px;border-radius:50%;background:#4caf50;flex-shrink:0;
+  box-shadow:0 0 0 0 rgba(76,175,80,.5);animation:dot-pulse 2s ease-in-out infinite;}
+@keyframes dot-pulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(76,175,80,.5);}
+  50%{box-shadow:0 0 0 4px rgba(76,175,80,0);}
+}
 .member-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .member-name.self{color:var(--accent);font-weight:600;}
 
+/* ---------- COMPOSER ---------- */
 .composer{display:flex;align-items:flex-end;gap:8px;flex-shrink:0;
   padding:10px 14px calc(10px + env(safe-area-inset-bottom,0));
   background:var(--panel);border-top:1px solid var(--border);position:relative;}
 #msg-input{flex:1;min-width:0;padding:10px 14px;background:var(--panel2);
   border:1px solid transparent;border-radius:20px;font-size:14px;line-height:1.4;
-  max-height:120px;min-height:42px;resize:none;outline:none;color:var(--text);}
+  max-height:120px;min-height:42px;resize:none;outline:none;color:var(--text);
+  transition:background .12s,border-color .12s;}
 #msg-input:focus{background:var(--panel);border-color:var(--border);}
 .send-btn{width:42px;height:42px;flex-shrink:0;border-radius:50%;
-  background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;}
+  background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;
+  transition:background .12s,transform .08s;}
 .send-btn:hover{background:var(--accent-h);}
+.send-btn:active{transform:scale(.94);}
 .send-btn:disabled{background:var(--border);cursor:default;}
 
+/* Кнопка "перейти к упоминанию" */
+.jump-mention{
+  position:absolute;right:66px;bottom:calc(100% + 8px);
+  width:38px;height:38px;border-radius:50%;
+  background:var(--mention);color:#fff;
+  display:none;align-items:center;justify-content:center;
+  box-shadow:0 4px 12px rgba(224,138,30,.4);
+  transition:transform .15s,background .12s;
+  z-index:15;
+  animation:mbadge-in .2s ease-out;
+}
+.jump-mention.visible{display:flex;}
+.jump-mention:hover{background:#c97a15;transform:translateY(-2px) scale(1.05);}
+.jump-mention:active{transform:scale(.94);}
+.jump-mention svg{pointer-events:none;}
+.jump-mention .jm-count{
+  position:absolute;top:-4px;right:-4px;
+  background:#c33;color:#fff;font-size:10px;font-weight:700;
+  min-width:16px;height:16px;padding:0 4px;border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  border:2px solid var(--panel);
+}
+
+/* ---------- MENTION MENU ---------- */
 .mention-menu{position:absolute;left:10px;right:10px;bottom:calc(100% + 4px);
   background:var(--panel);border:1px solid var(--border);border-radius:6px;
   box-shadow:0 4px 16px rgba(0,0,0,.15);max-height:200px;overflow-y:auto;
-  z-index:20;display:none;}
+  z-index:20;display:none;animation:menu-in .14s ease-out;}
 .mention-menu.visible{display:block;}
-.mention-item{padding:8px 12px;cursor:pointer;font-size:13px;}
+@keyframes menu-in{
+  from{opacity:0;transform:translateY(4px);}
+  to{opacity:1;transform:none;}
+}
+.mention-item{padding:8px 12px;cursor:pointer;font-size:13px;transition:background .1s;}
 .mention-item:hover{background:var(--panel2);}
 .mention-item .u{color:var(--muted);margin-left:6px;}
 
-/* context menu */
+/* ---------- CONTEXT MENU ---------- */
 .ctx-menu{position:fixed;z-index:400;background:var(--panel);
   border:1px solid var(--border);border-radius:6px;padding:4px;
-  box-shadow:0 6px 20px rgba(0,0,0,.2);min-width:150px;display:none;}
+  box-shadow:0 6px 20px rgba(0,0,0,.2);min-width:150px;display:none;
+  animation:ctx-in .12s ease-out;transform-origin:top left;}
 .ctx-menu.visible{display:block;}
+@keyframes ctx-in{
+  from{opacity:0;transform:scale(.94);}
+  to{opacity:1;transform:scale(1);}
+}
 .ctx-item{display:flex;align-items:center;gap:8px;padding:8px 12px;
-  border-radius:4px;font-size:13px;cursor:pointer;}
+  border-radius:4px;font-size:13px;cursor:pointer;transition:background .1s;}
 .ctx-item:hover{background:var(--panel2);}
 .ctx-item.danger{color:#c33;}
 .ctx-item.danger:hover{background:rgba(204,51,51,.1);}
 
+/* ---------- MODALS ---------- */
 .modal-backdrop{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.5);
-  display:none;align-items:center;justify-content:center;padding:20px;}
+  display:none;align-items:center;justify-content:center;padding:20px;
+  animation:fadein .15s ease;}
 .modal-backdrop.visible{display:flex;}
 .modal{background:var(--panel);border-radius:8px;padding:20px 22px;
-  width:380px;max-width:100%;color:var(--text);}
+  width:380px;max-width:100%;color:var(--text);
+  animation:modal-in .18s ease-out;}
+@keyframes modal-in{
+  from{opacity:0;transform:translateY(8px) scale(.97);}
+  to{opacity:1;transform:none;}
+}
 .modal h3{font-size:15px;margin-bottom:14px;font-weight:600;}
 .modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
 .modal input,.modal textarea{width:100%;padding:9px 11px;border:1px solid var(--border);
   border-radius:4px;font-size:14px;outline:none;background:var(--panel2);
-  color:var(--text);margin-bottom:10px;font-family:inherit;}
+  color:var(--text);margin-bottom:10px;font-family:inherit;
+  transition:border-color .12s,background .12s;}
 .modal textarea{min-height:90px;resize:vertical;}
 .modal input:focus,.modal textarea:focus{border-color:var(--accent);background:var(--panel);}
 .modal .row{display:flex;justify-content:flex-end;gap:8px;margin-top:6px;}
 .modal .btn2{padding:8px 14px;border-radius:4px;font-size:13px;
-  background:var(--panel2);color:var(--text);}
+  background:var(--panel2);color:var(--text);transition:background .12s;}
 .modal .btn2:hover{background:var(--border);}
 .modal .btn2.primary{background:var(--accent);color:#fff;}
 .modal .btn2.primary:hover{background:var(--accent-h);}
 .modal-err{color:#c33;font-size:12px;min-height:16px;margin-bottom:6px;}
 
+/* ---------- MOBILE ---------- */
 @media (max-width:800px){
   #app.visible{display:block;position:relative;overflow:hidden;}
   .sidebar{position:absolute;inset:0;width:100%;border-right:none;}
   .chat{position:absolute;inset:0;background:var(--chat-bg);
     transform:translateX(100%);transition:transform .22s ease;z-index:5;
-    display:flex;flex-direction:column;min-height:0;}
+    display:flex;flex-direction:column;min-height:0;
+    height:var(--app-h);}
   #app.chat-open .chat{transform:translateX(0);}
   #back-btn{display:flex;}
   .bubble{max-width:82%;}
   .members-panel{position:absolute;top:52px;right:0;bottom:0;width:200px;
     z-index:8;box-shadow:-4px 0 16px rgba(0,0,0,.15);}
+  .jump-mention{bottom:calc(100% + 6px);right:60px;}
 }
+
 .channel-list::-webkit-scrollbar,.messages::-webkit-scrollbar,
 .members-list::-webkit-scrollbar,.mention-menu::-webkit-scrollbar{width:6px;height:6px;}
 .channel-list::-webkit-scrollbar-thumb,.messages::-webkit-scrollbar-thumb,
@@ -1078,8 +1351,12 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
         <div id="me-user"></div>
       </div>
       <div style="display:flex;gap:2px;">
-        <button class="icon-btn" id="theme-btn" title="Тема"><svg id="theme-icon" viewBox="0 0 24 24" width="18" height="18"></svg></button>
-        <button class="icon-btn" id="logout-btn" title="Выйти"><svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg></button>
+        <button class="icon-btn" id="theme-btn" title="Тема">
+          <svg id="theme-icon" viewBox="0 0 24 24" width="18" height="18"></svg>
+        </button>
+        <button class="icon-btn" id="logout-btn" title="Выйти">
+          <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>
+        </button>
       </div>
     </div>
     <div class="search-wrap">
@@ -1089,13 +1366,17 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
     <div class="channel-list" id="channel-list"></div>
     <div class="new-channel" id="new-channel-wrap">
       <input id="new-channel-name" placeholder="Новый канал" maxlength="32">
-      <button id="new-channel-btn" title="Создать"><svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></button>
+      <button id="new-channel-btn" title="Создать">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+      </button>
     </div>
   </aside>
 
   <main class="chat" id="chat">
     <div class="chat-header">
-      <button class="icon-btn" id="back-btn"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+      <button class="icon-btn" id="back-btn">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+      </button>
       <div class="chat-title">
         <span id="chat-name">Выберите канал</span>
         <span class="chat-users" id="chat-users"></span>
@@ -1112,6 +1393,10 @@ html[data-theme=dark] .auth-card{box-shadow:0 4px 24px rgba(0,0,0,.4);}
       </aside>
     </div>
     <div class="composer">
+      <button class="jump-mention" id="jump-mention" title="Перейти к упоминанию">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10h5v-2h-5c-4.34 0-8-3.66-8-8s3.66-8 8-8 8 3.66 8 8v1.43c0 .79-.71 1.57-1.5 1.57s-1.5-.78-1.5-1.57V12c0-2.76-2.24-5-5-5s-5 2.24-5 5 2.24 5 5 5c1.38 0 2.64-.56 3.54-1.47.65.89 1.77 1.47 2.96 1.47 1.97 0 3.5-1.6 3.5-3.57V12c0-5.52-4.48-10-10-10zm0 13c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3z"/></svg>
+        <span class="jm-count" id="jm-count">0</span>
+      </button>
       <div class="mention-menu" id="mention-menu"></div>
       <textarea id="msg-input" placeholder="Сообщение..." rows="1" enterkeyhint="send"></textarea>
       <button class="send-btn" id="send-btn" aria-label="Отправить">
@@ -1176,15 +1461,30 @@ const state = {
   reconnectTimer: null, pingTimer: null,
   profiles: {}, allowChannelCreation: true,
   totalOnline: 0, onlineUsers: [],
+  mentions: [],                    // все упоминания меня
+  mentionByChannel: {},            // channel -> [mention]
+  mentionIds: new Set(),           // ids всех сообщений, где меня упомянули
   _openInFlight: null, _lastOpenChannel: null, _lastOpenAt: 0,
+  _jumpTarget: null,
 };
 let authMode = 'login';
 
+/* ---------- VIEWPORT FIX (mobile keyboard) ---------- */
+function fitViewport(){
+  const h = (window.visualViewport ? window.visualViewport.height : window.innerHeight);
+  document.documentElement.style.setProperty('--app-h', h + 'px');
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', fitViewport);
+window.addEventListener('orientationchange', fitViewport);
+window.addEventListener('resize', fitViewport);
+fitViewport();
+
+/* ---------- Prevent right-click (кроме своих сообщений) ---------- */
 document.addEventListener('contextmenu', e => {
   if (!e.target.closest('.msg.mine') && !e.target.closest('.ctx-menu')) e.preventDefault();
 });
 
-/* THEME */
+/* ---------- THEME ---------- */
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   const ic = $('theme-icon');
@@ -1197,7 +1497,7 @@ $('theme-btn').addEventListener('click', () => {
   applyTheme(n); localStorage.setItem(LS_THEME, n);
 });
 
-/* API */
+/* ---------- API ---------- */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   if (state.token) h['X-Auth-Token'] = state.token;
@@ -1213,7 +1513,7 @@ async function api(path, opts = {}) {
   return r.json();
 }
 
-/* UTILS */
+/* ---------- UTILS ---------- */
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function hhmm(ts){const t=new Date(ts*1000);if(isNaN(t))return '';return String(t.getHours()).padStart(2,'0')+':'+String(t.getMinutes()).padStart(2,'0');}
 function renderTextWithMentions(text, self){
@@ -1224,7 +1524,7 @@ function renderTextWithMentions(text, self){
   });
 }
 
-/* SESSION MODAL */
+/* ---------- SESSION MODAL ---------- */
 function sessionModal(title, text){
   $('session-title').textContent = title;
   $('session-text').textContent = text;
@@ -1235,7 +1535,7 @@ $('session-ok').addEventListener('click', () => {
   hardLogout();
 });
 
-/* AUTH */
+/* ---------- AUTH ---------- */
 function setAuthMode(m){
   authMode = m;
   document.querySelectorAll('.auth-tab').forEach(t=>t.classList.toggle('active',t.dataset.mode===m));
@@ -1282,6 +1582,7 @@ function hardLogout(){
   if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
   state.token = null; state.username = null; state.display_name = null;
   state.currentChannel = null; state.channels = [];
+  state.mentions = []; state.mentionByChannel = {}; state.mentionIds = new Set();
   localStorage.removeItem(LS_TOKEN);
   $('app').classList.remove('visible','chat-open');
   $('auth-screen').classList.add('visible');
@@ -1293,7 +1594,7 @@ $('logout-btn').addEventListener('click', async () => {
   hardLogout();
 });
 
-/* BOOT */
+/* ---------- BOOT ---------- */
 async function boot(){
   if (!state.token) { showAuth(); return; }
   try {
@@ -1318,6 +1619,7 @@ async function enterApp(){
   try { const cfg = await api('/api/config'); state.allowChannelCreation = !!cfg.allow_channel_creation; } catch(e){}
   $('new-channel-wrap').style.display = state.allowChannelCreation ? '' : 'none';
   paintMe();
+  await loadMentions();
   await loadChannels();
   $('boot').style.display = 'none';
   $('auth-screen').classList.remove('visible');
@@ -1325,7 +1627,68 @@ async function enterApp(){
   connectWs();
 }
 
-/* PROFILE */
+/* ---------- MENTIONS ---------- */
+async function loadMentions(){
+  try {
+    const d = await api('/api/mentions');
+    state.mentions = d.mentions || [];
+    state.mentionIds = new Set(state.mentions.map(m => m.id));
+    state.mentionByChannel = {};
+    for (const m of state.mentions) {
+      (state.mentionByChannel[m.channel] = state.mentionByChannel[m.channel] || []).push(m);
+    }
+    updateJumpButton();
+  } catch(e){}
+}
+
+function unreadMentionsFor(channel){
+  const lst = state.mentionByChannel[channel] || [];
+  return lst.filter(m => !m.read);
+}
+
+function updateJumpButton(){
+  const c = state.currentChannel;
+  if (!c) { $('jump-mention').classList.remove('visible'); return; }
+  const unread = unreadMentionsFor(c);
+  if (unread.length) {
+    $('jm-count').textContent = unread.length;
+    $('jump-mention').classList.add('visible');
+  } else {
+    $('jump-mention').classList.remove('visible');
+  }
+}
+
+$('jump-mention').addEventListener('click', async () => {
+  const c = state.currentChannel;
+  if (!c) return;
+  const unread = unreadMentionsFor(c);
+  if (!unread.length) return;
+  // Переходим к первому непрочитанному
+  const target = unread[0];
+  const el = $('messages').querySelector(`.msg[data-id="${CSS.escape(target.id)}"]`);
+  if (el) {
+    el.scrollIntoView({ behavior:'smooth', block:'center' });
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 1600);
+  } else {
+    // сообщение вне текущего буфера — перезапросим канал
+    if (state.ws && state.wsReady) {
+      state.ws.send(JSON.stringify({type:'join', channel:c}));
+      state._jumpTarget = target.id;
+    }
+  }
+  // Помечаем прочитанным на сервере
+  try {
+    await api('/api/mentions/read', { method:'POST', body:{ channel: c } });
+  } catch(e){}
+  for (const m of unread) m.read = true;
+  updateJumpButton();
+  renderChannels();
+});
+
+/* ---------- PROFILE ---------- */
 $('me-block').addEventListener('click', () => {
   $('profile-display').value = state.display_name || state.username;
   $('profile-err').textContent = '';
@@ -1344,7 +1707,7 @@ $('profile-save').addEventListener('click', async () => {
   } catch(e){ $('profile-err').textContent = e.message; }
 });
 
-/* CHANNELS */
+/* ---------- CHANNELS ---------- */
 async function loadChannels(){
   try {
     const data = await api('/api/channels');
@@ -1355,11 +1718,13 @@ async function loadChannels(){
       $('app').classList.remove('chat-open');
       $('chat-name').textContent = 'Выберите канал';
       renderMessages([]);
+      updateJumpButton();
     }
     renderChannels();
     updateHeader();
   } catch(e){}
 }
+
 function updateHeader(){
   if (state.currentChannel) {
     $('chat-users').textContent = state.totalOnline + ' онлайн';
@@ -1369,6 +1734,7 @@ function updateHeader(){
   $('members-count').textContent = state.onlineUsers.length || state.totalOnline || 0;
   renderMembers();
 }
+
 function renderChannels(){
   const list = $('channel-list');
   const q = $('search').value.toLowerCase().trim();
@@ -1380,15 +1746,18 @@ function renderChannels(){
     el.dataset.id = c.id;
     const last = c.last_message
       ? `<div class="channel-last">${escapeHtml(c.last_message.user)}: ${escapeHtml(c.last_message.text)}</div>` : '';
+    const unread = (state.mentionByChannel[c.id] || []).filter(m=>!m.read).length;
+    const badge = unread
+      ? `<div class="channel-mention" title="${unread} упоминаний">@ ${unread}</div>` : '';
     el.innerHTML =
       `<div class="channel-hash">#</div>
        <div class="channel-body">
          <div class="channel-row1">
            <div class="channel-name">${escapeHtml(c.name)}</div>
-           <div class="channel-meta">${c.online||0}</div>
          </div>
          ${last}
-       </div>`;
+       </div>
+       ${badge}`;
     el.addEventListener('click', () => openChannel(c.id));
     list.appendChild(el);
   }
@@ -1397,7 +1766,7 @@ function renderChannels(){
 function openChannel(id){
   const now = Date.now();
   if (state._openInFlight === id) return;
-  if (id === state._lastOpenChannel && now - state._lastOpenAt < 600) return;
+  if (id === state._lastOpenChannel && now - state._lastOpenAt < 500) return;
   state._lastOpenChannel = id; state._lastOpenAt = now;
   state._openInFlight = id;
 
@@ -1407,17 +1776,16 @@ function openChannel(id){
   const ch = state.channels.find(c=>c.id===id);
   $('chat-name').textContent = ch ? '# '+ch.name : '# '+id;
   updateHeader();
+  updateJumpButton();
   renderMessages([]);
 
   if (state.ws && state.wsReady) {
     state.ws.send(JSON.stringify({type:'join', channel:id}));
-    state._openInFlight = null;
-  } else {
-    state._openInFlight = null;
   }
+  setTimeout(() => { state._openInFlight = null; }, 200);
 }
 
-/* MESSAGES */
+/* ---------- MESSAGES ---------- */
 function renderMessages(msgs){
   const box = $('messages');
   box.innerHTML = '';
@@ -1429,20 +1797,26 @@ function renderMessages(msgs){
   for (const m of msgs) { appendMessage(m, {skipScroll:true, prevUser}); prevUser = m.user; }
   box.scrollTop = box.scrollHeight;
 }
+
 function userProfile(name){
   return state.profiles[(name||'').toLowerCase()] ||
     (name === state.username
       ? {username:state.username, display_name:state.display_name}
       : {username:name, display_name:name});
 }
+
 function appendMessage(m, opts = {}){
   const box = $('messages');
   const empty = box.querySelector('.empty'); if (empty) empty.remove();
   const out = m.user === state.username;
   const same = opts.prevUser === m.user;
   const prof = userProfile(m.user);
+  const isMentioned = state.mentionIds.has(m.id);
   const div = document.createElement('div');
-  div.className = 'msg ' + (out ? 'out' : 'in') + (same ? ' same-user' : '') + (out ? ' mine' : '');
+  div.className = 'msg ' + (out ? 'out' : 'in')
+    + (same ? ' same-user' : '')
+    + (out ? ' mine' : '')
+    + (isMentioned ? ' mentioned-me' : '');
   div.dataset.user = m.user; div.dataset.id = m.id;
   const nameHtml = out ? '' : `<div class="name">${escapeHtml(prof.display_name||prof.username)}</div>`;
   const edited = m.edited ? ' <span class="edited">(изм.)</span>' : '';
@@ -1460,20 +1834,32 @@ function appendMessage(m, opts = {}){
   }
   box.appendChild(div);
   if (!opts.skipScroll) box.scrollTop = box.scrollHeight;
+
+  // Если ждали перехода к упоминанию — прыгаем
+  if (state._jumpTarget && state._jumpTarget === m.id) {
+    state._jumpTarget = null;
+    setTimeout(() => {
+      div.scrollIntoView({ behavior:'smooth', block:'center' });
+      div.classList.add('flash');
+      setTimeout(() => div.classList.remove('flash'), 1600);
+    }, 50);
+  }
 }
 
-/* CONTEXT MENU */
+/* ---------- CONTEXT MENU ---------- */
 let ctxTarget = {id:null, text:null};
 function openCtxMenu(x, y, id, text){
   ctxTarget = {id, text};
   const menu = $('ctx-menu');
+  menu.style.left = '0px'; menu.style.top = '0px';
   menu.classList.add('visible');
-  // Позиционируем с учётом размеров окна
   const mw = menu.offsetWidth || 160;
   const mh = menu.offsetHeight || 80;
   let px = x, py = y;
   if (px + mw > window.innerWidth - 8) px = window.innerWidth - mw - 8;
   if (py + mh > window.innerHeight - 8) py = window.innerHeight - mh - 8;
+  if (px < 8) px = 8;
+  if (py < 8) py = 8;
   menu.style.left = px + 'px';
   menu.style.top = py + 'px';
 }
@@ -1497,7 +1883,7 @@ document.querySelectorAll('#ctx-menu .ctx-item').forEach(it => {
   });
 });
 
-/* EDIT MSG */
+/* ---------- EDIT MSG ---------- */
 let editMsgId = null;
 function openEditMsg(id, text){
   editMsgId = id;
@@ -1514,7 +1900,7 @@ $('edit-msg-save').addEventListener('click', () => {
   $('edit-msg-modal').classList.remove('visible');
 });
 
-/* MEMBERS — весь сервер */
+/* ---------- MEMBERS (весь сервер) ---------- */
 const MEMBERS_LS = 'sld_members_visible';
 if (localStorage.getItem(MEMBERS_LS) === '1') $('members-panel').classList.add('visible');
 $('members-btn').addEventListener('click', () => {
@@ -1542,7 +1928,7 @@ function renderMembers(){
   }
 }
 
-/* WS */
+/* ---------- WS ---------- */
 function connectWs(){
   if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
   if (state.ws) { try { state.ws.onclose = null; state.ws.close(); } catch(e){} state.ws = null; }
@@ -1579,11 +1965,6 @@ function handleWsEvent(d){
   if (d.type === 'presence') {
     state.totalOnline = d.total || 0;
     state.onlineUsers = d.users || [];
-    for (const c of state.channels) {
-      if (c.id === state.currentChannel) {
-        // не пересчитываем здесь — считает сервер
-      }
-    }
     updateHeader();
     renderChannels();
   } else if (d.type === 'channel_joined') {
@@ -1592,6 +1973,7 @@ function handleWsEvent(d){
       state.profiles[(p.username||'').toLowerCase()] = p;
     });
     renderMessages(d.messages||[]);
+    updateJumpButton();
   } else if (d.type === 'message') {
     const m = d.message;
     const ch = state.channels.find(c=>c.id===m.channel);
@@ -1602,6 +1984,24 @@ function handleWsEvent(d){
       appendMessage(m, {prevUser: last ? last.dataset.user : null});
     }
     renderChannels();
+  } else if (d.type === 'mentioned') {
+    // меня упомянули
+    const entry = {
+      id: d.message_id, channel: d.channel,
+      from: d.from, ts: d.ts, read: false, text: d.text,
+    };
+    state.mentions.push(entry);
+    state.mentionIds.add(d.message_id);
+    (state.mentionByChannel[d.channel] = state.mentionByChannel[d.channel] || []).push(entry);
+    // пометить существующее сообщение оранжевым
+    const el = $('messages').querySelector(`.msg[data-id="${CSS.escape(d.message_id)}"]`);
+    if (el) el.classList.add('mentioned-me');
+    updateJumpButton();
+    renderChannels();
+    // лёгкий звуковой/визуальный сигнал в заголовке
+    if (document.hidden) document.title = '• ' + (state.mentions.length) + ' — {{APP_NAME}}';
+  } else if (d.type === 'mentions_read') {
+    // сервер подтвердил — можно ничего не делать
   } else if (d.type === 'message_edited') {
     if (d.channel !== state.currentChannel) return;
     const el = $('messages').querySelector(`.msg[data-id="${d.id}"] .text`);
@@ -1611,20 +2011,29 @@ function handleWsEvent(d){
       const el = $('messages').querySelector(`.msg[data-id="${d.id}"]`);
       if (el) el.remove();
     }
+    state.mentions = state.mentions.filter(m => m.id !== d.id);
+    state.mentionIds.delete(d.id);
+    for (const k of Object.keys(state.mentionByChannel)) {
+      state.mentionByChannel[k] = state.mentionByChannel[k].filter(m => m.id !== d.id);
+    }
+    updateJumpButton();
     loadChannels();
   } else if (d.type === 'channels_changed') {
     loadChannels();
   } else if (d.type === 'channel_cleared') {
     if (d.channel === state.currentChannel) renderMessages([]);
     loadChannels();
+    loadMentions();
   } else if (d.type === 'channel_removed') {
     if (d.channel === state.currentChannel) {
       state.currentChannel = null;
       $('app').classList.remove('chat-open');
       $('chat-name').textContent = 'Выберите канал';
       renderMessages([]);
+      updateJumpButton();
     }
     loadChannels();
+    loadMentions();
   } else if (d.type === 'profile_updated') {
     state.profiles[(d.username||'').toLowerCase()] = {username:d.username, display_name:d.display_name};
     if (d.username === state.username) { state.display_name = d.display_name; paintMe(); }
@@ -1636,6 +2045,7 @@ function handleWsEvent(d){
       return;
     }
     document.querySelectorAll(`.msg[data-user="${CSS.escape(d.username)}"]`).forEach(el => el.remove());
+    loadMentions();
   } else if (d.type === 'session_expired') {
     sessionModal('Сессия истекла', 'Ваша сессия недействительна.');
   } else if (d.type === 'channel_not_found') {
@@ -1643,10 +2053,11 @@ function handleWsEvent(d){
     $('app').classList.remove('chat-open');
     $('chat-name').textContent = 'Выберите канал';
     renderMessages([]);
+    updateJumpButton();
   }
 }
 
-/* MENTIONS */
+/* ---------- MENTIONS AUTOCOMPLETE ---------- */
 const MQ_RE = /(?:^|\s)@([A-Za-z0-9_\-]{0,24})$/;
 function currentMQ(){
   const ta = $('msg-input');
@@ -1657,7 +2068,7 @@ function hideMQ(){ $('mention-menu').classList.remove('visible'); }
 function showMQ(q){
   const m = $('mention-menu');
   const lq = (q||'').toLowerCase();
-  const cands = Object.values(state.profiles)
+  const cands = (state.onlineUsers || [])
     .filter(p=>p.username && p.username!==state.username && p.username.toLowerCase().startsWith(lq))
     .slice(0, 8);
   if (state.username && state.username.toLowerCase().startsWith(lq))
@@ -1689,12 +2100,15 @@ $('msg-input').addEventListener('input', e => {
 });
 $('msg-input').addEventListener('blur', ()=>setTimeout(hideMQ, 120));
 
+/* ---------- SEND ---------- */
 function sendMessage(){
   const inp = $('msg-input');
   const text = inp.value.trim();
   if (!text || !state.ws || !state.wsReady || !state.currentChannel) return;
   state.ws.send(JSON.stringify({type:'message', text}));
-  inp.value=''; inp.style.height='auto'; hideMQ();
+  inp.value=''; inp.style.height='auto';
+  hideMQ();
+  inp.focus();   // фокус остаётся на поле
 }
 $('send-btn').addEventListener('click', sendMessage);
 $('msg-input').addEventListener('keydown', e => {
@@ -1717,6 +2131,10 @@ $('new-channel-btn').addEventListener('click', async () => {
 });
 $('new-channel-name').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('new-channel-btn').click();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) document.title = '{{APP_NAME}}';
 });
 
 boot();
@@ -1802,7 +2220,7 @@ nav a svg{width:15px;height:15px;flex-shrink:0;}
 .card h3{font-size:14.5px;font-weight:500;margin:0 0 12px;}
 .grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;}
 .grid-4{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;}
-.kv{display:grid;grid-template-columns:140px 1fr;gap:6px 14px;font-size:13px;}
+.kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:13px;}
 .kv .k{color:var(--muted);}
 .metric{font-size:24px;font-weight:400;line-height:1;color:var(--text);}
 .metric-label{font-size:12px;color:var(--muted);margin-top:6px;}
@@ -1828,8 +2246,10 @@ tbody tr:hover td{background:var(--side);}
 html[data-theme=dark] .chip.blue{background:#1e3a5f;color:#90c2f0;border-color:#2c527f;}
 .chip.green{background:#e6f5e6;color:#1a6b1a;border-color:#b8deb8;}
 html[data-theme=dark] .chip.green{background:#16351a;color:#8adf8a;border-color:#2c6b2c;}
+.chip.warn{background:#fff5e6;color:#8a5c1a;border-color:#f0d5b0;}
+html[data-theme=dark] .chip.warn{background:#3a2d12;color:#f0c88a;border-color:#6b5228;}
 
-.btn{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:12px;}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:12px;transition:background .1s;}
 .btn:hover{background:var(--side);}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
 .btn.primary:hover{background:var(--accent-h);}
@@ -1863,7 +2283,8 @@ html[data-theme=dark] .btn.danger:hover{background:#3a1a1a;}
 .pie-legend .val{margin-left:auto;color:var(--muted);}
 
 #toasts{position:fixed;right:20px;bottom:20px;z-index:300;display:flex;flex-direction:column;gap:8px;}
-.toast{padding:10px 14px;border-radius:3px;background:var(--topbg);color:var(--topfg);font-size:12.5px;border-left:3px solid var(--green);box-shadow:0 4px 12px rgba(0,0,0,.15);}
+.toast{padding:10px 14px;border-radius:3px;background:var(--topbg);color:var(--topfg);font-size:12.5px;border-left:3px solid var(--green);box-shadow:0 4px 12px rgba(0,0,0,.15);animation:toastin .18s ease-out;}
+@keyframes toastin{from{opacity:0;transform:translateX(12px);}to{opacity:1;transform:none;}}
 .toast.err{border-left-color:var(--red);}
 
 .hidden{display:none !important;}
@@ -1949,6 +2370,19 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
   </div>
 </div>
 
+<div class="modal-backdrop" id="chan-edit-modal">
+  <div class="modal">
+    <h3>Переименовать канал</h3>
+    <div class="modal-err" id="ce-err"></div>
+    <label>Название</label>
+    <input id="ce-name" type="text" maxlength="32">
+    <div class="row">
+      <button class="btn" id="ce-cancel">Отмена</button>
+      <button class="btn primary" id="ce-save">Сохранить</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-backdrop" id="msg-edit-modal">
   <div class="modal">
     <h3>Редактировать сообщение</h3>
@@ -1967,7 +2401,7 @@ html[data-theme=dark] ::-webkit-scrollbar-thumb{background:#39424e;}
 <script>
 const $ = id => document.getElementById(id);
 const LS_THEME = 'sld_admin_theme';
-const state = { tab:'dashboard', subId:null, currentUser:null, currentMsg:null,
+const state = { tab:'dashboard', subId:null, currentUser:null, currentChan:null, currentMsg:null,
                 _isRendering:false, _lastRender:0 };
 
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -2075,7 +2509,6 @@ async function renderTab(opts = {}){
   if (!opts.force && now - state._lastRender < 500) return;
   state._lastRender = now;
   state._isRendering = true;
-
   const { tab, sub } = parseHash();
   state.tab = tab; state.subId = sub;
   setActiveTab(tab);
@@ -2095,12 +2528,10 @@ async function renderTab(opts = {}){
   state._isRendering = false;
 }
 
-/* AUTO REFRESH — раз в 15 сек, не во время печати */
 setInterval(() => {
   if (!$('panel-view').classList.contains('visible')) return;
   if (state._isRendering) return;
   if (isTyping()) return;
-  // Не перерисовываем, если открыта модалка
   if (document.querySelector('.modal-backdrop.visible')) return;
   renderTab({ force: true });
 }, 15000);
@@ -2165,6 +2596,7 @@ async function renderUsers(main){
       <td>${status}</td>
       <td style="white-space:nowrap;">
         <button class="btn mini" data-edit-user="${escapeHtml(u.username)}" data-edit-name="${escapeHtml(u.display_name)}">Изменить</button>
+        <button class="btn mini" data-kick-user="${escapeHtml(u.username)}">Кик</button>
         <button class="btn mini danger" data-del-user="${escapeHtml(u.username)}">Удалить</button>
       </td>
     </tr>`;
@@ -2181,9 +2613,21 @@ async function renderUsers(main){
   main.querySelectorAll('[data-edit-user]').forEach(b => {
     b.addEventListener('click', e => { e.preventDefault(); openUserEdit(b.dataset.editUser, b.dataset.editName); });
   });
+  main.querySelectorAll('[data-kick-user]').forEach(b => {
+    b.addEventListener('click', () => kickUser(b.dataset.kickUser));
+  });
   main.querySelectorAll('[data-del-user]').forEach(b => {
     b.addEventListener('click', () => deleteUser(b.dataset.delUser));
   });
+}
+
+async function kickUser(username){
+  if (!confirm(`Кикнуть "${username}"? Аккаунт останется, но сессии сбросятся.`)) return;
+  try {
+    const r = await api('/api/admin/users/' + encodeURIComponent(username) + '/kick', { method:'POST' });
+    toast(`Кикнут (${r.kicked} сессий)`);
+    renderTab({force:true});
+  } catch(e){ toast(e.message,'err'); }
 }
 
 /* USER DETAIL */
@@ -2194,16 +2638,22 @@ async function renderUserDetail(main, username){
   const loginsPerDay = days.map(day => ({ label: day.slice(5), value: d.logins_per_day[day] || 0 }));
   const pie = Object.entries(d.messages_by_channel || {}).sort((a,b)=>b[1]-a[1]);
   const palette = ['#0066cc','#3db83d','#f0ad4e','#d9534f','#9b59b6','#16a085','#e67e22','#34495e'];
-  const pieData = pie.map(([ch,n],i) => ({
-    label: '#' + ch,
-    value: n, color: palette[i%palette.length],
-  }));
+  const pieData = pie.map(([ch,n],i) => ({ label: '#' + ch, value: n, color: palette[i%palette.length] }));
   const status = d.is_online
     ? '<span class="chip green">онлайн сейчас</span>'
     : '<span class="chip">offline</span>';
   const activity = d.is_online
     ? '<span class="green">сейчас</span>'
     : fmtRel(d.last_seen) + ' <span class="muted">('+fmtTs(d.last_seen)+')</span>';
+
+  const channelBreakdown = pie.length ? pie.map(([cid, n]) => `
+    <tr>
+      <td><span class="chip blue">#${escapeHtml(cid)}</span></td>
+      <td>${n}</td>
+      <td style="text-align:right;">
+        <button class="btn mini danger" data-clear-uch="${escapeHtml(cid)}">Удалить сообщения в этом канале</button>
+      </td>
+    </tr>`).join('') : '';
 
   main.innerHTML = `
     <h2 class="page-title">Профиль: ${escapeHtml(d.display_name)}</h2>
@@ -2219,9 +2669,12 @@ async function renderUserDetail(main, username){
           <div class="k">Статус</div><div class="v">${status}</div>
           <div class="k">Сообщений</div><div class="v">${d.total_messages}</div>
           <div class="k">Входов</div><div class="v">${(d.logins||[]).length}</div>
+          <div class="k">Упоминаний отправил</div><div class="v">${d.mentions_sent||0}</div>
+          <div class="k">Упоминаний получил</div><div class="v">${d.mentions_received||0}</div>
         </div>
-        <div style="margin-top:14px;display:flex;gap:8px;">
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
           <button class="btn" id="det-edit">Редактировать</button>
+          <button class="btn" id="det-kick">Кикнуть</button>
           <button class="btn danger" id="det-del">Удалить аккаунт</button>
         </div>
       </div>
@@ -2239,6 +2692,13 @@ async function renderUserDetail(main, username){
             </div>
           </div>` : `<div class="muted">Пользователь не писал сообщений</div>`}
       </div>
+    </div>
+    <div class="card">
+      <h3>Управление сообщениями по каналам</h3>
+      ${channelBreakdown ? `<table>
+        <thead><tr><th>Канал</th><th>Сообщений</th><th></th></tr></thead>
+        <tbody>${channelBreakdown}</tbody>
+      </table>` : `<div class="muted">Нет сообщений</div>`}
     </div>
     <div class="card"><h3>Сообщения по дням (14 дней)</h3>${barChartSvg(msgsPerDay, 900, 130)}</div>
     <div class="card"><h3>Входы по дням (14 дней)</h3>${barChartSvg(loginsPerDay, 900, 130, '#3db83d')}</div>
@@ -2258,18 +2718,32 @@ async function renderUserDetail(main, username){
     <div class="card">
       <h3>Последние сообщения</h3>
       ${(d.recent_messages && d.recent_messages.length) ? `<table style="table-layout:fixed;">
-        <colgroup><col style="width:150px;"><col style="width:140px;"><col></colgroup>
-        <thead><tr><th>Когда</th><th>Канал</th><th>Текст</th></tr></thead>
+        <colgroup><col style="width:150px;"><col style="width:140px;"><col style="width:100px;"><col></colgroup>
+        <thead><tr><th>Когда</th><th>Канал</th><th>ID</th><th>Текст</th></tr></thead>
         <tbody>${d.recent_messages.slice(0,20).map(m => `
           <tr>
             <td class="mono muted">${fmtTs(m.ts)}</td>
             <td><span class="chip blue">#${escapeHtml(m.channel_name)}</span></td>
+            <td class="mono muted" style="font-size:11px;">${escapeHtml(m.id)}</td>
             <td>${escapeHtml(m.text)}</td>
           </tr>`).join('')}
         </tbody></table>` : `<div class="muted">Сообщений нет</div>`}
     </div>`;
   $('det-edit').addEventListener('click', () => openUserEdit(d.username, d.display_name));
+  $('det-kick').addEventListener('click', () => kickUser(d.username));
   $('det-del').addEventListener('click', () => deleteUser(d.username));
+  main.querySelectorAll('[data-clear-uch]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const cid = b.dataset.clearUch;
+      if (!confirm(`Удалить все сообщения @${d.username} в #${cid}?`)) return;
+      try {
+        const r = await api(`/api/admin/channels/${encodeURIComponent(cid)}/user/${encodeURIComponent(d.username)}`,
+                            { method:'DELETE' });
+        toast(`Удалено сообщений: ${r.removed}`);
+        renderTab({force:true});
+      } catch(e){ toast(e.message,'err'); }
+    });
+  });
 }
 
 /* CHARTS */
@@ -2356,6 +2830,8 @@ async function renderChannels(main){
       <td>${c.messages}</td>
       <td>${c.online ? `<span class="chip green">${c.online}</span>` : `<span class="chip">0</span>`}</td>
       <td style="white-space:nowrap;">
+        <button class="btn mini" data-rename="${escapeHtml(c.id)}" data-rename-name="${escapeHtml(c.name)}">Переименовать</button>
+        <button class="btn mini" data-kickall="${escapeHtml(c.id)}">Кикнуть всех</button>
         <button class="btn mini" data-clear="${escapeHtml(c.id)}">Очистить</button>
         <button class="btn mini danger" data-del="${escapeHtml(c.id)}">Удалить</button>
       </td>
@@ -2375,6 +2851,9 @@ async function renderChannels(main){
     </div>`;
   main.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', ()=>deleteChannel(b.dataset.del)));
   main.querySelectorAll('[data-clear]').forEach(b => b.addEventListener('click', ()=>clearChannel(b.dataset.clear)));
+  main.querySelectorAll('[data-kickall]').forEach(b => b.addEventListener('click', ()=>kickAll(b.dataset.kickall)));
+  main.querySelectorAll('[data-rename]').forEach(b =>
+    b.addEventListener('click', ()=>openChanRename(b.dataset.rename, b.dataset.renameName)));
   $('new-ch-btn').addEventListener('click', createChannel);
   $('new-ch').addEventListener('keydown', e => { if (e.key==='Enter') createChannel(); });
 }
@@ -2394,6 +2873,33 @@ async function clearChannel(cid){
   try { await api('/api/admin/channels/'+encodeURIComponent(cid)+'/messages', { method:'DELETE' }); toast('Очищено'); renderTab({force:true}); }
   catch(e){ toast(e.message,'err'); }
 }
+async function kickAll(cid){
+  if (!confirm(`Кикнуть всех из #${cid}?`)) return;
+  try {
+    const r = await api('/api/admin/channels/'+encodeURIComponent(cid)+'/kickall', { method:'POST' });
+    toast(`Кикнуто: ${r.kicked}`);
+    renderTab({force:true});
+  } catch(e){ toast(e.message,'err'); }
+}
+function openChanRename(cid, name){
+  state.currentChan = cid;
+  $('ce-err').textContent = '';
+  $('ce-name').value = name || '';
+  $('chan-edit-modal').classList.add('visible');
+  setTimeout(()=>$('ce-name').focus(), 30);
+}
+$('ce-cancel').addEventListener('click', ()=>$('chan-edit-modal').classList.remove('visible'));
+$('ce-save').addEventListener('click', async () => {
+  const name = $('ce-name').value.trim();
+  if (!name) { $('ce-err').textContent = 'Введите название'; return; }
+  try {
+    await api('/api/admin/channels/'+encodeURIComponent(state.currentChan),
+              { method:'PATCH', body:{name} });
+    toast('Переименовано');
+    $('chan-edit-modal').classList.remove('visible');
+    renderTab({force:true});
+  } catch(e){ $('ce-err').textContent = e.message; }
+});
 
 /* MESSAGES */
 async function renderMessages(main){
@@ -2422,7 +2928,7 @@ async function renderMessages(main){
     try {
       const data = await api('/api/admin/messages?'+p.toString());
       wrap.innerHTML = data.messages.length ? `<table style="table-layout:fixed;">
-        <colgroup><col style="width:140px;"><col style="width:120px;"><col style="width:140px;"><col><col style="width:170px;"></colgroup>
+        <colgroup><col style="width:140px;"><col style="width:120px;"><col style="width:130px;"><col><col style="width:170px;"></colgroup>
         <thead><tr><th>Время</th><th>Канал</th><th>Автор</th><th>Текст</th><th></th></tr></thead>
         <tbody>${data.messages.map(m => `<tr>
           <td class="mono muted">${fmtTs(m.ts)}</td>
