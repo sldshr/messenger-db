@@ -1,440 +1,470 @@
-"""
-Мини-Википедия на FastAPI. Хранилище — в оперативке (dict).
-Запуск:  uvicorn main:app --reload
-Открыть: http://127.0.0.1:8000
-"""
-from __future__ import annotations
+# main.py
+# MiniSearch — простая поисковая система на FastAPI с хранением в оперативной памяти.
+# Запуск:  pip install fastapi uvicorn httpx beautifulsoup4 lxml
+#          uvicorn main:app --reload
+# Открой:  http://127.0.0.1:8000/
 
+import asyncio
+import math
 import re
-from datetime import datetime
-from typing import Dict, List, Optional
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from html import escape
+from typing import Optional
+from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
-from jinja2 import DictLoader, Environment, select_autoescape
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import BackgroundTasks, FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-# ---------- Markdown ----------
-try:
-    import markdown as _md
-
-    def render_md(text: str) -> str:
-        return _md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
-except ImportError:
-    import html as _html
-
-    def render_md(text: str) -> str:
-        return "<pre>" + _html.escape(text) + "</pre>"
-
-
-# ---------- Хранилище в памяти ----------
-# slug -> {"slug", "title", "content", "created_at", "updated_at"}
-ARTICLES: Dict[str, dict] = {}
-
-
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
-# ---------- Slug ----------
-_TRANSLIT = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
-    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
-    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+# --------------------------------------------------------------------------- #
+#  Настройки
+# --------------------------------------------------------------------------- #
+USER_AGENT = "MiniSearchBot/1.0 (+http://localhost)"
+TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]{2,}")
+STOP_WORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то",
+    "все", "она", "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за",
+    "бы", "по", "только", "ее", "мне", "было", "вот", "от", "меня", "еще",
+    "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг", "ли",
+    "если", "уже", "или", "ни", "быть", "был", "него", "до", "вас", "нибудь",
+    "the", "a", "an", "and", "or", "of", "to", "in", "is", "it", "on", "for",
+    "with", "as", "at", "by", "be", "this", "that", "are", "was", "were",
+    "from", "but", "not", "you", "your", "we", "our", "they", "their",
 }
 
 
-def slugify(text: str) -> str:
-    text = text.lower().strip()
-    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
-    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
-    return text or "article"
+def tokenize(text: str) -> list[str]:
+    return [t for t in TOKEN_RE.findall(text.lower()) if t not in STOP_WORDS]
 
 
-def unique_slug(desired: str, ignore: Optional[str] = None) -> str:
-    if desired not in ARTICLES or desired == ignore:
-        return desired
-    n = 1
-    base = desired
-    while f"{base}-{n}" in ARTICLES and f"{base}-{n}" != ignore:
-        n += 1
-    return f"{base}-{n}"
+# --------------------------------------------------------------------------- #
+#  Поисковый движок (инвертированный индекс + TF-IDF)
+# --------------------------------------------------------------------------- #
+class SearchEngine:
+    def __init__(self) -> None:
+        self.pages: dict[str, dict] = {}                  # url -> документ
+        self.index: dict[str, dict[str, int]] = defaultdict(dict)  # term -> {url: tf}
+        self.doc_len: dict[str, int] = {}                 # url -> количество токенов
+        self.started_at = datetime.now(timezone.utc)
+
+    # ---- индексация ----
+    def add(self, url: str, title: str, text: str, links: list[str]) -> bool:
+        if url in self.pages:
+            return False
+        tokens = tokenize(text)
+        if len(tokens) < 5:
+            return False
+        counts = Counter(tokens)
+        self.pages[url] = {
+            "url": url,
+            "title": (title or url).strip()[:200],
+            "text": text[:20000],
+            "links": links[:300],
+            "added": datetime.now(timezone.utc).isoformat(),
+        }
+        self.doc_len[url] = len(tokens)
+        for term, cnt in counts.items():
+            self.index[term][url] = cnt
+        return True
+
+    def clear(self) -> None:
+        self.pages.clear()
+        self.index.clear()
+        self.doc_len.clear()
+
+    # ---- поиск ----
+    def search(self, query: str, limit: int = 10, offset: int = 0) -> list[dict]:
+        terms = tokenize(query)
+        if not terms or not self.pages:
+            return []
+
+        N = len(self.pages)
+        scores: dict[str, float] = defaultdict(float)
+        matched_terms: dict[str, set] = defaultdict(set)
+
+        for term in set(terms):
+            postings = self.index.get(term)
+            if not postings:
+                continue
+            df = len(postings)
+            idf = math.log(1.0 + N / df)
+            for url, tf in postings.items():
+                dl = self.doc_len.get(url) or 1
+                scores[url] += (1.0 + math.log(tf)) / math.sqrt(dl) * idf
+                matched_terms[url].add(term)
+
+        # небольшая премия за совпадение во всех терминах запроса
+        uniq_terms = set(terms)
+        if len(uniq_terms) > 1:
+            for url in scores:
+                coverage = len(matched_terms[url]) / len(uniq_terms)
+                scores[url] *= (0.5 + 0.5 * coverage)
+
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        ranked = ranked[offset: offset + limit]
+
+        results = []
+        for url, score in ranked:
+            page = self.pages[url]
+            results.append({
+                "url": url,
+                "title": page["title"],
+                "snippet": make_snippet(page["text"], list(uniq_terms)),
+                "score": round(score, 4),
+                "terms": sorted(matched_terms[url]),
+            })
+        return results
 
 
-def preview_of(content: str, limit: int = 160) -> str:
-    text = re.sub(r"```.*?```", " ", content, flags=re.S)
-    text = re.sub(r"[#*_>`\[\]()!]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit] + ("…" if len(text) > limit else "")
+def make_snippet(text: str, terms: list[str], length: int = 240) -> str:
+    if not text:
+        return ""
+    low = text.lower()
+    pos = -1
+    for t in terms:
+        p = low.find(t)
+        if p != -1 and (pos == -1 or p < pos):
+            pos = p
+    if pos == -1:
+        return text[:length] + ("…" if len(text) > length else "")
+    start = max(0, pos - length // 3)
+    end = min(len(text), start + length)
+    snip = text[start:end].strip()
+    if start > 0:
+        snip = "…" + snip
+    if end < len(text):
+        snip = snip + "…"
+    return snip
 
 
-# ---------- Шаблоны ----------
-TEMPLATES = {
-    "base.html": """
-<!DOCTYPE html>
+engine = SearchEngine()
+crawl_state: dict = {"running": False, "started": None, "last_result": None, "log": []}
+
+
+# --------------------------------------------------------------------------- #
+#  Краулер
+# --------------------------------------------------------------------------- #
+async def fetch(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    try:
+        r = await client.get(url)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    ctype = r.headers.get("content-type", "").lower()
+    if "html" not in ctype and "xml" not in ctype:
+        return None
+    return r.text
+
+
+def parse_html(html: str, base_url: str) -> tuple[str, str, list[str]]:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "svg", "iframe"]):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    # главный контент, если есть
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    text = re.sub(r"\s+", " ", main.get_text(" ", strip=True))
+
+    links: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        full = urljoin(base_url, href).split("#")[0]
+        p = urlparse(full)
+        if p.scheme in ("http", "https") and p.netloc:
+            links.append(full)
+
+    # уникализируем, сохраняя порядок
+    seen, uniq = set(), []
+    for l in links:
+        if l not in seen:
+            seen.add(l)
+            uniq.append(l)
+    return title, text, uniq
+
+
+async def crawl_site(start_url: str, max_pages: int = 20, max_depth: int = 2,
+                     same_domain: bool = True) -> dict:
+    if crawl_state["running"]:
+        return {"error": "crawl already running"}
+    crawl_state["running"] = True
+    crawl_state["started"] = datetime.now(timezone.utc).isoformat()
+    crawl_state["log"] = []
+
+    start_domain = urlparse(start_url).netloc
+    queue: asyncio.Queue = asyncio.Queue()
+    await queue.put((start_url, 0))
+    seen = {start_url}
+    added = 0
+
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": USER_AGENT},
+            timeout=12.0,
+            follow_redirects=True,
+        ) as client:
+            while not queue.empty() and added < max_pages:
+                url, depth = await queue.get()
+                if url in engine.pages:
+                    continue
+
+                html = await fetch(client, url)
+                if html is None:
+                    crawl_state["log"].append(f"skip {url}")
+                    continue
+
+                title, text, links = parse_html(html, url)
+                if engine.add(url, title, text, links):
+                    added += 1
+                    crawl_state["log"].append(f"indexed {url}")
+                else:
+                    crawl_state["log"].append(f"skipped (empty) {url}")
+
+                if depth < max_depth:
+                    for link in links:
+                        if link in seen:
+                            continue
+                        if same_domain and urlparse(link).netloc != start_domain:
+                            continue
+                        seen.add(link)
+                        if len(seen) <= max_pages * 15:
+                            await queue.put((link, depth + 1))
+    finally:
+        crawl_state["running"] = False
+        crawl_state["last_result"] = {
+            "added": added,
+            "total_pages": len(engine.pages),
+            "finished": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return crawl_state["last_result"]
+
+
+# --------------------------------------------------------------------------- #
+#  FastAPI
+# --------------------------------------------------------------------------- #
+app = FastAPI(title="MiniSearch", version="1.0")
+
+
+HTML_PAGE = """<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}MiniWiki{% endblock %}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
 <style>
-  :root { --link:#3366cc; --border:#a2a9b1; --bg:#f6f6f6; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, "Segoe UI", Arial, sans-serif;
-         color:#202122; background:#fff; }
-  header { border-bottom:1px solid var(--border); padding:10px 20px;
-           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
-  header .logo { font-family: Georgia, serif; font-size:22px; font-weight:bold; }
-  header .logo a { color:#202122; text-decoration:none; }
-  header form.search { display:flex; gap:6px; margin-left:auto; }
-  header input[type=search] { padding:6px 10px; border:1px solid var(--border);
-                              border-radius:2px; width:220px; }
-  .container { max-width:900px; margin:0 auto; padding:24px 20px 60px; }
-  h1 { font-family: Georgia, serif; font-weight:normal;
-       border-bottom:1px solid var(--border); padding-bottom:8px; }
-  h2 { font-family: Georgia, serif; font-weight:normal;
-       border-bottom:1px solid var(--border); padding-bottom:4px; margin-top:28px; }
-  a { color: var(--link); }
-  .btn { display:inline-block; padding:6px 12px; border:1px solid var(--border);
-         background:var(--bg); border-radius:2px; text-decoration:none;
-         color:#202122; cursor:pointer; font-size:14px; font-family:inherit; }
-  .btn:hover { background:#eaecf0; }
-  .btn.primary { background:#36c; color:#fff; border-color:#36c; }
-  .btn.primary:hover { background:#2a4b8d; }
-  .btn.danger { color:#b32424; }
-  input[type=text], textarea { width:100%; padding:8px 10px;
-        border:1px solid var(--border); border-radius:2px;
-        font-family:inherit; font-size:15px; }
-  textarea { min-height:320px; font-family: ui-monospace, Menlo, monospace;
-             line-height:1.5; }
-  label { display:block; margin:14px 0 6px; font-weight:bold; }
-  .article-body { font-family: Georgia, serif; font-size:16px; line-height:1.7; }
-  .article-body pre { background:var(--bg); padding:12px; overflow:auto; font-size:14px;
-                      border:1px solid #eaecf0; border-radius:2px; }
-  .article-body code { background:var(--bg); padding:2px 4px; border-radius:2px; }
-  .article-body pre code { background:transparent; padding:0; }
-  .article-body blockquote { border-left:4px solid #eaecf0; margin:1em 0;
-                             padding:0 1em; color:#54595d; }
-  .article-body table { border-collapse:collapse; }
-  .article-body th, .article-body td { border:1px solid var(--border); padding:6px 10px; }
-  .meta { color:#72777d; font-size:13px; margin-top:32px;
-          border-top:1px solid var(--border); padding-top:8px; }
-  ul.articles { list-style:none; padding:0; }
-  ul.articles li { padding:10px 0; border-bottom:1px solid #eaecf0; }
-  ul.articles .desc { color:#54595d; font-size:14px; margin-top:4px; }
-  .actions { display:flex; gap:8px; margin:16px 0; }
-  .actions form { margin:0; }
-  .empty { color:#72777d; font-style:italic; }
-  .error { background:#fee7e6; color:#b32424; padding:8px 12px;
-           border:1px solid #f8c3c0; border-radius:2px; margin:12px 0; }
-  .hint { color:#72777d; font-size:13px; margin-top:4px; }
-  .note { background:#eaf3ff; border:1px solid #c8dcf5; color:#2a4b8d;
-          padding:8px 12px; border-radius:2px; margin:12px 0; font-size:14px; }
+  :root {{ color-scheme: light; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0; padding: 0; background: #fff; color: #202124;
+  }}
+  .wrap {{ max-width: 780px; margin: 0 auto; padding: 28px 20px 80px; }}
+  .brand {{ font-size: 34px; font-weight: 700; letter-spacing: -1px; margin: 0 0 6px; }}
+  .brand span:nth-child(1) {{ color: #4285f4; }}
+  .brand span:nth-child(2) {{ color: #ea4335; }}
+  .brand span:nth-child(3) {{ color: #fbbc05; }}
+  .brand span:nth-child(4) {{ color: #4285f4; }}
+  .brand span:nth-child(5) {{ color: #34a853; }}
+  .brand span:nth-child(6) {{ color: #ea4335; }}
+  .brand span:nth-child(7) {{ color: #fbbc05; }}
+  .brand span:nth-child(8) {{ color: #4285f4; }}
+  .brand span:nth-child(9) {{ color: #34a853; }}
+  form.search {{ display: flex; gap: 8px; margin: 18px 0 10px; }}
+  input[type=text] {{
+    flex: 1; padding: 12px 16px; font-size: 16px; border: 1px solid #dfe1e5;
+    border-radius: 24px; outline: none; transition: .15s;
+  }}
+  input[type=text]:focus {{ border-color: #4285f4; box-shadow: 0 1px 6px rgba(32,33,36,.18); }}
+  button {{
+    padding: 12px 22px; font-size: 15px; border: 1px solid #dfe1e5; background: #f8f9fa;
+    border-radius: 24px; cursor: pointer;
+  }}
+  button:hover {{ background: #f1f3f4; box-shadow: 0 1px 2px rgba(0,0,0,.1); }}
+  .stats {{ color: #70757a; font-size: 13px; margin: 8px 0 22px; }}
+  .result {{ margin-bottom: 26px; }}
+  .result a {{ color: #1a0dab; font-size: 18px; text-decoration: none; }}
+  .result a:hover {{ text-decoration: underline; }}
+  .result .url {{ color: #5f6368; font-size: 12px; margin-top: 2px; word-break: break-all; }}
+  .result .snip {{ color: #4d5156; font-size: 14px; line-height: 1.5; margin-top: 6px; }}
+  mark {{ background: #fff3b0; color: inherit; padding: 0 2px; border-radius: 2px; }}
+  .empty {{ color: #5f6368; font-size: 15px; padding: 30px 0; }}
+  .panel {{
+    margin-top: 40px; padding: 16px; border: 1px solid #e8eaed;
+    border-radius: 10px; background: #fafafa; font-size: 13px; color: #5f6368;
+  }}
+  .panel h3 {{ margin: 0 0 8px; font-size: 14px; color: #202124; }}
+  .panel code {{ background: #eef1f3; padding: 1px 5px; border-radius: 4px; }}
+  .panel form {{ display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }}
+  .panel input {{ flex: 1; min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid #dfe1e5; }}
+  .panel button {{ padding: 8px 14px; border-radius: 8px; }}
+  .nav {{ margin-bottom: 12px; }}
+  .nav a {{ color: #1a73e8; text-decoration: none; font-size: 14px; }}
 </style>
 </head>
 <body>
-<header>
-  <div class="logo"><a href="/">📖 MiniWiki</a></div>
-  <form class="search" action="/search" method="get">
-    <input type="search" name="q" placeholder="Поиск…" value="{{ q or '' }}">
-    <button class="btn" type="submit">Найти</button>
+<div class="wrap">
+  <div class="nav"><a href="/">← На главную</a></div>
+  <h1 class="brand"><span>M</span><span>i</span><span>n</span><span>i</span><span>S</span><span>e</span><span>a</span><span>r</span><span>ch</span></h1>
+
+  <form class="search" action="/" method="get">
+    <input type="text" name="q" value="{q_esc}" placeholder="Поиск по проиндексированным страницам…" autofocus>
+    <button type="submit">Найти</button>
   </form>
-  <a class="btn primary" href="/new">+ Новая статья</a>
-</header>
-<div class="container">
-{% block content %}{% endblock %}
+
+  <div class="stats">{stats}</div>
+
+  {results_html}
+
+  <div class="panel">
+    <h3>Проиндексировать сайт</h3>
+    <form action="/crawl" method="get">
+      <input type="text" name="url" placeholder="https://example.com" required>
+      <input type="number" name="max_pages" value="15" min="1" max="200" style="max-width:100px">
+      <button type="submit">Сканировать</button>
+    </form>
+    <div style="margin-top:10px">
+      API: <code>GET /api/search?q=…</code> · <code>POST /api/crawl</code> ·
+      <code>GET /api/stats</code> · <code>POST /api/clear</code>
+    </div>
+  </div>
 </div>
 </body>
 </html>
-""",
-
-    "index.html": """
-{% extends "base.html" %}
-{% block content %}
-<h1>Все статьи</h1>
-<div class="note">
-  ⚠️ Статьи хранятся <b>только в оперативной памяти</b>.
-  После перезапуска сервера они исчезнут.
-</div>
-{% if articles %}
-<ul class="articles">
-{% for a in articles %}
-  <li>
-    <a href="/wiki/{{ a.slug }}"><strong>{{ a.title }}</strong></a>
-    <div class="desc">{{ a.preview }}</div>
-  </li>
-{% endfor %}
-</ul>
-{% else %}
-<p class="empty">Пока нет статей. <a href="/new">Создайте первую!</a></p>
-{% endif %}
-{% endblock %}
-""",
-
-    "search.html": """
-{% extends "base.html" %}
-{% block title %}Поиск: {{ q }} — MiniWiki{% endblock %}
-{% block content %}
-<h1>Поиск: «{{ q }}»</h1>
-{% if articles %}
-  <p>Найдено статей: {{ articles|length }}</p>
-  <ul class="articles">
-  {% for a in articles %}
-    <li>
-      <a href="/wiki/{{ a.slug }}"><strong>{{ a.title }}</strong></a>
-      <div class="desc">{{ a.preview }}</div>
-    </li>
-  {% endfor %}
-  </ul>
-{% else %}
-  <p class="empty">Ничего не найдено.</p>
-{% endif %}
-{% endblock %}
-""",
-
-    "article.html": """
-{% extends "base.html" %}
-{% block title %}{{ article.title }} — MiniWiki{% endblock %}
-{% block content %}
-<h1>{{ article.title }}</h1>
-<div class="actions">
-  <a class="btn" href="/edit/{{ article.slug }}">✏️ Редактировать</a>
-  <form method="post" action="/delete/{{ article.slug }}"
-        onsubmit="return confirm('Удалить статью «{{ article.title }}»?')">
-    <button class="btn danger" type="submit">🗑 Удалить</button>
-  </form>
-</div>
-<div class="article-body">{{ content|safe }}</div>
-<div class="meta">
-  Создано: {{ article.created_at }} · Обновлено: {{ article.updated_at }} ·
-  slug: <code>{{ article.slug }}</code>
-</div>
-{% endblock %}
-""",
-
-    "form.html": """
-{% extends "base.html" %}
-{% block title %}{{ heading }} — MiniWiki{% endblock %}
-{% block content %}
-<h1>{{ heading }}</h1>
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-<form method="post" action="{{ action }}">
-  <label for="title">Заголовок</label>
-  <input type="text" id="title" name="title" value="{{ title }}" required autofocus>
-
-  <label for="slug">Slug (URL)</label>
-  <input type="text" id="slug" name="slug" value="{{ slug }}"
-         placeholder="оставьте пустым — сгенерируется автоматически">
-  <div class="hint">Например: <code>python-fastapi</code></div>
-
-  <label for="content">Содержимое (Markdown)</label>
-  <textarea id="content" name="content">{{ content }}</textarea>
-  <div class="hint">
-    Поддерживается Markdown: <code># заголовок</code>, <code>**жирный**</code>,
-    <code>*курсив*</code>, <code>[ссылка](url)</code>, <code>```код```</code>,
-    списки, таблицы.
-  </div>
-
-  <div class="actions" style="margin-top:18px">
-    <button class="btn primary" type="submit">💾 Сохранить</button>
-    <a class="btn" href="{{ cancel_url }}">Отмена</a>
-  </div>
-</form>
-{% endblock %}
-""",
-
-    "404.html": """
-{% extends "base.html" %}
-{% block title %}Не найдено — MiniWiki{% endblock %}
-{% block content %}
-<h1>404 — страница не найдена</h1>
-<p class="empty">{{ message }}</p>
-<p><a href="/">← На главную</a></p>
-{% endblock %}
-""",
-}
-
-env = Environment(loader=DictLoader(TEMPLATES), autoescape=select_autoescape(["html"]))
+"""
 
 
-def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
-    return HTMLResponse(env.get_template(name).render(**ctx), status_code=status_code)
+def highlight(text: str, terms: list[str]) -> str:
+    out = escape(text)
+    for t in sorted({t for t in terms if len(t) >= 2}, key=len, reverse=True):
+        out = re.sub(rf"\b({re.escape(t)}[а-яa-z]*)", r"<mark>\1</mark>",
+                     out, flags=re.IGNORECASE)
+    return out
 
 
-# ---------- Приложение ----------
-app = FastAPI(title="MiniWiki")
+def render_page(q: str, results: list[dict], extra_stats: str = "") -> str:
+    if q and results:
+        parts = []
+        for r in results:
+            parts.append(f"""
+            <div class="result">
+              <a href="{escape(r['url'])}" target="_blank" rel="noopener">{escape(r['title'])}</a>
+              <div class="url">{escape(r['url'])}</div>
+              <div class="snip">{highlight(r['snippet'], r['terms'])}</div>
+            </div>""")
+        results_html = "".join(parts)
+    elif q:
+        results_html = '<div class="empty">Ничего не найдено. Попробуйте другой запрос или проиндексируйте сайт ниже.</div>'
+    else:
+        results_html = ""
+
+    stats = f"Страниц в индексе: {len(engine.pages)} · Терминов: {len(engine.index)}"
+    if extra_stats:
+        stats += f" · {extra_stats}"
+    if q:
+        stats = f"Найдено {len(results)} результатов · " + stats
+
+    return HTML_PAGE.format(
+        title=escape(q) if q else "MiniSearch",
+        q_esc=escape(q),
+        stats=escape(stats),
+        results_html=results_html,
+    )
 
 
-# ---------- Роуты ----------
+# ---------------- HTML-роуты ----------------
 @app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
-    articles = sorted(
-        (
-            {
-                "slug": a["slug"],
-                "title": a["title"],
-                "preview": preview_of(a["content"]),
-            }
-            for a in ARTICLES.values()
-        ),
-        key=lambda x: x["title"].lower(),
-    )
-    return render("index.html", articles=articles)
+async def index(q: str = Query("", max_length=200)):
+    results = engine.search(q, limit=10) if q.strip() else []
+    extra = ""
+    if crawl_state["running"]:
+        extra = "идёт сканирование…"
+    return HTMLResponse(render_page(q.strip(), results, extra))
 
 
-@app.get("/search", response_class=HTMLResponse)
-def search(q: str = "") -> HTMLResponse:
-    q = q.strip()
-    if not q:
-        return RedirectResponse("/", status_code=303)
-    needle = q.lower()
-    found = [
-        {
-            "slug": a["slug"],
-            "title": a["title"],
-            "preview": preview_of(a["content"]),
-        }
-        for a in ARTICLES.values()
-        if needle in a["title"].lower() or needle in a["content"].lower()
-    ]
-    found.sort(key=lambda x: x["title"].lower())
-    return render("search.html", q=q, articles=found)
-
-
-@app.get("/wiki/{slug}", response_class=HTMLResponse)
-def view_article(slug: str) -> HTMLResponse:
-    article = ARTICLES.get(slug)
-    if not article:
-        raise HTTPException(status_code=404, detail=f"Статья «{slug}» не существует.")
-    return render(
-        "article.html",
-        article=article,
-        content=render_md(article["content"]),
-    )
-
-
-# ---- Создание ----
-@app.get("/new", response_class=HTMLResponse)
-def new_article_form() -> HTMLResponse:
-    return render(
-        "form.html",
-        heading="Новая статья",
-        action="/new",
-        cancel_url="/",
-        title="",
-        slug="",
-        content="",
-        error=None,
-    )
-
-
-@app.post("/new")
-def create_article(
-    title: str = Form(...),
-    content: str = Form(""),
-    slug: str = Form(""),
-):
-    title = title.strip()
-    if not title:
-        return render(
-            "form.html",
-            heading="Новая статья",
-            action="/new",
-            cancel_url="/",
-            title=title,
-            slug=slug,
-            content=content,
-            error="Заголовок не может быть пустым.",
-            status_code=400,
-        )
-
-    desired = slugify(slug.strip() or title)
-    final_slug = unique_slug(desired)
-    ts = now_str()
-    ARTICLES[final_slug] = {
-        "slug": final_slug,
-        "title": title,
-        "content": content,
-        "created_at": ts,
-        "updated_at": ts,
-    }
-    return RedirectResponse(f"/wiki/{final_slug}", status_code=303)
-
-
-# ---- Редактирование ----
-@app.get("/edit/{slug}", response_class=HTMLResponse)
-def edit_article_form(slug: str) -> HTMLResponse:
-    article = ARTICLES.get(slug)
-    if not article:
-        raise HTTPException(status_code=404, detail=f"Статья «{slug}» не найдена.")
-    return render(
-        "form.html",
-        heading=f"Редактирование: {article['title']}",
-        action=f"/edit/{slug}",
-        cancel_url=f"/wiki/{slug}",
-        title=article["title"],
-        slug=article["slug"],
-        content=article["content"],
-        error=None,
-    )
-
-
-@app.post("/edit/{slug}")
-def update_article(
-    slug: str,
-    title: str = Form(...),
-    content: str = Form(""),
-    slug_new: str = Form("", alias="slug"),
-):
-    if slug not in ARTICLES:
-        raise HTTPException(status_code=404, detail="Статья не найдена.")
-
-    title = title.strip()
-    if not title:
-        return render(
-            "form.html",
-            heading=f"Редактирование: {slug}",
-            action=f"/edit/{slug}",
-            cancel_url=f"/wiki/{slug}",
-            title=title,
-            slug=slug_new,
-            content=content,
-            error="Заголовок не может быть пустым.",
-            status_code=400,
-        )
-
-    desired = slugify(slug_new.strip() or title)
-    final_slug = unique_slug(desired, ignore=slug)
-
-    article = ARTICLES.pop(slug)
-    article["title"] = title
-    article["content"] = content
-    article["slug"] = final_slug
-    article["updated_at"] = now_str()
-    ARTICLES[final_slug] = article
-
-    return RedirectResponse(f"/wiki/{final_slug}", status_code=303)
-
-
-# ---- Удаление ----
-@app.post("/delete/{slug}")
-def delete_article(slug: str):
-    if slug not in ARTICLES:
-        raise HTTPException(status_code=404, detail="Статья не найдена.")
-    del ARTICLES[slug]
+@app.get("/crawl")
+async def crawl_html(background: BackgroundTasks,
+                     url: str = Query(..., min_length=4),
+                     max_pages: int = Query(15, ge=1, le=200),
+                     max_depth: int = Query(2, ge=0, le=4)):
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    if not crawl_state["running"]:
+        background.add_task(crawl_site, url, max_pages, max_depth, True)
     return RedirectResponse("/", status_code=303)
 
 
-# ---- Обработчик 404 ----
-@app.exception_handler(404)
-async def not_found_handler(request: Request, exc: HTTPException):
-    msg = exc.detail if isinstance(exc.detail, str) else "Страница не найдена."
-    return render("404.html", message=msg, status_code=404)
+# ---------------- JSON API ----------------
+@app.get("/api/search")
+async def api_search(q: str = Query(..., min_length=1),
+                     limit: int = Query(10, ge=1, le=50),
+                     offset: int = Query(0, ge=0)):
+    results = engine.search(q, limit=limit, offset=offset)
+    return {
+        "query": q,
+        "count": len(results),
+        "results": results,
+    }
 
 
-# ---------- Запуск ----------
+@app.post("/api/crawl")
+async def api_crawl(background: BackgroundTasks,
+                    url: str = Query(..., min_length=4),
+                    max_pages: int = Query(20, ge=1, le=500),
+                    max_depth: int = Query(2, ge=0, le=5),
+                    same_domain: bool = True):
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    if crawl_state["running"]:
+        return JSONResponse({"status": "busy", "message": "уже идёт сканирование"},
+                            status_code=409)
+    background.add_task(crawl_site, url, max_pages, max_depth, same_domain)
+    return {"status": "started", "url": url, "max_pages": max_pages}
+
+
+@app.get("/api/stats")
+async def api_stats():
+    return {
+        "pages": len(engine.pages),
+        "terms": len(engine.index),
+        "started_at": engine.started_at.isoformat(),
+        "crawl": {
+            "running": crawl_state["running"],
+            "started": crawl_state["started"],
+            "last_result": crawl_state["last_result"],
+        },
+        "top_terms": sorted(
+            ((t, len(p)) for t, p in engine.index.items()),
+            key=lambda x: -x[1],
+        )[:20],
+        "urls": list(engine.pages.keys())[:50],
+    }
+
+
+@app.post("/api/clear")
+async def api_clear():
+    engine.clear()
+    crawl_state["log"] = []
+    crawl_state["last_result"] = None
+    return {"status": "cleared"}
+
+
+@app.get("/api/page")
+async def api_page(url: str):
+    page = engine.pages.get(url)
+    if not page:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return page
+
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
