@@ -1,6 +1,7 @@
 import os
 import hashlib
 import uuid
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -31,30 +32,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def _ensure_bucket():
+    """Создаёт публичный бакет, если его ещё нет."""
+    try:
+        buckets = supabase.storage.list_buckets()
+        names = []
+        for b in buckets:
+            if isinstance(b, dict):
+                names.append(b.get("name"))
+            else:
+                names.append(getattr(b, "name", None))
+        if BUCKET_NAME not in names:
+            supabase.storage.create_bucket(BUCKET_NAME, options={"public": True})
+            print(f"[startup] created bucket '{BUCKET_NAME}'")
+        else:
+            print(f"[startup] bucket '{BUCKET_NAME}' exists")
+    except Exception as e:
+        print(f"[startup] bucket check failed: {e}")
+        traceback.print_exc()
+
+
 # --- Модели ---
 class RegisterRequest(BaseModel):
     username: str
     password: str
 
+
 class LoginRequest(BaseModel):
     username: str
     password: str
+
 
 class ProfileUpdate(BaseModel):
     display_name: Optional[str] = None
     bio: Optional[str] = None
     avatar_url: Optional[str] = None
 
+
 class PostCreate(BaseModel):
     description: str
     image_urls: List[str] = []
+
 
 # --- Утилиты ---
 def hash_password(password: str) -> str:
     return hashlib.sha256((password + SECRET_KEY).encode()).hexdigest()
 
+
 def verify_password(password: str, password_hash: str) -> bool:
     return hash_password(password) == password_hash
+
 
 def create_session(user_id: str) -> str:
     """Создаёт случайный токен и сохраняет сессию в БД."""
@@ -66,6 +95,7 @@ def create_session(user_id: str) -> str:
         "expires_at": expires_at.isoformat(),
     }).execute()
     return token
+
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
@@ -89,6 +119,7 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
     return user_resp.data[0]
 
+
 # --- Эндпоинты ---
 @app.post("/register")
 async def register(req: RegisterRequest):
@@ -102,7 +133,6 @@ async def register(req: RegisterRequest):
         "id": user_id,
         "username": req.username,
         "password_hash": password_hash,
-        # display_name намеренно не задаём — пользователь укажет его позже в профиле
     }
     supabase.table("profiles").insert(data).execute()
 
@@ -113,6 +143,7 @@ async def register(req: RegisterRequest):
         "username": req.username,
         "display_name": None,
     }
+
 
 @app.post("/login")
 async def login(req: LoginRequest):
@@ -130,12 +161,14 @@ async def login(req: LoginRequest):
         "display_name": user.get("display_name"),
     }
 
+
 @app.post("/logout")
 async def logout(authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:].strip()
         supabase.table("sessions").delete().eq("token", token).execute()
     return {"status": "ok"}
+
 
 @app.get("/profile")
 async def get_profile(user: dict = Depends(get_current_user)):
@@ -148,6 +181,7 @@ async def get_profile(user: dict = Depends(get_current_user)):
         "created_at": user.get("created_at"),
     }
 
+
 @app.put("/profile")
 async def update_profile(update: ProfileUpdate, user: dict = Depends(get_current_user)):
     data = {k: v for k, v in update.dict().items() if v is not None}
@@ -157,21 +191,57 @@ async def update_profile(update: ProfileUpdate, user: dict = Depends(get_current
     supabase.table("profiles").update(data).eq("id", user["id"]).execute()
     return {"status": "ok"}
 
+
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    ext = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    filename = f"{user['id']}/{uuid.uuid4()}.{ext}"
     contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+
+    ct = (file.content_type or "").lower()
+    if ct not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        name = file.filename or ""
+        ext_guess = name.rsplit(".", 1)[-1].lower() if "." in name else "jpg"
+        ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+              "png": "image/png", "webp": "image/webp",
+              "gif": "image/gif"}.get(ext_guess, "image/jpeg")
+
+    ext = {"image/jpeg": "jpg", "image/png": "png",
+           "image/webp": "webp", "image/gif": "gif"}.get(ct, "jpg")
+
+    filename = f"{user['id']}/{uuid.uuid4().hex}.{ext}"
+
     try:
-        supabase.storage.from_(BUCKET_NAME).upload(
-            path=filename,
-            file=contents,
-            file_options={"content-type": file.content_type or "image/jpeg", "upsert": "false"}
-        )
+        try:
+            supabase.storage.from_(BUCKET_NAME).upload(
+                path=filename,
+                file=contents,
+                file_options={"content-type": ct, "upsert": "false"},
+            )
+        except Exception as inner:
+            msg = str(inner)
+            if "Bucket not found" in msg or "not found" in msg.lower():
+                supabase.storage.create_bucket(BUCKET_NAME, options={"public": True})
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path=filename,
+                    file=contents,
+                    file_options={"content-type": ct, "upsert": "false"},
+                )
+            else:
+                raise
+
         public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(filename)
+        if isinstance(public_url, dict):
+            public_url = public_url.get("publicUrl") or public_url.get("public_url") or ""
+
+        print(f"[upload] OK user={user['id']} file={filename} url={public_url}")
         return {"url": public_url}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка загрузки: {str(e)}")
+        print("[upload] FAILED:", repr(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
 
 @app.post("/posts")
 async def create_post(post: PostCreate, user: dict = Depends(get_current_user)):
@@ -192,6 +262,7 @@ async def create_post(post: PostCreate, user: dict = Depends(get_current_user)):
             "position": idx,
         }).execute()
     return {"post_id": post_id}
+
 
 @app.get("/posts/{post_id}")
 async def get_post(post_id: str, request: Request):
@@ -218,7 +289,10 @@ async def get_post(post_id: str, request: Request):
         })
     else:
         desc = post["description"] or ""
-        images_html = "".join(f'<img src="{url}" style="max-width:100%; margin:10px 0; border-radius:8px;" />' for url in images)
+        images_html = "".join(
+            f'<img src="{url}" style="max-width:100%; margin:10px 0; border-radius:8px;" />'
+            for url in images
+        )
         html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -243,9 +317,11 @@ async def get_post(post_id: str, request: Request):
 </html>"""
         return HTMLResponse(content=html)
 
+
 @app.get("/")
 async def root():
     return {"message": "Social Network API", "status": "running"}
+
 
 if __name__ == "__main__":
     import uvicorn
