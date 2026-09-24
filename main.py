@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-СЛД — социальная сеть / форум в старом стиле.
-Один файл. Регистрация, вход, профиль с фото, темы, комментарии.
+СЛД — форум-соцсеть. Один файл.
+Регистрация, вход, профиль с фото, темы, комментарии, поиск.
 БД — Supabase (service_role).
 
 Запуск:
@@ -26,9 +26,9 @@ from supabase import create_client
 from PIL import Image
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Конфигурация
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
@@ -45,17 +45,16 @@ POST_MAX = 5000
 COMMENT_MAX = 2000
 ABOUT_MAX = 2000
 
-# Ограничения на аватар
-AVATAR_UPLOAD_MAX = 10 * 1024 * 1024     # принимаем на вход до 10 МБ
-AVATAR_TARGET_BYTES = 150 * 1024         # на выходе — не более 150 КБ
-AVATAR_MAX_SIDE = 512                    # ресайз: длинная сторона ≤ 512 px
+AVATAR_UPLOAD_MAX = 10 * 1024 * 1024
+AVATAR_TARGET_BYTES = 150 * 1024
+AVATAR_MAX_SIDE = 512
 
 app = FastAPI(title="СЛД", docs_url=None, redoc_url=None)
 
 
-# ---------------------------------------------------------------------------
-# Утилиты
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Базовые утилиты
+# ===========================================================================
 
 def esc(v: Any) -> str:
     return html.escape("" if v is None else str(v), quote=True)
@@ -94,8 +93,8 @@ def parse_dt(value: Any) -> Optional[datetime]:
         return None
 
 
-MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
-          "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн",
+          "июл", "авг", "сен", "окт", "ноя", "дек"]
 
 
 def fmt_dt(value: Any) -> str:
@@ -105,10 +104,15 @@ def fmt_dt(value: Any) -> str:
     dt = dt.astimezone()
     now = datetime.now(timezone.utc).astimezone()
     if dt.date() == now.date():
-        return f"сегодня в {dt:%H:%M}"
+        return f"сегодня, {dt:%H:%M}"
     if (now.date() - dt.date()).days == 1:
-        return f"вчера в {dt:%H:%M}"
+        return f"вчера, {dt:%H:%M}"
     return f"{dt.day} {MONTHS[dt.month - 1]} {dt.year}"
+
+
+def fmt_iso(value: Any) -> str:
+    dt = parse_dt(value)
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -125,46 +129,39 @@ def plural(n: int, one: str, few: str, many: str) -> str:
 
 def avatar_color(name: str) -> str:
     h = int(hashlib.md5((name or "?").encode("utf-8")).hexdigest()[:6], 16)
-    r = 110 + (h & 0x4F)
-    g = 120 + ((h >> 8) & 0x4F)
-    b = 140 + ((h >> 16) & 0x3F)
+    r = 90 + (h & 0x5F)
+    g = 80 + ((h >> 8) & 0x5F)
+    b = 70 + ((h >> 16) & 0x4F)
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def avatar_html(username: str, avatar: Optional[str], size: int = 50) -> str:
+def avatar_html(username: str, avatar: Optional[str], size: int = 40) -> str:
     if avatar:
         return (f'<img class="av" src="{esc(avatar)}" '
-                f'width="{size}" height="{size}" alt="">')
+                f'width="{size}" height="{size}" alt="" loading="lazy">')
     letter = esc((username or "?")[0].upper())
     color = avatar_color(username or "?")
     return (f'<div class="av av-letter" style="background:{color};'
-            f'width:{size}px;height:{size}px;line-height:{size}px;'
-            f'font-size:{int(size * 0.45)}px">{letter}</div>')
+            f'width:{size}px;height:{size}px;'
+            f'font-size:{int(size * 0.42)}px">{letter}</div>')
 
 
 def process_avatar(raw: bytes) -> Optional[str]:
-    """
-    Принимает байты изображения, возвращает data:URL JPEG.
-    - ресайз: длинная сторона ≤ AVATAR_MAX_SIDE (512) с сохранением пропорций
-    - подбором качества гарантируем размер ≤ AVATAR_TARGET_BYTES (150 КБ)
-    - если никакое качество не помогает — дополнительно уменьшаем
-    """
+    """Ресайз до 512 по длинной стороне и сжатие JPEG до 150 КБ."""
     try:
         img = Image.open(io.BytesIO(raw))
         img.load()
     except Exception:
         return None
 
-    # Приводим к RGB (прозрачность ложим на белый фон)
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
-        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg = Image.new("RGB", img.size, (24, 21, 18))  # тёмный фон — под тему
         bg.paste(img, mask=img.split()[-1])
         img = bg
     else:
         img = img.convert("RGB")
 
-    # Первый ресайз
     img.thumbnail((AVATAR_MAX_SIDE, AVATAR_MAX_SIDE), Image.LANCZOS)
 
     def encode(im: Image.Image, q: int) -> bytes:
@@ -172,32 +169,65 @@ def process_avatar(raw: bytes) -> Optional[str]:
         im.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
         return buf.getvalue()
 
-    # Пробуем уменьшать качество
     for q in (88, 82, 76, 70, 64, 58, 52, 46, 40, 34, 28):
         data = encode(img, q)
         if len(data) <= AVATAR_TARGET_BYTES:
-            b64 = base64.b64encode(data).decode("ascii")
-            return f"data:image/jpeg;base64,{b64}"
+            return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
-    # Если всё равно много — пропорционально уменьшаем размер
     w, h = img.size
     for scale in (0.85, 0.7, 0.6, 0.5, 0.4, 0.3):
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        small = img.resize((nw, nh), Image.LANCZOS)
+        small = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                           Image.LANCZOS)
         data = encode(small, 70)
         if len(data) <= AVATAR_TARGET_BYTES:
-            b64 = base64.b64encode(data).decode("ascii")
-            return f"data:image/jpeg;base64,{b64}"
+            return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
-    # Совсем крайний случай
     data = encode(img.resize((128, 128), Image.LANCZOS), 55)
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Иконки (inline SVG)
+# ===========================================================================
+
+_ICONS = {
+    "logo": '<path d="M12 3l2.7 5.7 6.3.9-4.6 4.4 1.1 6.2L12 17.3 6.5 20.2l1.1-6.2L3 9.6l6.3-.9L12 3z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+    "feed": '<path d="M4 5h16M4 10h16M4 15h16M4 20h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+    "users": '<circle cx="9" cy="8" r="3.2" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M3.5 19.5c.3-3 2.7-5 5.5-5s5.2 2 5.5 5" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><circle cx="17" cy="9" r="2.3" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M14.5 18c.3-1.9 1.3-3 2.5-3s2.2 1.1 2.5 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/>',
+    "user": '<circle cx="12" cy="8" r="3.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M5 20c.5-3.5 3.5-6 7-6s6.5 2.5 7 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/>',
+    "cog": '<circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 3v2.6M12 18.4V21M3 12h2.6M18.4 12H21M5.6 5.6l1.9 1.9M16.5 16.5l1.9 1.9M5.6 18.4l1.9-1.9M16.5 7.5l1.9-1.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
+    "logout": '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M10 12h10m0 0l-3-3m3 3l-3 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "login": '<path d="M9 4h9a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M14 12H4m0 0l3-3m-3 3l3 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "signup": '<circle cx="10" cy="8" r="3.3" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M4 20c.4-3.3 3-5.7 6-5.7s5.6 2.4 6 5.7" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M18 8v6M15 11h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
+    "edit": '<path d="M4 20h4l10-10-4-4L4 16v4z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M14 6l4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
+    "trash": '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "comment": '<path d="M4 5h16v11H8l-4 4V5z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
+    "send": '<path d="M3 12l18-8-6 18-3-7-9-3z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
+    "plus": '<path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+    "search": '<circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
+    "back": '<path d="M20 12H4m0 0l6-6m-6 6l6 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "next": '<path d="M4 12h16m0 0l-6-6m6 6l-6 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "clock": '<circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>',
+    "hash": '<path d="M5 9h14M5 15h14M10 4l-2 16M16 4l-2 16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>',
+    "file": '<path d="M6 3h8l4 4v14H6z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M14 3v4h4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
+    "alert": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 7v6M12 16.5v.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+    "check": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M8 12.5l3 3 5-6" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "image": '<rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/><circle cx="9" cy="10" r="1.7" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 18l5-5 4 4 3-3 4 4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    "home": '<path d="M4 11l8-7 8 7v9H4z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M10 20v-5h4v5" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
+    "tag": '<path d="M3 12l9-9h9v9l-9 9z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><circle cx="16" cy="8" r="1.6" stroke="currentColor" stroke-width="1.5" fill="none"/>',
+}
+
+
+def ic(name: str, size: int = 16, cls: str = "") -> str:
+    p = _ICONS.get(name, "")
+    c = f"ic {cls}".strip()
+    return (f"<svg class='{c}' width='{size}' height='{size}' "
+            f"viewBox='0 0 24 24' fill='none' aria-hidden='true'>{p}</svg>")
+
+
+# ===========================================================================
 # Сессии
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def create_session(user_id: str) -> str:
     token = secrets.token_urlsafe(32)
@@ -249,317 +279,539 @@ def destroy_session(request: Request) -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Стиль: спокойный старый форум
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Стиль
+# ===========================================================================
 
 CSS = """
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#131110;--bg-2:#191614;--surface:#1e1a17;--surface-hi:#26211c;
+  --border:#302922;--border-2:#40372e;
+  --text:#ebe4d8;--dim:#9c9183;--mute:#6b6156;
+  --accent:#e0a04a;--accent-hi:#f2bb6b;--accent-bg:rgba(224,160,74,.10);
+  --danger:#d0766a;--ok:#88b86e;
+  --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  --radius:6px;
+}
+html,body{height:100%}
 body{
-  font:12px/1.5 Verdana,Tahoma,Arial,sans-serif;
-  color:#2A2A2A;
-  background:#E4E4DE;
-  padding:16px 0 40px;
+  font-family:var(--sans);font-size:14px;line-height:1.55;
+  color:var(--text);background:var(--bg);
+  -webkit-font-smoothing:antialiased;
 }
-a{color:#2B587A;text-decoration:none}
-a:hover{text-decoration:underline}
-img{border:0}
+a{color:var(--accent);text-decoration:none}
+a:hover{color:var(--accent-hi)}
+svg{display:block}
+button{font-family:inherit;cursor:pointer}
+kbd{
+  display:inline-block;padding:1px 6px;border-radius:3px;
+  background:var(--surface-hi);border:1px solid var(--border-2);
+  font-family:var(--mono);font-size:10px;color:var(--text);
+  box-shadow:0 1px 0 var(--border-2);
+}
 
-.wrap{width:880px;margin:0 auto}
+/* Topbar */
+.topbar{
+  background:linear-gradient(180deg,#1c1815,#141110);
+  border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:50;
+}
+.topbar-in{
+  max-width:1120px;margin:0 auto;height:56px;
+  display:flex;align-items:center;gap:20px;padding:0 20px;
+}
+.brand{
+  display:flex;align-items:center;gap:9px;
+  font-family:var(--mono);font-weight:700;font-size:16px;
+  letter-spacing:2.5px;color:var(--text);flex:none;
+}
+.brand:hover{color:var(--accent-hi)}
+.brand svg{color:var(--accent)}
+.topnav{display:flex;gap:3px;align-items:center}
+.topnav a{
+  display:flex;align-items:center;gap:7px;
+  padding:7px 12px;border-radius:5px;color:var(--dim);
+  font-size:13px;font-weight:500;transition:background .12s,color .12s;
+}
+.topnav a:hover{background:var(--surface);color:var(--text)}
+.topnav a.on{background:var(--accent-bg);color:var(--accent-hi)}
+.topnav a.on svg{color:var(--accent)}
+.topnav a svg{color:var(--mute)}
+.topnav a:hover svg{color:var(--text)}
 
-/* Шапка */
-.head{
-  background:#4A6886;
-  color:#fff;
-  border:1px solid #354E66;
-  border-bottom:none;
-  padding:12px 16px;
-  overflow:hidden;
+.userarea{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;flex:none}
+.userarea .who{
+  display:flex;align-items:center;gap:9px;
+  padding:4px 12px 4px 4px;border-radius:100px;
+  background:var(--surface);border:1px solid var(--border);
+  color:var(--text);
 }
-.head .logo{
-  font:bold 26px/1 Verdana,Tahoma,sans-serif;
-  letter-spacing:4px;color:#fff;text-decoration:none;
-  text-shadow:0 1px 1px rgba(0,0,0,.25);
-  float:left;
+.userarea .who:hover{border-color:var(--border-2);color:var(--text)}
+.userarea .who .av{border-radius:50%}
+.userarea .who .uname{font-weight:600}
+.iconbtn{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;height:34px;border-radius:6px;
+  color:var(--dim);background:transparent;
+  border:1px solid transparent;transition:all .12s;
 }
-.head .logo:hover{text-decoration:none;color:#F0F4F8}
-.head .tagline{
-  float:left;margin-left:14px;padding-top:8px;
-  font-size:11px;color:#C8D6E2;font-style:italic;
-}
-.head .right{
-  float:right;text-align:right;font-size:11px;color:#D4DEE8;padding-top:6px;
-}
-.head .right a{color:#FFFFFF}
-.head .right b a{font-weight:bold}
+.iconbtn:hover{background:var(--surface);color:var(--text);border-color:var(--border)}
 
-/* Навигация */
-.nav{
-  background:#EFEDE5;
-  border:1px solid #C7C3B4;
-  border-top:none;
-  padding:5px 12px;
-  font-size:11px;
+/* Layout */
+.wrap{max-width:1120px;margin:0 auto;padding:22px 20px 60px}
+.cols{display:grid;grid-template-columns:236px 1fr;gap:22px;align-items:start}
+.side{position:sticky;top:78px;display:flex;flex-direction:column;gap:14px}
+.content{min-width:0;display:flex;flex-direction:column;gap:14px}
+
+/* Sidebar */
+.side-block{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
 }
-.nav a{color:#2B587A;padding:1px 2px}
-.nav a.on{font-weight:bold;color:#111;text-decoration:underline}
-.nav .sep{color:#A8A392;padding:0 6px}
-
-/* Основной контейнер */
-.main{background:#F7F5EF;border:1px solid #C7C3B4;border-top:none;padding:12px}
-.cols{display:flex;gap:12px;align-items:flex-start}
-.side{width:198px;flex:none}
-.content{flex:1;min-width:0}
-
-/* Коробки */
-.box{background:#fff;border:1px solid #C7C3B4;margin-bottom:12px}
-.box-title{
-  background:#E5E1D3;
-  border-bottom:1px solid #C7C3B4;
-  padding:5px 10px;font-weight:bold;color:#2F3B48;font-size:11px;
+.side-title{
+  padding:9px 14px;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:1.6px;text-transform:uppercase;
+  color:var(--mute);border-bottom:1px solid var(--border);
+  background:var(--bg-2);
 }
-.box-title .cnt{float:right;font-weight:normal;color:#7A7462;font-size:11px}
-.box-body{padding:10px}
-
-/* Боковое меню */
-.smenu a{
-  display:block;padding:5px 10px;border-bottom:1px solid #EFEDE5;
-  color:#2B587A;text-decoration:none;
+.side-menu{display:flex;flex-direction:column;padding:6px}
+.side-menu a{
+  display:flex;align-items:center;gap:9px;
+  padding:8px 10px;border-radius:5px;
+  color:var(--dim);font-size:13px;transition:all .12s;
 }
-.smenu a:last-child{border-bottom:none}
-.smenu a:hover{background:#F4F2EA;text-decoration:none}
-.smenu a.on{background:#E5E1D3;font-weight:bold}
+.side-menu a:hover{background:var(--surface-hi);color:var(--text)}
+.side-menu a.on{background:var(--accent-bg);color:var(--accent-hi)}
+.side-menu a svg{color:var(--mute);flex:none}
+.side-menu a.on svg{color:var(--accent)}
+.side-menu a:hover svg{color:var(--text)}
 
-/* Аватары */
-.av{display:block;border:1px solid #9A9684;background:#EEE}
+/* Card */
+.card{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;
+}
+.card-head{
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:10px;background:var(--bg-2);
+}
+.card-head .h-ic{color:var(--accent);flex:none}
+.card-head h2{
+  font-family:var(--mono);font-size:12.5px;font-weight:600;
+  letter-spacing:.6px;color:var(--text);
+}
+.card-head .h-count{
+  margin-left:auto;font-family:var(--mono);font-size:11px;
+  color:var(--mute);
+}
+.card-body{padding:16px}
+
+/* Buttons */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  padding:8px 15px;border-radius:5px;
+  font-size:13px;font-weight:500;line-height:1;
+  background:var(--surface-hi);color:var(--text);
+  border:1px solid var(--border-2);transition:all .12s;
+}
+.btn:hover{background:#2e2822;border-color:#4e4338;color:var(--text)}
+.btn:active{transform:translateY(1px)}
+.btn-primary{
+  background:var(--accent);color:#1a1410;
+  border-color:var(--accent);font-weight:600;
+}
+.btn-primary:hover{background:var(--accent-hi);border-color:var(--accent-hi);color:#1a1410}
+.btn-ghost{background:transparent;border-color:var(--border);color:var(--dim)}
+.btn-ghost:hover{color:var(--text);border-color:var(--border-2);background:var(--surface)}
+.btn-sm{padding:5px 10px;font-size:12px}
+
+/* Forms */
+.field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
+.field label{font-size:12px;color:var(--dim);font-weight:500}
+.field input[type=text],.field input[type=password]{
+  padding:9px 12px;background:var(--bg-2);
+  border:1px solid var(--border-2);border-radius:5px;
+  color:var(--text);font-size:14px;transition:border-color .12s;
+}
+.field input:focus{outline:none;border-color:var(--accent);background:#1c1815}
+textarea{
+  width:100%;padding:11px 13px;background:var(--bg-2);
+  border:1px solid var(--border-2);border-radius:5px;
+  color:var(--text);font-size:14px;line-height:1.6;
+  resize:vertical;transition:border-color .12s;font-family:inherit;
+  min-height:80px;
+}
+textarea:focus{outline:none;border-color:var(--accent);background:#1c1815}
+textarea::placeholder,input::placeholder{color:var(--mute)}
+.hint{font-size:11px;color:var(--mute);font-family:var(--mono)}
+
+/* Alerts */
+.alert{
+  display:flex;align-items:flex-start;gap:10px;
+  padding:11px 14px;border-radius:var(--radius);
+  font-size:13px;border:1px solid;
+}
+.alert svg{flex:none;margin-top:1px}
+.alert-err{background:rgba(208,118,106,.08);border-color:rgba(208,118,106,.32);color:#e5a297}
+.alert-err svg{color:var(--danger)}
+.alert-ok{background:rgba(136,184,110,.08);border-color:rgba(136,184,110,.3);color:#b5d5a4}
+.alert-ok svg{color:var(--ok)}
+
+/* Avatar */
+.av{
+  display:block;border-radius:6px;object-fit:cover;
+  background:var(--surface-hi);flex:none;
+}
 .av-letter{
-  color:#fff;text-align:center;font-weight:bold;
-  text-shadow:1px 1px 1px rgba(0,0,0,.35);
-  font-family:Verdana,sans-serif;
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:700;text-shadow:0 1px 1px rgba(0,0,0,.4);
 }
 
-/* Карточка пользователя */
-.ucard{display:flex;gap:8px;align-items:flex-start}
-.ucard .meta{font-size:11px;color:#7A7462;margin-top:2px}
-
-/* Записи */
-.post{display:flex;gap:10px;padding:11px 10px;border-bottom:1px solid #EFEDE5}
+/* Post */
+.post{padding:16px;border-bottom:1px solid var(--border);display:flex;gap:14px}
 .post:last-child{border-bottom:none}
-.pbody{flex:1;min-width:0}
-.pname{font-weight:bold}
-.pdate{color:#8A8574;font-size:11px}
-.ptext{margin-top:4px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word}
-.pacts{margin-top:6px;font-size:11px;color:#8A8574;
-       padding-top:5px;border-top:1px dashed #EFEDE5}
-.pacts a{color:#5A7085}
-.pacts button{
-  background:none;border:none;padding:0;color:#5A7085;cursor:pointer;
-  font:11px Verdana,sans-serif;text-decoration:none;
+.post-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+.post-head{display:flex;align-items:center;gap:9px;font-size:13px;flex-wrap:wrap}
+.post-author{font-weight:600;color:var(--text)}
+.post-author:hover{color:var(--accent-hi)}
+.post-time{
+  color:var(--mute);font-size:11px;font-family:var(--mono);
+  display:inline-flex;align-items:center;gap:4px;
 }
-.pacts button:hover{text-decoration:underline;color:#2B587A}
-.pacts form{display:inline;margin:0}
-
-/* Формы */
-textarea,input[type=text],input[type=password],input[type=file]{
-  font:12px/1.5 Verdana,Tahoma,Arial,sans-serif;color:#2A2A2A;
-  border:1px solid #B6B2A2;background:#fff;padding:4px 6px;
-  border-radius:2px;
+.post-content{
+  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;
+  font-size:14px;line-height:1.62;
 }
-textarea:focus,input:focus{outline:none;border-color:#4A6886;background:#FCFCF9}
-textarea{width:100%;resize:vertical}
-
-button,.btn{
-  font:12px Verdana,Tahoma,Arial,sans-serif;
-  background:#E5E1D3;color:#2F3B48;
-  border:1px solid #B6B2A2;border-radius:2px;
-  padding:4px 14px;cursor:pointer;
+.post-actions{
+  display:flex;gap:4px;align-items:center;flex-wrap:wrap;
+  padding-top:10px;border-top:1px solid var(--border);
 }
-button:hover,.btn:hover{background:#DAD6C6}
-button:active,.btn:active{background:#CFCAB6}
+.post-actions a,.post-actions button{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 10px;border-radius:4px;
+  background:transparent;border:1px solid transparent;
+  color:var(--dim);font-size:12px;transition:all .12s;
+}
+.post-actions a:hover,.post-actions button:hover{
+  background:var(--surface-hi);color:var(--text);border-color:var(--border);
+}
+.post-actions svg{color:var(--mute);flex:none}
+.post-actions a:hover svg,.post-actions button:hover svg{color:var(--text)}
+.post-actions .danger:hover{color:#e5a297}
+.post-actions .danger:hover svg{color:var(--danger)}
+.post-actions form{display:inline;margin:0}
 
-.field{margin-bottom:9px}
-.field label{display:block;color:#5A5646;margin-bottom:3px}
-.field input[type=text],
-.field input[type=password]{width:320px}
+/* Empty */
+.empty{
+  padding:48px 20px;text-align:center;color:var(--mute);
+  display:flex;flex-direction:column;align-items:center;gap:10px;
+}
+.empty svg{color:var(--border-2)}
+.empty .big{font-family:var(--mono);font-size:12.5px;letter-spacing:.5px}
 
-.err{background:#F7E3E3;border:1px solid #CE9C9C;color:#7A2A2A;
-     padding:6px 10px;margin-bottom:10px;border-radius:2px}
-.ok{background:#E6F0DC;border:1px solid #A7C493;color:#325A22;
-    padding:6px 10px;margin-bottom:10px;border-radius:2px}
+/* Breadcrumbs */
+.crumbs{
+  display:flex;align-items:center;gap:8px;font-size:12px;
+  font-family:var(--mono);color:var(--mute);
+}
+.crumbs a{color:var(--dim)}
+.crumbs a:hover{color:var(--accent)}
+.crumbs svg{color:var(--border-2);flex:none}
 
-.muted{color:#8A8574;font-size:11px}
-.hint{color:#8A8574;font-size:11px}
-.center{text-align:center}
-
-h1.ph{margin:0 0 4px;font:bold 20px/1.2 Verdana,sans-serif;color:#2F3B48}
-h2.pht{
-  margin:0 0 8px;font:bold 13px/1.2 Verdana,sans-serif;color:#2F3B48;
-  border-bottom:1px solid #E5E1D3;padding-bottom:3px;
+/* Profile */
+.profile-head{display:flex;gap:20px;padding:20px}
+.profile-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.profile-name{
+  font-size:22px;font-weight:700;color:var(--text);
+  font-family:var(--mono);letter-spacing:-.3px;line-height:1.15;
+}
+.profile-status{
+  color:var(--dim);font-style:italic;margin:7px 0 12px;font-size:13px;
+}
+.info-list{display:flex;flex-direction:column;margin-top:2px}
+.info-row{
+  display:flex;gap:12px;padding:7px 0;font-size:13px;
+  border-bottom:1px dashed var(--border);
+}
+.info-row:last-child{border-bottom:none}
+.info-row .k{
+  color:var(--mute);font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.6px;width:130px;flex:none;text-transform:uppercase;
+  padding-top:3px;
 }
 
-.profile-card{display:flex;gap:14px;padding:12px}
-.profile-card .info{flex:1;min-width:0}
-.status{font-style:italic;color:#4E4A3C;margin:3px 0 8px}
-.info-table{width:100%;border-collapse:collapse}
-.info-table td{padding:3px 6px 3px 0;vertical-align:top;
-               border-bottom:1px dotted #E5E1D3}
-.info-table td.k{color:#7A7462;width:150px;white-space:nowrap}
+/* Mini user */
+.mini-user{display:flex;gap:11px;align-items:center;padding:13px 14px}
+.mini-user .uinfo{min-width:0;flex:1}
+.mini-user .uname{font-weight:600;color:var(--text);font-size:13px;display:block}
+.mini-user .uname:hover{color:var(--accent-hi)}
+.mini-user .umeta{font-size:11px;color:var(--mute);font-family:var(--mono);margin-top:2px}
 
-.comment{display:flex;gap:9px;padding:10px;border-bottom:1px solid #EFEDE5}
+/* Comment */
+.comment{
+  display:flex;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);
+}
 .comment:last-child{border-bottom:none}
-
-.foot{
-  background:#E5E1D3;border:1px solid #C7C3B4;border-top:none;
-  padding:8px 12px;font-size:11px;color:#6E6A5A;
+.comment-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.comment-text{
+  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;
+  font-size:13.5px;
 }
-.foot a{color:#2B587A}
-.clear{clear:both}
+
+/* Search */
+.searchbar{
+  display:flex;gap:10px;align-items:center;
+  padding:0 14px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius);
+  transition:border-color .12s;
+}
+.searchbar:focus-within{border-color:var(--accent)}
+.searchbar .s-ic{color:var(--mute);flex:none}
+.searchbar input{
+  flex:1;background:transparent;border:none;color:var(--text);
+  font-size:14px;padding:12px 0;
+}
+.searchbar input:focus{outline:none}
+.searchbar .kbd-hint{font-family:var(--mono);font-size:10px;color:var(--mute)}
+
+/* Char counter */
+.cc{
+  font-family:var(--mono);font-size:11px;color:var(--mute);
+  text-align:right;margin-top:4px;transition:color .12s;
+}
+.cc.warn{color:var(--accent)}
+.cc.over{color:var(--danger)}
+
+/* Footer */
+.foot{
+  max-width:1120px;margin:0 auto;padding:22px 20px;
+  color:var(--mute);font-size:11.5px;font-family:var(--mono);
+  display:flex;justify-content:space-between;align-items:center;gap:16px;
+  border-top:1px solid var(--border);flex-wrap:wrap;
+}
+.foot a{color:var(--dim)}
+.foot a:hover{color:var(--accent)}
+
+@media (max-width:860px){
+  .cols{grid-template-columns:1fr}
+  .side{position:static}
+  .topbar-in{flex-wrap:wrap;height:auto;padding:10px 14px;gap:8px}
+  .userarea{margin-left:auto}
+  .topnav{order:3;width:100%;overflow-x:auto}
+  .wrap{padding:16px}
+  .profile-head{flex-direction:column;align-items:center;text-align:center}
+  .profile-head .info-list{text-align:left;width:100%}
+  .info-row .k{width:110px}
+}
+"""
+
+JS = """
+(function(){
+  // Ctrl/Cmd + Enter -> submit nearest form
+  document.addEventListener('keydown', function(e){
+    if((e.ctrlKey||e.metaKey) && e.key === 'Enter'){
+      var t = e.target;
+      if(t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')){
+        var f = t.closest('form');
+        if(f){
+          if(typeof f.requestSubmit === 'function') f.requestSubmit();
+          else f.submit();
+        }
+      }
+    }
+  });
+  // Char counters
+  document.querySelectorAll('textarea[data-max]').forEach(function(t){
+    var max = parseInt(t.dataset.max, 10);
+    if(!max) return;
+    var box = document.createElement('div');
+    box.className = 'cc';
+    function upd(){
+      var n = t.value.length;
+      box.textContent = n + ' / ' + max;
+      box.className = 'cc' + (n > max ? ' over' : (n > max * 0.9 ? ' warn' : ''));
+    }
+    t.addEventListener('input', upd);
+    t.parentNode.insertBefore(box, t.nextSibling);
+    upd();
+  });
+  // "/" -> focus search
+  document.addEventListener('keydown', function(e){
+    if(e.key === '/' && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)){
+      var s = document.querySelector('input[name="q"]');
+      if(s){ e.preventDefault(); s.focus(); s.select(); }
+    }
+  });
+})();
 """
 
 
+# ===========================================================================
+# Каркас страницы
+# ===========================================================================
+
 def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str:
+    # Top-right
     if user:
         un = esc(user["username"])
-        head_right = (f'Вы вошли как <b><a href="/u/{un}">{un}</a></b>'
-                      f' &nbsp;·&nbsp; <a href="/settings">настройки</a>'
-                      f' &nbsp;·&nbsp; <a href="/logout">выход</a>')
+        av = avatar_html(user["username"], user.get("avatar"), 26)
+        userarea = (
+            f'<a class="who" href="/u/{un}" title="Мой профиль">'
+            f'{av}<span class="uname">{un}</span></a>'
+            f'<a class="iconbtn" href="/settings" title="Настройки">{ic("cog", 18)}</a>'
+            f'<a class="iconbtn" href="/logout" title="Выход">{ic("logout", 18)}</a>'
+        )
     else:
-        head_right = '<a href="/login">вход</a> &nbsp;·&nbsp; <a href="/register">регистрация</a>'
+        userarea = (
+            f'<a class="btn btn-sm btn-ghost" href="/login">{ic("login", 15)}<span>Вход</span></a>'
+            f'<a class="btn btn-sm btn-primary" href="/register">{ic("signup", 15)}<span>Регистрация</span></a>'
+        )
 
-    nav = [("/", "Главная", "feed"), ("/people", "Участники", "people")]
+    # Top nav
+    nav_items = [
+        ("/", "Лента", "feed", "feed"),
+        ("/people", "Участники", "users", "people"),
+    ]
     if user:
-        nav.append((f"/u/{esc(user['username'])}", "Мой профиль", "me"))
-        nav.append(("/settings", "Настройки", "settings"))
+        nav_items.append((f"/u/{esc(user['username'])}", "Профиль", "user", "me"))
 
-    nav_html = '<span class="sep">|</span>'.join(
-        f'<a href="{h}"{" class=\"on\"" if k == active else ""}>{esc(n)}</a>'
-        for h, n, k in nav
+    nav_html = "".join(
+        f'<a href="{h}"{" class=\'on\'" if k == active else ""}>{ic(icn, 16)}<span>{n}</span></a>'
+        for h, n, icn, k in nav_items
     )
 
-    # Боковая панель
+    # Sidebar
     side = ""
-    if user:
-        side += (f'<div class="box"><div class="box-title">Пользователь</div>'
-                 f'<div class="box-body">'
-                 f'<div class="ucard">{avatar_html(user["username"], user.get("avatar"), 60)}'
-                 f'<div><a href="/u/{esc(user["username"])}"><b>{esc(user["username"])}</b></a>'
-                 f'<div class="meta">{esc(fmt_dt(user.get("created_at")))}</div></div>'
-                 f'</div></div></div>')
-        side += ('<div class="box"><div class="box-title">Меню</div>'
-                 '<div class="smenu">'
-                 '<a href="/">Все темы</a>'
-                 f'<a href="/u/{esc(user["username"])}">Мои записи</a>'
-                 '<a href="/people">Участники</a>'
-                 '<a href="/settings">Настройки профиля</a>'
-                 '<a href="/logout">Выход</a>'
-                 '</div></div>')
-    else:
-        side += ('<div class="box"><div class="box-title">Вход</div>'
-                 '<div class="box-body">'
-                 '<form method="post" action="/login">'
-                 '<div class="field"><label>Имя</label>'
-                 '<input type="text" name="username" maxlength="20" style="width:100%"></div>'
-                 '<div class="field"><label>Пароль</label>'
-                 '<input type="password" name="password" style="width:100%"></div>'
-                 '<button type="submit" style="width:100%">Войти</button>'
-                 '</form>'
-                 '<div style="margin-top:8px;text-align:center">'
-                 'или <a href="/register">зарегистрируйтесь</a>'
-                 '</div></div></div>')
 
-    side += ('<div class="box"><div class="box-title">О сайте</div>'
-             '<div class="box-body muted">'
-             'СЛД — маленькая соцсеть с форумом.<br>'
-             'Темы, комментарии, профили.<br>'
-             'Без лишнего.'
-             '</div></div>')
+    # Mini user card
+    if user:
+        un = esc(user["username"])
+        side += (
+            f'<div class="side-block"><div class="mini-user">'
+            f'{avatar_html(user["username"], user.get("avatar"), 44)}'
+            f'<div class="uinfo"><a class="uname" href="/u/{un}">{un}</a>'
+            f'<div class="umeta">{esc(fmt_dt(user.get("created_at")))}</div></div>'
+            f'</div></div>'
+        )
+
+    # Nav menu
+    menu_items = [("/", "Лента", "feed", "feed"),
+                  ("/people", "Участники", "users", "people")]
+    if user:
+        menu_items.append((f"/u/{esc(user['username'])}", "Моя страница", "user", "me"))
+        menu_items.append(("/settings", "Настройки", "cog", "settings"))
+
+    menu_html = "".join(
+        f'<a href="{h}"{" class=\'on\'" if k == active else ""}>{ic(icn, 16)}<span>{n}</span></a>'
+        for h, n, icn, k in menu_items
+    )
+    side += f'<div class="side-block"><div class="side-title">Навигация</div><div class="side-menu">{menu_html}</div></div>'
+
+    # Auth block if not logged in
+    if not user:
+        side += (
+            '<div class="side-block"><div class="side-title">Вход</div>'
+            '<div style="padding:14px">'
+            '<form method="post" action="/login">'
+            '<div class="field"><label>Логин</label>'
+            '<input type="text" name="username" maxlength="20" style="width:100%"></div>'
+            '<div class="field"><label>Пароль</label>'
+            '<input type="password" name="password" style="width:100%"></div>'
+            f'<button class="btn btn-primary" type="submit" style="width:100%">{ic("login", 15)}<span>Войти</span></button>'
+            '</form></div></div>'
+        )
+
+    # Shortcuts
+    side += (
+        '<div class="side-block"><div class="side-title">Горячие клавиши</div>'
+        '<div style="padding:10px 14px;font-size:12px;color:var(--dim);'
+        'display:flex;flex-direction:column;gap:8px">'
+        '<div><kbd>/</kbd> — поиск</div>'
+        '<div><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — отправить</div>'
+        '</div></div>'
+    )
+
+    # About
+    side += (
+        '<div class="side-block"><div class="side-title">О проекте</div>'
+        '<div style="padding:12px 14px;font-size:12px;color:var(--dim);line-height:1.55">'
+        'СЛД — небольшой форум. Темы, комментарии, профили. '
+        'Никакой рекламы и лишнего.'
+        '</div></div>'
+    )
 
     year = datetime.now().year
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=880">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} — СЛД</title>
 <style>{CSS}</style>
 </head>
 <body>
-<div class="wrap">
 
-  <div class="head">
-    <a class="logo" href="/">СЛД</a>
-    <div class="tagline">соцсеть и форум</div>
-    <div class="right">{head_right}</div>
-    <div class="clear"></div>
-  </div>
-  <div class="nav">{nav_html}</div>
+<div class="topbar"><div class="topbar-in">
+  <a class="brand" href="/">{ic("logo", 22)}<span>СЛД</span></a>
+  <nav class="topnav">{nav_html}</nav>
+  <div class="userarea">{userarea}</div>
+</div></div>
 
-  <div class="main">
-    <div class="cols">
-      <div class="side">{side}</div>
-      <div class="content">{body}</div>
-    </div>
-  </div>
+<div class="wrap"><div class="cols">
+  <aside class="side">{side}</aside>
+  <main class="content">{body}</main>
+</div></div>
 
-  <div class="foot">
-    <div class="clear">
-      &copy; {year} СЛД. Все права защищены.
-      &nbsp;·&nbsp; <a href="/">На главную</a>
-    </div>
-  </div>
-
+<div class="foot">
+  <div>© {year} СЛД · форум</div>
+  <div><a href="/">Лента</a> · <a href="/people">Участники</a></div>
 </div>
+
+<script>{JS}</script>
 </body>
 </html>"""
 
 
-# ---------------------------------------------------------------------------
-# Рендер постов
-# ---------------------------------------------------------------------------
+def alert_html(kind: str, text: str) -> str:
+    if kind == "err":
+        return f'<div class="alert alert-err">{ic("alert", 16)}<div>{esc(text)}</div></div>'
+    return f'<div class="alert alert-ok">{ic("check", 16)}<div>{esc(text)}</div></div>'
 
-def render_posts(posts: list, me: Optional[dict], comment_counts: dict,
-                 empty_text: str = "Здесь пока ничего не написано.") -> str:
-    if not posts:
-        return f'<div class="box-body muted">{esc(empty_text)}</div>'
 
-    out = []
-    for p in posts:
-        u = p.get("users") or {}
-        if isinstance(u, list):
-            u = u[0] if u else {}
-        uname = u.get("username") or "удалён"
-        pid = p.get("id")
-        content = esc(p.get("content", ""))
-        created = fmt_dt(p.get("created_at"))
-        cnt = comment_counts.get(pid, 0)
-        edited = ""
-        if p.get("updated_at"):
-            edited = f' · ред. {esc(fmt_dt(p["updated_at"]))}'
+def crumbs(items: list) -> str:
+    parts = [f'<a href="/">{ic("home", 13)}</a>']
+    for i, (label, href) in enumerate(items):
+        parts.append(ic("next", 13))
+        if href:
+            parts.append(f'<a href="{esc(href)}">{esc(label)}</a>')
+        else:
+            parts.append(f'<span>{esc(label)}</span>')
+    return f'<div class="crumbs">{"".join(parts)}</div>'
 
-        actions = []
-        if me and p.get("user_id") == me["id"]:
-            actions.append(f'<a href="/posts/{pid}/edit">редактировать</a>')
-            actions.append(
-                f'<form method="post" action="/posts/{pid}/delete" '
-                f'onsubmit="return confirm(\'Удалить запись?\')">'
-                f'<button type="submit">удалить</button></form>'
-            )
-        actions_html = " · ".join(actions)
 
-        out.append(f"""<div class="post">
-  {avatar_html(uname, u.get("avatar"), 50)}
-  <div class="pbody">
-    <div><span class="pname"><a href="/u/{esc(uname)}">{esc(uname)}</a></span>
-      <span class="pdate">· {esc(created)}{edited}</span></div>
-    <div class="ptext">{content}</div>
-    <div class="pacts">
-      <a href="/posts/{pid}">{cnt} {esc(plural(cnt, "комментарий", "комментария", "комментариев"))}</a>
-      {(' &nbsp;·&nbsp; ' + actions_html) if actions_html else ''}
-    </div>
-  </div>
-</div>""")
-    return "".join(out)
+def empty_html(text: str) -> str:
+    return (f'<div class="empty">{ic("file", 36)}'
+            f'<div class="big">{esc(text)}</div></div>')
+
+
+# ===========================================================================
+# Помощники выборок и рендера
+# ===========================================================================
+
+POST_SELECT = "id,user_id,content,created_at,updated_at,users(username,avatar)"
+
+
+def fetch_posts(limit: int = 50, user_id: Optional[str] = None,
+                q: Optional[str] = None) -> list:
+    query = (sb.table("posts").select(POST_SELECT)
+             .order("created_at", desc=True).limit(limit))
+    if user_id:
+        query = query.eq("user_id", user_id)
+    if q:
+        query = query.ilike("content", f"%{q}%")
+    return query.execute().data or []
 
 
 def comment_counts_for(post_ids: list) -> dict:
@@ -576,25 +828,63 @@ def comment_counts_for(post_ids: list) -> dict:
     return d
 
 
-POST_SELECT = "id,user_id,content,created_at,updated_at,users(username,avatar)"
+def render_posts(posts: list, me: Optional[dict], counts: dict,
+                 empty_text: str = "Пока ничего нет.") -> str:
+    if not posts:
+        return empty_html(empty_text)
+
+    out = []
+    for p in posts:
+        u = p.get("users") or {}
+        if isinstance(u, list):
+            u = u[0] if u else {}
+        uname = u.get("username") or "удалён"
+        pid = p.get("id")
+        cnt = counts.get(pid, 0)
+
+        edited = ""
+        if p.get("updated_at"):
+            edited = f' <span class="post-time">· ред. {esc(fmt_dt(p["updated_at"]))}</span>'
+
+        actions = []
+        if me and p.get("user_id") == me["id"]:
+            actions.append(f'<a href="/posts/{pid}/edit" title="Редактировать">{ic("edit", 14)}<span>правка</span></a>')
+            actions.append(
+                f'<form method="post" action="/posts/{pid}/delete" '
+                f'onsubmit="return confirm(\'Удалить тему?\')">'
+                f'<button type="submit" class="danger" title="Удалить">{ic("trash", 14)}<span>удалить</span></button></form>'
+            )
+        actions_html = "".join(actions)
+
+        out.append(f"""<article class="post" id="p{pid}">
+  {avatar_html(uname, u.get("avatar"), 42)}
+  <div class="post-body">
+    <div class="post-head">
+      <a class="post-author" href="/u/{esc(uname)}">{esc(uname)}</a>
+      <span class="post-time" title="{esc(fmt_iso(p.get('created_at')))}">{ic("clock", 12)}{esc(fmt_dt(p.get("created_at")))}</span>{edited}
+    </div>
+    <div class="post-content">{esc(p.get('content', ''))}</div>
+    <div class="post-actions">
+      <a href="/posts/{pid}" title="Обсуждение">{ic("comment", 14)}<span>{cnt} {esc(plural(cnt, "коммент.", "коммент.", "коммент."))}</span></a>
+      {actions_html}
+      <a href="#p{pid}" title="Ссылка на запись" style="margin-left:auto">{ic("tag", 14)}<span>#{pid}</span></a>
+    </div>
+  </div>
+</article>""")
+    return "".join(out)
 
 
-def fetch_posts(limit: int = 50, user_id: Optional[str] = None) -> list:
-    q = sb.table("posts").select(POST_SELECT).order("created_at", desc=True).limit(limit)
-    if user_id:
-        q = q.eq("user_id", user_id)
-    return q.execute().data or []
-
-
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Главная
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, msg: str = "", err: str = ""):
+def index(request: Request, msg: str = "", err: str = "", q: str = ""):
     me = current_user(request)
+    q = (q or "").strip()
+
     try:
-        posts = fetch_posts()
+        posts = fetch_posts(q=q or None)
     except Exception as e:
         posts = []
         err = err or f"Ошибка БД: {e}"
@@ -603,72 +893,92 @@ def index(request: Request, msg: str = "", err: str = ""):
 
     alerts = ""
     if err:
-        alerts += f'<div class="err">{esc(err)}</div>'
+        alerts += alert_html("err", err)
     if msg:
-        alerts += f'<div class="ok">{esc(msg)}</div>'
+        alerts += alert_html("ok", msg)
 
+    # Поиск
+    search = (
+        f'<form method="get" action="/" class="searchbar">'
+        f'{ic("search", 16, "s-ic")}'
+        f'<input type="text" name="q" placeholder="Поиск по темам..." value="{esc(q)}" autocomplete="off">'
+        f'<span class="kbd-hint">/</span>'
+        f'</form>'
+    )
+
+    # Форма новой темы
     if me:
-        compose = f"""<div class="box">
-  <div class="box-title">Новая тема</div>
-  <div class="box-body">
+        compose = f"""<section class="card">
+  <div class="card-head">{ic("plus", 16, "h-ic")}<h2>Новая тема</h2></div>
+  <div class="card-body">
     <form method="post" action="/posts">
-      <textarea name="content" rows="5" maxlength="{POST_MAX}"
-        placeholder="Расскажите что-нибудь..."></textarea>
-      <div style="margin-top:7px">
-        <button type="submit">Отправить</button>
-        <span class="hint" style="margin-left:10px">не более {POST_MAX} символов</span>
+      <textarea name="content" rows="4" maxlength="{POST_MAX}" data-max="{POST_MAX}"
+        placeholder="Напишите что-нибудь. Ctrl+Enter — отправить."></textarea>
+      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+        <button class="btn btn-primary" type="submit">{ic("send", 15)}<span>Опубликовать</span></button>
+        <span class="hint">Ctrl+Enter</span>
       </div>
     </form>
   </div>
-</div>"""
+</section>"""
     else:
-        compose = ('<div class="box"><div class="box-body">'
-                   'Чтобы открывать темы, нужно <a href="/login">войти</a> '
-                   'или <a href="/register">зарегистрироваться</a>.'
-                   '</div></div>')
+        compose = f"""<section class="card">
+  <div class="card-body" style="display:flex;align-items:center;gap:12px">
+    {ic("user", 18, "h-ic")}
+    <div style="color:var(--dim)">Чтобы открывать темы, нужно <a href="/login">войти</a> или <a href="/register">зарегистрироваться</a>.</div>
+  </div>
+</section>"""
 
     n = len(posts)
+    heading = f'Результаты поиска: «{esc(q)}»' if q else "Последние темы"
+    clear = f'<a href="/" class="btn btn-sm btn-ghost" style="margin-left:auto">{ic("back", 13)}<span>сбросить</span></a>' if q else ""
+
     body = f"""{alerts}
+{search}
 {compose}
-<div class="box">
-  <div class="box-title">Последние темы <span class="cnt">всего: {n}</span></div>
-  {render_posts(posts, me, counts, empty_text="Тем пока нет. Будьте первым.")}
-</div>"""
-    return HTMLResponse(layout("Главная", me, body, active="feed"))
+<section class="card">
+  <div class="card-head">{ic("feed", 16, "h-ic")}<h2>{heading}</h2>{clear}<span class="h-count">{n}</span></div>
+  {render_posts(posts, me, counts, empty_text=("Ничего не найдено." if q else "Тем пока нет. Будьте первым."))}
+</section>"""
+    return HTMLResponse(layout("Лента", me, body, active="feed"))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Регистрация / вход / выход
-# ---------------------------------------------------------------------------
-
-def _auth_form(action: str, username: str = "") -> str:
-    if action == "/register":
-        return f"""
-<form method="post" action="/register">
-  <div class="field"><label>Имя пользователя</label>
-    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus></div>
-  <div class="hint" style="margin:-4px 0 9px">3&ndash;20 символов: латиница, цифры, подчёркивание.</div>
-  <div class="field"><label>Пароль</label>
-    <input type="password" name="password"></div>
-  <div class="field"><label>Пароль ещё раз</label>
-    <input type="password" name="password2"></div>
-  <button type="submit">Зарегистрироваться</button>
-</form>"""
-    return f"""
-<form method="post" action="/login">
-  <div class="field"><label>Имя пользователя</label>
-    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus></div>
-  <div class="field"><label>Пароль</label>
-    <input type="password" name="password"></div>
-  <button type="submit">Войти</button>
-</form>"""
-
+# ===========================================================================
 
 def _auth_page(title: str, action: str, err: str = "", username: str = "") -> str:
-    alert = f'<div class="err">{esc(err)}</div>' if err else ""
-    inner = f'<div class="box"><div class="box-title">{esc(title)}</div>' \
-            f'<div class="box-body">{alert}{_auth_form(action, username)}</div></div>'
-    return layout(title, None, inner)
+    alert = alert_html("err", err) if err else ""
+
+    if action == "/register":
+        fields = f"""
+  <div class="field"><label>Имя пользователя</label>
+    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus autocomplete="username"></div>
+  <div class="hint" style="margin:-10px 0 14px">3–20 символов: латиница, цифры, подчёркивание</div>
+  <div class="field"><label>Пароль</label>
+    <input type="password" name="password" autocomplete="new-password"></div>
+  <div class="field"><label>Пароль ещё раз</label>
+    <input type="password" name="password2" autocomplete="new-password"></div>
+  <button class="btn btn-primary" type="submit" style="width:100%">{ic("signup", 15)}<span>Создать аккаунт</span></button>"""
+    else:
+        fields = f"""
+  <div class="field"><label>Имя пользователя</label>
+    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus autocomplete="username"></div>
+  <div class="field"><label>Пароль</label>
+    <input type="password" name="password" autocomplete="current-password"></div>
+  <button class="btn btn-primary" type="submit" style="width:100%">{ic("login", 15)}<span>Войти</span></button>"""
+
+    body = f"""{crumbs([(title, None)])}
+<div style="max-width:420px">
+  <section class="card">
+    <div class="card-head">{ic("user", 16, "h-ic")}<h2>{esc(title)}</h2></div>
+    <div class="card-body">
+      {alert}
+      <form method="post" action="{action}">{fields}</form>
+    </div>
+  </section>
+</div>"""
+    return layout(title, None, body)
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -696,9 +1006,8 @@ def register_post(request: Request,
         err = "Пароли не совпадают."
     else:
         try:
-            exists = (sb.table("users").select("id")
-                      .ilike("username", username).limit(1).execute().data)
-            if exists:
+            if (sb.table("users").select("id")
+                    .ilike("username", username).limit(1).execute().data):
                 err = "Такое имя уже занято."
         except Exception as e:
             err = f"Ошибка БД: {e}"
@@ -714,7 +1023,7 @@ def register_post(request: Request,
         }).execute().data[0]
     except Exception as e:
         return HTMLResponse(_auth_page("Регистрация", "/register",
-                                       f"Не удалось создать пользователя: {e}", username),
+                                       f"Не удалось создать: {e}", username),
                             status_code=500)
 
     token = create_session(row["id"])
@@ -768,9 +1077,9 @@ def logout(request: Request):
     return resp
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Темы
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.post("/posts")
 def create_post(request: Request, content: str = Form("")):
@@ -800,12 +1109,11 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
         rows = (sb.table("posts").select(POST_SELECT)
                 .eq("id", post_id).limit(1).execute().data)
     except Exception as e:
-        return HTMLResponse(layout("Ошибка", me,
-                                   f'<div class="box"><div class="box-body err">Ошибка БД: {esc(e)}</div></div>'),
-                            status_code=500)
+        body = alert_html("err", f"Ошибка БД: {e}")
+        return HTMLResponse(layout("Ошибка", me, body), status_code=500)
+
     if not rows:
-        return HTMLResponse(layout("Не найдено", me,
-                                   '<div class="box"><div class="box-body">Тема не найдена.</div></div>'),
+        return HTMLResponse(layout("Не найдено", me, empty_html("Тема не найдена.")),
                             status_code=404)
 
     p = rows[0]
@@ -822,91 +1130,110 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
     except Exception:
         comments = []
 
+    # Пост
     post_actions = ""
     if me and p.get("user_id") == me["id"]:
         post_actions = (
-            f'<div style="margin-top:6px;font-size:11px">'
-            f'<a href="/posts/{post_id}/edit">редактировать</a> · '
+            f'<a href="/posts/{post_id}/edit" title="Редактировать">{ic("edit", 14)}<span>правка</span></a>'
             f'<form method="post" action="/posts/{post_id}/delete" '
-            f'onsubmit="return confirm(\'Удалить тему?\')" style="display:inline">'
-            f'<button type="submit">удалить</button></form></div>'
+            f'onsubmit="return confirm(\'Удалить тему?\')">'
+            f'<button type="submit" class="danger" title="Удалить">{ic("trash", 14)}<span>удалить</span></button></form>'
         )
 
-    post_box = f"""<div class="box">
-  <div class="box-title">Тема #{post_id}</div>
-  <div class="post" style="border-bottom:none;padding:14px">
-    {avatar_html(uname, u.get("avatar"), 70)}
-    <div class="pbody">
-      <div><span class="pname"><a href="/u/{esc(uname)}">{esc(uname)}</a></span>
-        <span class="pdate">· {esc(fmt_dt(p.get("created_at")))}</span></div>
-      <div class="ptext" style="margin-top:8px">{esc(p.get('content', ''))}</div>
-      {post_actions}
-    </div>
-  </div>
-</div>"""
+    edited = ""
+    if p.get("updated_at"):
+        edited = f' <span class="post-time">· ред. {esc(fmt_dt(p["updated_at"]))}</span>'
 
-    items = []
-    for c in comments:
-        cu = c.get("users") or {}
-        if isinstance(cu, list):
-            cu = cu[0] if cu else {}
-        cname = cu.get("username") or "удалён"
-        del_btn = ""
-        if me and c.get("user_id") == me["id"]:
-            del_btn = (
-                f' · <form method="post" action="/comments/{c["id"]}/delete" '
-                f'onsubmit="return confirm(\'Удалить комментарий?\')" style="display:inline">'
-                f'<button type="submit">удалить</button></form>'
-            )
-        items.append(f"""<div class="comment">
-  {avatar_html(cname, cu.get("avatar"), 40)}
-  <div class="pbody">
-    <div><span class="pname"><a href="/u/{esc(cname)}">{esc(cname)}</a></span>
-      <span class="pdate">· {esc(fmt_dt(c.get('created_at')))}</span></div>
-    <div class="ptext">{esc(c.get('content', ''))}</div>
-    <div class="pacts" style="border:none;padding-top:2px;margin-top:3px">
-      <a href="#c{c['id']}" id="c{c['id']}">#{c['id']}</a>{del_btn}
+    post_html = f"""<article class="post" style="border-bottom:none;padding:18px">
+  {avatar_html(uname, u.get("avatar"), 56)}
+  <div class="post-body">
+    <div class="post-head">
+      <a class="post-author" href="/u/{esc(uname)}" style="font-size:15px">{esc(uname)}</a>
+      <span class="post-time" title="{esc(fmt_iso(p.get('created_at')))}">{ic("clock", 12)}{esc(fmt_dt(p.get("created_at")))}</span>{edited}
     </div>
+    <div class="post-content" style="font-size:15px">{esc(p.get('content', ''))}</div>
+    <div class="post-actions">{post_actions}</div>
+  </div>
+</article>"""
+
+    # Комментарии
+    if comments:
+        items = []
+        for c in comments:
+            cu = c.get("users") or {}
+            if isinstance(cu, list):
+                cu = cu[0] if cu else {}
+            cname = cu.get("username") or "удалён"
+            del_btn = ""
+            if me and c.get("user_id") == me["id"]:
+                del_btn = (
+                    f'<form method="post" action="/comments/{c["id"]}/delete" '
+                    f'onsubmit="return confirm(\'Удалить комментарий?\')">'
+                    f'<button type="submit" class="danger" title="Удалить">{ic("trash", 13)}<span>удалить</span></button></form>'
+                )
+            items.append(f"""<div class="comment" id="c{c['id']}">
+  {avatar_html(cname, cu.get("avatar"), 34)}
+  <div class="comment-body">
+    <div class="post-head">
+      <a class="post-author" href="/u/{esc(cname)}">{esc(cname)}</a>
+      <span class="post-time" title="{esc(fmt_iso(c.get('created_at')))}">{ic("clock", 11)}{esc(fmt_dt(c.get('created_at')))}</span>
+      <a href="#c{c['id']}" class="post-time" style="margin-left:auto">#{c['id']}</a>
+    </div>
+    <div class="comment-text">{esc(c.get('content', ''))}</div>
+    {f'<div class="post-actions" style="border:none;padding-top:0">{del_btn}</div>' if del_btn else ''}
   </div>
 </div>""")
+        comments_html = "".join(items)
+    else:
+        comments_html = empty_html("Комментариев пока нет.")
 
-    comments_html = "".join(items) if items else '<div class="box-body muted">Комментариев пока нет.</div>'
-
+    # Форма коммента
     if me:
-        form_html = f"""<div class="box">
-  <div class="box-title">Ваш комментарий</div>
-  <div class="box-body">
+        form_html = f"""<section class="card">
+  <div class="card-head">{ic("comment", 16, "h-ic")}<h2>Ваш комментарий</h2></div>
+  <div class="card-body">
     <form method="post" action="/posts/{post_id}/comments">
-      <textarea name="content" rows="4" maxlength="{COMMENT_MAX}"
-        placeholder="Написать комментарий..."></textarea>
-      <div style="margin-top:7px">
-        <button type="submit">Отправить</button>
-        <span class="hint" style="margin-left:10px">не более {COMMENT_MAX} символов</span>
+      <textarea name="content" rows="4" maxlength="{COMMENT_MAX}" data-max="{COMMENT_MAX}"
+        placeholder="Написать комментарий... Ctrl+Enter — отправить."></textarea>
+      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+        <button class="btn btn-primary" type="submit">{ic("send", 15)}<span>Отправить</span></button>
+        <span class="hint">Ctrl+Enter</span>
       </div>
     </form>
   </div>
-</div>"""
+</section>"""
     else:
-        form_html = ('<div class="box"><div class="box-body">'
-                     'Чтобы оставить комментарий, <a href="/login">войдите</a> '
-                     'или <a href="/register">зарегистрируйтесь</a>.'
-                     '</div></div>')
+        form_html = f"""<section class="card">
+  <div class="card-body" style="color:var(--dim);display:flex;align-items:center;gap:10px">
+    {ic("user", 18, "h-ic")}
+    Чтобы оставить комментарий, <a href="/login">войдите</a> или <a href="/register">зарегистрируйтесь</a>.
+  </div>
+</section>"""
 
     alerts = ""
     if err:
-        alerts += f'<div class="err">{esc(err)}</div>'
+        alerts += alert_html("err", err)
     if msg:
-        alerts += f'<div class="ok">{esc(msg)}</div>'
+        alerts += alert_html("ok", msg)
 
     cnt = len(comments)
-    body = f"""{alerts}
-{post_box}
-<div class="box">
-  <div class="box-title">Комментарии <span class="cnt">{cnt}</span></div>
+    body = f"""{crumbs([("Лента", "/"), (f"Тема #{post_id}", None)])}
+{alerts}
+<section class="card">
+  <div class="card-head">{ic("file", 16, "h-ic")}<h2>Тема #{post_id}</h2>
+    <span class="h-count">{cnt} {esc(plural(cnt, "комментарий", "комментария", "комментариев"))}</span>
+  </div>
+  {post_html}
+</section>
+
+<section class="card">
+  <div class="card-head">{ic("comment", 16, "h-ic")}<h2>Обсуждение</h2><span class="h-count">{cnt}</span></div>
   {comments_html}
-</div>
+</section>
+
 {form_html}
-<div style="margin-top:8px"><a href="/">&larr; На главную</a></div>"""
+
+<div><a href="/" class="btn btn-ghost">{ic("back", 14)}<span>К ленте</span></a></div>"""
     return HTMLResponse(layout(f"Тема #{post_id}", me, body))
 
 
@@ -919,27 +1246,27 @@ def post_edit_get(request: Request, post_id: int):
     rows = (sb.table("posts").select("id,user_id,content")
             .eq("id", post_id).limit(1).execute().data)
     if not rows:
-        return HTMLResponse(layout("Не найдено", me,
-                                   '<div class="box"><div class="box-body">Тема не найдена.</div></div>'),
+        return HTMLResponse(layout("Не найдено", me, empty_html("Тема не найдена.")),
                             status_code=404)
     p = rows[0]
     if p["user_id"] != me["id"]:
         return HTMLResponse(layout("Отказано", me,
-                                   '<div class="box"><div class="box-body">Это не ваша тема.</div></div>'),
+                                   alert_html("err", "Это не ваша тема.")),
                             status_code=403)
 
-    body = f"""<div class="box">
-  <div class="box-title">Редактирование темы #{post_id}</div>
-  <div class="box-body">
+    body = f"""{crumbs([("Лента", "/"), (f"Тема #{post_id}", f"/posts/{post_id}"), ("Правка", None)])}
+<section class="card">
+  <div class="card-head">{ic("edit", 16, "h-ic")}<h2>Редактирование темы #{post_id}</h2></div>
+  <div class="card-body">
     <form method="post" action="/posts/{post_id}/edit">
-      <textarea name="content" rows="10" maxlength="{POST_MAX}">{esc(p['content'])}</textarea>
-      <div style="margin-top:7px">
-        <button type="submit">Сохранить</button>
-        <a href="/posts/{post_id}" style="margin-left:12px">отмена</a>
+      <textarea name="content" rows="10" maxlength="{POST_MAX}" data-max="{POST_MAX}">{esc(p['content'])}</textarea>
+      <div style="margin-top:10px;display:flex;gap:10px">
+        <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сохранить</span></button>
+        <a class="btn btn-ghost" href="/posts/{post_id}">Отмена</a>
       </div>
     </form>
   </div>
-</div>"""
+</section>"""
     return HTMLResponse(layout("Редактирование", me, body))
 
 
@@ -982,9 +1309,9 @@ def post_delete(request: Request, post_id: int):
     return RedirectResponse("/?msg=Тема+удалена", status_code=303)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Комментарии
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.post("/posts/{post_id}/comments")
 def comment_create(request: Request, post_id: int, content: str = Form("")):
@@ -998,9 +1325,7 @@ def comment_create(request: Request, post_id: int, content: str = Form("")):
     if len(content) > COMMENT_MAX:
         content = content[:COMMENT_MAX]
 
-    exists = (sb.table("posts").select("id").eq("id", post_id)
-              .limit(1).execute().data)
-    if not exists:
+    if not sb.table("posts").select("id").eq("id", post_id).limit(1).execute().data:
         return RedirectResponse("/", status_code=303)
 
     sb.table("comments").insert({
@@ -1029,11 +1354,11 @@ def comment_delete(request: Request, comment_id: int):
                             status_code=303)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Профиль
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def _profile_fields_html(u: dict) -> str:
+def _profile_info_rows(u: dict) -> str:
     rows = [
         ("Имя", u.get("username")),
         ("Город", u.get("city")),
@@ -1041,7 +1366,7 @@ def _profile_fields_html(u: dict) -> str:
         ("Сайт", u.get("site")),
         ("На сайте с", fmt_dt(u.get("created_at"))),
     ]
-    out = []
+    html_rows = []
     for k, v in rows:
         if not v:
             continue
@@ -1052,9 +1377,10 @@ def _profile_fields_html(u: dict) -> str:
             v_html = f'<a href="{link}" target="_blank" rel="noopener">{esc(v)}</a>'
         else:
             v_html = esc(v)
-        out.append(f'<tr><td class="k">{esc(k)}:</td><td>{v_html}</td></tr>')
-    return "".join(out) if out else \
-        '<tr><td colspan="2" class="muted">Информация не заполнена.</td></tr>'
+        html_rows.append(f'<div class="info-row"><div class="k">{esc(k)}</div><div>{v_html}</div></div>')
+    if not html_rows:
+        return '<div class="muted" style="color:var(--mute);font-size:12px">Информация не заполнена.</div>'
+    return "".join(html_rows)
 
 
 @app.get("/u/{username}", response_class=HTMLResponse)
@@ -1065,7 +1391,7 @@ def profile(request: Request, username: str, msg: str = "", err: str = ""):
             .ilike("username", username).limit(1).execute().data)
     if not rows:
         return HTMLResponse(layout("Не найдено", me,
-                                   '<div class="box"><div class="box-body">Пользователь не найден.</div></div>'),
+                                   empty_html("Пользователь не найден.")),
                             status_code=404)
     owner = rows[0]
     is_me = bool(me and me["id"] == owner["id"])
@@ -1078,59 +1404,63 @@ def profile(request: Request, username: str, msg: str = "", err: str = ""):
     counts = comment_counts_for([p["id"] for p in posts])
 
     status_line = esc(owner.get("status") or "")
-    if not status_line:
-        status_line = '<span class="muted">Статус не указан.</span>'
+    status_html = (f'<div class="profile-status">«{status_line}»</div>'
+                   if status_line else
+                   '<div class="profile-status" style="opacity:.6">статус не указан</div>')
 
-    edit_link = ''
+    edit_link = ""
     if is_me:
-        edit_link = ('<div style="margin-top:8px">'
-                     '<a href="/settings">[ редактировать профиль ]</a></div>')
+        edit_link = (f'<div style="margin-top:12px">'
+                     f'<a class="btn btn-sm" href="/settings">{ic("cog", 14)}<span>Редактировать профиль</span></a>'
+                     f'</div>')
 
     about = owner.get("about")
     about_block = ""
     if about:
-        about_block = (f'<div class="box"><div class="box-title">О себе</div>'
-                       f'<div class="box-body" style="white-space:pre-wrap">{esc(about)}</div></div>')
+        about_block = f"""<section class="card">
+  <div class="card-head">{ic("file", 16, "h-ic")}<h2>О себе</h2></div>
+  <div class="card-body" style="white-space:pre-wrap;line-height:1.6">{esc(about)}</div>
+</section>"""
 
     n = len(posts)
     cnt_word = plural(n, "запись", "записи", "записей")
 
     alerts = ""
     if err:
-        alerts += f'<div class="err">{esc(err)}</div>'
+        alerts += alert_html("err", err)
     if msg:
-        alerts += f'<div class="ok">{esc(msg)}</div>'
+        alerts += alert_html("ok", msg)
 
-    body = f"""{alerts}
-<div class="box">
-  <div class="box-title">Профиль участника</div>
-  <div class="profile-card">
-    {avatar_html(owner["username"], owner.get("avatar"), 140)}
-    <div class="info">
-      <h1 class="ph">{esc(owner['username'])}</h1>
-      <div class="status">&laquo;{status_line}&raquo;</div>
-      <table class="info-table">
-        <tr><td colspan="2"><h2 class="pht">Личные данные</h2></td></tr>
-        {_profile_fields_html(owner)}
-      </table>
+    body = f"""{crumbs([("Участники", "/people"), (owner['username'], None)])}
+{alerts}
+<section class="card">
+  <div class="profile-head">
+    {avatar_html(owner["username"], owner.get("avatar"), 128)}
+    <div class="profile-info">
+      <div class="profile-name">{esc(owner['username'])}</div>
+      {status_html}
+      <div class="info-list">{_profile_info_rows(owner)}</div>
       {edit_link}
     </div>
   </div>
-</div>
+</section>
 
 {about_block}
 
-<div class="box">
-  <div class="box-title">Записи участника <span class="cnt">{n} {esc(cnt_word)}</span></div>
+<section class="card">
+  <div class="card-head">{ic("feed", 16, "h-ic")}<h2>Записи участника</h2>
+    <span class="h-count">{n} {esc(cnt_word)}</span>
+  </div>
   {render_posts(posts, me, counts,
                 empty_text=("Вы ещё ничего не написали." if is_me else "Записей нет."))}
-</div>"""
-    return HTMLResponse(layout(owner["username"], me, body, active="me" if is_me else ""))
+</section>"""
+    return HTMLResponse(layout(owner["username"], me, body,
+                               active="me" if is_me else ""))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Настройки профиля
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_get(request: Request, msg: str = "", err: str = ""):
@@ -1140,31 +1470,38 @@ def settings_get(request: Request, msg: str = "", err: str = ""):
 
     alerts = ""
     if err:
-        alerts += f'<div class="err">{esc(err)}</div>'
+        alerts += alert_html("err", err)
     if msg:
-        alerts += f'<div class="ok">{esc(msg)}</div>'
+        alerts += alert_html("ok", msg)
 
-    body = f"""{alerts}
-<div class="box">
-  <div class="box-title">Настройки профиля</div>
-  <div class="box-body">
+    body = f"""{crumbs([(me['username'], f"/u/{esc(me['username'])}"), ("Настройки", None)])}
+{alerts}
+<section class="card">
+  <div class="card-head">{ic("cog", 16, "h-ic")}<h2>Настройки профиля</h2></div>
+  <div class="card-body">
     <form method="post" action="/settings" enctype="multipart/form-data">
 
-      <h2 class="pht">Фотография</h2>
-      <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:10px">
-        <div>{avatar_html(me["username"], me.get("avatar"), 120)}</div>
-        <div class="muted" style="flex:1">
-          JPEG, PNG или GIF. Фото автоматически сжимается
-          до 512&times;512 и веса не более 150 КБ.<br>
-          <input type="file" name="avatar" accept="image/*" style="margin-top:6px">
-          <label style="display:block;margin-top:6px">
+      <div style="font-family:var(--mono);font-size:11px;letter-spacing:1.4px;
+                  text-transform:uppercase;color:var(--mute);margin-bottom:10px">
+        Фотография
+      </div>
+      <div style="display:flex;gap:16px;align-items:flex-start;margin-bottom:18px">
+        <div>{avatar_html(me["username"], me.get("avatar"), 108)}</div>
+        <div style="flex:1;color:var(--dim);font-size:12.5px;line-height:1.55">
+          JPEG, PNG или GIF. Автоматически сжимается до 512&times;512 и не более 150 КБ.<br>
+          <input type="file" name="avatar" accept="image/*" style="margin-top:8px;color:var(--dim)">
+          <label style="display:flex;gap:7px;align-items:center;margin-top:8px;cursor:pointer">
             <input type="checkbox" name="avatar_remove" value="1">
-            удалить текущую фотографию
+            <span>удалить текущую фотографию</span>
           </label>
         </div>
       </div>
 
-      <h2 class="pht">Основное</h2>
+      <div style="font-family:var(--mono);font-size:11px;letter-spacing:1.4px;
+                  text-transform:uppercase;color:var(--mute);margin-bottom:10px">
+        Основное
+      </div>
+
       <div class="field"><label>Статус</label>
         <input type="text" name="status" maxlength="200" style="width:100%"
                value="{esc(me.get('status') or '')}"
@@ -1181,20 +1518,20 @@ def settings_get(request: Request, msg: str = "", err: str = ""):
                value="{esc(me.get('site') or '')}"
                placeholder="http://..."></div>
       <div class="field"><label>О себе</label>
-        <textarea name="about" rows="7" maxlength="{ABOUT_MAX}"
+        <textarea name="about" rows="7" maxlength="{ABOUT_MAX}" data-max="{ABOUT_MAX}"
           placeholder="Пара слов о себе...">{esc(me.get('about') or '')}</textarea></div>
 
-      <div style="margin-top:10px">
-        <button type="submit">Сохранить</button>
-        <a href="/u/{esc(me['username'])}" style="margin-left:12px">отмена</a>
+      <div style="margin-top:14px;display:flex;gap:10px">
+        <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сохранить</span></button>
+        <a class="btn btn-ghost" href="/u/{esc(me['username'])}">Отмена</a>
       </div>
     </form>
   </div>
-</div>
+</section>
 
-<div class="box">
-  <div class="box-title">Смена пароля</div>
-  <div class="box-body">
+<section class="card">
+  <div class="card-head">{ic("cog", 16, "h-ic")}<h2>Смена пароля</h2></div>
+  <div class="card-body">
     <form method="post" action="/settings/password">
       <div class="field"><label>Текущий пароль</label>
         <input type="password" name="old_password"></div>
@@ -1202,10 +1539,10 @@ def settings_get(request: Request, msg: str = "", err: str = ""):
         <input type="password" name="new_password"></div>
       <div class="field"><label>Повтор нового</label>
         <input type="password" name="new_password2"></div>
-      <button type="submit">Сменить пароль</button>
+      <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сменить пароль</span></button>
     </form>
   </div>
-</div>"""
+</section>"""
     return HTMLResponse(layout("Настройки", me, body, active="settings"))
 
 
@@ -1240,11 +1577,10 @@ async def settings_post(
             return RedirectResponse("/settings?err=Пустой+файл", status_code=303)
         if len(raw) > AVATAR_UPLOAD_MAX:
             return RedirectResponse("/settings?err=Файл+слишком+большой", status_code=303)
-
         data_url = process_avatar(raw)
         if not data_url:
-            return RedirectResponse(
-                "/settings?err=Не+удалось+обработать+изображение", status_code=303)
+            return RedirectResponse("/settings?err=Не+удалось+обработать+изображение",
+                                    status_code=303)
         update["avatar"] = data_url
 
     try:
@@ -1284,9 +1620,9 @@ def settings_password(request: Request,
     return RedirectResponse("/settings?msg=Пароль+изменён", status_code=303)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Участники
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.get("/people", response_class=HTMLResponse)
 def people(request: Request):
@@ -1303,35 +1639,41 @@ def people(request: Request):
     items = []
     for u in users:
         un = esc(u["username"])
-        city = esc(u.get("city") or "")
-        st = esc(u.get("status") or "")
-        meta = ""
-        if city:
-            meta += f'город: {city}'
-        if st:
-            meta += (" · " if meta else "") + f'&laquo;{st}&raquo;'
-        items.append(f"""<div class="post">
-  {avatar_html(u['username'], u.get('avatar'), 50)}
-  <div class="pbody">
-    <div><span class="pname"><a href="/u/{un}">{un}</a></span></div>
-    <div class="pdate">{esc(fmt_dt(u.get('created_at')))}</div>
-    <div class="ptext muted">{meta or '&nbsp;'}</div>
-  </div>
-</div>""")
+        bits = []
+        if u.get("city"):
+            bits.append(f'{ic("home", 12)} {esc(u["city"])}')
+        if u.get("status"):
+            bits.append(f'«{esc(u["status"])}»')
+        meta = " · ".join(bits)
 
-    inner = "".join(items) if items else '<div class="box-body muted">Пока никого.</div>'
-    alerts = f'<div class="err">{esc(db_err)}</div>' if db_err else ""
-    body = f"""{alerts}
-<div class="box">
-  <div class="box-title">Участники <span class="cnt">{len(users)}</span></div>
+        items.append(f"""<article class="post">
+  {avatar_html(u['username'], u.get('avatar'), 42)}
+  <div class="post-body">
+    <div class="post-head">
+      <a class="post-author" href="/u/{un}">{un}</a>
+      <span class="post-time" title="{esc(fmt_iso(u.get('created_at')))}">{ic("clock", 11)}{esc(fmt_dt(u.get('created_at')))}</span>
+    </div>
+    {f'<div style="font-size:12.5px;color:var(--dim)">{meta}</div>' if meta else ''}
+  </div>
+</article>""")
+
+    inner = "".join(items) if items else empty_html("Пока никого.")
+    alerts = alert_html("err", db_err) if db_err else ""
+
+    body = f"""{crumbs([("Участники", None)])}
+{alerts}
+<section class="card">
+  <div class="card-head">{ic("users", 16, "h-ic")}<h2>Участники</h2>
+    <span class="h-count">{len(users)}</span>
+  </div>
   {inner}
-</div>"""
+</section>"""
     return HTMLResponse(layout("Участники", me, body, active="people"))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Служебное
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.get("/healthz")
 def healthz():
