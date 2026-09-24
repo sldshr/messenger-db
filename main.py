@@ -6,21 +6,25 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
 # --- Конфигурация ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # Service Role Key
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL и SUPABASE_KEY должны быть установлены")
+
+# Android package + SHA-256 fingerprint для App Links
+ANDROID_PACKAGE = os.environ.get("ANDROID_PACKAGE", "com.example.socialnetwork")
+ANDROID_SHA256  = os.environ.get("ANDROID_SHA256", "")  # добавьте свой отпечаток
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 BUCKET_NAME = "post-images"
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-production")
-TOKEN_EXPIRE_HOURS = 24 * 30  # 30 дней
+TOKEN_EXPIRE_HOURS = 24 * 30
 
 app = FastAPI(title="Social Network API")
 
@@ -35,7 +39,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _ensure_bucket():
-    """Создаёт публичный бакет, если его ещё нет."""
     try:
         buckets = supabase.storage.list_buckets()
         names = []
@@ -86,7 +89,6 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_session(user_id: str) -> str:
-    """Создаёт случайный токен и сохраняет сессию в БД."""
     token = uuid.uuid4().hex + uuid.uuid4().hex
     expires_at = datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS)
     supabase.table("sessions").insert({
@@ -120,6 +122,11 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     return user_resp.data[0]
 
 
+def _fetch_images(post_id: str) -> List[str]:
+    resp = supabase.table("post_images").select("image_url").eq("post_id", post_id).order("position").execute()
+    return [img["image_url"] for img in resp.data] if resp.data else []
+
+
 # --- Эндпоинты ---
 @app.post("/register")
 async def register(req: RegisterRequest):
@@ -129,12 +136,11 @@ async def register(req: RegisterRequest):
 
     user_id = str(uuid.uuid4())
     password_hash = hash_password(req.password)
-    data = {
+    supabase.table("profiles").insert({
         "id": user_id,
         "username": req.username,
         "password_hash": password_hash,
-    }
-    supabase.table("profiles").insert(data).execute()
+    }).execute()
 
     token = create_session(user_id)
     return {
@@ -234,7 +240,6 @@ async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_cu
         if isinstance(public_url, dict):
             public_url = public_url.get("publicUrl") or public_url.get("public_url") or ""
 
-        print(f"[upload] OK user={user['id']} file={filename} url={public_url}")
         return {"url": public_url}
 
     except Exception as e:
@@ -247,11 +252,10 @@ async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_cu
 async def create_post(post: PostCreate, user: dict = Depends(get_current_user)):
     if len(post.image_urls) > 5:
         raise HTTPException(status_code=400, detail="Максимум 5 изображений")
-    post_data = {
+    resp = supabase.table("posts").insert({
         "user_id": user["id"],
         "description": post.description,
-    }
-    resp = supabase.table("posts").insert(post_data).execute()
+    }).execute()
     if not resp.data:
         raise HTTPException(status_code=500, detail="Ошибка создания поста")
     post_id = resp.data[0]["id"]
@@ -264,14 +268,56 @@ async def create_post(post: PostCreate, user: dict = Depends(get_current_user)):
     return {"post_id": post_id}
 
 
+@app.get("/my-posts")
+async def my_posts(user: dict = Depends(get_current_user)):
+    """Список постов текущего пользователя с картинками и ссылкой."""
+    posts_resp = supabase.table("posts").select("*") \
+        .eq("user_id", user["id"]).order("created_at", desc=True).execute()
+    result = []
+    for p in posts_resp.data or []:
+        imgs = _fetch_images(p["id"])
+        result.append({
+            "id": p["id"],
+            "description": p.get("description") or "",
+            "created_at": p.get("created_at"),
+            "images": imgs,
+            "share_url": f"https://sldchat.fastapicloud.dev/posts/{p['id']}",
+        })
+    return {"posts": result}
+
+
+@app.delete("/posts/{post_id}")
+async def delete_post(post_id: str, user: dict = Depends(get_current_user)):
+    post_resp = supabase.table("posts").select("*").eq("id", post_id).execute()
+    if not post_resp.data:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+    post = post_resp.data[0]
+    if post["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Нет прав на удаление")
+
+    # Удаляем файлы из Storage
+    for url in _fetch_images(post_id):
+        try:
+            # из публичного URL вытаскиваем путь внутри бакета
+            marker = f"/object/public/{BUCKET_NAME}/"
+            if marker in url:
+                path = url.split(marker, 1)[1]
+                supabase.storage.from_(BUCKET_NAME).remove([path])
+        except Exception as e:
+            print("[delete] storage remove failed:", e)
+
+    # post_images удалятся каскадом (ON DELETE CASCADE)
+    supabase.table("posts").delete().eq("id", post_id).execute()
+    return {"status": "ok"}
+
+
 @app.get("/posts/{post_id}")
 async def get_post(post_id: str, request: Request):
     post_resp = supabase.table("posts").select("*, profiles(username, display_name)").eq("id", post_id).execute()
     if not post_resp.data:
         raise HTTPException(status_code=404, detail="Пост не найден")
     post = post_resp.data[0]
-    images_resp = supabase.table("post_images").select("image_url").eq("post_id", post_id).order("position").execute()
-    images = [img["image_url"] for img in images_resp.data] if images_resp.data else []
+    images = _fetch_images(post_id)
 
     user_agent = request.headers.get("user-agent", "").lower()
     is_mobile = any(kw in user_agent for kw in ["android", "iphone", "ipad", "mobile"])
@@ -279,21 +325,62 @@ async def get_post(post_id: str, request: Request):
     author = post["profiles"].get("display_name") or post["profiles"]["username"]
 
     if is_mobile:
-        return JSONResponse({
-            "id": post["id"],
-            "author": author,
-            "username": post["profiles"]["username"],
-            "description": post["description"],
-            "images": images,
-            "created_at": post["created_at"],
-        })
-    else:
-        desc = post["description"] or ""
+        # Страница-прослойка: пытается открыть приложение, иначе показывает кнопку
+        deep_link = f"sldnet://post/{post_id}"
+        app_link  = f"https://sldchat.fastapicloud.dev/posts/{post_id}"
+        intent_url = (
+            f"intent://sldchat.fastapicloud.dev/posts/{post_id}"
+            f"#Intent;scheme=https;package={ANDROID_PACKAGE};end"
+        )
         images_html = "".join(
             f'<img src="{url}" style="max-width:100%; margin:10px 0; border-radius:8px;" />'
             for url in images
-        )
+        ) or "<em>Нет изображений</em>"
+        desc = post["description"] or ""
         html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Пост от {author}</title>
+    <style>
+        body {{ font-family: -apple-system, Arial, sans-serif; max-width: 640px; margin: 0 auto;
+                padding: 24px 20px 60px; color: #222; background: #f5f5f7; }}
+        .card {{ background: #fff; border-radius: 14px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }}
+        h1 {{ font-size: 1.25em; margin: 0 0 4px; }}
+        .meta {{ color: #666; font-size: .9em; margin-bottom: 16px; }}
+        .desc {{ font-size: 1.05em; line-height: 1.5; margin: 12px 0; white-space: pre-wrap; }}
+        .open-btn {{ display:block; text-align:center; text-decoration:none; background:#0a84ff;
+                     color:#fff; padding:14px; border-radius:12px; font-weight:600; margin: 20px 0; }}
+        img {{ display:block; border-radius:8px; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>{author}</h1>
+        <div class="meta">@{post['profiles']['username']}</div>
+        <a class="open-btn" href="{intent_url}">Открыть в приложении</a>
+        <a class="open-btn" style="background:#34c759" href="{deep_link}">Открыть (если не сработало)</a>
+        <div class="desc">{desc}</div>
+        <div>{images_html}</div>
+    </div>
+    <script>
+        // Авто-попытка открыть приложение через custom scheme
+        setTimeout(function() {{
+            window.location.href = "{deep_link}";
+        }}, 100);
+    </script>
+</body>
+</html>"""
+        return HTMLResponse(content=html)
+
+    # ПК: обычная страница
+    desc = post["description"] or ""
+    images_html = "".join(
+        f'<img src="{url}" style="max-width:100%; margin:10px 0; border-radius:8px;" />'
+        for url in images
+    )
+    html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
@@ -315,7 +402,22 @@ async def get_post(post_id: str, request: Request):
     <div class="content"><strong>content:</strong><br/>{images_html if images_html else '<em>Нет изображений</em>'}</div>
 </body>
 </html>"""
-        return HTMLResponse(content=html)
+    return HTMLResponse(content=html)
+
+
+@app.get("/.well-known/assetlinks.json")
+async def assetlinks():
+    """Файл для верификации Android App Links."""
+    if not ANDROID_SHA256:
+        raise HTTPException(status_code=404, detail="ANDROID_SHA256 не настроен")
+    return JSONResponse([{
+        "relation": ["delegate_permission/common.handle_all_urls"],
+        "target": {
+            "namespace": "android_app",
+            "package_name": ANDROID_PACKAGE,
+            "sha256_cert_fingerprints": [ANDROID_SHA256],
+        },
+    }])
 
 
 @app.get("/")
