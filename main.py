@@ -9,6 +9,7 @@
 
 import io
 import os
+import re
 import uuid
 import secrets
 import logging
@@ -18,6 +19,7 @@ from typing import Optional, List
 import httpx
 import jwt
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Form
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -36,20 +38,22 @@ JWT_ALG      = "HS256"
 COOKIE_NAME  = "sld_token"
 COOKIE_DAYS  = 30
 
-# Ограничения
-MAX_TEXT_LEN       = 10000
-MAX_TITLE_LEN      = 200
-MAX_TAGS           = 20
-MAX_TAG_LEN        = 30
-MAX_IMAGES         = 5
-MAX_POST_IMAGE_B   = 95 * 1024     # 95 KB × 5 = 475 KB
-MAX_AVATAR_B       = 150 * 1024    # 150 KB
-AVATAR_DIM         = 512
-POST_IMAGE_DIM     = 1024
+MAX_TEXT_LEN   = 10000
+MAX_TITLE_LEN  = 200
+MAX_TAGS       = 20
+MAX_TAG_LEN    = 30
+MAX_IMAGES     = 5
+MAX_POST_IMAGE_B = 95 * 1024     # 95 KB × 5 = 475 KB
+MAX_AVATAR_B     = 150 * 1024
+AVATAR_DIM       = 512
+POST_IMAGE_DIM   = 1024
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="СЛД", docs_url="/api/docs", redoc_url=None)
+
+# GZip для всех ответов > 500 байт — режет HTML/SVG/JSON в 3-5 раз
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,10 +182,50 @@ def compress_image(data: bytes, max_dim: int, max_size: int):
             log.warning("format %s failed: %s", fmt, e)
             continue
 
-    # Fallback — любой JPEG
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=30, optimize=True)
     return buf.getvalue(), "image/jpeg", "jpg"
+
+
+# --------------------------------------------------------------------------- #
+# Storage path helpers
+# --------------------------------------------------------------------------- #
+_STORAGE_RE = re.compile(r"/storage/v1/object/(?:public/|sign/)?media/(.+)$")
+
+
+def storage_path_from_url(url: str) -> Optional[str]:
+    """
+    Из публичного URL картинки вытаскивает путь внутри бакета 'media'.
+    Пример:
+      https://xxx.supabase.co/storage/v1/object/public/media/<uid>/abc.avif
+      -> <uid>/abc.avif
+    """
+    if not url:
+        return None
+    m = _STORAGE_RE.search(url)
+    if not m:
+        return None
+    path = m.group(1)
+    # убираем query, если приклеился
+    path = path.split("?", 1)[0]
+    return path or None
+
+
+def remove_storage_paths(paths: List[str]) -> int:
+    """Удаляет список путей из бакета media. Возвращает кол-во успешных удалений."""
+    paths = [p for p in paths if p]
+    if not paths:
+        return 0
+    removed = 0
+    # supabase-py лимитов не имеет явных, но бьём по 100 на всякий
+    for i in range(0, len(paths), 100):
+        chunk = paths[i:i + 100]
+        try:
+            supabase.storage.from_("media").remove(chunk)
+            removed += len(chunk)
+        except Exception as e:
+            log.warning("storage remove failed for %s: %s", chunk[:2], e)
+    return removed
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +301,7 @@ async def login(body: AuthIn, response: Response):
     if not uid:
         raise HTTPException(500, "Не удалось получить профиль")
 
-    prof = supabase.table("profiles").select("*").eq("id", uid).execute()
+    prof = supabase.table("profiles").select("id").eq("id", uid).execute()
     if not prof.data:
         supabase.table("profiles").insert({
             "id": uid, "username": uname, "name": uname, "avatar": "^_^",
@@ -283,6 +327,9 @@ async def me(user: Optional[dict] = Depends(current_user)):
 # --------------------------------------------------------------------------- #
 # Posts
 # --------------------------------------------------------------------------- #
+POST_FIELDS = "id,author_id,author_username,title,text,tags,font,image_urls,created_at,updated_at"
+
+
 def _row_to_post(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -314,14 +361,23 @@ def _clean_tags(tags: List[str]) -> List[str]:
 
 
 @app.get("/api/posts")
-async def list_posts():
-    res = supabase.table("posts").select("*").order("created_at", desc=True).limit(500).execute()
+async def list_posts(response: Response):
+    # select только нужных полей — payload меньше в ~2 раза
+    res = (supabase.table("posts")
+           .select(POST_FIELDS)
+           .order("created_at", desc=True)
+           .limit(300)
+           .execute())
+    # разрешаем кэш браузеру на 15 сек
+    response.headers["Cache-Control"] = "private, max-age=15"
     return [_row_to_post(r) for r in (res.data or [])]
 
 
 @app.get("/api/posts/{post_id}")
 async def get_post(post_id: str):
-    res = supabase.table("posts").select("*").eq("id", post_id).limit(1).execute()
+    res = (supabase.table("posts")
+           .select(POST_FIELDS)
+           .eq("id", post_id).limit(1).execute())
     if not res.data:
         raise HTTPException(404, "Пост не найден")
     return _row_to_post(res.data[0])
@@ -354,11 +410,17 @@ async def update_post(post_id: str, body: PostIn, user: dict = Depends(require_u
     if len(body.image_urls) > MAX_IMAGES:
         raise HTTPException(400, f"Максимум {MAX_IMAGES} фото на пост")
 
-    check = supabase.table("posts").select("author_id").eq("id", post_id).limit(1).execute()
+    check = (supabase.table("posts")
+             .select("author_id,image_urls")
+             .eq("id", post_id).limit(1).execute())
     if not check.data:
         raise HTTPException(404, "Пост не найден")
     if check.data[0]["author_id"] != user["id"]:
         raise HTTPException(403, "Нет прав")
+
+    old_urls = set(check.data[0].get("image_urls") or [])
+    new_urls = set(body.image_urls or [])
+    to_remove = old_urls - new_urls
 
     row = {
         "title": body.title.strip()[:MAX_TITLE_LEN],
@@ -368,18 +430,37 @@ async def update_post(post_id: str, body: PostIn, user: dict = Depends(require_u
         "image_urls": body.image_urls,
     }
     res = supabase.table("posts").update(row).eq("id", post_id).execute()
+
+    # Чистим файлы, которые отвалились от поста
+    if to_remove:
+        paths = [storage_path_from_url(u) for u in to_remove]
+        n = remove_storage_paths([p for p in paths if p])
+        if n:
+            log.info("update_post: cleaned %d orphan files", n)
+
     return _row_to_post(res.data[0])
 
 
 @app.delete("/api/posts/{post_id}")
 async def delete_post(post_id: str, user: dict = Depends(require_user)):
-    check = supabase.table("posts").select("author_id").eq("id", post_id).limit(1).execute()
+    check = (supabase.table("posts")
+             .select("author_id,image_urls")
+             .eq("id", post_id).limit(1).execute())
     if not check.data:
         raise HTTPException(404, "Пост не найден")
     if check.data[0]["author_id"] != user["id"]:
         raise HTTPException(403, "Нет прав")
+
+    # Сначала удаляем строку из БД
     supabase.table("posts").delete().eq("id", post_id).execute()
-    return {"ok": True}
+
+    # Затем — файлы из Storage
+    urls = check.data[0].get("image_urls") or []
+    paths = [storage_path_from_url(u) for u in urls]
+    n = remove_storage_paths([p for p in paths if p])
+    log.info("delete_post %s: removed %d files", post_id, n)
+
+    return {"ok": True, "files_removed": n}
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +468,9 @@ async def delete_post(post_id: str, user: dict = Depends(require_user)):
 # --------------------------------------------------------------------------- #
 @app.get("/api/profiles/{username}")
 async def get_profile(username: str):
-    res = supabase.table("profiles").select("*").eq("username", username).limit(1).execute()
+    res = (supabase.table("profiles")
+           .select("id,username,name,avatar,avatar_url,bio,status")
+           .eq("username", username).limit(1).execute())
     if not res.data:
         return {"username": username, "name": username, "avatar": "^_^",
                 "avatar_url": "", "bio": "", "status": ""}
@@ -403,8 +486,11 @@ async def get_profile(username: str):
 
 
 @app.get("/api/profiles")
-async def all_profiles():
-    res = supabase.table("profiles").select("*").execute()
+async def all_profiles(response: Response):
+    # select только нужных полей, кэш 30 сек
+    res = (supabase.table("profiles")
+           .select("username,name,avatar,avatar_url,bio,status")
+           .execute())
     out = {}
     for p in (res.data or []):
         out[p["username"]] = {
@@ -414,6 +500,7 @@ async def all_profiles():
             "bio": p.get("bio") or "",
             "status": p.get("status") or "",
         }
+    response.headers["Cache-Control"] = "private, max-age=30"
     return out
 
 
@@ -423,6 +510,12 @@ async def update_my_profile(body: ProfileIn, user: dict = Depends(require_user))
         raise HTTPException(400, "Символьный аватар — до 5 знаков")
     if len(body.status) > 60:
         raise HTTPException(400, "Статус — до 60 символов")
+
+    # старая аватарка — удалим, если заменили на новую
+    old_res = (supabase.table("profiles")
+               .select("avatar_url")
+               .eq("id", user["id"]).limit(1).execute())
+    old_avatar = (old_res.data[0].get("avatar_url") if old_res.data else None) or ""
 
     upd = {
         "name": body.name.strip()[:64] or user["username"],
@@ -436,6 +529,12 @@ async def update_my_profile(body: ProfileIn, user: dict = Depends(require_user))
         upd["id"] = user["id"]
         upd["username"] = user["username"]
         supabase.table("profiles").insert(upd).execute()
+
+    if old_avatar and old_avatar != body.avatar_url:
+        p = storage_path_from_url(old_avatar)
+        if p:
+            remove_storage_paths([p])
+
     return {"ok": True}
 
 
@@ -461,7 +560,9 @@ async def upload(
 
     try:
         supabase.storage.from_("media").upload(
-            key, data, {"content-type": mime, "upsert": "true"}
+            key, data,
+            {"content-type": mime, "upsert": "true",
+             "cache-control": "public, max-age=31536000, immutable"}
         )
     except Exception as e:
         raise HTTPException(500, f"Ошибка загрузки: {e}")
@@ -498,15 +599,27 @@ async def stats():
 # Frontend
 # --------------------------------------------------------------------------- #
 HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="ru" class="light">
+<html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>СЛД</title>
 <meta name="description" content="СЛД — тексты, заметки и мысли.">
+
+<!-- анти-FOUC: тема до отрисовки -->
+<script>
+try{if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){document.documentElement.classList.add('dark')}}catch(e){}
+</script>
+
+<link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+
 <script src="https://cdn.tailwindcss.com"></script>
 <script>tailwind.config = { darkMode: 'class' };</script>
+
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&family=Inter:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;1,400&family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500;700&family=Caveat:wght@500;700&family=Montserrat:wght@400;500;600&family=Merriweather:ital,wght@0,300;0,400;1,300&display=swap');
 
@@ -528,7 +641,7 @@ img { max-width: 100%; height: auto; }
 .font-montserrat     { font-family:'Montserrat',sans-serif }
 .font-merriweather   { font-family:'Merriweather',serif }
 
-/* ------ ФИКС textarea: только последние символы видны при повторяющихся буквах ------ */
+/* === ФИКС textarea: пропадающие символы при повторении === */
 textarea, .editable {
   overflow-x: hidden !important;
   overflow-y: auto;
@@ -565,23 +678,54 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 }
 @keyframes spin { to { transform: rotate(360deg) } }
 
-/* Иконки-кнопки в предпросмотре */
+/* Кнопки-иконки в предпросмотре картинок */
 .icon-btn {
   display:inline-flex; align-items:center; justify-content:center;
-  width: 42px; height: 42px;
+  width: 44px; height: 44px;
   border-radius: 12px;
-  background: rgba(255,255,255,.1);
+  background: rgba(255,255,255,.10);
   color: #fff;
-  transition: background .15s ease;
+  transition: background .15s ease, transform .1s ease;
+  border: none; cursor: pointer;
 }
 .icon-btn:hover  { background: rgba(255,255,255,.22) }
-.icon-btn:active { transform: scale(.95) }
-.icon-btn svg    { width: 20px; height: 20px; stroke-width: 2 }
+.icon-btn:active { transform: scale(.94) }
+.icon-btn svg    { width: 22px; height: 22px; stroke-width: 2 }
 
-@media (max-width: 380px) {
-  .icon-btn { width: 36px; height: 36px }
-  .icon-btn svg { width: 16px; height: 16px }
+/* ===== Стрелки карусели — в 2× больше ===== */
+.carousel-nav {
+  display:flex; align-items:center; justify-content:center;
+  width: 48px; height: 48px;
+  border-radius: 9999px;
+  background: rgba(255,255,255,.9);
+  color: #111827;
+  border: 1px solid rgba(0,0,0,.06);
+  box-shadow: 0 4px 14px rgba(0,0,0,.15);
+  cursor: pointer;
+  transition: background .15s ease, transform .1s ease;
 }
+.carousel-nav:hover  { background:#fff }
+.carousel-nav:active { transform: scale(.94) }
+.carousel-nav svg    { width: 24px; height: 24px; stroke-width: 2.4 }
+.dark .carousel-nav  { background: rgba(20,20,20,.85); color:#fff; border-color: rgba(255,255,255,.06) }
+.dark .carousel-nav:hover { background: rgba(30,30,30,.95) }
+
+@media (max-width: 640px) {
+  .carousel-nav { width: 40px; height: 40px }
+  .carousel-nav svg { width: 20px; height: 20px }
+}
+
+/* Мобильная нижняя навигация */
+#mobileBottomNav {
+  padding-bottom: calc(6px + env(safe-area-inset-bottom));
+  padding-top: 6px;
+}
+.bottom-item {
+  display:flex; flex-direction:column; align-items:center; gap:2px;
+  flex:1 1 0; padding: 4px 2px; min-width: 0;
+}
+.bottom-item svg { width: 22px; height: 22px }
+.bottom-item span { font-size: 10px; font-weight: 500; line-height: 1 }
 </style>
 </head>
 <body class="bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 transition-colors duration-200 flex flex-col min-h-screen pb-20 sm:pb-0">
@@ -595,28 +739,34 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 <!-- ============ Toast ============ -->
 <div id="toast" class="fixed top-5 left-1/2 -translate-x-1/2 sm:top-auto sm:bottom-6 sm:left-auto sm:right-6 sm:translate-x-0 bg-gray-900/95 dark:bg-gray-100/95 backdrop-blur-md text-white dark:text-gray-900 px-5 py-3 rounded-2xl text-xs sm:text-sm font-medium opacity-0 pointer-events-none transition-all duration-300 z-[100] shadow-2xl max-w-[90vw] truncate">…</div>
 
-<!-- ============ Image preview ============ -->
+<!-- ============ Image preview (только зум + скачать + закрыть) ============ -->
 <div id="imagePreviewModal" class="fixed inset-0 bg-black/95 backdrop-blur-xl z-[200] flex-col hidden">
   <div class="flex justify-between items-center p-2 sm:p-4 text-white bg-black/40 shrink-0 gap-2">
-    <div class="flex gap-1.5 sm:gap-2 flex-wrap">
-      <button onclick="zoomPreview(1.3)" class="icon-btn" title="Приблизить">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/></svg>
+    <div class="flex gap-2">
+      <button onclick="zoomPreview(1.3)" class="icon-btn" title="Приблизить" aria-label="Приблизить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/>
+        </svg>
       </button>
-      <button onclick="zoomPreview(0.77)" class="icon-btn" title="Отдалить">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/></svg>
+      <button onclick="zoomPreview(0.77)" class="icon-btn" title="Отдалить" aria-label="Отдалить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6"/>
+        </svg>
       </button>
-      <button onclick="rotatePreview(-90)" class="icon-btn" title="Повернуть влево">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.7 9.7 0 0 0-6.7 2.7L3 8"/><path d="M3 3v5h5"/></svg>
-      </button>
-      <button onclick="rotatePreview(90)" class="icon-btn" title="Повернуть вправо">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9 9.7 9.7 0 0 1 6.7 2.7L21 8"/><path d="M21 3v5h-5"/></svg>
-      </button>
-      <button onclick="resetPreview()" class="icon-btn" title="Сброс">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+      <button onclick="downloadPreview()" class="icon-btn" title="Скачать" aria-label="Скачать">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+        </svg>
       </button>
     </div>
-    <button onclick="closeImagePreview()" class="icon-btn" style="background:rgba(239,68,68,.55)" onmouseover="this.style.background='rgba(239,68,68,.85)'" onmouseout="this.style.background='rgba(239,68,68,.55)'" title="Закрыть">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 18L18 6M6 6l12 12"/></svg>
+    <button onclick="closeImagePreview()" class="icon-btn"
+            style="background:rgba(239,68,68,.55)"
+            onmouseover="this.style.background='rgba(239,68,68,.9)'"
+            onmouseout="this.style.background='rgba(239,68,68,.55)'"
+            title="Закрыть" aria-label="Закрыть">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 18L18 6M6 6l12 12"/>
+      </svg>
     </button>
   </div>
   <div class="flex-1 overflow-auto flex items-center justify-center p-4 relative">
@@ -676,7 +826,9 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
     </button>
     <div class="flex items-center gap-3 mb-6">
       <div class="w-11 h-11 rounded-xl bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-blue-500">
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg>
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>
+        </svg>
       </div>
       <div>
         <h3 class="text-lg font-semibold leading-tight">Статус хранилища</h3>
@@ -698,11 +850,8 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
         <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-2 mb-1.5 overflow-hidden border border-gray-200 dark:border-gray-700">
           <div id="dbProgressBar" class="bg-blue-500 h-2 rounded-full transition-all duration-700 ease-out" style="width:0%"></div>
         </div>
-        <div class="text-[10px] text-gray-500 text-right">
-          <span id="dbUsedMB">0</span> / 500 МБ
-        </div>
+        <div class="text-[10px] text-gray-500 text-right"><span id="dbUsedMB">0</span> / 500 МБ</div>
       </div>
-
       <div>
         <div class="mb-1.5 flex justify-between items-end">
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Файловое хранилище</span>
@@ -711,11 +860,8 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
         <div class="w-full bg-gray-100 dark:bg-gray-800 rounded-full h-2 mb-1.5 overflow-hidden border border-gray-200 dark:border-gray-700">
           <div id="fileProgressBar" class="bg-purple-500 h-2 rounded-full transition-all duration-700 ease-out" style="width:0%"></div>
         </div>
-        <div class="text-[10px] text-gray-500 text-right">
-          <span id="fileUsedMB">0</span> / 1024 МБ · <span id="fileCount">0</span> файл(ов)
-        </div>
+        <div class="text-[10px] text-gray-500 text-right"><span id="fileUsedMB">0</span> / 1024 МБ · <span id="fileCount">0</span> файл(ов)</div>
       </div>
-
       <div class="pt-4 border-t border-gray-100 dark:border-gray-800 text-[10px] text-gray-400 space-y-1">
         <div class="flex justify-between"><span>Постов в БД:</span><span id="postsBytes" class="font-medium text-gray-600 dark:text-gray-300">0 КБ</span></div>
         <div class="flex justify-between"><span>Профилей в БД:</span><span id="profilesBytes" class="font-medium text-gray-600 dark:text-gray-300">0 КБ</span></div>
@@ -724,9 +870,8 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   </div>
 </div>
 
-<!-- ============ Header (PC/Tablet) ============ -->
+<!-- ============ Header / main ============ -->
 <div class="max-w-3xl w-full mx-auto px-4 py-4 sm:py-8 flex-1 flex flex-col min-h-0">
-
   <header class="hidden sm:flex justify-between items-center pb-5 mb-6 border-b border-gray-200 dark:border-gray-800">
     <div>
       <a href="#/" onclick="event.preventDefault(); goHome()" class="text-2xl sm:text-3xl font-semibold tracking-tight hover:opacity-80">СЛД</a>
@@ -735,7 +880,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
     <div id="desktopUserProfileArea" class="flex items-center gap-2"></div>
   </header>
 
-  <!-- Мобильная шапка -->
   <div class="sm:hidden mb-4 flex justify-between items-center pb-3 border-b border-gray-200 dark:border-gray-800">
     <div>
       <a href="#/" onclick="event.preventDefault(); goHome()" class="text-xl font-bold">СЛД</a>
@@ -747,8 +891,7 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 </div>
 
 <!-- ============ Mobile bottom nav ============ -->
-<nav id="mobileBottomNav" class="sm:hidden fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-gray-900/90 backdrop-blur-lg border-t border-gray-200/80 dark:border-gray-800/80 z-40 px-3 py-2 flex justify-around items-center shadow-[0_-4px_15px_rgba(0,0,0,0.05)]"
-     style="padding-bottom: max(8px, env(safe-area-inset-bottom));"></nav>
+<nav id="mobileBottomNav" class="sm:hidden fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-gray-900/90 backdrop-blur-lg border-t border-gray-200/80 dark:border-gray-800/80 z-40 px-1 flex justify-around items-stretch shadow-[0_-4px_15px_rgba(0,0,0,0.05)]"></nav>
 
 <!-- ============ Footer (PC/Tablet) ============ -->
 <footer class="hidden sm:block mt-10 border-t border-gray-200 dark:border-gray-800 py-6 text-center text-xs text-gray-500 dark:text-gray-400">
@@ -780,7 +923,7 @@ let pendingImages = [];
 let isDataLoaded = false;
 let editingPostId = null;
 let activeCreateFont = 'font-serif-custom';
-let previewScale = 1, previewRotation = 0;
+let previewScale = 1;
 let pendingHash = null;
 
 const MAX_TEXT = 10000;
@@ -807,9 +950,8 @@ function sanitizeHTML(str) {
   if (str == null) return '';
   return String(str).replace(/[&<>'"]/g, t => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t]||t));
 }
-
-function esc(s) { return sanitizeHTML(s); }
-function escAttr(s) { return sanitizeHTML(s).replace(/`/g,'&#96;'); }
+const esc = sanitizeHTML;
+const escAttr = s => sanitizeHTML(s).replace(/`/g,'&#96;');
 
 function showToast(text) {
   const t = document.getElementById('toast');
@@ -843,7 +985,7 @@ window.navigateToProfile = navigateToProfile;
 window.openImagePreview = function(url) {
   const m = document.getElementById('imagePreviewModal');
   document.getElementById('previewImage').src = url;
-  previewScale = 1; previewRotation = 0; updatePreviewTransform();
+  previewScale = 1; updatePreviewTransform();
   m.classList.remove('hidden'); m.classList.add('flex');
   document.body.style.overflow = 'hidden';
 };
@@ -857,79 +999,96 @@ window.zoomPreview = f => {
   previewScale = Math.min(8, Math.max(0.3, previewScale * f));
   updatePreviewTransform();
 };
-window.rotatePreview = d => {
-  previewRotation += d;
-  updatePreviewTransform();
-};
-window.resetPreview = () => {
-  previewScale = 1; previewRotation = 0; updatePreviewTransform();
-};
 function updatePreviewTransform() {
-  document.getElementById('previewImage').style.transform =
-    `scale(${previewScale}) rotate(${previewRotation}deg)`;
+  document.getElementById('previewImage').style.transform = `scale(${previewScale})`;
 }
-window.downloadImage = async function(url, index) {
+window.downloadPreview = async function() {
+  const url = document.getElementById('previewImage').src;
+  if (!url) return;
   try {
     const r = await fetch(url, { mode: 'cors' });
     const b = await r.blob();
     const u = URL.createObjectURL(b);
     const a = document.createElement('a');
-    a.href = u; a.download = `SLD_${index+1}.jpg`;
+    a.href = u; a.download = 'SLD.jpg';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(u), 1000);
     showToast('Загрузка начата');
-  } catch {
-    window.open(url, '_blank');
-  }
+  } catch { window.open(url, '_blank'); }
 };
+window.downloadImage = window.downloadPreview;
 
 // =============================================================
-//  Carousel
+//  Carousel — большие стрелки
 // =============================================================
 function generateCarouselHTML(postId, images) {
   if (!images || !images.length) return '';
   const slides = images.map((url, idx) => `
-    <div class="w-full min-w-full flex-shrink-0 snap-center relative flex items-center justify-center cursor-pointer overflow-hidden p-1" onclick="openImagePreview('${escAttr(url)}')">
-      <img src="${escAttr(url)}" class="max-h-[55vh] sm:max-h-[65vh] max-w-full object-contain rounded-xl bg-gray-100 dark:bg-gray-900" loading="lazy" alt="">
+    <div class="w-full min-w-full flex-shrink-0 snap-center relative flex items-center justify-center cursor-pointer overflow-hidden p-1"
+         onclick="openImagePreview('${escAttr(url)}')">
+      <img src="${escAttr(url)}" loading="lazy" decoding="async" alt=""
+           class="max-h-[55vh] sm:max-h-[65vh] max-w-full object-contain rounded-xl bg-gray-100 dark:bg-gray-900">
       <button onclick="event.stopPropagation(); downloadImage('${escAttr(url)}', ${idx})" title="Скачать"
-              class="absolute top-2 right-2 bg-black/55 hover:bg-black/85 text-white p-2 rounded-xl backdrop-blur-sm">
-        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+              class="absolute top-2 right-2 bg-black/55 hover:bg-black/85 text-white p-2.5 rounded-xl backdrop-blur-sm transition">
+        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+        </svg>
       </button>
-      ${images.length>1 ? `<div class="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/60 text-white text-[10px] px-3 py-1 rounded-full">${idx+1}/${images.length}</div>` : ''}
+      ${images.length>1 ? `<div class="absolute bottom-3 left-1/2 -translate-x-1/2 bg-black/60 text-white text-[11px] font-medium px-3 py-1 rounded-full backdrop-blur-sm">${idx+1} / ${images.length}</div>` : ''}
     </div>`).join('');
 
   return `
     <div class="relative bg-gray-100/50 dark:bg-[#0a0a0a] rounded-2xl mb-4 overflow-hidden border border-gray-100 dark:border-gray-800/50 group">
       <div id="carousel-${postId}" class="flex w-full overflow-x-auto snap-x snap-mandatory scroll-smooth no-scrollbar">${slides}</div>
       ${images.length>1 ? `
-        <button onclick="event.stopPropagation(); const c=document.getElementById('carousel-${postId}'); c.scrollBy({left:-c.clientWidth,behavior:'smooth'})"
-                class="hidden sm:flex absolute left-2 top-1/2 -translate-y-1/2 bg-white/85 dark:bg-black/60 hover:bg-white dark:hover:bg-black p-2 rounded-full opacity-0 group-hover:opacity-100 transition z-10">
-          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 19l-7-7 7-7"/></svg>
+        <button onclick="event.stopPropagation(); scrollCarousel('${escAttr(postId)}', -1)" aria-label="Предыдущее фото"
+                class="carousel-nav absolute left-2 sm:left-3 top-1/2 -translate-y-1/2 z-10">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M15 19l-7-7 7-7"/></svg>
         </button>
-        <button onclick="event.stopPropagation(); const c=document.getElementById('carousel-${postId}'); c.scrollBy({left:c.clientWidth,behavior:'smooth'})"
-                class="hidden sm:flex absolute right-2 top-1/2 -translate-y-1/2 bg-white/85 dark:bg-black/60 hover:bg-white dark:hover:bg-black p-2 rounded-full opacity-0 group-hover:opacity-100 transition z-10">
-          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 5l7 7-7 7"/></svg>
+        <button onclick="event.stopPropagation(); scrollCarousel('${escAttr(postId)}', 1)" aria-label="Следующее фото"
+                class="carousel-nav absolute right-2 sm:right-3 top-1/2 -translate-y-1/2 z-10">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
         </button>` : ''}
     </div>`;
 }
 
+window.scrollCarousel = function(postId, dir) {
+  const c = document.getElementById('carousel-' + postId);
+  if (!c) return;
+  c.scrollBy({ left: dir * c.clientWidth, behavior: 'smooth' });
+};
+
 // =============================================================
-//  Data loading
+//  Data loading (оптимизировано: параллельно + кэш)
 // =============================================================
+let _dataPromise = null;
 async function fetchAllData() {
+  // дедупликация параллельных вызовов
+  if (_dataPromise) return _dataPromise;
+  _dataPromise = (async () => {
+    try {
+      const [posts, profiles] = await Promise.all([
+        api('/api/posts'),
+        api('/api/profiles'),
+      ]);
+      database = posts.map(p => ({ ...p, timestamp: fmtDate(p.timestamp) }));
+      profilesData = profiles || {};
+    } catch (e) {
+      console.error('load error', e);
+    }
+    isDataLoaded = true;
+    updateUserInterface();
+    router();
+  })();
+  try { await _dataPromise; } finally { _dataPromise = null; }
+}
+
+// точечное обновление без полного перезапроса
+async function refreshProfiles() {
   try {
-    const [posts, profiles] = await Promise.all([
-      api('/api/posts'),
-      api('/api/profiles'),
-    ]);
-    database = posts.map(p => ({ ...p, timestamp: fmtDate(p.timestamp) }));
-    profilesData = profiles || {};
-  } catch (e) {
-    console.error('load error', e);
-  }
-  isDataLoaded = true;
-  updateUserInterface();
-  router();
+    profilesData = await api('/api/profiles') || {};
+    updateUserInterface();
+  } catch (e) { console.warn('profiles refresh failed', e); }
 }
 
 // =============================================================
@@ -976,44 +1135,39 @@ function showPostNotFoundError() {
 }
 
 // =============================================================
-//  Mobile nav
+//  Mobile nav — компактная, ничего не вылезает
 // =============================================================
 function updateMobileNav() {
   const nav = document.getElementById('mobileBottomNav');
   const hash = location.hash;
 
-  const home = `<a href="#/" onclick="event.preventDefault();goHome()"
-    class="flex flex-col items-center gap-0.5 flex-1 py-1 ${(!hash||hash==='#/'||hash==='#')?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
-    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M3 12l2-2 7-7 7 7M5 10v10h4v-6h6v6h4V10"/>
-    </svg>
-    <span class="text-[10px] font-medium">Главная</span></a>`;
+  const itemCls = active =>
+    `bottom-item ${active ? 'text-gray-900 dark:text-white font-semibold' : 'text-gray-400 dark:text-gray-500'} transition-colors`;
 
-  const create = `<a href="#create" onclick="if(!currentUser){event.preventDefault();openAuth('#create')}"
-    class="flex flex-col items-center gap-0.5 flex-1 py-1 ${hash==='#create'?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
-    <div class="w-9 h-9 rounded-xl bg-gray-900 dark:bg-white text-white dark:text-gray-900 flex items-center justify-center -mt-3 shadow-md">
-      <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-    </div>
-    <span class="text-[10px] font-medium">Создать</span></a>`;
+  const home = `<a href="#/" onclick="event.preventDefault();goHome()" class="${itemCls(!hash||hash==='#/'||hash==='#')}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12l2-2 7-7 7 7M5 10v10h4v-6h6v6h4V10"/>
+      </svg><span>Главная</span></a>`;
 
-  const stats = `<button onclick="openStats()"
-    class="flex flex-col items-center gap-0.5 flex-1 py-1 text-gray-400">
-    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>
-    </svg>
-    <span class="text-[10px] font-medium">Статус</span></button>`;
+  const create = `<a href="#create" onclick="if(!currentUser){event.preventDefault();openAuth('#create')}" class="${itemCls(hash==='#create')}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>
+      </svg><span>Создать</span></a>`;
+
+  const stats = `<button onclick="openStats()" class="${itemCls(false)}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5"/><path d="M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>
+      </svg><span>Статус</span></button>`;
 
   const profile = currentUser
-    ? `<a href="#profile" class="flex flex-col items-center gap-0.5 flex-1 py-1 ${hash.startsWith('#profile')?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    ? `<a href="#profile" class="${itemCls(hash.startsWith('#profile'))}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM12 14a7 7 0 0 0-7 7h14a7 7 0 0 0-7-7z"/>
-        </svg>
-        <span class="text-[10px] font-medium">Профиль</span></a>`
-    : `<button onclick="openAuth('#profile')" class="flex flex-col items-center gap-0.5 flex-1 py-1 text-gray-400">
-        <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        </svg><span>Профиль</span></a>`
+    : `<button onclick="openAuth('#profile')" class="${itemCls(false)}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M11 16l-4-4m0 0l4-4m-4 4h14M18 20v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h7a3 3 0 0 1 3 3v1"/>
-        </svg>
-        <span class="text-[10px] font-medium">Вход</span></button>`;
+        </svg><span>Вход</span></button>`;
 
   nav.innerHTML = home + create + stats + profile;
 }
@@ -1065,8 +1219,7 @@ function renderDBList() {
   );
 
   filtered.sort((a,b) => {
-    const ta = a.timestamp || '';
-    const tb = b.timestamp || '';
+    const ta = a.timestamp || '', tb = b.timestamp || '';
     if (currentSortOrder === 'new') return tb.localeCompare(ta) || (b.id||'').localeCompare(a.id||'');
     return ta.localeCompare(tb) || (a.id||'').localeCompare(b.id||'');
   });
@@ -1086,7 +1239,7 @@ function renderDBList() {
     const prof = profilesData[entry.author] || { avatar: '^_^', name: entry.author, avatar_url: '' };
     const isOwn = entry.author === currentUser;
     const av = prof.avatar_url
-      ? `<img src="${escAttr(prof.avatar_url)}" class="w-9 h-9 rounded-xl object-cover" alt="">`
+      ? `<img src="${escAttr(prof.avatar_url)}" loading="lazy" decoding="async" class="w-9 h-9 rounded-xl object-cover" alt="">`
       : `<div class="w-9 h-9 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-xs font-bold">${esc(prof.avatar)}</div>`;
 
     return `
@@ -1150,7 +1303,7 @@ function renderSinglePost(entry) {
            onclick="setSearch('${escAttr(t)}')">#${esc(t)}</span>`
   ).join('');
   const av = prof.avatar_url
-    ? `<img src="${escAttr(prof.avatar_url)}" class="w-11 h-11 rounded-2xl object-cover" alt="">`
+    ? `<img src="${escAttr(prof.avatar_url)}" loading="lazy" decoding="async" class="w-11 h-11 rounded-2xl object-cover" alt="">`
     : `<div class="w-11 h-11 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-sm font-bold">${esc(prof.avatar)}</div>`;
   const isOwn = entry.author === currentUser;
 
@@ -1307,7 +1460,7 @@ function updateCreateImagePreview() {
     cnt.innerText = pendingImages.length;
     slider.innerHTML = pendingImages.map((u,i) => `
       <div class="relative w-20 h-20 sm:w-24 sm:h-24 bg-gray-100 dark:bg-gray-800 rounded-xl flex-shrink-0 snap-start overflow-hidden border border-gray-200 dark:border-gray-700">
-        <img src="${escAttr(u)}" class="w-full h-full object-cover" alt="">
+        <img src="${escAttr(u)}" loading="lazy" decoding="async" class="w-full h-full object-cover" alt="">
         <button type="button" onclick="removePendingImage(${i})"
                 class="absolute top-1 right-1 bg-red-500/90 hover:bg-red-500 text-white rounded-full p-1 transition">
           <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 18L18 6M6 6l12 12"/></svg>
@@ -1315,7 +1468,6 @@ function updateCreateImagePreview() {
       </div>`).join('');
   }
 
-  // Блокируем добавление, если уже 5
   if (label) {
     if (pendingImages.length >= MAX_IMAGES) {
       label.classList.add('opacity-50','cursor-not-allowed');
@@ -1329,11 +1481,16 @@ function updateCreateImagePreview() {
   }
 }
 
+function forceRepaint(el) {
+  if (!el) return;
+  void el.offsetHeight;
+  el.style.transform = 'translateZ(0)';
+}
+
 function initCreateEvents() {
   const dataInput = document.getElementById('dataInput');
   const charCount = document.getElementById('charCount');
 
-  // ---------- Шрифты ----------
   document.querySelectorAll('.create-font-option').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.create-font-option')
@@ -1345,18 +1502,14 @@ function initCreateEvents() {
     });
   });
 
-  // ---------- Фикс бага textarea (последние 2 символа) ----------
   let rafId = null;
   dataInput.addEventListener('input', () => {
     if (charCount) charCount.innerText = dataInput.value.length;
     cancelAnimationFrame(rafId);
     rafId = requestAnimationFrame(() => forceRepaint(dataInput));
   });
-
-  // также — при вставке
   dataInput.addEventListener('paste', () => setTimeout(() => forceRepaint(dataInput), 10));
 
-  // ---------- Загрузка фото ----------
   const uploadFiles = async files => {
     files = files.filter(f => f && f.type && f.type.startsWith('image/'));
     if (!files.length) return;
@@ -1372,23 +1525,25 @@ function initCreateEvents() {
     if (saveBtn) saveBtn.disabled = true;
     showToast('Загрузка…');
 
-    for (const f of files) {
-      try {
-        const fd = new FormData();
-        fd.append('file', f);
-        fd.append('kind', 'post');
-        const r = await fetch('/api/upload', { method:'POST', body: fd, credentials:'include' });
-        if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
-        const j = await r.json();
-        pendingImages.push(j.url);
-      } catch (e) {
-        showToast('Ошибка: ' + e.message);
-      }
+    // Параллельная загрузка
+    const results = await Promise.allSettled(files.map(async f => {
+      const fd = new FormData();
+      fd.append('file', f);
+      fd.append('kind', 'post');
+      const r = await fetch('/api/upload', { method:'POST', body: fd, credentials:'include' });
+      if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+      return (await r.json()).url;
+    }));
+
+    let ok = 0;
+    for (const r of results) {
+      if (r.status === 'fulfilled') { pendingImages.push(r.value); ok++; }
+      else showToast('Ошибка: ' + r.reason?.message);
     }
 
     if (saveBtn) saveBtn.disabled = false;
     updateCreateImagePreview();
-    showToast('Готово');
+    if (ok) showToast(`Загружено: ${ok}`);
   };
 
   document.getElementById('imageUploadInput').addEventListener('change', e => {
@@ -1406,7 +1561,6 @@ function initCreateEvents() {
     if (imgs.length) { e.preventDefault(); uploadFiles(imgs); }
   });
 
-  // ---------- Сохранить ----------
   document.getElementById('saveBtn').addEventListener('click', async () => {
     const text = dataInput.value;
     const title = document.getElementById('postTitleInput').value.trim();
@@ -1416,8 +1570,7 @@ function initCreateEvents() {
     if (!text.trim() && !pendingImages.length && !title) { showToast('Пустой пост'); return; }
 
     const body = {
-      title,
-      text,
+      title, text,
       tags: tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [],
       font: activeCreateFont,
       image_urls: pendingImages,
@@ -1450,15 +1603,6 @@ function initCreateEvents() {
   });
 }
 
-// Принудительный перерасчёт (лечит баг невидимых символов в textarea)
-function forceRepaint(el) {
-  if (!el) return;
-  // чтение offsetHeight форсирует layout
-  void el.offsetHeight;
-  // держим GPU-слой
-  el.style.transform = 'translateZ(0)';
-}
-
 // =============================================================
 //  Profile page
 // =============================================================
@@ -1469,7 +1613,7 @@ function renderProfilePage(username, isOwn) {
 
   const userPosts = database.filter(p => p.author === username);
   const avatarEl = prof.avatar_url
-    ? `<img src="${escAttr(prof.avatar_url)}" class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-cover border border-gray-100 dark:border-gray-800" alt="">`
+    ? `<img src="${escAttr(prof.avatar_url)}" loading="lazy" decoding="async" class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-cover border border-gray-100 dark:border-gray-800" alt="">`
     : `<div class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-base sm:text-lg font-bold">${esc(prof.avatar)}</div>`;
 
   document.getElementById('appContent').innerHTML = `
@@ -1649,11 +1793,12 @@ window.removeAvatar = function() {
 //  Delete / copy
 // =============================================================
 window.deletePost = async function(postId, fromSingle) {
-  if (!confirm('Удалить запись?')) return;
+  if (!confirm('Удалить запись? Все прикреплённые файлы также будут удалены.')) return;
   try {
-    await api(`/api/posts/${postId}`, { method:'DELETE' });
+    const r = await api(`/api/posts/${postId}`, { method:'DELETE' });
     database = database.filter(p => p.id !== postId);
-    showToast('Удалено');
+    const removed = r.files_removed || 0;
+    showToast(removed ? `Удалено (файлов: ${removed})` : 'Удалено');
     if (fromSingle) goHome();
     else router();
   } catch (e) { showToast('Ошибка: ' + e.message); }
@@ -1687,11 +1832,14 @@ window.openStats = async function() {
   const m = document.getElementById('statsModal');
   m.classList.remove('hidden');
   document.getElementById('statsLoader').classList.remove('hidden');
+  document.getElementById('statsLoader').innerHTML = `
+    <div class="spinner mx-auto" style="width:32px;height:32px;border-width:2px"></div>
+    <div class="mt-3">Загрузка…</div>`;
   document.getElementById('statsBody').classList.add('hidden');
   try {
     const s = await api('/api/stats');
-    const DB_LIMIT = 500 * 1024 * 1024;   // 500 MB
-    const FS_LIMIT = 1024 * 1024 * 1024;  // 1 GB
+    const DB_LIMIT = 500 * 1024 * 1024;
+    const FS_LIMIT = 1024 * 1024 * 1024;
 
     const dbPct = Math.min(100, (s.db_bytes / DB_LIMIT) * 100);
     const fsPct = Math.min(100, (s.storage_bytes / FS_LIMIT) * 100);
@@ -1804,13 +1952,11 @@ document.getElementById('authForm').addEventListener('submit', async e => {
     let loggedIn = false;
     let lastErr = null;
 
-    // 1) Login
     try {
       await api('/api/auth/login', { method:'POST', body: JSON.stringify({ username: u, password: p }) });
       loggedIn = true;
     } catch (loginErr) {
       lastErr = loginErr;
-      // 2) Регистрация
       try {
         await api('/api/auth/signup', { method:'POST', body: JSON.stringify({ username: u, password: p }) });
         loggedIn = true;
@@ -1821,7 +1967,6 @@ document.getElementById('authForm').addEventListener('submit', async e => {
 
     if (!loggedIn) throw lastErr || new Error('Не удалось войти');
 
-    // Проверяем, что cookie реально применился
     const me = await api('/api/auth/me');
     if (!me.authenticated) throw new Error('Сессия не создалась, попробуйте ещё раз');
 
@@ -1850,40 +1995,27 @@ document.getElementById('authForm').addEventListener('submit', async e => {
 });
 
 // =============================================================
-//  Предзагрузка шрифтов + boot
+//  Boot
 // =============================================================
-const ALL_FONTS = ['Inter','Lora','Fira Code','Playfair Display','JetBrains Mono','Caveat','Montserrat','Merriweather'];
-async function preloadFonts() {
-  try {
-    await Promise.all(ALL_FONTS.map(f =>
-      document.fonts.load('16px "' + f + '"').catch(() => null)
-    ));
-    await document.fonts.ready;
-  } catch {}
-}
-
 (async function boot() {
-  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-    document.documentElement.classList.add('dark');
-  }
-
-  // Стартуем параллельно: проверка auth + предзагрузка шрифтов
-  const [meResult] = await Promise.allSettled([
+  // Параллельно: проверка сессии + предзагрузка данных + шрифты
+  const [meRes] = await Promise.allSettled([
     api('/api/auth/me'),
-    preloadFonts(),
+    (async () => { try { await document.fonts.ready; } catch {} })(),
   ]);
 
-  if (meResult.status === 'fulfilled' && meResult.value?.authenticated) {
-    currentUser = meResult.value.username;
-    currentUserId = meResult.value.id;
+  if (meRes.status === 'fulfilled' && meRes.value?.authenticated) {
+    currentUser = meRes.value.username;
+    currentUserId = meRes.value.id;
   }
 
   // Плавно скрываем overlay
   const ov = document.getElementById('loadingOverlay');
-  ov.style.transition = 'opacity .35s ease';
+  ov.style.transition = 'opacity .3s ease';
   ov.style.opacity = '0';
-  setTimeout(() => ov.remove(), 380);
+  setTimeout(() => ov.remove(), 320);
 
+  // Данные грузим после — overlay уже не мешает
   await fetchAllData();
 })();
 </script>
