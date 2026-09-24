@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-СЛД — старая социальная сеть / форум образца начала 2000-х.
-Один файл. Регистрация, вход, профиль с фото, темы (посты),
-комментарии. БД — Supabase (service_role).
+СЛД — социальная сеть / форум в старом стиле.
+Один файл. Регистрация, вход, профиль с фото, темы, комментарии.
+БД — Supabase (service_role).
 
 Запуск:
     export SUPABASE_URL=...
@@ -11,6 +11,7 @@
 """
 
 import os
+import io
 import re
 import html
 import base64
@@ -22,6 +23,7 @@ from typing import Optional, Any
 from fastapi import FastAPI, Request, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from supabase import create_client
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +43,12 @@ SESSION_DAYS = 30
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 POST_MAX = 5000
 COMMENT_MAX = 2000
-AVATAR_MAX = 150_000   # байт, ~150 КБ
+ABOUT_MAX = 2000
+
+# Ограничения на аватар
+AVATAR_UPLOAD_MAX = 10 * 1024 * 1024     # принимаем на вход до 10 МБ
+AVATAR_TARGET_BYTES = 150 * 1024         # на выходе — не более 150 КБ
+AVATAR_MAX_SIDE = 512                    # ресайз: длинная сторона ≤ 512 px
 
 app = FastAPI(title="СЛД", docs_url=None, redoc_url=None)
 
@@ -101,7 +108,7 @@ def fmt_dt(value: Any) -> str:
         return f"сегодня в {dt:%H:%M}"
     if (now.date() - dt.date()).days == 1:
         return f"вчера в {dt:%H:%M}"
-    return f"{dt.day} {MONTHS[dt.month - 1]} {dt.year} г."
+    return f"{dt.day} {MONTHS[dt.month - 1]} {dt.year}"
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -118,14 +125,13 @@ def plural(n: int, one: str, few: str, many: str) -> str:
 
 def avatar_color(name: str) -> str:
     h = int(hashlib.md5((name or "?").encode("utf-8")).hexdigest()[:6], 16)
-    r = 100 + (h & 0x4F)
-    g = 110 + ((h >> 8) & 0x4F)
-    b = 130 + ((h >> 16) & 0x3F)
+    r = 110 + (h & 0x4F)
+    g = 120 + ((h >> 8) & 0x4F)
+    b = 140 + ((h >> 16) & 0x3F)
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def avatar_html(username: str, avatar: Optional[str], size: int = 50) -> str:
-    """Аватар: либо загруженная картинка, либо цветной квадрат с буквой."""
     if avatar:
         return (f'<img class="av" src="{esc(avatar)}" '
                 f'width="{size}" height="{size}" alt="">')
@@ -136,11 +142,57 @@ def avatar_html(username: str, avatar: Optional[str], size: int = 50) -> str:
             f'font-size:{int(size * 0.45)}px">{letter}</div>')
 
 
-def user_card(u: dict, size: int = 50) -> str:
-    """Компактная карточка пользователя (аватар + ник), для списков."""
-    return (f'<div class="ucard">{avatar_html(u.get("username", ""), u.get("avatar"), size)}'
-            f'<div><a href="/u/{esc(u.get("username"))}">{esc(u.get("username"))}</a>'
-            f'<div class="muted">{esc(fmt_dt(u.get("created_at")))}</div></div></div>')
+def process_avatar(raw: bytes) -> Optional[str]:
+    """
+    Принимает байты изображения, возвращает data:URL JPEG.
+    - ресайз: длинная сторона ≤ AVATAR_MAX_SIDE (512) с сохранением пропорций
+    - подбором качества гарантируем размер ≤ AVATAR_TARGET_BYTES (150 КБ)
+    - если никакое качество не помогает — дополнительно уменьшаем
+    """
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        return None
+
+    # Приводим к RGB (прозрачность ложим на белый фон)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    else:
+        img = img.convert("RGB")
+
+    # Первый ресайз
+    img.thumbnail((AVATAR_MAX_SIDE, AVATAR_MAX_SIDE), Image.LANCZOS)
+
+    def encode(im: Image.Image, q: int) -> bytes:
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+        return buf.getvalue()
+
+    # Пробуем уменьшать качество
+    for q in (88, 82, 76, 70, 64, 58, 52, 46, 40, 34, 28):
+        data = encode(img, q)
+        if len(data) <= AVATAR_TARGET_BYTES:
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+
+    # Если всё равно много — пропорционально уменьшаем размер
+    w, h = img.size
+    for scale in (0.85, 0.7, 0.6, 0.5, 0.4, 0.3):
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        small = img.resize((nw, nh), Image.LANCZOS)
+        data = encode(small, 70)
+        if len(data) <= AVATAR_TARGET_BYTES:
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+
+    # Совсем крайний случай
+    data = encode(img.resize((128, 128), Image.LANCZOS), 55)
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
 
 
 # ---------------------------------------------------------------------------
@@ -198,189 +250,170 @@ def destroy_session(request: Request) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Стиль: старая сеть, ~2003 год
+# Стиль: спокойный старый форум
 # ---------------------------------------------------------------------------
 
 CSS = """
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
 body{
-  font-family:"Times New Roman",Times,Georgia,serif;
-  font-size:14px;
-  color:#1A1A1A;
-  background:#4E6478;
-  background-image:
-    repeating-linear-gradient(45deg, rgba(255,255,255,.025) 0 1px, transparent 1px 5px),
-    repeating-linear-gradient(-45deg, rgba(0,0,0,.035) 0 1px, transparent 1px 5px);
-  padding:14px 0 40px;
+  font:12px/1.5 Verdana,Tahoma,Arial,sans-serif;
+  color:#2A2A2A;
+  background:#E4E4DE;
+  padding:16px 0 40px;
 }
-a{color:#000099;text-decoration:underline}
-a:visited{color:#551A8B}
-a:hover{color:#CC0000}
+a{color:#2B587A;text-decoration:none}
+a:hover{text-decoration:underline}
 img{border:0}
 
-.wrap{width:860px;margin:0 auto}
+.wrap{width:880px;margin:0 auto}
 
 /* Шапка */
 .head{
-  border:1px solid #1A2E42;
+  background:#4A6886;
+  color:#fff;
+  border:1px solid #354E66;
   border-bottom:none;
-  background:#2B4A66;
-  background-image:linear-gradient(#3F6486,#203A52);
+  padding:12px 16px;
+  overflow:hidden;
 }
-.head-top{padding:10px 16px 6px;border-bottom:1px solid #142536}
-.logo{
-  font-family:Georgia,"Times New Roman",serif;
-  font-size:34px;letter-spacing:8px;font-weight:bold;
-  color:#FFD966;text-decoration:none;
-  text-shadow:2px 2px 0 #0A1620;
+.head .logo{
+  font:bold 26px/1 Verdana,Tahoma,sans-serif;
+  letter-spacing:4px;color:#fff;text-decoration:none;
+  text-shadow:0 1px 1px rgba(0,0,0,.25);
+  float:left;
 }
-.logo:hover{color:#FFEEA8;text-decoration:none}
-.tagline{color:#B8CCDD;font-size:12px;font-style:italic;margin-top:2px}
-.head-right{float:right;color:#C4D4E3;font-size:12px;text-align:right;padding-top:6px}
-.head-right a{color:#FFD966}
+.head .logo:hover{text-decoration:none;color:#F0F4F8}
+.head .tagline{
+  float:left;margin-left:14px;padding-top:8px;
+  font-size:11px;color:#C8D6E2;font-style:italic;
+}
+.head .right{
+  float:right;text-align:right;font-size:11px;color:#D4DEE8;padding-top:6px;
+}
+.head .right a{color:#FFFFFF}
+.head .right b a{font-weight:bold}
 
 /* Навигация */
 .nav{
-  background:#E4DCC4;
-  border:1px solid #A89A78;
-  border-top:none;border-bottom:1px solid #A89A78;
-  padding:4px 12px;
-  font-size:13px;
+  background:#EFEDE5;
+  border:1px solid #C7C3B4;
+  border-top:none;
+  padding:5px 12px;
+  font-size:11px;
 }
-.nav a{color:#2B4A66;text-decoration:none;padding:1px 2px}
-.nav a:hover{color:#CC0000;text-decoration:underline}
-.nav a.on{font-weight:bold;color:#000;text-decoration:underline}
-.nav .sep{color:#8A7A58;padding:0 6px}
-.nav .right{float:right}
+.nav a{color:#2B587A;padding:1px 2px}
+.nav a.on{font-weight:bold;color:#111;text-decoration:underline}
+.nav .sep{color:#A8A392;padding:0 6px}
 
 /* Основной контейнер */
-.main{background:#F5F1E5;border:1px solid #A89A78;border-top:none;padding:12px}
+.main{background:#F7F5EF;border:1px solid #C7C3B4;border-top:none;padding:12px}
 .cols{display:flex;gap:12px;align-items:flex-start}
-.side{width:200px;flex:none}
+.side{width:198px;flex:none}
 .content{flex:1;min-width:0}
 
 /* Коробки */
-.box{background:#FFFFFF;border:1px solid #A89A78;margin-bottom:12px}
+.box{background:#fff;border:1px solid #C7C3B4;margin-bottom:12px}
 .box-title{
-  background:#D8CFB8;
-  background-image:linear-gradient(#EAE2C9,#C8BEA0);
-  border-bottom:1px solid #A89A78;
-  padding:4px 10px;font-weight:bold;color:#2B2418;font-size:13px;
+  background:#E5E1D3;
+  border-bottom:1px solid #C7C3B4;
+  padding:5px 10px;font-weight:bold;color:#2F3B48;font-size:11px;
 }
-.box-title .cnt{float:right;font-weight:normal;color:#6A5F44;font-size:12px}
+.box-title .cnt{float:right;font-weight:normal;color:#7A7462;font-size:11px}
 .box-body{padding:10px}
 
-/* Ссылки в боковом меню */
+/* Боковое меню */
 .smenu a{
-  display:block;padding:4px 10px;border-bottom:1px dashed #D8CFB8;
-  color:#2B4A66;text-decoration:none;
+  display:block;padding:5px 10px;border-bottom:1px solid #EFEDE5;
+  color:#2B587A;text-decoration:none;
 }
 .smenu a:last-child{border-bottom:none}
-.smenu a:hover{background:#F0EAD5;color:#CC0000}
-.smenu a.on{background:#E4DCC4;font-weight:bold}
+.smenu a:hover{background:#F4F2EA;text-decoration:none}
+.smenu a.on{background:#E5E1D3;font-weight:bold}
 
 /* Аватары */
-.av{display:block;border:1px solid #6A5F44;background:#999}
+.av{display:block;border:1px solid #9A9684;background:#EEE}
 .av-letter{
   color:#fff;text-align:center;font-weight:bold;
-  text-shadow:1px 1px 1px rgba(0,0,0,.5);
-  font-family:Georgia,serif;
+  text-shadow:1px 1px 1px rgba(0,0,0,.35);
+  font-family:Verdana,sans-serif;
 }
 
-/* Пользователь */
-.ucard{display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px dotted #D8CFB8}
-.ucard:last-child{border-bottom:none}
+/* Карточка пользователя */
+.ucard{display:flex;gap:8px;align-items:flex-start}
+.ucard .meta{font-size:11px;color:#7A7462;margin-top:2px}
 
-/* Записи (темы) */
-.post{display:flex;gap:10px;padding:12px 10px;border-bottom:1px solid #E8E0C8}
+/* Записи */
+.post{display:flex;gap:10px;padding:11px 10px;border-bottom:1px solid #EFEDE5}
 .post:last-child{border-bottom:none}
 .pbody{flex:1;min-width:0}
-.pname{font-weight:bold;font-size:14px}
-.pdate{color:#7A6F50;font-size:12px}
-.ptext{margin-top:5px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;line-height:1.5}
-.pacts{margin-top:7px;font-size:12px;color:#7A6F50;padding-top:5px;border-top:1px dotted #E8E0C8}
-.pacts a,.pacts button{color:#000099}
-.pacts form{display:inline;margin:0}
+.pname{font-weight:bold}
+.pdate{color:#8A8574;font-size:11px}
+.ptext{margin-top:4px;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word}
+.pacts{margin-top:6px;font-size:11px;color:#8A8574;
+       padding-top:5px;border-top:1px dashed #EFEDE5}
+.pacts a{color:#5A7085}
 .pacts button{
-  background:none;border:none;padding:0;color:#000099;cursor:pointer;
-  font:12px "Times New Roman",serif;text-decoration:underline;
+  background:none;border:none;padding:0;color:#5A7085;cursor:pointer;
+  font:11px Verdana,sans-serif;text-decoration:none;
 }
-.pacts button:hover{color:#CC0000}
+.pacts button:hover{text-decoration:underline;color:#2B587A}
+.pacts form{display:inline;margin:0}
 
 /* Формы */
-textarea,input[type=text],input[type=password],input[type=url],input[type=date]{
-  font-family:"Times New Roman",Times,serif;font-size:13px;
-  border:2px inset #D8CFB8;
-  border-color:#8A7A58 #F0E8D0 #F0E8D0 #8A7A58;
-  padding:3px 5px;background:#FFFFFF;color:#1A1A1A;
-  border-radius:0;
+textarea,input[type=text],input[type=password],input[type=file]{
+  font:12px/1.5 Verdana,Tahoma,Arial,sans-serif;color:#2A2A2A;
+  border:1px solid #B6B2A2;background:#fff;padding:4px 6px;
+  border-radius:2px;
 }
-textarea:focus,input:focus{outline:none;background:#FFFFF0}
-textarea{width:100%;resize:vertical;line-height:1.5}
+textarea:focus,input:focus{outline:none;border-color:#4A6886;background:#FCFCF9}
+textarea{width:100%;resize:vertical}
 
 button,.btn{
-  font-family:"Times New Roman",serif;font-size:13px;
-  padding:3px 16px;cursor:pointer;
-  background:#D8CFB8;color:#2B2418;
-  border:2px solid;
-  border-color:#F0E8D0 #8A7A58 #8A7A58 #F0E8D0;
-  border-radius:0;
+  font:12px Verdana,Tahoma,Arial,sans-serif;
+  background:#E5E1D3;color:#2F3B48;
+  border:1px solid #B6B2A2;border-radius:2px;
+  padding:4px 14px;cursor:pointer;
 }
-button:hover,.btn:hover{background:#E4DCC4}
-button:active,.btn:active{
-  border-color:#8A7A58 #F0E8D0 #F0E8D0 #8A7A58;
-}
+button:hover,.btn:hover{background:#DAD6C6}
+button:active,.btn:active{background:#CFCAB6}
 
-.field{margin-bottom:8px}
-.field label{display:block;color:#4A4028;margin-bottom:3px;font-weight:bold}
+.field{margin-bottom:9px}
+.field label{display:block;color:#5A5646;margin-bottom:3px}
 .field input[type=text],
-.field input[type=password],
-.field input[type=url],
-.field input[type=date]{width:300px}
+.field input[type=password]{width:320px}
 
-.err{background:#FBE3E3;border:1px solid #C47878;color:#8A2A2A;padding:6px 10px;margin-bottom:10px}
-.ok{background:#E6F2DE;border:1px solid #88B078;color:#2F6B23;padding:6px 10px;margin-bottom:10px}
+.err{background:#F7E3E3;border:1px solid #CE9C9C;color:#7A2A2A;
+     padding:6px 10px;margin-bottom:10px;border-radius:2px}
+.ok{background:#E6F0DC;border:1px solid #A7C493;color:#325A22;
+    padding:6px 10px;margin-bottom:10px;border-radius:2px}
 
-.muted{color:#7A6F50;font-size:12px}
-.hint{color:#7A6F50;font-size:12px;margin-top:3px}
+.muted{color:#8A8574;font-size:11px}
+.hint{color:#8A8574;font-size:11px}
 .center{text-align:center}
 
-h1.ph{
-  margin:0 0 6px;font-family:Georgia,serif;font-size:22px;
-  color:#2B4A66;font-weight:bold;letter-spacing:1px;
-}
+h1.ph{margin:0 0 4px;font:bold 20px/1.2 Verdana,sans-serif;color:#2F3B48}
 h2.pht{
-  margin:0 0 8px;font-family:Georgia,serif;font-size:16px;
-  color:#2B4A66;border-bottom:1px solid #D8CFB8;padding-bottom:4px;
+  margin:0 0 8px;font:bold 13px/1.2 Verdana,sans-serif;color:#2F3B48;
+  border-bottom:1px solid #E5E1D3;padding-bottom:3px;
 }
 
-.profile-card{display:flex;gap:14px;align-items:flex-start;padding:14px}
+.profile-card{display:flex;gap:14px;padding:12px}
 .profile-card .info{flex:1;min-width:0}
-.status{font-style:italic;color:#4A4028;margin:3px 0 8px}
+.status{font-style:italic;color:#4E4A3C;margin:3px 0 8px}
 .info-table{width:100%;border-collapse:collapse}
-.info-table td{padding:3px 6px;vertical-align:top;border-bottom:1px dotted #E8E0C8}
-.info-table td.k{color:#7A6F50;width:140px;white-space:nowrap}
+.info-table td{padding:3px 6px 3px 0;vertical-align:top;
+               border-bottom:1px dotted #E5E1D3}
+.info-table td.k{color:#7A7462;width:150px;white-space:nowrap}
 
-.comment{display:flex;gap:9px;padding:10px;border-bottom:1px solid #E8E0C8}
+.comment{display:flex;gap:9px;padding:10px;border-bottom:1px solid #EFEDE5}
 .comment:last-child{border-bottom:none}
 
-/* Подвал */
 .foot{
-  border:1px solid #A89A78;border-top:none;
-  background:#E4DCC4;padding:8px 12px;font-size:12px;color:#5A5038;
+  background:#E5E1D3;border:1px solid #C7C3B4;border-top:none;
+  padding:8px 12px;font-size:11px;color:#6E6A5A;
 }
-.foot .left{float:left}
-.foot .right{float:right;text-align:right}
-.counter{
-  display:inline-block;
-  background:#000;color:#00FF00;
-  font-family:"Courier New",monospace;font-size:12px;letter-spacing:2px;
-  padding:1px 6px;border:1px solid #333;
-}
-.old-note{
-  margin-top:8px;color:#5A5038;font-size:11px;font-style:italic;
-}
+.foot a{color:#2B587A}
 .clear{clear:both}
 """
 
@@ -388,16 +421,13 @@ h2.pht{
 def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str:
     if user:
         un = esc(user["username"])
-        head_right = (f'Вы вошли как <b><a href="/u/{un}">{un}</a></b> · '
-                      f'<a href="/settings">настройки</a> · '
-                      f'<a href="/logout">выход</a>')
+        head_right = (f'Вы вошли как <b><a href="/u/{un}">{un}</a></b>'
+                      f' &nbsp;·&nbsp; <a href="/settings">настройки</a>'
+                      f' &nbsp;·&nbsp; <a href="/logout">выход</a>')
     else:
-        head_right = '<a href="/login">Вход</a> · <a href="/register">Регистрация</a>'
+        head_right = '<a href="/login">вход</a> &nbsp;·&nbsp; <a href="/register">регистрация</a>'
 
-    nav = [
-        ("/", "Главная", "feed"),
-        ("/people", "Участники", "people"),
-    ]
+    nav = [("/", "Главная", "feed"), ("/people", "Участники", "people")]
     if user:
         nav.append((f"/u/{esc(user['username'])}", "Мой профиль", "me"))
         nav.append(("/settings", "Настройки", "settings"))
@@ -414,8 +444,8 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
                  f'<div class="box-body">'
                  f'<div class="ucard">{avatar_html(user["username"], user.get("avatar"), 60)}'
                  f'<div><a href="/u/{esc(user["username"])}"><b>{esc(user["username"])}</b></a>'
-                 f'<div class="muted">{esc(fmt_dt(user.get("created_at")))}</div></div></div>'
-                 f'</div></div>')
+                 f'<div class="meta">{esc(fmt_dt(user.get("created_at")))}</div></div>'
+                 f'</div></div></div>')
         side += ('<div class="box"><div class="box-title">Меню</div>'
                  '<div class="smenu">'
                  '<a href="/">Все темы</a>'
@@ -438,18 +468,12 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
                  'или <a href="/register">зарегистрируйтесь</a>'
                  '</div></div></div>')
 
-    side += ('<div class="box"><div class="box-title">Статистика</div>'
-             '<div class="box-body muted">СЛД · форум<br>'
-             'основан в 2004 году<br>'
-             'движок: SLDengine 0.9.3<br>'
-             'сегодня: ' + datetime.now().strftime("%d.%m.%Y") +
+    side += ('<div class="box"><div class="box-title">О сайте</div>'
+             '<div class="box-body muted">'
+             'СЛД — маленькая соцсеть с форумом.<br>'
+             'Темы, комментарии, профили.<br>'
+             'Без лишнего.'
              '</div></div>')
-
-    side += ('<div class="box"><div class="box-title">Реклама</div>'
-             '<div class="box-body center muted">'
-             '<div style="border:1px dashed #A89A78;padding:12px 4px;font-size:12px">'
-             'Здесь могла быть<br>ваша реклама<br>'
-             '<b>8 (095) 123-45-67</b></div></div></div>')
 
     year = datetime.now().year
     return f"""<!DOCTYPE html>
@@ -457,7 +481,6 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=880">
-<meta name="generator" content="SLDengine 0.9.3">
 <title>{esc(title)} — СЛД</title>
 <style>{CSS}</style>
 </head>
@@ -465,13 +488,12 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
 <div class="wrap">
 
   <div class="head">
-    <div class="head-top">
-      <div class="head-right">{head_right}</div>
-      <a class="logo" href="/">С&nbsp;Л&nbsp;Д</a>
-      <div class="tagline">Сообщество. Люди. Дискуссии. — с 2004 года</div>
-    </div>
-    <div class="nav">{nav_html}</div>
+    <a class="logo" href="/">СЛД</a>
+    <div class="tagline">соцсеть и форум</div>
+    <div class="right">{head_right}</div>
+    <div class="clear"></div>
   </div>
+  <div class="nav">{nav_html}</div>
 
   <div class="main">
     <div class="cols">
@@ -481,15 +503,10 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
   </div>
 
   <div class="foot">
-    <div class="right">Вы посетитель №<span class="counter">{datetime.now().strftime('%H%M%S')}</span><br>
-      &copy; 2004&ndash;{year} СЛД. Все права защищены.</div>
-    <div class="left">
-      <b>СЛД</b> — старая добрая сеть.<br>
-      Оптимально смотреть в <i>Internet Explorer 5.5</i> или <i>Netscape</i>, разрешение 1024&times;768.<br>
-      При использовании материалов ссылка на сайт обязательна.
+    <div class="clear">
+      &copy; {year} СЛД. Все права защищены.
+      &nbsp;·&nbsp; <a href="/">На главную</a>
     </div>
-    <div class="clear"></div>
-    <div class="old-note">Сайт работает на SLDengine 0.9.3 (c) 2004—2008. Хостинг: sld.ru. Без JavaScript вы всё равно всё увидите.</div>
   </div>
 
 </div>
@@ -498,7 +515,7 @@ def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str
 
 
 # ---------------------------------------------------------------------------
-# Помощники рендера
+# Рендер постов
 # ---------------------------------------------------------------------------
 
 def render_posts(posts: list, me: Optional[dict], comment_counts: dict,
@@ -525,10 +542,10 @@ def render_posts(posts: list, me: Optional[dict], comment_counts: dict,
             actions.append(f'<a href="/posts/{pid}/edit">редактировать</a>')
             actions.append(
                 f'<form method="post" action="/posts/{pid}/delete" '
-                f'onsubmit="return confirm(\'Удалить запись?\')" style="display:inline">'
+                f'onsubmit="return confirm(\'Удалить запись?\')">'
                 f'<button type="submit">удалить</button></form>'
             )
-        actions_html = (" · ".join(actions)) if actions else ""
+        actions_html = " · ".join(actions)
 
         out.append(f"""<div class="post">
   {avatar_html(uname, u.get("avatar"), 50)}
@@ -538,7 +555,7 @@ def render_posts(posts: list, me: Optional[dict], comment_counts: dict,
     <div class="ptext">{content}</div>
     <div class="pacts">
       <a href="/posts/{pid}">{cnt} {esc(plural(cnt, "комментарий", "комментария", "комментариев"))}</a>
-      {(' · ' + actions_html) if actions_html else ''}
+      {(' &nbsp;·&nbsp; ' + actions_html) if actions_html else ''}
     </div>
   </div>
 </div>""")
@@ -570,7 +587,7 @@ def fetch_posts(limit: int = 50, user_id: Optional[str] = None) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Маршруты: главная
+# Главная
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
@@ -596,7 +613,7 @@ def index(request: Request, msg: str = "", err: str = ""):
   <div class="box-body">
     <form method="post" action="/posts">
       <textarea name="content" rows="5" maxlength="{POST_MAX}"
-        placeholder="Расскажите что-нибудь. Темы длиннее {POST_MAX} символов не принимаются."></textarea>
+        placeholder="Расскажите что-нибудь..."></textarea>
       <div style="margin-top:7px">
         <button type="submit">Отправить</button>
         <span class="hint" style="margin-left:10px">не более {POST_MAX} символов</span>
@@ -624,13 +641,13 @@ def index(request: Request, msg: str = "", err: str = ""):
 # Регистрация / вход / выход
 # ---------------------------------------------------------------------------
 
-def _auth_form(action: str, title: str, username: str = "") -> str:
+def _auth_form(action: str, username: str = "") -> str:
     if action == "/register":
         return f"""
 <form method="post" action="/register">
   <div class="field"><label>Имя пользователя</label>
     <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus></div>
-  <div class="hint" style="margin:-4px 0 8px">3&ndash;20 символов: латиница, цифры, подчёркивание.</div>
+  <div class="hint" style="margin:-4px 0 9px">3&ndash;20 символов: латиница, цифры, подчёркивание.</div>
   <div class="field"><label>Пароль</label>
     <input type="password" name="password"></div>
   <div class="field"><label>Пароль ещё раз</label>
@@ -650,7 +667,7 @@ def _auth_form(action: str, title: str, username: str = "") -> str:
 def _auth_page(title: str, action: str, err: str = "", username: str = "") -> str:
     alert = f'<div class="err">{esc(err)}</div>' if err else ""
     inner = f'<div class="box"><div class="box-title">{esc(title)}</div>' \
-            f'<div class="box-body">{alert}{_auth_form(action, title, username)}</div></div>'
+            f'<div class="box-body">{alert}{_auth_form(action, username)}</div></div>'
     return layout(title, None, inner)
 
 
@@ -752,7 +769,7 @@ def logout(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Темы (посты)
+# Темы
 # ---------------------------------------------------------------------------
 
 @app.post("/posts")
@@ -768,10 +785,8 @@ def create_post(request: Request, content: str = Form("")):
         content = content[:POST_MAX]
 
     try:
-        sb.table("posts").insert({
-            "user_id": me["id"], "content": content,
-        }).execute()
-    except Exception as e:
+        sb.table("posts").insert({"user_id": me["id"], "content": content}).execute()
+    except Exception:
         return RedirectResponse("/?err=Не+удалось+сохранить", status_code=303)
 
     return RedirectResponse("/?msg=Тема+опубликована", status_code=303)
@@ -807,17 +822,14 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
     except Exception:
         comments = []
 
-    # Заголовок темы
     post_actions = ""
     if me and p.get("user_id") == me["id"]:
         post_actions = (
-            f'<div style="margin-top:6px;font-size:12px">'
+            f'<div style="margin-top:6px;font-size:11px">'
             f'<a href="/posts/{post_id}/edit">редактировать</a> · '
             f'<form method="post" action="/posts/{post_id}/delete" '
             f'onsubmit="return confirm(\'Удалить тему?\')" style="display:inline">'
-            f'<button type="submit" style="background:none;border:none;padding:0;'
-            f'color:#000099;text-decoration:underline;cursor:pointer;'
-            f'font:12px \'Times New Roman\',serif">удалить</button></form></div>'
+            f'<button type="submit">удалить</button></form></div>'
         )
 
     post_box = f"""<div class="box">
@@ -833,7 +845,6 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
   </div>
 </div>"""
 
-    # Комментарии
     items = []
     for c in comments:
         cu = c.get("users") or {}
@@ -845,9 +856,7 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
             del_btn = (
                 f' · <form method="post" action="/comments/{c["id"]}/delete" '
                 f'onsubmit="return confirm(\'Удалить комментарий?\')" style="display:inline">'
-                f'<button type="submit" style="background:none;border:none;padding:0;'
-                f'color:#000099;text-decoration:underline;cursor:pointer;'
-                f'font:12px \'Times New Roman\',serif">удалить</button></form>'
+                f'<button type="submit">удалить</button></form>'
             )
         items.append(f"""<div class="comment">
   {avatar_html(cname, cu.get("avatar"), 40)}
@@ -855,18 +864,14 @@ def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
     <div><span class="pname"><a href="/u/{esc(cname)}">{esc(cname)}</a></span>
       <span class="pdate">· {esc(fmt_dt(c.get('created_at')))}</span></div>
     <div class="ptext">{esc(c.get('content', ''))}</div>
-    <div class="pacts" style="border:none;padding-top:2px;margin-top:4px">
+    <div class="pacts" style="border:none;padding-top:2px;margin-top:3px">
       <a href="#c{c['id']}" id="c{c['id']}">#{c['id']}</a>{del_btn}
     </div>
   </div>
 </div>""")
 
-    if items:
-        comments_html = "".join(items)
-    else:
-        comments_html = '<div class="box-body muted">Комментариев пока нет.</div>'
+    comments_html = "".join(items) if items else '<div class="box-body muted">Комментариев пока нет.</div>'
 
-    # Форма комментария
     if me:
         form_html = f"""<div class="box">
   <div class="box-title">Ваш комментарий</div>
@@ -993,7 +998,6 @@ def comment_create(request: Request, post_id: int, content: str = Form("")):
     if len(content) > COMMENT_MAX:
         content = content[:COMMENT_MAX]
 
-    # убедимся, что тема есть
     exists = (sb.table("posts").select("id").eq("id", post_id)
               .limit(1).execute().data)
     if not exists:
@@ -1049,7 +1053,8 @@ def _profile_fields_html(u: dict) -> str:
         else:
             v_html = esc(v)
         out.append(f'<tr><td class="k">{esc(k)}:</td><td>{v_html}</td></tr>')
-    return "".join(out) if out else '<tr><td colspan="2" class="muted">Информация не заполнена.</td></tr>'
+    return "".join(out) if out else \
+        '<tr><td colspan="2" class="muted">Информация не заполнена.</td></tr>'
 
 
 @app.get("/u/{username}", response_class=HTMLResponse)
@@ -1149,12 +1154,12 @@ def settings_get(request: Request, msg: str = "", err: str = ""):
       <div style="display:flex;gap:14px;align-items:flex-start;margin-bottom:10px">
         <div>{avatar_html(me["username"], me.get("avatar"), 120)}</div>
         <div class="muted" style="flex:1">
-          Загрузите фотографию (JPEG, PNG или GIF, не больше 150 КБ).<br>
+          JPEG, PNG или GIF. Фото автоматически сжимается
+          до 512&times;512 и веса не более 150 КБ.<br>
           <input type="file" name="avatar" accept="image/*" style="margin-top:6px">
-          <div class="hint">Чтобы удалить текущую фотографию, поставьте галочку ниже
-            и сохраните профиль.</div>
-          <label style="display:block;margin-top:5px">
-            <input type="checkbox" name="avatar_remove" value="1"> удалить фотографию
+          <label style="display:block;margin-top:6px">
+            <input type="checkbox" name="avatar_remove" value="1">
+            удалить текущую фотографию
           </label>
         </div>
       </div>
@@ -1176,8 +1181,8 @@ def settings_get(request: Request, msg: str = "", err: str = ""):
                value="{esc(me.get('site') or '')}"
                placeholder="http://..."></div>
       <div class="field"><label>О себе</label>
-        <textarea name="about" rows="7" maxlength="2000"
-          placeholder="Пара слов о себе. Не более 2000 символов.">{esc(me.get('about') or '')}</textarea></div>
+        <textarea name="about" rows="7" maxlength="{ABOUT_MAX}"
+          placeholder="Пара слов о себе...">{esc(me.get('about') or '')}</textarea></div>
 
       <div style="margin-top:10px">
         <button type="submit">Сохранить</button>
@@ -1220,31 +1225,31 @@ async def settings_post(
         return RedirectResponse("/login", status_code=303)
 
     update = {
-        "status": (status.strip()[:200] or None),
-        "city": (city.strip()[:100] or None),
-        "about": (about.strip()[:2000] or None),
-        "site": (site.strip()[:200] or None),
+        "status":   (status.strip()[:200] or None),
+        "city":     (city.strip()[:100] or None),
+        "about":    (about.strip()[:ABOUT_MAX] or None),
+        "site":     (site.strip()[:200] or None),
         "birthday": (birthday.strip()[:20] or None),
     }
 
     if avatar_remove:
         update["avatar"] = None
     elif avatar and avatar.filename:
-        data = await avatar.read()
-        if len(data) == 0:
+        raw = await avatar.read()
+        if not raw:
             return RedirectResponse("/settings?err=Пустой+файл", status_code=303)
-        if len(data) > AVATAR_MAX:
+        if len(raw) > AVATAR_UPLOAD_MAX:
+            return RedirectResponse("/settings?err=Файл+слишком+большой", status_code=303)
+
+        data_url = process_avatar(raw)
+        if not data_url:
             return RedirectResponse(
-                "/settings?err=Файл+больше+150+КБ", status_code=303)
-        mime = (avatar.content_type or "").lower()
-        if not mime.startswith("image/"):
-            return RedirectResponse("/settings?err=Нужно+изображение", status_code=303)
-        b64 = base64.b64encode(data).decode("ascii")
-        update["avatar"] = f"data:{mime};base64,{b64}"
+                "/settings?err=Не+удалось+обработать+изображение", status_code=303)
+        update["avatar"] = data_url
 
     try:
         sb.table("users").update(update).eq("id", me["id"]).execute()
-    except Exception as e:
+    except Exception:
         return RedirectResponse("/settings?err=Не+удалось+сохранить", status_code=303)
 
     return RedirectResponse("/settings?msg=Профиль+сохранён", status_code=303)
@@ -1270,7 +1275,6 @@ def settings_password(request: Request,
         "password_hash": hash_password(new_password),
     }).eq("id", me["id"]).execute()
 
-    # Разлогиним все сессии, кроме текущей
     token = request.cookies.get(SESSION_COOKIE)
     try:
         sb.table("sessions").delete().eq("user_id", me["id"]).neq("token", token).execute()
@@ -1291,11 +1295,10 @@ def people(request: Request):
         users = (sb.table("users")
                  .select("id,username,avatar,city,status,created_at")
                  .order("created_at", desc=True).limit(200).execute().data) or []
+        db_err = ""
     except Exception as e:
         users = []
         db_err = str(e)
-    else:
-        db_err = ""
 
     items = []
     for u in users:
