@@ -12,3 +12,4 @@ supabase
 pillow
 psycopg2-binary
 pyjwt
+beautifulsoup4
