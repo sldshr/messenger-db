@@ -1,1685 +1,1392 @@
-# -*- coding: utf-8 -*-
 """
-СЛД — форум-соцсеть. Один файл.
-Регистрация, вход, профиль с фото, темы, комментарии, поиск.
-БД — Supabase (service_role).
+СЛД — FastAPI + Supabase backend (всё в одном файле, включая фронтенд).
 
-Запуск:
-    export SUPABASE_URL=...
-    export SUPABASE_KEY=...
-    uvicorn main:app --reload --port 8000
+Переменные окружения:
+    SUPABASE_URL  — Project URL
+    SUPABASE_KEY  — service_role key (secret)
+    JWT_SECRET    — (опционально) секрет для подписи сессионных токенов
 """
 
-import os
 import io
-import re
-import html
-import base64
-import hashlib
+import os
+import uuid
 import secrets
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, List
 
-from fastapi import FastAPI, Request, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
-from supabase import create_client
+import httpx
+import jwt
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+from supabase import create_client, Client
 from PIL import Image
 
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("sld")
 
-# ===========================================================================
-# Конфигурация
-# ===========================================================================
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+JWT_SECRET   = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_ALG      = "HS256"
+COOKIE_NAME  = "sld_token"
+COOKIE_DAYS  = 30
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Не заданы SUPABASE_URL и/или SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-SESSION_COOKIE = "sld_sid"
-SESSION_DAYS = 30
-
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
-POST_MAX = 5000
-COMMENT_MAX = 2000
-ABOUT_MAX = 2000
-
-AVATAR_UPLOAD_MAX = 10 * 1024 * 1024
-AVATAR_TARGET_BYTES = 150 * 1024
-AVATAR_MAX_SIDE = 512
-
-app = FastAPI(title="СЛД", docs_url=None, redoc_url=None)
+app = FastAPI(title="СЛД", docs_url="/api/docs", redoc_url=None)
 
 
-# ===========================================================================
-# Базовые утилиты
-# ===========================================================================
-
-def esc(v: Any) -> str:
-    return html.escape("" if v is None else str(v), quote=True)
-
-
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    iters = 120_000
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                             salt.encode("utf-8"), iters)
-    return f"pbkdf2_sha256${iters}${salt}${dk.hex()}"
+# --------------------------------------------------------------------------- #
+# Auth helpers
+# --------------------------------------------------------------------------- #
+def make_token(user_id: str, username: str) -> str:
+    return jwt.encode(
+        {"sub": user_id, "username": username,
+         "exp": datetime.utcnow() + timedelta(days=COOKIE_DAYS)},
+        JWT_SECRET, algorithm=JWT_ALG,
+    )
 
 
-def verify_password(password: str, stored: str) -> bool:
+def decode_token(token: str) -> Optional[dict]:
     try:
-        algo, iters, salt, hexhash = stored.split("$")
-        if algo != "pbkdf2_sha256":
-            return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                                 salt.encode("utf-8"), int(iters))
-        return secrets.compare_digest(dk.hex(), hexhash)
-    except Exception:
-        return False
-
-
-def parse_dt(value: Any) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        s = str(value).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         return None
 
 
-MONTHS = ["янв", "фев", "мар", "апр", "мая", "июн",
-          "июл", "авг", "сен", "окт", "ноя", "дек"]
-
-
-def fmt_dt(value: Any) -> str:
-    dt = parse_dt(value)
-    if not dt:
-        return ""
-    dt = dt.astimezone()
-    now = datetime.now(timezone.utc).astimezone()
-    if dt.date() == now.date():
-        return f"сегодня, {dt:%H:%M}"
-    if (now.date() - dt.date()).days == 1:
-        return f"вчера, {dt:%H:%M}"
-    return f"{dt.day} {MONTHS[dt.month - 1]} {dt.year}"
-
-
-def fmt_iso(value: Any) -> str:
-    dt = parse_dt(value)
-    return dt.strftime("%Y-%m-%d %H:%M") if dt else ""
-
-
-def plural(n: int, one: str, few: str, many: str) -> str:
-    n = abs(n) % 100
-    if 11 <= n <= 19:
-        return many
-    n %= 10
-    if n == 1:
-        return one
-    if 2 <= n <= 4:
-        return few
-    return many
-
-
-def avatar_color(name: str) -> str:
-    h = int(hashlib.md5((name or "?").encode("utf-8")).hexdigest()[:6], 16)
-    r = 90 + (h & 0x5F)
-    g = 80 + ((h >> 8) & 0x5F)
-    b = 70 + ((h >> 16) & 0x4F)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def avatar_html(username: str, avatar: Optional[str], size: int = 40) -> str:
-    if avatar:
-        return (f'<img class="av" src="{esc(avatar)}" '
-                f'width="{size}" height="{size}" alt="" loading="lazy">')
-    letter = esc((username or "?")[0].upper())
-    color = avatar_color(username or "?")
-    return (f'<div class="av av-letter" style="background:{color};'
-            f'width:{size}px;height:{size}px;'
-            f'font-size:{int(size * 0.42)}px">{letter}</div>')
-
-
-def process_avatar(raw: bytes) -> Optional[str]:
-    """Ресайз до 512 по длинной стороне и сжатие JPEG до 150 КБ."""
-    try:
-        img = Image.open(io.BytesIO(raw))
-        img.load()
-    except Exception:
+def current_user(request: Request) -> Optional[dict]:
+    tok = request.cookies.get(COOKIE_NAME)
+    if not tok:
         return None
+    payload = decode_token(tok)
+    if not payload:
+        return None
+    return {"id": payload["sub"], "username": payload["username"]}
 
+
+def require_user(user: Optional[dict] = Depends(current_user)) -> dict:
+    if not user:
+        raise HTTPException(401, "Не авторизован")
+    return user
+
+
+def set_auth_cookie(response: Response, token: str):
+    response.set_cookie(
+        COOKIE_NAME, token,
+        max_age=COOKIE_DAYS * 24 * 3600,
+        httponly=True, samesite="lax", secure=False, path="/",
+    )
+
+
+def clear_auth_cookie(response: Response):
+    response.delete_cookie(COOKIE_NAME, path="/")
+
+
+# --------------------------------------------------------------------------- #
+# Supabase auth (через REST, чтобы использовать service role)
+# --------------------------------------------------------------------------- #
+AUTH_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+async def sb_signup(email: str, password: str) -> dict:
+    """Создать пользователя (email подтверждён автоматически)."""
+    async with httpx.AsyncClient(timeout=15) as cx:
+        r = await cx.post(f"{SUPABASE_URL}/auth/v1/admin/users",
+                          headers=AUTH_HEADERS,
+                          json={"email": email, "password": password,
+                                "email_confirm": True})
+        if r.status_code >= 400:
+            try:
+                msg = r.json().get("msg") or r.json().get("message") or r.text
+            except Exception:
+                msg = r.text
+            raise HTTPException(400, f"Ошибка регистрации: {msg}")
+        return r.json()
+
+
+async def sb_login(email: str, password: str) -> dict:
+    """Проверить пароль через токен-эндпоинт."""
+    async with httpx.AsyncClient(timeout=15) as cx:
+        r = await cx.post(
+            f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+            headers={"apikey": SUPABASE_KEY, "Content-Type": "application/json"},
+            json={"email": email, "password": password},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(400, "Неверное имя пользователя или пароль")
+        return r.json()
+
+
+# --------------------------------------------------------------------------- #
+# Image compression
+# --------------------------------------------------------------------------- #
+def compress_image(data: bytes, max_dim: int = 512, max_size: int = 150 * 1024):
+    """
+    Сжимает картинку до max_dim по длинной стороне и <= max_size байт.
+    Пытается AVIF → WebP → JPEG. Возвращает (bytes, mime, ext).
+    """
+    img = Image.open(io.BytesIO(data))
     if img.mode in ("RGBA", "LA", "P"):
-        img = img.convert("RGBA")
-        bg = Image.new("RGB", img.size, (24, 21, 18))  # тёмный фон — под тему
-        bg.paste(img, mask=img.split()[-1])
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
         img = bg
     else:
         img = img.convert("RGB")
 
-    img.thumbnail((AVATAR_MAX_SIDE, AVATAR_MAX_SIDE), Image.LANCZOS)
+    img.thumbnail((max_dim, max_dim), Image.LANCZOS)
 
-    def encode(im: Image.Image, q: int) -> bytes:
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
-        return buf.getvalue()
+    candidates = [("AVIF", "image/avif", "avif"),
+                  ("WEBP", "image/webp", "webp"),
+                  ("JPEG", "image/jpeg", "jpg")]
 
-    for q in (88, 82, 76, 70, 64, 58, 52, 46, 40, 34, 28):
-        data = encode(img, q)
-        if len(data) <= AVATAR_TARGET_BYTES:
-            return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    for fmt, mime, ext in candidates:
+        try:
+            for q in (80, 70, 60, 50, 40, 30):
+                buf = io.BytesIO()
+                img.save(buf, format=fmt, quality=q, method=4 if fmt == "AVIF" else 6)
+                if buf.tell() <= max_size:
+                    return buf.getvalue(), mime, ext
+        except Exception as e:
+            log.warning("format %s failed: %s", fmt, e)
+            continue
 
-    w, h = img.size
-    for scale in (0.85, 0.7, 0.6, 0.5, 0.4, 0.3):
-        small = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
-                           Image.LANCZOS)
-        data = encode(small, 70)
-        if len(data) <= AVATAR_TARGET_BYTES:
-            return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
-
-    data = encode(img.resize((128, 128), Image.LANCZOS), 55)
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
-
-
-# ===========================================================================
-# Иконки (inline SVG)
-# ===========================================================================
-
-_ICONS = {
-    "logo": '<path d="M12 3l2.7 5.7 6.3.9-4.6 4.4 1.1 6.2L12 17.3 6.5 20.2l1.1-6.2L3 9.6l6.3-.9L12 3z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
-    "feed": '<path d="M4 5h16M4 10h16M4 15h16M4 20h11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
-    "users": '<circle cx="9" cy="8" r="3.2" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M3.5 19.5c.3-3 2.7-5 5.5-5s5.2 2 5.5 5" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><circle cx="17" cy="9" r="2.3" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M14.5 18c.3-1.9 1.3-3 2.5-3s2.2 1.1 2.5 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/>',
-    "user": '<circle cx="12" cy="8" r="3.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M5 20c.5-3.5 3.5-6 7-6s6.5 2.5 7 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/>',
-    "cog": '<circle cx="12" cy="12" r="2.8" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 3v2.6M12 18.4V21M3 12h2.6M18.4 12H21M5.6 5.6l1.9 1.9M16.5 16.5l1.9 1.9M5.6 18.4l1.9-1.9M16.5 7.5l1.9-1.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
-    "logout": '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M10 12h10m0 0l-3-3m3 3l-3 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "login": '<path d="M9 4h9a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M14 12H4m0 0l3-3m-3 3l3 3" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "signup": '<circle cx="10" cy="8" r="3.3" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M4 20c.4-3.3 3-5.7 6-5.7s5.6 2.4 6 5.7" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round"/><path d="M18 8v6M15 11h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
-    "edit": '<path d="M4 20h4l10-10-4-4L4 16v4z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M14 6l4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
-    "trash": '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "comment": '<path d="M4 5h16v11H8l-4 4V5z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
-    "send": '<path d="M3 12l18-8-6 18-3-7-9-3z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
-    "plus": '<path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
-    "search": '<circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M16 16l4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
-    "back": '<path d="M20 12H4m0 0l6-6m-6 6l6 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "next": '<path d="M4 12h16m0 0l-6-6m6 6l-6 6" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "clock": '<circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>',
-    "hash": '<path d="M5 9h14M5 15h14M10 4l-2 16M16 4l-2 16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" fill="none"/>',
-    "file": '<path d="M6 3h8l4 4v14H6z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M14 3v4h4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
-    "alert": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M12 7v6M12 16.5v.5" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
-    "check": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7" fill="none"/><path d="M8 12.5l3 3 5-6" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "image": '<rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/><circle cx="9" cy="10" r="1.7" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 18l5-5 4 4 3-3 4 4" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    "home": '<path d="M4 11l8-7 8 7v9H4z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><path d="M10 20v-5h4v5" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/>',
-    "tag": '<path d="M3 12l9-9h9v9l-9 9z" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linejoin="round"/><circle cx="16" cy="8" r="1.6" stroke="currentColor" stroke-width="1.5" fill="none"/>',
-}
+    # fallback: любой JPEG, даже если чуть больше
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=35, optimize=True)
+    return buf.getvalue(), "image/jpeg", "jpg"
 
 
-def ic(name: str, size: int = 16, cls: str = "") -> str:
-    p = _ICONS.get(name, "")
-    c = f"ic {cls}".strip()
-    return (f"<svg class='{c}' width='{size}' height='{size}' "
-            f"viewBox='0 0 24 24' fill='none' aria-hidden='true'>{p}</svg>")
+# --------------------------------------------------------------------------- #
+# Pydantic models
+# --------------------------------------------------------------------------- #
+class AuthIn(BaseModel):
+    username: str = Field(min_length=2, max_length=32)
+    password: str = Field(min_length=6, max_length=128)
 
 
-# ===========================================================================
-# Сессии
-# ===========================================================================
+class PostIn(BaseModel):
+    title: str = ""
+    text: str = ""
+    tags: List[str] = []
+    font: str = "font-serif-custom"
+    image_urls: List[str] = []
 
-def create_session(user_id: str) -> str:
-    token = secrets.token_urlsafe(32)
-    expires = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
-    sb.table("sessions").insert({
-        "token": token, "user_id": user_id,
-        "expires_at": expires.isoformat(),
+
+class ProfileIn(BaseModel):
+    name: str = ""
+    avatar: str = "^_^"
+    avatar_url: str = ""
+    bio: str = ""
+    status: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Auth endpoints
+# --------------------------------------------------------------------------- #
+def _email(username: str) -> str:
+    return f"{username.lower()}@sld.local"
+
+
+@app.post("/api/auth/signup")
+async def signup(body: AuthIn, response: Response):
+    uname = body.username.strip()
+    if not uname.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(400, "Только буквы, цифры, _ и -")
+
+    # Проверка занятости username
+    existing = supabase.table("profiles").select("id").eq("username", uname).execute()
+    if existing.data:
+        raise HTTPException(400, "Имя занято")
+
+    try:
+        user = await sb_signup(_email(uname), body.password)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Ошибка: {e}")
+
+    uid = user.get("id") or user.get("user", {}).get("id")
+    if not uid:
+        raise HTTPException(500, "Не удалось создать пользователя")
+
+    # Создаём профиль
+    supabase.table("profiles").insert({
+        "id": uid, "username": uname, "name": uname, "avatar": "^_^",
+        "bio": "", "status": "", "avatar_url": ""
     }).execute()
-    return token
+
+    set_auth_cookie(response, make_token(uid, uname))
+    return {"ok": True, "id": uid, "username": uname}
 
 
-def set_session_cookie(resp: RedirectResponse, token: str) -> None:
-    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_DAYS * 24 * 3600,
-                    httponly=True, samesite="lax", path="/")
-
-
-def current_user(request: Request) -> Optional[dict]:
-    token = request.cookies.get(SESSION_COOKIE)
-    if not token:
-        return None
+@app.post("/api/auth/login")
+async def login(body: AuthIn, response: Response):
+    uname = body.username.strip()
     try:
-        rows = (sb.table("sessions").select("token,user_id,expires_at")
-                .eq("token", token).limit(1).execute().data)
-    except Exception:
-        return None
-    if not rows:
-        return None
-    exp = parse_dt(rows[0].get("expires_at"))
-    if not exp or exp < datetime.now(timezone.utc):
-        try:
-            sb.table("sessions").delete().eq("token", token).execute()
-        except Exception:
-            pass
-        return None
-    try:
-        u = (sb.table("users").select("*")
-             .eq("id", rows[0]["user_id"]).limit(1).execute().data)
-    except Exception:
-        return None
-    return u[0] if u else None
+        result = await sb_login(_email(uname), body.password)
+    except HTTPException:
+        raise
+
+    uid = result.get("user", {}).get("id")
+    if not uid:
+        raise HTTPException(500, "Не удалось получить профиль")
+
+    # Если профиля нет — создаём (на случай ручного создания в Supabase)
+    prof = supabase.table("profiles").select("*").eq("id", uid).execute()
+    if not prof.data:
+        supabase.table("profiles").insert({
+            "id": uid, "username": uname, "name": uname, "avatar": "^_^",
+        }).execute()
+
+    set_auth_cookie(response, make_token(uid, uname))
+    return {"ok": True, "id": uid, "username": uname}
 
 
-def destroy_session(request: Request) -> None:
-    token = request.cookies.get(SESSION_COOKIE)
-    if token:
-        try:
-            sb.table("sessions").delete().eq("token", token).execute()
-        except Exception:
-            pass
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    clear_auth_cookie(response)
+    return {"ok": True}
 
 
-# ===========================================================================
-# Стиль
-# ===========================================================================
-
-CSS = """
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#131110;--bg-2:#191614;--surface:#1e1a17;--surface-hi:#26211c;
-  --border:#302922;--border-2:#40372e;
-  --text:#ebe4d8;--dim:#9c9183;--mute:#6b6156;
-  --accent:#e0a04a;--accent-hi:#f2bb6b;--accent-bg:rgba(224,160,74,.10);
-  --danger:#d0766a;--ok:#88b86e;
-  --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
-  --radius:6px;
-}
-html,body{height:100%}
-body{
-  font-family:var(--sans);font-size:14px;line-height:1.55;
-  color:var(--text);background:var(--bg);
-  -webkit-font-smoothing:antialiased;
-}
-a{color:var(--accent);text-decoration:none}
-a:hover{color:var(--accent-hi)}
-svg{display:block}
-button{font-family:inherit;cursor:pointer}
-kbd{
-  display:inline-block;padding:1px 6px;border-radius:3px;
-  background:var(--surface-hi);border:1px solid var(--border-2);
-  font-family:var(--mono);font-size:10px;color:var(--text);
-  box-shadow:0 1px 0 var(--border-2);
-}
-
-/* Topbar */
-.topbar{
-  background:linear-gradient(180deg,#1c1815,#141110);
-  border-bottom:1px solid var(--border);
-  position:sticky;top:0;z-index:50;
-}
-.topbar-in{
-  max-width:1120px;margin:0 auto;height:56px;
-  display:flex;align-items:center;gap:20px;padding:0 20px;
-}
-.brand{
-  display:flex;align-items:center;gap:9px;
-  font-family:var(--mono);font-weight:700;font-size:16px;
-  letter-spacing:2.5px;color:var(--text);flex:none;
-}
-.brand:hover{color:var(--accent-hi)}
-.brand svg{color:var(--accent)}
-.topnav{display:flex;gap:3px;align-items:center}
-.topnav a{
-  display:flex;align-items:center;gap:7px;
-  padding:7px 12px;border-radius:5px;color:var(--dim);
-  font-size:13px;font-weight:500;transition:background .12s,color .12s;
-}
-.topnav a:hover{background:var(--surface);color:var(--text)}
-.topnav a.on{background:var(--accent-bg);color:var(--accent-hi)}
-.topnav a.on svg{color:var(--accent)}
-.topnav a svg{color:var(--mute)}
-.topnav a:hover svg{color:var(--text)}
-
-.userarea{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;flex:none}
-.userarea .who{
-  display:flex;align-items:center;gap:9px;
-  padding:4px 12px 4px 4px;border-radius:100px;
-  background:var(--surface);border:1px solid var(--border);
-  color:var(--text);
-}
-.userarea .who:hover{border-color:var(--border-2);color:var(--text)}
-.userarea .who .av{border-radius:50%}
-.userarea .who .uname{font-weight:600}
-.iconbtn{
-  display:flex;align-items:center;justify-content:center;
-  width:34px;height:34px;border-radius:6px;
-  color:var(--dim);background:transparent;
-  border:1px solid transparent;transition:all .12s;
-}
-.iconbtn:hover{background:var(--surface);color:var(--text);border-color:var(--border)}
-
-/* Layout */
-.wrap{max-width:1120px;margin:0 auto;padding:22px 20px 60px}
-.cols{display:grid;grid-template-columns:236px 1fr;gap:22px;align-items:start}
-.side{position:sticky;top:78px;display:flex;flex-direction:column;gap:14px}
-.content{min-width:0;display:flex;flex-direction:column;gap:14px}
-
-/* Sidebar */
-.side-block{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);overflow:hidden;
-}
-.side-title{
-  padding:9px 14px;font-family:var(--mono);font-size:10.5px;
-  letter-spacing:1.6px;text-transform:uppercase;
-  color:var(--mute);border-bottom:1px solid var(--border);
-  background:var(--bg-2);
-}
-.side-menu{display:flex;flex-direction:column;padding:6px}
-.side-menu a{
-  display:flex;align-items:center;gap:9px;
-  padding:8px 10px;border-radius:5px;
-  color:var(--dim);font-size:13px;transition:all .12s;
-}
-.side-menu a:hover{background:var(--surface-hi);color:var(--text)}
-.side-menu a.on{background:var(--accent-bg);color:var(--accent-hi)}
-.side-menu a svg{color:var(--mute);flex:none}
-.side-menu a.on svg{color:var(--accent)}
-.side-menu a:hover svg{color:var(--text)}
-
-/* Card */
-.card{
-  background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);overflow:hidden;
-}
-.card-head{
-  padding:12px 16px;border-bottom:1px solid var(--border);
-  display:flex;align-items:center;gap:10px;background:var(--bg-2);
-}
-.card-head .h-ic{color:var(--accent);flex:none}
-.card-head h2{
-  font-family:var(--mono);font-size:12.5px;font-weight:600;
-  letter-spacing:.6px;color:var(--text);
-}
-.card-head .h-count{
-  margin-left:auto;font-family:var(--mono);font-size:11px;
-  color:var(--mute);
-}
-.card-body{padding:16px}
-
-/* Buttons */
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:7px;
-  padding:8px 15px;border-radius:5px;
-  font-size:13px;font-weight:500;line-height:1;
-  background:var(--surface-hi);color:var(--text);
-  border:1px solid var(--border-2);transition:all .12s;
-}
-.btn:hover{background:#2e2822;border-color:#4e4338;color:var(--text)}
-.btn:active{transform:translateY(1px)}
-.btn-primary{
-  background:var(--accent);color:#1a1410;
-  border-color:var(--accent);font-weight:600;
-}
-.btn-primary:hover{background:var(--accent-hi);border-color:var(--accent-hi);color:#1a1410}
-.btn-ghost{background:transparent;border-color:var(--border);color:var(--dim)}
-.btn-ghost:hover{color:var(--text);border-color:var(--border-2);background:var(--surface)}
-.btn-sm{padding:5px 10px;font-size:12px}
-
-/* Forms */
-.field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
-.field label{font-size:12px;color:var(--dim);font-weight:500}
-.field input[type=text],.field input[type=password]{
-  padding:9px 12px;background:var(--bg-2);
-  border:1px solid var(--border-2);border-radius:5px;
-  color:var(--text);font-size:14px;transition:border-color .12s;
-}
-.field input:focus{outline:none;border-color:var(--accent);background:#1c1815}
-textarea{
-  width:100%;padding:11px 13px;background:var(--bg-2);
-  border:1px solid var(--border-2);border-radius:5px;
-  color:var(--text);font-size:14px;line-height:1.6;
-  resize:vertical;transition:border-color .12s;font-family:inherit;
-  min-height:80px;
-}
-textarea:focus{outline:none;border-color:var(--accent);background:#1c1815}
-textarea::placeholder,input::placeholder{color:var(--mute)}
-.hint{font-size:11px;color:var(--mute);font-family:var(--mono)}
-
-/* Alerts */
-.alert{
-  display:flex;align-items:flex-start;gap:10px;
-  padding:11px 14px;border-radius:var(--radius);
-  font-size:13px;border:1px solid;
-}
-.alert svg{flex:none;margin-top:1px}
-.alert-err{background:rgba(208,118,106,.08);border-color:rgba(208,118,106,.32);color:#e5a297}
-.alert-err svg{color:var(--danger)}
-.alert-ok{background:rgba(136,184,110,.08);border-color:rgba(136,184,110,.3);color:#b5d5a4}
-.alert-ok svg{color:var(--ok)}
-
-/* Avatar */
-.av{
-  display:block;border-radius:6px;object-fit:cover;
-  background:var(--surface-hi);flex:none;
-}
-.av-letter{
-  display:flex;align-items:center;justify-content:center;
-  color:#fff;font-weight:700;text-shadow:0 1px 1px rgba(0,0,0,.4);
-}
-
-/* Post */
-.post{padding:16px;border-bottom:1px solid var(--border);display:flex;gap:14px}
-.post:last-child{border-bottom:none}
-.post-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
-.post-head{display:flex;align-items:center;gap:9px;font-size:13px;flex-wrap:wrap}
-.post-author{font-weight:600;color:var(--text)}
-.post-author:hover{color:var(--accent-hi)}
-.post-time{
-  color:var(--mute);font-size:11px;font-family:var(--mono);
-  display:inline-flex;align-items:center;gap:4px;
-}
-.post-content{
-  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;
-  font-size:14px;line-height:1.62;
-}
-.post-actions{
-  display:flex;gap:4px;align-items:center;flex-wrap:wrap;
-  padding-top:10px;border-top:1px solid var(--border);
-}
-.post-actions a,.post-actions button{
-  display:inline-flex;align-items:center;gap:5px;
-  padding:4px 10px;border-radius:4px;
-  background:transparent;border:1px solid transparent;
-  color:var(--dim);font-size:12px;transition:all .12s;
-}
-.post-actions a:hover,.post-actions button:hover{
-  background:var(--surface-hi);color:var(--text);border-color:var(--border);
-}
-.post-actions svg{color:var(--mute);flex:none}
-.post-actions a:hover svg,.post-actions button:hover svg{color:var(--text)}
-.post-actions .danger:hover{color:#e5a297}
-.post-actions .danger:hover svg{color:var(--danger)}
-.post-actions form{display:inline;margin:0}
-
-/* Empty */
-.empty{
-  padding:48px 20px;text-align:center;color:var(--mute);
-  display:flex;flex-direction:column;align-items:center;gap:10px;
-}
-.empty svg{color:var(--border-2)}
-.empty .big{font-family:var(--mono);font-size:12.5px;letter-spacing:.5px}
-
-/* Breadcrumbs */
-.crumbs{
-  display:flex;align-items:center;gap:8px;font-size:12px;
-  font-family:var(--mono);color:var(--mute);
-}
-.crumbs a{color:var(--dim)}
-.crumbs a:hover{color:var(--accent)}
-.crumbs svg{color:var(--border-2);flex:none}
-
-/* Profile */
-.profile-head{display:flex;gap:20px;padding:20px}
-.profile-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
-.profile-name{
-  font-size:22px;font-weight:700;color:var(--text);
-  font-family:var(--mono);letter-spacing:-.3px;line-height:1.15;
-}
-.profile-status{
-  color:var(--dim);font-style:italic;margin:7px 0 12px;font-size:13px;
-}
-.info-list{display:flex;flex-direction:column;margin-top:2px}
-.info-row{
-  display:flex;gap:12px;padding:7px 0;font-size:13px;
-  border-bottom:1px dashed var(--border);
-}
-.info-row:last-child{border-bottom:none}
-.info-row .k{
-  color:var(--mute);font-family:var(--mono);font-size:10.5px;
-  letter-spacing:.6px;width:130px;flex:none;text-transform:uppercase;
-  padding-top:3px;
-}
-
-/* Mini user */
-.mini-user{display:flex;gap:11px;align-items:center;padding:13px 14px}
-.mini-user .uinfo{min-width:0;flex:1}
-.mini-user .uname{font-weight:600;color:var(--text);font-size:13px;display:block}
-.mini-user .uname:hover{color:var(--accent-hi)}
-.mini-user .umeta{font-size:11px;color:var(--mute);font-family:var(--mono);margin-top:2px}
-
-/* Comment */
-.comment{
-  display:flex;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border);
-}
-.comment:last-child{border-bottom:none}
-.comment-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
-.comment-text{
-  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;
-  font-size:13.5px;
-}
-
-/* Search */
-.searchbar{
-  display:flex;gap:10px;align-items:center;
-  padding:0 14px;background:var(--surface);
-  border:1px solid var(--border);border-radius:var(--radius);
-  transition:border-color .12s;
-}
-.searchbar:focus-within{border-color:var(--accent)}
-.searchbar .s-ic{color:var(--mute);flex:none}
-.searchbar input{
-  flex:1;background:transparent;border:none;color:var(--text);
-  font-size:14px;padding:12px 0;
-}
-.searchbar input:focus{outline:none}
-.searchbar .kbd-hint{font-family:var(--mono);font-size:10px;color:var(--mute)}
-
-/* Char counter */
-.cc{
-  font-family:var(--mono);font-size:11px;color:var(--mute);
-  text-align:right;margin-top:4px;transition:color .12s;
-}
-.cc.warn{color:var(--accent)}
-.cc.over{color:var(--danger)}
-
-/* Footer */
-.foot{
-  max-width:1120px;margin:0 auto;padding:22px 20px;
-  color:var(--mute);font-size:11.5px;font-family:var(--mono);
-  display:flex;justify-content:space-between;align-items:center;gap:16px;
-  border-top:1px solid var(--border);flex-wrap:wrap;
-}
-.foot a{color:var(--dim)}
-.foot a:hover{color:var(--accent)}
-
-@media (max-width:860px){
-  .cols{grid-template-columns:1fr}
-  .side{position:static}
-  .topbar-in{flex-wrap:wrap;height:auto;padding:10px 14px;gap:8px}
-  .userarea{margin-left:auto}
-  .topnav{order:3;width:100%;overflow-x:auto}
-  .wrap{padding:16px}
-  .profile-head{flex-direction:column;align-items:center;text-align:center}
-  .profile-head .info-list{text-align:left;width:100%}
-  .info-row .k{width:110px}
-}
-"""
-
-JS = """
-(function(){
-  // Ctrl/Cmd + Enter -> submit nearest form
-  document.addEventListener('keydown', function(e){
-    if((e.ctrlKey||e.metaKey) && e.key === 'Enter'){
-      var t = e.target;
-      if(t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')){
-        var f = t.closest('form');
-        if(f){
-          if(typeof f.requestSubmit === 'function') f.requestSubmit();
-          else f.submit();
-        }
-      }
-    }
-  });
-  // Char counters
-  document.querySelectorAll('textarea[data-max]').forEach(function(t){
-    var max = parseInt(t.dataset.max, 10);
-    if(!max) return;
-    var box = document.createElement('div');
-    box.className = 'cc';
-    function upd(){
-      var n = t.value.length;
-      box.textContent = n + ' / ' + max;
-      box.className = 'cc' + (n > max ? ' over' : (n > max * 0.9 ? ' warn' : ''));
-    }
-    t.addEventListener('input', upd);
-    t.parentNode.insertBefore(box, t.nextSibling);
-    upd();
-  });
-  // "/" -> focus search
-  document.addEventListener('keydown', function(e){
-    if(e.key === '/' && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)){
-      var s = document.querySelector('input[name="q"]');
-      if(s){ e.preventDefault(); s.focus(); s.select(); }
-    }
-  });
-})();
-"""
-
-
-# ===========================================================================
-# Каркас страницы
-# ===========================================================================
-
-def layout(title: str, user: Optional[dict], body: str, active: str = "") -> str:
-    # Top-right
-    if user:
-        un = esc(user["username"])
-        av = avatar_html(user["username"], user.get("avatar"), 26)
-        userarea = (
-            f'<a class="who" href="/u/{un}" title="Мой профиль">'
-            f'{av}<span class="uname">{un}</span></a>'
-            f'<a class="iconbtn" href="/settings" title="Настройки">{ic("cog", 18)}</a>'
-            f'<a class="iconbtn" href="/logout" title="Выход">{ic("logout", 18)}</a>'
-        )
-    else:
-        userarea = (
-            f'<a class="btn btn-sm btn-ghost" href="/login">{ic("login", 15)}<span>Вход</span></a>'
-            f'<a class="btn btn-sm btn-primary" href="/register">{ic("signup", 15)}<span>Регистрация</span></a>'
-        )
-
-    # Top nav
-    nav_items = [
-        ("/", "Лента", "feed", "feed"),
-        ("/people", "Участники", "users", "people"),
-    ]
-    if user:
-        nav_items.append((f"/u/{esc(user['username'])}", "Профиль", "user", "me"))
-
-    nav_html = "".join(
-        f'<a href="{h}"{" class=\'on\'" if k == active else ""}>{ic(icn, 16)}<span>{n}</span></a>'
-        for h, n, icn, k in nav_items
-    )
-
-    # Sidebar
-    side = ""
-
-    # Mini user card
-    if user:
-        un = esc(user["username"])
-        side += (
-            f'<div class="side-block"><div class="mini-user">'
-            f'{avatar_html(user["username"], user.get("avatar"), 44)}'
-            f'<div class="uinfo"><a class="uname" href="/u/{un}">{un}</a>'
-            f'<div class="umeta">{esc(fmt_dt(user.get("created_at")))}</div></div>'
-            f'</div></div>'
-        )
-
-    # Nav menu
-    menu_items = [("/", "Лента", "feed", "feed"),
-                  ("/people", "Участники", "users", "people")]
-    if user:
-        menu_items.append((f"/u/{esc(user['username'])}", "Моя страница", "user", "me"))
-        menu_items.append(("/settings", "Настройки", "cog", "settings"))
-
-    menu_html = "".join(
-        f'<a href="{h}"{" class=\'on\'" if k == active else ""}>{ic(icn, 16)}<span>{n}</span></a>'
-        for h, n, icn, k in menu_items
-    )
-    side += f'<div class="side-block"><div class="side-title">Навигация</div><div class="side-menu">{menu_html}</div></div>'
-
-    # Auth block if not logged in
+@app.get("/api/auth/me")
+async def me(user: Optional[dict] = Depends(current_user)):
     if not user:
-        side += (
-            '<div class="side-block"><div class="side-title">Вход</div>'
-            '<div style="padding:14px">'
-            '<form method="post" action="/login">'
-            '<div class="field"><label>Логин</label>'
-            '<input type="text" name="username" maxlength="20" style="width:100%"></div>'
-            '<div class="field"><label>Пароль</label>'
-            '<input type="password" name="password" style="width:100%"></div>'
-            f'<button class="btn btn-primary" type="submit" style="width:100%">{ic("login", 15)}<span>Войти</span></button>'
-            '</form></div></div>'
+        return {"authenticated": False}
+    return {"authenticated": True, "id": user["id"], "username": user["username"]}
+
+
+# --------------------------------------------------------------------------- #
+# Posts
+# --------------------------------------------------------------------------- #
+def _row_to_post(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "author": row["author_username"],
+        "author_id": row["author_id"],
+        "title": row.get("title") or "",
+        "text": row.get("text") or "",
+        "tags": row.get("tags") or [],
+        "font": row.get("font") or "font-serif-custom",
+        "images": row.get("image_urls") or [],
+        "timestamp": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@app.get("/api/posts")
+async def list_posts():
+    res = supabase.table("posts").select("*").order("created_at", desc=True).limit(500).execute()
+    return [_row_to_post(r) for r in (res.data or [])]
+
+
+@app.get("/api/posts/{post_id}")
+async def get_post(post_id: str):
+    res = supabase.table("posts").select("*").eq("id", post_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(404, "Пост не найден")
+    return _row_to_post(res.data[0])
+
+
+@app.post("/api/posts")
+async def create_post(body: PostIn, user: dict = Depends(require_user)):
+    row = {
+        "author_id": user["id"],
+        "author_username": user["username"],
+        "title": body.title.strip(),
+        "text": body.text,
+        "tags": [t.strip().lower() for t in body.tags if t.strip()],
+        "font": body.font,
+        "image_urls": body.image_urls,
+    }
+    res = supabase.table("posts").insert(row).execute()
+    return _row_to_post(res.data[0])
+
+
+@app.put("/api/posts/{post_id}")
+async def update_post(post_id: str, body: PostIn, user: dict = Depends(require_user)):
+    check = supabase.table("posts").select("author_id").eq("id", post_id).limit(1).execute()
+    if not check.data:
+        raise HTTPException(404, "Пост не найден")
+    if check.data[0]["author_id"] != user["id"]:
+        raise HTTPException(403, "Нет прав")
+
+    row = {
+        "title": body.title.strip(),
+        "text": body.text,
+        "tags": [t.strip().lower() for t in body.tags if t.strip()],
+        "font": body.font,
+        "image_urls": body.image_urls,
+    }
+    res = supabase.table("posts").update(row).eq("id", post_id).execute()
+    return _row_to_post(res.data[0])
+
+
+@app.delete("/api/posts/{post_id}")
+async def delete_post(post_id: str, user: dict = Depends(require_user)):
+    check = supabase.table("posts").select("author_id").eq("id", post_id).limit(1).execute()
+    if not check.data:
+        raise HTTPException(404, "Пост не найден")
+    if check.data[0]["author_id"] != user["id"]:
+        raise HTTPException(403, "Нет прав")
+    supabase.table("posts").delete().eq("id", post_id).execute()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Profiles
+# --------------------------------------------------------------------------- #
+@app.get("/api/profiles/{username}")
+async def get_profile(username: str):
+    res = supabase.table("profiles").select("*").eq("username", username).limit(1).execute()
+    if not res.data:
+        return {"username": username, "name": username, "avatar": "^_^",
+                "avatar_url": "", "bio": "", "status": ""}
+    p = res.data[0]
+    return {
+        "id": p["id"], "username": p["username"],
+        "name": p.get("name") or p["username"],
+        "avatar": p.get("avatar") or "^_^",
+        "avatar_url": p.get("avatar_url") or "",
+        "bio": p.get("bio") or "",
+        "status": p.get("status") or "",
+    }
+
+
+@app.get("/api/profiles")
+async def all_profiles():
+    res = supabase.table("profiles").select("*").execute()
+    out = {}
+    for p in (res.data or []):
+        out[p["username"]] = {
+            "name": p.get("name") or p["username"],
+            "avatar": p.get("avatar") or "^_^",
+            "avatar_url": p.get("avatar_url") or "",
+            "bio": p.get("bio") or "",
+            "status": p.get("status") or "",
+        }
+    return out
+
+
+@app.put("/api/profiles/me")
+async def update_my_profile(body: ProfileIn, user: dict = Depends(require_user)):
+    if len(body.avatar) > 5:
+        raise HTTPException(400, "Аватар до 5 символов")
+    if len(body.status) > 60:
+        raise HTTPException(400, "Статус до 60 символов")
+
+    upd = {
+        "name": body.name.strip() or user["username"],
+        "avatar": body.avatar or "^_^",
+        "avatar_url": body.avatar_url,
+        "bio": body.bio,
+        "status": body.status,
+    }
+    res = supabase.table("profiles").update(upd).eq("id", user["id"]).execute()
+    if not res.data:
+        upd["id"] = user["id"]
+        upd["username"] = user["username"]
+        supabase.table("profiles").insert(upd).execute()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Upload
+# --------------------------------------------------------------------------- #
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...), user: dict = Depends(require_user)):
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Пустой файл")
+
+    data, mime, ext = compress_image(raw)
+    key = f"{user['id']}/{uuid.uuid4().hex}.{ext}"
+
+    try:
+        supabase.storage.from_("media").upload(
+            key, data, {"content-type": mime, "upsert": "true"}
         )
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка загрузки: {e}")
 
-    # Shortcuts
-    side += (
-        '<div class="side-block"><div class="side-title">Горячие клавиши</div>'
-        '<div style="padding:10px 14px;font-size:12px;color:var(--dim);'
-        'display:flex;flex-direction:column;gap:8px">'
-        '<div><kbd>/</kbd> — поиск</div>'
-        '<div><kbd>Ctrl</kbd>+<kbd>Enter</kbd> — отправить</div>'
-        '</div></div>'
-    )
+    url = supabase.storage.from_("media").get_public_url(key)
+    return {"url": url, "size": len(data), "mime": mime}
 
-    # About
-    side += (
-        '<div class="side-block"><div class="side-title">О проекте</div>'
-        '<div style="padding:12px 14px;font-size:12px;color:var(--dim);line-height:1.55">'
-        'СЛД — небольшой форум. Темы, комментарии, профили. '
-        'Никакой рекламы и лишнего.'
-        '</div></div>'
-    )
 
-    year = datetime.now().year
-    return f"""<!DOCTYPE html>
-<html lang="ru">
+# --------------------------------------------------------------------------- #
+# Frontend
+# --------------------------------------------------------------------------- #
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="ru" class="light">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} — СЛД</title>
-<style>{CSS}</style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>СЛД</title>
+<meta name="description" content="СЛД — тексты, заметки и мысли.">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;700&family=Inter:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;1,400&family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;500;700&family=Caveat:wght@500;700&family=Montserrat:wght@400;500;600&family=Merriweather:ital,wght@0,300;0,400;1,300&display=swap');
+body { font-family:'Inter',sans-serif; }
+.font-sans-custom{font-family:'Inter',sans-serif}
+.font-serif-custom{font-family:'Lora',serif}
+.font-mono-custom{font-family:'Fira Code',monospace}
+.font-playfair{font-family:'Playfair Display',serif}
+.font-jetbrains{font-family:'JetBrains Mono',monospace}
+.font-caveat{font-family:'Caveat',cursive;font-size:1.35rem}
+.font-montserrat{font-family:'Montserrat',sans-serif}
+.font-merriweather{font-family:'Merriweather',serif}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:9999px}
+.dark ::-webkit-scrollbar-thumb{background:#334155}
+.no-scrollbar::-webkit-scrollbar{display:none}
+.no-scrollbar{-ms-overflow-style:none;scrollbar-width:none}
+.animate-fade-in{animation:fadeIn .25s cubic-bezier(.16,1,.3,1) forwards}
+.animate-pop-in{animation:popIn .2s cubic-bezier(.16,1,.3,1) forwards}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes popIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
+.spinner{width:44px;height:44px;border:3px solid rgba(148,163,184,.25);border-top-color:#3b82f6;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
 </head>
-<body>
+<body class="bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 antialiased transition-colors duration-200 flex flex-col min-h-screen pb-20 sm:pb-0">
 
-<div class="topbar"><div class="topbar-in">
-  <a class="brand" href="/">{ic("logo", 22)}<span>СЛД</span></a>
-  <nav class="topnav">{nav_html}</nav>
-  <div class="userarea">{userarea}</div>
-</div></div>
-
-<div class="wrap"><div class="cols">
-  <aside class="side">{side}</aside>
-  <main class="content">{body}</main>
-</div></div>
-
-<div class="foot">
-  <div>© {year} СЛД · форум</div>
-  <div><a href="/">Лента</a> · <a href="/people">Участники</a></div>
+<!-- Loading overlay -->
+<div id="loadingOverlay" class="fixed inset-0 bg-gray-50 dark:bg-gray-950 z-[300] flex flex-col items-center justify-center gap-4">
+  <div class="spinner"></div>
+  <div class="text-xs text-gray-400 font-medium tracking-wider">Загрузка СЛД…</div>
 </div>
 
-<script>{JS}</script>
+<div id="toast" class="fixed top-5 left-1/2 -translate-x-1/2 sm:top-auto sm:bottom-6 sm:left-auto sm:right-6 sm:translate-x-0 bg-gray-900/90 dark:bg-gray-100/90 backdrop-blur-md text-white dark:text-gray-900 px-5 py-3 rounded-2xl text-xs sm:text-sm font-medium opacity-0 pointer-events-none transition-all duration-300 z-[100] shadow-2xl">…</div>
+
+<!-- Image preview -->
+<div id="imagePreviewModal" class="fixed inset-0 bg-black/95 backdrop-blur-xl z-[100] flex-col hidden">
+  <div class="flex justify-between items-center p-3 sm:p-5 text-white bg-black/40">
+    <div class="flex gap-2">
+      <button onclick="zoomPreview(1.3)" class="p-2 bg-white/10 hover:bg-white/20 rounded-xl">＋</button>
+      <button onclick="zoomPreview(0.77)" class="p-2 bg-white/10 hover:bg-white/20 rounded-xl">−</button>
+      <button onclick="rotatePreview(-90)" class="p-2 bg-white/10 hover:bg-white/20 rounded-xl">↺</button>
+      <button onclick="rotatePreview(90)" class="p-2 bg-white/10 hover:bg-white/20 rounded-xl">↻</button>
+    </div>
+    <button onclick="closeImagePreview()" class="px-3 py-2 bg-red-500/80 hover:bg-red-500 rounded-xl text-sm font-medium">Закрыть</button>
+  </div>
+  <div class="flex-1 overflow-auto flex items-center justify-center p-4">
+    <img id="previewImage" class="max-h-full max-w-full object-contain select-none" draggable="false">
+  </div>
+</div>
+
+<!-- Auth modal -->
+<div id="authModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-[90] flex items-center justify-center p-4 hidden">
+  <div class="bg-white dark:bg-gray-900 rounded-3xl p-6 sm:p-8 max-w-sm w-full shadow-2xl border border-gray-100 dark:border-gray-800 relative animate-pop-in">
+    <button id="closeAuthModal" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-xl p-2">✕</button>
+    <h3 class="text-2xl font-semibold mb-1">Вход / Регистрация</h3>
+    <p class="text-xs text-gray-500 mb-6">Введите имя пользователя и пароль.</p>
+    <form id="authForm">
+      <div class="space-y-3">
+        <div>
+          <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Имя пользователя</label>
+          <input type="text" id="authUsername" required minlength="2" autocomplete="username"
+                 class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2.5 outline-none focus:border-gray-400" placeholder="username">
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Пароль (мин. 6)</label>
+          <input type="password" id="authPassword" required minlength="6" autocomplete="current-password"
+                 class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2.5 outline-none focus:border-gray-400" placeholder="••••••••">
+        </div>
+      </div>
+      <div id="authError" class="hidden mt-3 text-[11px] text-red-500 bg-red-50 dark:bg-red-950/30 px-3 py-2 rounded-xl"></div>
+      <button type="submit" id="authSubmit" class="mt-5 w-full bg-gray-900 dark:bg-white text-white dark:text-gray-900 py-3 rounded-xl text-sm font-medium active:scale-[0.98] transition-transform disabled:opacity-50">Войти / Создать</button>
+    </form>
+  </div>
+</div>
+
+<!-- Error modal -->
+<div id="errorModal" class="fixed inset-0 bg-black/60 backdrop-blur-md z-[90] flex items-center justify-center p-4 hidden">
+  <div class="bg-white dark:bg-gray-900 rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl border border-gray-100 dark:border-gray-800 animate-pop-in">
+    <div class="w-12 h-12 rounded-2xl bg-red-50 dark:bg-red-950/40 text-red-500 flex items-center justify-center mx-auto mb-3 font-bold text-xl">!</div>
+    <h3 class="text-lg font-semibold mb-1">Запись не найдена</h3>
+    <p class="text-xs text-gray-500 mb-5">Публикация удалена или не существовала.</p>
+    <button id="closeErrorBtn" class="w-full bg-gray-900 dark:bg-white text-white dark:text-gray-900 py-2.5 rounded-xl text-xs font-medium">На главную</button>
+  </div>
+</div>
+
+<div class="max-w-3xl w-full mx-auto px-4 py-4 sm:py-10 flex-1 flex flex-col">
+  <header class="hidden sm:flex justify-between items-center pb-6 mb-8 border-b border-gray-200 dark:border-gray-800">
+    <div>
+      <a href="#/" onclick="event.preventDefault(); goHome()" class="text-2xl sm:text-3xl font-semibold tracking-tight hover:opacity-80">СЛД</a>
+      <p class="text-gray-500 mt-0.5 text-xs sm:text-sm">ещё один текст</p>
+    </div>
+    <div id="desktopUserProfileArea" class="flex items-center gap-2"></div>
+  </header>
+
+  <main id="appContent" class="flex-1"></main>
+</div>
+
+<nav id="mobileBottomNav" class="sm:hidden fixed bottom-0 left-0 right-0 bg-white/85 dark:bg-gray-900/85 backdrop-blur-lg border-t border-gray-200/80 dark:border-gray-800/80 z-40 px-6 py-2.5 flex justify-around items-center"></nav>
+
+<footer class="hidden sm:block mt-12 border-t border-gray-200 dark:border-gray-800 py-8 text-center text-xs text-gray-500">
+  <div class="max-w-3xl mx-auto px-4 flex flex-col sm:flex-row justify-between items-center gap-4">
+    <div><span class="font-semibold text-gray-800 dark:text-gray-200">СЛД</span> &copy; 2026</div>
+    <div class="flex items-center gap-4 flex-wrap justify-center">
+      <a href="#/" onclick="event.preventDefault(); goHome()" class="hover:underline">Главная</a>
+      <span class="text-gray-300 dark:text-gray-700">|</span>
+      <span>powered by <span class="font-semibold">Supabase</span> &amp; <span class="font-semibold">FastAPICloud</span></span>
+    </div>
+  </div>
+</footer>
+
+<script>
+// =============================================================
+// State
+// =============================================================
+let currentUser = null;
+let currentUserId = null;
+let database = [];
+let profilesData = {};
+let currentSortOrder = 'new';
+let pendingImages = [];
+let isDataLoaded = false;
+let editingPostId = null;
+let previewScale = 1, previewRotation = 0;
+
+// =============================================================
+// API helper
+// =============================================================
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail = 'Ошибка';
+    try { detail = (await res.json()).detail || detail; } catch {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+// =============================================================
+// Utilities
+// =============================================================
+function sanitizeHTML(str) {
+  if (!str) return '';
+  return String(str).replace(/[&<>'"]/g, t => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[t]||t));
+}
+function showToast(text) {
+  const t = document.getElementById('toast');
+  t.innerText = text;
+  t.classList.remove('opacity-0','pointer-events-none');
+  setTimeout(() => t.classList.add('opacity-0','pointer-events-none'), 2500);
+}
+function fmtDate(s) {
+  if (!s) return '';
+  try { return new Date(s).toLocaleString('ru-RU',{day:'numeric',month:'long',hour:'2-digit',minute:'2-digit'}); }
+  catch { return s; }
+}
+function formatPostText(text) {
+  if (!text) return '';
+  let p = sanitizeHTML(text);
+  p = p.replace(/!([a-zA-Z0-9_-]+)/g, '<a href="#/@$1" onclick="event.stopPropagation(); navigateToProfile(\'$1\'); return false;" class="text-blue-500 font-medium hover:underline">!$1</a>');
+  return p.replace(/\n/g, '<br>');
+}
+function goHome() { location.hash = ''; router(); }
+
+// =============================================================
+// Image preview
+// =============================================================
+window.openImagePreview = function(url) {
+  const m = document.getElementById('imagePreviewModal');
+  document.getElementById('previewImage').src = url;
+  previewScale = 1; previewRotation = 0; updatePreviewTransform();
+  m.classList.remove('hidden'); m.classList.add('flex');
+};
+window.closeImagePreview = function() {
+  const m = document.getElementById('imagePreviewModal');
+  m.classList.add('hidden'); m.classList.remove('flex');
+  document.getElementById('previewImage').src = '';
+};
+window.zoomPreview = f => { previewScale = Math.min(8, Math.max(0.3, previewScale*f)); updatePreviewTransform(); };
+window.rotatePreview = d => { previewRotation += d; updatePreviewTransform(); };
+function updatePreviewTransform() {
+  document.getElementById('previewImage').style.transform = `scale(${previewScale}) rotate(${previewRotation}deg)`;
+}
+window.downloadImage = function(url, index) {
+  const a = document.createElement('a');
+  a.href = url; a.download = `SLD_${index+1}.jpg`; a.target = '_blank';
+  document.body.appendChild(a); a.click(); a.remove();
+  showToast('Загрузка начата');
+};
+
+// =============================================================
+// Carousel
+// =============================================================
+function generateCarouselHTML(postId, images) {
+  if (!images || images.length === 0) return '';
+  const slides = images.map((url, idx) => `
+    <div class="w-full min-w-full flex-shrink-0 snap-center relative flex items-center justify-center cursor-pointer overflow-hidden p-1" onclick="openImagePreview('${url}')">
+      <img src="${url}" class="max-h-[50vh] sm:max-h-[60vh] max-w-full object-contain rounded-xl bg-gray-100 dark:bg-gray-900" loading="lazy">
+      <button onclick="event.stopPropagation(); downloadImage('${url}', ${idx})" title="Скачать" class="absolute top-3 right-3 bg-black/50 hover:bg-black/80 text-white p-2 rounded-xl backdrop-blur">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+      </button>
+      ${images.length>1?`<div class="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/60 text-white text-[10px] px-3 py-1 rounded-full">${idx+1}/${images.length}</div>`:''}
+    </div>`).join('');
+  return `
+    <div class="relative bg-gray-100/50 dark:bg-[#0a0a0a] rounded-2xl mb-4 overflow-hidden border border-gray-100 dark:border-gray-800/50 group">
+      <div id="carousel-${postId}" class="flex w-full overflow-x-auto snap-x snap-mandatory scroll-smooth no-scrollbar">${slides}</div>
+      ${images.length>1?`
+        <button onclick="event.stopPropagation(); const c=document.getElementById('carousel-${postId}');c.scrollBy({left:-c.clientWidth,behavior:'smooth'})" class="hidden sm:flex absolute left-3 top-1/2 -translate-y-1/2 bg-white/80 dark:bg-black/60 p-2 rounded-full opacity-0 group-hover:opacity-100 z-10">‹</button>
+        <button onclick="event.stopPropagation(); const c=document.getElementById('carousel-${postId}');c.scrollBy({left:c.clientWidth,behavior:'smooth'})" class="hidden sm:flex absolute right-3 top-1/2 -translate-y-1/2 bg-white/80 dark:bg-black/60 p-2 rounded-full opacity-0 group-hover:opacity-100 z-10">›</button>`:''}
+    </div>`;
+}
+
+// =============================================================
+// Data loading
+// =============================================================
+async function fetchAllData() {
+  try {
+    const [posts, profiles] = await Promise.all([
+      api('/api/posts'),
+      api('/api/profiles'),
+    ]);
+    database = posts.map(p => ({ ...p, timestamp: fmtDate(p.timestamp) }));
+    profilesData = profiles;
+  } catch (e) {
+    console.error('load error', e);
+  }
+  isDataLoaded = true;
+  updateUserInterface();
+  router();
+}
+
+// =============================================================
+// Router
+// =============================================================
+window.addEventListener('hashchange', router);
+function router() {
+  const hash = location.hash;
+  updateMobileNav();
+
+  if (hash === '#create' || hash.startsWith('#edit/')) {
+    if (!currentUser) { openAuth(); location.hash = ''; return; }
+    renderCreateOrEditPage();
+    return;
+  }
+  if (hash.startsWith('#/@')) {
+    renderProfilePage(decodeURIComponent(hash.substring(3)).trim(), false);
+    return;
+  }
+  if (hash === '#profile' || hash === '#profile/edit') {
+    if (!currentUser) { openAuth(); location.hash = ''; return; }
+    renderProfilePage(currentUser, true);
+    return;
+  }
+  if (hash && hash.length > 1) {
+    const id = decodeURIComponent(hash.substring(1)).trim();
+    let post = database.find(p => p.id === id);
+    if (post) { renderSinglePost(post); return; }
+    api(`/api/posts/${id}`).then(p => {
+      p.timestamp = fmtDate(p.timestamp);
+      database.unshift(p);
+      renderSinglePost(p);
+    }).catch(() => showPostNotFoundError());
+    return;
+  }
+  renderMainFeed();
+}
+
+function showPostNotFoundError() {
+  const m = document.getElementById('errorModal');
+  m.classList.remove('hidden');
+  document.getElementById('closeErrorBtn').onclick = () => { m.classList.add('hidden'); goHome(); };
+}
+
+function navigateToProfile(u) { location.hash = '/@' + u; }
+window.navigateToProfile = navigateToProfile;
+
+// =============================================================
+// Mobile nav
+// =============================================================
+function updateMobileNav() {
+  const nav = document.getElementById('mobileBottomNav');
+  const hash = location.hash;
+  if (currentUser) {
+    nav.innerHTML = `
+      <a href="#/" onclick="event.preventDefault();goHome()" class="flex flex-col items-center gap-1 ${(!hash||hash==='#/')?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12l2-2m0 0l7-7 7 7M5 10v10h3m10-11l2 2m-2-2v10h-3m-6 0v-4h2v4"/></svg>
+        <span class="text-[10px] font-medium">Лента</span></a>
+      <a href="#create" class="flex flex-col items-center gap-1 ${hash==='#create'?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
+        <div class="w-8 h-8 rounded-xl bg-gray-900 dark:bg-white text-white dark:text-gray-900 flex items-center justify-center -mt-2 shadow-md">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </div>
+        <span class="text-[10px] font-medium">Создать</span></a>
+      <a href="#profile" class="flex flex-col items-center gap-1 ${hash.startsWith('#profile')?'text-gray-900 dark:text-white font-semibold':'text-gray-400'}">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+        <span class="text-[10px] font-medium">Профиль</span></a>`;
+  } else {
+    nav.innerHTML = `
+      <a href="#/" onclick="event.preventDefault();goHome()" class="flex flex-col items-center gap-1 text-gray-400">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 12l2-2m0 0l7-7 7 7M5 10v10h3m10-11l2 2m-2-2v10h-3m-6 0v-4h2v4"/></svg>
+        <span class="text-[10px] font-medium">Лента</span></a>
+      <button onclick="openAuth()" class="flex flex-col items-center gap-1 text-gray-400">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1"/></svg>
+        <span class="text-[10px] font-medium">Вход</span></button>`;
+  }
+}
+
+// =============================================================
+// Main feed
+// =============================================================
+function renderMainFeed() {
+  document.title = 'СЛД';
+  const content = document.getElementById('appContent');
+  content.innerHTML = `
+    <div class="sm:hidden mb-6 flex justify-between items-center pb-4 border-b border-gray-200 dark:border-gray-800">
+      <div><h1 class="text-xl font-bold">СЛД</h1><p class="text-gray-500 text-[11px]">ещё один текст</p></div>
+    </div>
+
+    <section id="createSectionDesktop" class="hidden ${currentUser?'sm:block':''} bg-white dark:bg-gray-900 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 p-4 sm:p-6 mb-6">
+      <div class="text-center py-4">
+        <p class="text-sm text-gray-500 mb-3">Хотите поделиться мыслью?</p>
+        <a href="#create" class="inline-block bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-6 py-2.5 rounded-xl text-sm font-medium">Написать пост</a>
+      </div>
+    </section>
+
+    <div class="flex flex-col sm:flex-row justify-between items-stretch sm:items-center mb-6 gap-3">
+      <h2 class="text-base sm:text-lg font-medium">Записи <span id="statTotal" class="text-gray-400 text-sm ml-1 font-normal">(0)</span></h2>
+      <div class="flex flex-wrap items-center gap-2">
+        <select id="sortSelect" class="text-[11px] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2 outline-none font-medium">
+          <option value="new">Сначала новые</option>
+          <option value="old">Сначала старые</option>
+        </select>
+        <input type="text" id="searchInput" class="text-[11px] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2 outline-none placeholder-gray-400 flex-1 sm:w-48" placeholder="Поиск…">
+      </div>
+    </div>
+
+    <div id="dbContainer" class="space-y-5"></div>`;
+
+  document.getElementById('sortSelect').addEventListener('change', e => {
+    currentSortOrder = e.target.value; renderDBList();
+  });
+  document.getElementById('searchInput').addEventListener('input', renderDBList);
+  renderDBList();
+}
+
+function renderDBList() {
+  const box = document.getElementById('dbContainer');
+  const stat = document.getElementById('statTotal');
+  if (!box) return;
+  const q = (document.getElementById('searchInput')?.value || '').toLowerCase();
+
+  let filtered = database.filter(e =>
+    ((e.title||'')+' '+e.text+' '+(e.tags||[]).join(' ')+' '+e.author).toLowerCase().includes(q)
+  );
+  filtered.sort((a,b) => currentSortOrder==='new'
+    ? (b.timestamp||'').localeCompare(a.timestamp||'') || b.id.localeCompare(a.id)
+    : (a.timestamp||'').localeCompare(b.timestamp||'') || a.id.localeCompare(b.id));
+
+  if (!filtered.length) {
+    box.innerHTML = `<div class="text-center py-10 text-gray-400 text-xs">Записей не найдено</div>`;
+    if (stat) stat.innerText = '(0)';
+    return;
+  }
+
+  box.innerHTML = filtered.map(entry => {
+    const tags = (entry.tags||[]).map(t =>
+      `<span class="inline-block bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] px-2.5 py-0.5 rounded-full cursor-pointer" onclick="event.stopPropagation();setSearch('${sanitizeHTML(t)}')">#${sanitizeHTML(t)}</span>`
+    ).join('');
+    const car = generateCarouselHTML(entry.id, entry.images);
+    const prof = profilesData[entry.author] || { avatar: '^_^', name: entry.author };
+    const isOwn = entry.author === currentUser;
+    const av = prof.avatar_url
+      ? `<img src="${prof.avatar_url}" class="w-9 h-9 rounded-xl object-cover">`
+      : `<div class="w-9 h-9 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-xs font-bold">${sanitizeHTML(prof.avatar)}</div>`;
+
+    return `
+    <article id="post-${entry.id}" onclick="location.hash='${entry.id}'" class="bg-white dark:bg-gray-900 rounded-3xl p-4 sm:p-6 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md transition-all cursor-pointer animate-fade-in">
+      <div class="flex justify-between items-center mb-4">
+        <div class="flex items-center gap-3">
+          <div onclick="event.stopPropagation();navigateToProfile('${sanitizeHTML(entry.author)}')" class="shrink-0">${av}</div>
+          <div>
+            <span onclick="event.stopPropagation();navigateToProfile('${sanitizeHTML(entry.author)}')" class="text-sm font-semibold hover:underline cursor-pointer block">${sanitizeHTML(prof.name)} <span class="font-normal text-gray-500">(@${sanitizeHTML(entry.author)})</span></span>
+            <span class="text-[10px] text-gray-400 block">${entry.timestamp}</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5">
+          ${isOwn ? `
+          <button onclick="event.stopPropagation();location.hash='edit/${entry.id}'" title="Редактировать" class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>` : ''}
+          <button onclick="event.stopPropagation();copyPostLink('${entry.id}')" title="Копировать ссылку" class="text-gray-400 hover:text-gray-700 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          </button>
+        </div>
+      </div>
+      ${entry.title?`<h3 class="text-lg font-bold mb-2">${sanitizeHTML(entry.title)}</h3>`:''}
+      ${car}
+      ${entry.text?`<div class="text-sm sm:text-base ${entry.font} leading-relaxed mb-3 line-clamp-4">${formatPostText(entry.text)}</div>`:''}
+      ${tags?`<div class="flex flex-wrap gap-1.5 pt-2.5 border-t border-gray-50 dark:border-gray-800 mt-2">${tags}</div>`:''}
+    </article>`;
+  }).join('');
+
+  if (stat) stat.innerText = `(${filtered.length})`;
+}
+
+window.setSearch = function(q) {
+  location.hash = '';
+  setTimeout(() => {
+    const i = document.getElementById('searchInput');
+    if (i) { i.value = q; renderDBList(); }
+  }, 60);
+};
+
+// =============================================================
+// Single post
+// =============================================================
+function renderSinglePost(entry) {
+  document.title = `Запись от @${entry.author} — СЛД`;
+  const prof = profilesData[entry.author] || { avatar: '^_^', name: entry.author };
+  const car = generateCarouselHTML(entry.id, entry.images);
+  const tags = (entry.tags||[]).map(t =>
+    `<span class="inline-block bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-xs px-3 py-1.5 rounded-full cursor-pointer" onclick="setSearch('${sanitizeHTML(t)}')">#${sanitizeHTML(t)}</span>`
+  ).join('');
+  const av = prof.avatar_url
+    ? `<img src="${prof.avatar_url}" class="w-11 h-11 rounded-2xl object-cover">`
+    : `<div class="w-11 h-11 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-sm font-bold">${sanitizeHTML(prof.avatar)}</div>`;
+  const isOwn = entry.author === currentUser;
+
+  document.getElementById('appContent').innerHTML = `
+    <div class="mb-4 sm:mb-6">
+      <a href="#/" onclick="event.preventDefault();goHome()" class="inline-flex items-center p-2.5 rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 text-xs font-medium gap-2">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        Назад к ленте
+      </a>
+    </div>
+    <div class="bg-white dark:bg-gray-900 rounded-3xl p-5 sm:p-8 shadow-sm border border-gray-100 dark:border-gray-800 animate-fade-in">
+      <div class="flex items-center justify-between mb-6 pb-4 border-b border-gray-100 dark:border-gray-800">
+        <div class="flex items-center gap-3 cursor-pointer" onclick="navigateToProfile('${sanitizeHTML(entry.author)}')">
+          ${av}
+          <div>
+            <span class="text-sm font-bold block">${sanitizeHTML(prof.name)} <span class="font-normal text-gray-500">(@${sanitizeHTML(entry.author)})</span></span>
+            <span class="text-[11px] text-gray-400 block mt-0.5">${entry.timestamp}</span>
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5">
+          ${isOwn?`
+          <button onclick="location.hash='edit/${entry.id}'" title="Редактировать" class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-3 rounded-xl">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <button onclick="deletePost('${entry.id}', true)" title="Удалить" class="text-red-400 hover:text-red-600 bg-red-50 dark:bg-red-950/30 p-3 rounded-xl">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+          </button>`:''}
+          <button onclick="copyPostLink('${entry.id}')" title="Копировать" class="text-gray-400 hover:text-gray-700 bg-gray-50 dark:bg-gray-800 p-3 rounded-xl">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          </button>
+        </div>
+      </div>
+      ${entry.title?`<h2 class="text-xl sm:text-2xl font-bold mb-4">${sanitizeHTML(entry.title)}</h2>`:''}
+      ${car}
+      ${entry.text?`<div class="text-base sm:text-lg ${entry.font} leading-relaxed mb-6 mt-4 break-words whitespace-pre-wrap">${formatPostText(entry.text)}</div>`:''}
+      ${tags?`<div class="flex flex-wrap gap-2 pt-5 border-t border-gray-100 dark:border-gray-800 mt-4">${tags}</div>`:''}
+    </div>`;
+}
+
+// =============================================================
+// Create / Edit page
+// =============================================================
+function renderCreateOrEditPage() {
+  const hash = location.hash;
+  const isEdit = hash.startsWith('#edit/');
+  editingPostId = isEdit ? hash.substring(6) : null;
+
+  let post = null;
+  if (isEdit) {
+    post = database.find(p => p.id === editingPostId);
+    if (!post) { showToast('Пост не найден'); goHome(); return; }
+    if (post.author !== currentUser) { showToast('Нет прав'); goHome(); return; }
+  }
+
+  document.title = isEdit ? 'Редактирование — СЛД' : 'Новая запись — СЛД';
+  activeCreateFont = post?.font || 'font-serif-custom';
+  pendingImages = post ? [...(post.images||[])] : [];
+
+  const fonts = [
+    ['font-sans-custom','Sans'],['font-serif-custom','Serif'],['font-mono-custom','Mono'],
+    ['font-playfair','Playfair'],['font-jetbrains','JetBrains'],['font-caveat','Caveat'],
+    ['font-montserrat','Montserrat'],['font-merriweather','Merriweather']
+  ];
+
+  document.getElementById('appContent').innerHTML = `
+    <div class="mb-4">
+      <a href="#/" onclick="event.preventDefault();goHome()" class="inline-flex items-center p-2.5 rounded-2xl bg-gray-100 dark:bg-gray-800 text-xs font-medium gap-2">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 19l-7-7 7-7"/></svg> Назад
+      </a>
+    </div>
+    <section class="bg-white dark:bg-gray-900 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 p-4 sm:p-6 animate-fade-in">
+      <div class="flex justify-between items-center mb-4 border-b border-gray-100 dark:border-gray-800 pb-3 gap-2 flex-wrap">
+        <h2 class="text-base font-semibold">${isEdit?'Редактирование':'Новая публикация'}</h2>
+        <label class="cursor-pointer text-gray-600 dark:text-gray-300 hover:text-blue-500 flex items-center gap-1.5 bg-gray-100 dark:bg-gray-800 px-3 py-1.5 rounded-xl text-[11px] font-medium">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+          Фото
+          <input type="file" id="imageUploadInput" accept="image/*" multiple class="hidden">
+        </label>
+      </div>
+
+      <div id="createImagePreview" class="hidden mb-4">
+        <div class="text-[10px] text-gray-400 mb-2">Фото: <span id="imageCount" class="font-medium text-gray-600 dark:text-gray-300">0</span></div>
+        <div id="createImageSlider" class="flex gap-3 overflow-x-auto snap-x pb-2 no-scrollbar"></div>
+      </div>
+
+      <input type="text" id="postTitleInput" value="${sanitizeHTML(post?.title||'')}" class="w-full text-base sm:text-lg font-bold bg-transparent outline-none placeholder-gray-400 mb-3 border-b border-transparent focus:border-gray-200 dark:focus:border-gray-800 pb-1" placeholder="Заголовок (необязательно)">
+
+      <div class="flex items-center justify-between mb-3 pb-3 border-b border-gray-100 dark:border-gray-800 gap-2 flex-wrap">
+        <span class="text-xs text-gray-500 font-medium">Шрифт:</span>
+        <div class="flex items-center bg-gray-100 dark:bg-gray-800 p-1 rounded-xl text-[11px] font-medium overflow-x-auto max-w-full">
+          ${fonts.map(([f,l]) => `<button data-font="${f}" class="create-font-option px-2 py-1 rounded-lg ${f===activeCreateFont?'bg-white dark:bg-gray-700 shadow-sm':''}">${l}</button>`).join('')}
+        </div>
+      </div>
+
+      <textarea id="dataInput" class="w-full h-40 sm:h-48 resize-none outline-none text-sm sm:text-base bg-transparent placeholder-gray-400 leading-relaxed ${activeCreateFont}" placeholder="Напишите текст… (можно вставить картинку Ctrl+V)">${sanitizeHTML(post?.text||'')}</textarea>
+
+      <div class="flex flex-col sm:flex-row justify-between items-stretch sm:items-center mt-3 pt-3 border-t border-gray-100 dark:border-gray-800 gap-3">
+        <input type="text" id="tagsInput" value="${(post?.tags||[]).join(', ')}" class="outline-none text-xs sm:text-sm bg-gray-50 dark:bg-gray-800 px-3.5 py-2.5 rounded-xl w-full sm:flex-1" placeholder="Теги (через запятую)">
+        <button id="saveBtn" class="bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-medium w-full sm:w-auto">${isEdit?'Сохранить':'Опубликовать'}</button>
+      </div>
+    </section>`;
+
+  initCreateEvents();
+}
+
+window.removePendingImage = i => { pendingImages.splice(i,1); updateCreateImagePreview(); };
+function updateCreateImagePreview() {
+  const box = document.getElementById('createImagePreview');
+  const slider = document.getElementById('createImageSlider');
+  const cnt = document.getElementById('imageCount');
+  if (!box) return;
+  if (!pendingImages.length) { box.classList.add('hidden'); slider.innerHTML=''; return; }
+  box.classList.remove('hidden');
+  cnt.innerText = pendingImages.length;
+  slider.innerHTML = pendingImages.map((u,i) => `
+    <div class="relative w-24 h-24 sm:w-32 sm:h-32 bg-gray-100 dark:bg-gray-800 rounded-xl flex-shrink-0 snap-start overflow-hidden border border-gray-200 dark:border-gray-700">
+      <img src="${u}" class="w-full h-full object-cover">
+      <button onclick="removePendingImage(${i})" class="absolute top-1.5 right-1.5 bg-red-500/90 text-white rounded-full p-1.5">
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>`).join('');
+}
+
+let activeCreateFont = 'font-serif-custom';
+
+function initCreateEvents() {
+  const dataInput = document.getElementById('dataInput');
+  document.querySelectorAll('.create-font-option').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.create-font-option').forEach(b => b.classList.remove('bg-white','dark:bg-gray-700','shadow-sm'));
+      btn.classList.add('bg-white','dark:bg-gray-700','shadow-sm');
+      activeCreateFont = btn.dataset.font;
+      dataInput.className = `w-full h-40 sm:h-48 resize-none outline-none text-sm sm:text-base bg-transparent placeholder-gray-400 leading-relaxed ${activeCreateFont}`;
+    });
+  });
+
+  const uploadFiles = async files => {
+    if (!files.length) return;
+    showToast('Загрузка…');
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true;
+    for (const f of files) {
+      try {
+        const fd = new FormData();
+        fd.append('file', f);
+        const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
+        if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+        const j = await r.json();
+        pendingImages.push(j.url);
+      } catch (e) { showToast('Ошибка загрузки: ' + e.message); }
+    }
+    saveBtn.disabled = false;
+    updateCreateImagePreview();
+    showToast('Готово');
+  };
+
+  document.getElementById('imageUploadInput').addEventListener('change', e => {
+    uploadFiles(Array.from(e.target.files));
+    e.target.value = '';
+  });
+
+  dataInput.addEventListener('paste', e => {
+    const items = (e.clipboardData||window.clipboardData).items;
+    const imgs = [];
+    for (const k in items) {
+      const it = items[k];
+      if (it.kind === 'file' && it.type.startsWith('image/')) imgs.push(it.getAsFile());
+    }
+    if (imgs.length) { e.preventDefault(); uploadFiles(imgs); }
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', async () => {
+    const text = dataInput.value.trim();
+    const title = document.getElementById('postTitleInput').value.trim();
+    const tagsRaw = document.getElementById('tagsInput').value;
+    if (!text && !pendingImages.length && !title) return;
+
+    const body = {
+      title, text,
+      tags: tagsRaw ? tagsRaw.split(',').map(t=>t.trim()).filter(Boolean) : [],
+      font: activeCreateFont,
+      image_urls: pendingImages,
+    };
+
+    const btn = document.getElementById('saveBtn');
+    btn.disabled = true;
+    try {
+      if (editingPostId) {
+        const updated = await api(`/api/posts/${editingPostId}`, { method:'PUT', body: JSON.stringify(body) });
+        const idx = database.findIndex(p => p.id === editingPostId);
+        updated.timestamp = fmtDate(updated.timestamp);
+        if (idx >= 0) database[idx] = updated;
+        showToast('Обновлено');
+      } else {
+        const created = await api('/api/posts', { method:'POST', body: JSON.stringify(body) });
+        created.timestamp = fmtDate(created.timestamp);
+        database.unshift(created);
+        showToast('Опубликовано');
+      }
+      pendingImages = [];
+      editingPostId = null;
+      goHome();
+    } catch (e) {
+      showToast('Ошибка: ' + e.message);
+      btn.disabled = false;
+    }
+  });
+
+  updateCreateImagePreview();
+}
+
+// =============================================================
+// Profile page
+// =============================================================
+function renderProfilePage(username, isOwn) {
+  const prof = profilesData[username] || { name: username, avatar: '^_^', bio: '', status: '', avatar_url: '' };
+  const isEditing = isOwn && location.hash === '#profile/edit';
+  document.title = `${prof.name} (@${username}) — СЛД`;
+
+  const userPosts = database.filter(p => p.author === username);
+  const avatarEl = prof.avatar_url
+    ? `<img src="${prof.avatar_url}" class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-cover">`
+    : `<div class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-base sm:text-lg font-bold">${sanitizeHTML(prof.avatar)}</div>`;
+
+  document.getElementById('appContent').innerHTML = `
+    <div class="mb-4 hidden sm:block">
+      <a href="#/" onclick="event.preventDefault();goHome()" class="text-xs font-medium text-gray-500 hover:underline">← Назад к ленте</a>
+    </div>
+    <div class="bg-white dark:bg-gray-900 rounded-3xl p-5 sm:p-8 shadow-sm border border-gray-100 dark:border-gray-800 mb-8 animate-fade-in">
+      <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4 sm:gap-6 justify-between">
+        <div class="flex items-center gap-4 w-full sm:w-auto">
+          ${avatarEl}
+          <div class="flex-1">
+            <h2 class="text-xl sm:text-2xl font-bold">${sanitizeHTML(prof.name)}</h2>
+            <p class="text-xs text-gray-500 mb-1.5">@${sanitizeHTML(username)}</p>
+            ${prof.status?`<div class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 text-[11px] font-medium mb-2">${sanitizeHTML(prof.status)}</div>`:''}
+            <p class="text-xs sm:text-sm text-gray-600 dark:text-gray-300 max-w-md">${sanitizeHTML(prof.bio||'Нет описания профиля.')}</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 pt-4 sm:pt-0 border-gray-100 dark:border-gray-800 mt-2 sm:mt-0">
+          ${isOwn?`
+            <a href="${isEditing?'#profile':'#profile/edit'}" class="flex-1 sm:flex-none text-center bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-medium">
+              ${isEditing?'Закрыть':'Настройки'}
+            </a>
+            <button onclick="logoutUser()" title="Выйти" class="text-red-500 bg-red-50 dark:bg-red-950/30 p-2.5 rounded-xl">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            </button>`:''}
+        </div>
+      </div>
+
+      ${isEditing?`
+      <form id="editProfileForm" class="mt-6 pt-6 border-t border-gray-100 dark:border-gray-800 space-y-4 animate-fade-in">
+        <h3 class="text-sm font-semibold">Настройки профиля</h3>
+
+        <div class="flex items-center gap-4">
+          <div id="avatarPreviewWrap">
+            ${prof.avatar_url
+              ? `<img id="avatarPreview" src="${prof.avatar_url}" class="w-20 h-20 rounded-2xl object-cover border border-gray-200 dark:border-gray-700">`
+              : `<div id="avatarPreviewEmoji" class="w-20 h-20 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono text-lg font-bold border border-gray-200 dark:border-gray-700">${sanitizeHTML(prof.avatar)}</div>`}
+          </div>
+          <div class="flex-1">
+            <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Аватар (картинка — до 512×512, ≤150KB, AVIF/WebP)</label>
+            <label class="inline-flex items-center gap-2 cursor-pointer bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-3.5 py-2.5 rounded-xl text-xs font-medium">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+              Загрузить
+              <input type="file" id="avatarInput" accept="image/*" class="hidden">
+            </label>
+            ${prof.avatar_url?`<button type="button" onclick="removeAvatar()" class="ml-2 text-xs text-red-500 hover:underline">Удалить</button>`:''}
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Имя</label>
+            <input type="text" id="editName" value="${sanitizeHTML(prof.name)}" class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2 outline-none">
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Статус (до 60)</label>
+            <input type="text" id="editStatus" maxlength="60" value="${sanitizeHTML(prof.status)}" class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2 outline-none">
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">Символ (если нет картинки, до 5)</label>
+            <input type="text" id="editAvatar" maxlength="5" value="${sanitizeHTML(prof.avatar)}" class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl px-3 py-2 outline-none font-mono">
+          </div>
+        </div>
+        <div>
+          <label class="block text-[11px] font-medium text-gray-700 dark:text-gray-300 mb-1">О себе</label>
+          <textarea id="editBio" class="w-full text-xs bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-3 outline-none resize-none h-20">${sanitizeHTML(prof.bio)}</textarea>
+        </div>
+        <button type="submit" class="bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-5 py-2.5 rounded-xl text-xs font-medium w-full sm:w-auto">Сохранить изменения</button>
+      </form>`:''}
+    </div>
+
+    <h3 class="text-base sm:text-lg font-medium mb-4">Публикации (${userPosts.length})</h3>
+    <div class="space-y-4">
+      ${userPosts.length===0?`<div class="text-center py-10 text-gray-400 text-xs">Пока пусто</div>`:''}
+      ${userPosts.map(entry => `
+        <article id="post-${entry.id}" onclick="location.hash='${entry.id}'" class="bg-white dark:bg-gray-900 rounded-3xl p-4 sm:p-5 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md cursor-pointer animate-fade-in">
+          <div class="flex justify-between items-center mb-3">
+            <span class="text-[11px] text-gray-400">${entry.timestamp}</span>
+            <div class="flex items-center gap-1.5">
+              ${isOwn?`
+              <button onclick="event.stopPropagation();location.hash='edit/${entry.id}'" title="Редактировать" class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              </button>
+              <button onclick="event.stopPropagation();deletePost('${entry.id}')" title="Удалить" class="text-red-400 hover:text-red-600 bg-red-50 dark:bg-red-950/30 p-2 rounded-xl">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+              </button>`:''}
+            </div>
+          </div>
+          ${entry.title?`<h3 class="text-base font-bold mb-2">${sanitizeHTML(entry.title)}</h3>`:''}
+          ${generateCarouselHTML(entry.id, entry.images)}
+          ${entry.text?`<div class="text-sm sm:text-base ${entry.font} leading-relaxed mb-3 line-clamp-3">${formatPostText(entry.text)}</div>`:''}
+        </article>`).join('')}
+    </div>`;
+
+  if (isEditing) initProfileEditEvents();
+}
+
+function initProfileEditEvents() {
+  const avatarInput = document.getElementById('avatarInput');
+  if (avatarInput) {
+    avatarInput.addEventListener('change', async e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      showToast('Загрузка аватара…');
+      try {
+        const fd = new FormData();
+        fd.append('file', f);
+        const r = await fetch('/api/upload', { method: 'POST', body: fd, credentials: 'include' });
+        if (!r.ok) throw new Error((await r.json()).detail || 'Ошибка');
+        const j = await r.json();
+        const wrap = document.getElementById('avatarPreviewWrap');
+        wrap.innerHTML = `<img id="avatarPreview" src="${j.url}" class="w-20 h-20 rounded-2xl object-cover border border-gray-200 dark:border-gray-700">`;
+        wrap.dataset.url = j.url;
+        showToast('Аватар загружен');
+      } catch (err) { showToast('Ошибка: ' + err.message); }
+    });
+  }
+
+  document.getElementById('editProfileForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const body = {
+      name: document.getElementById('editName').value.trim(),
+      avatar: document.getElementById('editAvatar').value.trim() || '^_^',
+      avatar_url: document.getElementById('avatarPreviewWrap').dataset.url || profilesData[currentUser]?.avatar_url || '',
+      status: document.getElementById('editStatus').value.trim(),
+      bio: document.getElementById('editBio').value.trim(),
+    };
+    if (body.avatar.length > 5) return showToast('Символ до 5 знаков');
+    try {
+      await api('/api/profiles/me', { method:'PUT', body: JSON.stringify(body) });
+      profilesData[currentUser] = { ...(profilesData[currentUser]||{}), ...body, name: body.name || currentUser };
+      showToast('Сохранено');
+      location.hash = '#profile';
+      router();
+    } catch (err) { showToast('Ошибка: ' + err.message); }
+  });
+}
+
+window.removeAvatar = function() {
+  const wrap = document.getElementById('avatarPreviewWrap');
+  if (!wrap) return;
+  wrap.dataset.url = '';
+  const emoji = document.getElementById('editAvatar')?.value || '^_^';
+  wrap.innerHTML = `<div class="w-20 h-20 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono text-lg font-bold border border-gray-200 dark:border-gray-700">${sanitizeHTML(emoji)}</div>`;
+};
+
+// =============================================================
+// Delete & copy
+// =============================================================
+window.deletePost = async function(postId, fromSingle) {
+  if (!confirm('Удалить запись?')) return;
+  try {
+    await api(`/api/posts/${postId}`, { method:'DELETE' });
+    database = database.filter(p => p.id !== postId);
+    showToast('Удалено');
+    if (fromSingle) goHome();
+    else router();
+  } catch (e) { showToast('Ошибка: ' + e.message); }
+};
+
+window.copyPostLink = function(id) {
+  const url = `${location.origin}${location.pathname}#${id}`;
+  navigator.clipboard?.writeText(url).then(
+    () => showToast('Ссылка скопирована'),
+    () => { const ta=document.createElement('textarea'); ta.value=url; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); showToast('Ссылка скопирована'); }
+  );
+};
+
+// =============================================================
+// Auth UI
+// =============================================================
+function openAuth() {
+  document.getElementById('authModal').classList.remove('hidden');
+  document.getElementById('authError').classList.add('hidden');
+  setTimeout(() => document.getElementById('authUsername').focus(), 50);
+}
+window.openAuth = openAuth;
+window.logoutUser = async function() {
+  await api('/api/auth/logout', { method:'POST' });
+  currentUser = null; currentUserId = null;
+  updateUserInterface();
+  goHome();
+  showToast('Вы вышли');
+};
+
+function updateUserInterface() {
+  const area = document.getElementById('desktopUserProfileArea');
+  if (!area) return;
+  if (currentUser) {
+    const prof = profilesData[currentUser] || { avatar: '^_^' };
+    const av = prof.avatar_url
+      ? `<img src="${prof.avatar_url}" class="w-7 h-7 rounded-xl object-cover">`
+      : `<div class="w-7 h-7 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono text-[10px] font-bold">${sanitizeHTML(prof.avatar)}</div>`;
+    area.innerHTML = `
+      <div class="flex items-center gap-3">
+        <a href="#profile" class="text-xs sm:text-sm hover:underline flex items-center gap-2 font-medium">
+          ${av}<span>${sanitizeHTML(currentUser)}</span>
+        </a>
+        <button onclick="logoutUser()" title="Выйти" class="text-gray-500 hover:text-red-500 p-2 rounded-xl bg-gray-100 dark:bg-gray-800">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </div>`;
+  } else {
+    area.innerHTML = `<button onclick="openAuth()" class="bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-700 px-4 py-2 rounded-xl text-xs sm:text-sm font-medium shadow-sm">Вход / Регистрация</button>`;
+  }
+}
+
+// =============================================================
+// Auth form
+// =============================================================
+document.getElementById('closeAuthModal').addEventListener('click', () => {
+  document.getElementById('authModal').classList.add('hidden');
+});
+
+document.getElementById('authForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const u = document.getElementById('authUsername').value.trim();
+  const p = document.getElementById('authPassword').value;
+  const errBox = document.getElementById('authError');
+  const btn = document.getElementById('authSubmit');
+  errBox.classList.add('hidden');
+
+  if (!u || p.length < 6) {
+    errBox.innerText = 'Имя и пароль (≥6 символов) обязательны';
+    errBox.classList.remove('hidden');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerText = 'Подождите…';
+
+  try {
+    // Пробуем login → если не вышло, регистрация
+    let ok = false;
+    try {
+      await api('/api/auth/login', { method:'POST', body: JSON.stringify({ username: u, password: p }) });
+      ok = true;
+    } catch (loginErr) {
+      try {
+        await api('/api/auth/signup', { method:'POST', body: JSON.stringify({ username: u, password: p }) });
+        ok = true;
+      } catch (signupErr) {
+        throw new Error(signupErr.message || loginErr.message);
+      }
+    }
+    if (ok) {
+      document.getElementById('authModal').classList.add('hidden');
+      document.getElementById('authForm').reset();
+      showToast(`Добро пожаловать, ${u}!`);
+      await fetchAllData();
+    }
+  } catch (err) {
+    errBox.innerText = err.message;
+    errBox.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.innerText = 'Войти / Создать';
+  }
+});
+
+// =============================================================
+// Boot
+// =============================================================
+(async function boot() {
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.documentElement.classList.add('dark');
+  }
+
+  try {
+    const me = await api('/api/auth/me');
+    if (me.authenticated) {
+      currentUser = me.username;
+      currentUserId = me.id;
+    }
+  } catch (e) {
+    console.warn('auth check failed', e);
+  }
+
+  // Скрываем overlay c плавным фейдом
+  const ov = document.getElementById('loadingOverlay');
+  ov.style.transition = 'opacity .4s ease';
+  ov.style.opacity = '0';
+  setTimeout(() => ov.remove(), 420);
+
+  await fetchAllData();
+  if (!location.hash) router();
+})();
+</script>
 </body>
 </html>"""
 
 
-def alert_html(kind: str, text: str) -> str:
-    if kind == "err":
-        return f'<div class="alert alert-err">{ic("alert", 16)}<div>{esc(text)}</div></div>'
-    return f'<div class="alert alert-ok">{ic("check", 16)}<div>{esc(text)}</div></div>'
-
-
-def crumbs(items: list) -> str:
-    parts = [f'<a href="/">{ic("home", 13)}</a>']
-    for i, (label, href) in enumerate(items):
-        parts.append(ic("next", 13))
-        if href:
-            parts.append(f'<a href="{esc(href)}">{esc(label)}</a>')
-        else:
-            parts.append(f'<span>{esc(label)}</span>')
-    return f'<div class="crumbs">{"".join(parts)}</div>'
-
-
-def empty_html(text: str) -> str:
-    return (f'<div class="empty">{ic("file", 36)}'
-            f'<div class="big">{esc(text)}</div></div>')
-
-
-# ===========================================================================
-# Помощники выборок и рендера
-# ===========================================================================
-
-POST_SELECT = "id,user_id,content,created_at,updated_at,users(username,avatar)"
-
-
-def fetch_posts(limit: int = 50, user_id: Optional[str] = None,
-                q: Optional[str] = None) -> list:
-    query = (sb.table("posts").select(POST_SELECT)
-             .order("created_at", desc=True).limit(limit))
-    if user_id:
-        query = query.eq("user_id", user_id)
-    if q:
-        query = query.ilike("content", f"%{q}%")
-    return query.execute().data or []
-
-
-def comment_counts_for(post_ids: list) -> dict:
-    if not post_ids:
-        return {}
-    try:
-        rows = (sb.table("comments").select("post_id")
-                .in_("post_id", post_ids).execute().data) or []
-    except Exception:
-        return {}
-    d: dict = {}
-    for r in rows:
-        d[r["post_id"]] = d.get(r["post_id"], 0) + 1
-    return d
-
-
-def render_posts(posts: list, me: Optional[dict], counts: dict,
-                 empty_text: str = "Пока ничего нет.") -> str:
-    if not posts:
-        return empty_html(empty_text)
-
-    out = []
-    for p in posts:
-        u = p.get("users") or {}
-        if isinstance(u, list):
-            u = u[0] if u else {}
-        uname = u.get("username") or "удалён"
-        pid = p.get("id")
-        cnt = counts.get(pid, 0)
-
-        edited = ""
-        if p.get("updated_at"):
-            edited = f' <span class="post-time">· ред. {esc(fmt_dt(p["updated_at"]))}</span>'
-
-        actions = []
-        if me and p.get("user_id") == me["id"]:
-            actions.append(f'<a href="/posts/{pid}/edit" title="Редактировать">{ic("edit", 14)}<span>правка</span></a>')
-            actions.append(
-                f'<form method="post" action="/posts/{pid}/delete" '
-                f'onsubmit="return confirm(\'Удалить тему?\')">'
-                f'<button type="submit" class="danger" title="Удалить">{ic("trash", 14)}<span>удалить</span></button></form>'
-            )
-        actions_html = "".join(actions)
-
-        out.append(f"""<article class="post" id="p{pid}">
-  {avatar_html(uname, u.get("avatar"), 42)}
-  <div class="post-body">
-    <div class="post-head">
-      <a class="post-author" href="/u/{esc(uname)}">{esc(uname)}</a>
-      <span class="post-time" title="{esc(fmt_iso(p.get('created_at')))}">{ic("clock", 12)}{esc(fmt_dt(p.get("created_at")))}</span>{edited}
-    </div>
-    <div class="post-content">{esc(p.get('content', ''))}</div>
-    <div class="post-actions">
-      <a href="/posts/{pid}" title="Обсуждение">{ic("comment", 14)}<span>{cnt} {esc(plural(cnt, "коммент.", "коммент.", "коммент."))}</span></a>
-      {actions_html}
-      <a href="#p{pid}" title="Ссылка на запись" style="margin-left:auto">{ic("tag", 14)}<span>#{pid}</span></a>
-    </div>
-  </div>
-</article>""")
-    return "".join(out)
-
-
-# ===========================================================================
-# Главная
-# ===========================================================================
-
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, msg: str = "", err: str = "", q: str = ""):
-    me = current_user(request)
-    q = (q or "").strip()
-
-    try:
-        posts = fetch_posts(q=q or None)
-    except Exception as e:
-        posts = []
-        err = err or f"Ошибка БД: {e}"
-
-    counts = comment_counts_for([p["id"] for p in posts])
-
-    alerts = ""
-    if err:
-        alerts += alert_html("err", err)
-    if msg:
-        alerts += alert_html("ok", msg)
-
-    # Поиск
-    search = (
-        f'<form method="get" action="/" class="searchbar">'
-        f'{ic("search", 16, "s-ic")}'
-        f'<input type="text" name="q" placeholder="Поиск по темам..." value="{esc(q)}" autocomplete="off">'
-        f'<span class="kbd-hint">/</span>'
-        f'</form>'
-    )
-
-    # Форма новой темы
-    if me:
-        compose = f"""<section class="card">
-  <div class="card-head">{ic("plus", 16, "h-ic")}<h2>Новая тема</h2></div>
-  <div class="card-body">
-    <form method="post" action="/posts">
-      <textarea name="content" rows="4" maxlength="{POST_MAX}" data-max="{POST_MAX}"
-        placeholder="Напишите что-нибудь. Ctrl+Enter — отправить."></textarea>
-      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
-        <button class="btn btn-primary" type="submit">{ic("send", 15)}<span>Опубликовать</span></button>
-        <span class="hint">Ctrl+Enter</span>
-      </div>
-    </form>
-  </div>
-</section>"""
-    else:
-        compose = f"""<section class="card">
-  <div class="card-body" style="display:flex;align-items:center;gap:12px">
-    {ic("user", 18, "h-ic")}
-    <div style="color:var(--dim)">Чтобы открывать темы, нужно <a href="/login">войти</a> или <a href="/register">зарегистрироваться</a>.</div>
-  </div>
-</section>"""
-
-    n = len(posts)
-    heading = f'Результаты поиска: «{esc(q)}»' if q else "Последние темы"
-    clear = f'<a href="/" class="btn btn-sm btn-ghost" style="margin-left:auto">{ic("back", 13)}<span>сбросить</span></a>' if q else ""
-
-    body = f"""{alerts}
-{search}
-{compose}
-<section class="card">
-  <div class="card-head">{ic("feed", 16, "h-ic")}<h2>{heading}</h2>{clear}<span class="h-count">{n}</span></div>
-  {render_posts(posts, me, counts, empty_text=("Ничего не найдено." if q else "Тем пока нет. Будьте первым."))}
-</section>"""
-    return HTMLResponse(layout("Лента", me, body, active="feed"))
-
-
-# ===========================================================================
-# Регистрация / вход / выход
-# ===========================================================================
-
-def _auth_page(title: str, action: str, err: str = "", username: str = "") -> str:
-    alert = alert_html("err", err) if err else ""
-
-    if action == "/register":
-        fields = f"""
-  <div class="field"><label>Имя пользователя</label>
-    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus autocomplete="username"></div>
-  <div class="hint" style="margin:-10px 0 14px">3–20 символов: латиница, цифры, подчёркивание</div>
-  <div class="field"><label>Пароль</label>
-    <input type="password" name="password" autocomplete="new-password"></div>
-  <div class="field"><label>Пароль ещё раз</label>
-    <input type="password" name="password2" autocomplete="new-password"></div>
-  <button class="btn btn-primary" type="submit" style="width:100%">{ic("signup", 15)}<span>Создать аккаунт</span></button>"""
-    else:
-        fields = f"""
-  <div class="field"><label>Имя пользователя</label>
-    <input type="text" name="username" maxlength="20" value="{esc(username)}" autofocus autocomplete="username"></div>
-  <div class="field"><label>Пароль</label>
-    <input type="password" name="password" autocomplete="current-password"></div>
-  <button class="btn btn-primary" type="submit" style="width:100%">{ic("login", 15)}<span>Войти</span></button>"""
-
-    body = f"""{crumbs([(title, None)])}
-<div style="max-width:420px">
-  <section class="card">
-    <div class="card-head">{ic("user", 16, "h-ic")}<h2>{esc(title)}</h2></div>
-    <div class="card-body">
-      {alert}
-      <form method="post" action="{action}">{fields}</form>
-    </div>
-  </section>
-</div>"""
-    return layout(title, None, body)
-
-
-@app.get("/register", response_class=HTMLResponse)
-def register_get(request: Request):
-    if current_user(request):
-        return RedirectResponse("/", status_code=303)
-    return HTMLResponse(_auth_page("Регистрация", "/register"))
-
-
-@app.post("/register", response_class=HTMLResponse)
-def register_post(request: Request,
-                  username: str = Form(""),
-                  password: str = Form(""),
-                  password2: str = Form("")):
-    if current_user(request):
-        return RedirectResponse("/", status_code=303)
-
-    username = username.strip()
-    err = None
-    if not USERNAME_RE.fullmatch(username):
-        err = "Имя: 3–20 символов, только латиница, цифры и подчёркивание."
-    elif len(password) < 6:
-        err = "Пароль должен быть не короче 6 символов."
-    elif password != password2:
-        err = "Пароли не совпадают."
-    else:
-        try:
-            if (sb.table("users").select("id")
-                    .ilike("username", username).limit(1).execute().data):
-                err = "Такое имя уже занято."
-        except Exception as e:
-            err = f"Ошибка БД: {e}"
-
-    if err:
-        return HTMLResponse(_auth_page("Регистрация", "/register", err, username),
-                            status_code=400)
-
-    try:
-        row = sb.table("users").insert({
-            "username": username,
-            "password_hash": hash_password(password),
-        }).execute().data[0]
-    except Exception as e:
-        return HTMLResponse(_auth_page("Регистрация", "/register",
-                                       f"Не удалось создать: {e}", username),
-                            status_code=500)
-
-    token = create_session(row["id"])
-    resp = RedirectResponse("/", status_code=303)
-    set_session_cookie(resp, token)
-    return resp
-
-
-@app.get("/login", response_class=HTMLResponse)
-def login_get(request: Request):
-    if current_user(request):
-        return RedirectResponse("/", status_code=303)
-    return HTMLResponse(_auth_page("Вход", "/login"))
-
-
-@app.post("/login", response_class=HTMLResponse)
-def login_post(request: Request,
-               username: str = Form(""),
-               password: str = Form("")):
-    if current_user(request):
-        return RedirectResponse("/", status_code=303)
-
-    username = username.strip()
-    err = None
-    row = None
-    try:
-        rows = (sb.table("users").select("*")
-                .ilike("username", username).limit(1).execute().data)
-        row = rows[0] if rows else None
-    except Exception as e:
-        err = f"Ошибка БД: {e}"
-
-    if not err and (not row or not verify_password(password, row["password_hash"])):
-        err = "Неверное имя пользователя или пароль."
-
-    if err:
-        return HTMLResponse(_auth_page("Вход", "/login", err, username),
-                            status_code=400)
-
-    token = create_session(row["id"])
-    resp = RedirectResponse("/", status_code=303)
-    set_session_cookie(resp, token)
-    return resp
-
-
-@app.get("/logout")
-def logout(request: Request):
-    destroy_session(request)
-    resp = RedirectResponse("/", status_code=303)
-    resp.delete_cookie(SESSION_COOKIE, path="/")
-    return resp
-
-
-# ===========================================================================
-# Темы
-# ===========================================================================
-
-@app.post("/posts")
-def create_post(request: Request, content: str = Form("")):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    content = (content or "").strip()
-    if not content:
-        return RedirectResponse("/?err=Пустое+сообщение", status_code=303)
-    if len(content) > POST_MAX:
-        content = content[:POST_MAX]
-
-    try:
-        sb.table("posts").insert({"user_id": me["id"], "content": content}).execute()
-    except Exception:
-        return RedirectResponse("/?err=Не+удалось+сохранить", status_code=303)
-
-    return RedirectResponse("/?msg=Тема+опубликована", status_code=303)
-
-
-@app.get("/posts/{post_id}", response_class=HTMLResponse)
-def post_detail(request: Request, post_id: int, msg: str = "", err: str = ""):
-    me = current_user(request)
-
-    try:
-        rows = (sb.table("posts").select(POST_SELECT)
-                .eq("id", post_id).limit(1).execute().data)
-    except Exception as e:
-        body = alert_html("err", f"Ошибка БД: {e}")
-        return HTMLResponse(layout("Ошибка", me, body), status_code=500)
-
-    if not rows:
-        return HTMLResponse(layout("Не найдено", me, empty_html("Тема не найдена.")),
-                            status_code=404)
-
-    p = rows[0]
-    u = p.get("users") or {}
-    if isinstance(u, list):
-        u = u[0] if u else {}
-    uname = u.get("username") or "удалён"
-
-    try:
-        comments = (sb.table("comments")
-                    .select("id,content,created_at,user_id,users(username,avatar)")
-                    .eq("post_id", post_id)
-                    .order("created_at", desc=False).execute().data) or []
-    except Exception:
-        comments = []
-
-    # Пост
-    post_actions = ""
-    if me and p.get("user_id") == me["id"]:
-        post_actions = (
-            f'<a href="/posts/{post_id}/edit" title="Редактировать">{ic("edit", 14)}<span>правка</span></a>'
-            f'<form method="post" action="/posts/{post_id}/delete" '
-            f'onsubmit="return confirm(\'Удалить тему?\')">'
-            f'<button type="submit" class="danger" title="Удалить">{ic("trash", 14)}<span>удалить</span></button></form>'
-        )
-
-    edited = ""
-    if p.get("updated_at"):
-        edited = f' <span class="post-time">· ред. {esc(fmt_dt(p["updated_at"]))}</span>'
-
-    post_html = f"""<article class="post" style="border-bottom:none;padding:18px">
-  {avatar_html(uname, u.get("avatar"), 56)}
-  <div class="post-body">
-    <div class="post-head">
-      <a class="post-author" href="/u/{esc(uname)}" style="font-size:15px">{esc(uname)}</a>
-      <span class="post-time" title="{esc(fmt_iso(p.get('created_at')))}">{ic("clock", 12)}{esc(fmt_dt(p.get("created_at")))}</span>{edited}
-    </div>
-    <div class="post-content" style="font-size:15px">{esc(p.get('content', ''))}</div>
-    <div class="post-actions">{post_actions}</div>
-  </div>
-</article>"""
-
-    # Комментарии
-    if comments:
-        items = []
-        for c in comments:
-            cu = c.get("users") or {}
-            if isinstance(cu, list):
-                cu = cu[0] if cu else {}
-            cname = cu.get("username") or "удалён"
-            del_btn = ""
-            if me and c.get("user_id") == me["id"]:
-                del_btn = (
-                    f'<form method="post" action="/comments/{c["id"]}/delete" '
-                    f'onsubmit="return confirm(\'Удалить комментарий?\')">'
-                    f'<button type="submit" class="danger" title="Удалить">{ic("trash", 13)}<span>удалить</span></button></form>'
-                )
-            items.append(f"""<div class="comment" id="c{c['id']}">
-  {avatar_html(cname, cu.get("avatar"), 34)}
-  <div class="comment-body">
-    <div class="post-head">
-      <a class="post-author" href="/u/{esc(cname)}">{esc(cname)}</a>
-      <span class="post-time" title="{esc(fmt_iso(c.get('created_at')))}">{ic("clock", 11)}{esc(fmt_dt(c.get('created_at')))}</span>
-      <a href="#c{c['id']}" class="post-time" style="margin-left:auto">#{c['id']}</a>
-    </div>
-    <div class="comment-text">{esc(c.get('content', ''))}</div>
-    {f'<div class="post-actions" style="border:none;padding-top:0">{del_btn}</div>' if del_btn else ''}
-  </div>
-</div>""")
-        comments_html = "".join(items)
-    else:
-        comments_html = empty_html("Комментариев пока нет.")
-
-    # Форма коммента
-    if me:
-        form_html = f"""<section class="card">
-  <div class="card-head">{ic("comment", 16, "h-ic")}<h2>Ваш комментарий</h2></div>
-  <div class="card-body">
-    <form method="post" action="/posts/{post_id}/comments">
-      <textarea name="content" rows="4" maxlength="{COMMENT_MAX}" data-max="{COMMENT_MAX}"
-        placeholder="Написать комментарий... Ctrl+Enter — отправить."></textarea>
-      <div style="margin-top:10px;display:flex;align-items:center;gap:10px">
-        <button class="btn btn-primary" type="submit">{ic("send", 15)}<span>Отправить</span></button>
-        <span class="hint">Ctrl+Enter</span>
-      </div>
-    </form>
-  </div>
-</section>"""
-    else:
-        form_html = f"""<section class="card">
-  <div class="card-body" style="color:var(--dim);display:flex;align-items:center;gap:10px">
-    {ic("user", 18, "h-ic")}
-    Чтобы оставить комментарий, <a href="/login">войдите</a> или <a href="/register">зарегистрируйтесь</a>.
-  </div>
-</section>"""
-
-    alerts = ""
-    if err:
-        alerts += alert_html("err", err)
-    if msg:
-        alerts += alert_html("ok", msg)
-
-    cnt = len(comments)
-    body = f"""{crumbs([("Лента", "/"), (f"Тема #{post_id}", None)])}
-{alerts}
-<section class="card">
-  <div class="card-head">{ic("file", 16, "h-ic")}<h2>Тема #{post_id}</h2>
-    <span class="h-count">{cnt} {esc(plural(cnt, "комментарий", "комментария", "комментариев"))}</span>
-  </div>
-  {post_html}
-</section>
-
-<section class="card">
-  <div class="card-head">{ic("comment", 16, "h-ic")}<h2>Обсуждение</h2><span class="h-count">{cnt}</span></div>
-  {comments_html}
-</section>
-
-{form_html}
-
-<div><a href="/" class="btn btn-ghost">{ic("back", 14)}<span>К ленте</span></a></div>"""
-    return HTMLResponse(layout(f"Тема #{post_id}", me, body))
-
-
-@app.get("/posts/{post_id}/edit", response_class=HTMLResponse)
-def post_edit_get(request: Request, post_id: int):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    rows = (sb.table("posts").select("id,user_id,content")
-            .eq("id", post_id).limit(1).execute().data)
-    if not rows:
-        return HTMLResponse(layout("Не найдено", me, empty_html("Тема не найдена.")),
-                            status_code=404)
-    p = rows[0]
-    if p["user_id"] != me["id"]:
-        return HTMLResponse(layout("Отказано", me,
-                                   alert_html("err", "Это не ваша тема.")),
-                            status_code=403)
-
-    body = f"""{crumbs([("Лента", "/"), (f"Тема #{post_id}", f"/posts/{post_id}"), ("Правка", None)])}
-<section class="card">
-  <div class="card-head">{ic("edit", 16, "h-ic")}<h2>Редактирование темы #{post_id}</h2></div>
-  <div class="card-body">
-    <form method="post" action="/posts/{post_id}/edit">
-      <textarea name="content" rows="10" maxlength="{POST_MAX}" data-max="{POST_MAX}">{esc(p['content'])}</textarea>
-      <div style="margin-top:10px;display:flex;gap:10px">
-        <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сохранить</span></button>
-        <a class="btn btn-ghost" href="/posts/{post_id}">Отмена</a>
-      </div>
-    </form>
-  </div>
-</section>"""
-    return HTMLResponse(layout("Редактирование", me, body))
-
-
-@app.post("/posts/{post_id}/edit")
-def post_edit_post(request: Request, post_id: int, content: str = Form("")):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    rows = (sb.table("posts").select("id,user_id")
-            .eq("id", post_id).limit(1).execute().data)
-    if not rows or rows[0]["user_id"] != me["id"]:
-        return RedirectResponse("/", status_code=303)
-
-    content = (content or "").strip()
-    if not content:
-        return RedirectResponse(f"/posts/{post_id}/edit", status_code=303)
-    if len(content) > POST_MAX:
-        content = content[:POST_MAX]
-
-    sb.table("posts").update({
-        "content": content,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", post_id).execute()
-
-    return RedirectResponse(f"/posts/{post_id}?msg=Тема+обновлена", status_code=303)
-
-
-@app.post("/posts/{post_id}/delete")
-def post_delete(request: Request, post_id: int):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    rows = (sb.table("posts").select("id,user_id")
-            .eq("id", post_id).limit(1).execute().data)
-    if rows and rows[0]["user_id"] == me["id"]:
-        sb.table("posts").delete().eq("id", post_id).execute()
-
-    return RedirectResponse("/?msg=Тема+удалена", status_code=303)
-
-
-# ===========================================================================
-# Комментарии
-# ===========================================================================
-
-@app.post("/posts/{post_id}/comments")
-def comment_create(request: Request, post_id: int, content: str = Form("")):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    content = (content or "").strip()
-    if not content:
-        return RedirectResponse(f"/posts/{post_id}?err=Пустой+комментарий", status_code=303)
-    if len(content) > COMMENT_MAX:
-        content = content[:COMMENT_MAX]
-
-    if not sb.table("posts").select("id").eq("id", post_id).limit(1).execute().data:
-        return RedirectResponse("/", status_code=303)
-
-    sb.table("comments").insert({
-        "post_id": post_id, "user_id": me["id"], "content": content,
-    }).execute()
-
-    return RedirectResponse(f"/posts/{post_id}?msg=Комментарий+добавлен", status_code=303)
-
-
-@app.post("/comments/{comment_id}/delete")
-def comment_delete(request: Request, comment_id: int):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    rows = (sb.table("comments").select("id,user_id,post_id")
-            .eq("id", comment_id).limit(1).execute().data)
-    if not rows:
-        return RedirectResponse("/", status_code=303)
-
-    c = rows[0]
-    if c["user_id"] == me["id"]:
-        sb.table("comments").delete().eq("id", comment_id).execute()
-
-    return RedirectResponse(f"/posts/{c['post_id']}?msg=Комментарий+удалён",
-                            status_code=303)
-
-
-# ===========================================================================
-# Профиль
-# ===========================================================================
-
-def _profile_info_rows(u: dict) -> str:
-    rows = [
-        ("Имя", u.get("username")),
-        ("Город", u.get("city")),
-        ("День рождения", u.get("birthday")),
-        ("Сайт", u.get("site")),
-        ("На сайте с", fmt_dt(u.get("created_at"))),
-    ]
-    html_rows = []
-    for k, v in rows:
-        if not v:
-            continue
-        if k == "Сайт":
-            link = esc(v)
-            if not link.startswith("http"):
-                link = "http://" + link
-            v_html = f'<a href="{link}" target="_blank" rel="noopener">{esc(v)}</a>'
-        else:
-            v_html = esc(v)
-        html_rows.append(f'<div class="info-row"><div class="k">{esc(k)}</div><div>{v_html}</div></div>')
-    if not html_rows:
-        return '<div class="muted" style="color:var(--mute);font-size:12px">Информация не заполнена.</div>'
-    return "".join(html_rows)
-
-
-@app.get("/u/{username}", response_class=HTMLResponse)
-def profile(request: Request, username: str, msg: str = "", err: str = ""):
-    me = current_user(request)
-
-    rows = (sb.table("users").select("*")
-            .ilike("username", username).limit(1).execute().data)
-    if not rows:
-        return HTMLResponse(layout("Не найдено", me,
-                                   empty_html("Пользователь не найден.")),
-                            status_code=404)
-    owner = rows[0]
-    is_me = bool(me and me["id"] == owner["id"])
-
-    try:
-        posts = fetch_posts(user_id=owner["id"])
-    except Exception as e:
-        posts = []
-        err = err or f"Ошибка БД: {e}"
-    counts = comment_counts_for([p["id"] for p in posts])
-
-    status_line = esc(owner.get("status") or "")
-    status_html = (f'<div class="profile-status">«{status_line}»</div>'
-                   if status_line else
-                   '<div class="profile-status" style="opacity:.6">статус не указан</div>')
-
-    edit_link = ""
-    if is_me:
-        edit_link = (f'<div style="margin-top:12px">'
-                     f'<a class="btn btn-sm" href="/settings">{ic("cog", 14)}<span>Редактировать профиль</span></a>'
-                     f'</div>')
-
-    about = owner.get("about")
-    about_block = ""
-    if about:
-        about_block = f"""<section class="card">
-  <div class="card-head">{ic("file", 16, "h-ic")}<h2>О себе</h2></div>
-  <div class="card-body" style="white-space:pre-wrap;line-height:1.6">{esc(about)}</div>
-</section>"""
-
-    n = len(posts)
-    cnt_word = plural(n, "запись", "записи", "записей")
-
-    alerts = ""
-    if err:
-        alerts += alert_html("err", err)
-    if msg:
-        alerts += alert_html("ok", msg)
-
-    body = f"""{crumbs([("Участники", "/people"), (owner['username'], None)])}
-{alerts}
-<section class="card">
-  <div class="profile-head">
-    {avatar_html(owner["username"], owner.get("avatar"), 128)}
-    <div class="profile-info">
-      <div class="profile-name">{esc(owner['username'])}</div>
-      {status_html}
-      <div class="info-list">{_profile_info_rows(owner)}</div>
-      {edit_link}
-    </div>
-  </div>
-</section>
-
-{about_block}
-
-<section class="card">
-  <div class="card-head">{ic("feed", 16, "h-ic")}<h2>Записи участника</h2>
-    <span class="h-count">{n} {esc(cnt_word)}</span>
-  </div>
-  {render_posts(posts, me, counts,
-                empty_text=("Вы ещё ничего не написали." if is_me else "Записей нет."))}
-</section>"""
-    return HTMLResponse(layout(owner["username"], me, body,
-                               active="me" if is_me else ""))
-
-
-# ===========================================================================
-# Настройки профиля
-# ===========================================================================
-
-@app.get("/settings", response_class=HTMLResponse)
-def settings_get(request: Request, msg: str = "", err: str = ""):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    alerts = ""
-    if err:
-        alerts += alert_html("err", err)
-    if msg:
-        alerts += alert_html("ok", msg)
-
-    body = f"""{crumbs([(me['username'], f"/u/{esc(me['username'])}"), ("Настройки", None)])}
-{alerts}
-<section class="card">
-  <div class="card-head">{ic("cog", 16, "h-ic")}<h2>Настройки профиля</h2></div>
-  <div class="card-body">
-    <form method="post" action="/settings" enctype="multipart/form-data">
-
-      <div style="font-family:var(--mono);font-size:11px;letter-spacing:1.4px;
-                  text-transform:uppercase;color:var(--mute);margin-bottom:10px">
-        Фотография
-      </div>
-      <div style="display:flex;gap:16px;align-items:flex-start;margin-bottom:18px">
-        <div>{avatar_html(me["username"], me.get("avatar"), 108)}</div>
-        <div style="flex:1;color:var(--dim);font-size:12.5px;line-height:1.55">
-          JPEG, PNG или GIF. Автоматически сжимается до 512&times;512 и не более 150 КБ.<br>
-          <input type="file" name="avatar" accept="image/*" style="margin-top:8px;color:var(--dim)">
-          <label style="display:flex;gap:7px;align-items:center;margin-top:8px;cursor:pointer">
-            <input type="checkbox" name="avatar_remove" value="1">
-            <span>удалить текущую фотографию</span>
-          </label>
-        </div>
-      </div>
-
-      <div style="font-family:var(--mono);font-size:11px;letter-spacing:1.4px;
-                  text-transform:uppercase;color:var(--mute);margin-bottom:10px">
-        Основное
-      </div>
-
-      <div class="field"><label>Статус</label>
-        <input type="text" name="status" maxlength="200" style="width:100%"
-               value="{esc(me.get('status') or '')}"
-               placeholder="Короткая фраза о себе"></div>
-      <div class="field"><label>Город</label>
-        <input type="text" name="city" maxlength="100"
-               value="{esc(me.get('city') or '')}"></div>
-      <div class="field"><label>День рождения</label>
-        <input type="text" name="birthday" maxlength="20"
-               value="{esc(me.get('birthday') or '')}"
-               placeholder="например, 12 мая"></div>
-      <div class="field"><label>Сайт</label>
-        <input type="text" name="site" maxlength="200"
-               value="{esc(me.get('site') or '')}"
-               placeholder="http://..."></div>
-      <div class="field"><label>О себе</label>
-        <textarea name="about" rows="7" maxlength="{ABOUT_MAX}" data-max="{ABOUT_MAX}"
-          placeholder="Пара слов о себе...">{esc(me.get('about') or '')}</textarea></div>
-
-      <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сохранить</span></button>
-        <a class="btn btn-ghost" href="/u/{esc(me['username'])}">Отмена</a>
-      </div>
-    </form>
-  </div>
-</section>
-
-<section class="card">
-  <div class="card-head">{ic("cog", 16, "h-ic")}<h2>Смена пароля</h2></div>
-  <div class="card-body">
-    <form method="post" action="/settings/password">
-      <div class="field"><label>Текущий пароль</label>
-        <input type="password" name="old_password"></div>
-      <div class="field"><label>Новый пароль</label>
-        <input type="password" name="new_password"></div>
-      <div class="field"><label>Повтор нового</label>
-        <input type="password" name="new_password2"></div>
-      <button class="btn btn-primary" type="submit">{ic("check", 15)}<span>Сменить пароль</span></button>
-    </form>
-  </div>
-</section>"""
-    return HTMLResponse(layout("Настройки", me, body, active="settings"))
-
-
-@app.post("/settings")
-async def settings_post(
-    request: Request,
-    status: str = Form(""),
-    city: str = Form(""),
-    about: str = Form(""),
-    site: str = Form(""),
-    birthday: str = Form(""),
-    avatar_remove: str = Form(""),
-    avatar: UploadFile = File(None),
-):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    update = {
-        "status":   (status.strip()[:200] or None),
-        "city":     (city.strip()[:100] or None),
-        "about":    (about.strip()[:ABOUT_MAX] or None),
-        "site":     (site.strip()[:200] or None),
-        "birthday": (birthday.strip()[:20] or None),
-    }
-
-    if avatar_remove:
-        update["avatar"] = None
-    elif avatar and avatar.filename:
-        raw = await avatar.read()
-        if not raw:
-            return RedirectResponse("/settings?err=Пустой+файл", status_code=303)
-        if len(raw) > AVATAR_UPLOAD_MAX:
-            return RedirectResponse("/settings?err=Файл+слишком+большой", status_code=303)
-        data_url = process_avatar(raw)
-        if not data_url:
-            return RedirectResponse("/settings?err=Не+удалось+обработать+изображение",
-                                    status_code=303)
-        update["avatar"] = data_url
-
-    try:
-        sb.table("users").update(update).eq("id", me["id"]).execute()
-    except Exception:
-        return RedirectResponse("/settings?err=Не+удалось+сохранить", status_code=303)
-
-    return RedirectResponse("/settings?msg=Профиль+сохранён", status_code=303)
-
-
-@app.post("/settings/password")
-def settings_password(request: Request,
-                      old_password: str = Form(""),
-                      new_password: str = Form(""),
-                      new_password2: str = Form("")):
-    me = current_user(request)
-    if not me:
-        return RedirectResponse("/login", status_code=303)
-
-    if not verify_password(old_password, me["password_hash"]):
-        return RedirectResponse("/settings?err=Неверный+текущий+пароль", status_code=303)
-    if len(new_password) < 6:
-        return RedirectResponse("/settings?err=Пароль+короче+6+символов", status_code=303)
-    if new_password != new_password2:
-        return RedirectResponse("/settings?err=Пароли+не+совпадают", status_code=303)
-
-    sb.table("users").update({
-        "password_hash": hash_password(new_password),
-    }).eq("id", me["id"]).execute()
-
-    token = request.cookies.get(SESSION_COOKIE)
-    try:
-        sb.table("sessions").delete().eq("user_id", me["id"]).neq("token", token).execute()
-    except Exception:
-        pass
-
-    return RedirectResponse("/settings?msg=Пароль+изменён", status_code=303)
-
-
-# ===========================================================================
-# Участники
-# ===========================================================================
-
-@app.get("/people", response_class=HTMLResponse)
-def people(request: Request):
-    me = current_user(request)
-    try:
-        users = (sb.table("users")
-                 .select("id,username,avatar,city,status,created_at")
-                 .order("created_at", desc=True).limit(200).execute().data) or []
-        db_err = ""
-    except Exception as e:
-        users = []
-        db_err = str(e)
-
-    items = []
-    for u in users:
-        un = esc(u["username"])
-        bits = []
-        if u.get("city"):
-            bits.append(f'{ic("home", 12)} {esc(u["city"])}')
-        if u.get("status"):
-            bits.append(f'«{esc(u["status"])}»')
-        meta = " · ".join(bits)
-
-        items.append(f"""<article class="post">
-  {avatar_html(u['username'], u.get('avatar'), 42)}
-  <div class="post-body">
-    <div class="post-head">
-      <a class="post-author" href="/u/{un}">{un}</a>
-      <span class="post-time" title="{esc(fmt_iso(u.get('created_at')))}">{ic("clock", 11)}{esc(fmt_dt(u.get('created_at')))}</span>
-    </div>
-    {f'<div style="font-size:12.5px;color:var(--dim)">{meta}</div>' if meta else ''}
-  </div>
-</article>""")
-
-    inner = "".join(items) if items else empty_html("Пока никого.")
-    alerts = alert_html("err", db_err) if db_err else ""
-
-    body = f"""{crumbs([("Участники", None)])}
-{alerts}
-<section class="card">
-  <div class="card-head">{ic("users", 16, "h-ic")}<h2>Участники</h2>
-    <span class="h-count">{len(users)}</span>
-  </div>
-  {inner}
-</section>"""
-    return HTMLResponse(layout("Участники", me, body, active="people"))
-
-
-# ===========================================================================
-# Служебное
-# ===========================================================================
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
+async def index():
+    return HTML_PAGE
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    # Простая SVG-иконка "СЛД"
+    svg = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#111827"/><text x="32" y="43" font-family="sans-serif" font-size="28" font-weight="700" fill="#fff" text-anchor="middle">\xd0\xa1\xd0\x9b\xd0\x94</text></svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
