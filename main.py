@@ -1,260 +1,440 @@
-# main.py
-# Запуск:  pip install fastapi uvicorn
-#          python main.py
-# Открыть: http://localhost:8000/input   (пишем сообщения)
-#          http://localhost:8000/output  (озвучивается голосом браузера)
+"""
+Мини-Википедия на FastAPI. Хранилище — в оперативке (dict).
+Запуск:  uvicorn main:app --reload
+Открыть: http://127.0.0.1:8000
+"""
+from __future__ import annotations
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-import asyncio
+import re
+from datetime import datetime
+from typing import Dict, List, Optional
 
-app = FastAPI(title="Chat TTS")
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from jinja2 import DictLoader, Environment, select_autoescape
 
-# ---------- Хранилище сообщений в памяти ----------
-_messages: list[dict] = []
-_next_id = 1
-_lock = asyncio.Lock()
+# ---------- Markdown ----------
+try:
+    import markdown as _md
 
+    def render_md(text: str) -> str:
+        return _md.markdown(text, extensions=["fenced_code", "tables", "nl2br"])
+except ImportError:
+    import html as _html
 
-class MessageIn(BaseModel):
-    text: str
-
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return """
-    <html><body style="font-family:system-ui;background:#111;color:#eee;padding:40px">
-      <h1>Chat TTS</h1>
-      <p><a style="color:#4caf50" href="/input">→ /input</a> — писать сообщения</p>
-      <p><a style="color:#4caf50" href="/output">→ /output</a> — слушать (открой в отдельной вкладке)</p>
-    </body></html>
-    """
+    def render_md(text: str) -> str:
+        return "<pre>" + _html.escape(text) + "</pre>"
 
 
-@app.post("/api/send")
-async def send(m: MessageIn):
-    global _next_id
-    text = m.text.strip()
-    if not text:
-        return {"ok": False}
-    async with _lock:
-        item = {"id": _next_id, "text": text}
-        _messages.append(item)
-        _next_id += 1
-    return item
+# ---------- Хранилище в памяти ----------
+# slug -> {"slug", "title", "content", "created_at", "updated_at"}
+ARTICLES: Dict[str, dict] = {}
 
 
-@app.get("/api/messages")
-async def get_messages(since: int = 0):
-    return [m for m in _messages if m["id"] > since]
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-# ---------- Страница /input ----------
-INPUT_HTML = """<!DOCTYPE html>
-<html lang="en">
+# ---------- Slug ----------
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text or "article"
+
+
+def unique_slug(desired: str, ignore: Optional[str] = None) -> str:
+    if desired not in ARTICLES or desired == ignore:
+        return desired
+    n = 1
+    base = desired
+    while f"{base}-{n}" in ARTICLES and f"{base}-{n}" != ignore:
+        n += 1
+    return f"{base}-{n}"
+
+
+def preview_of(content: str, limit: int = 160) -> str:
+    text = re.sub(r"```.*?```", " ", content, flags=re.S)
+    text = re.sub(r"[#*_>`\[\]()!]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+# ---------- Шаблоны ----------
+TEMPLATES = {
+    "base.html": """
+<!DOCTYPE html>
+<html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Input — Chat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}MiniWiki{% endblock %}</title>
 <style>
+  :root { --link:#3366cc; --border:#a2a9b1; --bg:#f6f6f6; }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background:#111; color:#eee;
-         margin:0; height:100vh; display:flex; flex-direction:column; }
-  header { padding: 12px 20px; background:#1a1a1a; border-bottom:1px solid #333;
-           font-weight:600; display:flex; justify-content:space-between; align-items:center; }
-  header a { color:#4caf50; text-decoration:none; font-weight:400; font-size:14px; }
-  #chat { flex:1; overflow-y:auto; padding: 16px 20px; }
-  .msg { padding: 10px 14px; margin: 6px 0; background:#1e1e1e; border-radius:10px;
-         border-left: 3px solid #4caf50; max-width: 75%; word-wrap:break-word; }
-  form { display:flex; gap:8px; padding: 12px; background:#1a1a1a; border-top:1px solid #333; }
-  input { flex:1; padding: 12px; font-size: 15px; border-radius:8px;
-          border:1px solid #333; background:#0d0d0d; color:#eee; outline:none; }
-  input:focus { border-color:#4caf50; }
-  button { padding: 12px 20px; font-size: 15px; border:none; border-radius:8px;
-           background:#4caf50; color:#fff; cursor:pointer; }
-  button:hover { background:#45a049; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+         color:#202122; background:#fff; }
+  header { border-bottom:1px solid var(--border); padding:10px 20px;
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header .logo { font-family: Georgia, serif; font-size:22px; font-weight:bold; }
+  header .logo a { color:#202122; text-decoration:none; }
+  header form.search { display:flex; gap:6px; margin-left:auto; }
+  header input[type=search] { padding:6px 10px; border:1px solid var(--border);
+                              border-radius:2px; width:220px; }
+  .container { max-width:900px; margin:0 auto; padding:24px 20px 60px; }
+  h1 { font-family: Georgia, serif; font-weight:normal;
+       border-bottom:1px solid var(--border); padding-bottom:8px; }
+  h2 { font-family: Georgia, serif; font-weight:normal;
+       border-bottom:1px solid var(--border); padding-bottom:4px; margin-top:28px; }
+  a { color: var(--link); }
+  .btn { display:inline-block; padding:6px 12px; border:1px solid var(--border);
+         background:var(--bg); border-radius:2px; text-decoration:none;
+         color:#202122; cursor:pointer; font-size:14px; font-family:inherit; }
+  .btn:hover { background:#eaecf0; }
+  .btn.primary { background:#36c; color:#fff; border-color:#36c; }
+  .btn.primary:hover { background:#2a4b8d; }
+  .btn.danger { color:#b32424; }
+  input[type=text], textarea { width:100%; padding:8px 10px;
+        border:1px solid var(--border); border-radius:2px;
+        font-family:inherit; font-size:15px; }
+  textarea { min-height:320px; font-family: ui-monospace, Menlo, monospace;
+             line-height:1.5; }
+  label { display:block; margin:14px 0 6px; font-weight:bold; }
+  .article-body { font-family: Georgia, serif; font-size:16px; line-height:1.7; }
+  .article-body pre { background:var(--bg); padding:12px; overflow:auto; font-size:14px;
+                      border:1px solid #eaecf0; border-radius:2px; }
+  .article-body code { background:var(--bg); padding:2px 4px; border-radius:2px; }
+  .article-body pre code { background:transparent; padding:0; }
+  .article-body blockquote { border-left:4px solid #eaecf0; margin:1em 0;
+                             padding:0 1em; color:#54595d; }
+  .article-body table { border-collapse:collapse; }
+  .article-body th, .article-body td { border:1px solid var(--border); padding:6px 10px; }
+  .meta { color:#72777d; font-size:13px; margin-top:32px;
+          border-top:1px solid var(--border); padding-top:8px; }
+  ul.articles { list-style:none; padding:0; }
+  ul.articles li { padding:10px 0; border-bottom:1px solid #eaecf0; }
+  ul.articles .desc { color:#54595d; font-size:14px; margin-top:4px; }
+  .actions { display:flex; gap:8px; margin:16px 0; }
+  .actions form { margin:0; }
+  .empty { color:#72777d; font-style:italic; }
+  .error { background:#fee7e6; color:#b32424; padding:8px 12px;
+           border:1px solid #f8c3c0; border-radius:2px; margin:12px 0; }
+  .hint { color:#72777d; font-size:13px; margin-top:4px; }
+  .note { background:#eaf3ff; border:1px solid #c8dcf5; color:#2a4b8d;
+          padding:8px 12px; border-radius:2px; margin:12px 0; font-size:14px; }
 </style>
 </head>
 <body>
 <header>
-  <span>💬 Input</span>
-  <a href="/output" target="_blank">open /output →</a>
+  <div class="logo"><a href="/">📖 MiniWiki</a></div>
+  <form class="search" action="/search" method="get">
+    <input type="search" name="q" placeholder="Поиск…" value="{{ q or '' }}">
+    <button class="btn" type="submit">Найти</button>
+  </form>
+  <a class="btn primary" href="/new">+ Новая статья</a>
 </header>
-<div id="chat"></div>
-<form id="form">
-  <input id="text" autofocus autocomplete="off"
-         placeholder="Напиши сообщение на русском или English...">
-  <button type="submit">Send</button>
+<div class="container">
+{% block content %}{% endblock %}
+</div>
+</body>
+</html>
+""",
+
+    "index.html": """
+{% extends "base.html" %}
+{% block content %}
+<h1>Все статьи</h1>
+<div class="note">
+  ⚠️ Статьи хранятся <b>только в оперативной памяти</b>.
+  После перезапуска сервера они исчезнут.
+</div>
+{% if articles %}
+<ul class="articles">
+{% for a in articles %}
+  <li>
+    <a href="/wiki/{{ a.slug }}"><strong>{{ a.title }}</strong></a>
+    <div class="desc">{{ a.preview }}</div>
+  </li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="empty">Пока нет статей. <a href="/new">Создайте первую!</a></p>
+{% endif %}
+{% endblock %}
+""",
+
+    "search.html": """
+{% extends "base.html" %}
+{% block title %}Поиск: {{ q }} — MiniWiki{% endblock %}
+{% block content %}
+<h1>Поиск: «{{ q }}»</h1>
+{% if articles %}
+  <p>Найдено статей: {{ articles|length }}</p>
+  <ul class="articles">
+  {% for a in articles %}
+    <li>
+      <a href="/wiki/{{ a.slug }}"><strong>{{ a.title }}</strong></a>
+      <div class="desc">{{ a.preview }}</div>
+    </li>
+  {% endfor %}
+  </ul>
+{% else %}
+  <p class="empty">Ничего не найдено.</p>
+{% endif %}
+{% endblock %}
+""",
+
+    "article.html": """
+{% extends "base.html" %}
+{% block title %}{{ article.title }} — MiniWiki{% endblock %}
+{% block content %}
+<h1>{{ article.title }}</h1>
+<div class="actions">
+  <a class="btn" href="/edit/{{ article.slug }}">✏️ Редактировать</a>
+  <form method="post" action="/delete/{{ article.slug }}"
+        onsubmit="return confirm('Удалить статью «{{ article.title }}»?')">
+    <button class="btn danger" type="submit">🗑 Удалить</button>
+  </form>
+</div>
+<div class="article-body">{{ content|safe }}</div>
+<div class="meta">
+  Создано: {{ article.created_at }} · Обновлено: {{ article.updated_at }} ·
+  slug: <code>{{ article.slug }}</code>
+</div>
+{% endblock %}
+""",
+
+    "form.html": """
+{% extends "base.html" %}
+{% block title %}{{ heading }} — MiniWiki{% endblock %}
+{% block content %}
+<h1>{{ heading }}</h1>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<form method="post" action="{{ action }}">
+  <label for="title">Заголовок</label>
+  <input type="text" id="title" name="title" value="{{ title }}" required autofocus>
+
+  <label for="slug">Slug (URL)</label>
+  <input type="text" id="slug" name="slug" value="{{ slug }}"
+         placeholder="оставьте пустым — сгенерируется автоматически">
+  <div class="hint">Например: <code>python-fastapi</code></div>
+
+  <label for="content">Содержимое (Markdown)</label>
+  <textarea id="content" name="content">{{ content }}</textarea>
+  <div class="hint">
+    Поддерживается Markdown: <code># заголовок</code>, <code>**жирный**</code>,
+    <code>*курсив*</code>, <code>[ссылка](url)</code>, <code>```код```</code>,
+    списки, таблицы.
+  </div>
+
+  <div class="actions" style="margin-top:18px">
+    <button class="btn primary" type="submit">💾 Сохранить</button>
+    <a class="btn" href="{{ cancel_url }}">Отмена</a>
+  </div>
 </form>
-<script>
-const chat = document.getElementById('chat');
-const form = document.getElementById('form');
-const text = document.getElementById('text');
-let lastId = 0;
+{% endblock %}
+""",
 
-function addMsg(m){
-  const d = document.createElement('div');
-  d.className = 'msg';
-  d.textContent = m.text;
-  chat.appendChild(d);
-  chat.scrollTop = chat.scrollHeight;
+    "404.html": """
+{% extends "base.html" %}
+{% block title %}Не найдено — MiniWiki{% endblock %}
+{% block content %}
+<h1>404 — страница не найдена</h1>
+<p class="empty">{{ message }}</p>
+<p><a href="/">← На главную</a></p>
+{% endblock %}
+""",
 }
 
-form.onsubmit = async (e) => {
-  e.preventDefault();
-  const t = text.value.trim();
-  if (!t) return;
-  text.value = '';
-  const r = await fetch('/api/send', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text: t})
-  });
-  if (r.ok){
-    const m = await r.json();
-    if (m.id) { lastId = Math.max(lastId, m.id); addMsg(m); }
-  }
-};
-
-(async () => {
-  const r = await fetch('/api/messages?since=0');
-  const arr = await r.json();
-  arr.forEach(m => { lastId = Math.max(lastId, m.id); addMsg(m); });
-})();
-</script>
-</body>
-</html>
-"""
+env = Environment(loader=DictLoader(TEMPLATES), autoescape=select_autoescape(["html"]))
 
 
-# ---------- Страница /output ----------
-OUTPUT_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Output — Voice</title>
-<style>
-  body { font-family: system-ui, sans-serif; background:#111; color:#eee;
-         margin:0; padding:20px; }
-  h1 { font-size: 18px; margin:0 0 8px; }
-  #status { color:#888; font-size: 13px; margin-bottom: 12px; }
-  #log { max-width: 800px; }
-  .msg { padding: 10px 14px; margin: 6px 0; background:#1e1e1e; border-radius:10px;
-         border-left: 3px solid #4caf50; word-wrap:break-word; transition: all .2s; }
-  .msg.speaking { background:#2a3f2a; border-left-color:#ffeb3b; }
-  #enable { padding: 10px 18px; font-size: 15px; border:none; border-radius:8px;
-            background:#4caf50; color:#fff; cursor:pointer; margin-bottom:12px; }
-  #enable:hover { background:#45a049; }
-</style>
-</head>
-<body>
-<h1>🔊 Output — голос браузера</h1>
-<div id="status">Инициализация...</div>
-<button id="enable">▶ Включить озвучку</button>
-<div id="log"></div>
+def render(name: str, status_code: int = 200, **ctx) -> HTMLResponse:
+    return HTMLResponse(env.get_template(name).render(**ctx), status_code=status_code)
 
-<script>
-const log = document.getElementById('log');
-const statusEl = document.getElementById('status');
-let lastId = 0;
-let queue = [];
-let busy = false;
-let enabled = false;
 
-// Определяем язык по кириллице
-function detectLang(t){
-  return /[\\u0400-\\u04FF]/.test(t) ? 'ru-RU' : 'en-US';
-}
+# ---------- Приложение ----------
+app = FastAPI(title="MiniWiki")
 
-// Подбираем голос под язык
-function pickVoice(lang){
-  const voices = speechSynthesis.getVoices();
-  return voices.find(v => v.lang === lang)
-      || voices.find(v => v.lang.replace('_','-') === lang)
-      || voices.find(v => v.lang.toLowerCase().startsWith(lang.slice(0,2).toLowerCase()));
-}
 
-function next(){
-  if (busy) return;
-  const item = queue.shift();
-  if (!item){
-    statusEl.textContent = 'Ожидание сообщений...';
-    return;
-  }
-  busy = true;
-  statusEl.textContent = '🔈 ' + item.text;
-  item.el.classList.add('speaking');
+# ---------- Роуты ----------
+@app.get("/", response_class=HTMLResponse)
+def index() -> HTMLResponse:
+    articles = sorted(
+        (
+            {
+                "slug": a["slug"],
+                "title": a["title"],
+                "preview": preview_of(a["content"]),
+            }
+            for a in ARTICLES.values()
+        ),
+        key=lambda x: x["title"].lower(),
+    )
+    return render("index.html", articles=articles)
 
-  const u = new SpeechSynthesisUtterance(item.text);
-  const lang = detectLang(item.text);
-  u.lang = lang;
-  const v = pickVoice(lang);
-  if (v) u.voice = v;
-  u.rate = 1.0;
-  u.pitch = 1.0;
 
-  const done = () => {
-    item.el.classList.remove('speaking');
-    busy = false;
-    next();
-  };
-  u.onend = done;
-  u.onerror = done;
-  speechSynthesis.speak(u);
-}
+@app.get("/search", response_class=HTMLResponse)
+def search(q: str = "") -> HTMLResponse:
+    q = q.strip()
+    if not q:
+        return RedirectResponse("/", status_code=303)
+    needle = q.lower()
+    found = [
+        {
+            "slug": a["slug"],
+            "title": a["title"],
+            "preview": preview_of(a["content"]),
+        }
+        for a in ARTICLES.values()
+        if needle in a["title"].lower() or needle in a["content"].lower()
+    ]
+    found.sort(key=lambda x: x["title"].lower())
+    return render("search.html", q=q, articles=found)
 
-function enqueue(text, el){
-  queue.push({ text, el });
-  next();
-}
 
-async function poll(){
-  try {
-    const r = await fetch('/api/messages?since=' + lastId);
-    const arr = await r.json();
-    for (const m of arr){
-      lastId = Math.max(lastId, m.id);
-      const d = document.createElement('div');
-      d.className = 'msg';
-      d.textContent = m.text;
-      log.appendChild(d);
-      if (enabled) enqueue(m.text, d);
+@app.get("/wiki/{slug}", response_class=HTMLResponse)
+def view_article(slug: str) -> HTMLResponse:
+    article = ARTICLES.get(slug)
+    if not article:
+        raise HTTPException(status_code=404, detail=f"Статья «{slug}» не существует.")
+    return render(
+        "article.html",
+        article=article,
+        content=render_md(article["content"]),
+    )
+
+
+# ---- Создание ----
+@app.get("/new", response_class=HTMLResponse)
+def new_article_form() -> HTMLResponse:
+    return render(
+        "form.html",
+        heading="Новая статья",
+        action="/new",
+        cancel_url="/",
+        title="",
+        slug="",
+        content="",
+        error=None,
+    )
+
+
+@app.post("/new")
+def create_article(
+    title: str = Form(...),
+    content: str = Form(""),
+    slug: str = Form(""),
+):
+    title = title.strip()
+    if not title:
+        return render(
+            "form.html",
+            heading="Новая статья",
+            action="/new",
+            cancel_url="/",
+            title=title,
+            slug=slug,
+            content=content,
+            error="Заголовок не может быть пустым.",
+            status_code=400,
+        )
+
+    desired = slugify(slug.strip() or title)
+    final_slug = unique_slug(desired)
+    ts = now_str()
+    ARTICLES[final_slug] = {
+        "slug": final_slug,
+        "title": title,
+        "content": content,
+        "created_at": ts,
+        "updated_at": ts,
     }
-  } catch (e) { /* ignore */ }
-  setTimeout(poll, 700);
-}
-
-// "Разогреваем" голоса
-speechSynthesis.getVoices();
-speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
-
-document.getElementById('enable').onclick = () => {
-  enabled = true;
-  // «тихое» воспроизведение, чтобы разблокировать аудио в браузере
-  const warm = new SpeechSynthesisUtterance(' ');
-  warm.volume = 0;
-  speechSynthesis.speak(warm);
-  document.getElementById('enable').style.display = 'none';
-  statusEl.textContent = 'Ожидание сообщений...';
-};
-
-poll();
-</script>
-</body>
-</html>
-"""
+    return RedirectResponse(f"/wiki/{final_slug}", status_code=303)
 
 
-@app.get("/input", response_class=HTMLResponse)
-async def input_page():
-    return INPUT_HTML
+# ---- Редактирование ----
+@app.get("/edit/{slug}", response_class=HTMLResponse)
+def edit_article_form(slug: str) -> HTMLResponse:
+    article = ARTICLES.get(slug)
+    if not article:
+        raise HTTPException(status_code=404, detail=f"Статья «{slug}» не найдена.")
+    return render(
+        "form.html",
+        heading=f"Редактирование: {article['title']}",
+        action=f"/edit/{slug}",
+        cancel_url=f"/wiki/{slug}",
+        title=article["title"],
+        slug=article["slug"],
+        content=article["content"],
+        error=None,
+    )
 
 
-@app.get("/output", response_class=HTMLResponse)
-async def output_page():
-    return OUTPUT_HTML
+@app.post("/edit/{slug}")
+def update_article(
+    slug: str,
+    title: str = Form(...),
+    content: str = Form(""),
+    slug_new: str = Form("", alias="slug"),
+):
+    if slug not in ARTICLES:
+        raise HTTPException(status_code=404, detail="Статья не найдена.")
+
+    title = title.strip()
+    if not title:
+        return render(
+            "form.html",
+            heading=f"Редактирование: {slug}",
+            action=f"/edit/{slug}",
+            cancel_url=f"/wiki/{slug}",
+            title=title,
+            slug=slug_new,
+            content=content,
+            error="Заголовок не может быть пустым.",
+            status_code=400,
+        )
+
+    desired = slugify(slug_new.strip() or title)
+    final_slug = unique_slug(desired, ignore=slug)
+
+    article = ARTICLES.pop(slug)
+    article["title"] = title
+    article["content"] = content
+    article["slug"] = final_slug
+    article["updated_at"] = now_str()
+    ARTICLES[final_slug] = article
+
+    return RedirectResponse(f"/wiki/{final_slug}", status_code=303)
 
 
+# ---- Удаление ----
+@app.post("/delete/{slug}")
+def delete_article(slug: str):
+    if slug not in ARTICLES:
+        raise HTTPException(status_code=404, detail="Статья не найдена.")
+    del ARTICLES[slug]
+    return RedirectResponse("/", status_code=303)
+
+
+# ---- Обработчик 404 ----
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc: HTTPException):
+    msg = exc.detail if isinstance(exc.detail, str) else "Страница не найдена."
+    return render("404.html", message=msg, status_code=404)
+
+
+# ---------- Запуск ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
