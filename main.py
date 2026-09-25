@@ -28,6 +28,10 @@ posts: Dict[str, Dict[str, Any]] = {}     # post_id -> post
 presence: Dict[str, int] = {}             # uid -> количество активных WS-соединений
 clients: List[WebSocket] = []             # открытые websocket-соединения
 
+MAX_TEXT_LEN = 5000
+MAX_TITLE_LEN = 80
+MAX_COMMENT_LEN = 200
+
 
 # ----------------------------------------------------------------------------
 # Утилиты
@@ -66,7 +70,6 @@ async def broadcast_state() -> None:
     await broadcast({
         "type": "state",
         "posts": list(posts.values()),
-        "online": online_count(),
         "uptime": uptime_seconds(),
     })
 
@@ -74,7 +77,6 @@ async def broadcast_state() -> None:
 async def broadcast_stats() -> None:
     await broadcast({
         "type": "stats",
-        "online": online_count(),
         "uptime": uptime_seconds(),
     })
 
@@ -125,19 +127,20 @@ class CommentBody(BaseModel):
 async def api_state():
     return {
         "posts": list(posts.values()),
-        "online": online_count(),
         "uptime": uptime_seconds(),
     }
 
 
 @app.post("/api/posts")
 async def api_create_post(body: CreatePostBody):
-    title = (body.title or "").strip()[:80]
+    title = (body.title or "").strip()[:MAX_TITLE_LEN]
     text = body.text or ""
     if not title:
         raise HTTPException(400, "Введите заголовок!")
     if not text.strip():
         raise HTTPException(400, "Напишите что-нибудь!")
+    if len(text) > MAX_TEXT_LEN:
+        raise HTTPException(400, f"Текст длиннее {MAX_TEXT_LEN} символов")
     if body.visibility not in ("public", "unlisted"):
         body.visibility = "public"
 
@@ -228,7 +231,7 @@ async def api_add_comment(pid: str, body: CommentBody):
     post = posts.get(pid)
     if not post:
         raise HTTPException(404)
-    text = (body.text or "").strip()[:200]
+    text = (body.text or "").strip()[:MAX_COMMENT_LEN]
     if not text:
         raise HTTPException(400, "Пустой комментарий")
     comment = {
@@ -272,10 +275,8 @@ async def ws_endpoint(websocket: WebSocket, uid: str = Query(...)):
         await websocket.send_text(json.dumps({
             "type": "state",
             "posts": list(posts.values()),
-            "online": online_count(),
             "uptime": uptime_seconds(),
         }, ensure_ascii=False))
-        await broadcast_stats()
 
         while True:
             msg = await websocket.receive_text()
@@ -295,10 +296,6 @@ async def ws_endpoint(websocket: WebSocket, uid: str = Query(...)):
             presence[uid] -= 1
             if presence[uid] <= 0:
                 del presence[uid]
-        try:
-            await broadcast_stats()
-        except Exception:
-            pass
 
 
 # ----------------------------------------------------------------------------
@@ -342,7 +339,6 @@ header { display: flex; justify-content: space-between; align-items: center; pad
 .logo-text { font-size: 1.7rem; font-weight: bold; color: var(--primary); cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .logo-sub { font-size: 0.8rem; color: var(--text); opacity: 0.7; margin-top: 2px; }
 
-.online-counter { font-size: 0.75rem; color: #4caf50; background: rgba(76, 175, 80, 0.1); border: 1px solid rgba(76, 175, 80, 0.3); padding: 2px 8px; border-radius: 12px; font-weight: normal; display: inline-flex; align-items: center; gap: 4px; }
 .uptime-counter { font-size: 0.75rem; color: var(--text); background: var(--active-bg); border: 1px solid var(--border); padding: 2px 8px; border-radius: 12px; font-weight: normal; display: inline-flex; align-items: center; gap: 4px; opacity: 0.85; }
 
 .text-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 4px; font-size: 0.85rem; font-weight: bold; cursor: pointer; text-decoration: none; text-align: center; }
@@ -364,10 +360,30 @@ header { display: flex; justify-content: space-between; align-items: center; pad
 .content-area { flex-grow: 1; min-width: 0; width: 100%; overflow: hidden; }
 
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; width: 100%; overflow: hidden; }
-.form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; min-width: 0; }
 label { font-size: 0.85rem; font-weight: bold; }
-input[type="text"], textarea, select { width: 100%; padding: 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 0.95rem; outline: none; }
+input[type="text"], textarea, select {
+    width: 100%;
+    max-width: 100%;
+    padding: 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.95rem;
+    outline: none;
+    font-family: inherit;
+}
+textarea {
+    resize: vertical;
+    min-height: 120px;
+    max-height: 60vh;
+    display: block;
+}
 input:focus, textarea:focus, select:focus { border-color: var(--primary); }
+
+.char-counter { font-size: 0.75rem; opacity: 0.65; text-align: right; margin-top: -2px; }
+.char-counter.limit { color: var(--error); opacity: 1; font-weight: bold; }
 
 .btn { background: var(--primary); color: #ffffff; border: 1px solid var(--primary); padding: 10px 16px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.95rem; text-align: center; display: inline-block; width: 100%; }
 .btn:active { opacity: 0.8; }
@@ -377,11 +393,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 .view { display: none; }
 .view.active { display: block; }
 
-.post-author-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 0.8rem; border-bottom: 1px dotted var(--border); padding-bottom: 6px; }
+.post-author-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 0.8rem; border-bottom: 1px dotted var(--border); padding-bottom: 6px; gap: 8px; flex-wrap: wrap; }
 .author-name { font-weight: bold; color: var(--primary); }
 .post-time { color: var(--text); opacity: 0.7; }
 .post-title { font-size: 1.25rem; font-weight: bold; margin-bottom: 8px; word-break: break-word; }
-.post-text { font-size: 0.95rem; line-height: 1.4; white-space: pre-wrap; margin-bottom: 12px; word-break: break-word; overflow-wrap: break-word; }
+.post-text { font-size: 0.95rem; line-height: 1.4; white-space: pre-wrap; margin-bottom: 12px; word-break: break-word; overflow-wrap: anywhere; }
 
 .post-footer { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; flex-wrap: wrap; gap: 8px; }
 .action-group { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -392,14 +408,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 .comments-section { display: none; margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 12px; }
 .comments-section.open { display: block; }
 .comment-item { margin-bottom: 8px; font-size: 0.9rem; background: var(--active-bg); padding: 8px; border-radius: 4px; border: 1px solid var(--border); overflow: hidden; }
-.comment-header { display: flex; justify-content: space-between; font-weight: bold; font-size: 0.8rem; margin-bottom: 4px; }
-.comment-text { line-height: 1.35; word-break: break-word; overflow-wrap: break-word; }
+.comment-header { display: flex; justify-content: space-between; font-weight: bold; font-size: 0.8rem; margin-bottom: 4px; gap: 6px; flex-wrap: wrap; }
+.comment-text { line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }
 .comment-form { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 10px; border: 1px dashed var(--border); border-radius: 4px; background: var(--surface); }
 
-.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 20px; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; font-weight: bold; opacity: 0; pointer-events: none; transition: opacity var(--transition-speed); z-index: 1000; }
+.toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 20px; border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem; font-weight: bold; opacity: 0; pointer-events: none; transition: opacity var(--transition-speed); z-index: 1000; max-width: 90vw; text-align: center; }
 .toast.show { opacity: 1; }
 
-.skeleton { height: 100px; border: 1px dashed var(--border); background: var(--surface); border-radius: 6px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; font-weight: bold; }
 .hidden { display: none !important; }
 
 @media (max-width: 650px) {
@@ -419,7 +434,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
             <div class="logo-block">
                 <div class="logo-text" onclick="window.goHome()">
                     sldchat
-                    <span id="online-counter" class="online-counter hidden">● 1</span>
                     <span id="uptime" class="uptime-counter">▲ 0ч 0м 0с</span>
                 </div>
                 <div class="logo-sub">посты и обсуждения</div>
@@ -461,7 +475,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 
                         <div class="form-group">
                             <label>Текст публикации</label>
-                            <textarea id="post-text-input" placeholder="Введите текст вашего сообщения..." rows="6"></textarea>
+                            <textarea id="post-text-input" placeholder="Введите текст вашего сообщения..." rows="8" maxlength="5000"></textarea>
+                            <div class="char-counter" id="post-text-counter">0 / 5000</div>
                         </div>
 
                         <div class="form-group">
@@ -499,6 +514,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
     </div>
 
     <script>
+        const MAX_TEXT_LEN = 5000;
+
         const localUid = (() => {
             let id = localStorage.getItem('sldchat_uid');
             if (!id) {
@@ -519,16 +536,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
             return text ? String(text).replace(/[&<>"']/g, m => map[m]) : '';
         }
 
-        function updateOnline(n) {
-            const el = document.getElementById('online-counter');
-            if (n > 0) {
-                el.innerText = `● ${n} онлайн`;
-                el.classList.remove('hidden');
-            } else {
-                el.classList.add('hidden');
-            }
-        }
-
         function renderUptime() {
             const total = Math.floor(uptimeBase + (Date.now() - uptimeAt) / 1000);
             const d = Math.floor(total / 86400);
@@ -546,7 +553,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
         function applyState(data) {
             allPosts = (data.posts || []).slice().sort((a, b) => b.createdAt - a.createdAt);
             if (typeof data.uptime === 'number') { uptimeBase = data.uptime; uptimeAt = Date.now(); }
-            updateOnline(data.online || 0);
             renderActiveViews();
         }
 
@@ -569,7 +575,6 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                         applyState(msg);
                     } else if (msg.type === 'stats') {
                         if (typeof msg.uptime === 'number') { uptimeBase = msg.uptime; uptimeAt = Date.now(); }
-                        updateOnline(msg.online || 0);
                     }
                 } catch (err) { /* ignore */ }
             };
@@ -611,13 +616,26 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
             }
         }
 
+        // -------- Счётчик символов --------
+        function updateCharCounter() {
+            const el = document.getElementById('post-text-input');
+            const counter = document.getElementById('post-text-counter');
+            const len = el.value.length;
+            counter.textContent = `${len} / ${MAX_TEXT_LEN}`;
+            counter.classList.toggle('limit', len >= MAX_TEXT_LEN);
+        }
+        document.getElementById('post-text-input').addEventListener('input', updateCharCounter);
+        updateCharCounter();
+
         window.createPost = async () => {
             const title = document.getElementById('post-title-input').value.trim();
-            const text = document.getElementById('post-text-input').value.trim();
+            const textEl = document.getElementById('post-text-input');
+            const text = textEl.value.trim();
             const visibility = document.getElementById('post-visibility').value;
 
             if (!title) return window.showToast('Введите заголовок!');
             if (!text) return window.showToast('Напишите что-нибудь!');
+            if (text.length > MAX_TEXT_LEN) return window.showToast(`Максимум ${MAX_TEXT_LEN} символов`);
 
             try {
                 const res = await fetch('/api/posts', {
@@ -631,7 +649,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                 }
                 const post = await res.json();
                 document.getElementById('post-title-input').value = '';
-                document.getElementById('post-text-input').value = '';
+                textEl.value = '';
+                updateCharCounter();
 
                 if (visibility === 'unlisted') {
                     window.showToast('Скрытый пост создан!');
