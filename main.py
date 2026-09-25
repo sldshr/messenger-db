@@ -13,7 +13,7 @@ from fastapi import (
 from pydantic import BaseModel
 
 
-# ─────────────────────────────────────────── in-memory storage ──
+# ───────────────────────────────────────────────── in-memory store ──
 @dataclass
 class User:
     username: str
@@ -32,8 +32,8 @@ class Message:
 @dataclass
 class Store:
     users: Dict[str, User] = field(default_factory=dict)
-    sessions: Dict[str, str] = field(default_factory=dict)          # token -> username
-    messages: Dict[str, List[Message]] = field(default_factory=dict) # key "a|b" -> [Message]
+    sessions: Dict[str, str] = field(default_factory=dict)
+    messages: Dict[str, List[Message]] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @staticmethod
@@ -56,14 +56,13 @@ def hash_pwd(password: str, salt: str) -> str:
     ).hex()
 
 
-# ─────────────────────────────────────────── WebSocket manager ──
+# ───────────────────────────────────────── WebSocket manager ──
 class ConnectionManager:
     def __init__(self) -> None:
         self.active: Dict[str, WebSocket] = {}
 
     async def connect(self, user: str, ws: WebSocket) -> None:
         await ws.accept()
-        # если был старый сокет — закрываем его
         old = self.active.get(user)
         if old is not None:
             try:
@@ -71,9 +70,12 @@ class ConnectionManager:
             except Exception:
                 pass
         self.active[user] = ws
+        await self.broadcast_user_list()
 
-    def disconnect(self, user: str) -> None:
-        self.active.pop(user, None)
+    async def disconnect(self, user: str) -> None:
+        if user in self.active:
+            del self.active[user]
+            await self.broadcast_user_list()
 
     async def send_to(self, user: str, data: dict) -> None:
         ws = self.active.get(user)
@@ -82,14 +84,28 @@ class ConnectionManager:
         try:
             await ws.send_json(data)
         except Exception:
-            self.disconnect(user)
+            self.active.pop(user, None)
+
+    async def broadcast(self, data: dict) -> None:
+        for u, ws in list(self.active.items()):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                self.active.pop(u, None)
+
+    async def broadcast_user_list(self) -> None:
+        await self.broadcast({
+            "type": "user_list",
+            "users": sorted(store.users.keys()),
+            "online": sorted(self.active.keys()),
+        })
 
 
 manager = ConnectionManager()
 app = FastAPI(title="Terminal Messenger (in-memory)", version="1.0")
 
 
-# ─────────────────────────────────────────────────── schemas ──
+# ────────────────────────────────────────────────── schemas ──
 class AuthReq(BaseModel):
     username: str
     password: str
@@ -100,7 +116,7 @@ class MessageReq(BaseModel):
     text: str
 
 
-# ────────────────────────────────────────────────────── auth ──
+# ───────────────────────────────────────────────────── auth ──
 @app.post("/api/register")
 async def register(req: AuthReq):
     if len(req.username) < 2 or len(req.password) < 4:
@@ -138,12 +154,12 @@ def auth_user(token: str) -> str:
     return username
 
 
-# ───────────────────────────────────────────────── endpoints ──
+# ──────────────────────────────────────────── endpoints ──
 @app.get("/api/users")
 def list_users(authorization: str = Header(...)):
     me = auth_user(authorization)
     users = sorted(u for u in store.users.keys() if u != me)
-    return {"users": users}
+    return {"users": users, "online": sorted(manager.active.keys())}
 
 
 @app.get("/api/messages/{peer}")
@@ -154,12 +170,8 @@ def get_messages(peer: str, authorization: str = Header(...)):
     msgs = store.get_conversation(me, peer)
     return {
         "messages": [
-            {
-                "sender": m.sender,
-                "recipient": m.recipient,
-                "text": m.text,
-                "timestamp": m.timestamp,
-            }
+            {"sender": m.sender, "recipient": m.recipient,
+             "text": m.text, "timestamp": m.timestamp}
             for m in msgs
         ]
     }
@@ -173,26 +185,17 @@ async def post_message(req: MessageReq, authorization: str = Header(...)):
     if not req.text.strip():
         raise HTTPException(400, "Empty message")
 
-    msg = Message(
-        sender=me,
-        recipient=req.to,
-        text=req.text,
-        timestamp=time.time(),
-    )
+    msg = Message(sender=me, recipient=req.to, text=req.text, timestamp=time.time())
     async with store.lock:
         store.add_message(msg)
 
-    payload = {
-        "sender": msg.sender,
-        "recipient": msg.recipient,
-        "text": msg.text,
-        "timestamp": msg.timestamp,
-    }
+    payload = {"sender": msg.sender, "recipient": msg.recipient,
+               "text": msg.text, "timestamp": msg.timestamp}
     await manager.send_to(req.to, {"type": "message", "message": payload})
     return {"ok": True, "message": payload}
 
 
-# ──────────────────────────────────────────────── WebSocket ──
+# ──────────────────────────────────────────── WebSocket ──
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket, token: str = Query(...)):
     username = store.sessions.get(token)
@@ -203,13 +206,11 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query(...)):
     await manager.connect(username, websocket)
     try:
         while True:
-            # держим соединение живым — клиент может слать ping/pong
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(username)
+        await manager.disconnect(username)
 
 
-# ──────────────────────────────────────────────── debug ──
 @app.get("/api/stats")
 def stats():
     return {
