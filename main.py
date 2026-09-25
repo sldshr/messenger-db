@@ -1,391 +1,468 @@
-# main.py — SLD Talk (SMS + calls, in-memory)
-import time, random, html, uuid as uuidlib
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException
+"""
+Terminal Messenger — одностраничный 1-на-1 мессенджер на FastAPI.
+
+Запуск:
+    pip install fastapi uvicorn
+    python main.py
+
+Использование:
+    Веб-терминал:   http://localhost:8000/
+    Netcat:         nc localhost 2323
+
+Всё хранится в оперативной памяти. При перезапуске — пусто.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable, Optional
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
 
-app = FastAPI(title="SLD Talk", version="1.0")
 
-users = {}   # uuid -> {uuid, code, nick, created_at}
-codes = {}   # code -> uuid
-sms   = []   # {id, from_uuid, to_uuid, text, ts, read}
-calls = []   # {id, from_uuid, to_uuid, status, started, ended}
+# ======================= Модель данных =======================
 
-# ============== MODELS ==============
-class RegisterReq(BaseModel):
-    uuid: str
-    nick: str = ""
-
-class SendSmsReq(BaseModel):
-    from_uuid: str
-    to_uuid: str
+@dataclass
+class Message:
+    sender: str
+    recipient: str
     text: str
+    ts: float
 
-class CallReq(BaseModel):
-    from_uuid: str
-    to_uuid: str
 
-class AnswerReq(BaseModel):
-    call_id: str
-    accept: bool
+@dataclass
+class Client:
+    """Живое подключение. Для web и tcp различается только send_raw."""
+    username: str
+    kind: str  # 'web' | 'tcp'
+    send_raw: Callable[[str], Awaitable[None]]
+    last_peer: Optional[str] = None
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-class EndReq(BaseModel):
-    call_id: str
+    async def send(self, text: str) -> None:
+        # Лок гарантирует, что сообщения одному клиенту
+        # не перемешаются, даже если их шлют из разных корутин.
+        async with self._lock:
+            await self.send_raw(text)
 
-# ============== UTILS ==============
-def now_ms(): return int(time.time() * 1000)
 
-def gen_code():
-    for _ in range(200):
-        c = f"{random.randint(100000, 999999):06d}"
-        if c not in codes:
-            return c
-    raise HTTPException(500, "code generation failed")
+class QuitSignal(Exception):
+    """Поднимается при /quit, чтобы выйти из цикла чтения."""
 
-def esc(s): return html.escape(s or "", quote=True)
-def fmt_time(ms):
-    try: return time.strftime("%d.%m.%Y %H:%M", time.localtime(ms/1000))
-    except Exception: return ""
 
-def ensure_user(uid, nick=None):
-    u = users.get(uid)
-    if u is None:
-        code = gen_code()
-        u = {"uuid": uid, "code": code, "nick": (nick or "").strip() or ("User" + code[-3:]),
-             "created_at": now_ms()}
-        users[uid] = u
-        codes[code] = uid
-    return u
+class Hub:
+    """Общее состояние: клиенты и история переписок."""
 
-def user_public(u):
-    return {"uuid": u["uuid"], "code": u["code"], "nick": u["nick"]}
+    def __init__(self) -> None:
+        self.clients: dict[str, Client] = {}
+        # ключ — (userA, userB) в алфавитном порядке
+        self.history: dict[tuple[str, str], list[Message]] = {}
 
-# ============== HTML ==============
-CSS = """
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;background:#0e1621;color:#fff;
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
-  -webkit-font-smoothing:antialiased;min-height:100vh}
-a{color:#8fd3ff;text-decoration:none}
-.container{max-width:640px;margin:0 auto;padding:20px 18px 60px}
-.header{background:#17212b;padding:16px 20px;display:flex;align-items:center;gap:12px;
-  border-bottom:1px solid #0a1018}
-.header .logo{width:40px;height:40px;border-radius:50%;
-  background:linear-gradient(135deg,#3a7bd5,#8f3ad5);
-  display:flex;align-items:center;justify-content:center;
-  font-weight:700;font-size:20px;color:#fff}
-.header .title{font-weight:700;font-size:20px;color:#fff}
-.header .sub{color:#7d8b99;font-size:12px;margin-top:2px}
-.hero{text-align:center;padding:40px 16px 10px}
-.hero .big-logo{width:96px;height:96px;border-radius:50%;
-  background:linear-gradient(135deg,#3a7bd5,#8f3ad5);
-  display:flex;align-items:center;justify-content:center;
-  font-weight:700;font-size:46px;color:#fff;margin:0 auto 18px}
-.hero h1{font-size:26px;margin:0 0 8px}
-.hero p{color:#7d8b99;margin:0;font-size:14px}
-.card{background:#17212b;border-radius:14px;padding:18px;margin-top:16px}
-.section-label{color:#aab6c3;font-size:13px;margin-bottom:8px}
-input[type=text]{flex:1;background:#0c1014;color:#fff;border:1px solid #0a1018;
-  border-radius:10px;padding:14px;font-size:18px;letter-spacing:.15em;
-  outline:none;font-family:inherit}
-input[type=text]:focus{border-color:#5288c1}
-input[type=text]::placeholder{color:#5e6a76;letter-spacing:normal}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  border:none;border-radius:10px;padding:14px 22px;font-size:15px;font-weight:600;
-  color:#fff;background:#2a3340;cursor:pointer;text-decoration:none;
-  transition:transform .06s ease,filter .12s ease;font-family:inherit}
-.btn:hover{filter:brightness(1.1)}
-.btn:active{transform:scale(.97)}
-.btn-primary{background:#5288c1}
-.btn-block{width:100%}
-.btn-svg{width:20px;height:20px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.user-badge{display:inline-block;background:#222c3a;color:#8fd3ff;
-  padding:6px 12px;border-radius:8px;font-weight:700;font-size:15px;letter-spacing:.08em}
-.not-found{text-align:center;padding:60px 16px}
-.not-found .code{font-size:72px;font-weight:800;color:#ff7676;letter-spacing:.1em}
-.not-found p{color:#7d8b99}
-.footer{text-align:center;color:#5e6a76;font-size:12px;padding:30px 16px 10px}
-.legal{color:#c5cfdb;font-size:14px;line-height:1.6}
-.legal h2{color:#fff;font-size:18px;margin:22px 0 8px}
-"""
+    @staticmethod
+    def _key(a: str, b: str) -> tuple[str, str]:
+        return (a, b) if a < b else (b, a)
 
-SVG_DL = '<svg class="btn-svg" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>'
-SVG_SEARCH = '<svg class="btn-svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5L21 21"/></svg>'
-SVG_BACK = '<svg class="btn-svg" viewBox="0 0 24 24"><path d="M15 5L8 12l7 7"/></svg>'
+    def register(self, client: Client) -> bool:
+        if client.username in self.clients:
+            return False
+        self.clients[client.username] = client
+        return True
 
-DL_JS = """
-function downloadSoon(b){var o=b.innerHTML;b.innerHTML='Скоро!';b.disabled=true;
-setTimeout(function(){b.innerHTML=o;b.disabled=false;},1600);}
-"""
+    def unregister(self, username: str) -> None:
+        self.clients.pop(username, None)
 
-def page(title, body):
-    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} — SLD</title><style>{CSS}</style></head><body>
-<div class="header">
-  <div class="logo">S</div>
-  <div><div class="title"><a href="/" style="color:#fff">SLD Talk</a></div>
-  <div class="sub">SMS и звонки без номера</div></div>
-</div>
-{body}
-<div class="footer">SLD · <a href="/privacy">Политика конфиденциальности</a></div>
-</body></html>"""
+    def online(self) -> list[str]:
+        return sorted(self.clients.keys())
 
-def index_page():
-    return page("Главная", f"""
-<div class="container">
-  <div class="hero">
-    <div class="big-logo">S</div>
-    <h1>SLD Talk</h1>
-    <p>SMS и звонки без номера телефона</p>
-  </div>
+    async def send_to(self, username: str, text: str) -> bool:
+        c = self.clients.get(username)
+        if c is None:
+            return False
+        try:
+            await c.send(text)
+            return True
+        except Exception:
+            return False
 
-  <button class="btn btn-primary btn-block" style="margin-top:24px"
-          onclick="downloadSoon(this)">{SVG_DL} Скачать приложение</button>
+    async def broadcast_system(self, text: str, exclude: Optional[str] = None) -> None:
+        for name, c in list(self.clients.items()):
+            if name == exclude:
+                continue
+            try:
+                await c.send(text)
+            except Exception:
+                pass
 
-  <div class="card">
-    <div class="section-label">Найти пользователя по коду</div>
-    <form class="search-row" onsubmit="event.preventDefault(); openCode();">
-      <input id="code" type="text" inputmode="numeric" pattern="[0-9]{{6}}"
-             maxlength="6" placeholder="6 цифр" autocomplete="off">
-      <button type="submit" class="btn btn-primary">{SVG_SEARCH} Найти</button>
-    </form>
-    <div id="err" class="error" style="color:#ff7676;font-size:13px;margin-top:8px"></div>
+    async def deliver(self, sender: str, recipient: str, text: str) -> tuple[bool, str]:
+        if sender == recipient:
+            return False, "нельзя отправить сообщение самому себе"
+        if recipient not in self.clients:
+            return False, f"пользователь '{recipient}' не в сети"
+
+        msg = Message(sender, recipient, text, time.time())
+        self.history.setdefault(self._key(sender, recipient), []).append(msg)
+        await self.send_to(recipient, f"< {sender}: {text}")
+        return True, "ok"
+
+    def get_history(self, a: str, b: str, limit: int = 20) -> list[Message]:
+        return self.history.get(self._key(a, b), [])[-limit:]
+
+
+hub = Hub()
+
+
+# ======================= Команды (общее для web/tcp) =======================
+
+HELP_TEXT = (
+    "Команды:\n"
+    "  /to <user> <text>   отправить сообщение\n"
+    "  /history <user>     последние 20 сообщений\n"
+    "  /users              кто онлайн\n"
+    "  /help               справка\n"
+    "  /quit               выйти\n"
+    "\n"
+    "Без команды текст уйдёт последнему собеседнику."
+)
+
+
+def valid_username(u: str) -> bool:
+    if not (1 <= len(u) <= 32):
+        return False
+    return not any(c.isspace() or ord(c) < 32 for c in u)
+
+
+async def handle_command(client: Client, line: str) -> None:
+    line = line.rstrip("\r\n")
+    if not line.strip():
+        return
+
+    if line.startswith("/"):
+        parts = line.split(maxsplit=2)
+        cmd = parts[0].lower()
+
+        if cmd in ("/help", "/?"):
+            await client.send(HELP_TEXT)
+            return
+
+        if cmd == "/users":
+            users = [u for u in hub.online() if u != client.username]
+            if not users:
+                await client.send("[вы единственный онлайн]")
+            else:
+                await client.send("Онлайн: " + ", ".join(users))
+            return
+
+        if cmd == "/to":
+            if len(parts) < 3:
+                await client.send("Использование: /to <user> <text>")
+                return
+            target, text = parts[1], parts[2]
+            ok, err = await hub.deliver(client.username, target, text)
+            if ok:
+                client.last_peer = target
+                await client.send(f"> {target}: {text}")
+            else:
+                await client.send(f"[ошибка] {err}")
+            return
+
+        if cmd == "/history":
+            if len(parts) < 2:
+                await client.send("Использование: /history <user>")
+                return
+            peer = parts[1]
+            msgs = hub.get_history(client.username, peer)
+            if not msgs:
+                await client.send(f"[нет истории с '{peer}']")
+                return
+            await client.send(f"--- история с {peer} ---")
+            for m in msgs:
+                who = "you" if m.sender == client.username else m.sender
+                t = time.strftime("%H:%M:%S", time.localtime(m.ts))
+                await client.send(f"[{t}] {who}: {m.text}")
+            await client.send("--- конец ---")
+            return
+
+        if cmd in ("/quit", "/exit"):
+            await client.send("[пока]")
+            raise QuitSignal()
+
+        await client.send(f"[неизвестная команда: {cmd}] введите /help")
+        return
+
+    # Обычный текст — уходит последнему собеседнику
+    if not client.last_peer:
+        await client.send("[нет собеседника] используйте: /to <user> <text>")
+        return
+    target = client.last_peer
+    ok, err = await hub.deliver(client.username, target, line)
+    if ok:
+        await client.send(f"> {target}: {line}")
+    else:
+        await client.send(f"[ошибка] {err}")
+
+
+async def start_session(client: Client) -> None:
+    await client.send(f"[вы вошли как {client.username}]")
+    await hub.broadcast_system(f"* {client.username} присоединился",
+                               exclude=client.username)
+    await client.send(HELP_TEXT)
+
+
+async def end_session(username: str) -> None:
+    hub.unregister(username)
+    await hub.broadcast_system(f"* {username} покинул чат")
+
+
+# ======================= TCP-обработчик (netcat) =======================
+
+async def tcp_handler(reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+    async def send_raw(text: str) -> None:
+        writer.write((text + "\r\n").encode("utf-8"))
+        await writer.drain()
+
+    username: Optional[str] = None
+    try:
+        await send_raw("=== Terminal Messenger ===")
+        await send_raw("Введите имя пользователя:")
+
+        try:
+            raw = await asyncio.wait_for(reader.readline(), timeout=60.0)
+        except asyncio.TimeoutError:
+            return
+
+        candidate = raw.decode("utf-8", errors="replace").strip()
+        if not valid_username(candidate):
+            await send_raw("[некорректное имя]")
+            return
+
+        client = Client(username=candidate, kind="tcp", send_raw=send_raw)
+        if not hub.register(client):
+            await send_raw(f"[имя '{candidate}' уже занято]")
+            return
+
+        username = candidate
+        await start_session(client)
+
+        while True:
+            raw = await reader.readline()
+            if not raw:
+                break
+            try:
+                await handle_command(client, raw.decode("utf-8", errors="replace"))
+            except QuitSignal:
+                break
+
+    except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
+        pass
+    except Exception:
+        pass
+    finally:
+        if username:
+            await end_session(username)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+# ======================= HTML-терминал для веба =======================
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal Messenger</title>
+<style>
+  :root { --fg:#33ff66; --bg:#050807; --dim:#1a8a3a; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin:0; padding:0; height:100%;
+    background: var(--bg); color: var(--fg);
+    font-family: "Menlo","Consolas","Courier New",monospace;
+    font-size: 14px; line-height: 1.4; overflow: hidden;
+  }
+  #wrap { display:flex; flex-direction:column; height:100vh; padding:8px; }
+  #header {
+    color: var(--dim);
+    border-bottom: 1px dashed var(--dim);
+    padding-bottom: 4px; margin-bottom: 6px; font-size: 12px;
+  }
+  #terminal {
+    flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-word;
+    padding-right:4px; scrollbar-width:thin; scrollbar-color:var(--dim) var(--bg);
+  }
+  #terminal::-webkit-scrollbar { width:8px; }
+  #terminal::-webkit-scrollbar-thumb { background: var(--dim); }
+  #terminal::-webkit-scrollbar-track { background: var(--bg); }
+  #inputrow {
+    display:flex; border-top:1px solid var(--dim);
+    padding-top:4px; margin-top:4px; align-items:center;
+  }
+  #prompt { color: var(--fg); padding-right: 8px; user-select:none; }
+  #input {
+    flex:1; background:transparent; color:var(--fg); border:none; outline:none;
+    font: inherit; caret-color: var(--fg);
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="header">Terminal Messenger :: websocket :: in-memory</div>
+  <div id="terminal"></div>
+  <div id="inputrow">
+    <span id="prompt">&gt;</span>
+    <input id="input" autofocus autocomplete="off" autocapitalize="off" spellcheck="false">
   </div>
 </div>
 <script>
-{DL_JS}
-function openCode(){{
-  var v=document.getElementById('code').value.trim();
-  var e=document.getElementById('err');
-  if(!/^\\d{{6}}$/.test(v)){{e.textContent='Введите ровно 6 цифр';return;}}
-  e.textContent='';window.location.href='/'+v;
-}}
-document.getElementById('code').addEventListener('keydown',function(ev){{
-  if(ev.key==='Enter'){{ev.preventDefault();openCode();}}
-}});
-</script>""")
+(function () {
+  const term = document.getElementById('terminal');
+  const input = document.getElementById('input');
+  const promptEl = document.getElementById('prompt');
 
-def user_page(u):
-    return page(u['code'], f"""
-<div class="container">
-  <a class="btn" href="/" style="margin-top:6px">{SVG_BACK} На главную</a>
-  <div class="card">
-    <div style="text-align:center;padding:12px 0">
-      <div style="width:88px;height:88px;border-radius:50%;margin:0 auto 14px;
-        background:linear-gradient(135deg,#5288c1,#8f3ad5);
-        display:flex;align-items:center;justify-content:center;
-        font-size:38px;font-weight:700">{esc((u['nick'] or '?')[:1].upper())}</div>
-      <div style="font-size:20px;font-weight:700">{esc(u['nick'])}</div>
-      <div style="margin-top:8px"><span class="user-badge">{esc(u['code'])}</span></div>
-    </div>
-  </div>
-  <button class="btn btn-primary btn-block" style="margin-top:20px"
-          onclick="downloadSoon(this)">{SVG_DL} Скачать приложение</button>
-</div>
-<script>{DL_JS}</script>""")
+  let ws = null;
+  let loggedIn = false;
+  let closed = false;
 
-def not_found_page(code):
-    return page("Не найдено", f"""
-<div class="container"><div class="not-found">
-  <div class="code">{esc(code)}</div>
-  <p>Пользователь не найден</p>
-  <a class="btn btn-primary" href="/" style="margin-top:20px">{SVG_BACK} На главную</a>
-</div></div>""")
+  function append(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    term.appendChild(div);
+    term.scrollTop = term.scrollHeight;
+  }
 
-def privacy_page():
-    return page("Политика", """
-<div class="container"><a class="btn" href="/" style="margin-top:6px">Назад</a>
-<div class="card"><h1 style="margin-top:0">Политика конфиденциальности</h1>
-<div class="legal">
-<p>SLD Talk — анонимная платформа SMS и звонков. Никакой реальный номер
-телефона не требуется.</p>
-<h2>1. Какие данные мы храним</h2>
-<ul><li><b>Анонимный UUID устройства</b> и <b>виртуальный 6-значный код</b>,
-автоматически выданный при регистрации.</li>
-<li><b>Ник</b>, который вы ввели (можно любой).</li>
-<li><b>Содержимое SMS</b> и <b>история звонков</b> — только между участниками.</li></ul>
-<h2>2. Чего мы НЕ делаем</h2>
-<ul><li>Не запрашиваем реальный телефон, email, имя.</li>
-<li>Не используем трекеры и рекламу.</li>
-<li>Не передаём данные третьим лицам.</li></ul>
-<h2>3. Где хранятся данные</h2>
-<p>В оперативной памяти сервера и стираются при перезапуске.</p>
-<h2>4. Ваши права</h2>
-<ul><li>Удалить аккаунт можно в настройках приложения.</li></ul>
-<h2>5. Контакты</h2>
-<p>privacy@sldchat.fastapicloud.dev</p>
-<p style="color:#7d8b99;margin-top:24px">Обновлено: 2025</p>
-</div></div></div>""")
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
 
-# ============== ROUTES ==============
-@app.get("/health")
-def health():
-    return {"status": "ok", "ts": now_ms(), "users": len(users),
-            "sms": len(sms), "calls": len(calls)}
+    ws.onopen = () => append('[*] подключено');
 
-@app.post("/register")
-def register(r: RegisterReq):
-    u = ensure_user(r.uuid, r.nick)
-    if (r.nick or "").strip():
-        u["nick"] = r.nick.strip()[:32]
-    return user_public(u)
+    ws.onmessage = (ev) => {
+      const text = ev.data;
+      append(text);
+      if (text.indexOf('[вы вошли как') === 0) loggedIn = true;
+    };
 
-@app.get("/me")
-def me(uuid: str):
-    u = users.get(uuid)
-    if not u: raise HTTPException(404, "user not found")
-    return user_public(u)
+    ws.onclose = () => {
+      if (closed) return;
+      closed = true;
+      append('[*] соединение закрыто');
+      promptEl.textContent = '!';
+      input.disabled = true;
+    };
 
-@app.get("/users")
-def all_users():
-    return [user_public(u) for u in users.values()]
+    ws.onerror = () => append('[*] ошибка соединения');
+  }
 
-@app.get("/search")
-def search(q: str):
-    q = (q or "").strip()
-    if not q: return []
-    res = []
-    ql = q.lower()
-    for u in users.values():
-        if q.isdigit() and len(q) == 6 and u["code"] == q:
-            res.append(user_public(u)); continue
-        if ql in (u["nick"] or "").lower():
-            res.append(user_public(u))
-    return res
+  connect();
 
-@app.get("/user/{code}")
-def user_by_code(code: str):
-    uid = codes.get(code)
-    if not uid: raise HTTPException(404, "not found")
-    return user_public(users[uid])
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    const line = input.value;
+    input.value = '';
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Локальное эхо только пока не вошли — чтобы видеть, что печатаешь в имя.
+    if (!loggedIn) append('> ' + line);
+    ws.send(line);
+  });
 
-@app.post("/sms")
-def send_sms(r: SendSmsReq):
-    if r.from_uuid not in users: raise HTTPException(404, "sender not found")
-    to = users.get(r.to_uuid) or ensure_user(r.to_uuid)
-    text = (r.text or "").strip()
-    if not text: raise HTTPException(400, "empty text")
-    m = {"id": str(uuidlib.uuid4()), "from_uuid": r.from_uuid,
-         "to_uuid": to["uuid"], "text": text[:2000],
-         "ts": now_ms(), "read": False}
-    sms.append(m)
-    return m
+  document.addEventListener('click', () => input.focus());
+  window.addEventListener('focus', () => input.focus());
+})();
+</script>
+</body>
+</html>
+"""
 
-@app.get("/sms/thread")
-def sms_thread(u1: str, u2: str, since: int = 0):
-    out = []
-    for m in sms:
-        if m["ts"] <= since: continue
-        if (m["from_uuid"] == u1 and m["to_uuid"] == u2) or \
-           (m["from_uuid"] == u2 and m["to_uuid"] == u1):
-            out.append(m)
-    return out
 
-@app.get("/sms/threads/{uid}")
-def sms_threads(uid: str):
-    last = {}
-    for m in sms:
-        if m["from_uuid"] == uid: partner = m["to_uuid"]
-        elif m["to_uuid"] == uid: partner = m["from_uuid"]
-        else: continue
-        if partner not in last or m["ts"] > last[partner]["ts"]:
-            last[partner] = m
-    res = []
-    for p, m in last.items():
-        pu = users.get(p) or ensure_user(p)
-        res.append({"partner_uuid": p, "partner_code": pu["code"],
-                    "partner_nick": pu["nick"], "last_text": m["text"],
-                    "last_ts": m["ts"], "last_from": m["from_uuid"]})
-    res.sort(key=lambda x: x["last_ts"], reverse=True)
-    return res
+# ======================= FastAPI =======================
 
-@app.get("/sms/inbox")
-def sms_inbox(uid: str, since: int = 0):
-    out = []
-    for m in sms:
-        if m["to_uuid"] != uid or m["ts"] <= since: continue
-        mm = dict(m)
-        fu = users.get(m["from_uuid"]) or ensure_user(m["from_uuid"])
-        mm["from_code"] = fu["code"]; mm["from_nick"] = fu["nick"]
-        out.append(mm)
-    return out
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Параллельно с uvicorn поднимаем TCP-сервер для netcat.
+    server = await asyncio.start_server(tcp_handler, "0.0.0.0", 2323)
+    app.state.tcp_server = server
 
-@app.post("/call")
-def start_call(r: CallReq):
-    if r.from_uuid not in users: raise HTTPException(404, "caller not found")
-    to = users.get(r.to_uuid) or ensure_user(r.to_uuid)
-    c = {"id": str(uuidlib.uuid4()), "from_uuid": r.from_uuid, "to_uuid": to["uuid"],
-         "status": "ringing", "started": now_ms(), "ended": None}
-    calls.append(c)
-    return c
+    print("=" * 60)
+    print("Terminal Messenger запущен")
+    print("  Web:     http://localhost:8000/")
+    print("  Netcat:  nc localhost 2323")
+    print("=" * 60)
+    try:
+        yield
+    finally:
+        server.close()
+        await server.wait_closed()
 
-@app.get("/call/pending")
-def call_pending(uid: str):
-    for c in reversed(calls):
-        if c["to_uuid"] == uid and c["status"] == "ringing":
-            return c
-    return None
 
-@app.get("/call/state/{cid}")
-def call_state(cid: str):
-    for c in calls:
-        if c["id"] == cid: return c
-    raise HTTPException(404, "call not found")
+app = FastAPI(lifespan=lifespan, title="Terminal Messenger")
 
-@app.post("/call/answer")
-def call_answer(r: AnswerReq):
-    for c in calls:
-        if c["id"] == r.call_id:
-            if r.accept: c["status"] = "accepted"
-            else: c["status"] = "declined"; c["ended"] = now_ms()
-            return c
-    raise HTTPException(404, "call not found")
 
-@app.post("/call/end")
-def call_end(r: EndReq):
-    for c in calls:
-        if c["id"] == r.call_id:
-            if c["status"] in ("ringing", "accepted"):
-                c["status"] = "ended"; c["ended"] = now_ms()
-            return c
-    raise HTTPException(404, "call not found")
-
-@app.get("/call/history/{uid}")
-def call_history(uid: str):
-    res = []
-    for c in calls:
-        if c["from_uuid"] != uid and c["to_uuid"] != uid: continue
-        other = c["to_uuid"] if c["from_uuid"] == uid else c["from_uuid"]
-        ou = users.get(other) or ensure_user(other)
-        res.append({"id": c["id"], "other_uuid": other, "other_code": ou["code"],
-                    "other_nick": ou["nick"], "outgoing": c["from_uuid"] == uid,
-                    "status": c["status"], "started": c["started"], "ended": c["ended"]})
-    res.sort(key=lambda x: x["started"], reverse=True)
-    return res
-
-@app.post("/reset/{uid}")
-def reset(uid: str):
-    u = users.pop(uid, None)
-    if u: codes.pop(u["code"], None)
-    global sms
-    sms = [m for m in sms if m["from_uuid"] != uid and m["to_uuid"] != uid]
-    return {"ok": True}
-
-# ============== WEB ==============
 @app.get("/", response_class=HTMLResponse)
-def web_index(): return index_page()
+async def index() -> str:
+    return INDEX_HTML
 
-@app.get("/privacy", response_class=HTMLResponse)
-def web_privacy(): return privacy_page()
 
-@app.get("/{code}", response_class=HTMLResponse)
-def web_user(code: str):
-    if not (len(code) == 6 and code.isdigit()):
-        return HTMLResponse(not_found_page(code), status_code=404)
-    uid = codes.get(code)
-    if not uid:
-        return HTMLResponse(not_found_page(code), status_code=404)
-    return user_page(users[uid])
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket) -> None:
+    await ws.accept()
+
+    async def send_raw(text: str) -> None:
+        await ws.send_text(text)
+
+    username: Optional[str] = None
+    try:
+        await send_raw("Введите имя пользователя:")
+
+        try:
+            first = await ws.receive_text()
+        except WebSocketDisconnect:
+            return
+
+        candidate = first.strip()
+        if not valid_username(candidate):
+            await send_raw("[некорректное имя]")
+            return
+
+        client = Client(username=candidate, kind="web", send_raw=send_raw)
+        if not hub.register(client):
+            await send_raw(f"[имя '{candidate}' уже занято]")
+            return
+
+        username = candidate
+        await start_session(client)
+
+        while True:
+            try:
+                text = await ws.receive_text()
+            except WebSocketDisconnect:
+                break
+            try:
+                await handle_command(client, text)
+            except QuitSignal:
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if username:
+            await end_session(username)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+# ======================= Точка входа =======================
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
