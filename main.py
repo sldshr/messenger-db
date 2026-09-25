@@ -24,13 +24,14 @@ from pydantic import BaseModel
 # Состояние (в оперативной памяти)
 # ----------------------------------------------------------------------------
 START_TIME = time.time()
-posts: Dict[str, Dict[str, Any]] = {}     # post_id -> post
-presence: Dict[str, int] = {}             # uid -> количество активных WS-соединений
-clients: List[WebSocket] = []             # открытые websocket-соединения
+posts: Dict[str, Dict[str, Any]] = {}
+presence: Dict[str, int] = {}
+clients: List[WebSocket] = []
 
 MAX_TEXT_LEN = 5000
 MAX_TITLE_LEN = 80
 MAX_COMMENT_LEN = 200
+MAX_ASCII_LEN = 120000
 
 
 # ----------------------------------------------------------------------------
@@ -47,10 +48,6 @@ def uptime_seconds() -> float:
 def gen_id(length: int = 5) -> str:
     chars = string.ascii_letters + string.digits
     return "".join(random.choice(chars) for _ in range(length))
-
-
-def online_count() -> int:
-    return len(presence)
 
 
 async def broadcast(message: dict) -> None:
@@ -108,6 +105,7 @@ class CreatePostBody(BaseModel):
     text: str = ""
     visibility: str = "public"
     ownerId: str
+    asciiArt: str = ""
 
 
 class RateBody(BaseModel):
@@ -135,12 +133,16 @@ async def api_state():
 async def api_create_post(body: CreatePostBody):
     title = (body.title or "").strip()[:MAX_TITLE_LEN]
     text = body.text or ""
+    ascii_art = body.asciiArt or ""
+
     if not title:
         raise HTTPException(400, "Введите заголовок!")
-    if not text.strip():
-        raise HTTPException(400, "Напишите что-нибудь!")
+    if not text.strip() and not ascii_art.strip():
+        raise HTTPException(400, "Напишите что-нибудь или добавьте ASCII-изображение!")
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"Текст длиннее {MAX_TEXT_LEN} символов")
+    if len(ascii_art) > MAX_ASCII_LEN:
+        raise HTTPException(400, "ASCII-изображение слишком большое")
     if body.visibility not in ("public", "unlisted"):
         body.visibility = "public"
 
@@ -152,6 +154,7 @@ async def api_create_post(body: CreatePostBody):
         "id": pid,
         "title": title,
         "text": text,
+        "asciiArt": ascii_art,
         "author": "Аноним",
         "ownerId": body.ownerId,
         "createdAt": now_ms(),
@@ -263,7 +266,7 @@ async def api_delete_comment(pid: str, cid: str, uid: str = Query(...)):
 
 
 # ----------------------------------------------------------------------------
-# WebSocket (живая синхронизация + presence)
+# WebSocket
 # ----------------------------------------------------------------------------
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket, uid: str = Query(...)):
@@ -385,6 +388,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 .char-counter { font-size: 0.75rem; opacity: 0.65; text-align: right; margin-top: -2px; }
 .char-counter.limit { color: var(--error); opacity: 1; font-weight: bold; }
 
+.hint { font-size: 0.72rem; opacity: 0.7; line-height: 1.5; padding: 6px 8px; background: var(--active-bg); border: 1px dashed var(--border); border-radius: 4px; }
+.hint code { background: var(--surface); padding: 1px 4px; border-radius: 2px; }
+
 .btn { background: var(--primary); color: #ffffff; border: 1px solid var(--primary); padding: 10px 16px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.95rem; text-align: center; display: inline-block; width: 100%; }
 .btn:active { opacity: 0.8; }
 .btn-tonal { background: var(--active-bg); color: var(--text); border: 1px solid var(--border); }
@@ -398,6 +404,36 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 .post-time { color: var(--text); opacity: 0.7; }
 .post-title { font-size: 1.25rem; font-weight: bold; margin-bottom: 8px; word-break: break-word; }
 .post-text { font-size: 0.95rem; line-height: 1.4; white-space: pre-wrap; margin-bottom: 12px; word-break: break-word; overflow-wrap: anywhere; }
+
+/* ASCII art */
+.ascii-art {
+    font-family: "Courier New", Courier, monospace;
+    font-size: 6px;
+    line-height: 1.0;
+    letter-spacing: 0;
+    white-space: pre;
+    overflow: auto;
+    max-height: 480px;
+    max-width: 100%;
+    padding: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: zoom-in;
+    color: var(--text);
+    margin-bottom: 10px;
+    tab-size: 1;
+}
+.ascii-art:hover { border-color: var(--primary); }
+
+.ascii-controls { display: grid; gap: 8px; padding: 10px; background: var(--active-bg); border-radius: 4px; border: 1px solid var(--border); margin-top: 6px; }
+.ascii-controls label { font-size: 0.78rem; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: bold; }
+.ascii-controls input[type="range"] { width: 100%; accent-color: var(--primary); }
+.ascii-controls select { font-size: 0.85rem; padding: 6px; }
+.ascii-controls .row { display: flex; flex-direction: column; gap: 3px; }
+.ascii-controls .row-flex { display: flex; gap: 12px; flex-wrap: wrap; }
+.ascii-controls .row-flex label { flex: 1; min-width: 130px; justify-content: flex-start; }
+.ascii-controls .row-flex input[type="checkbox"] { accent-color: var(--primary); }
 
 .post-footer { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; flex-wrap: wrap; gap: 8px; }
 .action-group { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -417,6 +453,39 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
 
 .hidden { display: none !important; }
 
+/* ASCII modal */
+#ascii-modal {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.94);
+    z-index: 10000;
+    overflow: auto;
+    padding: 70px 20px 30px;
+}
+#ascii-modal-toolbar {
+    position: fixed; top: 14px; right: 14px;
+    display: flex; gap: 8px; z-index: 10001;
+    background: var(--surface);
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+#ascii-modal pre {
+    display: block;
+    width: fit-content;
+    margin: 0 auto;
+    font-family: "Courier New", Courier, monospace;
+    line-height: 1.0;
+    letter-spacing: 0;
+    white-space: pre;
+    color: #e8e8e8;
+    background: #000;
+    padding: 14px;
+    border-radius: 6px;
+    border: 1px solid #333;
+    tab-size: 1;
+}
+
 @media (max-width: 650px) {
     body { padding-bottom: 70px; }
     .main-layout { flex-direction: column; gap: 10px; }
@@ -425,6 +494,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
     .sidebar-left-menu .nav-btn { flex: 1; text-align: center; padding: 8px; font-size: 0.8rem; }
     .sidebar-right { display: none; }
     .toast { bottom: 80px; }
+    .ascii-art { font-size: 4px; }
 }
 </style>
 </head>
@@ -477,6 +547,56 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                             <label>Текст публикации</label>
                             <textarea id="post-text-input" placeholder="Введите текст вашего сообщения..." rows="8" maxlength="5000"></textarea>
                             <div class="char-counter" id="post-text-counter">0 / 5000</div>
+                            <div class="hint">
+                                Цвета в тексте: <code>[c=red]красный[/c]</code>
+                                <code>[c=#ff8800]оранжевый[/c]</code>
+                                <code>[c=rgb(0,150,255)]синий[/c]</code>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>ASCII-изображение (необязательно)</label>
+                            <label class="btn btn-tonal" style="cursor: pointer; display: block; text-align: center;">
+                                <input type="file" class="hidden" id="ascii-image-input" accept="image/*" onchange="window.handleAsciiImage(event)">
+                                [Выбрать изображение]
+                            </label>
+
+                            <div id="ascii-controls" class="ascii-controls hidden">
+                                <div class="row">
+                                    <label>Ширина: <span id="ascii-width-val">80</span> симв.</label>
+                                    <input type="range" id="ascii-width" min="20" max="180" step="2" value="80">
+                                </div>
+                                <div class="row">
+                                    <label>Контраст: <span id="ascii-contrast-val">1.0</span></label>
+                                    <input type="range" id="ascii-contrast" min="0.4" max="3" step="0.05" value="1.0">
+                                </div>
+                                <div class="row">
+                                    <label>Яркость: <span id="ascii-brightness-val">0</span></label>
+                                    <input type="range" id="ascii-brightness" min="-100" max="100" step="1" value="0">
+                                </div>
+                                <div class="row">
+                                    <label>Набор символов</label>
+                                    <select id="ascii-charset">
+                                        <option value="classic">Классический (10)</option>
+                                        <option value="detailed">Детальный (70)</option>
+                                        <option value="blocks">Блоки ░▒▓█ (5)</option>
+                                        <option value="dots">Точки .oO@ (5)</option>
+                                        <option value="digits">Цифры (10)</option>
+                                        <option value="letters">Буквы (26)</option>
+                                    </select>
+                                </div>
+                                <div class="row-flex">
+                                    <label><input type="checkbox" id="ascii-invert"> Инвертировать</label>
+                                    <label><input type="checkbox" id="ascii-white-bg" checked> Белый фон</label>
+                                </div>
+                                <div style="font-size:0.72rem; opacity:0.7;">
+                                    Размер: <span id="ascii-size">—</span>
+                                </div>
+                            </div>
+
+                            <pre id="ascii-preview" class="ascii-art hidden" onclick="window.openAsciiViewer(this.textContent)"></pre>
+
+                            <button id="ascii-clear-btn" class="btn btn-tonal hidden" onclick="window.clearAscii()" style="margin-top:6px;">[Убрать изображение]</button>
                         </div>
 
                         <div class="form-group">
@@ -503,8 +623,11 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                     <div class="info-header">О платформе</div>
                     <p class="info-text">sldchat — простой и свободный анонимный блог без ограничений.</p>
 
-                    <div class="info-header">Правила</div>
-                    <p class="info-text">Пишите вежливо, делитесь мыслями.</p>
+                    <div class="info-header">Цвета</div>
+                    <p class="info-text">В тексте постов можно использовать <code>[c=red]...[/c]</code> — имена, HEX и rgb().</p>
+
+                    <div class="info-header">ASCII-фото</div>
+                    <p class="info-text">Изображения конвертируются в ASCII прямо в браузере. Настройте ширину, контраст и набор символов.</p>
 
                     <div class="info-header">Хранение</div>
                     <p class="info-text">Все данные хранятся в оперативной памяти сервера и очищаются при его перезапуске.</p>
@@ -513,8 +636,28 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
         </div>
     </div>
 
+    <!-- ASCII viewer modal -->
+    <div id="ascii-modal" class="hidden" onclick="if(event.target===this) window.closeAsciiViewer()">
+        <div id="ascii-modal-toolbar">
+            <button class="text-btn" onclick="window.asciiZoom(-1)">A−</button>
+            <button class="text-btn" onclick="window.asciiZoom(1)">A+</button>
+            <button class="text-btn" onclick="window.asciiCopy()">[Копировать]</button>
+            <button class="text-btn" onclick="window.closeAsciiViewer()">[Закрыть]</button>
+        </div>
+        <pre id="ascii-modal-content"></pre>
+    </div>
+
     <script>
         const MAX_TEXT_LEN = 5000;
+
+        const ASCII_CHARSETS = {
+            classic:  " .:-=+*#%@",
+            detailed: " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
+            blocks:   " ░▒▓█",
+            dots:     " .oO@",
+            digits:   "0123456789",
+            letters:  "abcdefghijklmnopqrstuvwxyz",
+        };
 
         const localUid = (() => {
             let id = localStorage.getItem('sldchat_uid');
@@ -531,11 +674,67 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
         let uptimeAt = Date.now();
         const trackedViews = new Set();
 
+        // ---- ASCII конвертер ----
+        let currentAsciiImage = null;
+        let currentAsciiText = '';
+
         function escapeHtml(text) {
             const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
             return text ? String(text).replace(/[&<>"']/g, m => map[m]) : '';
         }
 
+        // ---- Цвета ----
+        const COLOR_NAMES = new Set([
+            'black','silver','gray','grey','white','maroon','red','purple','fuchsia','green','lime',
+            'olive','yellow','navy','blue','teal','aqua','cyan','magenta','orange','pink','brown',
+            'gold','coral','salmon','crimson','tomato','khaki','plum','orchid','turquoise','beige',
+            'ivory','azure','violet','indigo','tan','lavender'
+        ]);
+        function isValidColor(c) {
+            c = String(c).trim().toLowerCase();
+            if (COLOR_NAMES.has(c)) return true;
+            if (/^#[0-9a-f]{3}$/i.test(c)) return true;
+            if (/^#[0-9a-f]{6}$/i.test(c)) return true;
+            if (/^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$/i.test(c)) return true;
+            return false;
+        }
+        function renderRichText(text) {
+            if (!text) return '';
+            const re = /\[c=([^\]]+)\]|\[\/c\]/gi;
+            let out = '';
+            const stack = [];
+            let last = 0;
+            let m;
+            while ((m = re.exec(text)) !== null) {
+                if (m.index > last) out += escapeHtml(text.slice(last, m.index));
+                if (m[0].toLowerCase() === '[/c]') {
+                    if (stack.length > 0) {
+                        const wasOpened = stack.pop();
+                        out += wasOpened ? '</span>' : '[/c]';
+                    } else {
+                        out += '[/c]';
+                    }
+                } else {
+                    const color = m[1].trim();
+                    if (isValidColor(color)) {
+                        out += `<span style="color:${color.toLowerCase()}">`;
+                        stack.push(true);
+                    } else {
+                        out += escapeHtml(m[0]);
+                        stack.push(false);
+                    }
+                }
+                last = re.lastIndex;
+            }
+            if (last < text.length) out += escapeHtml(text.slice(last));
+            while (stack.length > 0) {
+                const wasOpened = stack.pop();
+                if (wasOpened) out += '</span>';
+            }
+            return out;
+        }
+
+        // ---- Аптайм ----
         function renderUptime() {
             const total = Math.floor(uptimeBase + (Date.now() - uptimeAt) / 1000);
             const d = Math.floor(total / 86400);
@@ -627,21 +826,205 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
         document.getElementById('post-text-input').addEventListener('input', updateCharCounter);
         updateCharCounter();
 
+        // -------- ASCII: обработка файла --------
+        window.handleAsciiImage = (e) => {
+            const file = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (!file) return;
+            if (!file.type.startsWith('image/')) {
+                return window.showToast('Нужен файл-изображение');
+            }
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const img = new Image();
+                img.onload = () => {
+                    currentAsciiImage = img;
+                    document.getElementById('ascii-controls').classList.remove('hidden');
+                    document.getElementById('ascii-preview').classList.remove('hidden');
+                    document.getElementById('ascii-clear-btn').classList.remove('hidden');
+                    window.updateAsciiPreview();
+                };
+                img.onerror = () => window.showToast('Не удалось прочитать изображение');
+                img.src = ev.target.result;
+            };
+            reader.onerror = () => window.showToast('Ошибка чтения файла');
+            reader.readAsDataURL(file);
+        };
+
+        window.clearAscii = () => {
+            currentAsciiImage = null;
+            currentAsciiText = '';
+            document.getElementById('ascii-controls').classList.add('hidden');
+            document.getElementById('ascii-preview').classList.add('hidden');
+            document.getElementById('ascii-clear-btn').classList.add('hidden');
+            document.getElementById('ascii-preview').textContent = '';
+        };
+
+        // -------- ASCII: конвертер --------
+        function imageToAscii(img, opts) {
+            const {
+                width = 80,
+                charset = ASCII_CHARSETS.classic,
+                contrast = 1.0,
+                brightness = 0,
+                invert = false,
+                whiteBg = true,
+            } = opts;
+
+            // Символы моношрифта примерно в 2 раза выше, чем шириной — компенсируем
+            const CHAR_ASPECT = 0.5;
+
+            const targetW = Math.max(4, Math.min(300, Math.round(width)));
+            const targetH = Math.max(2, Math.round((img.height / img.width) * targetW * CHAR_ASPECT));
+
+            const canvas = document.createElement('canvas');
+            canvas.width = targetW;
+            canvas.height = targetH;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            // Фон для прозрачных картинок
+            if (whiteBg) {
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, targetW, targetH);
+            }
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, 0, 0, targetW, targetH);
+
+            let data;
+            try {
+                data = ctx.getImageData(0, 0, targetW, targetH).data;
+            } catch (err) {
+                return null;
+            }
+
+            const N = charset.length;
+            const lines = [];
+
+            for (let y = 0; y < targetH; y++) {
+                const row = new Array(targetW);
+                for (let x = 0; x < targetW; x++) {
+                    const i = (y * targetW + x) * 4;
+                    const r = data[i], g = data[i + 1], b = data[i + 2];
+                    // Luma Rec.601 (хорошо для восприятия)
+                    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                    // Контраст вокруг 128
+                    lum = (lum - 128) * contrast + 128;
+                    // Яркость (в диапазоне -100..100 → -255..255 / 2)
+                    lum += brightness * 1.275;
+                    // Клиппинг
+                    if (lum < 0) lum = 0;
+                    else if (lum > 255) lum = 255;
+
+                    // Инверсия
+                    if (invert) lum = 255 - lum;
+
+                    // Маппинг на набор символов.
+                    // Набор упорядочен от "тёмного" к "светлому" (или наоборот).
+                    // Классический " .:-=+*#%@" — пробел=светлое, @=тёмное.
+                    let idx = Math.floor((lum / 256) * N);
+                    if (idx < 0) idx = 0;
+                    else if (idx >= N) idx = N - 1;
+
+                    row[x] = charset[idx];
+                }
+                lines.push(row.join(''));
+            }
+            return lines.join('\n');
+        }
+
+        window.updateAsciiPreview = () => {
+            if (!currentAsciiImage) return;
+            const width = parseInt(document.getElementById('ascii-width').value, 10);
+            const contrast = parseFloat(document.getElementById('ascii-contrast').value);
+            const brightness = parseInt(document.getElementById('ascii-brightness').value, 10);
+            const charsetKey = document.getElementById('ascii-charset').value;
+            const invert = document.getElementById('ascii-invert').checked;
+            const whiteBg = document.getElementById('ascii-white-bg').checked;
+
+            document.getElementById('ascii-width-val').textContent = width;
+            document.getElementById('ascii-contrast-val').textContent = contrast.toFixed(2);
+            document.getElementById('ascii-brightness-val').textContent = brightness;
+
+            const charset = ASCII_CHARSETS[charsetKey] || ASCII_CHARSETS.classic;
+
+            const art = imageToAscii(currentAsciiImage, {
+                width, charset, contrast, brightness, invert, whiteBg,
+            });
+            if (art === null) {
+                window.showToast('Не удалось получить пиксели изображения');
+                return;
+            }
+            currentAsciiText = art;
+            const preview = document.getElementById('ascii-preview');
+            preview.textContent = art;
+            const lines = art.split('\n');
+            document.getElementById('ascii-size').textContent =
+                `${lines[0].length}×${lines.length} (${art.length} симв.)`;
+        };
+
+        // Слушатели слайдеров
+        ['ascii-width','ascii-contrast','ascii-brightness'].forEach(id => {
+            document.getElementById(id).addEventListener('input', window.updateAsciiPreview);
+        });
+        ['ascii-charset','ascii-invert','ascii-white-bg'].forEach(id => {
+            document.getElementById(id).addEventListener('change', window.updateAsciiPreview);
+        });
+
+        // -------- ASCII viewer --------
+        let asciiFontSize = 10;
+        let asciiOriginalText = '';
+
+        window.openAsciiViewer = (text) => {
+            asciiOriginalText = text;
+            const modal = document.getElementById('ascii-modal');
+            const content = document.getElementById('ascii-modal-content');
+            content.textContent = text;
+            asciiFontSize = 10;
+            content.style.fontSize = asciiFontSize + 'px';
+            modal.classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+        };
+        window.closeAsciiViewer = () => {
+            document.getElementById('ascii-modal').classList.add('hidden');
+            document.body.style.overflow = '';
+        };
+        window.asciiZoom = (delta) => {
+            asciiFontSize = Math.max(3, Math.min(40, asciiFontSize + delta * 1.5));
+            document.getElementById('ascii-modal-content').style.fontSize = asciiFontSize + 'px';
+        };
+        window.asciiCopy = async () => {
+            try {
+                await navigator.clipboard.writeText(asciiOriginalText);
+                window.showToast('ASCII скопирован!');
+            } catch (e) {
+                window.showToast('Не удалось скопировать');
+            }
+        };
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !document.getElementById('ascii-modal').classList.contains('hidden')) {
+                window.closeAsciiViewer();
+            }
+        });
+
+        // -------- Создание поста --------
         window.createPost = async () => {
             const title = document.getElementById('post-title-input').value.trim();
             const textEl = document.getElementById('post-text-input');
             const text = textEl.value.trim();
             const visibility = document.getElementById('post-visibility').value;
+            const asciiArt = currentAsciiText || '';
 
             if (!title) return window.showToast('Введите заголовок!');
-            if (!text) return window.showToast('Напишите что-нибудь!');
+            if (!text && !asciiArt) return window.showToast('Напишите что-нибудь!');
             if (text.length > MAX_TEXT_LEN) return window.showToast(`Максимум ${MAX_TEXT_LEN} символов`);
 
             try {
                 const res = await fetch('/api/posts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ title, text, visibility, ownerId: localUid })
+                    body: JSON.stringify({ title, text, visibility, ownerId: localUid, asciiArt })
                 });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
@@ -651,6 +1034,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                 document.getElementById('post-title-input').value = '';
                 textEl.value = '';
                 updateCharCounter();
+                window.clearAscii();
 
                 if (visibility === 'unlisted') {
                     window.showToast('Скрытый пост создан!');
@@ -787,7 +1171,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                 <div class="post-title">${escapeHtml(post.title)}</div>
             `;
 
-            if (post.text) html += `<div class="post-text">${escapeHtml(post.text)}</div>`;
+            if (post.asciiArt) {
+                // Store raw ascii in a data attribute for the viewer
+                const id = 'ascii-' + post.id;
+                html += `<pre class="ascii-art" id="${id}" data-ascii-id="${post.id}" onclick="window.openAsciiViewer(document.getElementById('${id}').textContent)">${escapeHtml(post.asciiArt)}</pre>`;
+            }
+
+            if (post.text) html += `<div class="post-text">${renderRichText(post.text)}</div>`;
 
             html += `
                 <div class="post-footer">
@@ -830,7 +1220,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--primary); }
                                     ${isCommentOwner || isOwner ? `<span style="color:var(--error); margin-left:6px; cursor:pointer;" onclick="window.deleteComment('${post.id}', '${c.id}')">[Удалить]</span>` : ''}
                                 </div>
                             </div>
-                            <div class="comment-text">${escapeHtml(c.text)}</div>
+                            <div class="comment-text">${renderRichText(c.text)}</div>
                         </div>
                     `;
                 });
