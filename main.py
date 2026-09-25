@@ -84,7 +84,6 @@ manager = WSManager()
 
 
 async def notify_friends_status(user: str, online: bool):
-    """Сообщаем всем друзьям, что user появился/ушел."""
     for f in list(friends.get(user, set())):
         if online:
             await manager.send(f, {"type": "user_online", "user": user})
@@ -183,7 +182,6 @@ async def get_friends(user: str = Depends(current_user)):
 
 @app.get("/api/status")
 async def get_statuses(user: str = Depends(current_user)):
-    """Текущий онлайн-статус всех друзей + last_seen для оффлайна."""
     out = {}
     for f in friends.get(user, set()):
         out[f] = {
@@ -201,13 +199,10 @@ async def friend_request(data: TargetData, user: str = Depends(current_user)):
     if are_friends(user, t):
         raise HTTPException(400, "Уже друзья")
     if user in requests.get(t, set()):
-        # встречная заявка — сразу друзья
         requests[t].discard(user)
         add_friends(user, t)
-        # статус обеим сторонам
         await manager.send(t, {"type": "friends_changed"})
         await manager.send(user, {"type": "friends_changed"})
-        # оповестим о онлайне друг друга
         if manager.is_online(user):
             await manager.send(t, {"type": "user_online", "user": user})
         if manager.is_online(t):
@@ -253,10 +248,8 @@ async def friend_cancel(data: TargetData, user: str = Depends(current_user)):
 
 @app.post("/api/friends/remove")
 async def friend_remove(data: TargetData, user: str = Depends(current_user)):
-    """Удаляем из друзей + стираем всю переписку между ними."""
     t = data.target
     remove_friends(user, t)
-    # удаляем сообщения
     global messages
     messages[:] = [m for m in messages
                    if not ((m["from"] == user and m["to"] == t) or
@@ -362,7 +355,6 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     await manager.add(username, websocket)
 
     try:
-        # Отправляем клиенту приветствие и список друзей-онлайн
         online = [f for f in friends.get(username, set()) if manager.is_online(f)]
         ls = {f: last_seen.get(f, 0) for f in friends.get(username, set())}
         await websocket.send_json({
@@ -370,8 +362,6 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
             "users": online,
             "last_seen": ls,
         })
-
-        # Сообщаем друзьям, что мы онлайн
         await notify_friends_status(username, True)
 
         while True:
@@ -384,7 +374,6 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
         pass
     finally:
         await manager.remove(username, websocket)
-        # Если у пользователя больше нет активных соединений — оффлайн
         if not manager.is_online(username):
             last_seen[username] = time.time()
             await notify_friends_status(username, False)
@@ -394,7 +383,7 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
 #                     PWA / SERVICE WORKER / ИКОНКА
 # ==================================================================
 SW_JS = r"""
-const CACHE = 'msgr-v3';
+const CACHE = 'msgr-v4';
 self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil((async () => {
@@ -491,6 +480,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Мессенджер">
 <link rel="manifest" href="/manifest.webmanifest">
@@ -508,7 +498,7 @@ HTML = r"""<!DOCTYPE html>
   --glass-bg:rgba(255,255,255,.72);
   --glass-border:rgba(255,255,255,.5);
   --shadow:0 8px 24px rgba(0,0,0,.06);
-  --app-h:100dvh;
+  --app-h:100vh;
 }
 [data-theme="dark"]{
   --bg:#0b0b0c; --bg-elev:#17171a; --bg-soft:#101013;
@@ -521,38 +511,48 @@ HTML = r"""<!DOCTYPE html>
   --glass-border:rgba(255,255,255,.08);
   --shadow:0 8px 24px rgba(0,0,0,.4);
 }
+
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+
 html,body{
-  position:fixed;inset:0;
-  width:100%;height:100%;
+  height:100%;width:100%;
   overflow:hidden;
   overscroll-behavior:none;
-  touch-action:none;
   background:var(--bg);color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
   font-size:17px;-webkit-font-smoothing:antialiased;
-  -webkit-touch-callout:none;
-  -webkit-user-select:none;user-select:none;
 }
-input, textarea { -webkit-user-select:text; user-select:text; }
 
 #app{
   position:fixed;
   top:0;left:0;right:0;
-  height:var(--app-h, 100dvh);
+  height:var(--app-h);
   overflow:hidden;
-  touch-action:none;
   background:var(--bg);
 }
 
-/* ---------- Screens with transition ---------- */
+/* ---------- Кнопки: убираем 300ms задержку и двойной тап ---------- */
+button,
+.row,
+.nav-btn,
+.icon-btn,
+.mini-btn,
+.send-btn,
+.seg,
+.tab,
+.switch,
+label,
+a {
+  touch-action: manipulation;
+}
+
+/* ---------- Экраны и переходы ---------- */
 .screen{
   position:absolute;inset:0;
   display:flex;flex-direction:column;
   overflow:hidden;background:var(--bg);
   opacity:0;visibility:hidden;pointer-events:none;
   transition:opacity .24s ease, visibility 0s linear .24s;
-  will-change:opacity, transform;
 }
 .screen.active{
   opacity:1;visibility:visible;pointer-events:auto;
@@ -567,7 +567,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   transition:opacity .22s ease, transform .3s cubic-bezier(.22,1,.36,1), visibility 0s;
 }
 
-/* ---------- Topbar ---------- */
+/* ---------- Верхняя панель ---------- */
 .topbar{
   flex-shrink:0;display:flex;align-items:center;gap:6px;
   padding:8px;
@@ -575,7 +575,6 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   border-bottom:1px solid var(--border);
   background:var(--bg);
   min-height:56px;z-index:5;
-  transition:background .2s, border-color .2s;
 }
 .topbar .title{
   flex:1;display:flex;align-items:center;gap:10px;
@@ -586,8 +585,13 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 .topbar .title.center{
   padding-left:0;text-align:center;font-size:17px;font-weight:600;
   flex-direction:column;gap:0;align-items:center;justify-content:center;
+  min-width:0;
 }
-.title-main{font-weight:inherit}
+.title-main{
+  font-weight:inherit;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  max-width:100%;
+}
 .title-status{
   font-size:12.5px;font-weight:500;color:var(--text-dim);
   margin-top:1px;line-height:1.2;height:15px;
@@ -596,12 +600,10 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 .title-status.typing{color:var(--ok)}
 .title-status.online{color:var(--ok)}
 
-/* connection dot */
 .conn-dot{
   width:9px;height:9px;border-radius:50%;
   background:#c7c7cc;flex-shrink:0;
   transition:background .3s, box-shadow .3s;
-  box-shadow:0 0 0 0 rgba(34,197,94,0);
 }
 .conn-dot.online{
   background:var(--ok);
@@ -619,10 +621,11 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   display:flex;align-items:center;justify-content:center;
   border-radius:12px;cursor:pointer;color:var(--text);
   transition:background .15s, transform .1s;
+  touch-action: manipulation;
 }
 .icon-btn:active{background:var(--bg-elev);transform:scale(.94)}
 .icon-btn svg{width:22px;height:22px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
 
 /* ---------- Glass ---------- */
 [data-glass="on"] .glass{
@@ -632,14 +635,13 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   border-color:var(--glass-border) !important;
 }
 
-/* ---------- Bottom nav ---------- */
+/* ---------- Нижнее меню ---------- */
 .bottom-nav{
   flex-shrink:0;display:flex;
   padding:6px;
   padding-bottom:calc(6px + env(safe-area-inset-bottom,0));
   border-top:1px solid var(--border);
   background:var(--bg);z-index:5;
-  transition:background .2s, border-color .2s;
 }
 .nav-btn{
   flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -648,12 +650,13 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   border-radius:14px;
   transition:color .18s, background .18s, transform .12s;
   position:relative;
+  touch-action: manipulation;
 }
 .nav-btn:active{transform:scale(.94)}
 .nav-btn.active{color:var(--text)}
 .nav-btn svg{width:24px;height:24px;stroke:currentColor;fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
-  transition:transform .2s}
+  transition:transform .2s;pointer-events:none}
 .nav-btn.active svg{transform:translateY(-1px)}
 .nav-btn .dot{
   position:absolute;top:6px;right:calc(50% - 18px);
@@ -661,11 +664,12 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   background:#ef4444;color:#fff;font-size:10px;font-weight:700;
   display:flex;align-items:center;justify-content:center;
   animation:badgepop .25s ease;
+  pointer-events:none;
 }
 @keyframes badgepop{from{transform:scale(0)}to{transform:scale(1)}}
 
-/* ---------- Page area ---------- */
-.page-area{flex:1;overflow:hidden;position:relative}
+/* ---------- Область страниц ---------- */
+.page-area{flex:1;overflow:hidden;position:relative;min-height:0}
 .page{
   position:absolute;inset:0;display:flex;flex-direction:column;overflow:hidden;
   opacity:0;pointer-events:none;visibility:hidden;
@@ -676,14 +680,23 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   transition:opacity .22s ease, visibility 0s;
 }
 
-/* ---------- Scroll containers ---------- */
-.page-scroll, .messages, #auth{
-  overflow-y:auto;-webkit-overflow-scrolling:touch;
+/* ---------- Скролл-контейнеры ---------- */
+.page-scroll,
+.messages{
+  flex:1;min-height:0;
+  overflow-y:auto;
+  -webkit-overflow-scrolling:touch;
   overscroll-behavior:contain;
-  touch-action:pan-y;
+  touch-action: pan-y;
+}
+#auth{
+  overflow-y:auto;
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;
+  touch-action: pan-y;
 }
 
-/* ---------- Segmented control ---------- */
+/* ---------- Сегментированный контрол ---------- */
 .segmented{
   display:flex;background:var(--bg-elev);border-radius:12px;
   padding:4px;margin:12px 16px 6px;
@@ -695,19 +708,22 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   font-family:inherit;
   transition:background .2s, color .2s, box-shadow .2s;
   position:relative;
+  touch-action: manipulation;
 }
 .seg.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .seg .badge-inline{
   display:inline-block;min-width:18px;height:18px;padding:0 5px;border-radius:9px;
   background:#ef4444;color:#fff;font-size:11px;font-weight:700;
   margin-left:6px;line-height:18px;vertical-align:middle;
+  pointer-events:none;
 }
 
-/* ---------- Rows ---------- */
+/* ---------- Строки ---------- */
 .row{
   display:flex;align-items:center;gap:14px;
   padding:12px 16px;cursor:pointer;
   transition:background .15s;
+  touch-action: manipulation;
 }
 .row:active{background:var(--bg-soft)}
 .avatar{
@@ -716,7 +732,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   display:flex;align-items:center;justify-content:center;
   font-weight:700;font-size:19px;color:var(--text-dim);flex-shrink:0;
   letter-spacing:.5px;
-  transition:background .2s;
+  pointer-events:none;
 }
 .avatar .online-dot{
   position:absolute;bottom:-1px;right:-1px;
@@ -725,9 +741,10 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   border:3px solid var(--bg);
   box-sizing:content-box;
   animation:dotin .25s ease;
+  pointer-events:none;
 }
 @keyframes dotin{from{transform:scale(0)}to{transform:scale(1)}}
-.row-info{flex:1;min-width:0}
+.row-info{flex:1;min-width:0;pointer-events:none}
 .row-title{
   font-size:16.5px;font-weight:600;color:var(--text);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
@@ -739,7 +756,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 }
 .row-sub.online{color:var(--ok);font-weight:500}
 .row-sub.italic{font-style:italic;opacity:.85}
-.row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0}
+.row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;pointer-events:none}
 .badge{
   min-width:22px;height:22px;padding:0 7px;border-radius:11px;
   background:var(--text);color:var(--bg);font-size:12.5px;font-weight:700;
@@ -756,21 +773,30 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;
 }
 
-/* ---------- Mini buttons ---------- */
+/* ---------- Маленькие кнопки ---------- */
 .mini-btn{
   border:none;font-family:inherit;font-size:13.5px;font-weight:600;
   padding:8px 14px;border-radius:10px;cursor:pointer;
   transition:transform .1s, opacity .15s, background .15s;
   display:inline-flex;align-items:center;justify-content:center;gap:4px;
+  touch-action: manipulation;
+  position:relative;
+  z-index:1;
 }
 .mini-btn:active{transform:scale(.95)}
 .mini-btn.primary{background:var(--text);color:var(--bg)}
 .mini-btn.ghost{background:var(--bg-elev);color:var(--text)}
 .mini-btn.danger{background:transparent;color:var(--danger);padding:8px}
-.mini-btn-row{display:flex;gap:8px;flex-shrink:0}
+.mini-btn svg{pointer-events:none}
+.mini-btn-row{display:flex;gap:8px;flex-shrink:0;position:relative;z-index:1}
 
-/* ---------- Auth ---------- */
-#auth{justify-content:center;align-items:center;padding:24px}
+/* ---------- Авторизация ---------- */
+#auth{
+  display:flex;flex-direction:column;
+  padding:24px;
+  padding-top:calc(24px + env(safe-area-inset-top,0));
+  padding-bottom:calc(24px + env(safe-area-inset-bottom,0));
+}
 .auth-wrap{width:100%;max-width:380px;text-align:center;margin:auto}
 .logo{
   width:84px;height:84px;margin:0 auto 22px;background:var(--text);border-radius:26px;
@@ -785,6 +811,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   flex:1;padding:11px;border:none;background:transparent;border-radius:9px;
   font-size:14.5px;font-weight:600;color:var(--text-dim);cursor:pointer;
   transition:all .2s;font-family:inherit;
+  touch-action: manipulation;
 }
 .tab.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .input-wrap{
@@ -799,20 +826,22 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 .input-wrap input{
   flex:1;border:none;outline:none;background:transparent;padding:16px 0;
   font-size:16.5px;font-family:inherit;color:var(--text);min-width:0;
+  -webkit-user-select:text;user-select:text;
 }
 .input-wrap input::placeholder{color:var(--text-dim)}
 .btn-primary{
   width:100%;padding:17px;background:var(--text);color:var(--bg);border:none;
   border-radius:13px;font-size:16.5px;font-weight:600;cursor:pointer;
   margin-top:4px;transition:transform .1s,opacity .2s;font-family:inherit;
+  touch-action: manipulation;
 }
 .btn-primary:active{transform:scale(.98)}
 .btn-primary:disabled{opacity:.5;cursor:default}
 .error{color:var(--danger);font-size:14px;margin-top:12px;min-height:20px}
 
-/* ---------- Chat ---------- */
+/* ---------- Чат ---------- */
 .messages{
-  flex:1;padding:16px 14px 8px;
+  padding:16px 14px 8px;
   display:flex;flex-direction:column;gap:6px;
   background:var(--bg);
 }
@@ -821,6 +850,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   font-size:17.5px;line-height:1.42;word-wrap:break-word;overflow-wrap:anywhere;
   white-space:pre-wrap;
   animation:pop .18s cubic-bezier(.22,1,.36,1);
+  -webkit-user-select:text;user-select:text;
 }
 @keyframes pop{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
 .msg.me{align-self:flex-end;background:var(--bubble-me);color:var(--bubble-me-fg);
@@ -833,12 +863,11 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   padding:10px 12px;
   padding-bottom:calc(10px + env(safe-area-inset-bottom,0));
   border-top:1px solid var(--border);background:var(--bg);z-index:5;
-  transition:background .2s, border-color .2s;
 }
 .composer input{
   flex:1;padding:13px 18px;border:none;outline:none;background:var(--bg-elev);
   border-radius:24px;font-size:17px;font-family:inherit;color:var(--text);min-width:0;
-  transition:background .2s;
+  -webkit-user-select:text;user-select:text;
 }
 .composer input::placeholder{color:var(--text-dim)}
 .send-btn{
@@ -847,13 +876,14 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   display:flex;align-items:center;justify-content:center;cursor:pointer;
   flex-shrink:0;
   transition:transform .12s, opacity .2s, background .2s;
-  touch-action:manipulation;
+  touch-action: manipulation;
+  -webkit-user-select:none;user-select:none;
 }
 .send-btn:active{transform:scale(.9)}
 .send-btn svg{width:20px;height:20px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
 
-/* ---------- Settings ---------- */
+/* ---------- Настройки ---------- */
 .settings-group{margin:14px 12px;background:var(--bg-elev);border-radius:14px;overflow:hidden}
 .set-row{display:flex;align-items:center;justify-content:space-between;
   padding:15px 16px;gap:12px}
@@ -863,12 +893,14 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 .switch{
   width:52px;height:31px;border-radius:16px;background:var(--border);
   position:relative;cursor:pointer;transition:background .2s;flex-shrink:0;
+  touch-action: manipulation;
 }
 .switch::after{
   content:'';position:absolute;top:2.5px;left:2.5px;
   width:26px;height:26px;border-radius:50%;background:#fff;
   transition:left .2s cubic-bezier(.22,1,.36,1);
   box-shadow:0 1px 3px rgba(0,0,0,.2);
+  pointer-events:none;
 }
 .switch.on{background:var(--ok)}
 .switch.on::after{left:23.5px}
@@ -882,10 +914,10 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   width:100%;padding:15px;background:transparent;color:var(--danger);
   border:none;border-radius:14px;font-size:16px;font-weight:600;
   cursor:pointer;font-family:inherit;
+  touch-action: manipulation;
 }
 .danger-btn:active{background:var(--bg-soft)}
 
-/* Search */
 .search-wrap{
   display:flex;align-items:center;gap:10px;background:var(--bg-elev);
   border-radius:13px;padding:0 14px;margin:12px 16px 0;flex-shrink:0;
@@ -895,6 +927,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
 .search-wrap input{
   flex:1;border:none;outline:none;background:transparent;padding:13px 0;
   font-size:16.5px;font-family:inherit;color:var(--text);min-width:0;
+  -webkit-user-select:text;user-select:text;
 }
 .search-wrap input::placeholder{color:var(--text-dim)}
 
@@ -912,7 +945,6 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   opacity:0;pointer-events:none;
   transition:opacity .25s,transform .25s;
   z-index:9999;max-width:90vw;text-align:center;
-  will-change:opacity, transform;
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
@@ -956,7 +988,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
         <span class="conn-dot" id="conn-dot"></span>
         <span class="title-main" id="main-title">Чаты</span>
       </div>
-      <button class="icon-btn" id="quick-theme" aria-label="Тема">
+      <button class="icon-btn" id="quick-theme" type="button" aria-label="Тема">
         <svg id="quick-theme-icon" viewBox="0 0 24 24"></svg>
       </button>
     </header>
@@ -974,8 +1006,8 @@ input, textarea { -webkit-user-select:text; user-select:text; }
           <input type="text" id="friend-search" placeholder="Найти пользователя..." autocomplete="off">
         </div>
         <div class="segmented" id="friends-seg">
-          <button class="seg active" data-tab="friends">Друзья</button>
-          <button class="seg" data-tab="pending">Ожидание<span id="pending-badge"></span></button>
+          <button type="button" class="seg active" data-tab="friends">Друзья</button>
+          <button type="button" class="seg" data-tab="pending">Ожидание<span id="pending-badge"></span></button>
         </div>
         <div class="page-scroll" id="friends-list"></div>
       </div>
@@ -1015,7 +1047,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
           </div>
 
           <div class="settings-group">
-            <button class="danger-btn" id="logout-btn">Выйти из аккаунта</button>
+            <button type="button" class="danger-btn" id="logout-btn">Выйти из аккаунта</button>
           </div>
 
           <div class="footnote">
@@ -1027,17 +1059,17 @@ input, textarea { -webkit-user-select:text; user-select:text; }
     </div>
 
     <nav class="bottom-nav glass">
-      <button class="nav-btn active" data-page="home">
+      <button type="button" class="nav-btn active" data-page="home">
         <svg viewBox="0 0 24 24"><path d="M3 12l9-9 9 9"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
         <span>Главная</span>
         <span class="dot" id="home-dot" style="display:none"></span>
       </button>
-      <button class="nav-btn" data-page="friends">
+      <button type="button" class="nav-btn" data-page="friends">
         <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span>Друзья</span>
         <span class="dot" id="friends-dot" style="display:none"></span>
       </button>
-      <button class="nav-btn" data-page="settings">
+      <button type="button" class="nav-btn" data-page="settings">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.6.65 1 1.26 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span>Настройки</span>
       </button>
@@ -1047,7 +1079,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
   <!-- ===================== CHAT ===================== -->
   <div id="chat" class="screen">
     <header class="topbar glass">
-      <button class="icon-btn" id="chat-back" aria-label="Назад">
+      <button type="button" class="icon-btn" id="chat-back" aria-label="Назад">
         <svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
       </button>
       <div class="title center">
@@ -1059,7 +1091,7 @@ input, textarea { -webkit-user-select:text; user-select:text; }
     <div class="messages" id="messages"></div>
     <div class="composer glass">
       <input type="text" id="msg-input" placeholder="Сообщение..." maxlength="2000" autocomplete="off" enterkeyhint="send">
-      <button class="send-btn" id="send-btn" type="button" aria-label="Отправить">
+      <button type="button" class="send-btn" id="send-btn" aria-label="Отправить">
         <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
@@ -1083,7 +1115,7 @@ const state = {
   notif: localStorage.getItem('m_notif') === '1',
   ws: null,
   wsReady: false,
-  wsState: 'connecting',   // connecting | online | offline
+  wsState: 'connecting',
   reconnectTimer: null,
   page: 'home',
   friendsTab: 'friends',
@@ -1110,7 +1142,6 @@ const ICONS = {
   trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/>',
 };
 
-// ---------- Helpers ----------
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
   '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
 }[c]));
@@ -1119,8 +1150,9 @@ function fmtTime(ts){
   if (!ts) return '';
   const d = new Date(ts * 1000);
   const now = new Date();
-  const sameDay = d.toDateString() === now.toDateString();
-  if (sameDay) return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  if (d.toDateString() === now.toDateString()){
+    return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+  }
   const yest = new Date(now); yest.setDate(now.getDate() - 1);
   if (d.toDateString() === yest.toDateString()) return 'вчера';
   const dd = d.getDate().toString().padStart(2,'0');
@@ -1188,38 +1220,27 @@ function applyNotifUI(){
 // ---------- Viewport ----------
 function updateViewport(){
   const vv = window.visualViewport;
-  const h = vv ? vv.height : window.innerHeight;
+  let h;
+  if (vv) {
+    h = vv.height;
+  } else {
+    h = window.innerHeight;
+  }
   document.documentElement.style.setProperty('--app-h', h + 'px');
 }
 if (window.visualViewport){
   window.visualViewport.addEventListener('resize', updateViewport);
   window.visualViewport.addEventListener('scroll', () => {
+    // при скролле visual viewport (iOS) держим body в нуле
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
     updateViewport();
-    window.scrollTo(0,0);
   });
 }
 window.addEventListener('orientationchange', () => setTimeout(updateViewport, 200));
+window.addEventListener('resize', updateViewport);
 updateViewport();
 
-// Защита от прокрутки body за пределами скролл-контейнеров
-document.addEventListener('touchmove', (e) => {
-  if (e.touches.length > 1) return;
-  let el = e.target;
-  while (el && el !== document.body && el !== document.documentElement){
-    if (el.classList && (
-      el.classList.contains('page-scroll') ||
-      el.classList.contains('messages') ||
-      el.classList.contains('screen-scroll') ||
-      (el.id === 'auth')
-    )){
-      return;
-    }
-    el = el.parentElement;
-  }
-  e.preventDefault();
-}, { passive: false });
-
-// ---------- Connection status ----------
+// ---------- Connection ----------
 function setWsState(s){
   state.wsState = s;
   const dot = $('#conn-dot');
@@ -1240,7 +1261,7 @@ function setWsState(s){
   }
 }
 
-// ---------- Auth ----------
+// ---------- Auth / API ----------
 async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({
@@ -1332,7 +1353,7 @@ function switchPage(page){
 
 $$('.nav-btn').forEach(b => b.addEventListener('click', () => switchPage(b.dataset.page)));
 
-// ---------- Enter app ----------
+// ---------- Enter ----------
 async function enterApp(){
   $('#me-avatar').textContent = (state.username[0] || '?').toUpperCase();
   $('#me-name').textContent = state.username;
@@ -1345,7 +1366,6 @@ async function enterApp(){
   if ('serviceWorker' in navigator){
     navigator.serviceWorker.register('/sw.js').catch(()=>{});
   }
-  // обработка ?peer= после логина
   if (state.pendingPeer){
     const p = state.pendingPeer;
     state.pendingPeer = null;
@@ -1353,7 +1373,7 @@ async function enterApp(){
   }
 }
 
-// ---------- WS ----------
+// ---------- WebSocket ----------
 function connectWS(){
   if (!state.token) return;
   if (state.ws && (state.ws.readyState === 0 || state.ws.readyState === 1)) return;
@@ -1375,10 +1395,7 @@ function connectWS(){
   ws.onclose = (e) => {
     state.wsReady = false;
     if (state.ws === ws) state.ws = null;
-    if (e.code === 4000){
-      // заменены другой вкладкой — не переподключаемся
-      return;
-    }
+    if (e.code === 4000) return;
     if (state.token){
       setWsState('connecting');
       clearTimeout(state.reconnectTimer);
@@ -1397,7 +1414,6 @@ function wsSend(obj){
   return false;
 }
 
-// ---------- Server events ----------
 function handleServerEvent(m){
   if (m.type === 'online_list'){
     state.onlineUsers = new Set(m.users || []);
@@ -1427,7 +1443,6 @@ function handleServerEvent(m){
       scrollMessages();
       if (m.from !== state.username){
         wsSend({ type: 'read', peer });
-        // сбрасываем "печатает" — пришло сообщение
         state.peerTyping = false;
         clearTimeout(state.peerTypingTimer);
         refreshStatusUI();
@@ -1445,7 +1460,6 @@ function handleServerEvent(m){
   if (m.type === 'friends_changed'){
     refreshFriends();
     refreshChats();
-    // подтянем статусы новых друзей
     fetchStatuses();
     return;
   }
@@ -1513,7 +1527,6 @@ function maybeNotify(m){
 
 // ---------- Status UI ----------
 function refreshStatusUI(){
-  // шапка чата
   if (state.activePeer){
     const el = $('#chat-status');
     if (state.peerTyping){
@@ -1529,11 +1542,11 @@ function refreshStatusUI(){
       el.classList.remove('typing','online');
     }
   }
-  // список чатов
   renderChats();
+  if (state.page === 'friends' && !state.searchQuery) renderFriends();
 }
 
-// ---------- Chats (Home) ----------
+// ---------- Chats ----------
 async function refreshChats(){
   if (!state.token) return;
   try {
@@ -1577,7 +1590,7 @@ function renderChats(){
   });
 }
 
-// ---------- Friends ----------
+// ---------- Dots ----------
 function updateDots(){
   const homeUnread = state.chats.reduce((s,c) => s + (c.unread||0), 0);
   const homeDot = $('#home-dot');
@@ -1598,6 +1611,7 @@ function updateDots(){
   else pb.innerHTML = '';
 }
 
+// ---------- Friends ----------
 async function refreshFriends(){
   if (!state.token) return;
   try {
@@ -1641,8 +1655,8 @@ function renderFriends(){
         '<div class="avatar">' + esc(initial) + onlineDot + '</div>' +
         '<div class="row-info"><div class="row-title">' + esc(name) + '</div>' + sub + '</div>' +
         '<div class="mini-btn-row">' +
-          '<button class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
-          '<button class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '" title="Удалить">' +
+          '<button type="button" class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
+          '<button type="button" class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '" title="Удалить">' +
             '<svg style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" viewBox="0 0 24 24">' + ICONS.trash + '</svg>' +
           '</button>' +
         '</div></div>';
@@ -1674,9 +1688,9 @@ function bindFriendButtons(box){
 function rowPending(name, kind){
   const initial = (name[0] || '?').toUpperCase();
   const btns = kind === 'incoming'
-    ? '<button class="mini-btn primary" data-act="accept" data-user="' + esc(name) + '">Принять</button>' +
-      '<button class="mini-btn ghost" data-act="decline" data-user="' + esc(name) + '">Отклонить</button>'
-    : '<button class="mini-btn ghost" data-act="cancel" data-user="' + esc(name) + '">Отменить</button>';
+    ? '<button type="button" class="mini-btn primary" data-act="accept" data-user="' + esc(name) + '">Принять</button>' +
+      '<button type="button" class="mini-btn ghost" data-act="decline" data-user="' + esc(name) + '">Отклонить</button>'
+    : '<button type="button" class="mini-btn ghost" data-act="cancel" data-user="' + esc(name) + '">Отменить</button>';
   return '<div class="row">' +
     '<div class="avatar">' + esc(initial) + '</div>' +
     '<div class="row-info"><div class="row-title">' + esc(name) + '</div>' +
@@ -1693,9 +1707,9 @@ function renderSearch(box){
     const initial = (u.username[0] || '?').toUpperCase();
     let btn;
     if (u.status === 'friend') btn = '<div class="mini-btn ghost" style="opacity:.6">Друзья</div>';
-    else if (u.status === 'outgoing') btn = '<button class="mini-btn ghost" data-act="cancel" data-user="' + esc(u.username) + '">Отменить</button>';
-    else if (u.status === 'incoming') btn = '<button class="mini-btn primary" data-act="accept" data-user="' + esc(u.username) + '">Принять</button>';
-    else btn = '<button class="mini-btn primary" data-act="request" data-user="' + esc(u.username) + '">Добавить</button>';
+    else if (u.status === 'outgoing') btn = '<button type="button" class="mini-btn ghost" data-act="cancel" data-user="' + esc(u.username) + '">Отменить</button>';
+    else if (u.status === 'incoming') btn = '<button type="button" class="mini-btn primary" data-act="accept" data-user="' + esc(u.username) + '">Принять</button>';
+    else btn = '<button type="button" class="mini-btn primary" data-act="request" data-user="' + esc(u.username) + '">Добавить</button>';
     return '<div class="row">' +
       '<div class="avatar">' + esc(initial) + '</div>' +
       '<div class="row-info"><div class="row-title">' + esc(u.username) + '</div></div>' +
@@ -1804,14 +1818,13 @@ $('#chat-back').addEventListener('click', () => {
   setTimeout(updateViewport, 50);
 });
 
-// ВАЖНО: кнопка отправки. Никаких preventDefault на touchstart — иначе клик не сработает.
+// ---------- Send ----------
 function sendMessage(){
   if (!state.activePeer) return;
   const input = $('#msg-input');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
-  // сохраняем фокус/клавиатуру
   try { input.focus({ preventScroll: true }); } catch(_) { input.focus(); }
   const ok = wsSend({ type:'send', to: state.activePeer, text });
   if (!ok){
@@ -1828,10 +1841,6 @@ $('#send-btn').addEventListener('click', (e) => {
   e.preventDefault();
   sendMessage();
 });
-// На мыши не даём кнопке украсть фокус у поля. На тач — не трогаем (иначе клик пропадает).
-$('#send-btn').addEventListener('pointerdown', (e) => {
-  if (e.pointerType === 'mouse') e.preventDefault();
-});
 
 $('#msg-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey){
@@ -1840,7 +1849,6 @@ $('#msg-input').addEventListener('keydown', (e) => {
   }
 });
 
-// typing — мы печатаем
 let typingTimer = null;
 $('#msg-input').addEventListener('input', () => {
   if (!state.activePeer) return;
@@ -1856,7 +1864,7 @@ if (window.visualViewport){
   });
 }
 
-// ---------- Settings toggles ----------
+// ---------- Settings ----------
 $('#set-theme').addEventListener('click', () => {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem('m_theme', state.theme);
@@ -1894,30 +1902,22 @@ $('#set-notif').addEventListener('click', async () => {
   applyNotifUI();
 });
 
-// ---------- Notification click → open chat ----------
+// ---------- Notification click ----------
 if ('serviceWorker' in navigator){
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'notification_click'){
       const peer = e.data.peer;
       if (!peer) return;
-      if (state.token){
-        // если приложение уже открыто
-        if (document.getElementById('main').classList.contains('active') ||
-            document.getElementById('chat').classList.contains('active')){
-          openChat(peer);
-        }
-      }
+      if (state.token) openChat(peer);
     }
   });
 }
 
-// ?peer= в URL — после логина откроем чат
 (function checkInitialPeer(){
   const params = new URLSearchParams(location.search);
   const p = params.get('peer');
   if (p){
     state.pendingPeer = p;
-    // чистим URL
     try { history.replaceState(null, '', location.pathname); } catch(_){}
   }
 })();
@@ -1944,12 +1944,6 @@ document.addEventListener('visibilitychange', () => {
     if (state.page === 'friends') refreshFriends();
     fetchStatuses();
   }
-});
-
-// блокируем контекстное меню на долгое нажатие вне input
-document.addEventListener('contextmenu', (e) => {
-  if (e.target && e.target.tagName === 'INPUT') return;
-  e.preventDefault();
 });
 
 })();
