@@ -23,8 +23,7 @@ users: dict = {}         # username -> {"password": str}
 tokens: dict = {}        # token -> username
 messages: list = []      # {"id","from","to","text","ts","read"}
 friends: dict = {}       # user -> set(user)
-requests: dict = {}      # from_user -> set(to_user) — исходящие заявки
-last_seen: dict = {}     # username -> timestamp последнего отключения
+requests: dict = {}      # from_user -> set(to_user)
 
 
 # ==================================================================
@@ -45,29 +44,43 @@ def remove_friends(a: str, b: str):
 
 
 def unread_count(user: str, peer: str) -> int:
-    return sum(1 for m in messages
-               if m["from"] == peer and m["to"] == user and not m["read"])
+    return sum(1 for m in messages if m["from"] == peer and m["to"] == user and not m["read"])
+
+
+def delete_dialog(a: str, b: str):
+    messages[:] = [m for m in messages if not (
+        (m["from"] == a and m["to"] == b) or (m["from"] == b and m["to"] == a)
+    )]
 
 
 class WSManager:
     def __init__(self):
-        self.conns: dict = {}   # username -> WebSocket
+        self.conns: dict = {}
 
-    async def add(self, user: str, ws: WebSocket):
+    def online_users(self):
+        return set(self.conns.keys())
+
+    def is_online(self, user: str) -> bool:
+        return user in self.conns
+
+    async def add(self, user: str, ws: WebSocket) -> bool:
+        """Возвращает True, если пользователь только что вышел в сеть (был офлайн)."""
         old = self.conns.get(user)
+        was_online = old is not None
         self.conns[user] = ws
         if old is not None and old is not ws:
             try:
                 await old.close(code=4000)
             except Exception:
                 pass
+        return not was_online
 
-    async def remove(self, user: str, ws: WebSocket):
+    async def remove(self, user: str, ws: WebSocket) -> bool:
+        """Возвращает True, если пользователь стал офлайн (последнее соединение закрыто)."""
         if self.conns.get(user) is ws:
             self.conns.pop(user, None)
-
-    def is_online(self, user: str) -> bool:
-        return user in self.conns
+            return True
+        return False
 
     async def send(self, user: str, data: dict) -> bool:
         ws = self.conns.get(user)
@@ -83,16 +96,10 @@ class WSManager:
 manager = WSManager()
 
 
-async def notify_friends_status(user: str, online: bool):
-    for f in list(friends.get(user, set())):
-        if online:
-            await manager.send(f, {"type": "user_online", "user": user})
-        else:
-            await manager.send(f, {
-                "type": "user_offline",
-                "user": user,
-                "ts": last_seen.get(user, time.time()),
-            })
+async def broadcast_presence(username: str, online: bool):
+    payload = {"type": "presence", "user": username, "online": online}
+    for f in friends.get(username, set()):
+        await manager.send(f, payload)
 
 
 # ==================================================================
@@ -167,7 +174,11 @@ async def search_users(q: str = "", user: str = Depends(current_user)):
             status = "incoming"
         else:
             status = "none"
-        out.append({"username": name, "status": status})
+        out.append({
+            "username": name,
+            "status": status,
+            "online": manager.is_online(name),
+        })
     out.sort(key=lambda x: x["username"].lower())
     return out[:100]
 
@@ -177,18 +188,12 @@ async def get_friends(user: str = Depends(current_user)):
     fl = sorted(friends.get(user, set()), key=str.lower)
     incoming = sorted([f for f, s in requests.items() if user in s], key=str.lower)
     outgoing = sorted(list(requests.get(user, set())), key=str.lower)
-    return {"friends": fl, "incoming": incoming, "outgoing": outgoing}
-
-
-@app.get("/api/status")
-async def get_statuses(user: str = Depends(current_user)):
-    out = {}
-    for f in friends.get(user, set()):
-        out[f] = {
-            "online": manager.is_online(f),
-            "lastSeen": last_seen.get(f, 0),
-        }
-    return out
+    return {
+        "friends": fl,
+        "online": [f for f in fl if manager.is_online(f)],
+        "incoming": incoming,
+        "outgoing": outgoing,
+    }
 
 
 @app.post("/api/friends/request")
@@ -204,9 +209,9 @@ async def friend_request(data: TargetData, user: str = Depends(current_user)):
         await manager.send(t, {"type": "friends_changed"})
         await manager.send(user, {"type": "friends_changed"})
         if manager.is_online(user):
-            await manager.send(t, {"type": "user_online", "user": user})
+            await manager.send(t, {"type": "presence", "user": user, "online": True})
         if manager.is_online(t):
-            await manager.send(user, {"type": "user_online", "user": t})
+            await manager.send(user, {"type": "presence", "user": t, "online": True})
         return {"ok": True, "status": "friend"}
     requests.setdefault(user, set()).add(t)
     await manager.send(t, {"type": "friends_changed"})
@@ -223,9 +228,9 @@ async def friend_accept(data: TargetData, user: str = Depends(current_user)):
     await manager.send(f, {"type": "friends_changed"})
     await manager.send(user, {"type": "friends_changed"})
     if manager.is_online(user):
-        await manager.send(f, {"type": "user_online", "user": user})
+        await manager.send(f, {"type": "presence", "user": user, "online": True})
     if manager.is_online(f):
-        await manager.send(user, {"type": "user_online", "user": f})
+        await manager.send(user, {"type": "presence", "user": f, "online": True})
     return {"ok": True}
 
 
@@ -250,14 +255,10 @@ async def friend_cancel(data: TargetData, user: str = Depends(current_user)):
 async def friend_remove(data: TargetData, user: str = Depends(current_user)):
     t = data.target
     remove_friends(user, t)
-    global messages
-    messages[:] = [m for m in messages
-                   if not ((m["from"] == user and m["to"] == t) or
-                           (m["from"] == t and m["to"] == user))]
+    # удаляем всю переписку
+    delete_dialog(user, t)
     await manager.send(t, {"type": "friends_changed"})
-    await manager.send(t, {"type": "chat_deleted", "peer": user})
     await manager.send(user, {"type": "friends_changed"})
-    await manager.send(user, {"type": "chat_deleted", "peer": t})
     return {"ok": True}
 
 
@@ -352,17 +353,18 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
         await websocket.close(code=4401)
         return
     await websocket.accept()
-    await manager.add(username, websocket)
-
+    just_online = await manager.add(username, websocket)
     try:
-        online = [f for f in friends.get(username, set()) if manager.is_online(f)]
-        ls = {f: last_seen.get(f, 0) for f in friends.get(username, set())}
-        await websocket.send_json({
-            "type": "online_list",
-            "users": online,
-            "last_seen": ls,
-        })
-        await notify_friends_status(username, True)
+        await websocket.send_json({"type": "hello", "username": username})
+
+        # отправляем текущие статусы друзей
+        for f in friends.get(username, set()):
+            if manager.is_online(f):
+                await websocket.send_json({"type": "presence", "user": f, "online": True})
+
+        # уведомляем друзей, что я в сети
+        if just_online:
+            await broadcast_presence(username, True)
 
         while True:
             data = await websocket.receive_json()
@@ -373,17 +375,16 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     except Exception:
         pass
     finally:
-        await manager.remove(username, websocket)
-        if not manager.is_online(username):
-            last_seen[username] = time.time()
-            await notify_friends_status(username, False)
+        went_offline = await manager.remove(username, websocket)
+        if went_offline:
+            await broadcast_presence(username, False)
 
 
 # ==================================================================
 #                     PWA / SERVICE WORKER / ИКОНКА
 # ==================================================================
 SW_JS = r"""
-const CACHE = 'msgr-v4';
+const CACHE = 'msgr-v2';
 self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil((async () => {
@@ -400,33 +401,33 @@ self.addEventListener('fetch', e => {
   e.respondWith((async () => {
     try {
       const fresh = await fetch(req);
-      if (fresh && fresh.status === 200 && url.origin === location.origin) {
+      if (fresh && fresh.status === 200 && url.origin === location.origin && url.pathname !== '/') {
         const clone = fresh.clone();
         caches.open(CACHE).then(c => c.put(req, clone)).catch(()=>{});
       }
       return fresh;
     } catch (err) {
-      const cached = await caches.match(req);
+      const cached = await caches.match(req, { ignoreSearch: true });
       if (cached) return cached;
       throw err;
     }
   })());
 });
-
 self.addEventListener('notificationclick', e => {
-  const peer = (e.notification.data && e.notification.data.peer) || '';
   e.notification.close();
+  const peer = (e.notification.data && e.notification.data.peer) || '';
   e.waitUntil((async () => {
-    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const c of all) {
+    const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    // Ищем уже открытое окно приложения — фокусируем и передаём сообщение
+    for (const c of list) {
       try {
-        c.postMessage({ type: 'notification_click', peer });
-        if ('focus' in c) await c.focus();
-        return;
-      } catch(_){}
+        c.postMessage({ type: 'open-chat', peer });
+        if ('focus' in c) { await c.focus(); return; }
+      } catch (_) {}
     }
     if (self.clients.openWindow) {
-      return self.clients.openWindow('/?peer=' + encodeURIComponent(peer));
+      const url = peer ? '/?open=' + encodeURIComponent(peer) : '/';
+      return self.clients.openWindow(url);
     }
   })());
 });
@@ -480,7 +481,6 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Мессенджер">
 <link rel="manifest" href="/manifest.webmanifest">
@@ -494,11 +494,10 @@ HTML = r"""<!DOCTYPE html>
   --accent:#111111; --accent-fg:#ffffff;
   --bubble-me:#111111; --bubble-me-fg:#ffffff;
   --bubble-them:#f2f2f3; --bubble-them-fg:#111111;
-  --danger:#e11d48; --ok:#22c55e;
-  --glass-bg:rgba(255,255,255,.72);
-  --glass-border:rgba(255,255,255,.5);
+  --danger:#e11d48; --ok:#16a34a; --offline:#b0b0b5;
+  --glass-bg:rgba(255,255,255,.72); --glass-border:rgba(255,255,255,.5);
   --shadow:0 8px 24px rgba(0,0,0,.06);
-  --app-h:100vh;
+  --app-h:100dvh;
 }
 [data-theme="dark"]{
   --bg:#0b0b0c; --bg-elev:#17171a; --bg-soft:#101013;
@@ -506,126 +505,66 @@ HTML = r"""<!DOCTYPE html>
   --accent:#ffffff; --accent-fg:#111111;
   --bubble-me:#ffffff; --bubble-me-fg:#111111;
   --bubble-them:#1d1d20; --bubble-them-fg:#f5f5f7;
-  --danger:#ff5c7a; --ok:#34d058;
-  --glass-bg:rgba(15,15,17,.66);
-  --glass-border:rgba(255,255,255,.08);
+  --danger:#ff5c7a; --ok:#34d058; --offline:#5a5a5e;
+  --glass-bg:rgba(15,15,17,.66); --glass-border:rgba(255,255,255,.08);
   --shadow:0 8px 24px rgba(0,0,0,.4);
 }
-
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-
 html,body{
-  height:100%;width:100%;
-  overflow:hidden;
-  overscroll-behavior:none;
-  background:var(--bg);color:var(--text);
+  position:fixed; top:0; left:0; right:0; bottom:0;
+  width:100%; height:100%;
+  background:var(--bg); color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
   font-size:17px;-webkit-font-smoothing:antialiased;
+  overflow:hidden;
+  overscroll-behavior:none;
 }
-
+body{ touch-action:manipulation; }
 #app{
-  position:fixed;
-  top:0;left:0;right:0;
+  position:fixed; top:0; left:0; right:0;
   height:var(--app-h);
   overflow:hidden;
   background:var(--bg);
 }
-
-/* ---------- Кнопки: убираем 300ms задержку и двойной тап ---------- */
-button,
-.row,
-.nav-btn,
-.icon-btn,
-.mini-btn,
-.send-btn,
-.seg,
-.tab,
-.switch,
-label,
-a {
-  touch-action: manipulation;
-}
-
-/* ---------- Экраны и переходы ---------- */
 .screen{
-  position:absolute;inset:0;
-  display:flex;flex-direction:column;
-  overflow:hidden;background:var(--bg);
-  opacity:0;visibility:hidden;pointer-events:none;
-  transition:opacity .24s ease, visibility 0s linear .24s;
+  position:absolute; inset:0; display:none; flex-direction:column;
+  overflow:hidden; background:var(--bg);
 }
-.screen.active{
-  opacity:1;visibility:visible;pointer-events:auto;
-  transition:opacity .24s ease, visibility 0s;
-}
-#chat{
-  transform:translateX(100%);
-  transition:opacity .22s ease, transform .3s cubic-bezier(.22,1,.36,1), visibility 0s linear .3s;
-}
-#chat.active{
-  transform:translateX(0);
-  transition:opacity .22s ease, transform .3s cubic-bezier(.22,1,.36,1), visibility 0s;
-}
+.screen.active{display:flex}
 
-/* ---------- Верхняя панель ---------- */
+/* ---------- Топбар ---------- */
 .topbar{
-  flex-shrink:0;display:flex;align-items:center;gap:6px;
-  padding:8px;
+  flex-shrink:0;
+  display:flex;align-items:center;gap:6px;
+  padding:8px 8px;
   padding-top:calc(8px + env(safe-area-inset-top,0));
   border-bottom:1px solid var(--border);
   background:var(--bg);
-  min-height:56px;z-index:5;
+  min-height:56px;
+  z-index:5;
 }
 .topbar .title{
-  flex:1;display:flex;align-items:center;gap:10px;
-  font-size:20px;font-weight:700;letter-spacing:-.3px;
+  flex:1;font-size:20px;font-weight:700;letter-spacing:-.3px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  padding-left:6px;
+  display:flex;align-items:center;gap:8px;min-width:0;
 }
-.topbar .title.center{
-  padding-left:0;text-align:center;font-size:17px;font-weight:600;
-  flex-direction:column;gap:0;align-items:center;justify-content:center;
-  min-width:0;
-}
-.title-main{
-  font-weight:inherit;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  max-width:100%;
-}
-.title-status{
-  font-size:12.5px;font-weight:500;color:var(--text-dim);
-  margin-top:1px;line-height:1.2;height:15px;
-  transition:color .2s;
-}
-.title-status.typing{color:var(--ok)}
-.title-status.online{color:var(--ok)}
-
+.topbar .title .title-text{overflow:hidden;text-overflow:ellipsis}
 .conn-dot{
   width:9px;height:9px;border-radius:50%;
-  background:#c7c7cc;flex-shrink:0;
-  transition:background .3s, box-shadow .3s;
+  background:var(--offline);flex-shrink:0;
+  transition:background .25s, box-shadow .25s;
 }
-.conn-dot.online{
-  background:var(--ok);
-  animation:pulse 2.2s infinite;
-}
-.conn-dot.connecting{background:#f59e0b}
-.conn-dot.offline{background:var(--danger)}
-@keyframes pulse{
-  0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}
-  50%{box-shadow:0 0 0 6px rgba(34,197,94,0)}
-}
-
+.conn-dot.online{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.15)}
 .icon-btn{
   width:44px;height:44px;flex-shrink:0;border:none;background:transparent;
   display:flex;align-items:center;justify-content:center;
   border-radius:12px;cursor:pointer;color:var(--text);
   transition:background .15s, transform .1s;
-  touch-action: manipulation;
+  touch-action:manipulation;
 }
 .icon-btn:active{background:var(--bg-elev);transform:scale(.94)}
 .icon-btn svg{width:22px;height:22px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 
 /* ---------- Glass ---------- */
 [data-glass="on"] .glass{
@@ -638,220 +577,140 @@ a {
 /* ---------- Нижнее меню ---------- */
 .bottom-nav{
   flex-shrink:0;display:flex;
-  padding:6px;
+  padding:6px 6px;
   padding-bottom:calc(6px + env(safe-area-inset-bottom,0));
   border-top:1px solid var(--border);
-  background:var(--bg);z-index:5;
+  background:var(--bg);
+  z-index:5;
 }
 .nav-btn{
   flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:3px;padding:8px 4px;background:transparent;border:none;cursor:pointer;
   color:var(--text-dim);font-family:inherit;font-size:11.5px;font-weight:600;
-  border-radius:14px;
-  transition:color .18s, background .18s, transform .12s;
-  position:relative;
-  touch-action: manipulation;
+  border-radius:14px;transition:color .15s,background .15s,transform .1s;
+  position:relative;touch-action:manipulation;
 }
-.nav-btn:active{transform:scale(.94)}
+.nav-btn:active{transform:scale(.95)}
 .nav-btn.active{color:var(--text)}
 .nav-btn svg{width:24px;height:24px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
-  transition:transform .2s;pointer-events:none}
-.nav-btn.active svg{transform:translateY(-1px)}
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .nav-btn .dot{
   position:absolute;top:6px;right:calc(50% - 18px);
   min-width:16px;height:16px;padding:0 4px;border-radius:8px;
   background:#ef4444;color:#fff;font-size:10px;font-weight:700;
   display:flex;align-items:center;justify-content:center;
-  animation:badgepop .25s ease;
-  pointer-events:none;
 }
-@keyframes badgepop{from{transform:scale(0)}to{transform:scale(1)}}
 
-/* ---------- Область страниц ---------- */
+/* ---------- Область страницы ---------- */
 .page-area{flex:1;overflow:hidden;position:relative;min-height:0}
-.page{
-  position:absolute;inset:0;display:flex;flex-direction:column;overflow:hidden;
-  opacity:0;pointer-events:none;visibility:hidden;
-  transition:opacity .2s ease, visibility 0s linear .2s;
-}
-.page.active{
-  opacity:1;pointer-events:auto;visibility:visible;
-  transition:opacity .22s ease, visibility 0s;
-}
+.page{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden}
+.page.active{display:flex}
+.page-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;min-height:0}
 
-/* ---------- Скролл-контейнеры ---------- */
-.page-scroll,
-.messages{
-  flex:1;min-height:0;
-  overflow-y:auto;
-  -webkit-overflow-scrolling:touch;
-  overscroll-behavior:contain;
-  touch-action: pan-y;
-}
-#auth{
-  overflow-y:auto;
-  -webkit-overflow-scrolling:touch;
-  overscroll-behavior:contain;
-  touch-action: pan-y;
-}
-
-/* ---------- Сегментированный контрол ---------- */
-.segmented{
-  display:flex;background:var(--bg-elev);border-radius:12px;
-  padding:4px;margin:12px 16px 6px;
-  flex-shrink:0;
-}
-.seg{
-  flex:1;padding:10px;border:none;background:transparent;border-radius:9px;
+/* ---------- Segmented ---------- */
+.segmented{display:flex;background:var(--bg-elev);border-radius:12px;
+  padding:4px;margin:12px 16px 6px}
+.seg{flex:1;padding:10px;border:none;background:transparent;border-radius:9px;
   font-size:14.5px;font-weight:600;color:var(--text-dim);cursor:pointer;
-  font-family:inherit;
-  transition:background .2s, color .2s, box-shadow .2s;
-  position:relative;
-  touch-action: manipulation;
-}
+  font-family:inherit;transition:all .2s;position:relative;touch-action:manipulation}
 .seg.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.06)}
-.seg .badge-inline{
-  display:inline-block;min-width:18px;height:18px;padding:0 5px;border-radius:9px;
-  background:#ef4444;color:#fff;font-size:11px;font-weight:700;
-  margin-left:6px;line-height:18px;vertical-align:middle;
-  pointer-events:none;
-}
+.seg .badge-inline{display:inline-block;min-width:18px;height:18px;padding:0 5px;
+  border-radius:9px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;
+  margin-left:6px;line-height:18px;vertical-align:middle}
 
-/* ---------- Строки ---------- */
-.row{
-  display:flex;align-items:center;gap:14px;
-  padding:12px 16px;cursor:pointer;
-  transition:background .15s;
-  touch-action: manipulation;
-}
+/* ---------- Rows ---------- */
+.row{display:flex;align-items:center;gap:14px;padding:12px 16px;
+  cursor:pointer;transition:background .15s;-webkit-user-select:none;user-select:none}
 .row:active{background:var(--bg-soft)}
 .avatar{
   position:relative;
   width:52px;height:52px;border-radius:50%;background:var(--bg-elev);
   display:flex;align-items:center;justify-content:center;
-  font-weight:700;font-size:19px;color:var(--text-dim);flex-shrink:0;
-  letter-spacing:.5px;
-  pointer-events:none;
+  font-weight:700;font-size:19px;color:var(--text-dim);flex-shrink:0;letter-spacing:.5px;
 }
+[data-theme="dark"] .avatar{color:var(--text)}
 .avatar .online-dot{
-  position:absolute;bottom:-1px;right:-1px;
+  position:absolute;bottom:1px;right:1px;
   width:14px;height:14px;border-radius:50%;
-  background:var(--ok);
-  border:3px solid var(--bg);
+  background:var(--offline);
+  border:2.5px solid var(--bg);
   box-sizing:content-box;
-  animation:dotin .25s ease;
-  pointer-events:none;
 }
-@keyframes dotin{from{transform:scale(0)}to{transform:scale(1)}}
-.row-info{flex:1;min-width:0;pointer-events:none}
-.row-title{
-  font-size:16.5px;font-weight:600;color:var(--text);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.row-sub{
-  font-size:14px;color:var(--text-dim);margin-top:2px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  transition:color .2s;
-}
-.row-sub.online{color:var(--ok);font-weight:500}
-.row-sub.italic{font-style:italic;opacity:.85}
-.row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;pointer-events:none}
-.badge{
-  min-width:22px;height:22px;padding:0 7px;border-radius:11px;
+.avatar .online-dot.on{background:var(--ok)}
+.row-info{flex:1;min-width:0}
+.row-title{font-size:16.5px;font-weight:600;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-sub{font-size:14px;color:var(--text-dim);margin-top:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-sub.typing{color:var(--ok);font-style:italic}
+.row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0}
+.badge{min-width:22px;height:22px;padding:0 7px;border-radius:11px;
   background:var(--text);color:var(--bg);font-size:12.5px;font-weight:700;
-  display:flex;align-items:center;justify-content:center;
-  animation:badgepop .25s ease;
-}
+  display:flex;align-items:center;justify-content:center}
 .row-time{font-size:12.5px;color:var(--text-dim)}
-.empty{
-  padding:60px 30px;text-align:center;color:var(--text-dim);
-  font-size:14.5px;line-height:1.55;
-}
-.section-label{
-  padding:14px 16px 6px;font-size:12.5px;font-weight:700;
-  color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;
-}
+.empty{padding:60px 30px;text-align:center;color:var(--text-dim);
+  font-size:14.5px;line-height:1.55}
+.section-label{padding:14px 16px 6px;font-size:12.5px;font-weight:700;
+  color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px}
 
-/* ---------- Маленькие кнопки ---------- */
-.mini-btn{
-  border:none;font-family:inherit;font-size:13.5px;font-weight:600;
+/* ---------- Мини-кнопки ---------- */
+.mini-btn{border:none;font-family:inherit;font-size:13.5px;font-weight:600;
   padding:8px 14px;border-radius:10px;cursor:pointer;
-  transition:transform .1s, opacity .15s, background .15s;
-  display:inline-flex;align-items:center;justify-content:center;gap:4px;
-  touch-action: manipulation;
-  position:relative;
-  z-index:1;
-}
+  transition:transform .1s,opacity .15s;touch-action:manipulation}
 .mini-btn:active{transform:scale(.95)}
 .mini-btn.primary{background:var(--text);color:var(--bg)}
 .mini-btn.ghost{background:var(--bg-elev);color:var(--text)}
-.mini-btn.danger{background:transparent;color:var(--danger);padding:8px}
-.mini-btn svg{pointer-events:none}
-.mini-btn-row{display:flex;gap:8px;flex-shrink:0;position:relative;z-index:1}
+.mini-btn.danger{background:transparent;color:var(--danger)}
+.mini-btn-row{display:flex;gap:8px;flex-shrink:0}
 
-/* ---------- Авторизация ---------- */
-#auth{
-  display:flex;flex-direction:column;
-  padding:24px;
-  padding-top:calc(24px + env(safe-area-inset-top,0));
-  padding-bottom:calc(24px + env(safe-area-inset-bottom,0));
-}
+/* ---------- Auth ---------- */
+#auth{justify-content:center;align-items:center;padding:24px;overflow-y:auto}
 .auth-wrap{width:100%;max-width:380px;text-align:center;margin:auto}
-.logo{
-  width:84px;height:84px;margin:0 auto 22px;background:var(--text);border-radius:26px;
-  display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow);
-}
+.logo{width:84px;height:84px;margin:0 auto 22px;background:var(--text);border-radius:26px;
+  display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow)}
 .logo svg{width:42px;height:42px;stroke:var(--bg);fill:none;stroke-width:2;
   stroke-linecap:round;stroke-linejoin:round}
 .auth-wrap h1{font-size:27px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px}
 .subtitle{color:var(--text-dim);font-size:14.5px;margin-bottom:26px}
 .tabs{display:flex;background:var(--bg-elev);border-radius:12px;padding:4px;margin-bottom:20px}
-.tab{
-  flex:1;padding:11px;border:none;background:transparent;border-radius:9px;
+.tab{flex:1;padding:11px;border:none;background:transparent;border-radius:9px;
   font-size:14.5px;font-weight:600;color:var(--text-dim);cursor:pointer;
-  transition:all .2s;font-family:inherit;
-  touch-action: manipulation;
-}
+  transition:all .2s;font-family:inherit;touch-action:manipulation}
 .tab.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.08)}
-.input-wrap{
-  display:flex;align-items:center;gap:10px;background:var(--bg-elev);
+.input-wrap{display:flex;align-items:center;gap:10px;background:var(--bg-elev);
   border-radius:13px;padding:0 14px;margin-bottom:11px;
-  border:1.5px solid transparent;
-  transition:border-color .2s,background .2s;
-}
+  border:1.5px solid transparent;transition:border-color .2s,background .2s}
 .input-wrap:focus-within{background:var(--bg);border-color:var(--text)}
 .input-wrap svg{width:19px;height:19px;stroke:var(--text-dim);flex-shrink:0;fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.input-wrap input{
-  flex:1;border:none;outline:none;background:transparent;padding:16px 0;
-  font-size:16.5px;font-family:inherit;color:var(--text);min-width:0;
-  -webkit-user-select:text;user-select:text;
-}
+.input-wrap input{flex:1;border:none;outline:none;background:transparent;padding:16px 0;
+  font-size:16.5px;font-family:inherit;color:var(--text);min-width:0}
 .input-wrap input::placeholder{color:var(--text-dim)}
-.btn-primary{
-  width:100%;padding:17px;background:var(--text);color:var(--bg);border:none;
+.btn-primary{width:100%;padding:17px;background:var(--text);color:var(--bg);border:none;
   border-radius:13px;font-size:16.5px;font-weight:600;cursor:pointer;
-  margin-top:4px;transition:transform .1s,opacity .2s;font-family:inherit;
-  touch-action: manipulation;
-}
+  margin-top:4px;transition:transform .1s,opacity .2s;font-family:inherit;touch-action:manipulation}
 .btn-primary:active{transform:scale(.98)}
 .btn-primary:disabled{opacity:.5;cursor:default}
 .error{color:var(--danger);font-size:14px;margin-top:12px;min-height:20px}
 
-/* ---------- Чат ---------- */
+/* ---------- Chat ---------- */
+.title-block{flex:1;min-width:0;text-align:center;overflow:hidden}
+.title-name{font-size:17px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.15}
+.title-status{font-size:12.5px;color:var(--text-dim);margin-top:1px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  min-height:15px;line-height:15px;transition:color .2s}
+.title-status.online{color:var(--ok)}
+.title-status.typing{color:var(--ok);font-style:italic}
+
 .messages{
-  padding:16px 14px 8px;
-  display:flex;flex-direction:column;gap:6px;
-  background:var(--bg);
+  flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+  padding:16px 14px 8px;display:flex;flex-direction:column;gap:6px;
+  background:var(--bg);min-height:0;
 }
-.msg{
-  max-width:80%;padding:10px 15px;border-radius:20px;
+.msg{max-width:80%;padding:10px 15px;border-radius:20px;
   font-size:17.5px;line-height:1.42;word-wrap:break-word;overflow-wrap:anywhere;
-  white-space:pre-wrap;
-  animation:pop .18s cubic-bezier(.22,1,.36,1);
-  -webkit-user-select:text;user-select:text;
-}
+  white-space:pre-wrap;animation:pop .14s ease}
 @keyframes pop{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
 .msg.me{align-self:flex-end;background:var(--bubble-me);color:var(--bubble-me-fg);
   border-bottom-right-radius:6px}
@@ -859,93 +718,65 @@ a {
   border-bottom-left-radius:6px}
 
 .composer{
-  flex-shrink:0;display:flex;align-items:center;gap:8px;
-  padding:10px 12px;
+  flex-shrink:0;display:flex;align-items:center;gap:8px;padding:10px 12px;
   padding-bottom:calc(10px + env(safe-area-inset-bottom,0));
   border-top:1px solid var(--border);background:var(--bg);z-index:5;
 }
 .composer input{
   flex:1;padding:13px 18px;border:none;outline:none;background:var(--bg-elev);
   border-radius:24px;font-size:17px;font-family:inherit;color:var(--text);min-width:0;
-  -webkit-user-select:text;user-select:text;
 }
 .composer input::placeholder{color:var(--text-dim)}
 .send-btn{
-  width:48px;height:48px;min-width:48px;border-radius:50%;border:none;
-  background:var(--text);color:var(--bg);
+  width:46px;height:46px;border-radius:50%;border:none;background:var(--text);
   display:flex;align-items:center;justify-content:center;cursor:pointer;
-  flex-shrink:0;
-  transition:transform .12s, opacity .2s, background .2s;
-  touch-action: manipulation;
-  -webkit-user-select:none;user-select:none;
+  flex-shrink:0;transition:transform .1s,opacity .2s;color:var(--bg);
+  touch-action:manipulation; -webkit-user-select:none;user-select:none;
 }
-.send-btn:active{transform:scale(.9)}
+.send-btn:active{transform:scale(.92)}
 .send-btn svg{width:20px;height:20px;stroke:currentColor;fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.send-btn:disabled{opacity:.4}
 
 /* ---------- Настройки ---------- */
 .settings-group{margin:14px 12px;background:var(--bg-elev);border-radius:14px;overflow:hidden}
-.set-row{display:flex;align-items:center;justify-content:space-between;
-  padding:15px 16px;gap:12px}
+.set-row{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;gap:12px}
 .set-row + .set-row{border-top:1px solid var(--border)}
 .set-label{font-size:16px;font-weight:500}
 .set-hint{font-size:13px;color:var(--text-dim);margin-top:2px}
-.switch{
-  width:52px;height:31px;border-radius:16px;background:var(--border);
-  position:relative;cursor:pointer;transition:background .2s;flex-shrink:0;
-  touch-action: manipulation;
-}
-.switch::after{
-  content:'';position:absolute;top:2.5px;left:2.5px;
+.switch{width:52px;height:31px;border-radius:16px;background:var(--border);
+  position:relative;cursor:pointer;transition:background .2s;flex-shrink:0;touch-action:manipulation}
+.switch::after{content:'';position:absolute;top:2.5px;left:2.5px;
   width:26px;height:26px;border-radius:50%;background:#fff;
-  transition:left .2s cubic-bezier(.22,1,.36,1);
-  box-shadow:0 1px 3px rgba(0,0,0,.2);
-  pointer-events:none;
-}
+  transition:left .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
 .switch.on{background:var(--ok)}
 .switch.on::after{left:23.5px}
 .settings-user{display:flex;align-items:center;gap:14px;padding:18px 16px}
 .settings-user .avatar{width:58px;height:58px;font-size:22px}
 .settings-user-name{font-size:18px;font-weight:700}
-.settings-user-sub{font-size:13.5px;color:var(--text-dim);margin-top:2px;
-  display:flex;align-items:center;gap:6px}
-.settings-user-sub .conn-dot{width:8px;height:8px}
-.danger-btn{
-  width:100%;padding:15px;background:transparent;color:var(--danger);
+.settings-user-sub{font-size:13.5px;color:var(--text-dim);margin-top:2px}
+.danger-btn{width:100%;padding:15px;background:transparent;color:var(--danger);
   border:none;border-radius:14px;font-size:16px;font-weight:600;
-  cursor:pointer;font-family:inherit;
-  touch-action: manipulation;
-}
-.danger-btn:active{background:var(--bg-soft)}
+  cursor:pointer;font-family:inherit;touch-action:manipulation}
+.danger-btn:active{background:var(--bg-elev)}
 
-.search-wrap{
-  display:flex;align-items:center;gap:10px;background:var(--bg-elev);
-  border-radius:13px;padding:0 14px;margin:12px 16px 0;flex-shrink:0;
-}
+.search-wrap{display:flex;align-items:center;gap:10px;background:var(--bg-elev);
+  border-radius:13px;padding:0 14px;margin:12px 16px 0}
 .search-wrap svg{width:19px;height:19px;stroke:var(--text-dim);fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
-.search-wrap input{
-  flex:1;border:none;outline:none;background:transparent;padding:13px 0;
-  font-size:16.5px;font-family:inherit;color:var(--text);min-width:0;
-  -webkit-user-select:text;user-select:text;
-}
+.search-wrap input{flex:1;border:none;outline:none;background:transparent;padding:13px 0;
+  font-size:16.5px;font-family:inherit;color:var(--text);min-width:0}
 .search-wrap input::placeholder{color:var(--text-dim)}
 
-.footnote{
-  text-align:center;font-size:12px;color:var(--text-dim);
-  padding:20px 30px 8px;line-height:1.5;
-}
+.footnote{text-align:center;font-size:12px;color:var(--text-dim);
+  padding:20px 30px 8px;line-height:1.5}
 
-/* ---------- Toast ---------- */
-.toast{
-  position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom,0));
+.toast{position:fixed;left:50%;bottom:calc(90px + env(safe-area-inset-bottom,0));
   transform:translateX(-50%) translateY(20px);
   background:var(--text);color:var(--bg);
   padding:11px 18px;border-radius:22px;font-size:14.5px;font-weight:600;
-  opacity:0;pointer-events:none;
-  transition:opacity .25s,transform .25s;
-  z-index:9999;max-width:90vw;text-align:center;
-}
+  opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;
+  z-index:9999;max-width:90vw;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
 </head>
@@ -985,34 +816,31 @@ a {
   <div id="main" class="screen">
     <header class="topbar glass">
       <div class="title">
-        <span class="conn-dot" id="conn-dot"></span>
-        <span class="title-main" id="main-title">Чаты</span>
+        <span class="conn-dot" id="conn-dot" title="Соединение"></span>
+        <span class="title-text" id="main-title">Чаты</span>
       </div>
-      <button class="icon-btn" id="quick-theme" type="button" aria-label="Тема">
+      <button class="icon-btn" id="quick-theme" aria-label="Тема">
         <svg id="quick-theme-icon" viewBox="0 0 24 24"></svg>
       </button>
     </header>
 
     <div class="page-area">
-      <!-- HOME -->
       <div class="page active" id="page-home">
         <div class="page-scroll" id="home-list"></div>
       </div>
 
-      <!-- FRIENDS -->
       <div class="page" id="page-friends">
         <div class="search-wrap">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input type="text" id="friend-search" placeholder="Найти пользователя..." autocomplete="off">
         </div>
         <div class="segmented" id="friends-seg">
-          <button type="button" class="seg active" data-tab="friends">Друзья</button>
-          <button type="button" class="seg" data-tab="pending">Ожидание<span id="pending-badge"></span></button>
+          <button class="seg active" data-tab="friends">Друзья</button>
+          <button class="seg" data-tab="pending">Ожидание<span id="pending-badge"></span></button>
         </div>
         <div class="page-scroll" id="friends-list"></div>
       </div>
 
-      <!-- SETTINGS -->
       <div class="page" id="page-settings">
         <div class="page-scroll">
           <div class="settings-group">
@@ -1020,34 +848,37 @@ a {
               <div class="avatar" id="me-avatar">?</div>
               <div>
                 <div class="settings-user-name" id="me-name">—</div>
-                <div class="settings-user-sub">
-                  <span class="conn-dot" id="me-conn-dot"></span>
-                  <span id="me-conn-text">подключение…</span>
-                </div>
+                <div class="settings-user-sub" id="me-status">не в сети</div>
               </div>
             </div>
           </div>
 
           <div class="settings-group">
             <div class="set-row">
-              <div><div class="set-label">Тёмная тема</div>
-              <div class="set-hint">Ночной режим интерфейса</div></div>
+              <div>
+                <div class="set-label">Тёмная тема</div>
+                <div class="set-hint">Ночной режим интерфейса</div>
+              </div>
               <div class="switch" id="set-theme"></div>
             </div>
             <div class="set-row">
-              <div><div class="set-label">Liquid Glass</div>
-              <div class="set-hint">Полупрозрачные панели с блюром</div></div>
+              <div>
+                <div class="set-label">Liquid Glass</div>
+                <div class="set-hint">Полупрозрачные панели с блюром</div>
+              </div>
               <div class="switch" id="set-glass"></div>
             </div>
             <div class="set-row">
-              <div><div class="set-label">Уведомления</div>
-              <div class="set-hint" id="notif-hint">Всплывающие оповещения</div></div>
+              <div>
+                <div class="set-label">Уведомления</div>
+                <div class="set-hint" id="notif-hint">Всплывающие оповещения о новых сообщениях</div>
+              </div>
               <div class="switch" id="set-notif"></div>
             </div>
           </div>
 
           <div class="settings-group">
-            <button type="button" class="danger-btn" id="logout-btn">Выйти из аккаунта</button>
+            <button class="danger-btn" id="logout-btn">Выйти из аккаунта</button>
           </div>
 
           <div class="footnote">
@@ -1059,17 +890,17 @@ a {
     </div>
 
     <nav class="bottom-nav glass">
-      <button type="button" class="nav-btn active" data-page="home">
+      <button class="nav-btn active" data-page="home">
         <svg viewBox="0 0 24 24"><path d="M3 12l9-9 9 9"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
         <span>Главная</span>
         <span class="dot" id="home-dot" style="display:none"></span>
       </button>
-      <button type="button" class="nav-btn" data-page="friends">
+      <button class="nav-btn" data-page="friends">
         <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         <span>Друзья</span>
         <span class="dot" id="friends-dot" style="display:none"></span>
       </button>
-      <button type="button" class="nav-btn" data-page="settings">
+      <button class="nav-btn" data-page="settings">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.6.65 1 1.26 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span>Настройки</span>
       </button>
@@ -1079,11 +910,11 @@ a {
   <!-- ===================== CHAT ===================== -->
   <div id="chat" class="screen">
     <header class="topbar glass">
-      <button type="button" class="icon-btn" id="chat-back" aria-label="Назад">
+      <button class="icon-btn" id="chat-back" aria-label="Назад">
         <svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
       </button>
-      <div class="title center">
-        <div class="title-main" id="chat-title">—</div>
+      <div class="title-block">
+        <div class="title-name" id="chat-title">—</div>
         <div class="title-status" id="chat-status"></div>
       </div>
       <div style="width:44px"></div>
@@ -1091,7 +922,7 @@ a {
     <div class="messages" id="messages"></div>
     <div class="composer glass">
       <input type="text" id="msg-input" placeholder="Сообщение..." maxlength="2000" autocomplete="off" enterkeyhint="send">
-      <button type="button" class="send-btn" id="send-btn" aria-label="Отправить">
+      <button class="send-btn" id="send-btn" type="button" aria-label="Отправить">
         <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
@@ -1115,12 +946,12 @@ const state = {
   notif: localStorage.getItem('m_notif') === '1',
   ws: null,
   wsReady: false,
-  wsState: 'connecting',
   reconnectTimer: null,
   page: 'home',
   friendsTab: 'friends',
   chats: [],
   friendsList: [],
+  onlineFriends: new Set(),
   incoming: [],
   outgoing: [],
   searchResults: [],
@@ -1128,12 +959,8 @@ const state = {
   activePeer: null,
   activeMsgs: [],
   seenIds: new Set(),
-  friendCache: new Set(),
-  onlineUsers: new Set(),
-  lastSeen: {},
-  peerTyping: false,
-  peerTypingTimer: null,
-  pendingPeer: null,
+  typing: {},          // peer -> last typing timestamp
+  typingTimers: {},    // peer -> hide timer
 };
 
 const ICONS = {
@@ -1150,31 +977,11 @@ function fmtTime(ts){
   if (!ts) return '';
   const d = new Date(ts * 1000);
   const now = new Date();
-  if (d.toDateString() === now.toDateString()){
-    return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
-  }
+  if (d.toDateString() === now.toDateString())
+    return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
   const yest = new Date(now); yest.setDate(now.getDate() - 1);
   if (d.toDateString() === yest.toDateString()) return 'вчера';
-  const dd = d.getDate().toString().padStart(2,'0');
-  const mm = (d.getMonth()+1).toString().padStart(2,'0');
-  return dd + '.' + mm;
-}
-
-function fmtLastSeen(ts){
-  if (!ts) return 'не в сети';
-  const diff = Date.now()/1000 - ts;
-  if (diff < 45) return 'был(а) только что';
-  if (diff < 3600) return 'был(а) ' + Math.floor(diff/60) + ' мин назад';
-  const d = new Date(ts * 1000);
-  const now = new Date();
-  const hh = d.getHours().toString().padStart(2,'0');
-  const mm = d.getMinutes().toString().padStart(2,'0');
-  if (d.toDateString() === now.toDateString()) return 'был(а) в ' + hh + ':' + mm;
-  const yest = new Date(now); yest.setDate(now.getDate()-1);
-  if (d.toDateString() === yest.toDateString()) return 'был(а) вчера в ' + hh + ':' + mm;
-  const dd = d.getDate().toString().padStart(2,'0');
-  const mo = (d.getMonth()+1).toString().padStart(2,'0');
-  return 'был(а) ' + dd + '.' + mo + ' ' + hh + ':' + mm;
+  return String(d.getDate()).padStart(2,'0') + '.' + String(d.getMonth()+1).padStart(2,'0');
 }
 
 function toast(msg){
@@ -1185,83 +992,71 @@ function toast(msg){
   el._t = setTimeout(() => el.classList.remove('show'), 1800);
 }
 
+function isTyping(peer){
+  const t = state.typing[peer];
+  return t && (Date.now() - t) < 3500;
+}
+
+function isOnline(peer){
+  return state.onlineFriends.has(peer);
+}
+
+/* ---------------- Тема / стекло / уведомления ---------------- */
 function applyTheme(){
   document.documentElement.setAttribute('data-theme', state.theme);
   const meta = document.querySelector('meta[name=theme-color]');
   if (meta) meta.setAttribute('content', state.theme === 'dark' ? '#0b0b0c' : '#ffffff');
   const icon = $('#quick-theme-icon');
-  if (icon) icon.outerHTML = '<svg id="quick-theme-icon" viewBox="0 0 24 24">' + (state.theme === 'dark' ? ICONS.sun : ICONS.moon) + '</svg>';
-  const setSw = $('#set-theme');
-  if (setSw) setSw.classList.toggle('on', state.theme === 'dark');
+  if (icon) icon.outerHTML = '<svg id="quick-theme-icon" viewBox="0 0 24 24">' +
+    (state.theme === 'dark' ? ICONS.sun : ICONS.moon) + '</svg>';
+  const sw = $('#set-theme'); if (sw) sw.classList.toggle('on', state.theme === 'dark');
 }
-
 function applyGlass(){
   document.documentElement.setAttribute('data-glass', state.glass);
-  const setSw = $('#set-glass');
-  if (setSw) setSw.classList.toggle('on', state.glass === 'on');
+  const sw = $('#set-glass'); if (sw) sw.classList.toggle('on', state.glass === 'on');
 }
-
 function applyNotifUI(){
-  const setSw = $('#set-notif');
-  if (!setSw) return;
+  const sw = $('#set-notif'); if (!sw) return;
   const supported = 'Notification' in window;
   const granted = supported && Notification.permission === 'granted';
-  setSw.classList.toggle('on', granted && state.notif);
+  sw.classList.toggle('on', granted && state.notif);
   const hint = $('#notif-hint');
   if (hint){
-    if (!supported) hint.textContent = 'Не поддерживается';
+    if (!supported) hint.textContent = 'Не поддерживается браузером';
     else if (Notification.permission === 'denied') hint.textContent = 'Запрещено в браузере';
-    else if (granted && state.notif) hint.textContent = 'Уведомления включены';
-    else if (granted) hint.textContent = 'Уведомления выключены';
+    else if (granted) hint.textContent = 'Уведомления включены';
     else hint.textContent = 'Нажмите, чтобы разрешить';
   }
 }
 
-// ---------- Viewport ----------
+/* ---------------- Viewport / клавиатура ---------------- */
 function updateViewport(){
   const vv = window.visualViewport;
-  let h;
-  if (vv) {
-    h = vv.height;
-  } else {
-    h = window.innerHeight;
-  }
+  const h = vv ? vv.height : window.innerHeight;
   document.documentElement.style.setProperty('--app-h', h + 'px');
+  const app = document.getElementById('app');
+  if (app){
+    const top = vv ? Math.max(0, vv.offsetTop) : 0;
+    app.style.transform = top > 0 ? 'translateY(' + top + 'px)' : '';
+  }
 }
 if (window.visualViewport){
-  window.visualViewport.addEventListener('resize', updateViewport);
-  window.visualViewport.addEventListener('scroll', () => {
-    // при скролле visual viewport (iOS) держим body в нуле
-    if (window.scrollY !== 0) window.scrollTo(0, 0);
+  window.visualViewport.addEventListener('resize', () => {
     updateViewport();
+    if (state.activePeer) setTimeout(() => scrollMessages(), 30);
+  });
+  window.visualViewport.addEventListener('scroll', () => {
+    updateViewport();
+    // запрещаем странице "уползать" вверх/вниз при фокусе
+    window.scrollTo(0, 0);
   });
 }
 window.addEventListener('orientationchange', () => setTimeout(updateViewport, 200));
-window.addEventListener('resize', updateViewport);
+// Когда появляется фокус — не даём iOS прокрутить страницу
+document.addEventListener('focusin', () => setTimeout(() => window.scrollTo(0, 0), 80));
 updateViewport();
 
-// ---------- Connection ----------
-function setWsState(s){
-  state.wsState = s;
-  const dot = $('#conn-dot');
-  const meDot = $('#me-conn-dot');
-  const meText = $('#me-conn-text');
-  if (dot){
-    dot.classList.remove('online','connecting','offline');
-    dot.classList.add(s);
-  }
-  if (meDot){
-    meDot.classList.remove('online','connecting','offline');
-    meDot.classList.add(s);
-  }
-  if (meText){
-    meText.textContent = s === 'online' ? 'в сети'
-                        : s === 'connecting' ? 'подключение…'
-                        : 'нет соединения';
-  }
-}
-
-// ---------- Auth / API ----------
+/* ---------------- API ---------------- */
 async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({
@@ -1275,6 +1070,7 @@ async function api(path, opts){
   return data;
 }
 
+/* ---------------- Auth ---------------- */
 let authMode = 'login';
 $$('.tab').forEach(t => t.addEventListener('click', () => {
   $$('.tab').forEach(x => x.classList.remove('active'));
@@ -1322,19 +1118,21 @@ function doLogout(){
   state.activePeer = null;
   state.activeMsgs = [];
   state.seenIds.clear();
-  state.friendCache.clear();
-  state.onlineUsers.clear();
-  state.lastSeen = {};
-  state.peerTyping = false;
+  state.friendsList = [];
+  state.onlineFriends.clear();
+  state.chats = [];
+  state.incoming = [];
+  state.outgoing = [];
+  state.typing = {};
   if (state.ws){ try { state.ws.close(); } catch(e){} state.ws = null; }
   clearTimeout(state.reconnectTimer);
-  setWsState('offline');
+  state.wsReady = false;
+  updateConnDot();
   showScreen('auth');
 }
-
 $('#logout-btn').addEventListener('click', doLogout);
 
-// ---------- Navigation ----------
+/* ---------------- Навигация ---------------- */
 function showScreen(name){
   $$('.screen').forEach(s => s.classList.remove('active'));
   const el = document.getElementById(name);
@@ -1350,43 +1148,70 @@ function switchPage(page){
   if (page === 'home') refreshChats();
   if (page === 'friends') refreshFriends();
 }
-
 $$('.nav-btn').forEach(b => b.addEventListener('click', () => switchPage(b.dataset.page)));
 
-// ---------- Enter ----------
+/* ---------------- Вход в приложение ---------------- */
 async function enterApp(){
   $('#me-avatar').textContent = (state.username[0] || '?').toUpperCase();
   $('#me-name').textContent = state.username;
   applyTheme(); applyGlass(); applyNotifUI();
-  setWsState('connecting');
   connectWS();
   switchPage('home');
   showScreen('main');
   updateViewport();
+
   if ('serviceWorker' in navigator){
-    navigator.serviceWorker.register('/sw.js').catch(()=>{});
+    try { await navigator.serviceWorker.register('/sw.js'); } catch(e){}
+    navigator.serviceWorker.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'open-chat' && e.data.peer){
+        tryOpenChat(e.data.peer);
+      }
+    });
   }
-  if (state.pendingPeer){
-    const p = state.pendingPeer;
-    state.pendingPeer = null;
-    setTimeout(() => openChat(p), 300);
+
+  // обработка ?open=peer из клика по уведомлению
+  const params = new URLSearchParams(location.search);
+  const peer = params.get('open');
+  if (peer){
+    localStorage.setItem('m_open_after_login', peer);
+    history.replaceState({}, '', '/');
+  }
+  const toOpen = localStorage.getItem('m_open_after_login');
+  if (toOpen){
+    localStorage.removeItem('m_open_after_login');
+    setTimeout(() => tryOpenChat(toOpen), 300);
   }
 }
 
-// ---------- WebSocket ----------
+function tryOpenChat(peer){
+  if (!peer) return;
+  showScreen('main');
+  openChat(peer);
+}
+
+/* ---------------- WebSocket ---------------- */
+function updateConnDot(){
+  const dot = $('#conn-dot');
+  if (!dot) return;
+  dot.classList.toggle('online', !!state.wsReady);
+  const st = $('#me-status');
+  if (st){
+    st.textContent = state.wsReady ? 'в сети' : 'нет соединения';
+    st.style.color = state.wsReady ? 'var(--ok)' : 'var(--text-dim)';
+  }
+}
+
 function connectWS(){
   if (!state.token) return;
-  if (state.ws && (state.ws.readyState === 0 || state.ws.readyState === 1)) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = proto + '://' + location.host + '/ws?token=' + encodeURIComponent(state.token);
   let ws;
   try { ws = new WebSocket(url); } catch(e){ return; }
   state.ws = ws;
-  setWsState('connecting');
 
   ws.onopen = () => {
     state.wsReady = true;
-    setWsState('online');
+    updateConnDot();
   };
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch(_) { return; }
@@ -1394,14 +1219,12 @@ function connectWS(){
   };
   ws.onclose = (e) => {
     state.wsReady = false;
+    updateConnDot();
     if (state.ws === ws) state.ws = null;
     if (e.code === 4000) return;
     if (state.token){
-      setWsState('connecting');
       clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = setTimeout(connectWS, 1000 + Math.random() * 1000);
-    } else {
-      setWsState('offline');
+      state.reconnectTimer = setTimeout(connectWS, 1200 + Math.random() * 800);
     }
   };
   ws.onerror = () => {};
@@ -1414,91 +1237,100 @@ function wsSend(obj){
   return false;
 }
 
+/* ---------------- События сервера ---------------- */
 function handleServerEvent(m){
-  if (m.type === 'online_list'){
-    state.onlineUsers = new Set(m.users || []);
-    state.lastSeen = Object.assign({}, m.last_seen || {});
-    refreshStatusUI();
+  if (m.type === 'hello') return;
+
+  if (m.type === 'presence'){
+    if (m.online) state.onlineFriends.add(m.user);
+    else state.onlineFriends.delete(m.user);
+    if (state.page === 'home') renderChats();
+    if (state.page === 'friends') renderFriends();
+    if (state.activePeer === m.user) updateChatHeaderStatus();
     return;
   }
-  if (m.type === 'user_online'){
-    state.onlineUsers.add(m.user);
-    refreshStatusUI();
-    refreshChats();
-    return;
-  }
-  if (m.type === 'user_offline'){
-    state.onlineUsers.delete(m.user);
-    if (m.ts) state.lastSeen[m.user] = m.ts;
-    refreshStatusUI();
-    refreshChats();
-    return;
-  }
+
   if (m.type === 'message'){
     const peer = m.from === state.username ? m.to : m.from;
+    const mine = m.from === state.username;
+
+    // если диалог открыт — добавляем
     if (state.activePeer === peer && !state.seenIds.has(m.id)){
       state.seenIds.add(m.id);
       state.activeMsgs.push({ id: m.id, from: m.from, text: m.text, ts: m.ts });
       appendMessage({ id: m.id, from: m.from, text: m.text, ts: m.ts });
-      scrollMessages();
-      if (m.from !== state.username){
-        wsSend({ type: 'read', peer });
-        state.peerTyping = false;
-        clearTimeout(state.peerTypingTimer);
-        refreshStatusUI();
-      }
-    } else if (state.activePeer !== peer && m.from !== state.username){
+      scrollMessages(true);
+      if (!mine) wsSend({ type: 'read', peer });
+    } else if (!mine){
       maybeNotify(m);
     }
-    if (state.page === 'home' && state.activePeer !== peer) refreshChats();
+
+    // обновляем локальный кэш чатов
+    updateChatFromMessage(m);
+
+    // если собеседник печатал — сбрасываем его "печатает"
+    if (m.from === peer) delete state.typing[peer];
+
     return;
   }
+
   if (m.type === 'chat_read'){
-    if (state.page === 'home') refreshChats();
+    // мы прочитали/нам сообщили
+    const c = state.chats.find(x => x.username === m.peer);
+    if (c) c.unread = 0;
+    if (state.page === 'home'){ renderChats(); updateDots(); }
     return;
   }
+
   if (m.type === 'friends_changed'){
-    refreshFriends();
-    refreshChats();
-    fetchStatuses();
-    return;
-  }
-  if (m.type === 'chat_deleted'){
-    if (state.activePeer === m.peer){
-      state.activePeer = null;
-      state.activeMsgs = [];
-      state.seenIds.clear();
-      clearTimeout(state.peerTypingTimer);
-      showScreen('main');
-      toast('Чат удалён');
+    // если открыт чат с тем, кто нас удалил
+    if (state.activePeer && !state.friendsList.includes(state.activePeer)){
+      // возможно просто ещё не подгрузили — подождём refreshFriends
     }
+    refreshFriends().then(() => {
+      if (state.activePeer && !state.friendsList.includes(state.activePeer)){
+        toast('Диалог закрыт');
+        state.activePeer = null;
+        showScreen('main');
+        if (state.page === 'home') refreshChats();
+      }
+    });
     refreshChats();
     return;
   }
+
   if (m.type === 'typing'){
-    if (m.from === state.activePeer){
-      state.peerTyping = true;
-      clearTimeout(state.peerTypingTimer);
-      state.peerTypingTimer = setTimeout(() => {
-        state.peerTyping = false;
-        refreshStatusUI();
-      }, 2600);
-      refreshStatusUI();
+    if (m.from){
+      state.typing[m.from] = Date.now();
+      clearTimeout(state.typingTimers[m.from]);
+      state.typingTimers[m.from] = setTimeout(() => {
+        delete state.typing[m.from];
+        if (state.activePeer === m.from) updateChatHeaderStatus();
+        if (state.page === 'home') renderChats();
+      }, 3500);
+      if (state.activePeer === m.from) updateChatHeaderStatus();
+      if (state.page === 'home') renderChats();
     }
+    return;
   }
 }
 
-async function fetchStatuses(){
-  if (!state.token) return;
-  try {
-    const s = await api('/api/status');
-    state.onlineUsers = new Set();
-    Object.keys(s).forEach(k => {
-      if (s[k].online) state.onlineUsers.add(k);
-      if (s[k].lastSeen) state.lastSeen[k] = s[k].lastSeen;
-    });
-    refreshStatusUI();
-  } catch(e){}
+function updateChatFromMessage(m){
+  const peer = m.from === state.username ? m.to : m.from;
+  const mine = m.from === state.username;
+  let c = state.chats.find(x => x.username === peer);
+  if (!c){
+    // если мы не в списке — обновим
+    refreshChats();
+    return;
+  }
+  c.lastText = m.text;
+  c.lastTs = m.ts;
+  c.lastFromMe = mine;
+  if (!mine && state.activePeer !== peer) c.unread = (c.unread || 0) + 1;
+  state.chats.sort((a,b) => (b.lastTs||0) - (a.lastTs||0) || a.username.localeCompare(b.username));
+  if (state.page === 'home'){ renderChats(); updateDots(); }
+  else updateDots();
 }
 
 function maybeNotify(m){
@@ -1506,55 +1338,44 @@ function maybeNotify(m){
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
   if (!document.hidden && state.activePeer === m.from) return;
+  const title = m.from;
   const body = m.text.length > 80 ? m.text.slice(0, 77) + '…' : m.text;
   try {
-    if (navigator.serviceWorker && navigator.serviceWorker.ready){
-      navigator.serviceWorker.ready.then(reg => {
-        reg.showNotification(m.from, {
+    const doShow = (reg) => {
+      try {
+        reg.showNotification(title, {
           body,
           tag: 'msg-' + m.from,
           renotify: true,
           icon: '/icon.svg',
           badge: '/icon.svg',
           data: { peer: m.from },
-        }).catch(()=>{});
-      }).catch(()=>{});
+        });
+      } catch(e){
+        try { new Notification(title, { body, icon: '/icon.svg', data: { peer: m.from } }); } catch(_){}
+      }
+    };
+    if (navigator.serviceWorker && navigator.serviceWorker.ready){
+      navigator.serviceWorker.ready.then(doShow).catch(() => {
+        try { new Notification(title, { body, icon: '/icon.svg' }); } catch(_){}
+      });
     } else {
-      new Notification(m.from, { body, icon: '/icon.svg' });
+      new Notification(title, { body, icon: '/icon.svg' });
     }
   } catch(e){}
 }
 
-// ---------- Status UI ----------
-function refreshStatusUI(){
-  if (state.activePeer){
-    const el = $('#chat-status');
-    if (state.peerTyping){
-      el.textContent = 'печатает…';
-      el.classList.add('typing');
-      el.classList.remove('online');
-    } else if (state.onlineUsers.has(state.activePeer)){
-      el.textContent = 'в сети';
-      el.classList.remove('typing');
-      el.classList.add('online');
-    } else {
-      el.textContent = fmtLastSeen(state.lastSeen[state.activePeer]);
-      el.classList.remove('typing','online');
-    }
-  }
-  renderChats();
-  if (state.page === 'friends' && !state.searchQuery) renderFriends();
-}
-
-// ---------- Chats ----------
+/* ---------------- Список чатов ---------------- */
 async function refreshChats(){
   if (!state.token) return;
   try {
     const list = await api('/api/chats');
     state.chats = list;
-    state.chats.forEach(c => {
-      c.online = state.onlineUsers.has(c.username);
-    });
+    // обновим также онлайн-кэш
+    for (const c of list){
+      if (c.online) state.onlineFriends.add(c.username);
+      else state.onlineFriends.delete(c.username);
+    }
     renderChats();
     updateDots();
   } catch(e){}
@@ -1568,50 +1389,42 @@ function renderChats(){
   }
   box.innerHTML = state.chats.map(c => {
     const initial = (c.username[0] || '?').toUpperCase();
-    let sub, subCls = 'row-sub';
-    if (c.lastText){
-      sub = (c.lastFromMe ? 'Вы: ' : '') + esc(c.lastText);
-    } else if (state.onlineUsers.has(c.username)){
-      sub = 'в сети'; subCls = 'row-sub online';
-    } else {
-      sub = '<span class="italic">нет сообщений</span>';
-    }
+    const online = isOnline(c.username);
+    const typing = isTyping(c.username);
+    let sub;
+    if (typing) sub = '<span class="row-sub typing" style="color:var(--ok);font-style:italic">печатает…</span>';
+    else if (c.lastText) sub = '<span class="row-sub">' + esc((c.lastFromMe ? 'Вы: ' : '') + c.lastText) + '</span>';
+    else sub = '<span class="row-sub">нет сообщений</span>';
     const badge = c.unread ? '<div class="badge">' + c.unread + '</div>' : '';
     const time = c.lastTs ? '<div class="row-time">' + esc(fmtTime(c.lastTs)) + '</div>' : '';
-    const onlineDot = state.onlineUsers.has(c.username) ? '<span class="online-dot"></span>' : '';
     return '<div class="row" data-peer="' + esc(c.username) + '">' +
-      '<div class="avatar">' + esc(initial) + onlineDot + '</div>' +
+      '<div class="avatar">' + esc(initial) +
+        '<span class="online-dot ' + (online ? 'on' : '') + '"></span>' +
+      '</div>' +
       '<div class="row-info"><div class="row-title">' + esc(c.username) + '</div>' +
-      '<div class="' + subCls + '">' + sub + '</div></div>' +
+        sub + '</div>' +
       '<div class="row-right">' + time + badge + '</div></div>';
   }).join('');
-  box.querySelectorAll('.row').forEach(r => {
-    r.addEventListener('click', () => openChat(r.dataset.peer));
-  });
+  box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => openChat(r.dataset.peer)));
 }
 
-// ---------- Dots ----------
+/* ---------------- Друзья ---------------- */
 function updateDots(){
   const homeUnread = state.chats.reduce((s,c) => s + (c.unread||0), 0);
-  const homeDot = $('#home-dot');
-  if (homeUnread > 0){
-    homeDot.textContent = homeUnread > 99 ? '99+' : homeUnread;
-    homeDot.style.display = 'flex';
-  } else homeDot.style.display = 'none';
+  const hd = $('#home-dot');
+  if (homeUnread > 0){ hd.textContent = homeUnread > 99 ? '99+' : homeUnread; hd.style.display = 'flex'; }
+  else hd.style.display = 'none';
 
   const pendingCount = state.incoming.length;
-  const friendsDot = $('#friends-dot');
-  if (pendingCount > 0){
-    friendsDot.textContent = pendingCount > 99 ? '99+' : pendingCount;
-    friendsDot.style.display = 'flex';
-  } else friendsDot.style.display = 'none';
+  const fd = $('#friends-dot');
+  if (pendingCount > 0){ fd.textContent = pendingCount > 99 ? '99+' : pendingCount; fd.style.display = 'flex'; }
+  else fd.style.display = 'none';
 
   const pb = $('#pending-badge');
   if (pendingCount > 0) pb.innerHTML = '<span class="badge-inline">' + pendingCount + '</span>';
   else pb.innerHTML = '';
 }
 
-// ---------- Friends ----------
 async function refreshFriends(){
   if (!state.token) return;
   try {
@@ -1619,7 +1432,7 @@ async function refreshFriends(){
     state.friendsList = data.friends || [];
     state.incoming = data.incoming || [];
     state.outgoing = data.outgoing || [];
-    state.friendCache = new Set(state.friendsList);
+    state.onlineFriends = new Set(data.online || []);
     updateDots();
     renderFriends();
   } catch(e){}
@@ -1633,11 +1446,8 @@ $$('#friends-seg .seg').forEach(b => b.addEventListener('click', () => {
 
 function renderFriends(){
   const box = $('#friends-list');
+  if (state.searchQuery){ renderSearch(box); return; }
 
-  if (state.searchQuery){
-    renderSearch(box);
-    return;
-  }
   if (state.friendsTab === 'friends'){
     if (!state.friendsList.length){
       box.innerHTML = '<div class="empty">Пока нет друзей.<br>Найдите людей через поиск выше.</div>';
@@ -1645,23 +1455,28 @@ function renderFriends(){
     }
     box.innerHTML = state.friendsList.map(name => {
       const initial = (name[0] || '?').toUpperCase();
-      const online = state.onlineUsers.has(name);
-      const onlineDot = online ? '<span class="online-dot"></span>' : '';
-      const sub = online ? '<div class="row-sub online">в сети</div>'
-                         : (state.lastSeen[name]
-                            ? '<div class="row-sub">' + esc(fmtLastSeen(state.lastSeen[name])) + '</div>'
-                            : '');
+      const online = isOnline(name);
+      const typing = isTyping(name);
+      const status = typing ? 'печатает…' : (online ? 'в сети' : 'не в сети');
+      const statusCls = typing ? 'row-sub typing' : 'row-sub';
       return '<div class="row">' +
-        '<div class="avatar">' + esc(initial) + onlineDot + '</div>' +
-        '<div class="row-info"><div class="row-title">' + esc(name) + '</div>' + sub + '</div>' +
+        '<div class="avatar">' + esc(initial) +
+          '<span class="online-dot ' + (online ? 'on' : '') + '"></span>' +
+        '</div>' +
+        '<div class="row-info">' +
+          '<div class="row-title">' + esc(name) + '</div>' +
+          '<div class="' + statusCls + '">' + status + '</div>' +
+        '</div>' +
         '<div class="mini-btn-row">' +
-          '<button type="button" class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
-          '<button type="button" class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '" title="Удалить">' +
-            '<svg style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" viewBox="0 0 24 24">' + ICONS.trash + '</svg>' +
+          '<button class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
+          '<button class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '" aria-label="Удалить">' +
+            '<svg style="width:18px;height:18px;vertical-align:middle;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" viewBox="0 0 24 24">' + ICONS.trash + '</svg>' +
           '</button>' +
         '</div></div>';
     }).join('');
-    bindFriendButtons(box);
+    box.querySelectorAll('button[data-act]').forEach(b => {
+      b.addEventListener('click', (e) => { e.stopPropagation(); friendAction(b.dataset.act, b.dataset.user); });
+    });
     return;
   }
 
@@ -1673,26 +1488,22 @@ function renderFriends(){
   if (out) html += '<div class="section-label">Исходящие</div>' + out;
   if (!html) html = '<div class="empty">Нет активных заявок.</div>';
   box.innerHTML = html;
-  bindFriendButtons(box);
-}
-
-function bindFriendButtons(box){
   box.querySelectorAll('button[data-act]').forEach(b => {
-    b.addEventListener('click', (e) => {
-      e.stopPropagation();
-      friendAction(b.dataset.act, b.dataset.user);
-    });
+    b.addEventListener('click', (e) => { e.stopPropagation(); friendAction(b.dataset.act, b.dataset.user); });
   });
 }
 
 function rowPending(name, kind){
   const initial = (name[0] || '?').toUpperCase();
+  const online = isOnline(name);
   const btns = kind === 'incoming'
-    ? '<button type="button" class="mini-btn primary" data-act="accept" data-user="' + esc(name) + '">Принять</button>' +
-      '<button type="button" class="mini-btn ghost" data-act="decline" data-user="' + esc(name) + '">Отклонить</button>'
-    : '<button type="button" class="mini-btn ghost" data-act="cancel" data-user="' + esc(name) + '">Отменить</button>';
+    ? '<button class="mini-btn primary" data-act="accept" data-user="' + esc(name) + '">Принять</button>' +
+      '<button class="mini-btn ghost" data-act="decline" data-user="' + esc(name) + '">Отклонить</button>'
+    : '<button class="mini-btn ghost" data-act="cancel" data-user="' + esc(name) + '">Отменить</button>';
   return '<div class="row">' +
-    '<div class="avatar">' + esc(initial) + '</div>' +
+    '<div class="avatar">' + esc(initial) +
+      '<span class="online-dot ' + (online ? 'on' : '') + '"></span>' +
+    '</div>' +
     '<div class="row-info"><div class="row-title">' + esc(name) + '</div>' +
     '<div class="row-sub">' + (kind === 'incoming' ? 'хочет добавить вас' : 'заявка отправлена') + '</div></div>' +
     '<div class="mini-btn-row">' + btns + '</div></div>';
@@ -1705,24 +1516,29 @@ function renderSearch(box){
   }
   box.innerHTML = state.searchResults.map(u => {
     const initial = (u.username[0] || '?').toUpperCase();
-    let btn;
-    if (u.status === 'friend') btn = '<div class="mini-btn ghost" style="opacity:.6">Друзья</div>';
-    else if (u.status === 'outgoing') btn = '<button type="button" class="mini-btn ghost" data-act="cancel" data-user="' + esc(u.username) + '">Отменить</button>';
-    else if (u.status === 'incoming') btn = '<button type="button" class="mini-btn primary" data-act="accept" data-user="' + esc(u.username) + '">Принять</button>';
-    else btn = '<button type="button" class="mini-btn primary" data-act="request" data-user="' + esc(u.username) + '">Добавить</button>';
+    const online = !!u.online;
+    let btn = '';
+    if (u.status === 'friend') btn = '<button class="mini-btn primary" data-act="open" data-user="' + esc(u.username) + '">Написать</button>';
+    else if (u.status === 'outgoing') btn = '<button class="mini-btn ghost" data-act="cancel" data-user="' + esc(u.username) + '">Отменить</button>';
+    else if (u.status === 'incoming') btn = '<button class="mini-btn primary" data-act="accept" data-user="' + esc(u.username) + '">Принять</button>';
+    else btn = '<button class="mini-btn primary" data-act="request" data-user="' + esc(u.username) + '">Добавить</button>';
     return '<div class="row">' +
-      '<div class="avatar">' + esc(initial) + '</div>' +
+      '<div class="avatar">' + esc(initial) +
+        '<span class="online-dot ' + (online ? 'on' : '') + '"></span>' +
+      '</div>' +
       '<div class="row-info"><div class="row-title">' + esc(u.username) + '</div></div>' +
       '<div class="mini-btn-row">' + btn + '</div></div>';
   }).join('');
-  bindFriendButtons(box);
+  box.querySelectorAll('button[data-act]').forEach(b => {
+    b.addEventListener('click', (e) => { e.stopPropagation(); friendAction(b.dataset.act, b.dataset.user); });
+  });
 }
 
 async function friendAction(act, user){
   try {
     if (act === 'open'){ openChat(user); return; }
     if (act === 'unfriend'){
-      if (!confirm('Удалить ' + user + ' из друзей?\nВся переписка с ним тоже будет удалена.')) return;
+      if (!confirm('Удалить ' + user + ' из друзей?\nВся переписка тоже будет удалена.')) return;
       await api('/api/friends/remove', { method: 'POST', body: JSON.stringify({target:user}) });
       toast('Удалено');
     } else if (act === 'request'){
@@ -1737,13 +1553,14 @@ async function friendAction(act, user){
       await api('/api/friends/cancel', { method: 'POST', body: JSON.stringify({target:user}) });
     }
     await refreshFriends();
+    await refreshChats();
     if (state.searchQuery) await runSearch(state.searchQuery);
   } catch(err){
     toast(err.message || 'Ошибка');
   }
 }
 
-// ---------- Search ----------
+/* ---------------- Поиск ---------------- */
 let searchTimer = null;
 $('#friend-search').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
@@ -1761,16 +1578,31 @@ async function runSearch(q){
   } catch(e){}
 }
 
-// ---------- Chat ----------
+/* ---------------- Чат ---------------- */
+function updateChatHeaderStatus(){
+  const el = $('#chat-status');
+  if (!el || !state.activePeer) return;
+  if (isTyping(state.activePeer)){
+    el.textContent = 'печатает…';
+    el.className = 'title-status typing';
+    return;
+  }
+  if (isOnline(state.activePeer)){
+    el.textContent = 'в сети';
+    el.className = 'title-status online';
+  } else {
+    el.textContent = 'не в сети';
+    el.className = 'title-status';
+  }
+}
+
 async function openChat(peer){
   state.activePeer = peer;
   state.activeMsgs = [];
   state.seenIds.clear();
-  state.peerTyping = false;
-  clearTimeout(state.peerTypingTimer);
   $('#chat-title').textContent = peer;
   $('#messages').innerHTML = '';
-  refreshStatusUI();
+  updateChatHeaderStatus();
   showScreen('chat');
   updateViewport();
 
@@ -1781,17 +1613,19 @@ async function openChat(peer){
       state.seenIds.add(m.id);
       appendMessage({ id:m.id, from:m.from, text:m.text, ts:m.ts });
     }
-    scrollMessages();
+    scrollMessages(true);
     wsSend({ type:'read', peer });
     const c = state.chats.find(x => x.username === peer);
     if (c){ c.unread = 0; renderChats(); updateDots(); }
   } catch(e){
-    toast('Ошибка загрузки');
+    toast(e.message || 'Ошибка загрузки');
+    if (e.message && e.message.indexOf('Не друзья') >= 0){
+      state.activePeer = null;
+      showScreen('main');
+      return;
+    }
   }
-  setTimeout(() => {
-    const inp = $('#msg-input');
-    try { inp.focus({ preventScroll: true }); } catch(_) { inp.focus(); }
-  }, 50);
+  setTimeout(() => { try { $('#msg-input').focus({preventScroll:true}); } catch(_){} }, 50);
 }
 
 function appendMessage(m){
@@ -1811,36 +1645,49 @@ $('#chat-back').addEventListener('click', () => {
   state.activePeer = null;
   state.activeMsgs = [];
   state.seenIds.clear();
-  state.peerTyping = false;
-  clearTimeout(state.peerTypingTimer);
   showScreen('main');
   if (state.page === 'home') refreshChats();
   setTimeout(updateViewport, 50);
 });
 
-// ---------- Send ----------
 function sendMessage(){
   if (!state.activePeer) return;
   const input = $('#msg-input');
   const text = input.value.trim();
   if (!text) return;
-  input.value = '';
-  try { input.focus({ preventScroll: true }); } catch(_) { input.focus(); }
   const ok = wsSend({ type:'send', to: state.activePeer, text });
   if (!ok){
     toast('Нет соединения');
-    input.value = text;
     return;
   }
-  requestAnimationFrame(() => {
-    try { input.focus({ preventScroll: true }); } catch(_) { input.focus(); }
-  });
+  input.value = '';
+  // не убираем фокус с поля, чтобы клавиатура не закрывалась
+  try { input.focus({preventScroll:true}); } catch(_){}
 }
 
-$('#send-btn').addEventListener('click', (e) => {
-  e.preventDefault();
-  sendMessage();
-});
+/* --- ГЛАВНЫЙ ФИКС: кнопка отправки на мобильных --- */
+// pointerdown предотвращает потерю фокуса, click — реальный обработчик.
+// preventDefault на touchstart ломал click на мобильных — убран.
+(function bindSend(){
+  const btn = $('#send-btn');
+  if (!btn) return;
+  btn.addEventListener('pointerdown', (e) => {
+    // не даём кнопке забрать фокус с поля ввода
+    e.preventDefault();
+  });
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    sendMessage();
+  });
+  // старый iOS без PointerEvent
+  btn.addEventListener('touchend', (e) => {
+    // если click не сработает (редкий случай) — отправим
+    if (!('PointerEvent' in window)){
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+})();
 
 $('#msg-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey){
@@ -1855,7 +1702,7 @@ $('#msg-input').addEventListener('input', () => {
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => {
     wsSend({ type:'typing', to: state.activePeer });
-  }, 250);
+  }, 300);
 });
 
 if (window.visualViewport){
@@ -1864,7 +1711,7 @@ if (window.visualViewport){
   });
 }
 
-// ---------- Settings ----------
+/* ---------------- Настройки ---------------- */
 $('#set-theme').addEventListener('click', () => {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem('m_theme', state.theme);
@@ -1902,36 +1749,18 @@ $('#set-notif').addEventListener('click', async () => {
   applyNotifUI();
 });
 
-// ---------- Notification click ----------
-if ('serviceWorker' in navigator){
-  navigator.serviceWorker.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'notification_click'){
-      const peer = e.data.peer;
-      if (!peer) return;
-      if (state.token) openChat(peer);
-    }
-  });
-}
+// не даём странице зумиться двойным тапом
+document.addEventListener('dblclick', e => e.preventDefault(), {passive:false});
 
-(function checkInitialPeer(){
-  const params = new URLSearchParams(location.search);
-  const p = params.get('peer');
-  if (p){
-    state.pendingPeer = p;
-    try { history.replaceState(null, '', location.pathname); } catch(_){}
-  }
-})();
-
-// ---------- Init ----------
+/* ---------------- Старт ---------------- */
 applyTheme();
 applyGlass();
-setWsState('connecting');
+updateConnDot();
 
 if (state.token){
-  fetch('/api/chats', { headers: { 'Authorization': 'Bearer ' + state.token } }).then(r => {
-    if (r.ok){ enterApp(); }
-    else { doLogout(); }
-  }).catch(() => doLogout());
+  fetch('/api/chats', { headers: { 'Authorization': 'Bearer ' + state.token } })
+    .then(r => { if (r.ok) enterApp(); else doLogout(); })
+    .catch(() => doLogout());
 } else {
   showScreen('auth');
   updateViewport();
@@ -1942,7 +1771,6 @@ document.addEventListener('visibilitychange', () => {
     if (!state.ws || state.ws.readyState > 1) connectWS();
     if (state.page === 'home') refreshChats();
     if (state.page === 'friends') refreshFriends();
-    fetchStatuses();
   }
 });
 
