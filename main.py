@@ -1,54 +1,86 @@
-# main.py — SLD Posts (FastAPI + Supabase)
-import os, time, random, html
+# main.py — SLD Posts (FastAPI + Supabase via stdlib urllib)
+# Никаких внешних зависимостей кроме fastapi/uvicorn.
+import os, time, random, html, json, ssl, traceback
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from urllib import request as urlreq
+from urllib import parse as urlparse
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import httpx
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-SB_REST = f"{SUPABASE_URL}/rest/v1"
+# ================= ENV =================
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = (os.environ.get("SUPABASE_KEY") or "")
 
+def env_state():
+    return {
+        "SUPABASE_URL_set": bool(SUPABASE_URL),
+        "SUPABASE_URL_prefix": SUPABASE_URL[:40] if SUPABASE_URL else None,
+        "SUPABASE_KEY_set": bool(SUPABASE_KEY),
+        "SUPABASE_KEY_len": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+    }
+
+# ================= LIMITS =================
 MAX_POST_BYTES  = 350 * 1024
 MAX_IMAGE_BYTES = 280 * 1024
 
-app = FastAPI(title="SLD Posts", version="2.0")
+app = FastAPI(title="SLD Posts", version="2.1")
 
-# ================= SUPABASE HELPERS =================
+# ================= SUPABASE (stdlib) =================
 def sb_headers(prefer=None):
     h = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
     if prefer:
         h["Prefer"] = prefer
     return h
 
+def sb_request(method, path, params=None, body=None, prefer=None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase env vars not set (SUPABASE_URL / SUPABASE_KEY)")
+
+    url = f"{SUPABASE_URL}/rest/v1{path}"
+    if params:
+        url += "?" + urlparse.urlencode(params)
+
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+
+    req = urlreq.Request(url, data=data, method=method, headers=sb_headers(prefer))
+    ctx = ssl.create_default_context()
+    try:
+        with urlreq.urlopen(req, timeout=20, context=ctx) as r:
+            raw = r.read().decode("utf-8")
+            if not raw:
+                return []
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+    except urlreq.HTTPError as he:
+        err_body = ""
+        try: err_body = he.read().decode("utf-8")
+        except Exception: pass
+        raise RuntimeError(f"Supabase {he.code}: {err_body[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"Supabase request failed: {e}")
+
 def sb_get(path, params=None):
-    with httpx.Client(timeout=20) as cli:
-        r = cli.get(f"{SB_REST}{path}", headers=sb_headers(), params=params or {})
-    r.raise_for_status()
-    return r.json()
+    return sb_request("GET", path, params=params)
 
 def sb_post(path, data):
-    with httpx.Client(timeout=20) as cli:
-        r = cli.post(f"{SB_REST}{path}", headers=sb_headers("return=representation"), json=data)
-    r.raise_for_status()
-    return r.json()
+    return sb_request("POST", path, body=data, prefer="return=representation")
 
 def sb_patch(path, data, params=None):
-    with httpx.Client(timeout=20) as cli:
-        r = cli.patch(f"{SB_REST}{path}", headers=sb_headers("return=representation"),
-                      params=params or {}, json=data)
-    r.raise_for_status()
-    return r.json()
+    return sb_request("PATCH", path, params=params, body=data, prefer="return=representation")
 
 def sb_delete(path, params=None):
-    with httpx.Client(timeout=20) as cli:
-        r = cli.delete(f"{SB_REST}{path}", headers=sb_headers(), params=params or {})
-    r.raise_for_status()
+    sb_request("DELETE", path, params=params)
     return True
 
 # ================= UTILS =================
@@ -57,8 +89,8 @@ def now_ms(): return int(time.time() * 1000)
 def gen_id():
     for _ in range(30):
         s = f"{random.randint(100000, 999999):06d}"
-        exists = sb_get("/posts", {"id": f"eq.{s}", "select": "id", "limit": 1})
-        if not exists:
+        rows = sb_get("/posts", {"id": f"eq.{s}", "select": "id", "limit": 1})
+        if not rows:
             return s
     raise HTTPException(500, "id generation failed")
 
@@ -78,7 +110,6 @@ def fmt_time(ms):
 def esc(s): return html.escape(s or "", quote=True)
 
 def row_to_post(row):
-    """Приводим строку из Supabase к JSON для клиента."""
     return {
         "id": row.get("id"),
         "author_uuid": row.get("author_uuid"),
@@ -157,11 +188,22 @@ input[type=text]::placeholder{color:#5e6a76;letter-spacing:normal}
 .footer{text-align:center;color:#5e6a76;font-size:12px;padding:30px 16px 10px}
 .legal{color:#c5cfdb;font-size:14px;line-height:1.6}
 .legal h2{color:#fff;font-size:18px;margin:22px 0 8px}
+.banner{background:#3a2a2a;color:#ffd0d0;padding:12px 16px;border-radius:10px;
+  margin-top:16px;font-size:13px;border:1px solid #6a3a3a}
 """
 
 SVG_DL     = '<svg class="btn-svg" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 21h16"/></svg>'
 SVG_SEARCH = '<svg class="btn-svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5L21 21"/></svg>'
 SVG_BACK   = '<svg class="btn-svg" viewBox="0 0 24 24"><path d="M15 5L8 12l7 7"/></svg>'
+
+DOWNLOAD_JS = """
+function downloadSoon(btn){
+  var old = btn.innerHTML;
+  btn.innerHTML = 'Скоро!';
+  btn.disabled = true;
+  setTimeout(function(){ btn.innerHTML = old; btn.disabled = false; }, 1600);
+}
+"""
 
 def page(title, body):
     return f"""<!DOCTYPE html>
@@ -177,17 +219,8 @@ def page(title, body):
 <div class="footer">SLD · <a href="/privacy">Политика конфиденциальности</a></div>
 </body></html>"""
 
-DOWNLOAD_JS = """
-function downloadSoon(btn){
-  var old = btn.innerHTML;
-  btn.innerHTML = 'Скоро!';
-  btn.disabled = true;
-  alert('Скоро!');
-  setTimeout(function(){ btn.innerHTML = old; btn.disabled = false; }, 1600);
-}
-"""
-
-def index_page():
+def index_page(err_banner=""):
+    banner = f'<div class="banner">{esc(err_banner)}</div>' if err_banner else ""
     body = f"""
 <div class="container">
   <div class="hero">
@@ -200,6 +233,8 @@ def index_page():
           onclick="downloadSoon(this)">
     {SVG_DL} Скачать приложение
   </button>
+
+  {banner}
 
   <div class="card">
     <div class="section-label">Найти пост по ID</div>
@@ -281,43 +316,29 @@ def privacy_page():
   <div class="card">
     <h1 style="margin-top:0">Политика конфиденциальности</h1>
     <div class="legal">
-      <p>Сервис SLD («мы») предоставляет анонимную платформу для публикации постов.
-      Эта страница описывает, какие данные мы собираем и как их используем.</p>
-
+      <p>Сервис SLD («мы») предоставляет анонимную платформу для публикации постов.</p>
       <h2>1. Какие данные мы храним</h2>
       <ul>
-        <li><b>Анонимный идентификатор устройства (UUID)</b> — генерируется на
-        основе системного идентификатора вашего устройства. Используется
-        исключительно для того, чтобы вы могли видеть и редактировать
-        собственные посты. Ни имя, ни номер телефона, ни email не запрашиваются.</li>
-        <li><b>Содержимое постов</b> — текст, теги и (при наличии) композитное
-        изображение, которое вы публикуете добровольно.</li>
-        <li><b>Дата и время публикации</b> — для сортировки.</li>
+        <li><b>Анонимный UUID</b> — генерируется на основе системного идентификатора устройства.
+        Используется, чтобы вы могли видеть и редактировать собственные посты.</li>
+        <li><b>Содержимое постов</b> — текст, теги и композитное изображение.</li>
+        <li><b>Дата и время публикации</b>.</li>
       </ul>
-
       <h2>2. Чего мы НЕ делаем</h2>
       <ul>
         <li>Не запрашиваем регистрацию, имя, телефон или почту.</li>
-        <li>Не используем рекламные трекеры и сторонние SDK аналитики.</li>
-        <li>Не передаём данные третьим лицам, кроме хостинга Supabase,
-        который хранит содержимое базы данных на своих серверах.</li>
+        <li>Не используем рекламные трекеры.</li>
+        <li>Не передаём данные третьим лицам, кроме хостинга Supabase.</li>
       </ul>
-
       <h2>3. Где хранятся данные</h2>
-      <p>Данные хранятся в облачной базе данных Supabase. Передача между
-      приложением и сервером идёт по HTTPS.</p>
-
+      <p>Данные в Supabase. Передача по HTTPS.</p>
       <h2>4. Ваши права</h2>
       <ul>
-        <li>Вы можете в любой момент удалить свой пост — он немедленно удаляется из базы.</li>
-        <li>Вы можете сбросить аккаунт в настройках приложения — все ваши посты
-        будут удалены.</li>
+        <li>Удалить свой пост можно в любой момент.</li>
+        <li>Сбросить аккаунт можно в настройках приложения — все ваши посты удалятся.</li>
       </ul>
-
       <h2>5. Контакты</h2>
-      <p>По вопросам: <a href="mailto:privacy@sldchat.fastapicloud.dev">
-      privacy@sldchat.fastapicloud.dev</a></p>
-
+      <p>privacy@sldchat.fastapicloud.dev</p>
       <p style="color:#7b8794;margin-top:24px">Обновлено: 2025</p>
     </div>
   </div>
@@ -325,15 +346,29 @@ def privacy_page():
 """
     return page("Политика конфиденциальности", body)
 
-# ================= API ROUTES =================
+# ================= DIAGNOSTIC ROUTES (идут раньше /{code}) =================
 @app.get("/health")
 def health():
-    return {"status": "ok", "ts": now_ms()}
+    """Общая проверка — сервер жив?"""
+    return {"status": "ok", "ts": now_ms(), "env": env_state()}
+
+@app.get("/diag")
+def diag():
+    """Полная диагностика: env + попытка запроса к Supabase."""
+    result = {"ts": now_ms(), "env": env_state(), "supabase": None}
+    try:
+        rows = sb_get("/posts", {"select": "id", "limit": 1})
+        result["supabase"] = {"ok": True, "sample": rows}
+    except Exception as e:
+        result["supabase"] = {"ok": False, "error": str(e),
+                              "trace": traceback.format_exc()[-800:]}
+    return JSONResponse(result)
 
 @app.get("/api")
 def api_root():
-    return {"ok": True, "service": "SLD Posts"}
+    return {"ok": True, "service": "SLD Posts", "env": env_state()}
 
+# ================= API ROUTES =================
 @app.post("/post")
 def create_post(r: CreatePostReq):
     text = (r.text or "")[:10000]
@@ -342,91 +377,142 @@ def create_post(r: CreatePostReq):
 
     if not text.strip() and not img:
         raise HTTPException(400, "empty post")
-
     if img and len(img) > MAX_IMAGE_BYTES:
-        raise HTTPException(413, f"image too large: {len(img)} > {MAX_IMAGE_BYTES}")
-
+        raise HTTPException(413, f"image too large: {len(img)}")
     total = len(text.encode("utf-8")) + len(img or "")
     if total > MAX_POST_BYTES:
-        raise HTTPException(413, f"post too large: {total} > {MAX_POST_BYTES}")
+        raise HTTPException(413, f"post too large: {total}")
 
-    pid = gen_id()
-    row = {
-        "id": pid,
-        "author_uuid": r.author_uuid,
-        "content": text,
-        "tags": tags,
-        "image_base64": img,
-        "created_at": now_ms(),
-    }
-    created = sb_post("/posts", row)
-    return row_to_post(created[0] if created else row)
+    try:
+        pid = gen_id()
+        row = {
+            "id": pid,
+            "author_uuid": r.author_uuid,
+            "content": text,
+            "tags": tags,
+            "image_base64": img,
+            "created_at": now_ms(),
+        }
+        created = sb_post("/posts", row)
+        return row_to_post(created[0] if created else row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 @app.put("/post/{pid}")
 def update_post(pid: str, r: UpdatePostReq):
-    rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
-    if not rows:
-        raise HTTPException(404, "not found")
-    if rows[0]["author_uuid"] != r.author_uuid:
-        raise HTTPException(403, "not owner")
+    try:
+        rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
+        if not rows:
+            raise HTTPException(404, "not found")
+        if rows[0]["author_uuid"] != r.author_uuid:
+            raise HTTPException(403, "not owner")
 
-    upd = {}
-    if r.text is not None: upd["content"] = (r.text or "")[:10000]
-    if r.tags is not None: upd["tags"] = normalize_tags(r.tags)
-    if r.image is not None:
-        if r.image and len(r.image) > MAX_IMAGE_BYTES:
-            raise HTTPException(413, "image too large")
-        upd["image_base64"] = r.image or None
-    upd["created_at"] = now_ms()
+        upd = {}
+        if r.text is not None: upd["content"] = (r.text or "")[:10000]
+        if r.tags is not None: upd["tags"] = normalize_tags(r.tags)
+        if r.image is not None:
+            if r.image and len(r.image) > MAX_IMAGE_BYTES:
+                raise HTTPException(413, "image too large")
+            upd["image_base64"] = r.image or None
+        upd["created_at"] = now_ms()
 
-    total = len((upd.get("content") or "").encode("utf-8")) + len(upd.get("image_base64") or "")
-    if total > MAX_POST_BYTES:
-        raise HTTPException(413, "post too large")
+        total = len((upd.get("content") or "").encode("utf-8")) + len(upd.get("image_base64") or "")
+        if total > MAX_POST_BYTES:
+            raise HTTPException(413, "post too large")
 
-    out = sb_patch("/posts", upd, {"id": f"eq.{pid}"})
-    return row_to_post(out[0] if out else upd)
+        out = sb_patch("/posts", upd, {"id": f"eq.{pid}"})
+        return row_to_post(out[0] if out else upd)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 @app.delete("/post/{pid}")
 def delete_post(pid: str, author_uuid: str):
-    rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
-    if not rows:
-        raise HTTPException(404, "not found")
-    if rows[0]["author_uuid"] != author_uuid:
-        raise HTTPException(403, "not owner")
-    sb_delete("/posts", {"id": f"eq.{pid}"})
-    return {"ok": True}
+    try:
+        rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
+        if not rows:
+            raise HTTPException(404, "not found")
+        if rows[0]["author_uuid"] != author_uuid:
+            raise HTTPException(403, "not owner")
+        sb_delete("/posts", {"id": f"eq.{pid}"})
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 @app.get("/post/{pid}")
 def get_post(pid: str):
-    rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
-    if not rows:
-        raise HTTPException(404, "not found")
-    return row_to_post(rows[0])
+    try:
+        rows = sb_get("/posts", {"id": f"eq.{pid}", "limit": 1})
+        if not rows:
+            raise HTTPException(404, "not found")
+        return row_to_post(rows[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 @app.get("/my_posts/{uid}")
 def my_posts(uid: str):
-    rows = sb_get("/posts", {"author_uuid": f"eq.{uid}",
-                             "order": "created_at.desc"})
-    return [row_to_post(r) for r in rows]
+    try:
+        rows = sb_get("/posts", {"author_uuid": f"eq.{uid}", "order": "created_at.desc"})
+        return [row_to_post(r) for r in rows]
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 @app.post("/reset/{uid}")
 def reset(uid: str):
-    sb_delete("/posts", {"author_uuid": f"eq.{uid}"})
-    return {"ok": True}
+    try:
+        sb_delete("/posts", {"author_uuid": f"eq.{uid}"})
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, f"supabase: {e}")
 
 # ================= WEB ROUTES =================
 @app.get("/", response_class=HTMLResponse)
-def web_index(): return index_page()
+def web_index():
+    """Главная страница — рендерится ВСЕГДА, даже если Supabase лежит."""
+    banner = ""
+    try:
+        # Простая проверка доступности БД — не блокирует рендер при ошибке
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            banner = ("Внимание: не заданы SUPABASE_URL / SUPABASE_KEY. "
+                      "Поиск по ID работать не будет. Проверь /diag.")
+        else:
+            sb_get("/posts", {"select": "id", "limit": 1})
+    except Exception as e:
+        banner = f"Supabase недоступен: {e}"
+    return index_page(banner)
 
 @app.get("/privacy", response_class=HTMLResponse)
 def web_privacy(): return privacy_page()
 
-# ВАЖНО: последний маршрут — ловит 6-значные коды
+# ВАЖНО: последний маршрут — catch-all для 6-значных кодов
 @app.get("/{code}", response_class=HTMLResponse)
 def web_post(code: str):
     if not (len(code) == 6 and code.isdigit()):
         return HTMLResponse(not_found_page(code), status_code=404)
-    rows = sb_get("/posts", {"id": f"eq.{code}", "limit": 1})
+    try:
+        rows = sb_get("/posts", {"id": f"eq.{code}", "limit": 1})
+    except Exception as e:
+        return HTMLResponse(page("Ошибка", f"""
+<div class="container"><div class="card">
+  <h2 style="margin-top:0">Не удалось получить пост</h2>
+  <p style="color:#7b8794">{esc(str(e))}</p>
+  <a class="btn btn-primary" href="/" style="margin-top:12px">На главную</a>
+</div></div>"""), status_code=500)
     if not rows:
         return HTMLResponse(not_found_page(code), status_code=404)
     return post_page(row_to_post(rows[0]))
+
+# ================= STARTUP LOG =================
+@app.on_event("startup")
+def on_startup():
+    print("=" * 60)
+    print("SLD Posts server started")
+    print("env:", env_state())
+    print("=" * 60)
