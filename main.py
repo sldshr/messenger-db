@@ -1,5 +1,4 @@
-# main.py
-# SLD Chat server — FastAPI, всё хранится в оперативке.
+# main.py — SLD Chat server
 # Deploy: fastapicloud / uvicorn main:app --host 0.0.0.0 --port 8000
 
 from fastapi import FastAPI, HTTPException
@@ -8,13 +7,11 @@ from typing import Optional, List
 import time
 import uuid as uuidlib
 
-app = FastAPI(title="SLD Chat", version="1.0")
+app = FastAPI(title="SLD Chat", version="1.2")
 
-# ====================== STORAGE ======================
 users = {}     # uuid -> {uuid, nick, created_at, last_seen}
-messages = []  # list of dicts
+messages = []  # список сообщений
 
-# ====================== MODELS ======================
 class RegisterReq(BaseModel):
     uuid: str
     nick: str
@@ -28,7 +25,6 @@ class SendReq(BaseModel):
     to_uuid: str
     text: str
 
-# ====================== UTILS ======================
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -44,15 +40,9 @@ def ensure_user(uid: str, nick: Optional[str] = None) -> dict:
         users[uid] = u
     return u
 
-# ====================== ROUTES ======================
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": "SLD Chat",
-        "users": len(users),
-        "messages": len(messages),
-    }
+    return {"ok": True, "service": "SLD Chat", "users": len(users), "messages": len(messages)}
 
 @app.get("/health")
 def health():
@@ -93,6 +83,36 @@ def get_user(uid: str):
     if u is None:
         raise HTTPException(404, "user not found")
     return u
+
+# --- НОВОЕ: поиск по нику ---
+@app.get("/search")
+def search(nick: str, exclude_uuid: Optional[str] = None):
+    q = (nick or "").strip().lower()
+    if not q:
+        return []
+    res = []
+    for u in users.values():
+        if exclude_uuid and u["uuid"] == exclude_uuid:
+            continue
+        if q in u["nick"].lower():
+            res.append({"uuid": u["uuid"], "nick": u["nick"]})
+    return res
+
+# --- НОВОЕ: входящие (для уведомлений) ---
+@app.get("/incoming")
+def incoming(uid: str, since: Optional[int] = 0):
+    since = int(since or 0)
+    out = []
+    for m in messages:
+        if m["to_uuid"] != uid:
+            continue
+        if m["timestamp"] <= since:
+            continue
+        mm = dict(m)
+        fu = users.get(m["from_uuid"])
+        mm["from_nick"] = fu["nick"] if fu else ("User-" + m["from_uuid"][:6])
+        out.append(mm)
+    return out
 
 @app.post("/send")
 def send(r: SendReq):
@@ -164,5 +184,3 @@ def reset_user(uid: str):
     global messages
     messages = [m for m in messages if m["from_uuid"] != uid and m["to_uuid"] != uid]
     return {"ok": True}
-
-# run: uvicorn main:app --host 0.0.0.0 --port 8000
