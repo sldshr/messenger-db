@@ -1,738 +1,560 @@
-"""
-EDEX://MESSENGER
-Одностраничный мессенджер в стиле edex-ui.
-Запуск:  python main.py   ->  http://127.0.0.1:8000
-"""
+# main.py
+# Запуск: python main.py  (или: uvicorn main:app --host 0.0.0.0 --port 8000)
+# Открыть на телефоне: http://<IP-компьютера>:8000
 
-import asyncio
+import uuid
 import time
-from collections import deque
-from typing import Deque, Dict, List, Optional
+from typing import Optional
 
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import HTMLResponse
-
-MAX_HISTORY = 200
-MAX_MSG_LEN = 2000
-MAX_NAME_LEN = 24
-DEFAULT_ROOMS = ["general", "random", "tech", "offtopic"]
-
-app = FastAPI(title="edex-msg")
+from pydantic import BaseModel
+import uvicorn
 
 
-# ────────────────────────────── HUB ──────────────────────────────
-class Hub:
-    def __init__(self) -> None:
-        self.history: Dict[str, Deque[dict]] = {r: deque(maxlen=MAX_HISTORY) for r in DEFAULT_ROOMS}
-        self.rooms: Dict[str, Dict[WebSocket, str]] = {r: {} for r in DEFAULT_ROOMS}
-        self.lock = asyncio.Lock()
+app = FastAPI(title="Messenger")
 
-    async def ensure(self, room: str) -> None:
-        async with self.lock:
-            self.history.setdefault(room, deque(maxlen=MAX_HISTORY))
-            self.rooms.setdefault(room, {})
-
-    async def add(self, ws: WebSocket, name: str, room: str) -> None:
-        await self.ensure(room)
-        async with self.lock:
-            self.rooms[room][ws] = name
-
-    async def remove(self, ws: WebSocket) -> Optional[str]:
-        async with self.lock:
-            for room, users in self.rooms.items():
-                if ws in users:
-                    del users[ws]
-                    return room
-        return None
-
-    async def move(self, ws: WebSocket, name: str, frm: str, to: str) -> None:
-        await self.ensure(to)
-        async with self.lock:
-            if frm in self.rooms:
-                self.rooms[frm].pop(ws, None)
-            self.rooms[to][ws] = name
-
-    def users(self, room: str) -> List[str]:
-        return sorted(set(self.rooms.get(room, {}).values()))
-
-    def room_list(self) -> List[str]:
-        return sorted(self.rooms.keys())
-
-    async def send_room(self, room: str, payload: dict, skip: Optional[WebSocket] = None) -> None:
-        dead = []
-        for ws in list(self.rooms.get(room, {}).keys()):
-            if ws is skip:
-                continue
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            await self.remove(ws)
-
-    async def send_all(self, payload: dict) -> None:
-        for room in list(self.rooms.keys()):
-            await self.send_room(room, payload)
+# ---------- Хранилище в оперативке ----------
+users: dict = {}      # username -> {"password": str}
+tokens: dict = {}     # token -> username
+messages: list = []   # {"from","to","text","ts","read"}
 
 
-hub = Hub()
+# ---------- Схемы ----------
+class AuthData(BaseModel):
+    username: str
+    password: str
 
 
-def ts_now() -> float:
-    return time.time()
+class MessageData(BaseModel):
+    to: str
+    text: str
 
 
-async def push_users(room: str) -> None:
-    await hub.send_room(room, {"type": "users", "users": hub.users(room)})
+# ---------- Авторизация ----------
+def current_user(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    token = authorization[7:].strip()
+    username = tokens.get(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Сессия истекла")
+    return username
 
 
-async def push_rooms() -> None:
-    await hub.send_all({"type": "rooms", "rooms": hub.room_list()})
+# ---------- API ----------
+@app.post("/api/register")
+async def register(data: AuthData):
+    u = data.username.strip()
+    if len(u) < 2:
+        raise HTTPException(400, "Имя минимум 2 символа")
+    if len(u) > 20:
+        raise HTTPException(400, "Имя максимум 20 символов")
+    if len(data.password) < 3:
+        raise HTTPException(400, "Пароль минимум 3 символа")
+    if u in users:
+        raise HTTPException(400, "Такое имя уже занято")
+    users[u] = {"password": data.password}
+    token = uuid.uuid4().hex
+    tokens[token] = u
+    return {"token": token, "username": u}
 
 
-# ────────────────────────────── ROUTES ──────────────────────────────
-@app.get("/")
-async def index() -> HTMLResponse:
-    return HTMLResponse(INDEX_HTML)
+@app.post("/api/login")
+async def login(data: AuthData):
+    u = data.username.strip()
+    if u not in users or users[u]["password"] != data.password:
+        raise HTTPException(400, "Неверное имя или пароль")
+    token = uuid.uuid4().hex
+    tokens[token] = u
+    return {"token": token, "username": u}
 
 
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket) -> None:
-    await ws.accept()
-    username: Optional[str] = None
-    room: Optional[str] = None
-
-    try:
-        first = await ws.receive_json()
-        if first.get("type") != "join":
-            await ws.close()
-            return
-
-        username = (str(first.get("username") or "anon").strip()[:MAX_NAME_LEN]) or "anon"
-        room = str(first.get("room") or "general").strip()[:32] or "general"
-
-        await hub.add(ws, username, room)
-        await ws.send_json({
-            "type": "history",
-            "room": room,
-            "messages": list(hub.history.get(room, [])),
-        })
-        await ws.send_json({"type": "rooms", "rooms": hub.room_list(), "current": room})
-        await ws.send_json({"type": "users", "users": hub.users(room)})
-        await hub.send_room(
-            room,
-            {"type": "system", "text": f"{username} подключился к # {room}", "ts": ts_now()},
-            skip=ws,
+@app.get("/api/users")
+async def list_users(user: str = Depends(current_user)):
+    result = []
+    for name in users:
+        if name == user:
+            continue
+        unread = sum(
+            1 for m in messages
+            if m["from"] == name and m["to"] == user and not m["read"]
         )
-        await push_users(room)
-
-        while True:
-            msg = await ws.receive_json()
-            mtype = msg.get("type")
-
-            if mtype == "message":
-                text = str(msg.get("text") or "").strip()
-                if not text:
-                    continue
-                text = text[:MAX_MSG_LEN]
-                payload = {
-                    "type": "message",
-                    "user": username,
-                    "text": text,
-                    "ts": ts_now(),
-                }
-                hub.history.setdefault(room, deque(maxlen=MAX_HISTORY)).append(payload)
-                await hub.send_room(room, payload)
-
-            elif mtype == "switch_room":
-                new_room = str(msg.get("room") or "").strip()[:32]
-                if not new_room or new_room == room:
-                    continue
-                await hub.ensure(new_room)
-                old_room = room
-                await hub.move(ws, username, old_room, new_room)
-                await hub.send_room(
-                    old_room,
-                    {"type": "system", "text": f"{username} покинул канал", "ts": ts_now()},
-                    skip=ws,
-                )
-                await push_users(old_room)
-                room = new_room
-                await ws.send_json({
-                    "type": "history",
-                    "room": room,
-                    "messages": list(hub.history.get(room, [])),
-                })
-                await ws.send_json({"type": "rooms", "rooms": hub.room_list(), "current": room})
-                await ws.send_json({"type": "users", "users": hub.users(room)})
-                await hub.send_room(
-                    room,
-                    {"type": "system", "text": f"{username} подключился к # {room}", "ts": ts_now()},
-                    skip=ws,
-                )
-                await push_users(room)
-                await push_rooms()
-
-            elif mtype == "create_room":
-                new_room = str(msg.get("room") or "").strip()[:32]
-                if not new_room:
-                    continue
-                await hub.ensure(new_room)
-                await push_rooms()
-                await ws.send_json({"type": "system", "text": f"канал # {new_room} доступен", "ts": ts_now()})
-
-            elif mtype == "typing":
-                await hub.send_room(room, {"type": "typing", "user": username}, skip=ws)
-
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        if username:
-            left = await hub.remove(ws)
-            if left:
-                await hub.send_room(
-                    left,
-                    {"type": "system", "text": f"{username} отключился", "ts": ts_now()},
-                )
-                await push_users(left)
+        result.append({"username": name, "unread": unread})
+    result.sort(key=lambda x: x["username"].lower())
+    return result
 
 
-# ────────────────────────────── FRONTEND ──────────────────────────────
-INDEX_HTML = r"""<!doctype html>
+@app.get("/api/messages/{peer}")
+async def get_messages(peer: str, user: str = Depends(current_user)):
+    out = []
+    for m in messages:
+        if m["from"] == user and m["to"] == peer:
+            out.append({"from": m["from"], "text": m["text"], "ts": m["ts"]})
+        elif m["from"] == peer and m["to"] == user:
+            m["read"] = True
+            out.append({"from": m["from"], "text": m["text"], "ts": m["ts"]})
+    return out
+
+
+@app.post("/api/messages")
+async def send_message(data: MessageData, user: str = Depends(current_user)):
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(400, "Пустое сообщение")
+    if len(text) > 2000:
+        raise HTTPException(400, "Слишком длинное сообщение")
+    if data.to not in users:
+        raise HTTPException(404, "Получатель не найден")
+    messages.append({
+        "from": user, "to": data.to, "text": text,
+        "ts": time.time(), "read": False,
+    })
+    return {"ok": True}
+
+
+# ---------- Фронтенд ----------
+HTML = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EDEX://MESSENGER</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Мессенджер</title>
 <style>
-  :root{
-    --bg:#04070a;
-    --bg-2:#08111a;
-    --panel:#0a1219;
-    --panel-hi:#0d1a24;
-    --border:#12303d;
-    --border-hi:#00d9ff;
-    --text:#a9c6d4;
-    --dim:#4a6a78;
-    --accent:#00d9ff;
-    --accent-2:#01ff70;
-    --warn:#ffb000;
-    --pink:#ff2e88;
-    --glow:0 0 8px rgba(0,217,255,.55);
-    --glow-soft:0 0 12px rgba(0,217,255,.25);
-  }
-  *{box-sizing:border-box;}
-  html,body{height:100%;margin:0;overflow:hidden;}
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
   body{
-    background:
-      radial-gradient(1200px 800px at 20% -10%, rgba(0,217,255,.06), transparent 60%),
-      radial-gradient(900px 700px at 90% 110%, rgba(1,255,112,.05), transparent 60%),
-      var(--bg);
-    color:var(--text);
-    font-family:'JetBrains Mono','Fira Code','Cascadia Code',Consolas,monospace;
-    font-size:13px;
-    letter-spacing:.2px;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+    background:#fff;color:#111;overflow:hidden;position:fixed;width:100%;height:100%;
+    font-size:16px;-webkit-font-smoothing:antialiased;
   }
-  body::after{
-    content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
-    background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 2px,rgba(0,217,255,.018) 3px 4px);
-    mix-blend-mode:screen;
-  }
-  body::before{
-    content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;
-    background:radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,.55) 100%);
-  }
+  .screen{position:absolute;inset:0;display:none;flex-direction:column;background:#fff}
+  .screen.active{display:flex}
 
-  /* ── layout ── */
-  #app{
-    display:grid;
-    grid-template-columns:250px 1fr;
-    grid-template-rows:46px 1fr;
-    grid-template-areas:"top top" "side main";
-    height:100vh;
-    gap:10px;
-    padding:10px;
+  /* ---------- Auth ---------- */
+  #auth-screen{justify-content:center;align-items:center;padding:24px;overflow-y:auto}
+  .auth-wrap{width:100%;max-width:380px;text-align:center;margin:auto}
+  .logo{
+    width:76px;height:76px;margin:0 auto 22px;background:#111;border-radius:24px;
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 12px 30px rgba(0,0,0,.14);
   }
+  .logo svg{width:38px;height:38px;stroke:#fff}
+  h1{font-size:26px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px}
+  .subtitle{color:#888;font-size:14px;margin-bottom:28px}
+  .tabs{display:flex;background:#f4f4f5;border-radius:12px;padding:4px;margin-bottom:22px}
+  .tab{
+    flex:1;padding:11px;border:none;background:transparent;border-radius:9px;
+    font-size:14px;font-weight:600;color:#666;cursor:pointer;transition:all .2s;
+    font-family:inherit;
+  }
+  .tab.active{background:#fff;color:#111;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .input-wrap{
+    display:flex;align-items:center;gap:10px;background:#f4f4f5;border-radius:12px;
+    padding:0 14px;margin-bottom:12px;border:1.5px solid transparent;
+    transition:border-color .2s,background .2s;
+  }
+  .input-wrap:focus-within{background:#fff;border-color:#111}
+  .input-wrap svg{width:18px;height:18px;stroke:#999;flex-shrink:0}
+  .input-wrap input{
+    flex:1;border:none;outline:none;background:transparent;padding:15px 0;
+    font-size:16px;font-family:inherit;color:#111;min-width:0;
+  }
+  .input-wrap input::placeholder{color:#aaa}
+  .btn-primary{
+    width:100%;padding:16px;background:#111;color:#fff;border:none;border-radius:12px;
+    font-size:16px;font-weight:600;cursor:pointer;margin-top:6px;
+    transition:transform .1s,opacity .2s;font-family:inherit;
+  }
+  .btn-primary:active{transform:scale(.98)}
+  .btn-primary:disabled{opacity:.5;cursor:default}
+  .error{color:#e11d48;font-size:13px;margin-top:14px;min-height:18px}
 
-  /* ── topbar ── */
-  #topbar{
-    grid-area:top;
-    display:flex;align-items:center;justify-content:space-between;
-    padding:0 14px;
-    border:1px solid var(--border);
-    background:linear-gradient(180deg,var(--panel-hi),var(--panel));
-    position:relative;
+  /* ---------- Header ---------- */
+  header{
+    display:flex;align-items:center;gap:8px;
+    padding:10px 8px;
+    padding-top:max(10px,env(safe-area-inset-top));
+    border-bottom:1px solid #f0f0f0;background:#fff;flex-shrink:0;min-height:56px;
   }
-  #topbar::after{
-    content:'';position:absolute;left:0;right:0;bottom:-1px;height:1px;
-    background:linear-gradient(90deg,transparent,var(--accent),transparent);
-    box-shadow:var(--glow);
-    opacity:.65;
-  }
-  .brand{
-    font-weight:700;letter-spacing:3px;font-size:14px;
-    color:var(--accent);
-    text-shadow:var(--glow);
-  }
-  .brand span{color:var(--pink);text-shadow:0 0 8px rgba(255,46,136,.55);}
-  .top-stats{display:flex;gap:18px;font-size:11px;letter-spacing:1.5px;}
-  .stat{display:flex;gap:8px;align-items:center;}
-  .stat .lbl{color:var(--dim);}
-  .stat span:last-child{color:var(--accent);text-shadow:var(--glow-soft);}
-  .stat #status.on{color:var(--accent-2);text-shadow:0 0 8px rgba(1,255,112,.55);}
-  .stat #status.off{color:var(--pink);text-shadow:0 0 8px rgba(255,46,136,.55);}
-  .stat #status.conn{color:var(--warn);text-shadow:0 0 8px rgba(255,176,0,.55);}
-
-  /* ── panels ── */
-  .panel{
-    position:relative;
-    border:1px solid var(--border);
-    background:linear-gradient(180deg,rgba(13,26,36,.75),rgba(4,7,10,.75));
-    padding:16px 12px 12px;
-    backdrop-filter:blur(2px);
-  }
-  .panel::before{
-    content:attr(data-title);
-    position:absolute;top:-1px;left:12px;
-    transform:translateY(-50%);
-    background:var(--bg);
-    padding:0 6px;
-    font-size:10px;letter-spacing:2.5px;
-    color:var(--accent);text-shadow:var(--glow-soft);
-  }
-  .panel::after{
-    content:'';position:absolute;inset:0;pointer-events:none;
-    background:
-      linear-gradient(var(--accent),var(--accent)) left 0 top 0/8px 1px no-repeat,
-      linear-gradient(var(--accent),var(--accent)) left 0 top 0/1px 8px no-repeat,
-      linear-gradient(var(--accent),var(--accent)) right 0 bottom 0/8px 1px no-repeat,
-      linear-gradient(var(--accent),var(--accent)) right 0 bottom 0/1px 8px no-repeat;
-    opacity:.55;
-  }
-
-  /* ── sidebar ── */
-  #sidebar{grid-area:side;display:flex;flex-direction:column;gap:10px;min-height:0;}
-  #sidebar .panel:first-child{flex:0 0 auto;}
-  #sidebar .panel:last-child{flex:1;min-height:0;display:flex;flex-direction:column;}
-  #sidebar ul{list-style:none;margin:0;padding:0;overflow-y:auto;}
-  #sidebar ul li{
-    padding:5px 8px;
-    cursor:pointer;
-    color:var(--text);
-    font-size:12px;
-    border-left:2px solid transparent;
-    transition:.12s;
+  .header-title{
+    flex:1;font-size:19px;font-weight:700;letter-spacing:-.3px;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   }
-  #sidebar ul li:hover{background:rgba(0,217,255,.06);color:#fff;}
-  #sidebar ul li.active{
-    color:var(--accent);
-    border-left-color:var(--accent);
-    background:rgba(0,217,255,.08);
-    text-shadow:var(--glow-soft);
-  }
-  #users li::before{
-    content:'● ';
-    color:var(--accent-2);
-    text-shadow:0 0 6px rgba(1,255,112,.7);
-    font-size:9px;
-  }
-  .newroom{display:flex;gap:6px;margin-top:8px;}
-  .newroom input{
-    flex:1;background:#030609;border:1px solid var(--border);
-    color:var(--text);padding:5px 8px;font:inherit;font-size:11px;outline:none;
-  }
-  .newroom input:focus{border-color:var(--accent);box-shadow:var(--glow-soft);}
-  .newroom button{
-    background:transparent;border:1px solid var(--border);
-    color:var(--accent);width:28px;cursor:pointer;font:inherit;
-    transition:.15s;
-  }
-  .newroom button:hover{background:rgba(0,217,255,.1);border-color:var(--accent);}
-
-  /* ── main ── */
-  #main{grid-area:main;display:flex;flex-direction:column;gap:8px;min-height:0;}
-  #chat{flex:1;min-height:0;display:flex;flex-direction:column;padding:16px 12px 12px;}
-  #messages{flex:1;overflow-y:auto;min-height:0;padding-right:6px;}
-  #messages::-webkit-scrollbar{width:6px;}
-  #messages::-webkit-scrollbar-thumb{background:var(--border);}
-  #messages::-webkit-scrollbar-thumb:hover{background:var(--accent);}
-
-  .msg{
-    display:flex;gap:8px;padding:2px 0;
-    font-size:12.5px;line-height:1.55;
-    word-break:break-word;
-    animation:slide .18s ease-out;
-  }
-  @keyframes slide{from{opacity:0;transform:translateX(-4px);}to{opacity:1;transform:none;}}
-  .msg .ts{color:var(--dim);flex:0 0 auto;}
-  .msg .user{font-weight:700;flex:0 0 auto;text-shadow:0 0 6px currentColor;}
-  .msg .sep{color:var(--dim);flex:0 0 auto;}
-  .msg .text{color:#d5e8f0;white-space:pre-wrap;}
-  .msg.sys{
-    color:var(--dim);font-style:italic;font-size:11.5px;padding-left:2px;
-  }
-  .msg.sys .text{color:var(--warn);text-shadow:0 0 6px rgba(255,176,0,.35);}
-  .msg.me .user{color:var(--accent-2)!important;}
-
-  #typing{
-    min-height:16px;padding:0 12px;
-    font-size:11px;color:var(--dim);letter-spacing:1px;
-  }
-  #typing .dot{
-    display:inline-block;width:4px;height:4px;margin-left:2px;border-radius:50%;
-    background:var(--accent);box-shadow:var(--glow);
-    animation:blink 1s infinite alternate;
-  }
-  #typing .dot:nth-child(2){animation-delay:.2s;}
-  #typing .dot:nth-child(3){animation-delay:.4s;}
-  @keyframes blink{from{opacity:.15;}to{opacity:1;}}
-
-  /* ── composer ── */
-  #composer{
-    display:flex;align-items:center;gap:10px;
-    border:1px solid var(--border);
-    background:linear-gradient(180deg,var(--panel-hi),var(--panel));
-    padding:8px 12px;
-    position:relative;
-  }
-  #composer::after{
-    content:'';position:absolute;left:0;right:0;top:-1px;height:1px;
-    background:linear-gradient(90deg,transparent,var(--accent),transparent);
-    opacity:.5;
-  }
-  #composer .prompt{
-    color:var(--accent);text-shadow:var(--glow);
-    font-weight:700;font-size:16px;
-  }
-  #input{
-    flex:1;background:transparent;border:none;outline:none;
-    color:#e3f5ff;font:inherit;font-size:13px;
-    caret-color:var(--accent);
-  }
-  #input::placeholder{color:var(--dim);}
-  #send{
-    background:transparent;border:1px solid var(--border);
-    color:var(--accent);padding:5px 14px;cursor:pointer;
-    font:inherit;font-size:11px;letter-spacing:2px;
-    transition:.15s;
-  }
-  #send:hover{background:rgba(0,217,255,.1);border-color:var(--accent);box-shadow:var(--glow-soft);}
-
-  /* ── login ── */
-  #login{
-    position:fixed;inset:0;z-index:10000;
+  .header-title.center{text-align:center;font-size:17px}
+  .icon-btn{
+    width:44px;height:44px;border:none;background:transparent;
     display:flex;align-items:center;justify-content:center;
-    background:rgba(2,5,8,.88);
-    backdrop-filter:blur(4px);
+    border-radius:12px;cursor:pointer;color:#111;flex-shrink:0;transition:background .15s;
   }
-  #login.hidden{display:none;}
-  .login-box{
-    width:380px;padding:28px 24px 22px;
-    text-align:center;
+  .icon-btn:active{background:#f4f4f5}
+  .icon-btn svg{width:22px;height:22px;stroke:#111}
+
+  /* ---------- Users list ---------- */
+  .list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+  .user-row{
+    display:flex;align-items:center;gap:14px;padding:12px 16px;
+    cursor:pointer;transition:background .15s;
   }
-  .login-box h1{
-    margin:0 0 6px;font-size:18px;letter-spacing:4px;
-    color:var(--accent);text-shadow:var(--glow);
+  .user-row:active{background:#fafafa}
+  .avatar{
+    width:50px;height:50px;border-radius:50%;background:#f4f4f5;
+    display:flex;align-items:center;justify-content:center;
+    font-weight:700;font-size:18px;color:#555;flex-shrink:0;
   }
-  .login-box h1 span{color:var(--pink);text-shadow:0 0 8px rgba(255,46,136,.55);}
-  .login-box p{color:var(--dim);font-size:11px;letter-spacing:2px;margin:0 0 18px;}
-  .login-box input{
-    width:100%;background:#030609;border:1px solid var(--border);
-    color:#e3f5ff;padding:10px 12px;font:inherit;font-size:13px;outline:none;
-    text-align:center;letter-spacing:2px;
+  .user-info{flex:1;min-width:0}
+  .user-name{
+    font-size:16px;font-weight:600;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   }
-  .login-box input:focus{border-color:var(--accent);box-shadow:var(--glow-soft);}
-  .login-box button{
-    margin-top:14px;width:100%;
-    background:transparent;border:1px solid var(--accent);
-    color:var(--accent);padding:10px;cursor:pointer;
-    font:inherit;font-size:12px;letter-spacing:3px;
-    transition:.15s;text-shadow:var(--glow);
+  .badge{
+    min-width:22px;height:22px;padding:0 7px;border-radius:11px;
+    background:#111;color:#fff;font-size:12px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;flex-shrink:0;
   }
-  .login-box button:hover{background:rgba(0,217,255,.1);box-shadow:var(--glow);}
-  .login-box .hint{margin-top:10px;font-size:10px;color:var(--dim);letter-spacing:2px;}
+  .empty{
+    padding:60px 30px;text-align:center;color:#aaa;font-size:14px;line-height:1.5;
+  }
+
+  /* ---------- Chat ---------- */
+  .messages{
+    flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+    padding:16px 14px 8px;display:flex;flex-direction:column;gap:6px;background:#fff;
+  }
+  .msg{
+    max-width:80%;padding:9px 14px;border-radius:18px;font-size:15.5px;
+    line-height:1.4;word-wrap:break-word;overflow-wrap:anywhere;white-space:pre-wrap;
+    animation:pop .15s ease;
+  }
+  @keyframes pop{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
+  .msg.me{align-self:flex-end;background:#111;color:#fff;border-bottom-right-radius:6px}
+  .msg.them{align-self:flex-start;background:#f4f4f5;color:#111;border-bottom-left-radius:6px}
+  .day-sep{align-self:center;font-size:12px;color:#aaa;margin:10px 0 4px}
+
+  .composer{
+    display:flex;align-items:center;gap:8px;padding:10px 12px;
+    padding-bottom:max(10px,env(safe-area-inset-bottom));
+    border-top:1px solid #f0f0f0;background:#fff;flex-shrink:0;
+  }
+  .composer input{
+    flex:1;padding:12px 18px;border:none;outline:none;background:#f4f4f5;
+    border-radius:22px;font-size:16px;font-family:inherit;color:#111;min-width:0;
+  }
+  .composer input::placeholder{color:#aaa}
+  .send-btn{
+    width:44px;height:44px;border-radius:50%;border:none;background:#111;
+    display:flex;align-items:center;justify-content:center;cursor:pointer;
+    flex-shrink:0;transition:transform .1s,opacity .2s;
+  }
+  .send-btn:active{transform:scale(.92)}
+  .send-btn svg{width:20px;height:20px;stroke:#fff;fill:none}
+  .send-btn:disabled{opacity:.4}
 </style>
 </head>
 <body>
 
-<div id="app">
-  <header id="topbar">
-    <div class="brand">EDEX<span>://</span>MESSENGER</div>
-    <div class="top-stats">
-      <div class="stat"><span class="lbl">CH</span><span id="rname">#general</span></div>
-      <div class="stat"><span class="lbl">USR</span><span id="ucount">0</span></div>
-      <div class="stat"><span class="lbl">NET</span><span id="status" class="off">OFFLINE</span></div>
-      <div class="stat"><span class="lbl">SYS</span><span id="clock">--:--:--</span></div>
+<!-- ============ Экран авторизации ============ -->
+<div id="auth-screen" class="screen">
+  <div class="auth-wrap">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
     </div>
-  </header>
+    <h1>Мессенджер</h1>
+    <p class="subtitle">Общайтесь без лишнего</p>
 
-  <aside id="sidebar">
-    <section class="panel" data-title="CHANNELS">
-      <ul id="channels"></ul>
-      <div class="newroom">
-        <input id="newroom-input" placeholder="new channel" maxlength="24">
-        <button id="newroom-btn" title="создать">+</button>
+    <div class="tabs">
+      <button type="button" class="tab active" data-tab="login">Вход</button>
+      <button type="button" class="tab" data-tab="register">Регистрация</button>
+    </div>
+
+    <form id="auth-form" autocomplete="on">
+      <div class="input-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+        <input type="text" id="username" placeholder="Имя пользователя" autocomplete="username" maxlength="20">
       </div>
-    </section>
-    <section class="panel" data-title="OPERATORS">
-      <ul id="users"></ul>
-    </section>
-  </aside>
-
-  <main id="main">
-    <section id="chat" class="panel" data-title="TRANSMISSION">
-      <div id="messages"></div>
-    </section>
-    <div id="typing"></div>
-    <div id="composer">
-      <span class="prompt">›</span>
-      <input id="input" autocomplete="off" spellcheck="false" placeholder="передача сообщения...">
-      <button id="send">SEND</button>
-    </div>
-  </main>
+      <div class="input-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        <input type="password" id="password" placeholder="Пароль" autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn-primary" id="auth-submit">Войти</button>
+      <div class="error" id="auth-error"></div>
+    </form>
+  </div>
 </div>
 
-<div id="login">
-  <div class="login-box panel" data-title="AUTH">
-    <h1>EDEX<span>://</span>MESSENGER</h1>
-    <p>ВВЕДИТЕ ПОЗЫВНОЙ</p>
-    <input id="login-name" maxlength="24" placeholder="nickname" autofocus>
-    <button id="login-btn">CONNECT</button>
-    <div class="hint">ENTER — ПОДКЛЮЧИТЬСЯ</div>
+<!-- ============ Список чатов ============ -->
+<div id="list-screen" class="screen">
+  <header>
+    <div class="header-title">Чаты</div>
+    <button class="icon-btn" id="logout-btn" aria-label="Выйти">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+        <polyline points="16 17 21 12 16 7"/>
+        <line x1="21" y1="12" x2="9" y2="12"/>
+      </svg>
+    </button>
+  </header>
+  <div class="list" id="users-list"></div>
+</div>
+
+<!-- ============ Чат ============ -->
+<div id="chat-screen" class="screen">
+  <header>
+    <button class="icon-btn" id="back-btn" aria-label="Назад">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="19" y1="12" x2="5" y2="12"/>
+        <polyline points="12 19 5 12 12 5"/>
+      </svg>
+    </button>
+    <div class="header-title center" id="chat-title">—</div>
+    <div style="width:44px"></div>
+  </header>
+  <div class="messages" id="messages"></div>
+  <div class="composer">
+    <input type="text" id="msg-input" placeholder="Сообщение..." maxlength="2000" autocomplete="off">
+    <button class="send-btn" id="send-btn" aria-label="Отправить">
+      <svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
   </div>
 </div>
 
 <script>
-(() => {
-  const $ = (id) => document.getElementById(id);
-  const messagesEl = $('messages');
-  const channelsEl = $('channels');
-  const usersEl = $('users');
-  const inputEl = $('input');
-  const typingEl = $('typing');
-  const clockEl = $('clock');
-  const statusEl = $('status');
-  const ucountEl = $('ucount');
-  const rnameEl = $('rname');
-  const loginEl = $('login');
+(function(){
+  "use strict";
+  const $ = s => document.querySelector(s);
 
-  let ws = null;
-  let username = '';
-  let currentRoom = 'general';
-  let lastTypingSent = 0;
-  const typingTimers = {};
+  const state = {
+    token: localStorage.getItem('token') || '',
+    username: localStorage.getItem('username') || '',
+    activePeer: null,
+    renderedCount: 0,
+    loading: false,
+    chatTimer: null,
+    listTimer: null,
+  };
 
-  // ── clock ──
-  setInterval(() => {
-    const d = new Date();
-    clockEl.textContent = d.toTimeString().slice(0, 8);
-  }, 250);
+  const authHeaders = () => ({
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + state.token,
+  });
 
-  function fmtTime(ts) {
-    const d = new Date(ts * 1000);
-    return d.toTimeString().slice(0, 8);
+  function showScreen(name){
+    clearInterval(state.chatTimer); state.chatTimer = null;
+    clearInterval(state.listTimer); state.listTimer = null;
+
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById(name + '-screen').classList.add('active');
+
+    if (name === 'list'){
+      loadUsers();
+      state.listTimer = setInterval(loadUsers, 3000);
+    }
   }
 
-  function userColor(name) {
-    const palette = ['#00d9ff','#01ff70','#ffb000','#ff2e88','#b388ff','#00ffa3','#ff7a45','#5ac8fa'];
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-    return palette[h % palette.length];
+  /* ---------------- Auth ---------------- */
+  let authMode = 'login';
+
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      authMode = tab.dataset.tab;
+      $('#auth-submit').textContent = authMode === 'login' ? 'Войти' : 'Создать аккаунт';
+      $('#auth-error').textContent = '';
+    });
+  });
+
+  $('#auth-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = $('#username').value.trim();
+    const password = $('#password').value;
+    const errEl = $('#auth-error');
+    errEl.textContent = '';
+
+    if (!username || !password){
+      errEl.textContent = 'Заполните все поля';
+      return;
+    }
+    const btn = $('#auth-submit');
+    btn.disabled = true;
+
+    try {
+      const res = await fetch('/api/' + authMode, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({username, password}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Ошибка');
+
+      state.token = data.token;
+      state.username = data.username;
+      localStorage.setItem('token', state.token);
+      localStorage.setItem('username', state.username);
+      $('#password').value = '';
+      showScreen('list');
+    } catch (err){
+      errEl.textContent = err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  function logout(){
+    localStorage.removeItem('token');
+    localStorage.removeItem('username');
+    state.token = '';
+    state.username = '';
+    state.activePeer = null;
+    state.renderedCount = 0;
+    clearInterval(state.chatTimer); state.chatTimer = null;
+    clearInterval(state.listTimer); state.listTimer = null;
+    showScreen('auth');
   }
 
-  function setStatus(text, cls) {
-    statusEl.textContent = text;
-    statusEl.className = cls;
+  $('#logout-btn').addEventListener('click', logout);
+
+  /* ---------------- Users ---------------- */
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
   }
 
-  // ── rendering ──
-  function renderMessage(m) {
-    const el = document.createElement('div');
-    el.className = 'msg' + (m.user === username ? ' me' : '');
-    const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = fmtTime(m.ts);
-    const u = document.createElement('span'); u.className = 'user'; u.textContent = m.user;
-    u.style.color = userColor(m.user);
-    const sep = document.createElement('span'); sep.className = 'sep'; sep.textContent = '›';
-    const t = document.createElement('span'); t.className = 'text'; t.textContent = m.text;
-    el.append(ts, u, sep, t);
-    return el;
+  async function loadUsers(){
+    if (!state.token) return;
+    try {
+      const res = await fetch('/api/users', { headers: authHeaders() });
+      if (res.status === 401){ logout(); return; }
+      const users = await res.json();
+      const list = $('#users-list');
+      list.innerHTML = '';
+
+      if (!users.length){
+        list.innerHTML = '<div class="empty">Пока никого нет.<br>Зарегистрируйте второго пользователя<br>в другом браузере или на телефоне.</div>';
+        return;
+      }
+
+      users.forEach(u => {
+        const row = document.createElement('div');
+        row.className = 'user-row';
+        const initial = (u.username[0] || '?').toUpperCase();
+        row.innerHTML =
+          '<div class="avatar">' + escapeHtml(initial) + '</div>' +
+          '<div class="user-info"><div class="user-name">' + escapeHtml(u.username) + '</div></div>' +
+          (u.unread ? '<div class="badge">' + u.unread + '</div>' : '');
+        row.addEventListener('click', () => openChat(u.username));
+        list.appendChild(row);
+      });
+    } catch(e){ /* игнорируем */ }
   }
 
-  function renderSystem(text, ts) {
-    const el = document.createElement('div');
-    el.className = 'msg sys';
-    const tsEl = document.createElement('span'); tsEl.className = 'ts'; tsEl.textContent = fmtTime(ts || Date.now()/1000);
-    const t = document.createElement('span'); t.className = 'text'; t.textContent = '* ' + text;
-    el.append(tsEl, t);
-    return el;
+  /* ---------------- Chat ---------------- */
+  function openChat(peer){
+    state.activePeer = peer;
+    state.renderedCount = 0;
+    $('#chat-title').textContent = peer;
+    $('#messages').innerHTML = '';
+    showScreen('chat');
+    loadMessages(true);
+    state.chatTimer = setInterval(() => loadMessages(false), 1500);
+    setTimeout(() => $('#msg-input').focus(), 100);
   }
 
-  function appendMsg(node) {
-    const atBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
-    messagesEl.appendChild(node);
-    if (atBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  async function loadMessages(forceScroll){
+    if (!state.activePeer || state.loading) return;
+    const peer = state.activePeer;
+    state.loading = true;
+    try {
+      const res = await fetch('/api/messages/' + encodeURIComponent(peer), { headers: authHeaders() });
+      if (!res.ok) return;
+      const msgs = await res.json();
+      if (peer !== state.activePeer) return;
+
+      const box = $('#messages');
+      const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+
+      let appendedMine = false;
+      for (let i = state.renderedCount; i < msgs.length; i++){
+        const m = msgs[i];
+        const el = document.createElement('div');
+        el.className = 'msg ' + (m.from === state.username ? 'me' : 'them');
+        el.textContent = m.text;
+        box.appendChild(el);
+        if (m.from === state.username) appendedMine = true;
+      }
+      const appended = msgs.length > state.renderedCount;
+      state.renderedCount = msgs.length;
+
+      if (forceScroll || (appended && (atBottom || appendedMine))){
+        requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+      }
+    } catch(e){
+      // сеть отвалилась — молча
+    } finally {
+      state.loading = false;
+    }
   }
 
-  function clearMessages() { messagesEl.innerHTML = ''; }
+  async function sendMessage(){
+    const input = $('#msg-input');
+    const text = input.value.trim();
+    if (!text || !state.activePeer) return;
+    input.value = '';
 
-  // ── sidebar ──
-  function renderChannels(rooms, current) {
-    channelsEl.innerHTML = '';
-    rooms.forEach(r => {
-      const li = document.createElement('li');
-      li.textContent = '# ' + r;
-      if (r === current) li.classList.add('active');
-      li.addEventListener('click', () => switchRoom(r));
-      channelsEl.appendChild(li);
+    try {
+      const res = await fetch('/api/messages', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ to: state.activePeer, text }),
+      });
+      if (res.status === 401){ logout(); return; }
+      await loadMessages(true);
+    } catch(e){ /* игнорируем */ }
+  }
+
+  $('#send-btn').addEventListener('click', sendMessage);
+  $('#msg-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter'){ e.preventDefault(); sendMessage(); }
+  });
+
+  $('#back-btn').addEventListener('click', () => {
+    state.activePeer = null;
+    state.renderedCount = 0;
+    clearInterval(state.chatTimer); state.chatTimer = null;
+    showScreen('list');
+  });
+
+  // Автоскролл при появлении клавиатуры на iOS
+  if (window.visualViewport){
+    window.visualViewport.addEventListener('resize', () => {
+      if (state.activePeer){
+        const box = $('#messages');
+        box.scrollTop = box.scrollHeight;
+      }
     });
   }
 
-  function renderUsers(users) {
-    usersEl.innerHTML = '';
-    users.forEach(u => {
-      const li = document.createElement('li');
-      li.textContent = u + (u === username ? ' (you)' : '');
-      li.style.color = userColor(u);
-      usersEl.appendChild(li);
-    });
-    ucountEl.textContent = users.length;
+  /* ---------------- Инициализация ---------------- */
+  if (state.token){
+    fetch('/api/users', { headers: authHeaders() }).then(r => {
+      if (r.ok){ showScreen('list'); } else { logout(); }
+    }).catch(() => logout());
+  } else {
+    showScreen('auth');
   }
-
-  // ── typing indicator ──
-  function showTyping(user) {
-    const el = document.createElement('div');
-    el.className = 'typing-line';
-    el.textContent = user + ' печатает';
-    for (let i = 0; i < 3; i++) {
-      const d = document.createElement('span'); d.className = 'dot'; el.appendChild(d);
-    }
-    typingEl.innerHTML = '';
-    typingEl.appendChild(el);
-    clearTimeout(typingTimers[user]);
-    typingTimers[user] = setTimeout(() => {
-      if (typingEl.firstChild === el) typingEl.innerHTML = '';
-    }, 1800);
-  }
-
-  // ── websocket ──
-  function connect() {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    setStatus('CONNECT...', 'conn');
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-
-    ws.onopen = () => {
-      setStatus('ONLINE', 'on');
-      ws.send(JSON.stringify({ type: 'join', username, room: currentRoom }));
-    };
-
-    ws.onmessage = (ev) => {
-      let data;
-      try { data = JSON.parse(ev.data); } catch { return; }
-      handle(data);
-    };
-
-    ws.onclose = () => {
-      setStatus('OFFLINE', 'off');
-      setTimeout(connect, 1500);
-    };
-
-    ws.onerror = () => setStatus('ERROR', 'off');
-  }
-
-  function handle(data) {
-    switch (data.type) {
-      case 'history':
-        currentRoom = data.room || currentRoom;
-        rnameEl.textContent = '#' + currentRoom;
-        clearMessages();
-        (data.messages || []).forEach(m => appendMsg(renderMessage(m)));
-        messagesEl.scrollTop = messagesEl.scrollHeight;
-        break;
-      case 'message':
-        appendMsg(renderMessage(data));
-        if (typingEl.firstChild) typingEl.innerHTML = '';
-        break;
-      case 'system':
-        appendMsg(renderSystem(data.text, data.ts));
-        break;
-      case 'users':
-        renderUsers(data.users || []);
-        break;
-      case 'rooms':
-        if (data.current) {
-          currentRoom = data.current;
-          rnameEl.textContent = '#' + currentRoom;
-        }
-        renderChannels(data.rooms || [], currentRoom);
-        break;
-      case 'typing':
-        showTyping(data.user);
-        break;
-    }
-  }
-
-  // ── actions ──
-  function sendMessage() {
-    const text = inputEl.value.trim();
-    if (!text || !ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({ type: 'message', text }));
-    inputEl.value = '';
-  }
-
-  function switchRoom(room) {
-    if (room === currentRoom || !ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify({ type: 'switch_room', room }));
-  }
-
-  function createRoom() {
-    const inp = $('newroom-input');
-    const name = inp.value.trim().replace(/\s+/g, '-').toLowerCase();
-    if (!name) return;
-    ws.send(JSON.stringify({ type: 'create_room', room: name }));
-    inp.value = '';
-    setTimeout(() => switchRoom(name), 120);
-  }
-
-  // ── events ──
-  $('send').addEventListener('click', sendMessage);
-
-  inputEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  });
-
-  inputEl.addEventListener('input', () => {
-    const now = Date.now();
-    if (now - lastTypingSent > 1200 && ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'typing' }));
-      lastTypingSent = now;
-    }
-  });
-
-  $('newroom-btn').addEventListener('click', createRoom);
-  $('newroom-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); createRoom(); }
-  });
-
-  function doLogin() {
-    const name = $('login-name').value.trim().slice(0, 24);
-    if (!name) return;
-    username = name;
-    loginEl.classList.add('hidden');
-    inputEl.focus();
-    connect();
-  }
-  $('login-btn').addEventListener('click', doLogin);
-  $('login-name').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') doLogin();
-  });
-  $('login-name').focus();
 })();
 </script>
 </body>
@@ -740,5 +562,11 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML
+
+
 if __name__ == "__main__":
+    # host="0.0.0.0" — чтобы открывалось с телефона по локальной сети
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
