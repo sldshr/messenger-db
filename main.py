@@ -7,14 +7,14 @@ import uuid
 from typing import Optional
 
 from fastapi import (
-    FastAPI, HTTPException, Header, Depends, WebSocket, WebSocketDisconnect, Query,
+    FastAPI, HTTPException, Header, Depends, WebSocket, WebSocketDisconnect, Query, Request,
 )
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
 
-app = FastAPI(title="Messenger")
+app = FastAPI(title="SLD Messenger")
 
 # ==================================================================
 #                         ХРАНИЛИЩЕ
@@ -24,6 +24,7 @@ tokens: dict = {}        # token -> username
 messages: list = []      # {"id","from","to","text","ts","read"}
 friends: dict = {}       # user -> set(user)
 requests: dict = {}      # from_user -> set(to_user)
+devices: dict = {}       # device_uuid -> username (доверенные устройства)
 
 
 # ==================================================================
@@ -57,14 +58,10 @@ class WSManager:
     def __init__(self):
         self.conns: dict = {}
 
-    def online_users(self):
-        return set(self.conns.keys())
-
     def is_online(self, user: str) -> bool:
         return user in self.conns
 
     async def add(self, user: str, ws: WebSocket) -> bool:
-        """Возвращает True, если пользователь только что вышел в сеть (был офлайн)."""
         old = self.conns.get(user)
         was_online = old is not None
         self.conns[user] = ws
@@ -76,7 +73,6 @@ class WSManager:
         return not was_online
 
     async def remove(self, user: str, ws: WebSocket) -> bool:
-        """Возвращает True, если пользователь стал офлайн (последнее соединение закрыто)."""
         if self.conns.get(user) is ws:
             self.conns.pop(user, None)
             return True
@@ -112,6 +108,10 @@ class AuthData(BaseModel):
 
 class TargetData(BaseModel):
     target: str
+
+
+class DeviceData(BaseModel):
+    uuid: str
 
 
 def current_user(authorization: Optional[str] = Header(None)) -> str:
@@ -152,6 +152,44 @@ async def login(data: AuthData):
     token = uuid.uuid4().hex
     tokens[token] = u
     return {"token": token, "username": u}
+
+
+# ==================================================================
+#                    ДОВЕРЕННЫЕ УСТРОЙСТВА
+# ==================================================================
+@app.post("/api/device/login")
+async def device_login(data: DeviceData):
+    d = data.uuid.strip()
+    if not d:
+        raise HTTPException(400, "Не передан uuid")
+    username = devices.get(d)
+    if not username or username not in users:
+        raise HTTPException(404, "Устройство не доверено")
+    token = uuid.uuid4().hex
+    tokens[token] = username
+    return {"token": token, "username": username}
+
+
+@app.post("/api/device/trust")
+async def device_trust(data: DeviceData, user: str = Depends(current_user)):
+    d = data.uuid.strip()
+    if not d:
+        raise HTTPException(400, "Не передан uuid")
+    devices[d] = user
+    return {"ok": True}
+
+
+@app.post("/api/device/untrust")
+async def device_untrust(data: DeviceData, user: str = Depends(current_user)):
+    d = data.uuid.strip()
+    if devices.get(d) == user:
+        del devices[d]
+    return {"ok": True}
+
+
+@app.get("/api/device/status")
+async def device_status(uuid: str = "", user: str = Depends(current_user)):
+    return {"trusted": devices.get(uuid) == user}
 
 
 # ==================================================================
@@ -255,7 +293,6 @@ async def friend_cancel(data: TargetData, user: str = Depends(current_user)):
 async def friend_remove(data: TargetData, user: str = Depends(current_user)):
     t = data.target
     remove_friends(user, t)
-    # удаляем всю переписку
     delete_dialog(user, t)
     await manager.send(t, {"type": "friends_changed"})
     await manager.send(user, {"type": "friends_changed"})
@@ -356,16 +393,11 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
     just_online = await manager.add(username, websocket)
     try:
         await websocket.send_json({"type": "hello", "username": username})
-
-        # отправляем текущие статусы друзей
         for f in friends.get(username, set()):
             if manager.is_online(f):
                 await websocket.send_json({"type": "presence", "user": f, "online": True})
-
-        # уведомляем друзей, что я в сети
         if just_online:
             await broadcast_presence(username, True)
-
         while True:
             data = await websocket.receive_json()
             if isinstance(data, dict):
@@ -384,7 +416,7 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
 #                     PWA / SERVICE WORKER / ИКОНКА
 # ==================================================================
 SW_JS = r"""
-const CACHE = 'msgr-v2';
+const CACHE = 'sld-v3';
 self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil((async () => {
@@ -418,7 +450,6 @@ self.addEventListener('notificationclick', e => {
   const peer = (e.notification.data && e.notification.data.peer) || '';
   e.waitUntil((async () => {
     const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    // Ищем уже открытое окно приложения — фокусируем и передаём сообщение
     for (const c of list) {
       try {
         c.postMessage({ type: 'open-chat', peer });
@@ -443,9 +474,9 @@ async def sw():
 @app.get("/manifest.webmanifest")
 async def manifest():
     return JSONResponse({
-        "name": "Мессенджер",
-        "short_name": "Мессенджер",
-        "description": "Простой мессенджер",
+        "name": "SLD",
+        "short_name": "SLD",
+        "description": "Мессенджер SLD",
         "start_url": "/",
         "scope": "/",
         "display": "standalone",
@@ -463,9 +494,9 @@ async def icon():
     svg = (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
         '<rect width="512" height="512" rx="112" fill="#111"/>'
-        '<path d="M400 340a34 34 0 0 1-34 34H160l-72 72V106a34 34 0 0 1 34-34h244'
-        'a34 34 0 0 1 34 34z" fill="none" stroke="#fff" stroke-width="28" '
-        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        '<text x="50%" y="54%" font-family="-apple-system,Segoe UI,Roboto,sans-serif" '
+        'font-size="230" font-weight="800" fill="#fff" text-anchor="middle" '
+        'dominant-baseline="middle">SLD</text></svg>'
     )
     return Response(svg, media_type="image/svg+xml",
                     headers={"Cache-Control": "public, max-age=86400"})
@@ -481,12 +512,11 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="Мессенджер">
+<meta name="apple-mobile-web-app-title" content="SLD">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg">
 <link rel="apple-touch-icon" href="/icon.svg">
-<title>Мессенджер</title>
+<title>SLD</title>
 <style>
 :root{
   --bg:#ffffff; --bg-elev:#f4f4f5; --bg-soft:#fafafa;
@@ -516,32 +546,21 @@ html,body{
   background:var(--bg); color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
   font-size:17px;-webkit-font-smoothing:antialiased;
-  overflow:hidden;
-  overscroll-behavior:none;
+  overflow:hidden; overscroll-behavior:none;
 }
 body{ touch-action:manipulation; }
 #app{
   position:fixed; top:0; left:0; right:0;
-  height:var(--app-h);
-  overflow:hidden;
-  background:var(--bg);
+  height:var(--app-h); overflow:hidden; background:var(--bg);
 }
-.screen{
-  position:absolute; inset:0; display:none; flex-direction:column;
-  overflow:hidden; background:var(--bg);
-}
+.screen{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden;background:var(--bg)}
 .screen.active{display:flex}
 
-/* ---------- Топбар ---------- */
 .topbar{
-  flex-shrink:0;
-  display:flex;align-items:center;gap:6px;
-  padding:8px 8px;
-  padding-top:calc(8px + env(safe-area-inset-top,0));
-  border-bottom:1px solid var(--border);
-  background:var(--bg);
-  min-height:56px;
-  z-index:5;
+  flex-shrink:0; display:flex;align-items:center;gap:6px;
+  padding:8px 8px; padding-top:calc(8px + env(safe-area-inset-top,0));
+  border-bottom:1px solid var(--border); background:var(--bg);
+  min-height:56px; z-index:5;
 }
 .topbar .title{
   flex:1;font-size:20px;font-weight:700;letter-spacing:-.3px;
@@ -549,24 +568,19 @@ body{ touch-action:manipulation; }
   display:flex;align-items:center;gap:8px;min-width:0;
 }
 .topbar .title .title-text{overflow:hidden;text-overflow:ellipsis}
-.conn-dot{
-  width:9px;height:9px;border-radius:50%;
-  background:var(--offline);flex-shrink:0;
-  transition:background .25s, box-shadow .25s;
-}
+.conn-dot{width:9px;height:9px;border-radius:50%;background:var(--offline);
+  flex-shrink:0;transition:background .25s, box-shadow .25s}
 .conn-dot.online{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.15)}
 .icon-btn{
   width:44px;height:44px;flex-shrink:0;border:none;background:transparent;
-  display:flex;align-items:center;justify-content:center;
-  border-radius:12px;cursor:pointer;color:var(--text);
-  transition:background .15s, transform .1s;
+  display:flex;align-items:center;justify-content:center;border-radius:12px;
+  cursor:pointer;color:var(--text);transition:background .15s, transform .1s;
   touch-action:manipulation;
 }
 .icon-btn:active{background:var(--bg-elev);transform:scale(.94)}
 .icon-btn svg{width:22px;height:22px;stroke:currentColor;fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 
-/* ---------- Glass ---------- */
 [data-glass="on"] .glass{
   background:var(--glass-bg) !important;
   backdrop-filter:blur(22px) saturate(180%);
@@ -574,14 +588,10 @@ body{ touch-action:manipulation; }
   border-color:var(--glass-border) !important;
 }
 
-/* ---------- Нижнее меню ---------- */
 .bottom-nav{
-  flex-shrink:0;display:flex;
-  padding:6px 6px;
+  flex-shrink:0;display:flex;padding:6px 6px;
   padding-bottom:calc(6px + env(safe-area-inset-bottom,0));
-  border-top:1px solid var(--border);
-  background:var(--bg);
-  z-index:5;
+  border-top:1px solid var(--border);background:var(--bg);z-index:5;
 }
 .nav-btn{
   flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -601,15 +611,12 @@ body{ touch-action:manipulation; }
   display:flex;align-items:center;justify-content:center;
 }
 
-/* ---------- Область страницы ---------- */
 .page-area{flex:1;overflow:hidden;position:relative;min-height:0}
 .page{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden}
 .page.active{display:flex}
 .page-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;min-height:0}
 
-/* ---------- Segmented ---------- */
-.segmented{display:flex;background:var(--bg-elev);border-radius:12px;
-  padding:4px;margin:12px 16px 6px}
+.segmented{display:flex;background:var(--bg-elev);border-radius:12px;padding:4px;margin:12px 16px 6px}
 .seg{flex:1;padding:10px;border:none;background:transparent;border-radius:9px;
   font-size:14.5px;font-weight:600;color:var(--text-dim);cursor:pointer;
   font-family:inherit;transition:all .2s;position:relative;touch-action:manipulation}
@@ -618,23 +625,18 @@ body{ touch-action:manipulation; }
   border-radius:9px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;
   margin-left:6px;line-height:18px;vertical-align:middle}
 
-/* ---------- Rows ---------- */
 .row{display:flex;align-items:center;gap:14px;padding:12px 16px;
   cursor:pointer;transition:background .15s;-webkit-user-select:none;user-select:none}
 .row:active{background:var(--bg-soft)}
 .avatar{
-  position:relative;
-  width:52px;height:52px;border-radius:50%;background:var(--bg-elev);
+  position:relative;width:52px;height:52px;border-radius:50%;background:var(--bg-elev);
   display:flex;align-items:center;justify-content:center;
   font-weight:700;font-size:19px;color:var(--text-dim);flex-shrink:0;letter-spacing:.5px;
 }
 [data-theme="dark"] .avatar{color:var(--text)}
 .avatar .online-dot{
-  position:absolute;bottom:1px;right:1px;
-  width:14px;height:14px;border-radius:50%;
-  background:var(--offline);
-  border:2.5px solid var(--bg);
-  box-sizing:content-box;
+  position:absolute;bottom:1px;right:1px;width:14px;height:14px;border-radius:50%;
+  background:var(--offline);border:2.5px solid var(--bg);box-sizing:content-box;
 }
 .avatar .online-dot.on{background:var(--ok)}
 .row-info{flex:1;min-width:0}
@@ -653,7 +655,6 @@ body{ touch-action:manipulation; }
 .section-label{padding:14px 16px 6px;font-size:12.5px;font-weight:700;
   color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px}
 
-/* ---------- Мини-кнопки ---------- */
 .mini-btn{border:none;font-family:inherit;font-size:13.5px;font-weight:600;
   padding:8px 14px;border-radius:10px;cursor:pointer;
   transition:transform .1s,opacity .15s;touch-action:manipulation}
@@ -663,7 +664,6 @@ body{ touch-action:manipulation; }
 .mini-btn.danger{background:transparent;color:var(--danger)}
 .mini-btn-row{display:flex;gap:8px;flex-shrink:0}
 
-/* ---------- Auth ---------- */
 #auth{justify-content:center;align-items:center;padding:24px;overflow-y:auto}
 .auth-wrap{width:100%;max-width:380px;text-align:center;margin:auto}
 .logo{width:84px;height:84px;margin:0 auto 22px;background:var(--text);border-radius:26px;
@@ -686,6 +686,29 @@ body{ touch-action:manipulation; }
 .input-wrap input{flex:1;border:none;outline:none;background:transparent;padding:16px 0;
   font-size:16.5px;font-family:inherit;color:var(--text);min-width:0}
 .input-wrap input::placeholder{color:var(--text-dim)}
+
+.remember-row{
+  display:none; align-items:center;gap:12px;
+  padding:14px 14px; margin-bottom:10px;
+  background:var(--bg-elev); border-radius:13px; cursor:pointer;
+  user-select:none; -webkit-user-select:none; touch-action:manipulation;
+  transition:background .15s;
+}
+.remember-row:active{background:var(--bg-soft)}
+.remember-row.show{display:flex}
+.remember-row .checkbox{
+  width:24px;height:24px;border-radius:7px;border:2px solid var(--text-dim);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:background .15s,border-color .15s;
+}
+.remember-row .checkbox svg{width:16px;height:16px;stroke:#fff;fill:none;
+  stroke-width:3;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity .15s}
+.remember-row.checked .checkbox{background:var(--text);border-color:var(--text)}
+.remember-row.checked .checkbox svg{opacity:1;stroke:var(--bg)}
+.remember-label{text-align:left;flex:1;min-width:0}
+.remember-title{font-size:15px;font-weight:600}
+.remember-sub{font-size:12.5px;color:var(--text-dim);margin-top:2px}
+
 .btn-primary{width:100%;padding:17px;background:var(--text);color:var(--bg);border:none;
   border-radius:13px;font-size:16.5px;font-weight:600;cursor:pointer;
   margin-top:4px;transition:transform .1s,opacity .2s;font-family:inherit;touch-action:manipulation}
@@ -693,7 +716,6 @@ body{ touch-action:manipulation; }
 .btn-primary:disabled{opacity:.5;cursor:default}
 .error{color:var(--danger);font-size:14px;margin-top:12px;min-height:20px}
 
-/* ---------- Chat ---------- */
 .title-block{flex:1;min-width:0;text-align:center;overflow:hidden}
 .title-name{font-size:17px;font-weight:600;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.15}
@@ -738,7 +760,6 @@ body{ touch-action:manipulation; }
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
 .send-btn:disabled{opacity:.4}
 
-/* ---------- Настройки ---------- */
 .settings-group{margin:14px 12px;background:var(--bg-elev);border-radius:14px;overflow:hidden}
 .set-row{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;gap:12px}
 .set-row + .set-row{border-top:1px solid var(--border)}
@@ -778,18 +799,64 @@ body{ touch-action:manipulation; }
   opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;
   z-index:9999;max-width:90vw;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ---- Offline banner ---- */
+.offline-banner{
+  position:fixed; top:0; left:0; right:0;
+  background:#e11d48; color:#fff;
+  text-align:center; padding:9px 12px;
+  padding-top:calc(9px + env(safe-area-inset-top,0));
+  font-size:13.5px; font-weight:600;
+  transform:translateY(-110%); transition:transform .25s ease;
+  z-index:99998; pointer-events:none;
+}
+.offline-banner.show{transform:translateY(0)}
+
+/* ---- Boot / offline overlay ---- */
+.boot{
+  position:fixed;inset:0;background:var(--bg);z-index:99997;
+  display:flex;align-items:center;justify-content:center;flex-direction:column;
+  padding:24px;text-align:center;gap:16px;
+}
+.boot.hide{display:none}
+.boot .logo{width:72px;height:72px;border-radius:22px;margin:0}
+.boot-title{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.boot-sub{color:var(--text-dim);font-size:14px;max-width:280px;line-height:1.5}
+.spinner{width:28px;height:28px;border-radius:50%;border:3px solid var(--border);
+  border-top-color:var(--text);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.retry-btn{
+  margin-top:6px;padding:12px 22px;border-radius:12px;border:none;
+  background:var(--text);color:var(--bg);font-weight:600;font-size:15px;
+  font-family:inherit;cursor:pointer;
+}
 </style>
 </head>
 <body>
+
+<!-- Offline banner -->
+<div class="offline-banner" id="offline-banner">Нет подключения к интернету</div>
+
+<!-- Boot overlay (используется при старте / отсутствии сети) -->
+<div class="boot" id="boot">
+  <div class="logo">
+    <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+  </div>
+  <div class="boot-title">SLD</div>
+  <div class="boot-sub" id="boot-sub">Подключение к серверу…</div>
+  <div class="spinner" id="boot-spinner"></div>
+  <button class="retry-btn" id="boot-retry" style="display:none">Повторить</button>
+</div>
+
 <div id="app">
 
-  <!-- ===================== AUTH ===================== -->
-  <div id="auth" class="screen active">
+  <!-- AUTH -->
+  <div id="auth" class="screen">
     <div class="auth-wrap">
       <div class="logo">
         <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
       </div>
-      <h1>Мессенджер</h1>
+      <h1>SLD</h1>
       <p class="subtitle">Общайтесь без лишнего</p>
 
       <div class="tabs">
@@ -806,13 +873,24 @@ body{ touch-action:manipulation; }
           <svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           <input type="password" id="password" placeholder="Пароль" autocomplete="current-password">
         </div>
+
+        <div class="remember-row" id="remember-row">
+          <div class="checkbox">
+            <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="remember-label">
+            <div class="remember-title">Запомнить устройство</div>
+            <div class="remember-sub">Вход без пароля на этом устройстве</div>
+          </div>
+        </div>
+
         <button type="submit" class="btn-primary" id="auth-submit">Войти</button>
         <div class="error" id="auth-error"></div>
       </form>
     </div>
   </div>
 
-  <!-- ===================== MAIN ===================== -->
+  <!-- MAIN -->
   <div id="main" class="screen">
     <header class="topbar glass">
       <div class="title">
@@ -871,13 +949,26 @@ body{ touch-action:manipulation; }
             <div class="set-row">
               <div>
                 <div class="set-label">Уведомления</div>
-                <div class="set-hint" id="notif-hint">Всплывающие оповещения о новых сообщениях</div>
+                <div class="set-hint" id="notif-hint">Всплывающие оповещения</div>
               </div>
               <div class="switch" id="set-notif"></div>
             </div>
           </div>
 
+          <div class="settings-group" id="device-group" style="display:none">
+            <div class="settings-user">
+              <div class="avatar" style="background:transparent;color:var(--ok)">
+                <svg viewBox="0 0 24 24" style="width:28px;height:28px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+              </div>
+              <div style="flex:1;min-width:0">
+                <div class="settings-user-name" style="font-size:16px">Устройство доверено</div>
+                <div class="settings-user-sub">Вход без пароля включён</div>
+              </div>
+            </div>
+          </div>
+
           <div class="settings-group">
+            <button class="danger-btn" id="forget-device-btn" style="display:none">Забыть это устройство</button>
             <button class="danger-btn" id="logout-btn">Выйти из аккаунта</button>
           </div>
 
@@ -907,7 +998,7 @@ body{ touch-action:manipulation; }
     </nav>
   </div>
 
-  <!-- ===================== CHAT ===================== -->
+  <!-- CHAT -->
   <div id="chat" class="screen">
     <header class="topbar glass">
       <button class="icon-btn" id="chat-back" aria-label="Назад">
@@ -934,16 +1025,51 @@ body{ touch-action:manipulation; }
 <script>
 (function(){
 "use strict";
-
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
+/* =========================================================
+   ОПРЕДЕЛЕНИЕ КЛИЕНТА / UUID
+   ========================================================= */
+const UA = navigator.userAgent || '';
+const IS_SLD_APP = /SLDApp/i.test(UA) || !!window.AndroidBridge;
+
+function readDeviceUuid(){
+  try {
+    if (window.AndroidBridge && typeof window.AndroidBridge.getUuid === 'function'){
+      const u = window.AndroidBridge.getUuid();
+      if (u && String(u).length > 0) return String(u);
+    }
+  } catch(e){}
+  try {
+    if (typeof window.__SLD_UUID__ === 'string' && window.__SLD_UUID__.length > 0){
+      return window.__SLD_UUID__;
+    }
+  } catch(e){}
+  try {
+    if (typeof AndroidBridge !== 'undefined' && AndroidBridge.getUuid){
+      const u = AndroidBridge.getUuid();
+      if (u) return String(u);
+    }
+  } catch(e){}
+  return '';
+}
+
+const DEVICE_UUID = readDeviceUuid();
+const HAS_DEVICE = IS_SLD_APP && DEVICE_UUID.length > 0;
+
+console.log('[SLD] UA app=', IS_SLD_APP, 'uuid=', DEVICE_UUID, 'hasDevice=', HAS_DEVICE);
+
+/* =========================================================
+   STATE
+   ========================================================= */
 const state = {
   token: localStorage.getItem('m_token') || '',
   username: localStorage.getItem('m_user') || '',
   theme: localStorage.getItem('m_theme') || 'light',
   glass: localStorage.getItem('m_glass') || 'on',
   notif: localStorage.getItem('m_notif') === '1',
+  rememberDevice: localStorage.getItem('m_remember_device') !== '0',  // по умолчанию вкл
   ws: null,
   wsReady: false,
   reconnectTimer: null,
@@ -959,8 +1085,9 @@ const state = {
   activePeer: null,
   activeMsgs: [],
   seenIds: new Set(),
-  typing: {},          // peer -> last typing timestamp
-  typingTimers: {},    // peer -> hide timer
+  typing: {},
+  typingTimers: {},
+  deviceTrusted: false,
 };
 
 const ICONS = {
@@ -979,8 +1106,8 @@ function fmtTime(ts){
   const now = new Date();
   if (d.toDateString() === now.toDateString())
     return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
-  const yest = new Date(now); yest.setDate(now.getDate() - 1);
-  if (d.toDateString() === yest.toDateString()) return 'вчера';
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return 'вчера';
   return String(d.getDate()).padStart(2,'0') + '.' + String(d.getMonth()+1).padStart(2,'0');
 }
 
@@ -996,12 +1123,11 @@ function isTyping(peer){
   const t = state.typing[peer];
   return t && (Date.now() - t) < 3500;
 }
+function isOnline(peer){ return state.onlineFriends.has(peer); }
 
-function isOnline(peer){
-  return state.onlineFriends.has(peer);
-}
-
-/* ---------------- Тема / стекло / уведомления ---------------- */
+/* =========================================================
+   ТЕМА / СТЕКЛО / УВЕДОМЛЕНИЯ
+   ========================================================= */
 function applyTheme(){
   document.documentElement.setAttribute('data-theme', state.theme);
   const meta = document.querySelector('meta[name=theme-color]');
@@ -1029,7 +1155,9 @@ function applyNotifUI(){
   }
 }
 
-/* ---------------- Viewport / клавиатура ---------------- */
+/* =========================================================
+   VIEWPORT / КЛАВИАТУРА
+   ========================================================= */
 function updateViewport(){
   const vv = window.visualViewport;
   const h = vv ? vv.height : window.innerHeight;
@@ -1047,30 +1175,75 @@ if (window.visualViewport){
   });
   window.visualViewport.addEventListener('scroll', () => {
     updateViewport();
-    // запрещаем странице "уползать" вверх/вниз при фокусе
     window.scrollTo(0, 0);
   });
 }
 window.addEventListener('orientationchange', () => setTimeout(updateViewport, 200));
-// Когда появляется фокус — не даём iOS прокрутить страницу
 document.addEventListener('focusin', () => setTimeout(() => window.scrollTo(0, 0), 80));
 updateViewport();
 
-/* ---------------- API ---------------- */
+/* =========================================================
+   OFFLINE / ONLINE
+   ========================================================= */
+const offlineBanner = $('#offline-banner');
+function setOffline(off){
+  if (offlineBanner) offlineBanner.classList.toggle('show', !!off);
+  if (!off && state.token && (!state.ws || state.ws.readyState > 1)){
+    connectWS();
+  }
+}
+window.addEventListener('offline', () => {
+  setOffline(true);
+  toast('Нет подключения');
+});
+window.addEventListener('online', () => {
+  setOffline(false);
+  if (state.token){
+    if (!state.ws || state.ws.readyState > 1) connectWS();
+    if (state.page === 'home') refreshChats();
+    if (state.page === 'friends') refreshFriends();
+  }
+});
+if (!navigator.onLine) setOffline(true);
+
+/* =========================================================
+   BOOT OVERLAY
+   ========================================================= */
+function showBoot(msg, showSpinner, showRetry){
+  const b = $('#boot');
+  b.classList.remove('hide');
+  $('#boot-sub').textContent = msg;
+  $('#boot-spinner').style.display = showSpinner ? '' : 'none';
+  $('#boot-retry').style.display = showRetry ? '' : 'none';
+}
+function hideBoot(){ $('#boot').classList.add('hide'); }
+$('#boot-retry').addEventListener('click', () => location.reload());
+
+/* =========================================================
+   API
+   ========================================================= */
 async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({
     'Content-Type': 'application/json',
     'Authorization': 'Bearer ' + state.token,
   }, opts.headers || {});
-  const r = await fetch(path, opts);
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch(e){
+    setOffline(!navigator.onLine);
+    throw new Error('Нет соединения');
+  }
   if (r.status === 401 && state.token){ doLogout(); throw new Error('unauth'); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
   return data;
 }
 
-/* ---------------- Auth ---------------- */
+/* =========================================================
+   AUTH FORM
+   ========================================================= */
 let authMode = 'login';
 $$('.tab').forEach(t => t.addEventListener('click', () => {
   $$('.tab').forEach(x => x.classList.remove('active'));
@@ -1080,6 +1253,19 @@ $$('.tab').forEach(t => t.addEventListener('click', () => {
   $('#auth-error').textContent = '';
 }));
 
+/* remember device checkbox */
+const rememberRow = $('#remember-row');
+function updateRememberUI(){
+  const show = HAS_DEVICE && authMode === 'login';
+  rememberRow.classList.toggle('show', show);
+  rememberRow.classList.toggle('checked', state.rememberDevice);
+}
+rememberRow.addEventListener('click', () => {
+  state.rememberDevice = !state.rememberDevice;
+  localStorage.setItem('m_remember_device', state.rememberDevice ? '1' : '0');
+  updateRememberUI();
+});
+
 $('#auth-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const username = $('#username').value.trim();
@@ -1087,6 +1273,8 @@ $('#auth-form').addEventListener('submit', async (e) => {
   const errEl = $('#auth-error');
   errEl.textContent = '';
   if (!username || !password){ errEl.textContent = 'Заполните все поля'; return; }
+  if (!navigator.onLine){ errEl.textContent = 'Нет подключения к интернету'; return; }
+
   const btn = $('#auth-submit');
   btn.disabled = true;
   try {
@@ -1097,11 +1285,25 @@ $('#auth-form').addEventListener('submit', async (e) => {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || 'Ошибка');
+
     state.token = data.token;
     state.username = data.username;
     localStorage.setItem('m_token', state.token);
     localStorage.setItem('m_user', state.username);
     $('#password').value = '';
+
+    // Запомнить устройство (только если включено и есть UUID)
+    if (HAS_DEVICE && state.rememberDevice){
+      try {
+        await fetch('/api/device/trust', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json', 'Authorization':'Bearer ' + state.token},
+          body: JSON.stringify({uuid: DEVICE_UUID}),
+        });
+        state.deviceTrusted = true;
+      } catch(e){}
+    }
+
     await enterApp();
   } catch (err){
     errEl.textContent = err.message;
@@ -1124,33 +1326,53 @@ function doLogout(){
   state.incoming = [];
   state.outgoing = [];
   state.typing = {};
+  state.deviceTrusted = false;
   if (state.ws){ try { state.ws.close(); } catch(e){} state.ws = null; }
   clearTimeout(state.reconnectTimer);
   state.wsReady = false;
   updateConnDot();
   showScreen('auth');
+  updateRememberUI();
 }
 $('#logout-btn').addEventListener('click', doLogout);
 
-/* ---------------- Навигация ---------------- */
+$('#forget-device-btn').addEventListener('click', async () => {
+  if (!HAS_DEVICE) return;
+  if (!confirm('Забыть это устройство? При следующем входе потребуется пароль.')) return;
+  try {
+    await api('/api/device/untrust', {
+      method: 'POST',
+      body: JSON.stringify({uuid: DEVICE_UUID}),
+    });
+    state.deviceTrusted = false;
+    toast('Устройство забыто');
+    refreshDeviceUI();
+  } catch(e){ toast(e.message || 'Ошибка'); }
+});
+
+/* =========================================================
+   NAV
+   ========================================================= */
 function showScreen(name){
   $$('.screen').forEach(s => s.classList.remove('active'));
   const el = document.getElementById(name);
   if (el) el.classList.add('active');
 }
-
 function switchPage(page){
   state.page = page;
   $$('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + page));
   const titles = { home: 'Чаты', friends: 'Друзья', settings: 'Настройки' };
-  $('#main-title').textContent = titles[page] || 'Мессенджер';
+  $('#main-title').textContent = titles[page] || 'SLD';
   if (page === 'home') refreshChats();
   if (page === 'friends') refreshFriends();
+  if (page === 'settings') refreshDeviceUI();
 }
 $$('.nav-btn').forEach(b => b.addEventListener('click', () => switchPage(b.dataset.page)));
 
-/* ---------------- Вход в приложение ---------------- */
+/* =========================================================
+   ENTER APP
+   ========================================================= */
 async function enterApp(){
   $('#me-avatar').textContent = (state.username[0] || '?').toUpperCase();
   $('#me-name').textContent = state.username;
@@ -1158,9 +1380,10 @@ async function enterApp(){
   connectWS();
   switchPage('home');
   showScreen('main');
+  hideBoot();
   updateViewport();
 
-  if ('serviceWorker' in navigator){
+  if ('serviceWorker' in navigator && !IS_SLD_APP){
     try { await navigator.serviceWorker.register('/sw.js'); } catch(e){}
     navigator.serviceWorker.addEventListener('message', (e) => {
       if (e.data && e.data.type === 'open-chat' && e.data.peer){
@@ -1169,7 +1392,7 @@ async function enterApp(){
     });
   }
 
-  // обработка ?open=peer из клика по уведомлению
+  // Открытие чата по параметру ?open=
   const params = new URLSearchParams(location.search);
   const peer = params.get('open');
   if (peer){
@@ -1181,15 +1404,37 @@ async function enterApp(){
     localStorage.removeItem('m_open_after_login');
     setTimeout(() => tryOpenChat(toOpen), 300);
   }
-}
 
+  // проверяем статус устройства
+  if (HAS_DEVICE){
+    try {
+      const r = await api('/api/device/status?uuid=' + encodeURIComponent(DEVICE_UUID));
+      state.deviceTrusted = !!r.trusted;
+    } catch(e){ state.deviceTrusted = false; }
+    refreshDeviceUI();
+  }
+}
 function tryOpenChat(peer){
   if (!peer) return;
   showScreen('main');
   openChat(peer);
 }
 
-/* ---------------- WebSocket ---------------- */
+function refreshDeviceUI(){
+  const group = $('#device-group');
+  const forget = $('#forget-device-btn');
+  if (!group) return;
+  const show = HAS_DEVICE && state.deviceTrusted;
+  group.style.display = show ? '' : 'none';
+  forget.style.display = show ? '' : 'none';
+  if (show){
+    group.querySelector('.settings-user-name').textContent = 'Устройство доверено';
+  }
+}
+
+/* =========================================================
+   WEBSOCKET
+   ========================================================= */
 function updateConnDot(){
   const dot = $('#conn-dot');
   if (!dot) return;
@@ -1203,23 +1448,19 @@ function updateConnDot(){
 
 function connectWS(){
   if (!state.token) return;
+  if (!navigator.onLine) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = proto + '://' + location.host + '/ws?token=' + encodeURIComponent(state.token);
   let ws;
   try { ws = new WebSocket(url); } catch(e){ return; }
   state.ws = ws;
-
-  ws.onopen = () => {
-    state.wsReady = true;
-    updateConnDot();
-  };
+  ws.onopen = () => { state.wsReady = true; updateConnDot(); };
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch(_) { return; }
     handleServerEvent(m);
   };
   ws.onclose = (e) => {
-    state.wsReady = false;
-    updateConnDot();
+    state.wsReady = false; updateConnDot();
     if (state.ws === ws) state.ws = null;
     if (e.code === 4000) return;
     if (state.token){
@@ -1237,7 +1478,9 @@ function wsSend(obj){
   return false;
 }
 
-/* ---------------- События сервера ---------------- */
+/* =========================================================
+   SERVER EVENTS
+   ========================================================= */
 function handleServerEvent(m){
   if (m.type === 'hello') return;
 
@@ -1254,7 +1497,6 @@ function handleServerEvent(m){
     const peer = m.from === state.username ? m.to : m.from;
     const mine = m.from === state.username;
 
-    // если диалог открыт — добавляем
     if (state.activePeer === peer && !state.seenIds.has(m.id)){
       state.seenIds.add(m.id);
       state.activeMsgs.push({ id: m.id, from: m.from, text: m.text, ts: m.ts });
@@ -1264,18 +1506,12 @@ function handleServerEvent(m){
     } else if (!mine){
       maybeNotify(m);
     }
-
-    // обновляем локальный кэш чатов
     updateChatFromMessage(m);
-
-    // если собеседник печатал — сбрасываем его "печатает"
     if (m.from === peer) delete state.typing[peer];
-
     return;
   }
 
   if (m.type === 'chat_read'){
-    // мы прочитали/нам сообщили
     const c = state.chats.find(x => x.username === m.peer);
     if (c) c.unread = 0;
     if (state.page === 'home'){ renderChats(); updateDots(); }
@@ -1283,10 +1519,6 @@ function handleServerEvent(m){
   }
 
   if (m.type === 'friends_changed'){
-    // если открыт чат с тем, кто нас удалил
-    if (state.activePeer && !state.friendsList.includes(state.activePeer)){
-      // возможно просто ещё не подгрузили — подождём refreshFriends
-    }
     refreshFriends().then(() => {
       if (state.activePeer && !state.friendsList.includes(state.activePeer)){
         toast('Диалог закрыт');
@@ -1319,14 +1551,8 @@ function updateChatFromMessage(m){
   const peer = m.from === state.username ? m.to : m.from;
   const mine = m.from === state.username;
   let c = state.chats.find(x => x.username === peer);
-  if (!c){
-    // если мы не в списке — обновим
-    refreshChats();
-    return;
-  }
-  c.lastText = m.text;
-  c.lastTs = m.ts;
-  c.lastFromMe = mine;
+  if (!c){ refreshChats(); return; }
+  c.lastText = m.text; c.lastTs = m.ts; c.lastFromMe = mine;
   if (!mine && state.activePeer !== peer) c.unread = (c.unread || 0) + 1;
   state.chats.sort((a,b) => (b.lastTs||0) - (a.lastTs||0) || a.username.localeCompare(b.username));
   if (state.page === 'home'){ renderChats(); updateDots(); }
@@ -1334,6 +1560,14 @@ function updateChatFromMessage(m){
 }
 
 function maybeNotify(m){
+  if (IS_SLD_APP){
+    try {
+      if (window.AndroidBridge && typeof window.AndroidBridge.notify === 'function'){
+        window.AndroidBridge.notify(m.from, m.text);
+      }
+    } catch(e){}
+    return;
+  }
   if (!state.notif) return;
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
@@ -1344,11 +1578,8 @@ function maybeNotify(m){
     const doShow = (reg) => {
       try {
         reg.showNotification(title, {
-          body,
-          tag: 'msg-' + m.from,
-          renotify: true,
-          icon: '/icon.svg',
-          badge: '/icon.svg',
+          body, tag: 'msg-' + m.from, renotify: true,
+          icon: '/icon.svg', badge: '/icon.svg',
           data: { peer: m.from },
         });
       } catch(e){
@@ -1365,13 +1596,14 @@ function maybeNotify(m){
   } catch(e){}
 }
 
-/* ---------------- Список чатов ---------------- */
+/* =========================================================
+   CHATS
+   ========================================================= */
 async function refreshChats(){
   if (!state.token) return;
   try {
     const list = await api('/api/chats');
     state.chats = list;
-    // обновим также онлайн-кэш
     for (const c of list){
       if (c.online) state.onlineFriends.add(c.username);
       else state.onlineFriends.delete(c.username);
@@ -1408,18 +1640,18 @@ function renderChats(){
   box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => openChat(r.dataset.peer)));
 }
 
-/* ---------------- Друзья ---------------- */
+/* =========================================================
+   FRIENDS
+   ========================================================= */
 function updateDots(){
   const homeUnread = state.chats.reduce((s,c) => s + (c.unread||0), 0);
   const hd = $('#home-dot');
   if (homeUnread > 0){ hd.textContent = homeUnread > 99 ? '99+' : homeUnread; hd.style.display = 'flex'; }
   else hd.style.display = 'none';
-
   const pendingCount = state.incoming.length;
   const fd = $('#friends-dot');
   if (pendingCount > 0){ fd.textContent = pendingCount > 99 ? '99+' : pendingCount; fd.style.display = 'flex'; }
   else fd.style.display = 'none';
-
   const pb = $('#pending-badge');
   if (pendingCount > 0) pb.innerHTML = '<span class="badge-inline">' + pendingCount + '</span>';
   else pb.innerHTML = '';
@@ -1447,7 +1679,6 @@ $$('#friends-seg .seg').forEach(b => b.addEventListener('click', () => {
 function renderFriends(){
   const box = $('#friends-list');
   if (state.searchQuery){ renderSearch(box); return; }
-
   if (state.friendsTab === 'friends'){
     if (!state.friendsList.length){
       box.innerHTML = '<div class="empty">Пока нет друзей.<br>Найдите людей через поиск выше.</div>';
@@ -1458,14 +1689,14 @@ function renderFriends(){
       const online = isOnline(name);
       const typing = isTyping(name);
       const status = typing ? 'печатает…' : (online ? 'в сети' : 'не в сети');
-      const statusCls = typing ? 'row-sub typing' : 'row-sub';
+      const cls = typing ? 'row-sub typing' : 'row-sub';
       return '<div class="row">' +
         '<div class="avatar">' + esc(initial) +
           '<span class="online-dot ' + (online ? 'on' : '') + '"></span>' +
         '</div>' +
         '<div class="row-info">' +
           '<div class="row-title">' + esc(name) + '</div>' +
-          '<div class="' + statusCls + '">' + status + '</div>' +
+          '<div class="' + cls + '">' + status + '</div>' +
         '</div>' +
         '<div class="mini-btn-row">' +
           '<button class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
@@ -1480,7 +1711,6 @@ function renderFriends(){
     return;
   }
 
-  // pending
   const inc = state.incoming.map(name => rowPending(name, 'incoming')).join('');
   const out = state.outgoing.map(name => rowPending(name, 'outgoing')).join('');
   let html = '';
@@ -1560,7 +1790,9 @@ async function friendAction(act, user){
   }
 }
 
-/* ---------------- Поиск ---------------- */
+/* =========================================================
+   SEARCH
+   ========================================================= */
 let searchTimer = null;
 $('#friend-search').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
@@ -1569,7 +1801,6 @@ $('#friend-search').addEventListener('input', (e) => {
   if (!q){ state.searchResults = []; renderFriends(); return; }
   searchTimer = setTimeout(() => runSearch(q), 220);
 });
-
 async function runSearch(q){
   try {
     const res = await api('/api/users?q=' + encodeURIComponent(q));
@@ -1578,21 +1809,19 @@ async function runSearch(q){
   } catch(e){}
 }
 
-/* ---------------- Чат ---------------- */
+/* =========================================================
+   CHAT
+   ========================================================= */
 function updateChatHeaderStatus(){
   const el = $('#chat-status');
   if (!el || !state.activePeer) return;
   if (isTyping(state.activePeer)){
-    el.textContent = 'печатает…';
-    el.className = 'title-status typing';
-    return;
+    el.textContent = 'печатает…'; el.className = 'title-status typing'; return;
   }
   if (isOnline(state.activePeer)){
-    el.textContent = 'в сети';
-    el.className = 'title-status online';
+    el.textContent = 'в сети'; el.className = 'title-status online';
   } else {
-    el.textContent = 'не в сети';
-    el.className = 'title-status';
+    el.textContent = 'не в сети'; el.className = 'title-status';
   }
 }
 
@@ -1605,7 +1834,6 @@ async function openChat(peer){
   updateChatHeaderStatus();
   showScreen('chat');
   updateViewport();
-
   try {
     const list = await api('/api/messages/' + encodeURIComponent(peer));
     state.activeMsgs = list;
@@ -1620,9 +1848,7 @@ async function openChat(peer){
   } catch(e){
     toast(e.message || 'Ошибка загрузки');
     if (e.message && e.message.indexOf('Не друзья') >= 0){
-      state.activePeer = null;
-      showScreen('main');
-      return;
+      state.activePeer = null; showScreen('main'); return;
     }
   }
   setTimeout(() => { try { $('#msg-input').focus({preventScroll:true}); } catch(_){} }, 50);
@@ -1635,7 +1861,6 @@ function appendMessage(m){
   el.textContent = m.text;
   box.appendChild(el);
 }
-
 function scrollMessages(){
   const box = $('#messages');
   requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
@@ -1652,66 +1877,44 @@ $('#chat-back').addEventListener('click', () => {
 
 function sendMessage(){
   if (!state.activePeer) return;
+  if (!navigator.onLine){ toast('Нет интернета'); return; }
   const input = $('#msg-input');
   const text = input.value.trim();
   if (!text) return;
   const ok = wsSend({ type:'send', to: state.activePeer, text });
-  if (!ok){
-    toast('Нет соединения');
-    return;
-  }
+  if (!ok){ toast('Нет соединения'); return; }
   input.value = '';
-  // не убираем фокус с поля, чтобы клавиатура не закрывалась
   try { input.focus({preventScroll:true}); } catch(_){}
 }
 
-/* --- ГЛАВНЫЙ ФИКС: кнопка отправки на мобильных --- */
-// pointerdown предотвращает потерю фокуса, click — реальный обработчик.
-// preventDefault на touchstart ломал click на мобильных — убран.
 (function bindSend(){
   const btn = $('#send-btn');
   if (!btn) return;
-  btn.addEventListener('pointerdown', (e) => {
-    // не даём кнопке забрать фокус с поля ввода
-    e.preventDefault();
-  });
-  btn.addEventListener('click', (e) => {
-    e.preventDefault();
-    sendMessage();
-  });
-  // старый iOS без PointerEvent
+  btn.addEventListener('pointerdown', (e) => { e.preventDefault(); });
+  btn.addEventListener('click', (e) => { e.preventDefault(); sendMessage(); });
   btn.addEventListener('touchend', (e) => {
-    // если click не сработает (редкий случай) — отправим
-    if (!('PointerEvent' in window)){
-      e.preventDefault();
-      sendMessage();
-    }
+    if (!('PointerEvent' in window)){ e.preventDefault(); sendMessage(); }
   });
 })();
 
 $('#msg-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey){
-    e.preventDefault();
-    sendMessage();
-  }
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); }
 });
-
 let typingTimer = null;
 $('#msg-input').addEventListener('input', () => {
   if (!state.activePeer) return;
   clearTimeout(typingTimer);
-  typingTimer = setTimeout(() => {
-    wsSend({ type:'typing', to: state.activePeer });
-  }, 300);
+  typingTimer = setTimeout(() => { wsSend({ type:'typing', to: state.activePeer }); }, 300);
 });
-
 if (window.visualViewport){
   window.visualViewport.addEventListener('resize', () => {
     if (state.activePeer) scrollMessages();
   });
 }
 
-/* ---------------- Настройки ---------------- */
+/* =========================================================
+   SETTINGS
+   ========================================================= */
 $('#set-theme').addEventListener('click', () => {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem('m_theme', state.theme);
@@ -1732,8 +1935,7 @@ $('#set-notif').addEventListener('click', async () => {
   if (Notification.permission === 'granted'){
     state.notif = !state.notif;
     localStorage.setItem('m_notif', state.notif ? '1' : '0');
-    applyNotifUI();
-    return;
+    applyNotifUI(); return;
   }
   if (Notification.permission === 'denied'){ toast('Запрещено в браузере'); return; }
   try {
@@ -1742,29 +1944,79 @@ $('#set-notif').addEventListener('click', async () => {
       state.notif = true;
       localStorage.setItem('m_notif', '1');
       toast('Уведомления включены');
-    } else {
-      toast('Разрешение не выдано');
-    }
+    } else toast('Разрешение не выдано');
   } catch(e){}
   applyNotifUI();
 });
 
-// не даём странице зумиться двойным тапом
 document.addEventListener('dblclick', e => e.preventDefault(), {passive:false});
 
-/* ---------------- Старт ---------------- */
-applyTheme();
-applyGlass();
-updateConnDot();
+/* =========================================================
+   INIT
+   ========================================================= */
+async function init(){
+  applyTheme();
+  applyGlass();
+  updateConnDot();
+  updateRememberUI();
 
-if (state.token){
-  fetch('/api/chats', { headers: { 'Authorization': 'Bearer ' + state.token } })
-    .then(r => { if (r.ok) enterApp(); else doLogout(); })
-    .catch(() => doLogout());
-} else {
+  // Нет интернета сразу
+  if (!navigator.onLine){
+    setOffline(true);
+    showBoot('Нет подключения к интернету', false, true);
+    return;
+  }
+
+  // Мгновенная попытка device-login (только для нашего приложения)
+  if (HAS_DEVICE){
+    try {
+      const r = await fetch('/api/device/login', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({uuid: DEVICE_UUID}),
+      });
+      if (r.ok){
+        const data = await r.json();
+        state.token = data.token;
+        state.username = data.username;
+        state.deviceTrusted = true;
+        localStorage.setItem('m_token', state.token);
+        localStorage.setItem('m_user', state.username);
+        await enterApp();
+        return;
+      }
+    } catch(e){
+      // сервер недоступен
+    }
+  }
+
+  // Есть сохранённый токен — валидируем
+  if (state.token){
+    try {
+      const r = await fetch('/api/chats', { headers: { 'Authorization': 'Bearer ' + state.token } });
+      if (r.ok){
+        await enterApp();
+        return;
+      } else {
+        localStorage.removeItem('m_token');
+        localStorage.removeItem('m_user');
+        state.token = ''; state.username = '';
+      }
+    } catch(e){
+      // Сервер недоступен, но интернет есть
+      showBoot('Сервер недоступен', false, true);
+      return;
+    }
+  }
+
+  // Показываем авторизацию
   showScreen('auth');
+  hideBoot();
   updateViewport();
+  updateRememberUI();
 }
+
+init();
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.token){
