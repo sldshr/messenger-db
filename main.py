@@ -43,16 +43,16 @@ MAX_TITLE_LEN  = 200
 MAX_TAGS       = 20
 MAX_TAG_LEN    = 30
 MAX_IMAGES     = 5
-MAX_POST_IMAGE_B = 95 * 1024     # 95 KB × 5 = 475 KB
+MAX_POST_IMAGE_B = 95 * 1024
 MAX_AVATAR_B     = 150 * 1024
 AVATAR_DIM       = 512
 POST_IMAGE_DIM   = 1024
 
+DEFAULT_FONT = "font-serif-custom"
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="СЛД", docs_url="/api/docs", redoc_url=None)
-
-# GZip для всех ответов > 500 байт — режет HTML/SVG/JSON в 3-5 раз
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -144,11 +144,6 @@ async def sb_login(email: str, password: str) -> dict:
 # Image compression
 # --------------------------------------------------------------------------- #
 def compress_image(data: bytes, max_dim: int, max_size: int):
-    """
-    Сжимает картинку до max_dim по длинной стороне и <= max_size байт.
-    Порядок: AVIF → WebP → JPEG.
-    Возвращает (bytes, mime, ext).
-    """
     img = Image.open(io.BytesIO(data))
     if img.mode in ("RGBA", "LA", "P"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
@@ -194,30 +189,20 @@ _STORAGE_RE = re.compile(r"/storage/v1/object/(?:public/|sign/)?media/(.+)$")
 
 
 def storage_path_from_url(url: str) -> Optional[str]:
-    """
-    Из публичного URL картинки вытаскивает путь внутри бакета 'media'.
-    Пример:
-      https://xxx.supabase.co/storage/v1/object/public/media/<uid>/abc.avif
-      -> <uid>/abc.avif
-    """
     if not url:
         return None
     m = _STORAGE_RE.search(url)
     if not m:
         return None
-    path = m.group(1)
-    # убираем query, если приклеился
-    path = path.split("?", 1)[0]
+    path = m.group(1).split("?", 1)[0]
     return path or None
 
 
 def remove_storage_paths(paths: List[str]) -> int:
-    """Удаляет список путей из бакета media. Возвращает кол-во успешных удалений."""
     paths = [p for p in paths if p]
     if not paths:
         return 0
     removed = 0
-    # supabase-py лимитов не имеет явных, но бьём по 100 на всякий
     for i in range(0, len(paths), 100):
         chunk = paths[i:i + 100]
         try:
@@ -240,7 +225,7 @@ class PostIn(BaseModel):
     title: str = Field(default="", max_length=MAX_TITLE_LEN)
     text:  str = Field(default="", max_length=MAX_TEXT_LEN)
     tags:  List[str] = []
-    font:  str = "font-serif-custom"
+    font:  str = DEFAULT_FONT          # поле сохраняем для совместимости, всегда default
     image_urls: List[str] = []
 
 
@@ -338,7 +323,7 @@ def _row_to_post(row: dict) -> dict:
         "title": row.get("title") or "",
         "text": row.get("text") or "",
         "tags": row.get("tags") or [],
-        "font": row.get("font") or "font-serif-custom",
+        "font": row.get("font") or DEFAULT_FONT,
         "images": row.get("image_urls") or [],
         "timestamp": row.get("created_at"),
         "updated_at": row.get("updated_at"),
@@ -362,13 +347,11 @@ def _clean_tags(tags: List[str]) -> List[str]:
 
 @app.get("/api/posts")
 async def list_posts(response: Response):
-    # select только нужных полей — payload меньше в ~2 раза
     res = (supabase.table("posts")
            .select(POST_FIELDS)
            .order("created_at", desc=True)
            .limit(300)
            .execute())
-    # разрешаем кэш браузеру на 15 сек
     response.headers["Cache-Control"] = "private, max-age=15"
     return [_row_to_post(r) for r in (res.data or [])]
 
@@ -396,7 +379,7 @@ async def create_post(body: PostIn, user: dict = Depends(require_user)):
         "title": body.title.strip()[:MAX_TITLE_LEN],
         "text": body.text,
         "tags": _clean_tags(body.tags),
-        "font": body.font,
+        "font": DEFAULT_FONT,
         "image_urls": body.image_urls,
     }
     res = supabase.table("posts").insert(row).execute()
@@ -426,12 +409,11 @@ async def update_post(post_id: str, body: PostIn, user: dict = Depends(require_u
         "title": body.title.strip()[:MAX_TITLE_LEN],
         "text": body.text,
         "tags": _clean_tags(body.tags),
-        "font": body.font,
+        "font": DEFAULT_FONT,
         "image_urls": body.image_urls,
     }
     res = supabase.table("posts").update(row).eq("id", post_id).execute()
 
-    # Чистим файлы, которые отвалились от поста
     if to_remove:
         paths = [storage_path_from_url(u) for u in to_remove]
         n = remove_storage_paths([p for p in paths if p])
@@ -451,10 +433,8 @@ async def delete_post(post_id: str, user: dict = Depends(require_user)):
     if check.data[0]["author_id"] != user["id"]:
         raise HTTPException(403, "Нет прав")
 
-    # Сначала удаляем строку из БД
     supabase.table("posts").delete().eq("id", post_id).execute()
 
-    # Затем — файлы из Storage
     urls = check.data[0].get("image_urls") or []
     paths = [storage_path_from_url(u) for u in urls]
     n = remove_storage_paths([p for p in paths if p])
@@ -487,7 +467,6 @@ async def get_profile(username: str):
 
 @app.get("/api/profiles")
 async def all_profiles(response: Response):
-    # select только нужных полей, кэш 30 сек
     res = (supabase.table("profiles")
            .select("username,name,avatar,avatar_url,bio,status")
            .execute())
@@ -511,7 +490,6 @@ async def update_my_profile(body: ProfileIn, user: dict = Depends(require_user))
     if len(body.status) > 60:
         raise HTTPException(400, "Статус — до 60 символов")
 
-    # старая аватарка — удалим, если заменили на новую
     old_res = (supabase.table("profiles")
                .select("avatar_url")
                .eq("id", user["id"]).limit(1).execute())
@@ -572,7 +550,7 @@ async def upload(
 
 
 # --------------------------------------------------------------------------- #
-# Stats (Статус БД)
+# Stats
 # --------------------------------------------------------------------------- #
 @app.get("/api/stats")
 async def stats():
@@ -607,7 +585,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <title>СЛД</title>
 <meta name="description" content="СЛД — тексты, заметки и мысли.">
 
-<!-- анти-FOUC: тема до отрисовки -->
 <script>
 try{if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches){document.documentElement.classList.add('dark')}}catch(e){}
 </script>
@@ -615,7 +592,6 @@ try{if(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matc
 <link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 
 <script src="https://cdn.tailwindcss.com"></script>
 <script>tailwind.config = { darkMode: 'class' };</script>
@@ -641,7 +617,6 @@ img { max-width: 100%; height: auto; }
 .font-montserrat     { font-family:'Montserrat',sans-serif }
 .font-merriweather   { font-family:'Merriweather',serif }
 
-/* === ФИКС textarea: пропадающие символы при повторении === */
 textarea, .editable {
   overflow-x: hidden !important;
   overflow-y: auto;
@@ -655,7 +630,6 @@ textarea, .editable {
   letter-spacing: normal;
   font-kerning: normal;
 }
-textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 
 ::-webkit-scrollbar { width:6px; height:6px }
 ::-webkit-scrollbar-track { background:transparent }
@@ -678,7 +652,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 }
 @keyframes spin { to { transform: rotate(360deg) } }
 
-/* Кнопки-иконки в предпросмотре картинок */
 .icon-btn {
   display:inline-flex; align-items:center; justify-content:center;
   width: 44px; height: 44px;
@@ -692,7 +665,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 .icon-btn:active { transform: scale(.94) }
 .icon-btn svg    { width: 22px; height: 22px; stroke-width: 2 }
 
-/* ===== Стрелки карусели — в 2× больше ===== */
 .carousel-nav {
   display:flex; align-items:center; justify-content:center;
   width: 48px; height: 48px;
@@ -715,7 +687,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   .carousel-nav svg { width: 20px; height: 20px }
 }
 
-/* Мобильная нижняя навигация */
 #mobileBottomNav {
   padding-bottom: calc(6px + env(safe-area-inset-bottom));
   padding-top: 6px;
@@ -730,16 +701,13 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 </head>
 <body class="bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 transition-colors duration-200 flex flex-col min-h-screen pb-20 sm:pb-0">
 
-<!-- ============ Loading overlay ============ -->
 <div id="loadingOverlay" class="fixed inset-0 bg-gray-50 dark:bg-gray-950 z-[300] flex flex-col items-center justify-center gap-4">
   <div class="spinner"></div>
   <div class="text-xs text-gray-400 font-medium tracking-widest uppercase">Загрузка СЛД…</div>
 </div>
 
-<!-- ============ Toast ============ -->
 <div id="toast" class="fixed top-5 left-1/2 -translate-x-1/2 sm:top-auto sm:bottom-6 sm:left-auto sm:right-6 sm:translate-x-0 bg-gray-900/95 dark:bg-gray-100/95 backdrop-blur-md text-white dark:text-gray-900 px-5 py-3 rounded-2xl text-xs sm:text-sm font-medium opacity-0 pointer-events-none transition-all duration-300 z-[100] shadow-2xl max-w-[90vw] truncate">…</div>
 
-<!-- ============ Image preview (только зум + скачать + закрыть) ============ -->
 <div id="imagePreviewModal" class="fixed inset-0 bg-black/95 backdrop-blur-xl z-[200] flex-col hidden">
   <div class="flex justify-between items-center p-2 sm:p-4 text-white bg-black/40 shrink-0 gap-2">
     <div class="flex gap-2">
@@ -774,7 +742,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   </div>
 </div>
 
-<!-- ============ Auth modal ============ -->
 <div id="authModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-[90] flex items-center justify-center p-4 hidden">
   <div class="bg-white dark:bg-gray-900 rounded-3xl p-6 sm:p-8 max-w-sm w-full shadow-2xl border border-gray-100 dark:border-gray-800 relative animate-pop-in">
     <button id="closeAuthModal" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-2">
@@ -806,7 +773,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   </div>
 </div>
 
-<!-- ============ Error modal ============ -->
 <div id="errorModal" class="fixed inset-0 bg-black/60 backdrop-blur-md z-[90] flex items-center justify-center p-4 hidden">
   <div class="bg-white dark:bg-gray-900 rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl border border-gray-100 dark:border-gray-800 animate-pop-in">
     <div class="w-12 h-12 rounded-2xl bg-red-50 dark:bg-red-950/40 text-red-500 flex items-center justify-center mx-auto mb-3">
@@ -818,7 +784,6 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   </div>
 </div>
 
-<!-- ============ Stats modal ============ -->
 <div id="statsModal" class="fixed inset-0 bg-black/60 backdrop-blur-md z-[90] flex items-center justify-center p-4 hidden">
   <div class="bg-white dark:bg-gray-900 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl border border-gray-100 dark:border-gray-800 relative animate-pop-in">
     <button onclick="closeStats()" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 p-2">
@@ -835,12 +800,10 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
         <p class="text-[11px] text-gray-500">Supabase · Free Tier</p>
       </div>
     </div>
-
     <div id="statsLoader" class="py-8 text-center text-gray-400 text-xs">
       <div class="spinner mx-auto" style="width:32px;height:32px;border-width:2px"></div>
       <div class="mt-3">Загрузка…</div>
     </div>
-
     <div id="statsBody" class="hidden space-y-5">
       <div>
         <div class="mb-1.5 flex justify-between items-end">
@@ -870,11 +833,10 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   </div>
 </div>
 
-<!-- ============ Header / main ============ -->
 <div class="max-w-3xl w-full mx-auto px-4 py-4 sm:py-8 flex-1 flex flex-col min-h-0">
   <header class="hidden sm:flex justify-between items-center pb-5 mb-6 border-b border-gray-200 dark:border-gray-800">
     <div>
-      <a href="#/" onclick="event.preventDefault(); goHome()" class="text-2xl sm:text-3xl font-semibold tracking-tight hover:opacity-80">СЛД</a>
+      <a href="/" class="text-2xl sm:text-3xl font-semibold tracking-tight hover:opacity-80">СЛД</a>
       <p class="text-gray-500 dark:text-gray-400 mt-0.5 text-xs sm:text-sm">ещё один текст</p>
     </div>
     <div id="desktopUserProfileArea" class="flex items-center gap-2"></div>
@@ -882,7 +844,7 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
 
   <div class="sm:hidden mb-4 flex justify-between items-center pb-3 border-b border-gray-200 dark:border-gray-800">
     <div>
-      <a href="#/" onclick="event.preventDefault(); goHome()" class="text-xl font-bold">СЛД</a>
+      <a href="/" class="text-xl font-bold">СЛД</a>
       <p class="text-gray-500 dark:text-gray-400 text-[10px]">ещё один текст</p>
     </div>
   </div>
@@ -890,19 +852,17 @@ textarea.font-caveat { font-size: 1rem; line-height: 1.5; }
   <main id="appContent" class="flex-1 min-h-0"></main>
 </div>
 
-<!-- ============ Mobile bottom nav ============ -->
 <nav id="mobileBottomNav" class="sm:hidden fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-gray-900/90 backdrop-blur-lg border-t border-gray-200/80 dark:border-gray-800/80 z-40 px-1 flex justify-around items-stretch shadow-[0_-4px_15px_rgba(0,0,0,0.05)]"></nav>
 
-<!-- ============ Footer (PC/Tablet) ============ -->
 <footer class="hidden sm:block mt-10 border-t border-gray-200 dark:border-gray-800 py-6 text-center text-xs text-gray-500 dark:text-gray-400">
   <div class="max-w-3xl mx-auto px-4 flex flex-col sm:flex-row justify-between items-center gap-3">
     <div><span class="font-semibold text-gray-800 dark:text-gray-200">СЛД</span> &copy; 2026</div>
     <div class="flex items-center gap-3 sm:gap-4 flex-wrap justify-center">
-      <a href="#/" onclick="event.preventDefault(); goHome()" class="hover:underline">Главная</a>
+      <a href="/" class="hover:underline">Главная</a>
       <span class="text-gray-300 dark:text-gray-700">·</span>
-      <a href="#profile" onclick="if(!currentUser){event.preventDefault();openAuth('#profile')}" class="hover:underline">Профиль</a>
+      <a href="/profile" class="hover:underline">Профиль</a>
       <span class="text-gray-300 dark:text-gray-700">·</span>
-      <a href="#create" onclick="if(!currentUser){event.preventDefault();openAuth('#create')}" class="hover:underline">Создать пост</a>
+      <a href="/create" class="hover:underline">Создать пост</a>
       <span class="text-gray-300 dark:text-gray-700">·</span>
       <a href="#" onclick="event.preventDefault(); openStats();" class="hover:text-blue-500 font-medium">Статус БД</a>
     </div>
@@ -922,12 +882,45 @@ let currentSortOrder = 'new';
 let pendingImages = [];
 let isDataLoaded = false;
 let editingPostId = null;
-let activeCreateFont = 'font-serif-custom';
 let previewScale = 1;
-let pendingHash = null;
+let pendingNav = null;
 
 const MAX_TEXT = 10000;
 const MAX_IMAGES = 5;
+const DEFAULT_FONT = 'font-serif-custom';
+
+// =============================================================
+//  Navigation (History API)
+// =============================================================
+function navigate(path, opts = {}) {
+  if (!path.startsWith('/')) path = '/' + path;
+  if (path === location.pathname + location.search && !opts.force) return;
+  try {
+    if (opts.replace) history.replaceState({}, '', path);
+    else history.pushState({}, '', path);
+  } catch (e) { location.href = path; return; }
+  router();
+  window.scrollTo(0, 0);
+}
+window.navigate = navigate;
+
+window.addEventListener('popstate', () => {
+  router();
+  window.scrollTo(0, 0);
+});
+
+// Перехват внутренних ссылок
+document.addEventListener('click', e => {
+  if (e.defaultPrevented) return;
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target.closest('a[href]');
+  if (!a) return;
+  const href = a.getAttribute('href');
+  if (!href || !href.startsWith('/')) return;
+  if (a.target === '_blank' || a.hasAttribute('download')) return;
+  e.preventDefault();
+  navigate(href);
+});
 
 // =============================================================
 //  Helpers
@@ -971,13 +964,12 @@ function formatPostText(text) {
   if (!text) return '';
   let p = sanitizeHTML(text);
   p = p.replace(/!([a-zA-Z0-9_\-]{1,32})/g,
-    '<a href="#/@$1" onclick="event.stopPropagation(); navigateToProfile(\'$1\'); return false;" class="text-blue-500 font-medium hover:underline">!$1</a>');
+    '<a href="/u/$1" class="text-blue-500 font-medium hover:underline">!$1</a>');
   return p.replace(/\n/g, '<br>');
 }
 
-function goHome() { location.hash = ''; router(); }
-function navigateToProfile(u) { location.hash = '/@' + u; }
-window.navigateToProfile = navigateToProfile;
+function profileUrl(u) { return '/u/' + encodeURIComponent(u); }
+function postUrl(id)    { return '/p/' + encodeURIComponent(id); }
 
 // =============================================================
 //  Image preview
@@ -1019,7 +1011,7 @@ window.downloadPreview = async function() {
 window.downloadImage = window.downloadPreview;
 
 // =============================================================
-//  Carousel — большие стрелки
+//  Carousel
 // =============================================================
 function generateCarouselHTML(postId, images) {
   if (!images || !images.length) return '';
@@ -1059,11 +1051,10 @@ window.scrollCarousel = function(postId, dir) {
 };
 
 // =============================================================
-//  Data loading (оптимизировано: параллельно + кэш)
+//  Data loading
 // =============================================================
 let _dataPromise = null;
 async function fetchAllData() {
-  // дедупликация параллельных вызовов
   if (_dataPromise) return _dataPromise;
   _dataPromise = (async () => {
     try {
@@ -1083,39 +1074,40 @@ async function fetchAllData() {
   try { await _dataPromise; } finally { _dataPromise = null; }
 }
 
-// точечное обновление без полного перезапроса
-async function refreshProfiles() {
-  try {
-    profilesData = await api('/api/profiles') || {};
-    updateUserInterface();
-  } catch (e) { console.warn('profiles refresh failed', e); }
-}
-
 // =============================================================
-//  Router
+//  Router (path-based)
 // =============================================================
-window.addEventListener('hashchange', router);
-
 function router() {
-  const hash = location.hash;
+  const path = location.pathname;
   updateMobileNav();
 
-  if (hash === '#create' || hash.startsWith('#edit/')) {
-    if (!currentUser) { openAuth(hash); return; }
-    renderCreateOrEditPage();
+  // /create и /edit/{id}
+  const editMatch = path.match(/^\/edit\/([^/]+)\/?$/);
+  if (path === '/create' || path === '/create/' || editMatch) {
+    if (!currentUser) { pendingNav = path; openAuth(); return; }
+    renderCreateOrEditPage(editMatch ? decodeURIComponent(editMatch[1]) : null);
     return;
   }
-  if (hash.startsWith('#/@')) {
-    renderProfilePage(decodeURIComponent(hash.substring(3)).trim(), false);
+
+  // /u/{username}
+  const uMatch = path.match(/^\/u\/([^/]+)\/?$/);
+  if (uMatch) {
+    renderProfilePage(decodeURIComponent(uMatch[1]), false);
     return;
   }
-  if (hash === '#profile' || hash === '#profile/edit') {
-    if (!currentUser) { openAuth('#profile'); return; }
+
+  // /profile  и  /profile/edit
+  if (path === '/profile' || path === '/profile/' ||
+      path === '/profile/edit' || path === '/profile/edit/') {
+    if (!currentUser) { pendingNav = path; openAuth(); return; }
     renderProfilePage(currentUser, true);
     return;
   }
-  if (hash.length > 1 && hash !== '#/') {
-    const id = decodeURIComponent(hash.substring(1)).trim();
+
+  // /p/{id}
+  const pMatch = path.match(/^\/p\/([^/]+)\/?$/);
+  if (pMatch) {
+    const id = decodeURIComponent(pMatch[1]);
     let post = database.find(p => p.id === id);
     if (post) { renderSinglePost(post); return; }
     api(`/api/posts/${id}`).then(p => {
@@ -1125,31 +1117,50 @@ function router() {
     }).catch(() => showPostNotFoundError());
     return;
   }
-  renderMainFeed();
+
+  // /
+  if (path === '/' || path === '' || path === '/index.html') {
+    renderMainFeed();
+    return;
+  }
+
+  // неизвестный путь → 404 → home
+  renderNotFound();
 }
 
 function showPostNotFoundError() {
   const m = document.getElementById('errorModal');
   m.classList.remove('hidden');
-  document.getElementById('closeErrorBtn').onclick = () => { m.classList.add('hidden'); goHome(); };
+  document.getElementById('closeErrorBtn').onclick = () => { m.classList.add('hidden'); navigate('/'); };
+}
+
+function renderNotFound() {
+  document.title = 'Не найдено — СЛД';
+  document.getElementById('appContent').innerHTML = `
+    <div class="bg-white dark:bg-gray-900 rounded-3xl p-8 text-center shadow-sm border border-gray-100 dark:border-gray-800 animate-fade-in">
+      <div class="text-5xl mb-3">🤷</div>
+      <h2 class="text-lg font-semibold mb-1">Страница не найдена</h2>
+      <p class="text-xs text-gray-500 mb-5">Возможно, ссылка устарела.</p>
+      <a href="/" class="inline-block bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-5 py-2.5 rounded-xl text-sm font-medium">На главную</a>
+    </div>`;
 }
 
 // =============================================================
-//  Mobile nav — компактная, ничего не вылезает
+//  Mobile nav
 // =============================================================
 function updateMobileNav() {
   const nav = document.getElementById('mobileBottomNav');
-  const hash = location.hash;
+  const path = location.pathname;
 
   const itemCls = active =>
     `bottom-item ${active ? 'text-gray-900 dark:text-white font-semibold' : 'text-gray-400 dark:text-gray-500'} transition-colors`;
 
-  const home = `<a href="#/" onclick="event.preventDefault();goHome()" class="${itemCls(!hash||hash==='#/'||hash==='#')}">
+  const home = `<a href="/" class="${itemCls(path === '/' || path === '')}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M3 12l2-2 7-7 7 7M5 10v10h4v-6h6v6h4V10"/>
       </svg><span>Главная</span></a>`;
 
-  const create = `<a href="#create" onclick="if(!currentUser){event.preventDefault();openAuth('#create')}" class="${itemCls(hash==='#create')}">
+  const create = `<a href="/create" class="${itemCls(path === '/create')}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>
       </svg><span>Создать</span></a>`;
@@ -1160,11 +1171,11 @@ function updateMobileNav() {
       </svg><span>Статус</span></button>`;
 
   const profile = currentUser
-    ? `<a href="#profile" class="${itemCls(hash.startsWith('#profile'))}">
+    ? `<a href="/profile" class="${itemCls(path === '/profile' || path.startsWith('/u/'))}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM12 14a7 7 0 0 0-7 7h14a7 7 0 0 0-7-7z"/>
         </svg><span>Профиль</span></a>`
-    : `<button onclick="openAuth('#profile')" class="${itemCls(false)}">
+    : `<button onclick="openAuth('/profile')" class="${itemCls(false)}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M11 16l-4-4m0 0l4-4m-4 4h14M18 20v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h7a3 3 0 0 1 3 3v1"/>
         </svg><span>Вход</span></button>`;
@@ -1183,7 +1194,7 @@ function renderMainFeed() {
     <section class="hidden sm:block bg-white dark:bg-gray-900 rounded-3xl shadow-sm border border-gray-100 dark:border-gray-800 p-5 mb-6">
       <div class="flex items-center justify-between gap-3">
         <p class="text-sm text-gray-500">Хотите поделиться мыслью?</p>
-        <a href="#create" class="shrink-0 bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-5 py-2.5 rounded-xl text-sm font-medium">Написать пост</a>
+        <a href="/create" class="shrink-0 bg-gray-900 dark:bg-white text-white dark:text-gray-900 px-5 py-2.5 rounded-xl text-sm font-medium">Написать пост</a>
       </div>
     </section>` : ''}
 
@@ -1243,28 +1254,26 @@ function renderDBList() {
       : `<div class="w-9 h-9 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono-custom text-xs font-bold">${esc(prof.avatar)}</div>`;
 
     return `
-    <article id="post-${entry.id}" onclick="location.hash='${escAttr(entry.id)}'"
-             class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-6 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md transition cursor-pointer animate-fade-in">
+    <article id="post-${entry.id}" class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-6 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md transition animate-fade-in">
       <div class="flex justify-between items-center mb-3 sm:mb-4 gap-2">
         <div class="flex items-center gap-3 min-w-0">
-          <div onclick="event.stopPropagation();navigateToProfile('${escAttr(entry.author)}')" class="shrink-0">${av}</div>
+          <a href="${profileUrl(entry.author)}" class="shrink-0">${av}</a>
           <div class="min-w-0">
-            <span onclick="event.stopPropagation();navigateToProfile('${escAttr(entry.author)}')"
-                  class="text-sm font-semibold hover:underline cursor-pointer block truncate">
+            <a href="${profileUrl(entry.author)}" class="text-sm font-semibold hover:underline block truncate">
               ${esc(prof.name)} <span class="font-normal text-gray-500">(@${esc(entry.author)})</span>
-            </span>
+            </a>
             <span class="text-[10px] text-gray-400 block">${esc(entry.timestamp)}</span>
           </div>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
-          ${isOwn ? `<button onclick="event.stopPropagation();location.hash='edit/${escAttr(entry.id)}'" title="Редактировать"
+          ${isOwn ? `<a href="/edit/${escAttr(entry.id)}" onclick="event.stopPropagation()" title="Редактировать"
                             class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl transition">
             <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
-          </button>` : ''}
-          <button onclick="event.stopPropagation();copyPostLink('${escAttr(entry.id)}')" title="Копировать ссылку"
+          </a>` : ''}
+          <button onclick="copyPostLink('${escAttr(entry.id)}')" title="Копировать ссылку"
                   class="text-gray-400 hover:text-gray-700 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl transition">
             <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect width="14" height="14" x="8" y="8" rx="2"/>
@@ -1273,9 +1282,11 @@ function renderDBList() {
           </button>
         </div>
       </div>
-      ${entry.title ? `<h3 class="text-base sm:text-lg font-bold mb-2 break-words">${esc(entry.title)}</h3>` : ''}
-      ${car}
-      ${entry.text ? `<div class="text-sm sm:text-base ${esc(entry.font)} leading-relaxed mb-2 line-clamp-4 break-words">${formatPostText(entry.text)}</div>` : ''}
+      <a href="${postUrl(entry.id)}" class="block">
+        ${entry.title ? `<h3 class="text-base sm:text-lg font-bold mb-2 break-words text-gray-900 dark:text-gray-100">${esc(entry.title)}</h3>` : ''}
+        ${car}
+        ${entry.text ? `<div class="text-sm sm:text-base ${esc(entry.font)} leading-relaxed mb-2 line-clamp-4 break-words">${formatPostText(entry.text)}</div>` : ''}
+      </a>
       ${tags ? `<div class="flex flex-wrap gap-1.5 pt-2.5 border-t border-gray-50 dark:border-gray-800 mt-2">${tags}</div>` : ''}
     </article>`;
   }).join('');
@@ -1284,7 +1295,7 @@ function renderDBList() {
 }
 
 window.setSearch = function(q) {
-  location.hash = '';
+  if (location.pathname !== '/') navigate('/');
   setTimeout(() => {
     const i = document.getElementById('searchInput');
     if (i) { i.value = q; renderDBList(); }
@@ -1309,30 +1320,29 @@ function renderSinglePost(entry) {
 
   document.getElementById('appContent').innerHTML = `
     <div class="mb-4 sm:mb-6">
-      <a href="#/" onclick="event.preventDefault();goHome()"
-         class="inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition">
+      <a href="/" class="inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition">
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
         Назад к ленте
       </a>
     </div>
     <div class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-8 shadow-sm border border-gray-100 dark:border-gray-800 animate-fade-in">
       <div class="flex items-center justify-between mb-5 sm:mb-6 pb-4 border-b border-gray-100 dark:border-gray-800 gap-3 flex-wrap">
-        <div class="flex items-center gap-3 cursor-pointer min-w-0" onclick="navigateToProfile('${escAttr(entry.author)}')">
+        <a href="${profileUrl(entry.author)}" class="flex items-center gap-3 min-w-0">
           ${av}
           <div class="min-w-0">
             <span class="text-sm font-bold block truncate">${esc(prof.name)} <span class="font-normal text-gray-500">(@${esc(entry.author)})</span></span>
             <span class="text-[11px] text-gray-400 block mt-0.5">${esc(entry.timestamp)}</span>
           </div>
-        </div>
+        </a>
         <div class="flex items-center gap-1.5">
           ${isOwn ? `
-          <button onclick="location.hash='edit/${escAttr(entry.id)}'" title="Редактировать"
+          <a href="/edit/${escAttr(entry.id)}" title="Редактировать"
                   class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-2.5 rounded-xl transition">
             <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
-          </button>
+          </a>
           <button onclick="deletePost('${escAttr(entry.id)}', true)" title="Удалить"
                   class="text-red-400 hover:text-red-600 bg-red-50 dark:bg-red-950/30 p-2.5 rounded-xl transition">
             <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1356,34 +1366,25 @@ function renderSinglePost(entry) {
 }
 
 // =============================================================
-//  Create / Edit page
+//  Create / Edit page  (без выбора шрифта)
 // =============================================================
-function renderCreateOrEditPage() {
-  const hash = location.hash;
-  const isEdit = hash.startsWith('#edit/');
-  editingPostId = isEdit ? hash.substring(6) : null;
+function renderCreateOrEditPage(editId) {
+  const isEdit = !!editId;
+  editingPostId = isEdit ? editId : null;
 
   let post = null;
   if (isEdit) {
     post = database.find(p => p.id === editingPostId);
-    if (!post) { showToast('Пост не найден'); goHome(); return; }
-    if (post.author !== currentUser) { showToast('Нет прав'); goHome(); return; }
+    if (!post) { showToast('Пост не найден'); navigate('/'); return; }
+    if (post.author !== currentUser) { showToast('Нет прав'); navigate('/'); return; }
   }
 
   document.title = isEdit ? 'Редактирование — СЛД' : 'Новая запись — СЛД';
-  activeCreateFont = post?.font || 'font-serif-custom';
   pendingImages = post ? [...(post.images || [])] : [];
-
-  const fonts = [
-    ['font-sans-custom','Sans'],['font-serif-custom','Serif'],['font-mono-custom','Mono'],
-    ['font-playfair','Playfair'],['font-jetbrains','JetBrains'],['font-caveat','Caveat'],
-    ['font-montserrat','Montserrat'],['font-merriweather','Merriweather']
-  ];
 
   document.getElementById('appContent').innerHTML = `
     <div class="mb-4">
-      <a href="#/" onclick="event.preventDefault();goHome()"
-         class="inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-gray-100 dark:bg-gray-800 text-xs font-medium hover:bg-gray-200 dark:hover:bg-gray-700 transition">
+      <a href="/" class="inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-gray-100 dark:bg-gray-800 text-xs font-medium hover:bg-gray-200 dark:hover:bg-gray-700 transition">
         <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 19l-7-7 7-7"/></svg>
         Назад
       </a>
@@ -1409,16 +1410,8 @@ function renderCreateOrEditPage() {
              class="w-full text-base sm:text-lg font-bold bg-transparent outline-none placeholder-gray-400 mb-3 border-b border-transparent focus:border-gray-200 dark:focus:border-gray-800 transition-colors pb-1"
              placeholder="Заголовок (необязательно)">
 
-      <div class="flex items-center justify-between mb-3 pb-3 border-b border-gray-100 dark:border-gray-800 gap-2 flex-wrap">
-        <span class="text-xs text-gray-500 font-medium">Шрифт:</span>
-        <div class="flex items-center bg-gray-100 dark:bg-gray-800 p-1 rounded-xl text-[11px] font-medium overflow-x-auto max-w-full no-scrollbar">
-          ${fonts.map(([f,l]) => `<button type="button" data-font="${f}"
-            class="create-font-option px-2.5 py-1 rounded-lg whitespace-nowrap transition ${f===activeCreateFont?'bg-white dark:bg-gray-700 shadow-sm':''}">${l}</button>`).join('')}
-        </div>
-      </div>
-
       <textarea id="dataInput" maxlength="${MAX_TEXT}"
-                class="w-full h-40 sm:h-52 resize-none outline-none text-sm sm:text-base bg-transparent placeholder-gray-400 leading-relaxed ${activeCreateFont}"
+                class="w-full h-40 sm:h-52 resize-none outline-none text-sm sm:text-base bg-transparent placeholder-gray-400 leading-relaxed ${DEFAULT_FONT}"
                 placeholder="Напишите текст… (можно вставить картинку Ctrl+V)">${esc(post?.text||'')}</textarea>
 
       <div class="text-right text-[10px] text-gray-400 mt-1">
@@ -1491,17 +1484,6 @@ function initCreateEvents() {
   const dataInput = document.getElementById('dataInput');
   const charCount = document.getElementById('charCount');
 
-  document.querySelectorAll('.create-font-option').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.create-font-option')
-        .forEach(b => b.classList.remove('bg-white','dark:bg-gray-700','shadow-sm'));
-      btn.classList.add('bg-white','dark:bg-gray-700','shadow-sm');
-      activeCreateFont = btn.dataset.font;
-      dataInput.className = `w-full h-40 sm:h-52 resize-none outline-none text-sm sm:text-base bg-transparent placeholder-gray-400 leading-relaxed ${activeCreateFont}`;
-      forceRepaint(dataInput);
-    });
-  });
-
   let rafId = null;
   dataInput.addEventListener('input', () => {
     if (charCount) charCount.innerText = dataInput.value.length;
@@ -1525,7 +1507,6 @@ function initCreateEvents() {
     if (saveBtn) saveBtn.disabled = true;
     showToast('Загрузка…');
 
-    // Параллельная загрузка
     const results = await Promise.allSettled(files.map(async f => {
       const fd = new FormData();
       fd.append('file', f);
@@ -1538,7 +1519,7 @@ function initCreateEvents() {
     let ok = 0;
     for (const r of results) {
       if (r.status === 'fulfilled') { pendingImages.push(r.value); ok++; }
-      else showToast('Ошибка: ' + r.reason?.message);
+      else showToast('Ошибка: ' + (r.reason?.message || ''));
     }
 
     if (saveBtn) saveBtn.disabled = false;
@@ -1572,7 +1553,7 @@ function initCreateEvents() {
     const body = {
       title, text,
       tags: tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [],
-      font: activeCreateFont,
+      font: DEFAULT_FONT,
       image_urls: pendingImages,
     };
 
@@ -1587,15 +1568,16 @@ function initCreateEvents() {
         updated.timestamp = fmtDate(updated.timestamp);
         if (idx >= 0) database[idx] = updated;
         showToast('Обновлено');
+        editingPostId = null;
+        navigate(postUrl(updated.id));
       } else {
         const created = await api('/api/posts', { method:'POST', body: JSON.stringify(body) });
         created.timestamp = fmtDate(created.timestamp);
         database.unshift(created);
         showToast('Опубликовано');
+        navigate('/');
       }
       pendingImages = [];
-      editingPostId = null;
-      goHome();
     } catch (e) {
       showToast('Ошибка: ' + e.message);
       btn.disabled = false;
@@ -1608,7 +1590,7 @@ function initCreateEvents() {
 // =============================================================
 function renderProfilePage(username, isOwn) {
   const prof = profilesData[username] || { name: username, avatar: '^_^', bio: '', status: '', avatar_url: '' };
-  const isEditing = isOwn && location.hash === '#profile/edit';
+  const isEditing = isOwn && (location.pathname === '/profile/edit' || location.pathname === '/profile/edit/');
   document.title = `${prof.name} (@${username}) — СЛД`;
 
   const userPosts = database.filter(p => p.author === username);
@@ -1618,7 +1600,7 @@ function renderProfilePage(username, isOwn) {
 
   document.getElementById('appContent').innerHTML = `
     <div class="mb-4 hidden sm:block">
-      <a href="#/" onclick="event.preventDefault();goHome()" class="text-xs font-medium text-gray-500 hover:underline">← Назад к ленте</a>
+      <a href="/" class="text-xs font-medium text-gray-500 hover:underline">← Назад к ленте</a>
     </div>
     <div class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-8 shadow-sm border border-gray-100 dark:border-gray-800 mb-6 sm:mb-8 animate-fade-in">
       <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4 sm:gap-6 justify-between">
@@ -1636,7 +1618,7 @@ function renderProfilePage(username, isOwn) {
         </div>
         <div class="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 pt-4 sm:pt-0 border-gray-100 dark:border-gray-800 mt-2 sm:mt-0 shrink-0">
           ${isOwn ? `
-            <a href="${isEditing ? '#profile' : '#profile/edit'}"
+            <a href="${isEditing ? '/profile' : '/profile/edit'}"
                class="flex-1 sm:flex-none text-center bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-medium transition">
               ${isEditing ? 'Закрыть' : 'Настройки'}
             </a>
@@ -1708,20 +1690,19 @@ function renderProfilePage(username, isOwn) {
     <div class="space-y-4">
       ${userPosts.length === 0 ? `<div class="text-center py-10 text-gray-400 text-xs">Пока пусто</div>` : ''}
       ${userPosts.map(entry => `
-        <article id="post-${entry.id}" onclick="location.hash='${escAttr(entry.id)}'"
-                 class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-5 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md cursor-pointer animate-fade-in">
+        <article id="post-${entry.id}" class="bg-white dark:bg-gray-900 rounded-2xl sm:rounded-3xl p-4 sm:p-5 shadow-sm border border-gray-100 dark:border-gray-800 hover:shadow-md animate-fade-in">
           <div class="flex justify-between items-center mb-3 gap-2">
-            <span class="text-[11px] text-gray-400">${esc(entry.timestamp)}</span>
+            <a href="${postUrl(entry.id)}" class="text-[11px] text-gray-400 hover:underline">${esc(entry.timestamp)}</a>
             <div class="flex items-center gap-1.5 shrink-0">
               ${isOwn ? `
-              <button onclick="event.stopPropagation();location.hash='edit/${escAttr(entry.id)}'" title="Редактировать"
+              <a href="/edit/${escAttr(entry.id)}" title="Редактировать"
                       class="text-gray-400 hover:text-blue-500 bg-gray-50 dark:bg-gray-800 p-2 rounded-xl transition">
                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                   <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                 </svg>
-              </button>
-              <button onclick="event.stopPropagation();deletePost('${escAttr(entry.id)}')" title="Удалить"
+              </a>
+              <button onclick="deletePost('${escAttr(entry.id)}')" title="Удалить"
                       class="text-red-400 hover:text-red-600 bg-red-50 dark:bg-red-950/30 p-2 rounded-xl transition">
                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
@@ -1729,9 +1710,11 @@ function renderProfilePage(username, isOwn) {
               </button>` : ''}
             </div>
           </div>
-          ${entry.title ? `<h3 class="text-base font-bold mb-2 break-words">${esc(entry.title)}</h3>` : ''}
-          ${generateCarouselHTML(entry.id, entry.images)}
-          ${entry.text ? `<div class="text-sm sm:text-base ${esc(entry.font)} leading-relaxed mb-2 line-clamp-3 break-words">${formatPostText(entry.text)}</div>` : ''}
+          <a href="${postUrl(entry.id)}" class="block">
+            ${entry.title ? `<h3 class="text-base font-bold mb-2 break-words text-gray-900 dark:text-gray-100">${esc(entry.title)}</h3>` : ''}
+            ${generateCarouselHTML(entry.id, entry.images)}
+            ${entry.text ? `<div class="text-sm sm:text-base ${esc(entry.font)} leading-relaxed mb-2 line-clamp-3 break-words">${formatPostText(entry.text)}</div>` : ''}
+          </a>
         </article>`).join('')}
     </div>`;
 
@@ -1775,8 +1758,7 @@ function initProfileEditEvents() {
       await api('/api/profiles/me', { method:'PUT', body: JSON.stringify(body) });
       profilesData[currentUser] = { ...(profilesData[currentUser]||{}), ...body, name: body.name || currentUser };
       showToast('Сохранено');
-      location.hash = '#profile';
-      router();
+      navigate('/profile');
     } catch (err) { showToast('Ошибка: ' + err.message); }
   });
 }
@@ -1799,13 +1781,13 @@ window.deletePost = async function(postId, fromSingle) {
     database = database.filter(p => p.id !== postId);
     const removed = r.files_removed || 0;
     showToast(removed ? `Удалено (файлов: ${removed})` : 'Удалено');
-    if (fromSingle) goHome();
+    if (fromSingle) navigate('/');
     else router();
   } catch (e) { showToast('Ошибка: ' + e.message); }
 };
 
 window.copyPostLink = function(id) {
-  const url = `${location.origin}${location.pathname}#${id}`;
+  const url = `${location.origin}${postUrl(id)}`;
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(url).then(
       () => showToast('Ссылка скопирована'),
@@ -1826,7 +1808,7 @@ function legacyCopy(text) {
 }
 
 // =============================================================
-//  Stats modal
+//  Stats
 // =============================================================
 window.openStats = async function() {
   const m = document.getElementById('statsModal');
@@ -1877,8 +1859,8 @@ function fmtBytes(b) {
 // =============================================================
 //  Auth UI
 // =============================================================
-window.openAuth = function(hash) {
-  pendingHash = hash || null;
+window.openAuth = function(navTo) {
+  pendingNav = navTo || pendingNav || null;
   const m = document.getElementById('authModal');
   m.classList.remove('hidden');
   document.getElementById('authError').classList.add('hidden');
@@ -1887,14 +1869,16 @@ window.openAuth = function(hash) {
 
 document.getElementById('closeAuthModal').addEventListener('click', () => {
   document.getElementById('authModal').classList.add('hidden');
-  pendingHash = null;
+  pendingNav = null;
+  // если мы уже не на '/' — вернёмся
+  if (location.pathname !== '/') navigate('/', { replace: true });
 });
 
 window.logoutUser = async function() {
   try { await api('/api/auth/logout', { method:'POST' }); } catch {}
   currentUser = null; currentUserId = null;
   updateUserInterface();
-  goHome();
+  navigate('/');
   showToast('Вы вышли');
 };
 
@@ -1908,7 +1892,7 @@ function updateUserInterface() {
       : `<div class="w-7 h-7 rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center font-mono text-[10px] font-bold">${esc(prof.avatar)}</div>`;
     area.innerHTML = `
       <div class="flex items-center gap-2">
-        <a href="#profile" class="text-xs sm:text-sm hover:underline flex items-center gap-2 font-medium">
+        <a href="/profile" class="text-xs sm:text-sm hover:underline flex items-center gap-2 font-medium">
           ${av}<span class="max-w-[120px] truncate">${esc(currentUser)}</span>
         </a>
         <button onclick="logoutUser()" title="Выйти"
@@ -1979,11 +1963,10 @@ document.getElementById('authForm').addEventListener('submit', async e => {
 
     await fetchAllData();
 
-    if (pendingHash) {
-      const target = pendingHash;
-      pendingHash = null;
-      location.hash = target;
-      router();
+    if (pendingNav) {
+      const target = pendingNav;
+      pendingNav = null;
+      navigate(target, { force: true });
     }
   } catch (err) {
     errBox.innerText = err.message || 'Ошибка';
@@ -1998,7 +1981,6 @@ document.getElementById('authForm').addEventListener('submit', async e => {
 //  Boot
 // =============================================================
 (async function boot() {
-  // Параллельно: проверка сессии + предзагрузка данных + шрифты
   const [meRes] = await Promise.allSettled([
     api('/api/auth/me'),
     (async () => { try { await document.fonts.ready; } catch {} })(),
@@ -2009,25 +1991,21 @@ document.getElementById('authForm').addEventListener('submit', async e => {
     currentUserId = meRes.value.id;
   }
 
-  // Плавно скрываем overlay
   const ov = document.getElementById('loadingOverlay');
   ov.style.transition = 'opacity .3s ease';
   ov.style.opacity = '0';
   setTimeout(() => ov.remove(), 320);
 
-  // Данные грузим после — overlay уже не мешает
-  await fetchAllData();
+  await fetchAllData();   // внутри вызовет router()
 })();
 </script>
 </body>
 </html>"""
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
-
-
+# --------------------------------------------------------------------------- #
+# Routes: catch-all в самом конце
+# --------------------------------------------------------------------------- #
 @app.get("/favicon.ico")
 async def favicon():
     svg = (
@@ -2038,6 +2016,19 @@ async def favicon():
         b'</text></svg>'
     )
     return Response(content=svg, media_type="image/svg+xml")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_PAGE
+
+
+# SPA catch-all — любой фронтовый путь отдаёт тот же HTML
+# ВАЖНО: объявлен последним, чтобы не перехватывать /api/* и /favicon.ico
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa(full_path: str):
+    # /api/* и /favicon.ico сюда не дойдут (свои роуты выше)
+    return HTML_PAGE
 
 
 if __name__ == "__main__":
