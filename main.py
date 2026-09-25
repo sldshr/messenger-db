@@ -23,7 +23,8 @@ users: dict = {}         # username -> {"password": str}
 tokens: dict = {}        # token -> username
 messages: list = []      # {"id","from","to","text","ts","read"}
 friends: dict = {}       # user -> set(user)
-requests: dict = {}      # from_user -> set(to_user)  (исходящие заявки)
+requests: dict = {}      # from_user -> set(to_user) — исходящие заявки
+last_seen: dict = {}     # username -> timestamp последнего отключения
 
 
 # ==================================================================
@@ -44,12 +45,13 @@ def remove_friends(a: str, b: str):
 
 
 def unread_count(user: str, peer: str) -> int:
-    return sum(1 for m in messages if m["from"] == peer and m["to"] == user and not m["read"])
+    return sum(1 for m in messages
+               if m["from"] == peer and m["to"] == user and not m["read"])
 
 
 class WSManager:
     def __init__(self):
-        self.conns: dict = {}
+        self.conns: dict = {}   # username -> WebSocket
 
     async def add(self, user: str, ws: WebSocket):
         old = self.conns.get(user)
@@ -64,6 +66,9 @@ class WSManager:
         if self.conns.get(user) is ws:
             self.conns.pop(user, None)
 
+    def is_online(self, user: str) -> bool:
+        return user in self.conns
+
     async def send(self, user: str, data: dict) -> bool:
         ws = self.conns.get(user)
         if ws is None:
@@ -76,6 +81,19 @@ class WSManager:
 
 
 manager = WSManager()
+
+
+async def notify_friends_status(user: str, online: bool):
+    """Сообщаем всем друзьям, что user появился/ушел."""
+    for f in list(friends.get(user, set())):
+        if online:
+            await manager.send(f, {"type": "user_online", "user": user})
+        else:
+            await manager.send(f, {
+                "type": "user_offline",
+                "user": user,
+                "ts": last_seen.get(user, time.time()),
+            })
 
 
 # ==================================================================
@@ -163,6 +181,18 @@ async def get_friends(user: str = Depends(current_user)):
     return {"friends": fl, "incoming": incoming, "outgoing": outgoing}
 
 
+@app.get("/api/status")
+async def get_statuses(user: str = Depends(current_user)):
+    """Текущий онлайн-статус всех друзей + last_seen для оффлайна."""
+    out = {}
+    for f in friends.get(user, set()):
+        out[f] = {
+            "online": manager.is_online(f),
+            "lastSeen": last_seen.get(f, 0),
+        }
+    return out
+
+
 @app.post("/api/friends/request")
 async def friend_request(data: TargetData, user: str = Depends(current_user)):
     t = data.target
@@ -174,8 +204,14 @@ async def friend_request(data: TargetData, user: str = Depends(current_user)):
         # встречная заявка — сразу друзья
         requests[t].discard(user)
         add_friends(user, t)
+        # статус обеим сторонам
         await manager.send(t, {"type": "friends_changed"})
         await manager.send(user, {"type": "friends_changed"})
+        # оповестим о онлайне друг друга
+        if manager.is_online(user):
+            await manager.send(t, {"type": "user_online", "user": user})
+        if manager.is_online(t):
+            await manager.send(user, {"type": "user_online", "user": t})
         return {"ok": True, "status": "friend"}
     requests.setdefault(user, set()).add(t)
     await manager.send(t, {"type": "friends_changed"})
@@ -191,6 +227,10 @@ async def friend_accept(data: TargetData, user: str = Depends(current_user)):
     add_friends(user, f)
     await manager.send(f, {"type": "friends_changed"})
     await manager.send(user, {"type": "friends_changed"})
+    if manager.is_online(user):
+        await manager.send(f, {"type": "user_online", "user": user})
+    if manager.is_online(f):
+        await manager.send(user, {"type": "user_online", "user": f})
     return {"ok": True}
 
 
@@ -213,10 +253,18 @@ async def friend_cancel(data: TargetData, user: str = Depends(current_user)):
 
 @app.post("/api/friends/remove")
 async def friend_remove(data: TargetData, user: str = Depends(current_user)):
+    """Удаляем из друзей + стираем всю переписку между ними."""
     t = data.target
     remove_friends(user, t)
+    # удаляем сообщения
+    global messages
+    messages[:] = [m for m in messages
+                   if not ((m["from"] == user and m["to"] == t) or
+                           (m["from"] == t and m["to"] == user))]
     await manager.send(t, {"type": "friends_changed"})
+    await manager.send(t, {"type": "chat_deleted", "peer": user})
     await manager.send(user, {"type": "friends_changed"})
+    await manager.send(user, {"type": "chat_deleted", "peer": t})
     return {"ok": True}
 
 
@@ -238,6 +286,7 @@ async def get_chats(user: str = Depends(current_user)):
             "lastText": (last["text"] if last else ""),
             "lastTs": (last["ts"] if last else 0),
             "lastFromMe": bool(last and last["from"] == user),
+            "online": manager.is_online(f),
         })
     result.sort(key=lambda x: (-x["lastTs"], x["username"].lower()))
     return result
@@ -311,8 +360,20 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
         return
     await websocket.accept()
     await manager.add(username, websocket)
+
     try:
-        await websocket.send_json({"type": "hello", "username": username})
+        # Отправляем клиенту приветствие и список друзей-онлайн
+        online = [f for f in friends.get(username, set()) if manager.is_online(f)]
+        ls = {f: last_seen.get(f, 0) for f in friends.get(username, set())}
+        await websocket.send_json({
+            "type": "online_list",
+            "users": online,
+            "last_seen": ls,
+        })
+
+        # Сообщаем друзьям, что мы онлайн
+        await notify_friends_status(username, True)
+
         while True:
             data = await websocket.receive_json()
             if isinstance(data, dict):
@@ -323,13 +384,17 @@ async def ws_endpoint(websocket: WebSocket, token: str = Query("")):
         pass
     finally:
         await manager.remove(username, websocket)
+        # Если у пользователя больше нет активных соединений — оффлайн
+        if not manager.is_online(username):
+            last_seen[username] = time.time()
+            await notify_friends_status(username, False)
 
 
 # ==================================================================
 #                     PWA / SERVICE WORKER / ИКОНКА
 # ==================================================================
 SW_JS = r"""
-const CACHE = 'msgr-v1';
+const CACHE = 'msgr-v3';
 self.addEventListener('install', e => { self.skipWaiting(); });
 self.addEventListener('activate', e => {
   e.waitUntil((async () => {
@@ -358,14 +423,22 @@ self.addEventListener('fetch', e => {
     }
   })());
 });
+
 self.addEventListener('notificationclick', e => {
+  const peer = (e.notification.data && e.notification.data.peer) || '';
   e.notification.close();
   e.waitUntil((async () => {
-    const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const c of list) {
-      if ('focus' in c) { await c.focus(); return; }
+    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const c of all) {
+      try {
+        c.postMessage({ type: 'notification_click', peer });
+        if ('focus' in c) await c.focus();
+        return;
+      } catch(_){}
     }
-    if (self.clients.openWindow) return self.clients.openWindow('/');
+    if (self.clients.openWindow) {
+      return self.clients.openWindow('/?peer=' + encodeURIComponent(peer));
+    }
   })());
 });
 """
@@ -426,83 +499,121 @@ HTML = r"""<!DOCTYPE html>
 <title>Мессенджер</title>
 <style>
 :root{
-  --bg:#ffffff;
-  --bg-elev:#f4f4f5;
-  --bg-soft:#fafafa;
-  --text:#111111;
-  --text-dim:#8a8a8e;
-  --border:#ececec;
-  --accent:#111111;
-  --accent-fg:#ffffff;
-  --bubble-me:#111111;
-  --bubble-me-fg:#ffffff;
-  --bubble-them:#f2f2f3;
-  --bubble-them-fg:#111111;
-  --danger:#e11d48;
-  --ok:#16a34a;
+  --bg:#ffffff; --bg-elev:#f4f4f5; --bg-soft:#fafafa;
+  --text:#111111; --text-dim:#8a8a8e; --border:#ececec;
+  --accent:#111111; --accent-fg:#ffffff;
+  --bubble-me:#111111; --bubble-me-fg:#ffffff;
+  --bubble-them:#f2f2f3; --bubble-them-fg:#111111;
+  --danger:#e11d48; --ok:#22c55e;
   --glass-bg:rgba(255,255,255,.72);
   --glass-border:rgba(255,255,255,.5);
   --shadow:0 8px 24px rgba(0,0,0,.06);
+  --app-h:100dvh;
 }
 [data-theme="dark"]{
-  --bg:#0b0b0c;
-  --bg-elev:#17171a;
-  --bg-soft:#101013;
-  --text:#f5f5f7;
-  --text-dim:#8e8e93;
-  --border:#232326;
-  --accent:#ffffff;
-  --accent-fg:#111111;
-  --bubble-me:#ffffff;
-  --bubble-me-fg:#111111;
-  --bubble-them:#1d1d20;
-  --bubble-them-fg:#f5f5f7;
-  --danger:#ff5c7a;
-  --ok:#34d058;
+  --bg:#0b0b0c; --bg-elev:#17171a; --bg-soft:#101013;
+  --text:#f5f5f7; --text-dim:#8e8e93; --border:#232326;
+  --accent:#ffffff; --accent-fg:#111111;
+  --bubble-me:#ffffff; --bubble-me-fg:#111111;
+  --bubble-them:#1d1d20; --bubble-them-fg:#f5f5f7;
+  --danger:#ff5c7a; --ok:#34d058;
   --glass-bg:rgba(15,15,17,.66);
   --glass-border:rgba(255,255,255,.08);
   --shadow:0 8px 24px rgba(0,0,0,.4);
 }
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{
-  height:100%;width:100%;
+  position:fixed;inset:0;
+  width:100%;height:100%;
+  overflow:hidden;
+  overscroll-behavior:none;
+  touch-action:none;
   background:var(--bg);color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
   font-size:17px;-webkit-font-smoothing:antialiased;
-  overscroll-behavior:none;
+  -webkit-touch-callout:none;
+  -webkit-user-select:none;user-select:none;
 }
-body{
-  position:fixed;top:0;left:0;right:0;bottom:0;
-  overflow:hidden;
-}
+input, textarea { -webkit-user-select:text; user-select:text; }
+
 #app{
-  position:fixed;top:0;left:0;right:0;
-  height:var(--app-h,100dvh);
-  display:block;overflow:hidden;
+  position:fixed;
+  top:0;left:0;right:0;
+  height:var(--app-h, 100dvh);
+  overflow:hidden;
+  touch-action:none;
   background:var(--bg);
 }
-.screen{
-  position:absolute;inset:0;display:none;flex-direction:column;
-  overflow:hidden;background:var(--bg);
-}
-.screen.active{display:flex}
 
-/* ---------- Общая шапка ---------- */
+/* ---------- Screens with transition ---------- */
+.screen{
+  position:absolute;inset:0;
+  display:flex;flex-direction:column;
+  overflow:hidden;background:var(--bg);
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .24s ease, visibility 0s linear .24s;
+  will-change:opacity, transform;
+}
+.screen.active{
+  opacity:1;visibility:visible;pointer-events:auto;
+  transition:opacity .24s ease, visibility 0s;
+}
+#chat{
+  transform:translateX(100%);
+  transition:opacity .22s ease, transform .3s cubic-bezier(.22,1,.36,1), visibility 0s linear .3s;
+}
+#chat.active{
+  transform:translateX(0);
+  transition:opacity .22s ease, transform .3s cubic-bezier(.22,1,.36,1), visibility 0s;
+}
+
+/* ---------- Topbar ---------- */
 .topbar{
-  flex-shrink:0;
-  display:flex;align-items:center;gap:6px;
-  padding:8px 8px;
+  flex-shrink:0;display:flex;align-items:center;gap:6px;
+  padding:8px;
   padding-top:calc(8px + env(safe-area-inset-top,0));
   border-bottom:1px solid var(--border);
   background:var(--bg);
-  min-height:56px;
-  z-index:5;
+  min-height:56px;z-index:5;
+  transition:background .2s, border-color .2s;
 }
 .topbar .title{
-  flex:1;font-size:20px;font-weight:700;letter-spacing:-.3px;
+  flex:1;display:flex;align-items:center;gap:10px;
+  font-size:20px;font-weight:700;letter-spacing:-.3px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  padding-left:6px;
 }
-.topbar .title.center{text-align:center;font-size:18px;font-weight:600}
+.topbar .title.center{
+  padding-left:0;text-align:center;font-size:17px;font-weight:600;
+  flex-direction:column;gap:0;align-items:center;justify-content:center;
+}
+.title-main{font-weight:inherit}
+.title-status{
+  font-size:12.5px;font-weight:500;color:var(--text-dim);
+  margin-top:1px;line-height:1.2;height:15px;
+  transition:color .2s;
+}
+.title-status.typing{color:var(--ok)}
+.title-status.online{color:var(--ok)}
+
+/* connection dot */
+.conn-dot{
+  width:9px;height:9px;border-radius:50%;
+  background:#c7c7cc;flex-shrink:0;
+  transition:background .3s, box-shadow .3s;
+  box-shadow:0 0 0 0 rgba(34,197,94,0);
+}
+.conn-dot.online{
+  background:var(--ok);
+  animation:pulse 2.2s infinite;
+}
+.conn-dot.connecting{background:#f59e0b}
+.conn-dot.offline{background:var(--danger)}
+@keyframes pulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.5)}
+  50%{box-shadow:0 0 0 6px rgba(34,197,94,0)}
+}
+
 .icon-btn{
   width:44px;height:44px;flex-shrink:0;border:none;background:transparent;
   display:flex;align-items:center;justify-content:center;
@@ -524,47 +635,66 @@ body{
 /* ---------- Bottom nav ---------- */
 .bottom-nav{
   flex-shrink:0;display:flex;
-  padding:6px 6px;
+  padding:6px;
   padding-bottom:calc(6px + env(safe-area-inset-bottom,0));
   border-top:1px solid var(--border);
-  background:var(--bg);
-  z-index:5;
+  background:var(--bg);z-index:5;
+  transition:background .2s, border-color .2s;
 }
 .nav-btn{
   flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:3px;padding:8px 4px;background:transparent;border:none;cursor:pointer;
   color:var(--text-dim);font-family:inherit;font-size:11.5px;font-weight:600;
-  border-radius:14px;transition:color .15s,background .15s,transform .1s;
+  border-radius:14px;
+  transition:color .18s, background .18s, transform .12s;
   position:relative;
 }
-.nav-btn:active{transform:scale(.95)}
+.nav-btn:active{transform:scale(.94)}
 .nav-btn.active{color:var(--text)}
 .nav-btn svg{width:24px;height:24px;stroke:currentColor;fill:none;
-  stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
+  transition:transform .2s}
+.nav-btn.active svg{transform:translateY(-1px)}
 .nav-btn .dot{
   position:absolute;top:6px;right:calc(50% - 18px);
   min-width:16px;height:16px;padding:0 4px;border-radius:8px;
   background:#ef4444;color:#fff;font-size:10px;font-weight:700;
   display:flex;align-items:center;justify-content:center;
+  animation:badgepop .25s ease;
 }
+@keyframes badgepop{from{transform:scale(0)}to{transform:scale(1)}}
 
 /* ---------- Page area ---------- */
 .page-area{flex:1;overflow:hidden;position:relative}
 .page{
-  position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden;
+  position:absolute;inset:0;display:flex;flex-direction:column;overflow:hidden;
+  opacity:0;pointer-events:none;visibility:hidden;
+  transition:opacity .2s ease, visibility 0s linear .2s;
 }
-.page.active{display:flex}
-.page-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.page.active{
+  opacity:1;pointer-events:auto;visibility:visible;
+  transition:opacity .22s ease, visibility 0s;
+}
+
+/* ---------- Scroll containers ---------- */
+.page-scroll, .messages, #auth{
+  overflow-y:auto;-webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;
+  touch-action:pan-y;
+}
 
 /* ---------- Segmented control ---------- */
 .segmented{
   display:flex;background:var(--bg-elev);border-radius:12px;
   padding:4px;margin:12px 16px 6px;
+  flex-shrink:0;
 }
 .seg{
   flex:1;padding:10px;border:none;background:transparent;border-radius:9px;
   font-size:14.5px;font-weight:600;color:var(--text-dim);cursor:pointer;
-  font-family:inherit;transition:all .2s;position:relative;
+  font-family:inherit;
+  transition:background .2s, color .2s, box-shadow .2s;
+  position:relative;
 }
 .seg.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.06)}
 .seg .badge-inline{
@@ -576,17 +706,27 @@ body{
 /* ---------- Rows ---------- */
 .row{
   display:flex;align-items:center;gap:14px;
-  padding:12px 16px;cursor:pointer;transition:background .15s;
-  -webkit-user-select:none;user-select:none;
+  padding:12px 16px;cursor:pointer;
+  transition:background .15s;
 }
 .row:active{background:var(--bg-soft)}
 .avatar{
+  position:relative;
   width:52px;height:52px;border-radius:50%;background:var(--bg-elev);
   display:flex;align-items:center;justify-content:center;
   font-weight:700;font-size:19px;color:var(--text-dim);flex-shrink:0;
   letter-spacing:.5px;
+  transition:background .2s;
 }
-[data-theme="dark"] .avatar{color:var(--text)}
+.avatar .online-dot{
+  position:absolute;bottom:-1px;right:-1px;
+  width:14px;height:14px;border-radius:50%;
+  background:var(--ok);
+  border:3px solid var(--bg);
+  box-sizing:content-box;
+  animation:dotin .25s ease;
+}
+@keyframes dotin{from{transform:scale(0)}to{transform:scale(1)}}
 .row-info{flex:1;min-width:0}
 .row-title{
   font-size:16.5px;font-weight:600;color:var(--text);
@@ -595,13 +735,16 @@ body{
 .row-sub{
   font-size:14px;color:var(--text-dim);margin-top:2px;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  transition:color .2s;
 }
+.row-sub.online{color:var(--ok);font-weight:500}
 .row-sub.italic{font-style:italic;opacity:.85}
 .row-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0}
 .badge{
   min-width:22px;height:22px;padding:0 7px;border-radius:11px;
   background:var(--text);color:var(--bg);font-size:12.5px;font-weight:700;
   display:flex;align-items:center;justify-content:center;
+  animation:badgepop .25s ease;
 }
 .row-time{font-size:12.5px;color:var(--text-dim)}
 .empty{
@@ -613,19 +756,21 @@ body{
   color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;
 }
 
-/* ---------- Small action buttons ---------- */
+/* ---------- Mini buttons ---------- */
 .mini-btn{
   border:none;font-family:inherit;font-size:13.5px;font-weight:600;
-  padding:8px 14px;border-radius:10px;cursor:pointer;transition:transform .1s,opacity .15s;
+  padding:8px 14px;border-radius:10px;cursor:pointer;
+  transition:transform .1s, opacity .15s, background .15s;
+  display:inline-flex;align-items:center;justify-content:center;gap:4px;
 }
 .mini-btn:active{transform:scale(.95)}
 .mini-btn.primary{background:var(--text);color:var(--bg)}
 .mini-btn.ghost{background:var(--bg-elev);color:var(--text)}
-.mini-btn.danger{background:transparent;color:var(--danger)}
+.mini-btn.danger{background:transparent;color:var(--danger);padding:8px}
 .mini-btn-row{display:flex;gap:8px;flex-shrink:0}
 
 /* ---------- Auth ---------- */
-#auth{justify-content:center;align-items:center;padding:24px;overflow-y:auto}
+#auth{justify-content:center;align-items:center;padding:24px}
 .auth-wrap{width:100%;max-width:380px;text-align:center;margin:auto}
 .logo{
   width:84px;height:84px;margin:0 auto 22px;background:var(--text);border-radius:26px;
@@ -645,7 +790,8 @@ body{
 .input-wrap{
   display:flex;align-items:center;gap:10px;background:var(--bg-elev);
   border-radius:13px;padding:0 14px;margin-bottom:11px;
-  border:1.5px solid transparent;transition:border-color .2s,background .2s;
+  border:1.5px solid transparent;
+  transition:border-color .2s,background .2s;
 }
 .input-wrap:focus-within{background:var(--bg);border-color:var(--text)}
 .input-wrap svg{width:19px;height:19px;stroke:var(--text-dim);flex-shrink:0;fill:none;
@@ -666,45 +812,46 @@ body{
 
 /* ---------- Chat ---------- */
 .messages{
-  flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
-  padding:16px 14px 8px;display:flex;flex-direction:column;gap:6px;
+  flex:1;padding:16px 14px 8px;
+  display:flex;flex-direction:column;gap:6px;
   background:var(--bg);
 }
 .msg{
   max-width:80%;padding:10px 15px;border-radius:20px;
   font-size:17.5px;line-height:1.42;word-wrap:break-word;overflow-wrap:anywhere;
-  white-space:pre-wrap;animation:pop .14s ease;
+  white-space:pre-wrap;
+  animation:pop .18s cubic-bezier(.22,1,.36,1);
 }
 @keyframes pop{from{transform:scale(.94);opacity:0}to{transform:scale(1);opacity:1}}
 .msg.me{align-self:flex-end;background:var(--bubble-me);color:var(--bubble-me-fg);
   border-bottom-right-radius:6px}
 .msg.them{align-self:flex-start;background:var(--bubble-them);color:var(--bubble-them-fg);
   border-bottom-left-radius:6px}
-.day-sep{align-self:center;font-size:12.5px;color:var(--text-dim);margin:8px 0 4px}
-.typing{align-self:flex-start;font-size:13px;color:var(--text-dim);
-  padding:2px 12px;height:16px;font-style:italic;opacity:0;transition:opacity .2s}
-.typing.on{opacity:1}
 
 .composer{
-  flex-shrink:0;display:flex;align-items:center;gap:8px;padding:10px 12px;
+  flex-shrink:0;display:flex;align-items:center;gap:8px;
+  padding:10px 12px;
   padding-bottom:calc(10px + env(safe-area-inset-bottom,0));
-  border-top:1px solid var(--border);background:var(--bg);
-  z-index:5;
+  border-top:1px solid var(--border);background:var(--bg);z-index:5;
+  transition:background .2s, border-color .2s;
 }
 .composer input{
   flex:1;padding:13px 18px;border:none;outline:none;background:var(--bg-elev);
   border-radius:24px;font-size:17px;font-family:inherit;color:var(--text);min-width:0;
+  transition:background .2s;
 }
 .composer input::placeholder{color:var(--text-dim)}
 .send-btn{
-  width:46px;height:46px;border-radius:50%;border:none;background:var(--text);
+  width:48px;height:48px;min-width:48px;border-radius:50%;border:none;
+  background:var(--text);color:var(--bg);
   display:flex;align-items:center;justify-content:center;cursor:pointer;
-  flex-shrink:0;transition:transform .1s,opacity .2s;color:var(--bg);
+  flex-shrink:0;
+  transition:transform .12s, opacity .2s, background .2s;
+  touch-action:manipulation;
 }
-.send-btn:active{transform:scale(.92)}
+.send-btn:active{transform:scale(.9)}
 .send-btn svg{width:20px;height:20px;stroke:currentColor;fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.send-btn:disabled{opacity:.4}
 
 /* ---------- Settings ---------- */
 .settings-group{margin:14px 12px;background:var(--bg-elev);border-radius:14px;overflow:hidden}
@@ -720,25 +867,28 @@ body{
 .switch::after{
   content:'';position:absolute;top:2.5px;left:2.5px;
   width:26px;height:26px;border-radius:50%;background:#fff;
-  transition:left .2s;box-shadow:0 1px 3px rgba(0,0,0,.2);
+  transition:left .2s cubic-bezier(.22,1,.36,1);
+  box-shadow:0 1px 3px rgba(0,0,0,.2);
 }
 .switch.on{background:var(--ok)}
 .switch.on::after{left:23.5px}
 .settings-user{display:flex;align-items:center;gap:14px;padding:18px 16px}
 .settings-user .avatar{width:58px;height:58px;font-size:22px}
 .settings-user-name{font-size:18px;font-weight:700}
-.settings-user-sub{font-size:13.5px;color:var(--text-dim);margin-top:2px}
+.settings-user-sub{font-size:13.5px;color:var(--text-dim);margin-top:2px;
+  display:flex;align-items:center;gap:6px}
+.settings-user-sub .conn-dot{width:8px;height:8px}
 .danger-btn{
   width:100%;padding:15px;background:transparent;color:var(--danger);
   border:none;border-radius:14px;font-size:16px;font-weight:600;
   cursor:pointer;font-family:inherit;
 }
-.danger-btn:active{background:var(--bg-elev)}
+.danger-btn:active{background:var(--bg-soft)}
 
 /* Search */
 .search-wrap{
   display:flex;align-items:center;gap:10px;background:var(--bg-elev);
-  border-radius:13px;padding:0 14px;margin:12px 16px 0;
+  border-radius:13px;padding:0 14px;margin:12px 16px 0;flex-shrink:0;
 }
 .search-wrap svg{width:19px;height:19px;stroke:var(--text-dim);fill:none;
   stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
@@ -755,12 +905,14 @@ body{
 
 /* ---------- Toast ---------- */
 .toast{
-  position:fixed;left:50%;bottom:calc(90px + env(safe-area-inset-bottom,0));
+  position:fixed;left:50%;bottom:calc(96px + env(safe-area-inset-bottom,0));
   transform:translateX(-50%) translateY(20px);
   background:var(--text);color:var(--bg);
   padding:11px 18px;border-radius:22px;font-size:14.5px;font-weight:600;
-  opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;
+  opacity:0;pointer-events:none;
+  transition:opacity .25s,transform .25s;
   z-index:9999;max-width:90vw;text-align:center;
+  will-change:opacity, transform;
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style>
@@ -800,7 +952,10 @@ body{
   <!-- ===================== MAIN ===================== -->
   <div id="main" class="screen">
     <header class="topbar glass">
-      <div class="title" id="main-title">Чаты</div>
+      <div class="title">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span class="title-main" id="main-title">Чаты</span>
+      </div>
       <button class="icon-btn" id="quick-theme" aria-label="Тема">
         <svg id="quick-theme-icon" viewBox="0 0 24 24"></svg>
       </button>
@@ -833,31 +988,28 @@ body{
               <div class="avatar" id="me-avatar">?</div>
               <div>
                 <div class="settings-user-name" id="me-name">—</div>
-                <div class="settings-user-sub">в сети</div>
+                <div class="settings-user-sub">
+                  <span class="conn-dot" id="me-conn-dot"></span>
+                  <span id="me-conn-text">подключение…</span>
+                </div>
               </div>
             </div>
           </div>
 
           <div class="settings-group">
             <div class="set-row">
-              <div>
-                <div class="set-label">Тёмная тема</div>
-                <div class="set-hint">Ночной режим интерфейса</div>
-              </div>
+              <div><div class="set-label">Тёмная тема</div>
+              <div class="set-hint">Ночной режим интерфейса</div></div>
               <div class="switch" id="set-theme"></div>
             </div>
             <div class="set-row">
-              <div>
-                <div class="set-label">Liquid Glass</div>
-                <div class="set-hint">Полупрозрачные панели с блюром</div>
-              </div>
+              <div><div class="set-label">Liquid Glass</div>
+              <div class="set-hint">Полупрозрачные панели с блюром</div></div>
               <div class="switch" id="set-glass"></div>
             </div>
             <div class="set-row">
-              <div>
-                <div class="set-label">Уведомления</div>
-                <div class="set-hint" id="notif-hint">Всплывающие оповещения о новых сообщениях</div>
-              </div>
+              <div><div class="set-label">Уведомления</div>
+              <div class="set-hint" id="notif-hint">Всплывающие оповещения</div></div>
               <div class="switch" id="set-notif"></div>
             </div>
           </div>
@@ -898,14 +1050,16 @@ body{
       <button class="icon-btn" id="chat-back" aria-label="Назад">
         <svg viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
       </button>
-      <div class="title center" id="chat-title">—</div>
+      <div class="title center">
+        <div class="title-main" id="chat-title">—</div>
+        <div class="title-status" id="chat-status"></div>
+      </div>
       <div style="width:44px"></div>
     </header>
     <div class="messages" id="messages"></div>
-    <div class="typing" id="typing"></div>
     <div class="composer glass">
       <input type="text" id="msg-input" placeholder="Сообщение..." maxlength="2000" autocomplete="off" enterkeyhint="send">
-      <button class="send-btn" id="send-btn" aria-label="Отправить">
+      <button class="send-btn" id="send-btn" type="button" aria-label="Отправить">
         <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
@@ -929,6 +1083,7 @@ const state = {
   notif: localStorage.getItem('m_notif') === '1',
   ws: null,
   wsReady: false,
+  wsState: 'connecting',   // connecting | online | offline
   reconnectTimer: null,
   page: 'home',
   friendsTab: 'friends',
@@ -942,17 +1097,17 @@ const state = {
   activeMsgs: [],
   seenIds: new Set(),
   friendCache: new Set(),
+  onlineUsers: new Set(),
+  lastSeen: {},
+  peerTyping: false,
+  peerTypingTimer: null,
+  pendingPeer: null,
 };
 
-// ---------- SVG icons ----------
 const ICONS = {
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>',
   moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
-  check: '<polyline points="20 6 9 17 4 12"/>',
-  x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
-  plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
   trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/>',
-  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
 };
 
 // ---------- Helpers ----------
@@ -973,6 +1128,23 @@ function fmtTime(ts){
   return dd + '.' + mm;
 }
 
+function fmtLastSeen(ts){
+  if (!ts) return 'не в сети';
+  const diff = Date.now()/1000 - ts;
+  if (diff < 45) return 'был(а) только что';
+  if (diff < 3600) return 'был(а) ' + Math.floor(diff/60) + ' мин назад';
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const hh = d.getHours().toString().padStart(2,'0');
+  const mm = d.getMinutes().toString().padStart(2,'0');
+  if (d.toDateString() === now.toDateString()) return 'был(а) в ' + hh + ':' + mm;
+  const yest = new Date(now); yest.setDate(now.getDate()-1);
+  if (d.toDateString() === yest.toDateString()) return 'был(а) вчера в ' + hh + ':' + mm;
+  const dd = d.getDate().toString().padStart(2,'0');
+  const mo = (d.getMonth()+1).toString().padStart(2,'0');
+  return 'был(а) ' + dd + '.' + mo + ' ' + hh + ':' + mm;
+}
+
 function toast(msg){
   const el = $('#toast');
   el.textContent = msg;
@@ -985,9 +1157,8 @@ function applyTheme(){
   document.documentElement.setAttribute('data-theme', state.theme);
   const meta = document.querySelector('meta[name=theme-color]');
   if (meta) meta.setAttribute('content', state.theme === 'dark' ? '#0b0b0c' : '#ffffff');
-  // quick toggle icon
   const icon = $('#quick-theme-icon');
-  icon.outerHTML = '<svg id="quick-theme-icon" viewBox="0 0 24 24">' + (state.theme === 'dark' ? ICONS.sun : ICONS.moon) + '</svg>';
+  if (icon) icon.outerHTML = '<svg id="quick-theme-icon" viewBox="0 0 24 24">' + (state.theme === 'dark' ? ICONS.sun : ICONS.moon) + '</svg>';
   const setSw = $('#set-theme');
   if (setSw) setSw.classList.toggle('on', state.theme === 'dark');
 }
@@ -1006,14 +1177,15 @@ function applyNotifUI(){
   setSw.classList.toggle('on', granted && state.notif);
   const hint = $('#notif-hint');
   if (hint){
-    if (!supported) hint.textContent = 'Не поддерживается браузером';
+    if (!supported) hint.textContent = 'Не поддерживается';
     else if (Notification.permission === 'denied') hint.textContent = 'Запрещено в браузере';
-    else if (granted) hint.textContent = 'Уведомления включены';
+    else if (granted && state.notif) hint.textContent = 'Уведомления включены';
+    else if (granted) hint.textContent = 'Уведомления выключены';
     else hint.textContent = 'Нажмите, чтобы разрешить';
   }
 }
 
-// ---------- Viewport fix (keyboard) ----------
+// ---------- Viewport ----------
 function updateViewport(){
   const vv = window.visualViewport;
   const h = vv ? vv.height : window.innerHeight;
@@ -1028,6 +1200,45 @@ if (window.visualViewport){
 }
 window.addEventListener('orientationchange', () => setTimeout(updateViewport, 200));
 updateViewport();
+
+// Защита от прокрутки body за пределами скролл-контейнеров
+document.addEventListener('touchmove', (e) => {
+  if (e.touches.length > 1) return;
+  let el = e.target;
+  while (el && el !== document.body && el !== document.documentElement){
+    if (el.classList && (
+      el.classList.contains('page-scroll') ||
+      el.classList.contains('messages') ||
+      el.classList.contains('screen-scroll') ||
+      (el.id === 'auth')
+    )){
+      return;
+    }
+    el = el.parentElement;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+// ---------- Connection status ----------
+function setWsState(s){
+  state.wsState = s;
+  const dot = $('#conn-dot');
+  const meDot = $('#me-conn-dot');
+  const meText = $('#me-conn-text');
+  if (dot){
+    dot.classList.remove('online','connecting','offline');
+    dot.classList.add(s);
+  }
+  if (meDot){
+    meDot.classList.remove('online','connecting','offline');
+    meDot.classList.add(s);
+  }
+  if (meText){
+    meText.textContent = s === 'online' ? 'в сети'
+                        : s === 'connecting' ? 'подключение…'
+                        : 'нет соединения';
+  }
+}
 
 // ---------- Auth ----------
 async function api(path, opts){
@@ -1091,14 +1302,18 @@ function doLogout(){
   state.activeMsgs = [];
   state.seenIds.clear();
   state.friendCache.clear();
+  state.onlineUsers.clear();
+  state.lastSeen = {};
+  state.peerTyping = false;
   if (state.ws){ try { state.ws.close(); } catch(e){} state.ws = null; }
   clearTimeout(state.reconnectTimer);
+  setWsState('offline');
   showScreen('auth');
 }
 
 $('#logout-btn').addEventListener('click', doLogout);
 
-// ---------- Screen / Page navigation ----------
+// ---------- Navigation ----------
 function showScreen(name){
   $$('.screen').forEach(s => s.classList.remove('active'));
   const el = document.getElementById(name);
@@ -1122,27 +1337,36 @@ async function enterApp(){
   $('#me-avatar').textContent = (state.username[0] || '?').toUpperCase();
   $('#me-name').textContent = state.username;
   applyTheme(); applyGlass(); applyNotifUI();
+  setWsState('connecting');
   connectWS();
   switchPage('home');
   showScreen('main');
   updateViewport();
-  // register SW
   if ('serviceWorker' in navigator){
     navigator.serviceWorker.register('/sw.js').catch(()=>{});
+  }
+  // обработка ?peer= после логина
+  if (state.pendingPeer){
+    const p = state.pendingPeer;
+    state.pendingPeer = null;
+    setTimeout(() => openChat(p), 300);
   }
 }
 
 // ---------- WS ----------
 function connectWS(){
   if (!state.token) return;
+  if (state.ws && (state.ws.readyState === 0 || state.ws.readyState === 1)) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = proto + '://' + location.host + '/ws?token=' + encodeURIComponent(state.token);
   let ws;
   try { ws = new WebSocket(url); } catch(e){ return; }
   state.ws = ws;
+  setWsState('connecting');
 
   ws.onopen = () => {
     state.wsReady = true;
+    setWsState('online');
   };
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch(_) { return; }
@@ -1151,10 +1375,16 @@ function connectWS(){
   ws.onclose = (e) => {
     state.wsReady = false;
     if (state.ws === ws) state.ws = null;
-    if (e.code === 4000) return; // replaced by another tab
+    if (e.code === 4000){
+      // заменены другой вкладкой — не переподключаемся
+      return;
+    }
     if (state.token){
+      setWsState('connecting');
       clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = setTimeout(connectWS, 1200 + Math.random() * 800);
+      state.reconnectTimer = setTimeout(connectWS, 1000 + Math.random() * 1000);
+    } else {
+      setWsState('offline');
     }
   };
   ws.onerror = () => {};
@@ -1169,26 +1399,43 @@ function wsSend(obj){
 
 // ---------- Server events ----------
 function handleServerEvent(m){
-  if (m.type === 'hello'){
+  if (m.type === 'online_list'){
+    state.onlineUsers = new Set(m.users || []);
+    state.lastSeen = Object.assign({}, m.last_seen || {});
+    refreshStatusUI();
+    return;
+  }
+  if (m.type === 'user_online'){
+    state.onlineUsers.add(m.user);
+    refreshStatusUI();
+    refreshChats();
+    return;
+  }
+  if (m.type === 'user_offline'){
+    state.onlineUsers.delete(m.user);
+    if (m.ts) state.lastSeen[m.user] = m.ts;
+    refreshStatusUI();
+    refreshChats();
     return;
   }
   if (m.type === 'message'){
-    // сохраняем только если диалог с этим пользователем открыт
     const peer = m.from === state.username ? m.to : m.from;
     if (state.activePeer === peer && !state.seenIds.has(m.id)){
       state.seenIds.add(m.id);
       state.activeMsgs.push({ id: m.id, from: m.from, text: m.text, ts: m.ts });
       appendMessage({ id: m.id, from: m.from, text: m.text, ts: m.ts });
-      scrollMessages(true);
+      scrollMessages();
       if (m.from !== state.username){
         wsSend({ type: 'read', peer });
+        // сбрасываем "печатает" — пришло сообщение
+        state.peerTyping = false;
+        clearTimeout(state.peerTypingTimer);
+        refreshStatusUI();
       }
     } else if (state.activePeer !== peer && m.from !== state.username){
-      // уведомление
       maybeNotify(m);
     }
-    // обновим список чатов
-    if (state.page === 'home') refreshChats();
+    if (state.page === 'home' && state.activePeer !== peer) refreshChats();
     return;
   }
   if (m.type === 'chat_read'){
@@ -1198,31 +1445,58 @@ function handleServerEvent(m){
   if (m.type === 'friends_changed'){
     refreshFriends();
     refreshChats();
+    // подтянем статусы новых друзей
+    fetchStatuses();
+    return;
+  }
+  if (m.type === 'chat_deleted'){
+    if (state.activePeer === m.peer){
+      state.activePeer = null;
+      state.activeMsgs = [];
+      state.seenIds.clear();
+      clearTimeout(state.peerTypingTimer);
+      showScreen('main');
+      toast('Чат удалён');
+    }
+    refreshChats();
     return;
   }
   if (m.type === 'typing'){
     if (m.from === state.activePeer){
-      const el = $('#typing');
-      el.textContent = 'печатает…';
-      el.classList.add('on');
-      clearTimeout(el._t);
-      el._t = setTimeout(() => el.classList.remove('on'), 2500);
+      state.peerTyping = true;
+      clearTimeout(state.peerTypingTimer);
+      state.peerTypingTimer = setTimeout(() => {
+        state.peerTyping = false;
+        refreshStatusUI();
+      }, 2600);
+      refreshStatusUI();
     }
   }
+}
+
+async function fetchStatuses(){
+  if (!state.token) return;
+  try {
+    const s = await api('/api/status');
+    state.onlineUsers = new Set();
+    Object.keys(s).forEach(k => {
+      if (s[k].online) state.onlineUsers.add(k);
+      if (s[k].lastSeen) state.lastSeen[k] = s[k].lastSeen;
+    });
+    refreshStatusUI();
+  } catch(e){}
 }
 
 function maybeNotify(m){
   if (!state.notif) return;
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
-  // не показываем если вкладка активна И открыт чат с этим пользователем
   if (!document.hidden && state.activePeer === m.from) return;
-  const title = m.from;
   const body = m.text.length > 80 ? m.text.slice(0, 77) + '…' : m.text;
   try {
     if (navigator.serviceWorker && navigator.serviceWorker.ready){
       navigator.serviceWorker.ready.then(reg => {
-        reg.showNotification(title, {
+        reg.showNotification(m.from, {
           body,
           tag: 'msg-' + m.from,
           renotify: true,
@@ -1232,9 +1506,31 @@ function maybeNotify(m){
         }).catch(()=>{});
       }).catch(()=>{});
     } else {
-      new Notification(title, { body, icon: '/icon.svg' });
+      new Notification(m.from, { body, icon: '/icon.svg' });
     }
   } catch(e){}
+}
+
+// ---------- Status UI ----------
+function refreshStatusUI(){
+  // шапка чата
+  if (state.activePeer){
+    const el = $('#chat-status');
+    if (state.peerTyping){
+      el.textContent = 'печатает…';
+      el.classList.add('typing');
+      el.classList.remove('online');
+    } else if (state.onlineUsers.has(state.activePeer)){
+      el.textContent = 'в сети';
+      el.classList.remove('typing');
+      el.classList.add('online');
+    } else {
+      el.textContent = fmtLastSeen(state.lastSeen[state.activePeer]);
+      el.classList.remove('typing','online');
+    }
+  }
+  // список чатов
+  renderChats();
 }
 
 // ---------- Chats (Home) ----------
@@ -1243,6 +1539,9 @@ async function refreshChats(){
   try {
     const list = await api('/api/chats');
     state.chats = list;
+    state.chats.forEach(c => {
+      c.online = state.onlineUsers.has(c.username);
+    });
     renderChats();
     updateDots();
   } catch(e){}
@@ -1256,31 +1555,43 @@ function renderChats(){
   }
   box.innerHTML = state.chats.map(c => {
     const initial = (c.username[0] || '?').toUpperCase();
-    const sub = c.lastText
-      ? (c.lastFromMe ? 'Вы: ' : '') + c.lastText
-      : '<span class="italic" style="color:var(--text-dim)">Нет сообщений</span>';
+    let sub, subCls = 'row-sub';
+    if (c.lastText){
+      sub = (c.lastFromMe ? 'Вы: ' : '') + esc(c.lastText);
+    } else if (state.onlineUsers.has(c.username)){
+      sub = 'в сети'; subCls = 'row-sub online';
+    } else {
+      sub = '<span class="italic">нет сообщений</span>';
+    }
     const badge = c.unread ? '<div class="badge">' + c.unread + '</div>' : '';
     const time = c.lastTs ? '<div class="row-time">' + esc(fmtTime(c.lastTs)) + '</div>' : '';
+    const onlineDot = state.onlineUsers.has(c.username) ? '<span class="online-dot"></span>' : '';
     return '<div class="row" data-peer="' + esc(c.username) + '">' +
-      '<div class="avatar">' + esc(initial) + '</div>' +
+      '<div class="avatar">' + esc(initial) + onlineDot + '</div>' +
       '<div class="row-info"><div class="row-title">' + esc(c.username) + '</div>' +
-      '<div class="row-sub">' + sub + '</div></div>' +
+      '<div class="' + subCls + '">' + sub + '</div></div>' +
       '<div class="row-right">' + time + badge + '</div></div>';
   }).join('');
-  box.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => openChat(r.dataset.peer)));
+  box.querySelectorAll('.row').forEach(r => {
+    r.addEventListener('click', () => openChat(r.dataset.peer));
+  });
 }
 
 // ---------- Friends ----------
 function updateDots(){
   const homeUnread = state.chats.reduce((s,c) => s + (c.unread||0), 0);
   const homeDot = $('#home-dot');
-  if (homeUnread > 0){ homeDot.textContent = homeUnread > 99 ? '99+' : homeUnread; homeDot.style.display = 'flex'; }
-  else homeDot.style.display = 'none';
+  if (homeUnread > 0){
+    homeDot.textContent = homeUnread > 99 ? '99+' : homeUnread;
+    homeDot.style.display = 'flex';
+  } else homeDot.style.display = 'none';
 
   const pendingCount = state.incoming.length;
   const friendsDot = $('#friends-dot');
-  if (pendingCount > 0){ friendsDot.textContent = pendingCount > 99 ? '99+' : pendingCount; friendsDot.style.display = 'flex'; }
-  else friendsDot.style.display = 'none';
+  if (pendingCount > 0){
+    friendsDot.textContent = pendingCount > 99 ? '99+' : pendingCount;
+    friendsDot.style.display = 'flex';
+  } else friendsDot.style.display = 'none';
 
   const pb = $('#pending-badge');
   if (pendingCount > 0) pb.innerHTML = '<span class="badge-inline">' + pendingCount + '</span>';
@@ -1309,7 +1620,6 @@ $$('#friends-seg .seg').forEach(b => b.addEventListener('click', () => {
 function renderFriends(){
   const box = $('#friends-list');
 
-  // Если есть запрос на поиск — показываем результаты
   if (state.searchQuery){
     renderSearch(box);
     return;
@@ -1321,19 +1631,23 @@ function renderFriends(){
     }
     box.innerHTML = state.friendsList.map(name => {
       const initial = (name[0] || '?').toUpperCase();
+      const online = state.onlineUsers.has(name);
+      const onlineDot = online ? '<span class="online-dot"></span>' : '';
+      const sub = online ? '<div class="row-sub online">в сети</div>'
+                         : (state.lastSeen[name]
+                            ? '<div class="row-sub">' + esc(fmtLastSeen(state.lastSeen[name])) + '</div>'
+                            : '');
       return '<div class="row">' +
-        '<div class="avatar">' + esc(initial) + '</div>' +
-        '<div class="row-info"><div class="row-title">' + esc(name) + '</div></div>' +
+        '<div class="avatar">' + esc(initial) + onlineDot + '</div>' +
+        '<div class="row-info"><div class="row-title">' + esc(name) + '</div>' + sub + '</div>' +
         '<div class="mini-btn-row">' +
           '<button class="mini-btn primary" data-act="open" data-user="' + esc(name) + '">Написать</button>' +
-          '<button class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '">' +
-            '<svg style="width:18px;height:18px;vertical-align:middle;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" viewBox="0 0 24 24">' + ICONS.trash + '</svg>' +
+          '<button class="mini-btn danger" data-act="unfriend" data-user="' + esc(name) + '" title="Удалить">' +
+            '<svg style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" viewBox="0 0 24 24">' + ICONS.trash + '</svg>' +
           '</button>' +
         '</div></div>';
     }).join('');
-    box.querySelectorAll('button[data-act]').forEach(b => {
-      b.addEventListener('click', () => friendAction(b.dataset.act, b.dataset.user));
-    });
+    bindFriendButtons(box);
     return;
   }
 
@@ -1345,8 +1659,15 @@ function renderFriends(){
   if (out) html += '<div class="section-label">Исходящие</div>' + out;
   if (!html) html = '<div class="empty">Нет активных заявок.</div>';
   box.innerHTML = html;
+  bindFriendButtons(box);
+}
+
+function bindFriendButtons(box){
   box.querySelectorAll('button[data-act]').forEach(b => {
-    b.addEventListener('click', () => friendAction(b.dataset.act, b.dataset.user));
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      friendAction(b.dataset.act, b.dataset.user);
+    });
   });
 }
 
@@ -1370,7 +1691,7 @@ function renderSearch(box){
   }
   box.innerHTML = state.searchResults.map(u => {
     const initial = (u.username[0] || '?').toUpperCase();
-    let btn = '';
+    let btn;
     if (u.status === 'friend') btn = '<div class="mini-btn ghost" style="opacity:.6">Друзья</div>';
     else if (u.status === 'outgoing') btn = '<button class="mini-btn ghost" data-act="cancel" data-user="' + esc(u.username) + '">Отменить</button>';
     else if (u.status === 'incoming') btn = '<button class="mini-btn primary" data-act="accept" data-user="' + esc(u.username) + '">Принять</button>';
@@ -1380,16 +1701,14 @@ function renderSearch(box){
       '<div class="row-info"><div class="row-title">' + esc(u.username) + '</div></div>' +
       '<div class="mini-btn-row">' + btn + '</div></div>';
   }).join('');
-  box.querySelectorAll('button[data-act]').forEach(b => {
-    b.addEventListener('click', () => friendAction(b.dataset.act, b.dataset.user));
-  });
+  bindFriendButtons(box);
 }
 
 async function friendAction(act, user){
   try {
     if (act === 'open'){ openChat(user); return; }
     if (act === 'unfriend'){
-      if (!confirm('Удалить ' + user + ' из друзей?')) return;
+      if (!confirm('Удалить ' + user + ' из друзей?\nВся переписка с ним тоже будет удалена.')) return;
       await api('/api/friends/remove', { method: 'POST', body: JSON.stringify({target:user}) });
       toast('Удалено');
     } else if (act === 'request'){
@@ -1433,9 +1752,11 @@ async function openChat(peer){
   state.activePeer = peer;
   state.activeMsgs = [];
   state.seenIds.clear();
+  state.peerTyping = false;
+  clearTimeout(state.peerTypingTimer);
   $('#chat-title').textContent = peer;
   $('#messages').innerHTML = '';
-  $('#typing').classList.remove('on');
+  refreshStatusUI();
   showScreen('chat');
   updateViewport();
 
@@ -1446,16 +1767,17 @@ async function openChat(peer){
       state.seenIds.add(m.id);
       appendMessage({ id:m.id, from:m.from, text:m.text, ts:m.ts });
     }
-    scrollMessages(true);
-    // помечаем прочитанным ещё раз через WS
+    scrollMessages();
     wsSend({ type:'read', peer });
-    // локально сбросим badge
     const c = state.chats.find(x => x.username === peer);
     if (c){ c.unread = 0; renderChats(); updateDots(); }
   } catch(e){
     toast('Ошибка загрузки');
   }
-  setTimeout(() => $('#msg-input').focus({preventScroll:true}), 50);
+  setTimeout(() => {
+    const inp = $('#msg-input');
+    try { inp.focus({ preventScroll: true }); } catch(_) { inp.focus(); }
+  }, 50);
 }
 
 function appendMessage(m){
@@ -1466,41 +1788,50 @@ function appendMessage(m){
   box.appendChild(el);
 }
 
-function scrollMessages(smooth){
+function scrollMessages(){
   const box = $('#messages');
-  requestAnimationFrame(() => {
-    box.scrollTop = box.scrollHeight;
-  });
+  requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
 }
 
 $('#chat-back').addEventListener('click', () => {
   state.activePeer = null;
   state.activeMsgs = [];
   state.seenIds.clear();
+  state.peerTyping = false;
+  clearTimeout(state.peerTypingTimer);
   showScreen('main');
   if (state.page === 'home') refreshChats();
   setTimeout(updateViewport, 50);
 });
 
+// ВАЖНО: кнопка отправки. Никаких preventDefault на touchstart — иначе клик не сработает.
 function sendMessage(){
   if (!state.activePeer) return;
   const input = $('#msg-input');
   const text = input.value.trim();
   if (!text) return;
   input.value = '';
+  // сохраняем фокус/клавиатуру
+  try { input.focus({ preventScroll: true }); } catch(_) { input.focus(); }
   const ok = wsSend({ type:'send', to: state.activePeer, text });
   if (!ok){
     toast('Нет соединения');
     input.value = text;
     return;
   }
-  // не теряем фокус, сохраняем клавиатуру
-  requestAnimationFrame(() => input.focus({preventScroll:true}));
+  requestAnimationFrame(() => {
+    try { input.focus({ preventScroll: true }); } catch(_) { input.focus(); }
+  });
 }
 
-$('#send-btn').addEventListener('click', sendMessage);
-$('#send-btn').addEventListener('mousedown', e => e.preventDefault());
-$('#send-btn').addEventListener('touchstart', e => e.preventDefault(), {passive:false});
+$('#send-btn').addEventListener('click', (e) => {
+  e.preventDefault();
+  sendMessage();
+});
+// На мыши не даём кнопке украсть фокус у поля. На тач — не трогаем (иначе клик пропадает).
+$('#send-btn').addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse') e.preventDefault();
+});
 
 $('#msg-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey){
@@ -1509,17 +1840,16 @@ $('#msg-input').addEventListener('keydown', (e) => {
   }
 });
 
-// typing indicator (мы печатаем)
+// typing — мы печатаем
 let typingTimer = null;
 $('#msg-input').addEventListener('input', () => {
   if (!state.activePeer) return;
   clearTimeout(typingTimer);
   typingTimer = setTimeout(() => {
     wsSend({ type:'typing', to: state.activePeer });
-  }, 300);
+  }, 250);
 });
 
-// автоскролл при появлении клавиатуры
 if (window.visualViewport){
   window.visualViewport.addEventListener('resize', () => {
     if (state.activePeer) scrollMessages();
@@ -1545,7 +1875,6 @@ $('#set-glass').addEventListener('click', () => {
 $('#set-notif').addEventListener('click', async () => {
   if (!('Notification' in window)){ toast('Не поддерживается'); return; }
   if (Notification.permission === 'granted'){
-    // toggle
     state.notif = !state.notif;
     localStorage.setItem('m_notif', state.notif ? '1' : '0');
     applyNotifUI();
@@ -1565,15 +1894,40 @@ $('#set-notif').addEventListener('click', async () => {
   applyNotifUI();
 });
 
-// отключаем зум двойным тапом
-document.addEventListener('dblclick', e => e.preventDefault(), {passive:false});
+// ---------- Notification click → open chat ----------
+if ('serviceWorker' in navigator){
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'notification_click'){
+      const peer = e.data.peer;
+      if (!peer) return;
+      if (state.token){
+        // если приложение уже открыто
+        if (document.getElementById('main').classList.contains('active') ||
+            document.getElementById('chat').classList.contains('active')){
+          openChat(peer);
+        }
+      }
+    }
+  });
+}
+
+// ?peer= в URL — после логина откроем чат
+(function checkInitialPeer(){
+  const params = new URLSearchParams(location.search);
+  const p = params.get('peer');
+  if (p){
+    state.pendingPeer = p;
+    // чистим URL
+    try { history.replaceState(null, '', location.pathname); } catch(_){}
+  }
+})();
 
 // ---------- Init ----------
 applyTheme();
 applyGlass();
+setWsState('connecting');
 
 if (state.token){
-  // Проверяем валидность токена
   fetch('/api/chats', { headers: { 'Authorization': 'Bearer ' + state.token } }).then(r => {
     if (r.ok){ enterApp(); }
     else { doLogout(); }
@@ -1583,13 +1937,19 @@ if (state.token){
   updateViewport();
 }
 
-// На случай если приложение вернулось из фона
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.token){
     if (!state.ws || state.ws.readyState > 1) connectWS();
     if (state.page === 'home') refreshChats();
     if (state.page === 'friends') refreshFriends();
+    fetchStatuses();
   }
+});
+
+// блокируем контекстное меню на долгое нажатие вне input
+document.addEventListener('contextmenu', (e) => {
+  if (e.target && e.target.tagName === 'INPUT') return;
+  e.preventDefault();
 });
 
 })();
