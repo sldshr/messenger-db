@@ -4,13 +4,14 @@
 #
 # Зависимости:  pip install fastapi uvicorn pillow python-multipart
 
+import asyncio
 import base64
 import html
 import io
 import time
 
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from PIL import Image
 
 try:
@@ -41,6 +42,17 @@ SECTION_MAP = dict(SECTIONS)
 
 
 # ---------------------------------------------------------------------------
+#  РЕАЛТАЙМ: событие для SSE — взводится при любом изменении
+# ---------------------------------------------------------------------------
+stats_event = asyncio.Event()
+
+
+def notify_change() -> None:
+    """Сообщить всем SSE-клиентам, что данные изменились."""
+    stats_event.set()
+
+
+# ---------------------------------------------------------------------------
 #  SVG-иконки
 # ---------------------------------------------------------------------------
 def _svg(paths: str, size: int = 14) -> str:
@@ -51,14 +63,13 @@ def _svg(paths: str, size: int = 14) -> str:
     )
 
 
-ICON_PENCIL = _svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>')
+ICON_PENCIL  = _svg('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>')
 ICON_COMMENT = _svg('<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>')
-ICON_IMAGE = _svg('<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>')
-ICON_FOLDER = _svg('<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>')
-ICON_HOME = _svg('<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>')
-ICON_CLOCK = _svg('<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', 12)
-ICON_LOGO = _svg('<circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/>', 22)
-ICON_CHART = _svg('<path d="M3 3v18h18"/><rect x="7" y="10" width="3" height="7"/><rect x="12" y="6" width="3" height="11"/><rect x="17" y="13" width="3" height="4"/>')
+ICON_IMAGE   = _svg('<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>')
+ICON_FOLDER  = _svg('<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>')
+ICON_HOME    = _svg('<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>')
+ICON_CLOCK   = _svg('<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', 12)
+ICON_LOGO    = _svg('<circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/>', 22)
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +94,12 @@ def time_ago(ts: float) -> str:
     return f"{d // 86400} дн. назад"
 
 
-def get_stats():
-    total_posts = len(posts)
-    total_comments = sum(len(p["comments"]) for p in posts)
-    return total_posts, total_comments
+def get_stats() -> tuple[int, int]:
+    return len(posts), sum(len(p["comments"]) for p in posts)
 
 
 # ---------------------------------------------------------------------------
-#  CSS — старый добрый 2010: градиенты, бевелы, Verdana
+#  CSS
 # ---------------------------------------------------------------------------
 CSS = """
 * { box-sizing: border-box; }
@@ -109,7 +118,6 @@ a { color: #1c4f8f; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .wrap { max-width: 900px; margin: 0 auto; padding: 0 10px; }
 
-/* ---- шапка ---- */
 .topbar {
   background: linear-gradient(#5d92cd 0%, #3a6fae 45%, #2b5a95 55%, #1e4577 100%);
   border-bottom: 3px solid #163459;
@@ -125,7 +133,6 @@ a:hover { text-decoration: underline; }
 }
 .tagline { font-size: 11px; color: #cfe2f7; text-shadow: 0 1px 0 #0d2440; }
 
-/* ---- навигация по разделам ---- */
 .nav {
   display: flex; flex-wrap: wrap; gap: 6px;
   margin: 12px 0;
@@ -152,7 +159,6 @@ a:hover { text-decoration: underline; }
   text-shadow: 0 1px 0 #16345a;
 }
 
-/* ---- форма нового поста ---- */
 .newpost {
   background: #fff;
   border: 1px solid #93b0cf;
@@ -199,10 +205,8 @@ textarea { width: 100%; resize: vertical; min-height: 70px; }
   user-select: none;
 }
 .filebtn:hover { background: linear-gradient(#ffffff, #f0f6fd 48%, #e4eef9 52%, #d4e3f3); }
-.fname { font-size: 11px; color: #5d7displaced; }
 .fname { font-size: 11px; color: #5d7a99; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ---- кнопки ---- */
 .btn {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 6px 14px;
@@ -220,7 +224,6 @@ textarea { width: 100%; resize: vertical; min-height: 70px; }
 .btn:active { background: #c6d8ec; box-shadow: inset 0 1px 3px rgba(0,0,0,.2); }
 .btn.small { padding: 4px 10px; font-size: 11px; font-weight: normal; }
 
-/* ---- пост ---- */
 .post {
   background: #fff;
   border: 1px solid #9ab3cc;
@@ -257,7 +260,6 @@ textarea { width: 100%; resize: vertical; min-height: 70px; }
   box-shadow: 0 1px 3px rgba(0,0,0,.15);
 }
 
-/* ---- комментарии ---- */
 .comments {
   background: #f7fafd;
   border-top: 1px solid #dbe6f2;
@@ -301,7 +303,6 @@ textarea { width: 100%; resize: vertical; min-height: 70px; }
   text-shadow: 0 1px 0 #fff;
 }
 
-/* ---- мобилки ---- */
 @media (max-width: 640px) {
   body { font-size: 12.5px; }
   .wrap { padding: 0 8px; }
@@ -401,7 +402,6 @@ def render_page(section_filter: str = "all", active=None) -> str:
 
     items = sorted(items, key=lambda p: p["id"], reverse=True)
 
-    # --- форма нового поста ---
     options = ""
     for key, name in SECTIONS:
         sel = " selected" if active == key else ""
@@ -425,7 +425,6 @@ def render_page(section_filter: str = "all", active=None) -> str:
   </div>
 </form>"""
 
-    # --- список постов ---
     if items:
         posts_html = "".join(render_post(p, back) for p in items)
     else:
@@ -478,6 +477,7 @@ async def create_post(
     })
     next_id += 1
 
+    notify_change()                     # ← РЕАЛТАЙМ: разбудить SSE-клиентов
     return RedirectResponse(f"/s/{section}", status_code=303)
 
 
@@ -490,20 +490,144 @@ async def add_comment(post_id: int, text: str = Form(...), back: str = Form("/")
                 p["comments"].append({"text": text[:1000], "time": time.time()})
                 break
 
+    notify_change()                     # ← РЕАЛТАЙМ
     if not back.startswith("/"):
         back = "/"
     return RedirectResponse(f"{back}#p{post_id}", status_code=303)
 
 
-@app.get("/stats/foned", response_class=PlainTextResponse)
-def stats_foned():
-    """Статистика без фона — чистый текст."""
-    total_posts, total_comments = get_stats()
+# ---------------------------------------------------------------------------
+#  СТАТИСТИКА — /stats/foned (real-time, без фона) + .txt + SSE
+# ---------------------------------------------------------------------------
+
+def _fmt_stats(p: int, c: int) -> str:
     return (
         "SLDCommunity — статистика\n"
         "=========================\n"
-        f"Всего постов:        {total_posts}\n"
-        f"Всего комментариев:  {total_comments}\n"
+        f"Всего постов:        {p}\n"
+        f"Всего комментариев:  {c}\n"
+    )
+
+
+STATS_PAGE = """<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Статистика — SLDCommunity</title>
+<style>
+  html, body {
+    margin: 0; padding: 22px;
+    background: transparent;
+    color: #1b2a3a;
+    font-family: "Courier New", Consolas, "Liberation Mono", monospace;
+    font-size: 14px; line-height: 1.55;
+  }
+  pre { margin: 0; white-space: pre-wrap; font: inherit; }
+  .live {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 10px; font-size: 12px; color: #5d7a99;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #3aa655; box-shadow: 0 0 6px #3aa655;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  .dot.off { background: #c14b3a; box-shadow: 0 0 6px #c14b3a; animation: none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+</style></head>
+<body>
+<pre id="out">__INITIAL__</pre>
+<div class="live"><span class="dot" id="dot"></span><span id="label">live</span></div>
+<script>
+(function () {
+  var out = document.getElementById('out');
+  var dot = document.getElementById('dot');
+  var lbl = document.getElementById('label');
+
+  function render(p, c) {
+    return 'SLDCommunity — статистика\\n'
+         + '=========================\\n'
+         + 'Всего постов:        ' + p + '\\n'
+         + 'Всего комментариев:  ' + c + '\\n';
+  }
+
+  if (!window.EventSource) {
+    dot.classList.add('off'); lbl.textContent = 'SSE не поддерживается';
+    return;
+  }
+
+  var es = new EventSource('/stats/foned/stream');
+  es.onopen    = function () { dot.classList.remove('off'); lbl.textContent = 'live'; };
+  es.onerror   = function () { dot.classList.add('off');    lbl.textContent = 'reconnecting…'; };
+  es.onmessage = function (e) {
+    var parts = e.data.split(' ');
+    out.textContent = render(parts[0], parts[1]);
+    document.title = 'Постов: ' + parts[0] + ' · Комментов: ' + parts[1];
+  };
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/stats/foned", response_class=HTMLResponse)
+def stats_foned():
+    """Живая статистика в браузере (обновляется через SSE, без фона)."""
+    p, c = get_stats()
+    page = STATS_PAGE.replace("__INITIAL__", esc(_fmt_stats(p, c)))
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/stats/foned.txt", response_class=PlainTextResponse)
+def stats_foned_txt():
+    """Статистика в виде чистого текста — для curl / скриптов."""
+    p, c = get_stats()
+    return PlainTextResponse(_fmt_stats(p, c), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/stats/foned/stream")
+async def stats_foned_stream():
+    """
+    SSE-поток. Отправляет 'data: <posts> <comments>\\n\\n' при каждом изменении.
+    Плюс heartbeat каждые 15 сек, чтобы прокси не рвали соединение.
+    """
+    async def gen():
+        last = None
+        last_beat = time.time()
+        try:
+            # первое событие — сразу отдаём текущее состояние
+            p, c = get_stats()
+            last = (p, c)
+            yield f"data: {p} {c}\n\n"
+
+            while True:
+                # ждём изменения либо таймаута (для heartbeat)
+                try:
+                    await asyncio.wait_for(stats_event.wait(), timeout=5.0)
+                    stats_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                p, c = get_stats()
+                if (p, c) != last:
+                    last = (p, c)
+                    yield f"data: {p} {c}\n\n"
+                    last_beat = time.time()
+                elif time.time() - last_beat >= 15:
+                    yield ": ping\n\n"      # SSE-комментарий — клиент его игнорирует
+                    last_beat = time.time()
+
+        except asyncio.CancelledError:
+            # клиент отключился — просто выходим
+            return
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",   # nginx — не буферизовать
+        },
     )
 
 
@@ -519,11 +643,8 @@ async def compress_image(file: UploadFile) -> str | None:
 
         img = Image.open(io.BytesIO(raw))
         img = img.convert("RGB")
-
-        # 1) уменьшаем до 420px по длинной стороне
         img.thumbnail((420, 420), RESAMPLE)
 
-        # 2) подбираем качество так, чтобы влезть в ~60 КБ
         quality = 55
         data = b""
         while quality >= 20:
