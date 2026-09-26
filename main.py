@@ -1,784 +1,743 @@
-# main.py
-# pip install fastapi uvicorn jinja2 python-multipart
-# uvicorn main:app --reload
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SLDCommunity — анонимный форум в одном файле.
 
-import base64
-import secrets
-from datetime import datetime
+  * посты и комментарии — полностью анонимно (никаких ников, id, cookie)
+  * всё хранится ТОЛЬКО в оперативной памяти (RAM), при перезапуске исчезает
+  * к посту можно прикрепить одно фото — оно автоматически сжимается
+  * разделы, SVG-иконки, адаптив под телефон и ПК
+  * статистика: /stats/foned  (без фона, простой текст)
 
-from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse
-from jinja2 import Template
-import uvicorn
+Запуск:  python main.py   ->  http://127.0.0.1:5000
+"""
 
-app = FastAPI(title="Community")
+import io
+import time
+import html as _html
+import itertools
+import threading
 
-# ============================================================
-#                     ХРАНИЛИЩЕ В ОПЕРАТИВКЕ
-# ============================================================
-STATE = {
-    "settings": {
-        "site_title": "Моё сообщество",
-        "author_nick": "Автор",
-        "channel_description": "Добро пожаловать в моё сообщество! Здесь вы найдёте самое интересное.",
-        "author_tagline": "Автор и создатель",
-        "footer_text": "© 2025 Моё сообщество",
+from flask import Flask, request, redirect, Response, abort
 
-        "author_photo": "",
-        "main_photo": "",
-
-        "primary_color": "#2a5db0",
-        "bg_color": "#d9e4f5",
-        "text_color": "#1a1a1a",
-        "font_family": "Arial, Tahoma, Verdana, sans-serif",
-        "border_radius": "6px",
-
-        "info_content": "<h2>О проекте</h2><p>Здесь вы можете написать любую информацию о своём сообществе, используя HTML.</p>",
-        "community_content": "<h2>Правила сообщества</h2><p>1. Будьте вежливы.<br>2. Не спамьте.<br>3. Уважайте других.</p>",
-
-        "sections": {
-            "main":      {"name": "Главная",    "visible": True, "order": 0},
-            "info":      {"name": "Инфо",       "visible": True, "order": 1},
-            "community": {"name": "Сообщество", "visible": True, "order": 2},
-            "livechat":  {"name": "Лайв чат",   "visible": True, "order": 3},
-        },
-
-        "chat_welcome": "Добро пожаловать в чат!",
-        "chat_max_history": 200,
-
-        "admin_password": "admin",
-    },
-    "chat": [],
-}
-
-SESSIONS: set[str] = set()
-CHAT_CLIENTS: set[WebSocket] = set()
-SEC_URL = {"main": "/", "info": "/info", "community": "/community", "livechat": "/livechat"}
-
-
-# ============================================================
-#                     БАЗОВЫЙ ШАБЛОН (2010 style)
-# ============================================================
-BASE_TPL = Template("""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{ title }} — {{ s.site_title }}</title>
-<style>
-:root{
-  --primary: {{ s.primary_color }};
-  --bg: {{ s.bg_color }};
-  --text: {{ s.text_color }};
-  --radius: {{ s.border_radius }};
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  font-family:{{ s.font_family }};
-  font-size:13px;
-  color:var(--text);
-  background:var(--bg);
-  background-image:
-    linear-gradient(to bottom, rgba(255,255,255,.6), rgba(255,255,255,0) 220px),
-    repeating-linear-gradient(0deg, rgba(0,0,0,.02) 0px, rgba(0,0,0,.02) 1px, transparent 1px, transparent 3px);
-  min-height:100vh;
-}
-a{color:var(--primary);text-decoration:none}
-a:hover{text-decoration:underline}
-
-/* ---------- Header ---------- */
-header{
-  background:linear-gradient(to bottom, #6f92c9 0%, var(--primary) 50%, #1c3f7a 100%);
-  border-bottom:3px solid #0e2547;
-  box-shadow:0 2px 6px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.5);
-  padding:0;
-}
-.header-inner{
-  max-width:1000px;margin:0 auto;padding:14px 16px 0;
-}
-.brand{
-  color:#fff;font-size:22px;font-weight:bold;
-  text-shadow:1px 1px 0 rgba(0,0,0,.5);
-  margin-bottom:10px;display:block;
-  letter-spacing:.5px;
-}
-.brand .dot{color:#ffe86a}
-nav{
-  display:block;
-  background:linear-gradient(to bottom, rgba(255,255,255,.25), rgba(255,255,255,.05));
-  border-radius:6px 6px 0 0;
-  border:1px solid #163a6e;border-bottom:none;
-  padding:0 4px;
-}
-nav ul{list-style:none;display:flex;flex-wrap:wrap}
-nav li{display:inline-block}
-nav a{
-  display:block;padding:8px 14px;color:#fff;font-weight:bold;
-  text-decoration:none;font-size:13px;
-  border-right:1px solid rgba(0,0,0,.2);
-  text-shadow:1px 1px 0 rgba(0,0,0,.4);
-  transition:none;
-}
-nav a:hover{background:rgba(255,255,255,.15);text-decoration:none}
-nav a.active{
-  background:linear-gradient(to bottom, #fdf3b5, #f5c842);
-  color:#5a3a00 !important;
-  text-shadow:0 1px 0 #fff;
-}
-nav a.admin-link{color:#ffe86a}
-
-/* ---------- Layout ---------- */
-main{
-  max-width:1000px;margin:0 auto;
-  padding:16px;
-}
-.card{
-  background:#ffffff;
-  border:1px solid #b8c5d9;
-  border-radius:var(--radius);
-  box-shadow:0 2px 4px rgba(0,0,0,.08);
-  margin-bottom:14px;
-  overflow:hidden;
-}
-.card-title{
-  background:linear-gradient(to bottom, #eaf0f9, #cfdcee);
-  border-bottom:1px solid #b8c5d9;
-  padding:8px 14px;
-  font-weight:bold;font-size:13px;color:#1c3f7a;
-  text-shadow:0 1px 0 #fff;
-}
-.card-body{padding:14px}
-
-/* ---------- Hero ---------- */
-.hero{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
-.hero .avatar{
-  width:120px;height:120px;border-radius:6px;object-fit:cover;
-  border:1px solid #8a9cb8;padding:2px;background:#fff;
-  box-shadow:0 1px 3px rgba(0,0,0,.2);flex-shrink:0;
-}
-.hero .avatar.ph{
-  display:flex;align-items:center;justify-content:center;
-  font-size:48px;color:#7a8ba5;background:#f3f6fb;
-}
-.hero h1{
-  color:#1c3f7a;font-size:24px;margin-bottom:4px;
-  font-family:Arial Black, Arial, sans-serif;
-  text-shadow:0 1px 0 #fff;
-}
-.hero .tagline{color:#556a86;margin-bottom:8px;font-size:12px;font-style:italic}
-.hero .desc{line-height:1.6;font-size:13px}
-.cover{
-  width:100%;max-height:340px;object-fit:cover;
-  border-bottom:1px solid #b8c5d9;display:block;
-}
-
-/* ---------- Кнопки ---------- */
-.btn{
-  display:inline-block;
-  background:linear-gradient(to bottom, #7ea7dd 0%, var(--primary) 50%, #1e4a8c 100%);
-  color:#fff;font-weight:bold;
-  border:1px solid #163a6e;
-  padding:6px 14px;
-  border-radius:5px;
-  cursor:pointer;
-  font-size:13px;font-family:inherit;
-  text-shadow:1px 1px 0 rgba(0,0,0,.4);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.4), 0 1px 2px rgba(0,0,0,.2);
-  text-decoration:none;
-}
-.btn:hover{filter:brightness(1.08);text-decoration:none}
-.btn:active{box-shadow:inset 0 2px 4px rgba(0,0,0,.35);}
-.btn.ghost{
-  background:linear-gradient(to bottom, #ffffff, #dfe6f0);
-  color:#1c3f7a;text-shadow:0 1px 0 #fff;
-  border:1px solid #8a9cb8;
-}
-.btn.danger{
-  background:linear-gradient(to bottom, #f08b8b 0%, #c32828 50%, #8b1414 100%);
-  border-color:#5a0a0a;color:#fff;
-}
-
-/* ---------- Формы ---------- */
-input,textarea,select{
-  background:#ffffff;
-  color:#1a1a1a;
-  border:1px solid #8a9cb8;
-  border-top-color:#5a6c88;
-  padding:5px 7px;
-  border-radius:3px;
-  font-family:inherit;
-  font-size:13px;
-  width:100%;
-  box-shadow:inset 0 1px 2px rgba(0,0,0,.06);
-}
-input:focus,textarea:focus,select:focus{
-  outline:none;border-color:var(--primary);
-  box-shadow:inset 0 1px 2px rgba(0,0,0,.06), 0 0 4px rgba(42,93,176,.5);
-}
-textarea{min-height:120px;resize:vertical;font-family:inherit}
-label{display:block;margin-bottom:3px;font-weight:bold;font-size:12px;color:#33475f}
-.field{margin-bottom:12px}
-.checkbox-label{display:flex;align-items:center;gap:6px;font-weight:normal;margin:0}
-.checkbox-label input{width:auto;box-shadow:none}
-
-/* ---------- Чат ---------- */
-.chat-box{
-  background:#ffffff;
-  border:1px solid #8a9cb8;
-  border-top-color:#5a6c88;
-  border-radius:3px;
-  padding:8px;
-  height:460px;overflow-y:auto;
-  margin-bottom:10px;
-  box-shadow:inset 0 1px 2px rgba(0,0,0,.08);
-}
-.msg{
-  padding:5px 8px;margin-bottom:4px;
-  border-radius:3px;
-  background:linear-gradient(to bottom, #f6f9fd, #e8eff9);
-  border:1px solid #d0dbea;
-  word-wrap:break-word;line-height:1.45;
-  font-size:13px;
-}
-.msg .nick{color:#1c3f7a;font-weight:bold;margin-right:5px}
-.msg .time{font-size:11px;color:#7a8ba5;margin-left:6px}
-.chat-input{display:flex;gap:6px;flex-wrap:wrap}
-.chat-input input{flex:1;min-width:120px}
-
-/* ---------- Сетки ---------- */
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-@media(max-width:750px){.grid2,.grid3{grid-template-columns:1fr}}
-
-/* ---------- Алерты ---------- */
-.alert{padding:10px 14px;border-radius:4px;margin-bottom:14px;font-weight:bold}
-.alert.ok{
-  background:linear-gradient(to bottom, #e3f6d9, #c6eab4);
-  border:1px solid #79b861;color:#2f5a1c;text-shadow:0 1px 0 #fff;
-}
-.alert.err{
-  background:linear-gradient(to bottom, #fbe2e2, #f2c0c0);
-  border:1px solid #c76a6a;color:#7a1414;text-shadow:0 1px 0 #fff;
-}
-
-.photo-preview{
-  max-width:200px;max-height:200px;border-radius:4px;object-fit:cover;
-  border:1px solid #8a9cb8;padding:2px;background:#fff;
-  box-shadow:0 1px 3px rgba(0,0,0,.15);
-  margin-bottom:8px;display:block;
-}
-.section-row{
-  display:flex;gap:10px;align-items:center;
-  padding:8px 0;border-bottom:1px dashed #c5d0e0;
-}
-.section-row:last-child{border-bottom:none}
-.muted{color:#5d6f89;font-size:12px;font-style:italic}
-code{
-  background:#eef2f8;padding:1px 5px;border-radius:3px;
-  font-family:Consolas, monospace;color:#a03030;font-size:12px;
-  border:1px solid #d5dde9;
-}
-h2{color:#1c3f7a;font-size:16px;margin-bottom:10px;text-shadow:0 1px 0 #fff}
-h3{color:#1c3f7a;font-size:14px;margin-bottom:8px}
-
-/* ---------- Footer ---------- */
-footer{
-  text-align:center;padding:16px;color:#556a86;
-  font-size:11px;
-  border-top:1px solid #b8c5d9;
-  margin-top:20px;
-  background:linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,.6));
-}
-</style>
-</head>
-<body>
-<header>
-  <div class="header-inner">
-    <span class="brand">{{ s.site_title }} <span class="dot">●</span></span>
-    <nav>
-      <ul>
-      {% for sec in sections if sec.visible %}
-        <li><a href="{{ sec.url }}" class="{{ 'active' if sec.id == current else '' }}">{{ sec.name }}</a></li>
-      {% endfor %}
-        <li><a href="/admin" class="admin-link">⚙ Админ</a></li>
-      </ul>
-    </nav>
-  </div>
-</header>
-<main>{{ content|safe }}</main>
-<footer>{{ s.footer_text }}</footer>
-</body>
-</html>""")
-
-
-def render_base(title: str, content: str, current: str) -> HTMLResponse:
-    s = STATE["settings"]
-    secs = [{"id": k, "name": v["name"], "url": SEC_URL[k],
-             "visible": v["visible"], "order": v["order"]}
-            for k, v in s["sections"].items()]
-    secs.sort(key=lambda x: x["order"])
-    html = BASE_TPL.render(title=title, s=s, sections=secs, current=current, content=content)
-    return HTMLResponse(html)
-
-
-# ============================================================
-#                     СТРАНИЦЫ
-# ============================================================
-def page_main_html() -> str:
-    s = STATE["settings"]
-    if s["author_photo"]:
-        avatar = f'<img class="avatar" src="{s["author_photo"]}" alt="avatar">'
-    else:
-        avatar = '<div class="avatar ph">👤</div>'
-    cover = f'<img class="cover" src="{s["main_photo"]}" alt="cover">' if s["main_photo"] else ""
-    return f"""
-    <div class="card">
-      {cover}
-      <div class="card-title">О канале</div>
-      <div class="card-body">
-        <div class="hero">
-          {avatar}
-          <div style="flex:1;min-width:240px">
-            <h1>{s['author_nick']}</h1>
-            <div class="tagline">{s['author_tagline']}</div>
-            <div class="desc">{s['channel_description']}</div>
-          </div>
-        </div>
-      </div>
-    </div>
-    """
-
-
-def page_info_html() -> str:
-    return f"""
-    <div class="card">
-      <div class="card-title">📄 Инфо</div>
-      <div class="card-body">{STATE['settings']['info_content']}</div>
-    </div>
-    """
-
-
-def page_community_html() -> str:
-    return f"""
-    <div class="card">
-      <div class="card-title">👥 Сообщество</div>
-      <div class="card-body">{STATE['settings']['community_content']}</div>
-    </div>
-    """
-
-
-def page_livechat_html() -> str:
-    s = STATE["settings"]
-    return f"""
-    <div class="card">
-      <div class="card-title">💬 Лайв чат</div>
-      <div class="card-body">
-        <p class="muted" style="margin-bottom:10px">{s['chat_welcome']}</p>
-        <div class="chat-box" id="chat"></div>
-        <div class="chat-input">
-          <input id="nick" placeholder="Ваш ник" style="max-width:220px">
-          <input id="msg" placeholder="Сообщение..." autocomplete="off">
-          <button class="btn" onclick="send()">Отправить</button>
-        </div>
-      </div>
-    </div>
-    <script>
-      const chat = document.getElementById('chat');
-      const nickInput = document.getElementById('nick');
-      const msgInput = document.getElementById('msg');
-      nickInput.value = localStorage.getItem('chat_nick') || '';
-      let ws;
-
-      function connect() {{
-        ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/chat');
-        ws.onmessage = e => {{
-          const d = JSON.parse(e.data);
-          if (d.type === 'history') d.messages.forEach(addMsg);
-          else if (d.type === 'message') addMsg(d.message);
-        }};
-        ws.onclose = () => setTimeout(connect, 2000);
-      }}
-
-      function addMsg(m) {{
-        const el = document.createElement('div');
-        el.className = 'msg';
-        const n = document.createElement('span'); n.className = 'nick'; n.textContent = m.nick + ':';
-        const t = document.createElement('span'); t.textContent = m.text;
-        const tm = document.createElement('span'); tm.className = 'time'; tm.textContent = m.time;
-        el.append(n, t, tm);
-        chat.appendChild(el);
-        chat.scrollTop = chat.scrollHeight;
-      }}
-
-      function send() {{
-        const nick = (nickInput.value || 'Гость').trim().slice(0, 32);
-        const text = msgInput.value.trim();
-        if (!text || !ws || ws.readyState !== 1) return;
-        localStorage.setItem('chat_nick', nick);
-        ws.send(JSON.stringify({{ nick, text }}));
-        msgInput.value = '';
-      }}
-
-      msgInput.addEventListener('keydown', e => {{ if (e.key === 'Enter') send(); }});
-      connect();
-    </script>
-    """
-
-
-# ============================================================
-#                     РОУТЫ
-# ============================================================
-@app.get("/", response_class=HTMLResponse)
-async def route_main():
-    return render_base("Главная", page_main_html(), "main")
-
-
-@app.get("/info", response_class=HTMLResponse)
-async def route_info():
-    return render_base("Инфо", page_info_html(), "info")
-
-
-@app.get("/community", response_class=HTMLResponse)
-async def route_community():
-    return render_base("Сообщество", page_community_html(), "community")
-
-
-@app.get("/livechat", response_class=HTMLResponse)
-async def route_livechat():
-    return render_base("Лайв чат", page_livechat_html(), "livechat")
-
-
-# ============================================================
-#                     WEBSOCKET ЧАТ
-# ============================================================
-@app.websocket("/ws/chat")
-async def ws_chat(ws: WebSocket):
-    await ws.accept()
-    CHAT_CLIENTS.add(ws)
+# ----------------------------------------------------------------------------
+# Pillow (для сжатия картинок). Если нет — фото сохраняется как есть.
+# ----------------------------------------------------------------------------
+try:
+    from PIL import Image
+    _HAS_PIL = True
     try:
-        await ws.send_json({"type": "history", "messages": STATE["chat"][-100:]})
-        while True:
-            data = await ws.receive_json()
-            nick = (str(data.get("nick") or "Гость")).strip()[:32] or "Гость"
-            text = (str(data.get("text") or "")).strip()[:500]
-            if not text:
-                continue
-            msg = {
-                "nick": nick,
-                "text": text,
-                "time": datetime.now().strftime("%H:%M:%S"),
-            }
-            STATE["chat"].append(msg)
-            limit = STATE["settings"].get("chat_max_history", 200)
-            if len(STATE["chat"]) > limit:
-                STATE["chat"] = STATE["chat"][-limit:]
+        _LANCZOS = Image.Resampling.LANCZOS
+    except AttributeError:            # старые версии Pillow
+        _LANCZOS = Image.LANCZOS
+except Exception:
+    _HAS_PIL = False
+    _LANCZOS = None
 
-            dead = []
-            for c in list(CHAT_CLIENTS):
-                try:
-                    await c.send_json({"type": "message", "message": msg})
-                except Exception:
-                    dead.append(c)
-            for d in dead:
-                CHAT_CLIENTS.discard(d)
-    except WebSocketDisconnect:
-        pass
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024          # 10 МБ на запрос
+app.config["JSON_AS_ASCII"] = False
+
+# ----------------------------------------------------------------------------
+# Настройки
+# ----------------------------------------------------------------------------
+MAX_POST_TEXT = 5000
+MAX_COMMENT_TEXT = 2000
+
+IMG_MAX_SIDE = 640          # максимальная сторона после сжатия
+IMG_QUALITY = 60            # качество JPEG
+IMG_MAX_UPLOAD = 8 * 1024 * 1024
+
+SECTIONS = [
+    ("general", "Общее",      "Общие темы, знакомства и объявления"),
+    ("tech",    "Технологии", "Компьютеры, софт, гаджеты и интернет"),
+    ("games",   "Игры",       "Игровые новости, обсуждения и советы"),
+    ("music",   "Музыка",     "Что слушаете, что советуете"),
+    ("humor",   "Юмор",       "Мемы, шутки и всё весёлое"),
+    ("life",    "Жизнь",      "Личное, повседневное, истории"),
+    ("help",    "Помощь",     "Вопросы и ответы, поддержка"),
+    ("flood",   "Флудилка",   "Всё подряд и ни о чём"),
+]
+SECTION_MAP = {k: (n, d) for k, n, d in SECTIONS}
+
+# ----------------------------------------------------------------------------
+# Хранилище в оперативной памяти
+# ----------------------------------------------------------------------------
+_lock = threading.Lock()
+_posts = {}                       # id -> dict
+_post_ids = itertools.count(1)
+_comment_ids = itertools.count(1)
+
+
+def all_posts():
+    """Все посты, новые сверху."""
+    with _lock:
+        return sorted(_posts.values(), key=lambda p: p["id"], reverse=True)
+
+
+def section_posts(key):
+    return [p for p in all_posts() if p["section"] == key]
+
+
+def total_comments():
+    with _lock:
+        return sum(len(p["comments"]) for p in _posts.values())
+
+
+# ----------------------------------------------------------------------------
+# SVG-иконки
+# ----------------------------------------------------------------------------
+_ICONS = {
+    "logo":    '<path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"/>',
+    "general": '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 3 2.5 15 0 18"/><path d="M12 3c-2.5 3-2.5 15 0 18"/>',
+    "tech":    '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/>',
+    "games":   '<rect x="2" y="6" width="20" height="12" rx="6"/><path d="M6 12h4M8 10v4"/><path d="M15.5 13h.01M18 11h.01"/>',
+    "music":   '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+    "humor":   '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/>',
+    "life":    '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/>',
+    "help":    '<circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>',
+    "flood":   '<path d="M3 12c2-3 5-3 7 0s5 3 7 0 4-2 4-2"/><path d="M3 18c2-3 5-3 7 0s5 3 7 0 4-2 4-2"/><path d="M3 6c2-3 5-3 7 0s5 3 7 0 4-2 4-2"/>',
+    "image":   '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
+    "comment": '<path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"/>',
+    "stats":   '<path d="M18 20V10M12 20V4M6 20v-6"/>',
+    "send":    '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>',
+    "clock":   '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+    "user":    '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    "hash":    '<path d="M4 9h16M4 15h16M10 3L8 21M16 3l-2 18"/>',
+    "back":    '<path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>',
+    "plus":    '<path d="M12 5v14M5 12h14"/>',
+    "shield":  '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+}
+
+
+def ico(name, size=16):
+    path = _ICONS.get(name, _ICONS["general"])
+    return ('<svg class="ico" width="%d" height="%d" viewBox="0 0 24 24" fill="none" '
+            'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+            'stroke-linejoin="round" aria-hidden="true">%s</svg>' % (size, size, path))
+
+
+# ----------------------------------------------------------------------------
+# Утилиты
+# ----------------------------------------------------------------------------
+def esc(s):
+    return _html.escape(str(s), quote=True)
+
+
+def fmt_time(ts):
+    return time.strftime("%d.%m.%Y в %H:%M", time.localtime(ts))
+
+
+def plural(n, one, few, many):
+    n = abs(int(n)) % 100
+    if 11 <= n <= 19:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
+def compress_image(file_storage):
+    """Возвращает (bytes, mime) или None. Картинка сжимается до минимума."""
+    try:
+        raw = file_storage.read()
     except Exception:
-        pass
-    finally:
-        CHAT_CLIENTS.discard(ws)
+        return None
+    if not raw or len(raw) > IMG_MAX_UPLOAD:
+        return None
 
+    if not _HAS_PIL:
+        mime = file_storage.mimetype or "image/jpeg"
+        if not mime.startswith("image/"):
+            return None
+        return raw, mime
 
-# ============================================================
-#                     АДМИНКА
-# ============================================================
-def admin_page_html(logged: bool, message: str = "", error: str = "") -> str:
-    s = STATE["settings"]
-    if not logged:
-        return f"""
-        <div class="card" style="max-width:420px;margin:20px auto">
-          <div class="card-title">🔐 Вход в админку</div>
-          <div class="card-body">
-            {f'<div class="alert err">{error}</div>' if error else ''}
-            <form method="post" action="/admin/login">
-              <div class="field">
-                <label>Пароль</label>
-                <input type="password" name="password" autofocus>
-              </div>
-              <button class="btn" type="submit">Войти</button>
-            </form>
-            <p class="muted" style="margin-top:12px">Пароль по умолчанию: <code>admin</code></p>
-          </div>
-        </div>
-        """
-
-    sections = s["sections"]
-    sec_rows = ""
-    for key, label in [("main","Главная"),("info","Инфо"),("community","Сообщество"),("livechat","Лайв чат")]:
-        sd = sections[key]
-        sec_rows += f"""
-        <div class="section-row">
-          <div style="width:120px"><b>{label}</b></div>
-          <div style="flex:1"><input name="{key}_name" value="{sd['name']}" placeholder="Название"></div>
-          <div style="width:90px"><input type="number" name="{key}_order" value="{sd['order']}" placeholder="Порядок"></div>
-          <label class="checkbox-label">
-            <input type="checkbox" name="{key}_visible" {'checked' if sd['visible'] else ''}>
-            показ
-          </label>
-        </div>
-        """
-
-    author_photo_block = (
-        f'<img class="photo-preview" src="{s["author_photo"]}">'
-        if s["author_photo"] else '<p class="muted">не загружено</p>'
-    )
-    main_photo_block = (
-        f'<img class="photo-preview" src="{s["main_photo"]}">'
-        if s["main_photo"] else '<p class="muted">не загружено</p>'
-    )
-
-    return f"""
-    <div class="card">
-      <div class="card-title">⚙ Панель администратора</div>
-      <div class="card-body">
-        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
-          <span>Управление сайтом. Все изменения хранятся в оперативной памяти.</span>
-          <form method="post" action="/admin/logout" style="margin:0">
-            <button class="btn ghost" type="submit">Выйти</button>
-          </form>
-        </div>
-        {f'<div class="alert ok" style="margin-top:12px">{message}</div>' if message else ''}
-        {f'<div class="alert err" style="margin-top:12px">{error}</div>' if error else ''}
-      </div>
-    </div>
-
-    <form method="post" action="/admin/save">
-
-      <div class="card">
-        <div class="card-title">🏠 Основное</div>
-        <div class="card-body">
-          <div class="grid2">
-            <div class="field"><label>Название сайта</label>
-              <input name="site_title" value="{s['site_title']}"></div>
-            <div class="field"><label>Ник автора</label>
-              <input name="author_nick" value="{s['author_nick']}"></div>
-          </div>
-          <div class="field"><label>Подпись автора (tagline)</label>
-            <input name="author_tagline" value="{s['author_tagline']}"></div>
-          <div class="field"><label>Описание канала</label>
-            <textarea name="channel_description">{s['channel_description']}</textarea></div>
-          <div class="field"><label>Текст в подвале</label>
-            <input name="footer_text" value="{s['footer_text']}"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">🎨 Стили</div>
-        <div class="card-body">
-          <div class="grid3">
-            <div class="field"><label>Основной цвет</label>
-              <input type="color" name="primary_color" value="{s['primary_color']}"></div>
-            <div class="field"><label>Цвет фона</label>
-              <input type="color" name="bg_color" value="{s['bg_color']}"></div>
-            <div class="field"><label>Цвет текста</label>
-              <input type="color" name="text_color" value="{s['text_color']}"></div>
-          </div>
-          <div class="grid2">
-            <div class="field"><label>Шрифт</label>
-              <input name="font_family" value="{s['font_family']}"></div>
-            <div class="field"><label>Радиус скругления</label>
-              <input name="border_radius" value="{s['border_radius']}"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">📄 Содержимое страниц</div>
-        <div class="card-body">
-          <div class="field"><label>Инфо (можно HTML)</label>
-            <textarea name="info_content" style="min-height:160px">{s['info_content']}</textarea></div>
-          <div class="field"><label>Сообщество (можно HTML)</label>
-            <textarea name="community_content" style="min-height:160px">{s['community_content']}</textarea></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">💬 Лайв чат</div>
-        <div class="card-body">
-          <div class="grid2">
-            <div class="field"><label>Приветствие</label>
-              <input name="chat_welcome" value="{s['chat_welcome']}"></div>
-            <div class="field"><label>Макс. история сообщений</label>
-              <input type="number" name="chat_max_history" value="{s['chat_max_history']}"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">🧩 Разделы меню</div>
-        <div class="card-body">
-          <p class="muted" style="margin-bottom:10px">Название, порядок и видимость пунктов в верхнем меню</p>
-          {sec_rows}
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">🔐 Пароль администратора</div>
-        <div class="card-body">
-          <div class="field"><label>Новый пароль (оставь пустым, чтобы не менять)</label>
-            <input name="new_password" type="password"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-body">
-          <button class="btn" type="submit" style="width:100%;padding:10px;font-size:15px">💾 Сохранить всё</button>
-        </div>
-      </div>
-    </form>
-
-    <div class="card">
-      <div class="card-title">🖼 Фотографии</div>
-      <div class="card-body">
-        <div class="grid2">
-          <div>
-            <label>Фото автора (аватар)</label>
-            {author_photo_block}
-            <form method="post" action="/admin/upload" enctype="multipart/form-data">
-              <input type="hidden" name="field" value="author_photo">
-              <div class="field"><input type="file" name="file" accept="image/*" required></div>
-              <button class="btn" type="submit">Загрузить</button>
-            </form>
-            <form method="post" action="/admin/remove_photo" style="margin-top:8px">
-              <input type="hidden" name="field" value="author_photo">
-              <button class="btn danger" type="submit">Удалить</button>
-            </form>
-          </div>
-          <div>
-            <label>Обложка главной</label>
-            {main_photo_block}
-            <form method="post" action="/admin/upload" enctype="multipart/form-data">
-              <input type="hidden" name="field" value="main_photo">
-              <div class="field"><input type="file" name="file" accept="image/*" required></div>
-              <button class="btn" type="submit">Загрузить</button>
-            </form>
-            <form method="post" action="/admin/remove_photo" style="margin-top:8px">
-              <input type="hidden" name="field" value="main_photo">
-              <button class="btn danger" type="submit">Удалить</button>
-            </form>
-          </div>
-        </div>
-      </div>
-    </div>
-    """
-
-
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_root(request: Request, admin_token: str = Cookie(None)):
-    msg = "Изменения сохранены ✔" if request.query_params.get("saved") else ""
-    err = ""
-    if request.query_params.get("error") == "1":
-        err = "Неверный пароль"
-    elif request.query_params.get("error") == "toobig":
-        err = "Файл слишком большой (макс. 5 МБ)"
-    logged = admin_token in SESSIONS
-    # ВАЖНО: render_base уже возвращает HTMLResponse — не оборачиваем повторно
-    return render_base("Админ", admin_page_html(logged, msg, err), "")
-
-
-@app.post("/admin/login")
-async def admin_login(password: str = Form(...)):
-    if password == STATE["settings"]["admin_password"]:
-        token = secrets.token_urlsafe(32)
-        SESSIONS.add(token)
-        resp = RedirectResponse("/admin", status_code=303)
-        resp.set_cookie("admin_token", token, httponly=True, samesite="lax")
-        return resp
-    return RedirectResponse("/admin?error=1", status_code=303)
-
-
-@app.post("/admin/logout")
-async def admin_logout(admin_token: str = Cookie(None)):
-    SESSIONS.discard(admin_token)
-    resp = RedirectResponse("/admin", status_code=303)
-    resp.delete_cookie("admin_token")
-    return resp
-
-
-@app.post("/admin/save")
-async def admin_save(request: Request, admin_token: str = Cookie(None)):
-    if admin_token not in SESSIONS:
-        return RedirectResponse("/admin", status_code=303)
-    form = await request.form()
-    s = STATE["settings"]
-
-    def get(key, default=""):
-        v = form.get(key)
-        return v if v is not None else default
-
-    s["site_title"] = get("site_title", s["site_title"])
-    s["author_nick"] = get("author_nick", s["author_nick"])
-    s["author_tagline"] = get("author_tagline", s["author_tagline"])
-    s["channel_description"] = get("channel_description", s["channel_description"])
-    s["footer_text"] = get("footer_text", s["footer_text"])
-
-    s["primary_color"] = get("primary_color", s["primary_color"])
-    s["bg_color"] = get("bg_color", s["bg_color"])
-    s["text_color"] = get("text_color", s["text_color"])
-    s["font_family"] = get("font_family", s["font_family"])
-    s["border_radius"] = get("border_radius", s["border_radius"])
-
-    s["info_content"] = get("info_content", s["info_content"])
-    s["community_content"] = get("community_content", s["community_content"])
-
-    s["chat_welcome"] = get("chat_welcome", s["chat_welcome"])
     try:
-        s["chat_max_history"] = int(get("chat_max_history", s["chat_max_history"]))
-    except (TypeError, ValueError):
-        pass
+        img = Image.open(io.BytesIO(raw))
+        img.load()
 
-    for key in ("main", "info", "community", "livechat"):
-        s["sections"][key]["name"] = get(f"{key}_name", s["sections"][key]["name"]) or s["sections"][key]["name"]
-        try:
-            s["sections"][key]["order"] = int(get(f"{key}_order", s["sections"][key]["order"]))
-        except (TypeError, ValueError):
-            pass
-        s["sections"][key]["visible"] = f"{key}_visible" in form
+        # прозрачность -> белый фон
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
 
-    new_pw = (get("new_password") or "").strip()
-    if new_pw:
-        s["admin_password"] = new_pw
+        # уменьшаем по большей стороне
+        w, h = img.size
+        if max(w, h) > IMG_MAX_SIDE:
+            if w >= h:
+                nw, nh = IMG_MAX_SIDE, max(1, int(h * IMG_MAX_SIDE / w))
+            else:
+                nh, nw = IMG_MAX_SIDE, max(1, int(w * IMG_MAX_SIDE / h))
+            img = img.resize((nw, nh), _LANCZOS)
 
-    return RedirectResponse("/admin?saved=1", status_code=303)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=IMG_QUALITY, optimize=True,
+                 progressive=True)
+        data = out.getvalue()
 
-
-@app.post("/admin/upload")
-async def admin_upload(request: Request, admin_token: str = Cookie(None)):
-    if admin_token not in SESSIONS:
-        return RedirectResponse("/admin", status_code=303)
-    form = await request.form()
-    field = form.get("field")
-    up = form.get("file")
-    if field in ("author_photo", "main_photo") and up is not None and hasattr(up, "read"):
-        data = await up.read()
-        if len(data) > 5 * 1024 * 1024:
-            return RedirectResponse("/admin?error=toobig", status_code=303)
-        mime = getattr(up, "content_type", None) or "image/png"
-        b64 = base64.b64encode(data).decode()
-        STATE["settings"][field] = f"data:{mime};base64,{b64}"
-    return RedirectResponse("/admin?saved=1", status_code=303)
+        # страховка: если сжатие не помогло — вернём оригинал
+        if len(data) >= len(raw) and max(w, h) <= IMG_MAX_SIDE:
+            return raw, (file_storage.mimetype or "image/jpeg")
+        return data, "image/jpeg"
+    except Exception:
+        return None
 
 
-@app.post("/admin/remove_photo")
-async def admin_remove_photo(request: Request, admin_token: str = Cookie(None)):
-    if admin_token not in SESSIONS:
-        return RedirectResponse("/admin", status_code=303)
-    form = await request.form()
-    field = form.get("field")
-    if field in ("author_photo", "main_photo"):
-        STATE["settings"][field] = ""
-    return RedirectResponse("/admin?saved=1", status_code=303)
+# ----------------------------------------------------------------------------
+# CSS / JS
+# ----------------------------------------------------------------------------
+CSS = """
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:Verdana,Tahoma,Arial,Helvetica,sans-serif;
+  font-size:12px;line-height:1.55;color:#1f2b38;
+  background:#dbe4ee;
+  background-image:linear-gradient(#dde7f1,#c6d4e5);
+  background-attachment:fixed;
+  -webkit-text-size-adjust:100%;
+}
+a{color:#1a5fa8;text-decoration:none}
+a:hover{color:#c0392b;text-decoration:underline}
+img{max-width:100%}
+.ico{flex:none;vertical-align:-2px}
+
+#header{
+  background:#3b6ea8;
+  background-image:linear-gradient(#5d92cd,#33628f);
+  border:1px solid #234d75;border-top:0;
+  border-radius:0 0 8px 8px;
+  box-shadow:0 2px 5px rgba(20,50,90,.35);
+  padding:10px 14px 9px;color:#fff;
+}
+.hrow{display:flex;align-items:center;justify-content:space-between;
+      gap:10px;flex-wrap:wrap}
+.logo{display:flex;align-items:center;gap:8px;font-size:20px;font-weight:bold;
+      color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.45);letter-spacing:.3px}
+.logo:hover{color:#fff;text-decoration:none}
+.logo span{color:#ffe680}
+.tagline{font-size:11px;color:#dbe9f8}
+
+#wrap{max-width:1000px;margin:0 auto;padding:0 10px 40px}
+
+.nav{display:flex;flex-wrap:wrap;gap:3px;background:#eef3f9;
+     border:1px solid #b7c8dc;border-radius:6px;padding:5px;margin:10px 0}
+.nav a{display:flex;align-items:center;gap:5px;padding:5px 9px;
+       border-radius:5px;color:#20486f;font-size:12px;border:1px solid transparent;
+       white-space:nowrap}
+.nav a:hover{background:#fff;border-color:#b7c8dc;text-decoration:none;color:#c0392b}
+.nav a.active{background:#3b6ea8;background-image:linear-gradient(#5d92cd,#33628f);
+       color:#fff;border-color:#234d75}
+
+.box{background:#fff;border:1px solid #b7c8dc;border-radius:6px;margin-bottom:12px;
+     box-shadow:0 1px 2px rgba(30,60,100,.08);overflow:hidden}
+.box-title{background:#eef3f9;background-image:linear-gradient(#f7fafd,#e4ecf6);
+     border-bottom:1px solid #cdd9e7;padding:7px 10px;font-weight:bold;
+     color:#20486f;display:flex;align-items:center;gap:6px;font-size:12px}
+.box-body{padding:10px}
+
+.hero{background:#fff;border:1px solid #b7c8dc;border-radius:6px;padding:14px;
+      margin-bottom:12px;box-shadow:0 1px 2px rgba(30,60,100,.08)}
+.hero h1{margin:0 0 6px;font-size:18px;color:#20486f}
+.hero p{margin:0 0 10px;color:#4a5c6e}
+.stats-row{display:flex;gap:8px;flex-wrap:wrap}
+.stat{background:#eef3f9;border:1px solid #cdd9e7;border-radius:5px;
+      padding:6px 10px;font-size:11px;color:#20486f;display:flex;align-items:center;gap:5px}
+.stat b{font-size:13px;color:#c0392b}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:10px}
+.card{display:block;background:#fff;border:1px solid #c3d2e2;border-radius:6px;
+      padding:10px;color:#1f2b38;transition:.12s}
+.card:hover{border-color:#5d92cd;background:#f7fbff;text-decoration:none;
+      color:#1f2b38;box-shadow:0 1px 6px rgba(60,110,170,.25)}
+.card-head{display:flex;align-items:center;gap:6px;font-size:13px;color:#20486f;
+      font-weight:bold;margin-bottom:4px}
+.card-desc{color:#5a6b7d;font-size:11px;min-height:30px}
+.card-count{margin-top:6px;font-size:10px;color:#7b8b9c;border-top:1px dashed #dde7f1;
+      padding-top:5px}
+
+.post{background:#fff;border:1px solid #c3d2e2;border-radius:6px;margin-bottom:10px;
+      overflow:hidden}
+.post-head{background:#f1f6fb;border-bottom:1px solid #dde7f1;padding:6px 10px;
+      font-size:11px;color:#5a6b7d;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.post-body{padding:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
+.post-text{flex:1 1 240px;min-width:200px;white-space:pre-wrap;
+      word-wrap:break-word;overflow-wrap:break-word}
+.post-img{flex:0 0 auto}
+.post-img img{max-width:240px;border:1px solid #b7c8dc;border-radius:4px;display:block;
+      background:#f4f7fa}
+.post-img img:hover{border-color:#5d92cd}
+.post-foot{border-top:1px solid #e7eef6;padding:6px 10px;background:#fbfdff;
+      font-size:11px;display:flex;gap:14px;flex-wrap:wrap}
+.post-foot a{display:flex;align-items:center;gap:5px}
+
+.badge{background:#3b6ea8;background-image:linear-gradient(#5d92cd,#33628f);
+      color:#fff;border-radius:9px;padding:1px 8px;font-size:10px;font-weight:bold}
+.anon{display:flex;align-items:center;gap:4px;color:#2e7d32;font-weight:bold}
+.dot{color:#a9b8c8}
+
+.comment{background:#fff;border:1px solid #d5e0ec;border-radius:5px;
+      margin-bottom:8px;overflow:hidden}
+.comment-head{background:#f5f9fd;border-bottom:1px solid #e7eef6;padding:5px 10px;
+      font-size:11px;color:#6b7c8e;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.comment-text{padding:9px 10px;white-space:pre-wrap;word-wrap:break-word;
+      overflow-wrap:break-word}
+
+label.lbl{display:block;font-size:11px;color:#20486f;font-weight:bold;
+      margin:0 0 4px}
+textarea,input[type=text],select{
+  width:100%;border:1px solid #b7c8dc;border-radius:4px;padding:6px 8px;
+  font:12px Verdana,Tahoma,Arial,sans-serif;background:#fdfefe;color:#1f2b38;
+  margin-bottom:8px}
+textarea:focus,input:focus,select:focus{outline:none;border-color:#5d92cd;
+      box-shadow:0 0 4px rgba(93,146,205,.65)}
+textarea{resize:vertical;min-height:80px}
+
+input[type=file]{width:100%;font-size:11px;margin-bottom:8px;
+      border:1px dashed #b7c8dc;border-radius:4px;padding:8px;background:#f8fbfe}
+
+.btn{display:inline-flex;align-items:center;gap:6px;
+      background:#3b6ea8;background-image:linear-gradient(#5d92cd,#33628f);
+      border:1px solid #234d75;color:#fff;border-radius:5px;padding:6px 14px;
+      cursor:pointer;font:bold 12px Verdana,Tahoma,Arial,sans-serif;
+      text-shadow:0 1px 1px rgba(0,0,0,.3)}
+.btn:hover{background-image:linear-gradient(#6ba0d9,#3d6f9e);color:#fff;
+      text-decoration:none}
+.btn:active{background-image:linear-gradient(#33628f,#5d92cd)}
+
+.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.form-row .col{flex:1 1 200px}
+
+#preview img{max-width:180px;border:1px solid #b7c8dc;border-radius:4px;
+      display:block;margin-top:2px}
+
+.notice{background:#fff8e1;border:1px solid #f0d98a;border-radius:5px;
+      padding:8px 10px;color:#7a5c00;font-size:11px;margin-bottom:10px;
+      display:flex;align-items:center;gap:6px}
+.empty{color:#7b8b9c;font-style:italic;padding:14px;text-align:center;
+      background:#fff;border:1px dashed #c3d2e2;border-radius:6px}
+
+#footer{margin-top:18px;padding:10px 4px;border-top:1px solid #b7c8dc;
+      color:#6b7c8e;font-size:11px;text-align:center;line-height:1.8}
+#footer a{display:inline-flex;align-items:center;gap:4px}
+
+.crumbs{font-size:11px;color:#6b7c8e;margin:0 0 8px;display:flex;
+      align-items:center;gap:6px;flex-wrap:wrap}
+
+@media (max-width:700px){
+  body{font-size:12px}
+  #header{padding:9px 10px 8px}
+  .logo{font-size:17px}
+  .tagline{font-size:10px}
+  #wrap{padding:0 7px 30px}
+  .nav{gap:3px;padding:4px}
+  .nav a{padding:5px 7px;font-size:11px}
+  .nav a span{display:none}
+  .nav a{padding:7px 9px}
+  .grid{grid-template-columns:1fr 1fr}
+  .card-desc{display:none}
+  .card{padding:8px}
+  .card-head{font-size:12px}
+  .post-body{flex-direction:column}
+  .post-img{width:100%}
+  .post-img img{max-width:100%}
+  .hero h1{font-size:15px}
+  textarea{min-height:90px}
+}
+@media (max-width:360px){
+  .grid{grid-template-columns:1fr}
+}
+"""
+
+JS = """
+(function(){
+  var f = document.querySelector('input[type=file][name=photo]');
+  if(!f) return;
+  f.addEventListener('change', function(){
+    var box = document.getElementById('preview');
+    if(!box) return;
+    box.innerHTML = '';
+    if(f.files && f.files[0]){
+      var img = document.createElement('img');
+      img.src = URL.createObjectURL(f.files[0]);
+      img.alt = '\u043f\u0440\u0435\u0432\u044c\u044e';
+      box.appendChild(img);
+    }
+  });
+})();
+"""
 
 
+# ----------------------------------------------------------------------------
+# Каркас страницы
+# ----------------------------------------------------------------------------
+def layout(title, content, active=""):
+    nav = []
+    for key, name, desc in SECTIONS:
+        cls = " active" if key == active else ""
+        nav.append(
+            '<a class="%s" href="/s/%s" title="%s">%s<span>%s</span></a>'
+            % (cls.strip(), key, esc(desc), ico(key, 14), esc(name))
+        )
+    nav = "".join(nav)
+    year = time.strftime("%Y")
+
+    return (
+        '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="theme-color" content="#3b6ea8">'
+        '<title>' + esc(title) + ' — SLDCommunity</title>'
+        '<style>' + CSS + '</style></head><body>'
+        '<div id="header"><div class="hrow">'
+        '<a class="logo" href="/">' + ico("logo", 22) + 'SLD<span>Community</span></a>'
+        '<div class="tagline">анонимно &middot; без регистрации &middot; без ников</div>'
+        '</div></div>'
+        '<div id="wrap">'
+        '<div class="nav">' + nav + '</div>'
+        + content +
+        '<div id="footer">SLDCommunity &copy; 2010&ndash;' + year +
+        ' &middot; всё хранится только в оперативной памяти &middot; '
+        '<a href="/stats/foned">' + ico("stats", 12) + 'статистика</a>'
+        '</div></div>'
+        '<script>' + JS + '</script>'
+        '</body></html>'
+    )
+
+
+def render_post(p, with_comments_link=True):
+    sec_name = SECTION_MAP.get(p["section"], ("Общее", ""))[0]
+    n = len(p["comments"])
+
+    img_html = ""
+    if p.get("img"):
+        img_html = (
+            '<div class="post-img"><a href="/img/%d" target="_blank" '
+            'title="Открыть в полном размере">'
+            '<img src="/img/%d" alt="изображение" loading="lazy"></a></div>'
+            % (p["id"], p["id"])
+        )
+
+    foot = ""
+    if with_comments_link:
+        foot = (
+            '<div class="post-foot">'
+            '<a href="/p/%d">%sКомментарии (%d)</a>'
+            '%s'
+            '</div>'
+            % (p["id"], ico("comment", 13), n,
+               ('<span style="color:#7b8b9c">с фото</span>' if p.get("img") else ""))
+        )
+
+    return (
+        '<div class="post">'
+        '<div class="post-head">'
+        '<span class="badge">#%d</span>'
+        '<span class="anon">%sАноним</span>'
+        '<span class="dot">&middot;</span>'
+        '<span>%s</span>'
+        '<span class="dot">&middot;</span>'
+        '<span>%s%s</span>'
+        '</div>'
+        '<div class="post-body">'
+        '<div class="post-text">%s</div>'
+        '%s'
+        '</div>'
+        '%s'
+        '</div>'
+        % (p["id"], ico("user", 12), fmt_time(p["ts"]),
+           ico("hash", 11), esc(sec_name),
+           esc(p["text"]), img_html, foot)
+    )
+
+
+def post_form(selected="general", compact=False):
+    opts = "".join(
+        '<option value="%s"%s>%s</option>'
+        % (k, " selected" if k == selected else "", esc(n))
+        for k, n, _ in SECTIONS
+    )
+    return (
+        '<form class="box" method="post" action="/create" '
+        'enctype="multipart/form-data">'
+        '<div class="box-title">' + ico("plus", 13) + 'Новый пост</div>'
+        '<div class="box-body">'
+        '<div class="form-row">'
+        '<div class="col" style="flex:0 0 190px">'
+        '<label class="lbl" for="section">Раздел</label>'
+        '<select id="section" name="section">' + opts + '</select>'
+        '</div>'
+        '<div class="col">'
+        '<label class="lbl">Фото (необязательно, одно)</label>'
+        '<input type="file" name="photo" accept="image/*">'
+        '</div>'
+        '</div>'
+        '<label class="lbl" for="text">Текст сообщения</label>'
+        '<textarea id="text" name="text" maxlength="' + str(MAX_POST_TEXT) + '" '
+        'placeholder="Пиши анонимно. Никто не узнает, кто ты."></textarea>'
+        '<div id="preview"></div>'
+        '<button class="btn" type="submit">' + ico("send", 13) + 'Отправить</button>'
+        '</div></form>'
+    )
+
+
+# ----------------------------------------------------------------------------
+# Маршруты
+# ----------------------------------------------------------------------------
+@app.route("/")
+def index():
+    posts = all_posts()
+    tp = len(posts)
+    tc = sum(len(p["comments"]) for p in posts)
+    tw = sum(1 for p in posts if p.get("img"))
+
+    cards = []
+    for key, name, desc in SECTIONS:
+        cnt = sum(1 for p in posts if p["section"] == key)
+        cards.append(
+            '<a class="card" href="/s/%s">'
+            '<div class="card-head">%s%s</div>'
+            '<div class="card-desc">%s</div>'
+            '<div class="card-count">%d %s</div>'
+            '</a>'
+            % (key, ico(key, 17), esc(name), esc(desc),
+               cnt, plural(cnt, "пост", "поста", "постов"))
+        )
+
+    latest = ""
+    if posts:
+        latest = "".join(render_post(p) for p in posts[:5])
+    else:
+        latest = '<div class="empty">Пока ни одного поста. Будь первым!</div>'
+
+    content = (
+        '<div class="hero">'
+        '<h1>SLDCommunity — анонимный форум</h1>'
+        '<p>Никаких ников, аккаунтов и идентификаторов. Пиши что думаешь — '
+        'всё живёт только в оперативной памяти сервера и исчезает при перезапуске.</p>'
+        '<div class="stats-row">'
+        '<span class="stat">' + ico("hash", 12) + 'Постов: <b>' + str(tp) + '</b></span>'
+        '<span class="stat">' + ico("comment", 12) + 'Комментариев: <b>' + str(tc) + '</b></span>'
+        '<span class="stat">' + ico("image", 12) + 'С фото: <b>' + str(tw) + '</b></span>'
+        '<span class="stat">' + ico("shield", 12) + 'Разделов: <b>' + str(len(SECTIONS)) + '</b></span>'
+        '</div></div>'
+        + post_form("general") +
+        '<div class="box"><div class="box-title">' + ico("general", 13) +
+        'Разделы форума</div><div class="box-body"><div class="grid">'
+        + "".join(cards) +
+        '</div></div></div>'
+        '<div class="box"><div class="box-title">' + ico("clock", 13) +
+        'Последние посты</div><div class="box-body">' + latest + '</div></div>'
+    )
+    return layout("Главная", content)
+
+
+@app.route("/s/<key>")
+def section(key):
+    if key not in SECTION_MAP:
+        abort(404)
+    name, desc = SECTION_MAP[key]
+    posts = section_posts(key)
+
+    body = "".join(render_post(p) for p in posts)
+    if not posts:
+        body = '<div class="empty">В этом разделе пока пусто. Создай первый пост!</div>'
+
+    content = (
+        '<div class="crumbs"><a href="/">' + ico("back", 12) + 'Главная</a>'
+        '<span class="dot">&rarr;</span><b>' + esc(name) + '</b></div>'
+        '<div class="hero"><h1>' + ico(key, 18) + ' ' + esc(name) + '</h1>'
+        '<p>' + esc(desc) + '</p>'
+        '<div class="stats-row"><span class="stat">' + ico("hash", 12) +
+        'Постов: <b>' + str(len(posts)) + '</b></span>'
+        '<span class="stat">' + ico("comment", 12) + 'Комментариев: <b>' +
+        str(sum(len(p["comments"]) for p in posts)) + '</b></span></div></div>'
+        + post_form(key) +
+        '<div class="box"><div class="box-title">' + ico(key, 13) +
+        'Посты раздела</div><div class="box-body">' + body + '</div></div>'
+    )
+    return layout(name, content, active=key)
+
+
+@app.route("/p/<int:pid>")
+def post_page(pid):
+    p = _posts.get(pid)
+    if not p:
+        abort(404)
+    name = SECTION_MAP.get(p["section"], ("Общее", ""))[0]
+
+    comments = ""
+    if p["comments"]:
+        parts = []
+        for c in p["comments"]:
+            parts.append(
+                '<div class="comment">'
+                '<div class="comment-head">'
+                '<span class="anon">' + ico("user", 11) + 'Аноним</span>'
+                '<span class="dot">&middot;</span>'
+                '<span>' + fmt_time(c["ts"]) + '</span>'
+                '<span class="dot">&middot;</span>'
+                '<span>#' + str(c["id"]) + '</span>'
+                '</div>'
+                '<div class="comment-text">' + esc(c["text"]) + '</div>'
+                '</div>'
+            )
+        comments = "".join(parts)
+    else:
+        comments = '<div class="empty">Комментариев пока нет. Напиши первым!</div>'
+
+    comment_form = (
+        '<form class="box" method="post" action="/p/' + str(pid) + '/comment">'
+        '<div class="box-title">' + ico("comment", 13) + 'Анонимный комментарий</div>'
+        '<div class="box-body">'
+        '<textarea name="text" maxlength="' + str(MAX_COMMENT_TEXT) + '" '
+        'placeholder="Твой комментарий..."></textarea>'
+        '<button class="btn" type="submit">' + ico("send", 13) + 'Отправить</button>'
+        '</div></form>'
+    )
+
+    content = (
+        '<div class="crumbs"><a href="/">' + ico("back", 12) + 'Главная</a>'
+        '<span class="dot">&rarr;</span>'
+        '<a href="/s/' + p["section"] + '">' + esc(name) + '</a>'
+        '<span class="dot">&rarr;</span><b>Пост #' + str(pid) + '</b></div>'
+        + render_post(p, with_comments_link=False) +
+        '<div class="box"><div class="box-title">' + ico("comment", 13) +
+        'Комментарии (' + str(len(p["comments"])) + ')</div>'
+        '<div class="box-body">' + comments + '</div></div>'
+        + comment_form
+    )
+    return layout("Пост #%d" % pid, content, active=p["section"])
+
+
+@app.route("/create", methods=["POST"])
+def create():
+    section_key = (request.form.get("section") or "general").strip()
+    if section_key not in SECTION_MAP:
+        section_key = "general"
+
+    text = (request.form.get("text") or "").strip()
+    if len(text) > MAX_POST_TEXT:
+        text = text[:MAX_POST_TEXT]
+
+    photo = request.files.get("photo")
+    image = None
+    if photo and photo.filename:
+        image = compress_image(photo)
+
+    if not text and not image:
+        return redirect(request.referrer or "/")
+
+    with _lock:
+        pid = next(_post_ids)
+        _posts[pid] = {
+            "id": pid,
+            "section": section_key,
+            "text": text if text else "(без текста)",
+            "img": image[0] if image else None,
+            "mime": image[1] if image else None,
+            "ts": time.time(),
+            "comments": [],
+        }
+    return redirect("/p/%d" % pid)
+
+
+@app.route("/p/<int:pid>/comment", methods=["POST"])
+def add_comment(pid):
+    p = _posts.get(pid)
+    if not p:
+        abort(404)
+    text = (request.form.get("text") or "").strip()
+    if len(text) > MAX_COMMENT_TEXT:
+        text = text[:MAX_COMMENT_TEXT]
+    if text:
+        with _lock:
+            p["comments"].append({
+                "id": next(_comment_ids),
+                "text": text,
+                "ts": time.time(),
+            })
+    return redirect("/p/%d" % pid)
+
+
+@app.route("/img/<int:pid>")
+def get_image(pid):
+    p = _posts.get(pid)
+    if not p or not p.get("img"):
+        abort(404)
+    return Response(
+        p["img"],
+        mimetype=p["mime"] or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.route("/stats/foned")
+def stats_foned():
+    """Статистика без фона — простой текст."""
+    posts = all_posts()
+    tp = len(posts)
+    tc = sum(len(p["comments"]) for p in posts)
+    tw = sum(1 for p in posts if p.get("img"))
+
+    lines = [
+        "SLDCommunity :: /stats/foned",
+        "",
+        "Всего постов:       %d" % tp,
+        "Всего комментариев: %d" % tc,
+        "Постов с фото:      %d" % tw,
+        "Разделов:           %d" % len(SECTIONS),
+        "",
+        "Хранилище: оперативная память (RAM), без базы данных.",
+        "Время сервера: %s" % time.strftime("%d.%m.%Y %H:%M:%S"),
+    ]
+    return Response("\n".join(lines) + "\n",
+                    mimetype="text/plain; charset=utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Обработчики ошибок
+# ----------------------------------------------------------------------------
+def _err_page(code, title, text):
+    content = (
+        '<div class="hero"><h1>%s</h1><p>%s</p>'
+        '<a class="btn" href="/">%sНа главную</a></div>'
+        % (esc(title), esc(text), ico("back", 13))
+    )
+    return layout("Ошибка %d" % code, content), code
+
+
+@app.errorhandler(404)
+def err404(e):
+    return _err_page(404, "404 — страница не найдена",
+                     "Такой страницы здесь нет. Возможно, пост был удалён "
+                     "или сервер перезапускался (всё хранится в памяти).")
+
+
+@app.errorhandler(413)
+def err413(e):
+    return _err_page(413, "413 — файл слишком большой",
+                     "Максимальный размер загружаемого файла — 10 МБ.")
+
+
+@app.errorhandler(500)
+def err500(e):
+    return _err_page(500, "500 — внутренняя ошибка",
+                     "Что-то пошло не так. Попробуй ещё раз.")
+
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    print("=" * 56)
+    print("  SLDCommunity запущен")
+    print("  Открой:  http://127.0.0.1:5000")
+    print("  Статистика: http://127.0.0.1:5000/stats/foned")
+    print("  Всё хранится в оперативной памяти (RAM).")
+    print("=" * 56)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
