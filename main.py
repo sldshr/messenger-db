@@ -1,14 +1,13 @@
 # main.py
-# Запуск: pip install fastapi uvicorn jinja2 python-multipart
-#         uvicorn main:app --reload
+# pip install fastapi uvicorn jinja2 python-multipart
+# uvicorn main:app --reload
 
-import asyncio
 import base64
 import secrets
 from datetime import datetime
 
 from fastapi import FastAPI, Request, Form, WebSocket, WebSocketDisconnect, Cookie
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from jinja2 import Template
 import uvicorn
 
@@ -19,29 +18,24 @@ app = FastAPI(title="Community")
 # ============================================================
 STATE = {
     "settings": {
-        # --- Основные ---
         "site_title": "Моё сообщество",
         "author_nick": "Автор",
         "channel_description": "Добро пожаловать в моё сообщество! Здесь вы найдёте самое интересное.",
         "author_tagline": "Автор и создатель",
         "footer_text": "© 2025 Моё сообщество",
 
-        # --- Фото (data-URL) ---
         "author_photo": "",
         "main_photo": "",
 
-        # --- Стили ---
-        "primary_color": "#6366f1",
-        "bg_color": "#0f172a",
-        "text_color": "#e2e8f0",
-        "font_family": "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
-        "border_radius": "16px",
+        "primary_color": "#2a5db0",
+        "bg_color": "#d9e4f5",
+        "text_color": "#1a1a1a",
+        "font_family": "Arial, Tahoma, Verdana, sans-serif",
+        "border_radius": "6px",
 
-        # --- Содержимое страниц ---
         "info_content": "<h2>О проекте</h2><p>Здесь вы можете написать любую информацию о своём сообществе, используя HTML.</p>",
         "community_content": "<h2>Правила сообщества</h2><p>1. Будьте вежливы.<br>2. Не спамьте.<br>3. Уважайте других.</p>",
 
-        # --- Разделы (видимость / название / порядок) ---
         "sections": {
             "main":      {"name": "Главная",    "visible": True, "order": 0},
             "info":      {"name": "Инфо",       "visible": True, "order": 1},
@@ -49,11 +43,9 @@ STATE = {
             "livechat":  {"name": "Лайв чат",   "visible": True, "order": 3},
         },
 
-        # --- Чат ---
         "chat_welcome": "Добро пожаловать в чат!",
         "chat_max_history": 200,
 
-        # --- Админ ---
         "admin_password": "admin",
     },
     "chat": [],
@@ -65,7 +57,7 @@ SEC_URL = {"main": "/", "info": "/info", "community": "/community", "livechat": 
 
 
 # ============================================================
-#                     БАЗОВЫЙ ШАБЛОН
+#                     БАЗОВЫЙ ШАБЛОН (2010 style)
 # ============================================================
 BASE_TPL = Template("""<!DOCTYPE html>
 <html lang="ru">
@@ -81,59 +73,237 @@ BASE_TPL = Template("""<!DOCTYPE html>
   --radius: {{ s.border_radius }};
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:{{ s.font_family }};background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
-header{background:rgba(0,0,0,.35);backdrop-filter:blur(10px);padding:.9rem 2rem;border-bottom:1px solid rgba(255,255,255,.1);position:sticky;top:0;z-index:10}
-nav{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;max-width:1200px;margin:0 auto}
-nav .brand{font-weight:700;font-size:1.25rem;margin-right:auto;color:var(--primary)}
-nav a{color:var(--text);text-decoration:none;padding:.5rem 1rem;border-radius:10px;transition:.2s;font-size:.95rem}
-nav a:hover{background:rgba(255,255,255,.1)}
-nav a.active{background:var(--primary);color:#fff}
-main{flex:1;padding:2rem;max-width:1200px;margin:0 auto;width:100%}
-footer{text-align:center;padding:1.5rem;opacity:.5;font-size:.9rem;border-top:1px solid rgba(255,255,255,.1)}
-.card{background:rgba(255,255,255,.05);border-radius:var(--radius);padding:2rem;margin-bottom:1.5rem;border:1px solid rgba(255,255,255,.1)}
-.hero{display:flex;gap:2rem;align-items:center;flex-wrap:wrap}
-.hero .avatar{width:130px;height:130px;border-radius:50%;object-fit:cover;border:3px solid var(--primary);flex-shrink:0;background:rgba(0,0,0,.3)}
-.hero h1{color:var(--primary);font-size:2.4rem;margin-bottom:.3rem;line-height:1.1}
-.hero .tagline{opacity:.6;margin-bottom:.7rem;font-size:.95rem}
-.hero .desc{opacity:.9;line-height:1.6;font-size:1.1rem}
-.cover{width:100%;max-height:400px;object-fit:cover;border-radius:calc(var(--radius) - 4px);margin-bottom:1.5rem}
-.btn{background:var(--primary);color:#fff;border:none;padding:.7rem 1.4rem;border-radius:10px;cursor:pointer;font-size:1rem;font-weight:500;transition:.2s;font-family:inherit}
-.btn:hover{filter:brightness(1.15)}
-.btn.ghost{background:transparent;border:1px solid var(--primary);color:var(--primary)}
-.btn.danger{background:#ef4444}
-input,textarea,select{background:rgba(0,0,0,.3);color:var(--text);border:1px solid rgba(255,255,255,.2);padding:.7rem;border-radius:10px;width:100%;font-family:inherit;font-size:1rem}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--primary)}
-textarea{min-height:130px;resize:vertical;font-family:inherit}
-label{display:block;margin-bottom:.4rem;font-weight:500;opacity:.9;font-size:.95rem}
-.field{margin-bottom:1rem}
-.chat-box{background:rgba(0,0,0,.3);border-radius:var(--radius);padding:1rem;height:500px;overflow-y:auto;margin-bottom:1rem}
-.msg{padding:.55rem .85rem;margin-bottom:.5rem;border-radius:10px;background:rgba(255,255,255,.05);word-wrap:break-word;line-height:1.4}
-.msg .nick{color:var(--primary);font-weight:700;margin-right:.5rem}
-.msg .time{font-size:.75rem;opacity:.5;margin-left:.5rem}
-.chat-input{display:flex;gap:.5rem;flex-wrap:wrap}
+body{
+  font-family:{{ s.font_family }};
+  font-size:13px;
+  color:var(--text);
+  background:var(--bg);
+  background-image:
+    linear-gradient(to bottom, rgba(255,255,255,.6), rgba(255,255,255,0) 220px),
+    repeating-linear-gradient(0deg, rgba(0,0,0,.02) 0px, rgba(0,0,0,.02) 1px, transparent 1px, transparent 3px);
+  min-height:100vh;
+}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ---------- Header ---------- */
+header{
+  background:linear-gradient(to bottom, #6f92c9 0%, var(--primary) 50%, #1c3f7a 100%);
+  border-bottom:3px solid #0e2547;
+  box-shadow:0 2px 6px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.5);
+  padding:0;
+}
+.header-inner{
+  max-width:1000px;margin:0 auto;padding:14px 16px 0;
+}
+.brand{
+  color:#fff;font-size:22px;font-weight:bold;
+  text-shadow:1px 1px 0 rgba(0,0,0,.5);
+  margin-bottom:10px;display:block;
+  letter-spacing:.5px;
+}
+.brand .dot{color:#ffe86a}
+nav{
+  display:block;
+  background:linear-gradient(to bottom, rgba(255,255,255,.25), rgba(255,255,255,.05));
+  border-radius:6px 6px 0 0;
+  border:1px solid #163a6e;border-bottom:none;
+  padding:0 4px;
+}
+nav ul{list-style:none;display:flex;flex-wrap:wrap}
+nav li{display:inline-block}
+nav a{
+  display:block;padding:8px 14px;color:#fff;font-weight:bold;
+  text-decoration:none;font-size:13px;
+  border-right:1px solid rgba(0,0,0,.2);
+  text-shadow:1px 1px 0 rgba(0,0,0,.4);
+  transition:none;
+}
+nav a:hover{background:rgba(255,255,255,.15);text-decoration:none}
+nav a.active{
+  background:linear-gradient(to bottom, #fdf3b5, #f5c842);
+  color:#5a3a00 !important;
+  text-shadow:0 1px 0 #fff;
+}
+nav a.admin-link{color:#ffe86a}
+
+/* ---------- Layout ---------- */
+main{
+  max-width:1000px;margin:0 auto;
+  padding:16px;
+}
+.card{
+  background:#ffffff;
+  border:1px solid #b8c5d9;
+  border-radius:var(--radius);
+  box-shadow:0 2px 4px rgba(0,0,0,.08);
+  margin-bottom:14px;
+  overflow:hidden;
+}
+.card-title{
+  background:linear-gradient(to bottom, #eaf0f9, #cfdcee);
+  border-bottom:1px solid #b8c5d9;
+  padding:8px 14px;
+  font-weight:bold;font-size:13px;color:#1c3f7a;
+  text-shadow:0 1px 0 #fff;
+}
+.card-body{padding:14px}
+
+/* ---------- Hero ---------- */
+.hero{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.hero .avatar{
+  width:120px;height:120px;border-radius:6px;object-fit:cover;
+  border:1px solid #8a9cb8;padding:2px;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.2);flex-shrink:0;
+}
+.hero .avatar.ph{
+  display:flex;align-items:center;justify-content:center;
+  font-size:48px;color:#7a8ba5;background:#f3f6fb;
+}
+.hero h1{
+  color:#1c3f7a;font-size:24px;margin-bottom:4px;
+  font-family:Arial Black, Arial, sans-serif;
+  text-shadow:0 1px 0 #fff;
+}
+.hero .tagline{color:#556a86;margin-bottom:8px;font-size:12px;font-style:italic}
+.hero .desc{line-height:1.6;font-size:13px}
+.cover{
+  width:100%;max-height:340px;object-fit:cover;
+  border-bottom:1px solid #b8c5d9;display:block;
+}
+
+/* ---------- Кнопки ---------- */
+.btn{
+  display:inline-block;
+  background:linear-gradient(to bottom, #7ea7dd 0%, var(--primary) 50%, #1e4a8c 100%);
+  color:#fff;font-weight:bold;
+  border:1px solid #163a6e;
+  padding:6px 14px;
+  border-radius:5px;
+  cursor:pointer;
+  font-size:13px;font-family:inherit;
+  text-shadow:1px 1px 0 rgba(0,0,0,.4);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4), 0 1px 2px rgba(0,0,0,.2);
+  text-decoration:none;
+}
+.btn:hover{filter:brightness(1.08);text-decoration:none}
+.btn:active{box-shadow:inset 0 2px 4px rgba(0,0,0,.35);}
+.btn.ghost{
+  background:linear-gradient(to bottom, #ffffff, #dfe6f0);
+  color:#1c3f7a;text-shadow:0 1px 0 #fff;
+  border:1px solid #8a9cb8;
+}
+.btn.danger{
+  background:linear-gradient(to bottom, #f08b8b 0%, #c32828 50%, #8b1414 100%);
+  border-color:#5a0a0a;color:#fff;
+}
+
+/* ---------- Формы ---------- */
+input,textarea,select{
+  background:#ffffff;
+  color:#1a1a1a;
+  border:1px solid #8a9cb8;
+  border-top-color:#5a6c88;
+  padding:5px 7px;
+  border-radius:3px;
+  font-family:inherit;
+  font-size:13px;
+  width:100%;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.06);
+}
+input:focus,textarea:focus,select:focus{
+  outline:none;border-color:var(--primary);
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.06), 0 0 4px rgba(42,93,176,.5);
+}
+textarea{min-height:120px;resize:vertical;font-family:inherit}
+label{display:block;margin-bottom:3px;font-weight:bold;font-size:12px;color:#33475f}
+.field{margin-bottom:12px}
+.checkbox-label{display:flex;align-items:center;gap:6px;font-weight:normal;margin:0}
+.checkbox-label input{width:auto;box-shadow:none}
+
+/* ---------- Чат ---------- */
+.chat-box{
+  background:#ffffff;
+  border:1px solid #8a9cb8;
+  border-top-color:#5a6c88;
+  border-radius:3px;
+  padding:8px;
+  height:460px;overflow-y:auto;
+  margin-bottom:10px;
+  box-shadow:inset 0 1px 2px rgba(0,0,0,.08);
+}
+.msg{
+  padding:5px 8px;margin-bottom:4px;
+  border-radius:3px;
+  background:linear-gradient(to bottom, #f6f9fd, #e8eff9);
+  border:1px solid #d0dbea;
+  word-wrap:break-word;line-height:1.45;
+  font-size:13px;
+}
+.msg .nick{color:#1c3f7a;font-weight:bold;margin-right:5px}
+.msg .time{font-size:11px;color:#7a8ba5;margin-left:6px}
+.chat-input{display:flex;gap:6px;flex-wrap:wrap}
 .chat-input input{flex:1;min-width:120px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem}
+
+/* ---------- Сетки ---------- */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 @media(max-width:750px){.grid2,.grid3{grid-template-columns:1fr}}
-.alert{padding:1rem;border-radius:10px;margin-bottom:1rem}
-.alert.ok{background:rgba(34,197,94,.2);border:1px solid #22c55e}
-.alert.err{background:rgba(239,68,68,.2);border:1px solid #ef4444}
-.photo-preview{max-width:200px;max-height:200px;border-radius:10px;object-fit:cover;border:1px solid rgba(255,255,255,.2);margin-bottom:.5rem;display:block}
-.section-row{display:flex;gap:1rem;align-items:center;padding:.6rem 0;border-bottom:1px solid rgba(255,255,255,.07)}
-.section-row .check{width:auto}
-h2{margin-bottom:1rem}
-.muted{opacity:.6;font-size:.9rem}
+
+/* ---------- Алерты ---------- */
+.alert{padding:10px 14px;border-radius:4px;margin-bottom:14px;font-weight:bold}
+.alert.ok{
+  background:linear-gradient(to bottom, #e3f6d9, #c6eab4);
+  border:1px solid #79b861;color:#2f5a1c;text-shadow:0 1px 0 #fff;
+}
+.alert.err{
+  background:linear-gradient(to bottom, #fbe2e2, #f2c0c0);
+  border:1px solid #c76a6a;color:#7a1414;text-shadow:0 1px 0 #fff;
+}
+
+.photo-preview{
+  max-width:200px;max-height:200px;border-radius:4px;object-fit:cover;
+  border:1px solid #8a9cb8;padding:2px;background:#fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.15);
+  margin-bottom:8px;display:block;
+}
+.section-row{
+  display:flex;gap:10px;align-items:center;
+  padding:8px 0;border-bottom:1px dashed #c5d0e0;
+}
+.section-row:last-child{border-bottom:none}
+.muted{color:#5d6f89;font-size:12px;font-style:italic}
+code{
+  background:#eef2f8;padding:1px 5px;border-radius:3px;
+  font-family:Consolas, monospace;color:#a03030;font-size:12px;
+  border:1px solid #d5dde9;
+}
+h2{color:#1c3f7a;font-size:16px;margin-bottom:10px;text-shadow:0 1px 0 #fff}
+h3{color:#1c3f7a;font-size:14px;margin-bottom:8px}
+
+/* ---------- Footer ---------- */
+footer{
+  text-align:center;padding:16px;color:#556a86;
+  font-size:11px;
+  border-top:1px solid #b8c5d9;
+  margin-top:20px;
+  background:linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,.6));
+}
 </style>
 </head>
 <body>
 <header>
-<nav>
-  <span class="brand">{{ s.site_title }}</span>
-  {% for sec in sections if sec.visible %}
-    <a href="{{ sec.url }}" class="{{ 'active' if sec.id == current else '' }}">{{ sec.name }}</a>
-  {% endfor %}
-  <a href="/admin">⚙ Админ</a>
-</nav>
+  <div class="header-inner">
+    <span class="brand">{{ s.site_title }} <span class="dot">●</span></span>
+    <nav>
+      <ul>
+      {% for sec in sections if sec.visible %}
+        <li><a href="{{ sec.url }}" class="{{ 'active' if sec.id == current else '' }}">{{ sec.name }}</a></li>
+      {% endfor %}
+        <li><a href="/admin" class="admin-link">⚙ Админ</a></li>
+      </ul>
+    </nav>
+  </div>
 </header>
 <main>{{ content|safe }}</main>
 <footer>{{ s.footer_text }}</footer>
@@ -159,18 +329,20 @@ def page_main_html() -> str:
     if s["author_photo"]:
         avatar = f'<img class="avatar" src="{s["author_photo"]}" alt="avatar">'
     else:
-        avatar = ('<div class="avatar" style="display:flex;align-items:center;'
-                  'justify-content:center;font-size:3.5rem">👤</div>')
+        avatar = '<div class="avatar ph">👤</div>'
     cover = f'<img class="cover" src="{s["main_photo"]}" alt="cover">' if s["main_photo"] else ""
     return f"""
     <div class="card">
       {cover}
-      <div class="hero">
-        {avatar}
-        <div style="flex:1;min-width:250px">
-          <h1>{s['author_nick']}</h1>
-          <div class="tagline">{s['author_tagline']}</div>
-          <div class="desc">{s['channel_description']}</div>
+      <div class="card-title">О канале</div>
+      <div class="card-body">
+        <div class="hero">
+          {avatar}
+          <div style="flex:1;min-width:240px">
+            <h1>{s['author_nick']}</h1>
+            <div class="tagline">{s['author_tagline']}</div>
+            <div class="desc">{s['channel_description']}</div>
+          </div>
         </div>
       </div>
     </div>
@@ -180,8 +352,8 @@ def page_main_html() -> str:
 def page_info_html() -> str:
     return f"""
     <div class="card">
-      <h1 style="color:var(--primary);margin-bottom:1rem">Инфо</h1>
-      <div>{STATE['settings']['info_content']}</div>
+      <div class="card-title">📄 Инфо</div>
+      <div class="card-body">{STATE['settings']['info_content']}</div>
     </div>
     """
 
@@ -189,8 +361,8 @@ def page_info_html() -> str:
 def page_community_html() -> str:
     return f"""
     <div class="card">
-      <h1 style="color:var(--primary);margin-bottom:1rem">Сообщество</h1>
-      <div>{STATE['settings']['community_content']}</div>
+      <div class="card-title">👥 Сообщество</div>
+      <div class="card-body">{STATE['settings']['community_content']}</div>
     </div>
     """
 
@@ -199,13 +371,15 @@ def page_livechat_html() -> str:
     s = STATE["settings"]
     return f"""
     <div class="card">
-      <h1 style="color:var(--primary);margin-bottom:1rem">Лайв чат</h1>
-      <p class="muted" style="margin-bottom:1rem">{s['chat_welcome']}</p>
-      <div class="chat-box" id="chat"></div>
-      <div class="chat-input">
-        <input id="nick" placeholder="Ваш ник" style="max-width:220px">
-        <input id="msg" placeholder="Сообщение..." autocomplete="off">
-        <button class="btn" onclick="send()">Отправить</button>
+      <div class="card-title">💬 Лайв чат</div>
+      <div class="card-body">
+        <p class="muted" style="margin-bottom:10px">{s['chat_welcome']}</p>
+        <div class="chat-box" id="chat"></div>
+        <div class="chat-input">
+          <input id="nick" placeholder="Ваш ник" style="max-width:220px">
+          <input id="msg" placeholder="Сообщение..." autocomplete="off">
+          <button class="btn" onclick="send()">Отправить</button>
+        </div>
       </div>
     </div>
     <script>
@@ -228,7 +402,7 @@ def page_livechat_html() -> str:
       function addMsg(m) {{
         const el = document.createElement('div');
         el.className = 'msg';
-        const n = document.createElement('span'); n.className = 'nick'; n.textContent = m.nick;
+        const n = document.createElement('span'); n.className = 'nick'; n.textContent = m.nick + ':';
         const t = document.createElement('span'); t.textContent = m.text;
         const tm = document.createElement('span'); tm.className = 'time'; tm.textContent = m.time;
         el.append(n, t, tm);
@@ -322,17 +496,19 @@ def admin_page_html(logged: bool, message: str = "", error: str = "") -> str:
     s = STATE["settings"]
     if not logged:
         return f"""
-        <div class="card" style="max-width:420px;margin:2rem auto">
-          <h2>Вход в админку</h2>
-          {f'<div class="alert err">{error}</div>' if error else ''}
-          <form method="post" action="/admin/login">
-            <div class="field">
-              <label>Пароль</label>
-              <input type="password" name="password" autofocus>
-            </div>
-            <button class="btn" type="submit">Войти</button>
-          </form>
-          <p class="muted" style="margin-top:1rem">Пароль по умолчанию: <code>admin</code></p>
+        <div class="card" style="max-width:420px;margin:20px auto">
+          <div class="card-title">🔐 Вход в админку</div>
+          <div class="card-body">
+            {f'<div class="alert err">{error}</div>' if error else ''}
+            <form method="post" action="/admin/login">
+              <div class="field">
+                <label>Пароль</label>
+                <input type="password" name="password" autofocus>
+              </div>
+              <button class="btn" type="submit">Войти</button>
+            </form>
+            <p class="muted" style="margin-top:12px">Пароль по умолчанию: <code>admin</code></p>
+          </div>
         </div>
         """
 
@@ -342,11 +518,11 @@ def admin_page_html(logged: bool, message: str = "", error: str = "") -> str:
         sd = sections[key]
         sec_rows += f"""
         <div class="section-row">
-          <div style="width:130px"><b>{label}</b></div>
+          <div style="width:120px"><b>{label}</b></div>
           <div style="flex:1"><input name="{key}_name" value="{sd['name']}" placeholder="Название"></div>
-          <div style="width:100px"><input type="number" name="{key}_order" value="{sd['order']}" placeholder="Порядок"></div>
-          <label style="display:flex;align-items:center;gap:.4rem;margin:0">
-            <input class="check" type="checkbox" name="{key}_visible" {'checked' if sd['visible'] else ''}>
+          <div style="width:90px"><input type="number" name="{key}_order" value="{sd['order']}" placeholder="Порядок"></div>
+          <label class="checkbox-label">
+            <input type="checkbox" name="{key}_visible" {'checked' if sd['visible'] else ''}>
             показ
           </label>
         </div>
@@ -363,115 +539,134 @@ def admin_page_html(logged: bool, message: str = "", error: str = "") -> str:
 
     return f"""
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-        <h2>⚙ Панель администратора</h2>
-        <form method="post" action="/admin/logout" style="margin:0">
-          <button class="btn ghost" type="submit">Выйти</button>
-        </form>
+      <div class="card-title">⚙ Панель администратора</div>
+      <div class="card-body">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <span>Управление сайтом. Все изменения хранятся в оперативной памяти.</span>
+          <form method="post" action="/admin/logout" style="margin:0">
+            <button class="btn ghost" type="submit">Выйти</button>
+          </form>
+        </div>
+        {f'<div class="alert ok" style="margin-top:12px">{message}</div>' if message else ''}
+        {f'<div class="alert err" style="margin-top:12px">{error}</div>' if error else ''}
       </div>
-      {f'<div class="alert ok">{message}</div>' if message else ''}
-      {f'<div class="alert err">{error}</div>' if error else ''}
     </div>
 
     <form method="post" action="/admin/save">
 
       <div class="card">
-        <h2>🏠 Основное</h2>
-        <div class="grid2">
-          <div class="field"><label>Название сайта</label>
-            <input name="site_title" value="{s['site_title']}"></div>
-          <div class="field"><label>Ник автора</label>
-            <input name="author_nick" value="{s['author_nick']}"></div>
-        </div>
-        <div class="field"><label>Подпись автора (tagline)</label>
-          <input name="author_tagline" value="{s['author_tagline']}"></div>
-        <div class="field"><label>Описание канала</label>
-          <textarea name="channel_description">{s['channel_description']}</textarea></div>
-        <div class="field"><label>Текст в подвале</label>
-          <input name="footer_text" value="{s['footer_text']}"></div>
-      </div>
-
-      <div class="card">
-        <h2>🎨 Стили</h2>
-        <div class="grid3">
-          <div class="field"><label>Основной цвет</label>
-            <input type="color" name="primary_color" value="{s['primary_color']}"></div>
-          <div class="field"><label>Цвет фона</label>
-            <input type="color" name="bg_color" value="{s['bg_color']}"></div>
-          <div class="field"><label>Цвет текста</label>
-            <input type="color" name="text_color" value="{s['text_color']}"></div>
-        </div>
-        <div class="grid2">
-          <div class="field"><label>Шрифт</label>
-            <input name="font_family" value="{s['font_family']}"></div>
-          <div class="field"><label>Радиус скругления</label>
-            <input name="border_radius" value="{s['border_radius']}"></div>
+        <div class="card-title">🏠 Основное</div>
+        <div class="card-body">
+          <div class="grid2">
+            <div class="field"><label>Название сайта</label>
+              <input name="site_title" value="{s['site_title']}"></div>
+            <div class="field"><label>Ник автора</label>
+              <input name="author_nick" value="{s['author_nick']}"></div>
+          </div>
+          <div class="field"><label>Подпись автора (tagline)</label>
+            <input name="author_tagline" value="{s['author_tagline']}"></div>
+          <div class="field"><label>Описание канала</label>
+            <textarea name="channel_description">{s['channel_description']}</textarea></div>
+          <div class="field"><label>Текст в подвале</label>
+            <input name="footer_text" value="{s['footer_text']}"></div>
         </div>
       </div>
 
       <div class="card">
-        <h2>📄 Содержимое страниц</h2>
-        <div class="field"><label>Инфо (можно HTML)</label>
-          <textarea name="info_content" style="min-height:180px">{s['info_content']}</textarea></div>
-        <div class="field"><label>Сообщество (можно HTML)</label>
-          <textarea name="community_content" style="min-height:180px">{s['community_content']}</textarea></div>
-      </div>
-
-      <div class="card">
-        <h2>💬 Лайв чат</h2>
-        <div class="grid2">
-          <div class="field"><label>Приветствие</label>
-            <input name="chat_welcome" value="{s['chat_welcome']}"></div>
-          <div class="field"><label>Макс. история сообщений</label>
-            <input type="number" name="chat_max_history" value="{s['chat_max_history']}"></div>
+        <div class="card-title">🎨 Стили</div>
+        <div class="card-body">
+          <div class="grid3">
+            <div class="field"><label>Основной цвет</label>
+              <input type="color" name="primary_color" value="{s['primary_color']}"></div>
+            <div class="field"><label>Цвет фона</label>
+              <input type="color" name="bg_color" value="{s['bg_color']}"></div>
+            <div class="field"><label>Цвет текста</label>
+              <input type="color" name="text_color" value="{s['text_color']}"></div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>Шрифт</label>
+              <input name="font_family" value="{s['font_family']}"></div>
+            <div class="field"><label>Радиус скругления</label>
+              <input name="border_radius" value="{s['border_radius']}"></div>
+          </div>
         </div>
       </div>
 
       <div class="card">
-        <h2>🧩 Разделы</h2>
-        <p class="muted" style="margin-bottom:1rem">Название, порядок и видимость в верхнем меню</p>
-        {sec_rows}
+        <div class="card-title">📄 Содержимое страниц</div>
+        <div class="card-body">
+          <div class="field"><label>Инфо (можно HTML)</label>
+            <textarea name="info_content" style="min-height:160px">{s['info_content']}</textarea></div>
+          <div class="field"><label>Сообщество (можно HTML)</label>
+            <textarea name="community_content" style="min-height:160px">{s['community_content']}</textarea></div>
+        </div>
       </div>
 
       <div class="card">
-        <h2>🔐 Пароль администратора</h2>
-        <div class="field"><label>Новый пароль (оставь пустым, чтобы не менять)</label>
-          <input name="new_password" type="password"></div>
+        <div class="card-title">💬 Лайв чат</div>
+        <div class="card-body">
+          <div class="grid2">
+            <div class="field"><label>Приветствие</label>
+              <input name="chat_welcome" value="{s['chat_welcome']}"></div>
+            <div class="field"><label>Макс. история сообщений</label>
+              <input type="number" name="chat_max_history" value="{s['chat_max_history']}"></div>
+          </div>
+        </div>
       </div>
 
-      <div class="card" style="position:sticky;bottom:1rem">
-        <button class="btn" type="submit" style="width:100%;padding:1rem;font-size:1.1rem">💾 Сохранить всё</button>
+      <div class="card">
+        <div class="card-title">🧩 Разделы меню</div>
+        <div class="card-body">
+          <p class="muted" style="margin-bottom:10px">Название, порядок и видимость пунктов в верхнем меню</p>
+          {sec_rows}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔐 Пароль администратора</div>
+        <div class="card-body">
+          <div class="field"><label>Новый пароль (оставь пустым, чтобы не менять)</label>
+            <input name="new_password" type="password"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <button class="btn" type="submit" style="width:100%;padding:10px;font-size:15px">💾 Сохранить всё</button>
+        </div>
       </div>
     </form>
 
     <div class="card">
-      <h2>🖼 Фотографии</h2>
-      <div class="grid2">
-        <div>
-          <label>Фото автора (аватар)</label>
-          {author_photo_block}
-          <form method="post" action="/admin/upload" enctype="multipart/form-data">
-            <input type="hidden" name="field" value="author_photo">
-            <div class="field"><input type="file" name="file" accept="image/*" required></div>
-            <button class="btn" type="submit">Загрузить</button>
-          </form>
-          <form method="post" action="/admin/remove_photo" style="margin-top:.5rem">
-            <input type="hidden" name="field" value="author_photo">
-            <button class="btn danger" type="submit">Удалить</button>
-          </form>
-        </div>
-        <div>
-          <label>Обложка главной</label>
-          {main_photo_block}
-          <form method="post" action="/admin/upload" enctype="multipart/form-data">
-            <input type="hidden" name="field" value="main_photo">
-            <div class="field"><input type="file" name="file" accept="image/*" required></div>
-            <button class="btn" type="submit">Загрузить</button>
-          </form>
-          <form method="post" action="/admin/remove_photo" style="margin-top:.5rem">
-            <input type="hidden" name="field" value="main_photo">
-            <button class="btn danger" type="submit">Удалить</button>
-          </form>
+      <div class="card-title">🖼 Фотографии</div>
+      <div class="card-body">
+        <div class="grid2">
+          <div>
+            <label>Фото автора (аватар)</label>
+            {author_photo_block}
+            <form method="post" action="/admin/upload" enctype="multipart/form-data">
+              <input type="hidden" name="field" value="author_photo">
+              <div class="field"><input type="file" name="file" accept="image/*" required></div>
+              <button class="btn" type="submit">Загрузить</button>
+            </form>
+            <form method="post" action="/admin/remove_photo" style="margin-top:8px">
+              <input type="hidden" name="field" value="author_photo">
+              <button class="btn danger" type="submit">Удалить</button>
+            </form>
+          </div>
+          <div>
+            <label>Обложка главной</label>
+            {main_photo_block}
+            <form method="post" action="/admin/upload" enctype="multipart/form-data">
+              <input type="hidden" name="field" value="main_photo">
+              <div class="field"><input type="file" name="file" accept="image/*" required></div>
+              <button class="btn" type="submit">Загрузить</button>
+            </form>
+            <form method="post" action="/admin/remove_photo" style="margin-top:8px">
+              <input type="hidden" name="field" value="main_photo">
+              <button class="btn danger" type="submit">Удалить</button>
+            </form>
+          </div>
         </div>
       </div>
     </div>
@@ -480,14 +675,15 @@ def admin_page_html(logged: bool, message: str = "", error: str = "") -> str:
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_root(request: Request, admin_token: str = Cookie(None)):
-    msg = request.query_params.get("saved") and "Изменения сохранены ✔" or ""
+    msg = "Изменения сохранены ✔" if request.query_params.get("saved") else ""
     err = ""
     if request.query_params.get("error") == "1":
         err = "Неверный пароль"
-    if request.query_params.get("error") == "toobig":
+    elif request.query_params.get("error") == "toobig":
         err = "Файл слишком большой (макс. 5 МБ)"
     logged = admin_token in SESSIONS
-    return HTMLResponse(render_base("Админ", admin_page_html(logged, msg or "", err), ""))
+    # ВАЖНО: render_base уже возвращает HTMLResponse — не оборачиваем повторно
+    return render_base("Админ", admin_page_html(logged, msg, err), "")
 
 
 @app.post("/admin/login")
@@ -520,32 +716,27 @@ async def admin_save(request: Request, admin_token: str = Cookie(None)):
         v = form.get(key)
         return v if v is not None else default
 
-    # Основное
     s["site_title"] = get("site_title", s["site_title"])
     s["author_nick"] = get("author_nick", s["author_nick"])
     s["author_tagline"] = get("author_tagline", s["author_tagline"])
     s["channel_description"] = get("channel_description", s["channel_description"])
     s["footer_text"] = get("footer_text", s["footer_text"])
 
-    # Стили
     s["primary_color"] = get("primary_color", s["primary_color"])
     s["bg_color"] = get("bg_color", s["bg_color"])
     s["text_color"] = get("text_color", s["text_color"])
     s["font_family"] = get("font_family", s["font_family"])
     s["border_radius"] = get("border_radius", s["border_radius"])
 
-    # Контент
     s["info_content"] = get("info_content", s["info_content"])
     s["community_content"] = get("community_content", s["community_content"])
 
-    # Чат
     s["chat_welcome"] = get("chat_welcome", s["chat_welcome"])
     try:
         s["chat_max_history"] = int(get("chat_max_history", s["chat_max_history"]))
     except (TypeError, ValueError):
         pass
 
-    # Разделы
     for key in ("main", "info", "community", "livechat"):
         s["sections"][key]["name"] = get(f"{key}_name", s["sections"][key]["name"]) or s["sections"][key]["name"]
         try:
@@ -554,7 +745,6 @@ async def admin_save(request: Request, admin_token: str = Cookie(None)):
             pass
         s["sections"][key]["visible"] = f"{key}_visible" in form
 
-    # Пароль
     new_pw = (get("new_password") or "").strip()
     if new_pw:
         s["admin_password"] = new_pw
@@ -590,8 +780,5 @@ async def admin_remove_photo(request: Request, admin_token: str = Cookie(None)):
     return RedirectResponse("/admin?saved=1", status_code=303)
 
 
-# ============================================================
-#                     ЗАПУСК
-# ============================================================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
