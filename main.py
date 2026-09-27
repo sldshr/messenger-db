@@ -149,7 +149,6 @@ PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar{width:0;height:0;display:none}
   *{scrollbar-width:none;-ms-overflow-style:none;-webkit-tap-highlight-color:transparent}
 
-  /* отключаем выделение везде, кроме полей */
   html,body{user-select:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none}
   input,textarea,[contenteditable]{user-select:text;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text}
 
@@ -163,6 +162,8 @@ PAGE = r"""<!DOCTYPE html>
     --text-mute:#61616E;
     --danger:#F0A0A0;
     --ok:#9BDCB0;
+    --ease:cubic-bezier(.32,.72,0,1);
+    --dur:.48s;
   }
 
   html,body{
@@ -181,7 +182,6 @@ PAGE = r"""<!DOCTYPE html>
       #0b0b10;
   }
 
-  /* ---------- каркас ---------- */
   .app{
     min-height:100dvh;
     display:flex;flex-direction:column;align-items:center;
@@ -217,19 +217,23 @@ PAGE = r"""<!DOCTYPE html>
     border-color:rgba(255,255,255,.95);
     box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 6px 22px rgba(255,255,255,.10);
   }
+  .btn.primary{
+    background:rgba(255,255,255,.92);color:#0b0b10;
+    border-color:rgba(255,255,255,.95);
+  }
+  .btn.primary:hover{background:#fff}
 
-  /* ---------- сцена со слайдом ---------- */
+  /* ---------- сцена ---------- */
   .stage{
     width:100%;max-width:520px;
     overflow:hidden;position:relative;
-    transition:height .4s cubic-bezier(.2,.9,.3,1);
+    transition:height var(--dur) var(--ease);
   }
   .stage[hidden]{display:none}
 
   .track{
-    display:flex;align-items:flex-start;
-    width:100%;
-    transition:transform .42s cubic-bezier(.2,.9,.3,1);
+    display:flex;align-items:flex-start;width:100%;
+    transition:transform var(--dur) var(--ease);
     will-change:transform;
   }
 
@@ -238,7 +242,6 @@ PAGE = r"""<!DOCTYPE html>
     display:flex;flex-direction:column;gap:12px;
   }
 
-  /* ---------- стеклянные фреймы ---------- */
   .frame{
     border:1px solid var(--glass-border);
     border-radius:22px;
@@ -247,7 +250,7 @@ PAGE = r"""<!DOCTYPE html>
     -webkit-backdrop-filter:blur(22px) saturate(160%);
     box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 14px 34px rgba(0,0,0,.32);
     padding:22px;
-    animation:frameIn .28s cubic-bezier(.2,.9,.3,1);
+    animation:frameIn .28s var(--ease);
   }
   .frame[hidden]{display:none}
   @keyframes frameIn{
@@ -255,7 +258,7 @@ PAGE = r"""<!DOCTYPE html>
     to{opacity:1;transform:none}
   }
 
-  /* ---------- поля с иконками ---------- */
+  /* ---------- поля ---------- */
   .input-wrap{position:relative;display:flex}
   .input-wrap + .input-wrap{margin-top:12px}
   .input-wrap .iw-icon{
@@ -304,9 +307,7 @@ PAGE = r"""<!DOCTYPE html>
   .drop .drop-hint{font-size:11.5px;color:var(--text-mute)}
   .drop:hover{border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.05)}
   .drop:hover .drop-icon,.drop:hover .drop-label{color:var(--text)}
-  .drop.filled{
-    border-style:solid;border-color:rgba(255,255,255,.25);
-  }
+  .drop.filled{border-style:solid;border-color:rgba(255,255,255,.25)}
   .drop.filled .drop-icon,.drop.filled .drop-label{color:var(--text)}
 
   .previews{
@@ -390,12 +391,14 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:14px;padding:12px 14px;font-size:13.5px;
     background:rgba(255,255,255,.05);color:var(--text);
     line-height:1.5;border:1px solid var(--glass-border);
+    margin-top:14px;
   }
+  .msg:first-child{margin-top:0}
   .msg svg{width:18px;height:18px;flex-shrink:0;margin-top:1px}
   .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
   .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
-  /* ---------- результат поста ---------- */
+  /* ---------- результат ---------- */
   .post-title{
     margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);
     word-break:break-word;
@@ -443,8 +446,7 @@ PAGE = r"""<!DOCTYPE html>
     background:rgba(6,6,10,.86);
     backdrop-filter:blur(16px) saturate(140%);
     -webkit-backdrop-filter:blur(16px) saturate(140%);
-    animation:lbIn .2s ease;
-    padding:60px 70px;
+    animation:lbIn .2s ease;padding:60px 70px;
   }
   .lightbox[hidden]{display:none}
   @keyframes lbIn{from{opacity:0}to{opacity:1}}
@@ -453,8 +455,16 @@ PAGE = r"""<!DOCTYPE html>
     max-width:100%;max-height:100%;
     object-fit:contain;border-radius:14px;
     box-shadow:0 20px 60px rgba(0,0,0,.5);
-    background:#0e0e13;
-    animation:lbImgIn .25s cubic-bezier(.2,.9,.3,1);
+    /* шахматка для прозрачных изображений */
+    background-color:#1c1c22;
+    background-image:
+      linear-gradient(45deg, rgba(255,255,255,.06) 25%, transparent 25%),
+      linear-gradient(-45deg, rgba(255,255,255,.06) 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, rgba(255,255,255,.06) 75%),
+      linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.06) 75%);
+    background-size:18px 18px;
+    background-position:0 0, 0 9px, 9px -9px, -9px 0px;
+    animation:lbImgIn .25s var(--ease);
   }
   @keyframes lbImgIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
 
@@ -490,6 +500,63 @@ PAGE = r"""<!DOCTYPE html>
     backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   }
 
+  /* ---------- модальное окно (код созданного поста) ---------- */
+  .modal{
+    position:fixed;inset:0;z-index:900;
+    display:flex;align-items:center;justify-content:center;
+    background:rgba(6,6,10,.55);
+    backdrop-filter:blur(10px) saturate(140%);
+    -webkit-backdrop-filter:blur(10px) saturate(140%);
+    animation:lbIn .2s ease;padding:20px;
+  }
+  .modal[hidden]{display:none}
+
+  .modal-card{
+    width:100%;max-width:380px;
+    padding:26px 24px;
+    border:1px solid var(--glass-border);
+    border-radius:22px;
+    background:rgba(28,28,36,.92);
+    backdrop-filter:blur(22px) saturate(160%);
+    -webkit-backdrop-filter:blur(22px) saturate(160%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.09),
+      0 20px 50px rgba(0,0,0,.5);
+    text-align:center;
+    animation:panelIn .3s var(--ease);
+  }
+  @keyframes panelIn{
+    from{opacity:0;transform:translateY(10px) scale(.96)}
+    to{opacity:1;transform:none}
+  }
+
+  .modal-icon{
+    width:52px;height:52px;margin:0 auto 14px;
+    border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    background:rgba(120,200,150,.14);
+    color:var(--ok);
+    border:1px solid rgba(120,200,150,.28);
+  }
+  .modal-icon svg{width:26px;height:26px}
+
+  .modal-title{font-size:17px;font-weight:600;margin:0 0 6px}
+  .modal-sub{font-size:13px;color:var(--text-dim);margin:0 0 18px;line-height:1.5}
+
+  .modal-code{
+    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    font-size:40px;font-weight:700;
+    letter-spacing:12px;text-indent:12px;
+    color:var(--text);
+    margin:6px 0 6px;
+    user-select:text;-webkit-user-select:text;
+  }
+
+  .modal-hint{font-size:12px;color:var(--text-dim);margin-bottom:22px}
+
+  .modal-actions{display:flex;gap:10px}
+  .modal-actions .btn{flex:1;height:46px;padding:0 14px;font-size:14px}
+
   /* ---------- адаптив ---------- */
   @media (max-width:560px){
     .app{padding:44px 14px 40px;gap:18px}
@@ -503,6 +570,7 @@ PAGE = r"""<!DOCTYPE html>
     .lb-prev{left:8px}
     .lb-next{right:8px}
     .lb-close{top:10px;right:10px}
+    .modal-code{font-size:34px;letter-spacing:9px;text-indent:9px}
   }
   @media (max-width:380px){
     .btn span.btn-label{display:none}
@@ -559,8 +627,8 @@ PAGE = r"""<!DOCTYPE html>
           <div class="previews" id="previews"></div>
 
           <div class="row">
-            <button class="btn" id="submitBtn" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+            <button class="btn primary" id="submitBtn" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
                 <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
               </svg>
               <span>Опубликовать</span>
@@ -597,6 +665,31 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </main>
 
+<!-- ================= МОДАЛКА (код созданного поста) ================= -->
+<div class="modal" id="createdModal" hidden>
+  <div class="modal-card" id="modalCard">
+    <div class="modal-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 6L9 17l-5-5"/>
+      </svg>
+    </div>
+    <h3 class="modal-title">Пост создан</h3>
+    <p class="modal-sub">Сохраните код — по нему можно найти пост в любое время</p>
+    <div class="modal-code" id="modalCode">000000</div>
+    <div class="modal-hint" id="modalHint"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modalCopyBtn" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+          <rect x="9" y="9" width="13" height="13" rx="2"/>
+          <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+        </svg>
+        <span>Копировать</span>
+      </button>
+      <button class="btn primary" id="modalCloseBtn" type="button">Готово</button>
+    </div>
+  </div>
+</div>
+
 <!-- ================= ЛАЙТБОКС ================= -->
 <div class="lightbox" id="lightbox" hidden>
   <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
@@ -629,9 +722,7 @@ PAGE = r"""<!DOCTYPE html>
   /* ---------- иконки ---------- */
   const ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
-    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
-    copy:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
-    plus:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
   };
 
   function makeMsg(kind, text) {
@@ -653,7 +744,7 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ (сдвиг ленты)
+     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ (сдвиг ленты + плавная высота)
      ========================================================= */
   const stage       = $("stage");
   const track       = $("track");
@@ -664,12 +755,16 @@ PAGE = r"""<!DOCTYPE html>
 
   let mode = null;  // 'create' | 'find' | null
 
-  function syncHeight() {
-    if (mode === null) return;
-    const p = (mode === "create") ? createPanel : findPanel;
-    stage.style.height = p.offsetHeight + "px";
+  function activePanel() {
+    return mode === "create" ? createPanel : findPanel;
   }
 
+  function syncHeight() {
+    if (mode === null || stage.hidden) return;
+    stage.style.height = activePanel().offsetHeight + "px";
+  }
+
+  // Любое изменение размера панели (появление контента) → синхронизация высоты сцены
   const ro = new ResizeObserver(() => syncHeight());
   ro.observe(createPanel);
   ro.observe(findPanel);
@@ -690,18 +785,22 @@ PAGE = r"""<!DOCTYPE html>
     mode = target;
     btnCreate.classList.toggle("active", target === "create");
     btnFind.classList.toggle("active", target === "find");
-    stage.hidden = false;
-
-    if (wasHidden) track.style.transition = "none";
-    track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
-
-    // Принудительный reflow, чтобы при следующем кадре включилась анимация
-    void track.offsetWidth;
 
     if (wasHidden) {
+      // первое появление — без анимации сдвига
+      track.style.transition = "none";
+      stage.style.transition = "none";
+      stage.hidden = false;
+      track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
+      stage.style.height = activePanel().offsetHeight + "px";
+      void track.offsetWidth;
       track.style.transition = "";
+      stage.style.transition = "";
+    } else {
+      // обычное переключение — с анимацией
+      track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
+      syncHeight();
     }
-    syncHeight();
 
     if (target === "create") setTimeout(() => $("title").focus(), 100);
     else setTimeout(() => otpCells[0].focus(), 100);
@@ -847,52 +946,22 @@ PAGE = r"""<!DOCTYPE html>
         return;
       }
 
-      createMsg.innerHTML = "";
-      createMsg.appendChild(makeMsg("ok", "Пост создан и зашифрован. Сохраните код:"));
-
-      const code = document.createElement("div");
-      code.className = "big-code";
-      code.textContent = data.code;
-      createMsg.appendChild(code);
-
-      const hint = document.createElement("div");
-      hint.className = "hint";
-      hint.textContent = "Занято в памяти: " + formatBytes(data.compressed_bytes);
-      createMsg.appendChild(hint);
-
-      const row = document.createElement("div");
-      row.className = "row";
-
-      const copyBtn = document.createElement("button");
-      copyBtn.className = "btn";
-      copyBtn.type = "button";
-      copyBtn.innerHTML = ICONS.copy + "<span>Скопировать</span>";
-      copyBtn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(data.code);
-          const label = copyBtn.querySelector("span");
-          if (label) label.textContent = "Готово";
-          setTimeout(() => { if (label) label.textContent = "Скопировать"; }, 1500);
-        } catch {
-          const label = copyBtn.querySelector("span");
-          if (label) label.textContent = "Ошибка";
-        }
-      });
-
-      const againBtn = document.createElement("button");
-      againBtn.className = "btn";
-      againBtn.type = "button";
-      againBtn.innerHTML = ICONS.plus + "<span>Ещё</span>";
-      againBtn.addEventListener("click", () => $("resetBtn").click());
-
-      row.append(copyBtn, againBtn);
-      createMsg.appendChild(row);
-
-      // очищаем форму, результат оставляем
+      // очищаем форму
       $("title").value = "";
       $("content").value = "";
       selectedFiles = [];
       renderPreviews();
+      clearCreateMsg();
+
+      // авто-переход в режим поиска + подстановка кода + поиск
+      const code = data.code;
+      setMode("find");
+      otpCells.forEach((c, i) => { c.value = code[i] || ""; });
+      lastSubmitted = code;
+      runSearch(code);
+
+      // модалка с кодом и кнопкой "копировать"
+      showCreatedModal(code, data.compressed_bytes);
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
@@ -900,6 +969,51 @@ PAGE = r"""<!DOCTYPE html>
       submitBtn.innerHTML = oldHTML;
     }
   });
+
+  /* =========================================================
+     МОДАЛЬНОЕ ОКНО (код созданного поста)
+     ========================================================= */
+  const createdModal  = $("createdModal");
+  const modalCard     = $("modalCard");
+  const modalCode     = $("modalCode");
+  const modalHint     = $("modalHint");
+  const modalCopyBtn  = $("modalCopyBtn");
+  const modalCloseBtn = $("modalCloseBtn");
+
+  let modalCopyTimer = null;
+
+  function showCreatedModal(code, bytes) {
+    modalCode.textContent = code;
+    modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
+    const label = modalCopyBtn.querySelector("span");
+    if (label) label.textContent = "Копировать";
+    createdModal.hidden = false;
+  }
+
+  function closeCreatedModal() {
+    createdModal.hidden = true;
+  }
+
+  modalCopyBtn.addEventListener("click", async () => {
+    const label = modalCopyBtn.querySelector("span");
+    try {
+      await navigator.clipboard.writeText(modalCode.textContent || "");
+      if (label) label.textContent = "Скопировано";
+      clearTimeout(modalCopyTimer);
+      modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
+    } catch {
+      if (label) label.textContent = "Ошибка";
+      clearTimeout(modalCopyTimer);
+      modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
+    }
+  });
+
+  modalCloseBtn.addEventListener("click", closeCreatedModal);
+
+  createdModal.addEventListener("click", (e) => {
+    if (e.target === createdModal) closeCreatedModal();
+  });
+  modalCard.addEventListener("click", (e) => e.stopPropagation());
 
   /* =========================================================
      ПОИСК ПО КОДУ (OTP)
@@ -986,10 +1100,11 @@ PAGE = r"""<!DOCTYPE html>
 
   function showSearchFrame() {
     searchFrame.hidden = false;
-    // перезапускаем анимацию появления
     searchFrame.style.animation = "none";
     void searchFrame.offsetWidth;
     searchFrame.style.animation = "";
+    // синхронизируем высоту сцены после вставки контента
+    requestAnimationFrame(syncHeight);
   }
 
   function renderSpinner() {
@@ -1035,7 +1150,6 @@ PAGE = r"""<!DOCTYPE html>
   function lbStep(dir) {
     if (lbPhotos.length < 2) return;
     lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
-    // лёгкая перерисовка
     lbImg.style.animation = "none";
     void lbImg.offsetWidth;
     lbImg.style.animation = "";
@@ -1046,16 +1160,9 @@ PAGE = r"""<!DOCTYPE html>
   lbPrev.addEventListener("click", (e) => { e.stopPropagation(); lbStep(-1); });
   lbNext.addEventListener("click", (e) => { e.stopPropagation(); lbStep(1); });
   lbClose.addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
-  lightbox.addEventListener("click", (e) => {
-    if (e.target === lightbox) closeLightbox();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (lightbox.hidden) return;
-    if (e.key === "Escape") closeLightbox();
-    else if (e.key === "ArrowLeft") lbStep(-1);
-    else if (e.key === "ArrowRight") lbStep(1);
-  });
+  lightbox.addEventListener("click", (e) => { if (e.target === lightbox) closeLightbox(); });
 
+  /* ---------- отрисовка поста ---------- */
   function renderPost(post) {
     searchFrame.innerHTML = "";
 
@@ -1132,6 +1239,13 @@ PAGE = r"""<!DOCTYPE html>
       setTimeout(clearOtp, 320);
     }
   }
+
+  /* ---------- общий Esc ---------- */
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!lightbox.hidden) { closeLightbox(); return; }
+    if (!createdModal.hidden) { closeCreatedModal(); return; }
+  });
 })();
 </script>
 </body>
