@@ -15,3 +15,5 @@ pyjwt
 beautifulsoup4
 lxml
 jinja2
+cryptography
+zstandard
