@@ -1,5 +1,5 @@
 """
-PostVault — посты с 6-значным кодом.
+Sld-Networking — посты с 6-значным кодом.
 Хранение: оперативная память, сжатие (gzip) + шифрование (Fernet/AES).
 
 Запуск:
@@ -28,22 +28,18 @@ from fastapi.responses import HTMLResponse
 # --------------------------------------------------------------------------
 #  Хранилище (только в оперативке)
 # --------------------------------------------------------------------------
-# Ключ шифрования генерируется при старте приложения.
-# После перезапуска все ранее созданные посты прочитать невозможно.
 _fernet = Fernet(Fernet.generate_key())
 
-# code -> зашифрованный+сжатый блоб
 _store: Dict[str, bytes] = {}
 _lock = threading.Lock()
 
 MAX_PHOTOS = 5
-MAX_PHOTO_BYTES = 8 * 1024 * 1024      # 8 МБ на одно фото
+MAX_PHOTO_BYTES = 8 * 1024 * 1024
 MAX_TITLE_LEN = 120
 MAX_CONTENT_LEN = 20_000
 
 
 def _pack(payload: dict) -> bytes:
-    """dict -> JSON -> gzip -> Fernet(encrypt)."""
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return _fernet.encrypt(gzip.compress(raw, compresslevel=9))
 
@@ -64,7 +60,7 @@ def _new_code() -> str:
 # --------------------------------------------------------------------------
 #  Приложение
 # --------------------------------------------------------------------------
-app = FastAPI(title="PostVault", docs_url=None, redoc_url=None)
+app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
 
 
 @app.post("/api/posts")
@@ -108,7 +104,6 @@ async def create_post(
         "content": content,
         "photos": photos,
         "created": datetime.now(timezone.utc).isoformat(),
-        "size_raw": 0,
     }
 
     blob = _pack(payload)
@@ -158,192 +153,231 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PostVault</title>
+<title>Sld-Networking</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23101012'/%3E%3Crect x='7.5' y='7.5' width='17' height='17' rx='3' fill='none' stroke='%23e8e8ea' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='2.6' fill='%23e8e8ea'/%3E%3C/svg%3E">
 <style>
   *{box-sizing:border-box}
   :root{
-    --bg:#17171a;
-    --panel:#202024;
-    --panel-2:#2d2d33;
-    --field:#131316;
-    --border:#3c3c44;
-    --border-hi:#5a5a66;
-    --text:#e9e9ec;
-    --muted:#9a9aa3;
-    --accent:#3f3f48;
+    --bg:#101012;
+    --panel:#18181b;
+    --panel-2:#202024;
+    --field:#141416;
+    --border:#2a2a2e;
+    --border-hi:#3d3d44;
+    --text:#e8e8ea;
+    --muted:#83838c;
   }
-  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
-    -webkit-font-smoothing:antialiased}
-  body{min-height:100vh;background:
-    radial-gradient(900px 480px at 50% -12%, #1f1f24 0%, rgba(23,23,26,0) 70%)}
 
-  header{max-width:840px;margin:0 auto;padding:40px 20px 10px;
-    display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:center}
-  .actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;width:100%}
+  /* убираем скроллбары везде */
+  ::-webkit-scrollbar{width:0;height:0;display:none}
+  *{scrollbar-width:none;-ms-overflow-style:none}
+
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;font-size:14px}
+
+  body{
+    min-height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:32px 20px;
+  }
+
+  .wrap{
+    width:100%;
+    max-width:600px;
+    display:flex;
+    flex-direction:column;
+    align-items:stretch;
+    gap:22px;
+  }
+
+  .brand{
+    text-align:center;
+    font-size:12px;
+    letter-spacing:3px;
+    text-transform:uppercase;
+    color:var(--muted);
+    user-select:none;
+  }
+
+  .actions{
+    display:flex;
+    gap:10px;
+    justify-content:center;
+    flex-wrap:wrap;
+  }
 
   .btn{
     display:inline-flex;align-items:center;justify-content:center;gap:8px;
     border:1px solid var(--border);
-    background:var(--panel-2);
+    background:var(--panel);
     color:var(--text);
-    padding:12px 20px;
-    border-radius:14px;
-    font-size:14px;
-    font-family:inherit;
+    padding:11px 20px;
+    border-radius:10px;
+    font:inherit;font-size:14px;
     cursor:pointer;
-    transition:background .15s,border-color .15s,transform .08s;
+    transition:background .12s,border-color .12s;
     white-space:nowrap;
   }
-  .btn svg{width:18px;height:18px;stroke:currentColor;stroke-width:2;
+  .btn svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.8;
     fill:none;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
-  .btn:hover{background:var(--accent);border-color:var(--border-hi)}
-  .btn:active{transform:scale(.98)}
-  .btn.active{background:#41414a;border-color:#6a6a78}
-  .btn.primary{background:#35353d}
-  .btn.primary:hover{background:#42424c}
+  .btn:hover{background:var(--panel-2);border-color:var(--border-hi)}
+  .btn:active{background:#26262a}
+  .btn.primary{background:var(--panel-2)}
+  .btn.primary:hover{background:#2a2a2f}
   .btn:disabled{opacity:.5;cursor:not-allowed}
 
-  main{max-width:840px;margin:0 auto;padding:0 20px 80px}
-
   .panel{
-    background:linear-gradient(180deg,#232328 0%,#1d1d21 100%);
+    background:var(--panel);
     border:1px solid var(--border);
-    border-radius:22px;
-    padding:24px;
-    margin-top:16px;
-    animation:pop .2s ease;
+    border-radius:12px;
+    padding:20px;
+    animation:fade .15s ease;
   }
-  @keyframes pop{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
-  .panel.hidden{display:none}
-  .panel h2{margin:0 0 16px;font-size:16px;font-weight:600;letter-spacing:.2px;text-align:center}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .panel[hidden]{display:none}
+  .panel h2{margin:0 0 16px;font-size:14px;font-weight:600;letter-spacing:.3px;text-align:center;color:var(--text)}
 
-  label{display:block;font-size:12.5px;color:var(--muted);margin:16px 0 7px;
-    text-transform:uppercase;letter-spacing:.7px}
+  label{display:block;font-size:11.5px;color:var(--muted);margin:14px 0 6px;
+    text-transform:uppercase;letter-spacing:.8px}
 
   input[type=text],textarea{
     width:100%;background:var(--field);border:1px solid var(--border);
-    border-radius:14px;padding:13px 15px;color:var(--text);font-size:14.5px;
-    font-family:inherit;outline:none;transition:border-color .15s,background .15s;
+    border-radius:10px;padding:11px 13px;color:var(--text);font-size:14px;
+    font-family:inherit;outline:none;transition:border-color .12s;
   }
-  input[type=text]:focus,textarea:focus{border-color:var(--border-hi);background:#17171b}
-  input[type=text]::placeholder,textarea::placeholder{color:#5b5b66}
-  textarea{min-height:130px;resize:vertical;line-height:1.5}
+  input[type=text]:focus,textarea:focus{border-color:var(--border-hi)}
+  input[type=text]::placeholder,textarea::placeholder{color:#4e4e56}
+  textarea{min-height:120px;resize:vertical;line-height:1.55}
 
   .drop{
-    border:1px dashed #4a4a54;border-radius:16px;padding:20px;text-align:center;
-    color:var(--muted);font-size:13.5px;cursor:pointer;background:#1a1a1e;
-    transition:border-color .15s,color .15s,background .15s;line-height:1.6;
+    border:1px dashed #35353b;border-radius:10px;padding:18px;text-align:center;
+    color:var(--muted);font-size:13px;cursor:pointer;background:var(--field);
+    transition:border-color .12s,color .12s;line-height:1.6;
   }
-  .drop:hover{border-color:var(--border-hi);color:#b6b6c0;background:#1e1e23}
-  .drop.filled{border-style:solid;border-color:#55555f;color:#a9a9b4}
+  .drop:hover{border-color:var(--border-hi);color:#b6b6bc}
+  .drop.filled{border-style:solid;border-color:var(--border-hi);color:#a9a9b0}
 
-  .previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));
-    gap:10px;margin-top:12px}
-  .preview{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;
-    border:1px solid var(--border);background:#131316;animation:pop .18s ease}
+  .previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(80px,1fr));
+    gap:8px;margin-top:10px}
+  .preview{position:relative;aspect-ratio:1/1;border-radius:10px;overflow:hidden;
+    border:1px solid var(--border);background:var(--field)}
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
   .preview button{
-    position:absolute;top:5px;right:5px;width:22px;height:22px;border-radius:50%;
-    border:none;background:rgba(10,10,12,.78);color:#e9e9ec;font-size:14px;
-    line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;
-    backdrop-filter:blur(4px);transition:background .15s;
+    position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:5px;
+    border:1px solid var(--border);background:rgba(16,16,18,.85);color:#e8e8ea;
+    font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;
+    justify-content:center;font-family:inherit;
   }
-  .preview button:hover{background:rgba(90,20,20,.9)}
+  .preview button:hover{background:#2a1414;border-color:#4a2020}
 
-  .row{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;justify-content:center}
+  .row{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap;justify-content:center}
 
   .code-input{
-    width:100%;text-align:center;font-size:36px;font-weight:600;
-    letter-spacing:16px;text-indent:16px;
-    background:var(--field);border:1px solid var(--border);border-radius:18px;
-    padding:16px 10px;color:var(--text);outline:none;
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    transition:border-color .15s,background .15s;
+    width:100%;text-align:center;font-size:34px;font-weight:600;
+    letter-spacing:14px;text-indent:14px;
+    background:var(--field);border:1px solid var(--border);border-radius:12px;
+    padding:14px 10px;color:var(--text);outline:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    transition:border-color .12s;
   }
-  .code-input:focus{border-color:var(--border-hi);background:#17171b}
-  .code-input::placeholder{color:#3d3d47;letter-spacing:16px}
+  .code-input:focus{border-color:var(--border-hi)}
+  .code-input::placeholder{color:#33333a;letter-spacing:14px}
 
-  #searchState{margin-top:6px}
-  .center{text-align:center;padding:26px 0}
+  /* анимация неверного кода */
+  @keyframes shake{
+    0%,100%{transform:translateX(0)}
+    20%{transform:translateX(-9px)}
+    40%{transform:translateX(9px)}
+    60%{transform:translateX(-6px)}
+    80%{transform:translateX(6px)}
+  }
+  .shake{
+    animation:shake .34s ease;
+    border-color:#6a2a2a !important;
+  }
+
+  #searchState{margin-top:4px}
+  .center{text-align:center;padding:22px 0}
 
   .spinner{
-    width:30px;height:30px;border-radius:50%;
-    border:3px solid #3c3c44;border-top-color:#9a9aa8;
-    animation:spin .75s linear infinite;margin:0 auto;
+    width:26px;height:26px;border-radius:50%;
+    border:2.5px solid var(--border);border-top-color:#9a9aa2;
+    animation:spin .7s linear infinite;margin:0 auto;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
-  .spinner-label{margin-top:12px;font-size:13px;color:var(--muted);text-align:center}
+  .spinner-label{margin-top:10px;font-size:12.5px;color:var(--muted);text-align:center}
 
-  .msg{border-radius:16px;padding:14px 16px;font-size:14px;margin-top:14px;
-    border:1px solid var(--border);background:var(--panel-2)}
-  .msg.err{border-color:#5a2b2b;background:#1e1414;color:#f0b4b4}
-  .msg.ok{border-color:#2e4a34;background:#131b15;color:#a9e0b8}
+  .msg{border-radius:10px;padding:12px 14px;font-size:13.5px;margin-top:12px;
+    border:1px solid var(--border);background:var(--panel-2);line-height:1.5}
+  .msg.err{border-color:#4a2424;background:#1a1212;color:#e0a8a8}
+  .msg.ok{border-color:#24402c;background:#111a14;color:#a3d9b4}
 
-  .result{margin-top:18px;border:1px solid var(--border);border-radius:20px;
-    background:var(--panel-2);padding:22px;animation:pop .2s ease}
-  .result h3{margin:0 0 6px;font-size:20px;font-weight:600;line-height:1.3}
-  .result .meta{font-size:12.5px;color:var(--muted);margin-bottom:14px;
-    display:flex;gap:14px;flex-wrap:wrap;align-items:center}
-  .result .body{font-size:14.5px;line-height:1.65;color:#d3d3da;white-space:pre-wrap;
+  .result{margin-top:16px;border:1px solid var(--border);border-radius:12px;
+    background:var(--panel-2);padding:20px;animation:fade .15s ease}
+  .result h3{margin:0 0 8px;font-size:18px;font-weight:600;line-height:1.3}
+  .result .meta{font-size:12px;color:var(--muted);margin-bottom:14px;
+    display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .result .body{font-size:14px;line-height:1.6;color:#d0d0d6;white-space:pre-wrap;
     word-break:break-word}
-  .result .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));
-    gap:10px;margin-top:18px}
-  .result .gallery img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:14px;
-    border:1px solid var(--border);cursor:zoom-in;transition:transform .15s,border-color .15s}
-  .result .gallery img:hover{transform:scale(1.02);border-color:var(--border-hi)}
+  .result .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
+    gap:8px;margin-top:16px}
+  .result .gallery img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:10px;
+    border:1px solid var(--border);cursor:zoom-in}
 
   .code-chip{
-    display:inline-flex;align-items:center;gap:10px;
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    font-size:15px;letter-spacing:4px;color:#cfcfd8;
-    background:#131316;border:1px solid var(--border);
-    border-radius:12px;padding:6px 12px;
+    display:inline-flex;align-items:center;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;letter-spacing:3px;color:#cfcfd6;
+    background:var(--field);border:1px solid var(--border);
+    border-radius:8px;padding:4px 10px;
   }
   .big-code{
-    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    font-size:44px;font-weight:700;letter-spacing:14px;text-indent:14px;
-    text-align:center;color:#e9e9ec;margin:10px 0 4px;
-    text-shadow:0 0 26px rgba(160,160,190,.18);
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:38px;font-weight:700;letter-spacing:12px;text-indent:12px;
+    text-align:center;color:var(--text);margin:8px 0 2px;
   }
-  .hint{font-size:12.5px;color:var(--muted);text-align:center}
+  .hint{font-size:12px;color:var(--muted);text-align:center;margin-top:4px}
 
   @media (max-width:560px){
-    header{padding-top:24px}
-    .actions .btn{flex:1;text-align:center;padding:12px 14px}
-    .code-input{font-size:28px;letter-spacing:12px;text-indent:12px}
-    .big-code{font-size:34px;letter-spacing:10px;text-indent:10px}
+    body{padding:20px 14px}
+    .actions{flex-direction:column}
+    .actions .btn{width:100%}
+    .code-input{font-size:26px;letter-spacing:11px;text-indent:11px}
+    .big-code{font-size:30px;letter-spacing:9px;text-indent:9px}
   }
 </style>
 </head>
 <body>
 
-<header>
+<div class="wrap">
+  <div class="brand">Sld-Networking</div>
+
   <div class="actions">
     <button class="btn" id="btnCreate">
-      <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+      <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       Создать пост
     </button>
     <button class="btn" id="btnFind">
-      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-      Найти пост по коду
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      Найти пост
     </button>
   </div>
-</header>
 
-<main>
   <!-- ================= СОЗДАНИЕ ================= -->
-  <section class="panel hidden" id="createPanel">
+  <section class="panel" id="createPanel" hidden>
     <h2>Новый пост</h2>
 
     <label for="title">Название</label>
-    <input id="title" type="text" maxlength="120" placeholder="Например: Отчёт за неделю" autocomplete="off">
+    <input id="title" type="text" maxlength="120" placeholder="Введите название" autocomplete="off">
 
     <label for="content">Содержимое</label>
-    <textarea id="content" placeholder="Введите текст поста..."></textarea>
+    <textarea id="content" placeholder="Введите текст поста"></textarea>
 
-    <label>Фотографии <span style="color:#5b5b66">— до 5 шт.</span></label>
-    <div class="drop" id="drop">Нажмите, чтобы выбрать фото<br><span style="color:#5b5b66">JPG · PNG · WEBP · GIF</span></div>
+    <label>Фотографии — до 5 шт.</label>
+    <div class="drop" id="drop">Нажмите, чтобы выбрать фото<br><span style="color:#4e4e56">JPG · PNG · WEBP · GIF</span></div>
     <input type="file" id="fileInput" accept="image/*" multiple hidden>
     <div class="previews" id="previews"></div>
 
@@ -356,7 +390,7 @@ PAGE = r"""<!DOCTYPE html>
   </section>
 
   <!-- ================= ПОИСК ================= -->
-  <section class="panel hidden" id="findPanel">
+  <section class="panel" id="findPanel" hidden>
     <h2>Поиск поста</h2>
 
     <input id="codeInput" class="code-input" inputmode="numeric" autocomplete="off"
@@ -364,7 +398,7 @@ PAGE = r"""<!DOCTYPE html>
 
     <div id="searchState"></div>
   </section>
-</main>
+</div>
 
 <script>
 (() => {
@@ -377,22 +411,25 @@ PAGE = r"""<!DOCTYPE html>
   const btnCreate   = $("btnCreate");
   const btnFind     = $("btnFind");
 
-  /* ---------------- переключение панелей ---------------- */
-  function syncButtons() {
-    btnCreate.classList.toggle("active", !createPanel.classList.contains("hidden"));
-    btnFind.classList.toggle("active", !findPanel.classList.contains("hidden"));
-  }
-
+  /* ---------------- переключение панелей ----------------
+     Открытие одной панели скрывает другую.
+     Данные внутри скрытой панели сохраняются. */
   btnCreate.addEventListener("click", () => {
-    createPanel.classList.toggle("hidden");
-    syncButtons();
-    if (!createPanel.classList.contains("hidden")) $("title").focus();
+    const willOpen = createPanel.hidden;
+    createPanel.hidden = !willOpen;
+    if (willOpen) {
+      findPanel.hidden = true;
+      setTimeout(() => $("title").focus(), 0);
+    }
   });
 
   btnFind.addEventListener("click", () => {
-    findPanel.classList.toggle("hidden");
-    syncButtons();
-    if (!findPanel.classList.contains("hidden")) $("codeInput").focus();
+    const willOpen = findPanel.hidden;
+    findPanel.hidden = !willOpen;
+    if (willOpen) {
+      createPanel.hidden = true;   // прячем создание, не очищая
+      setTimeout(() => codeInput.focus(), 0);
+    }
   });
 
   /* =========================================================
@@ -411,7 +448,7 @@ PAGE = r"""<!DOCTYPE html>
 
   drop.addEventListener("dragover", (e) => {
     e.preventDefault();
-    drop.style.borderColor = "#6a6a78";
+    drop.style.borderColor = "#3d3d44";
   });
   drop.addEventListener("dragleave", () => { drop.style.borderColor = ""; });
   drop.addEventListener("drop", (e) => {
@@ -467,7 +504,7 @@ PAGE = r"""<!DOCTYPE html>
 
     drop.classList.toggle("filled", selectedFiles.length > 0);
     drop.firstChild.textContent = selectedFiles.length
-      ? "Выбрано фото: " + selectedFiles.length + " / " + MAX_PHOTOS + "  ·  нажмите, чтобы добавить ещё"
+      ? "Выбрано фото: " + selectedFiles.length + " / " + MAX_PHOTOS + " — нажмите, чтобы добавить ещё"
       : "Нажмите, чтобы выбрать фото";
     drop.firstChild.nodeValue = drop.firstChild.textContent;
   }
@@ -521,8 +558,7 @@ PAGE = r"""<!DOCTYPE html>
       createMsg.innerHTML = "";
       const ok = document.createElement("div");
       ok.className = "msg ok";
-      ok.innerHTML =
-        "Пост создан и зашифрован.<br>Сохраните код — по нему его можно найти:";
+      ok.textContent = "Пост создан и зашифрован. Сохраните код:";
       createMsg.appendChild(ok);
 
       const code = document.createElement("div");
@@ -544,7 +580,7 @@ PAGE = r"""<!DOCTYPE html>
       copyBtn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(data.code);
-          copyBtn.textContent = "Скопировано ✓";
+          copyBtn.textContent = "Скопировано";
           setTimeout(() => (copyBtn.textContent = "Скопировать код"), 1500);
         } catch { copyBtn.textContent = "Не удалось"; }
       });
@@ -557,7 +593,7 @@ PAGE = r"""<!DOCTYPE html>
       row.append(copyBtn, againBtn);
       createMsg.appendChild(row);
 
-      // очищаем форму, но оставляем результат на экране
+      // очищаем только форму ввода, результат оставляем
       $("title").value = "";
       $("content").value = "";
       selectedFiles = [];
@@ -585,7 +621,7 @@ PAGE = r"""<!DOCTYPE html>
     if (cleaned.length === 6) {
       runSearch(cleaned);
     } else {
-      searchSeq++;              // отменяем предыдущий поиск
+      searchSeq++;
       searchState.innerHTML = "";
     }
   });
@@ -596,10 +632,19 @@ PAGE = r"""<!DOCTYPE html>
     }
   });
 
+  function triggerShakeAndClear() {
+    codeInput.value = "";
+    codeInput.classList.remove("shake");
+    // рестарт анимации
+    void codeInput.offsetWidth;
+    codeInput.classList.add("shake");
+    setTimeout(() => codeInput.classList.remove("shake"), 400);
+  }
+
   function renderSpinner() {
     searchState.innerHTML =
       '<div class="center"><div class="spinner"></div>' +
-      '<div class="spinner-label">Ищем пост…</div></div>';
+      '<div class="spinner-label">Ищем пост...</div></div>';
   }
 
   function renderError(text) {
@@ -631,10 +676,13 @@ PAGE = r"""<!DOCTYPE html>
       date.textContent = new Date(post.created).toLocaleString("ru-RU");
     } catch { date.textContent = ""; }
 
-    const photosCount = document.createElement("span");
-    photosCount.textContent = "Фото: " + (post.photos ? post.photos.length : 0);
+    meta.append(chip, date);
 
-    meta.append(chip, date, photosCount);
+    if (post.photos && post.photos.length) {
+      const cnt = document.createElement("span");
+      cnt.textContent = "Фото: " + post.photos.length;
+      meta.appendChild(cnt);
+    }
 
     box.append(h, meta);
 
@@ -667,8 +715,8 @@ PAGE = r"""<!DOCTYPE html>
 
     renderSpinner();
 
-    // небольшая задержка, чтобы колесико было видно даже при мгновенном ответе
-    await new Promise((r) => setTimeout(r, 550));
+    // небольшая задержка, чтобы спиннер был заметен
+    await new Promise((r) => setTimeout(r, 500));
     if (mySeq !== searchSeq) return;
 
     try {
@@ -678,6 +726,7 @@ PAGE = r"""<!DOCTYPE html>
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         renderError(data.detail || "Пост не найден.");
+        triggerShakeAndClear();
         return;
       }
 
@@ -687,6 +736,7 @@ PAGE = r"""<!DOCTYPE html>
     } catch (e) {
       if (mySeq !== searchSeq) return;
       renderError("Ошибка сети: " + e.message);
+      triggerShakeAndClear();
     }
   }
 })();
