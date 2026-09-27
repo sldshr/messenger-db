@@ -1,5 +1,5 @@
 """
-Sld-Networking — посты с 6-значным кодом.
+Sld-Networking — посты с 6-значным кодом (без повторяющихся цифр).
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import uvicorn
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse
 
 # ---------- сжатие ----------
@@ -83,9 +83,11 @@ MAX_CONTENT_LEN = 20_000
 
 
 def _new_code() -> str:
+    """6-значный код БЕЗ повторяющихся цифр."""
     with _lock:
         for _ in range(5000):
-            code = "".join(secrets.choice(string.digits) for _ in range(6))
+            # secrets.sample — выборка без повторов
+            code = "".join(secrets.sample(string.digits, 6))
             if code not in _store:
                 return code
     raise HTTPException(503, "Storage overflow")
@@ -247,7 +249,6 @@ PAGE = r"""<!DOCTYPE html>
   input::-moz-selection,textarea::-moz-selection{background:rgba(167,139,250,.45);color:#fff}
 
   :root{
-    /* более плотная подложка — меньше визуального шума от blur */
     --glass-bg:rgba(28,28,36,.55);
     --glass-bg-hi:rgba(38,38,48,.65);
     --glass-border:rgba(255,255,255,.10);
@@ -268,7 +269,6 @@ PAGE = r"""<!DOCTYPE html>
     font-size:14px;line-height:1.5;min-height:100%;overflow-x:hidden;
   }
 
-  /* фон — статичный, без анимаций, чтобы blur не «играл» */
   body::before{
     content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
     background:
@@ -301,7 +301,8 @@ PAGE = r"""<!DOCTYPE html>
     cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;
     backdrop-filter:blur(14px) saturate(140%);
     -webkit-backdrop-filter:blur(14px) saturate(140%);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 6px 20px rgba(0,0,0,.28);
+    /* убрано inset 0 1px 0 — из-за него был артефакт на верхней кромке */
+    box-shadow:0 6px 20px rgba(0,0,0,.28);
     transition:background .18s ease,border-color .18s ease,color .18s ease,transform .08s ease;
     transform:translateZ(0);
     -webkit-backface-visibility:hidden;
@@ -313,7 +314,7 @@ PAGE = r"""<!DOCTYPE html>
   .btn.active{
     background:rgba(255,255,255,.92);color:#0b0b10;
     border-color:rgba(255,255,255,.95);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 6px 22px rgba(255,255,255,.10);
+    box-shadow:0 6px 22px rgba(255,255,255,.10);
   }
   .btn.primary{
     background:rgba(255,255,255,.92);color:#0b0b10;
@@ -327,7 +328,6 @@ PAGE = r"""<!DOCTYPE html>
     width:100%;max-width:520px;
     overflow:hidden;
     transition:height var(--dur) var(--ease-out);
-    /* изоляция графического контекста — убирает артефакты blur при трансформациях */
     isolation:isolate;
     contain:paint layout style;
     transform:translateZ(0);
@@ -342,7 +342,6 @@ PAGE = r"""<!DOCTYPE html>
     display:flex;flex-direction:column;gap:12px;
     opacity:0;
     pointer-events:none;
-    /* translate3d — принудительно GPU-слой */
     transform:translate3d(var(--enter-x,26px),0,0) scale(.985);
     transition:
       opacity .30s cubic-bezier(.4,0,.2,1),
@@ -350,7 +349,6 @@ PAGE = r"""<!DOCTYPE html>
     will-change:transform,opacity;
     -webkit-backface-visibility:hidden;
     backface-visibility:hidden;
-    /* изолируем стек-контекст, чтобы blur соседней панели не протекал */
     isolation:isolate;
   }
   .panel.active{
@@ -360,24 +358,21 @@ PAGE = r"""<!DOCTYPE html>
     transform:translate3d(0,0,0) scale(1);
   }
 
+  /* .frame — убран inset highlight, из-за которого была прямая линия сверху */
   .frame{
     border:1px solid var(--glass-border);
     border-radius:22px;
     background:var(--glass-bg);
     backdrop-filter:blur(16px) saturate(150%);
     -webkit-backdrop-filter:blur(16px) saturate(150%);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.09),
-      0 14px 34px rgba(0,0,0,.32);
+    box-shadow:0 14px 34px rgba(0,0,0,.32);
     padding:22px;
     transform:translateZ(0);
     -webkit-backface-visibility:hidden;
     backface-visibility:hidden;
-    /* не даём blur-слою «гулять» при перерисовке */
     isolation:isolate;
   }
 
-  /* fallback, если браузер не поддерживает backdrop-filter */
   @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
     .frame{background:rgba(28,28,36,.88)}
     .btn{background:rgba(28,28,36,.85)}
@@ -458,13 +453,20 @@ PAGE = r"""<!DOCTYPE html>
   .row{display:flex;gap:10px;margin-top:20px;justify-content:center;flex-wrap:wrap}
   .row .btn{flex:0 1 auto;min-width:130px;padding:0 22px}
 
-  /* ---------- OTP ---------- */
-  .otp{display:flex;gap:8px;justify-content:center;align-items:center;margin:2px 0}
+  /* ---------- OTP + copy ---------- */
+  .otp-row{
+    display:flex;
+    gap:12px;
+    justify-content:center;
+    align-items:center;
+    flex-wrap:nowrap;
+  }
+  .otp{display:flex;gap:8px;justify-content:center;align-items:center;margin:0}
   .otp-cell{
-    width:clamp(38px,11vw,50px);height:clamp(50px,13vw,60px);
+    width:clamp(34px,10vw,46px);height:clamp(46px,12vw,56px);
     padding:0;text-align:center;
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    font-size:clamp(18px,5vw,22px);font-weight:600;
+    font-size:clamp(17px,4.6vw,21px);font-weight:600;
     color:var(--text);
     background:rgba(255,255,255,.05);
     border:1.5px solid var(--glass-border);
@@ -480,6 +482,38 @@ PAGE = r"""<!DOCTYPE html>
     box-shadow:0 0 0 3px rgba(255,255,255,.08);
     transform:translateY(-1px);
   }
+
+  /* кнопка copy рядом с кодом */
+  .otp-copy{
+    flex-shrink:0;
+    width:clamp(46px,12vw,56px);
+    height:clamp(46px,12vw,56px);
+    border-radius:14px;
+    border:1.5px solid var(--glass-border);
+    background:rgba(255,255,255,.05);
+    color:var(--text-dim);
+    display:flex;align-items:center;justify-content:center;
+    cursor:pointer;
+    -webkit-appearance:none;appearance:none;
+    transition:background .15s ease,border-color .15s ease,color .15s ease,transform .1s ease;
+    position:relative;
+  }
+  .otp-copy svg{width:20px;height:20px;pointer-events:none}
+  .otp-copy:hover:not(:disabled){
+    background:rgba(255,255,255,.10);
+    border-color:var(--glass-border-hi);
+    color:var(--text);
+  }
+  .otp-copy:active:not(:disabled){transform:scale(.94)}
+  .otp-copy:disabled{opacity:.35;cursor:not-allowed}
+  .otp-copy.copied{
+    color:var(--ok);
+    border-color:rgba(120,200,150,.45);
+    background:rgba(30,80,50,.20);
+  }
+  .otp-copy .icon-check{display:none}
+  .otp-copy.copied .icon-copy{display:none}
+  .otp-copy.copied .icon-check{display:block}
 
   @keyframes shake{
     0%,100%{transform:translateX(0)}
@@ -636,15 +670,14 @@ PAGE = r"""<!DOCTYPE html>
   }
   .modal[hidden]{display:none}
 
+  /* убран inset highlight — та же причина, что и у frame */
   .modal-card{
     width:100%;max-width:380px;
     padding:26px 24px;
     border:1px solid var(--glass-border);
     border-radius:22px;
     background:rgba(28,28,36,.94);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.09),
-      0 20px 50px rgba(0,0,0,.5);
+    box-shadow:0 20px 50px rgba(0,0,0,.5);
     text-align:center;
     animation:modalIn .32s var(--ease-out);
     transform:translateZ(0);
@@ -689,6 +722,7 @@ PAGE = r"""<!DOCTYPE html>
     .modal-code{font-size:34px;letter-spacing:9px;text-indent:9px}
     .lb-img{max-width:96vw;max-height:82vh}
     .lb-hint{display:none}
+    .otp-row{gap:8px}
   }
   @media (max-width:380px){
     .btn span.btn-label{display:none}
@@ -763,13 +797,25 @@ PAGE = r"""<!DOCTYPE html>
 
     <div class="panel" id="findPanel">
       <section class="frame">
-        <div class="otp" id="otp" autocomplete="off">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="1">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="2">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="3">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="4">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="5">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="6">
+        <div class="otp-row">
+          <div class="otp" id="otp" autocomplete="off">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="1">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="2">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="3">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="4">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="5">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="6">
+          </div>
+          <button class="otp-copy" id="otpCopyBtn" type="button" disabled
+                  data-i18n-title="copyCode" title="Copy code" aria-label="Copy code">
+            <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2"/>
+              <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+            </svg>
+            <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 6L9 17l-5-5"/>
+            </svg>
+          </button>
         </div>
       </section>
 
@@ -858,6 +904,7 @@ PAGE = r"""<!DOCTYPE html>
       postCreatedSub: "Сохраните код — по нему можно найти пост в любое время",
       memoryUsage: "Занято в памяти: {size}",
       copy: "Копировать",
+      copyCode: "Скопировать код",
       copied: "Скопировано",
       copyError: "Ошибка",
       done: "Готово",
@@ -884,6 +931,7 @@ PAGE = r"""<!DOCTYPE html>
       postCreatedSub: "Save the code — you can find the post anytime with it",
       memoryUsage: "Memory used: {size}",
       copy: "Copy",
+      copyCode: "Copy code",
       copied: "Copied",
       copyError: "Error",
       done: "Done",
@@ -919,6 +967,11 @@ PAGE = r"""<!DOCTYPE html>
       const key = el.getAttribute("data-i18n-ph");
       const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
       if (txt) el.placeholder = txt;
+    });
+    document.querySelectorAll("[data-i18n-title]").forEach(el => {
+      const key = el.getAttribute("data-i18n-title");
+      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
+      if (txt) { el.title = txt; el.setAttribute("aria-label", txt); }
     });
 
     dropLabel.textContent = defaultDropLabel();
@@ -1203,6 +1256,7 @@ PAGE = r"""<!DOCTYPE html>
       setMode("find");
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
+      updateOtpCopyState();
       runSearch(code);
 
       showCreatedModal(code, data.compressed_bytes);
@@ -1257,17 +1311,24 @@ PAGE = r"""<!DOCTYPE html>
      ========================================================= */
   const otp         = $("otp");
   const otpCells    = Array.from(document.querySelectorAll(".otp-cell"));
+  const otpCopyBtn  = $("otpCopyBtn");
   const searchFrame = $("searchFrame");
 
   let searchSeq = 0;
   let lastSubmitted = "";
+  let otpCopyTimer = null;
 
   function getCode() { return otpCells.map(c => c.value).join(""); }
+
+  function updateOtpCopyState() {
+    otpCopyBtn.disabled = getCode().length !== 6;
+  }
 
   function clearOtp() {
     otpCells.forEach(c => c.value = "");
     otpCells[0].focus();
     lastSubmitted = "";
+    updateOtpCopyState();
   }
 
   function shakeOtp() {
@@ -1293,7 +1354,20 @@ PAGE = r"""<!DOCTYPE html>
       hideSearchFrame();
       lastSubmitted = "";
     }
+    updateOtpCopyState();
   }
+
+  // Copy-кнопка рядом с OTP
+  otpCopyBtn.addEventListener("click", async () => {
+    const code = getCode();
+    if (code.length !== 6) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      otpCopyBtn.classList.add("copied");
+      clearTimeout(otpCopyTimer);
+      otpCopyTimer = setTimeout(() => otpCopyBtn.classList.remove("copied"), 1500);
+    } catch {}
+  });
 
   otpCells.forEach((cell, i) => {
     cell.addEventListener("focus", () => cell.select());
@@ -1331,6 +1405,8 @@ PAGE = r"""<!DOCTYPE html>
       maybeSearch();
     });
   });
+
+  updateOtpCopyState();
 
   function showSearchFrame() {
     searchFrame.hidden = false;
@@ -1613,7 +1689,7 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     Инициализация: язык + deep-link
+     Инициализация
      ========================================================= */
   function initFromUrl() {
     const { code, lang } = parseHash();
@@ -1624,6 +1700,7 @@ PAGE = r"""<!DOCTYPE html>
       setMode("find", true);
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
+      updateOtpCopyState();
       runSearch(code);
     } else {
       setMode("create", true);
@@ -1645,6 +1722,7 @@ PAGE = r"""<!DOCTYPE html>
       setMode("find", true);
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
+      updateOtpCopyState();
       runSearch(code);
     }
   });
