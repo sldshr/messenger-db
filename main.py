@@ -150,7 +150,13 @@ PAGE = r"""<!DOCTYPE html>
   *{scrollbar-width:none;-ms-overflow-style:none;-webkit-tap-highlight-color:transparent}
 
   html,body{user-select:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none}
-  input,textarea,[contenteditable]{user-select:text;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text}
+  input,textarea,[contenteditable],.modal-code{user-select:text;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text}
+
+  /* ---------- своё выделение текста ---------- */
+  ::selection{background:rgba(167,139,250,.38);color:#fff}
+  ::-moz-selection{background:rgba(167,139,250,.38);color:#fff}
+  input::selection,textarea::selection{background:rgba(167,139,250,.45);color:#fff}
+  input::-moz-selection,textarea::-moz-selection{background:rgba(167,139,250,.45);color:#fff}
 
   :root{
     --glass-bg:rgba(255,255,255,.055);
@@ -162,8 +168,8 @@ PAGE = r"""<!DOCTYPE html>
     --text-mute:#61616E;
     --danger:#F0A0A0;
     --ok:#9BDCB0;
-    --ease:cubic-bezier(.32,.72,0,1);
-    --dur:.48s;
+    --ease-out:cubic-bezier(.22,1,.36,1);
+    --dur:.55s;
   }
 
   html,body{
@@ -223,23 +229,32 @@ PAGE = r"""<!DOCTYPE html>
   }
   .btn.primary:hover{background:#fff}
 
-  /* ---------- сцена ---------- */
+  /* ---------- сцена с панелями ---------- */
   .stage{
+    position:relative;
     width:100%;max-width:520px;
-    overflow:hidden;position:relative;
-    transition:height var(--dur) var(--ease);
+    overflow:hidden;
+    transition:height var(--dur) var(--ease-out);
   }
   .stage[hidden]{display:none}
 
-  .track{
-    display:flex;align-items:flex-start;width:100%;
-    transition:transform var(--dur) var(--ease);
-    will-change:transform;
-  }
-
   .panel{
-    flex:0 0 100%;min-width:0;width:100%;
+    position:absolute;
+    top:0;left:0;right:0;
     display:flex;flex-direction:column;gap:12px;
+    opacity:0;
+    pointer-events:none;
+    transform:translateX(var(--enter-x,26px)) scale(.985);
+    transition:
+      opacity .32s cubic-bezier(.4,0,.2,1),
+      transform var(--dur) var(--ease-out);
+    will-change:transform,opacity;
+  }
+  .panel.active{
+    position:relative;
+    opacity:1;
+    pointer-events:auto;
+    transform:translateX(0) scale(1);
   }
 
   .frame{
@@ -250,12 +265,6 @@ PAGE = r"""<!DOCTYPE html>
     -webkit-backdrop-filter:blur(22px) saturate(160%);
     box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 14px 34px rgba(0,0,0,.32);
     padding:22px;
-    animation:frameIn .28s var(--ease);
-  }
-  .frame[hidden]{display:none}
-  @keyframes frameIn{
-    from{opacity:0;transform:translateY(6px) scale(.985)}
-    to{opacity:1;transform:none}
   }
 
   /* ---------- поля ---------- */
@@ -286,7 +295,14 @@ PAGE = r"""<!DOCTYPE html>
   }
   .field::placeholder{color:var(--text-mute)}
   .field:focus{border-color:var(--glass-border-hi);background:rgba(255,255,255,.07)}
-  textarea.field{min-height:132px;resize:vertical;line-height:1.55;font-family:inherit}
+
+  /* textarea: без ресайза и выше */
+  textarea.field{
+    min-height:180px;
+    resize:none;
+    line-height:1.55;
+    font-family:inherit;
+  }
 
   /* ---------- зона фото ---------- */
   .drop{
@@ -318,7 +334,6 @@ PAGE = r"""<!DOCTYPE html>
     position:relative;aspect-ratio:1/1;border-radius:12px;overflow:hidden;
     background:rgba(255,255,255,.04);
     border:1px solid var(--glass-border);
-    animation:frameIn .2s ease;
   }
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
   .preview button{
@@ -455,7 +470,6 @@ PAGE = r"""<!DOCTYPE html>
     max-width:100%;max-height:100%;
     object-fit:contain;border-radius:14px;
     box-shadow:0 20px 60px rgba(0,0,0,.5);
-    /* шахматка для прозрачных изображений */
     background-color:#1c1c22;
     background-image:
       linear-gradient(45deg, rgba(255,255,255,.06) 25%, transparent 25%),
@@ -464,7 +478,7 @@ PAGE = r"""<!DOCTYPE html>
       linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.06) 75%);
     background-size:18px 18px;
     background-position:0 0, 0 9px, 9px -9px, -9px 0px;
-    animation:lbImgIn .25s var(--ease);
+    animation:lbImgIn .25s var(--ease-out);
   }
   @keyframes lbImgIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
 
@@ -500,7 +514,7 @@ PAGE = r"""<!DOCTYPE html>
     backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   }
 
-  /* ---------- модальное окно (код созданного поста) ---------- */
+  /* ---------- модалка ---------- */
   .modal{
     position:fixed;inset:0;z-index:900;
     display:flex;align-items:center;justify-content:center;
@@ -523,10 +537,10 @@ PAGE = r"""<!DOCTYPE html>
       inset 0 1px 0 rgba(255,255,255,.09),
       0 20px 50px rgba(0,0,0,.5);
     text-align:center;
-    animation:panelIn .3s var(--ease);
+    animation:modalIn .32s var(--ease-out);
   }
-  @keyframes panelIn{
-    from{opacity:0;transform:translateY(10px) scale(.96)}
+  @keyframes modalIn{
+    from{opacity:0;transform:translateY(12px) scale(.95)}
     to{opacity:1;transform:none}
   }
 
@@ -549,7 +563,6 @@ PAGE = r"""<!DOCTYPE html>
     letter-spacing:12px;text-indent:12px;
     color:var(--text);
     margin:6px 0 6px;
-    user-select:text;-webkit-user-select:text;
   }
 
   .modal-hint{font-size:12px;color:var(--text-dim);margin-bottom:22px}
@@ -594,78 +607,76 @@ PAGE = r"""<!DOCTYPE html>
   </nav>
 
   <div class="stage" id="stage" hidden>
-    <div class="track" id="track">
 
-      <!-- ================= СОЗДАНИЕ ================= -->
-      <div class="panel" id="createPanel">
-        <section class="frame">
+    <!-- ================= СОЗДАНИЕ ================= -->
+    <div class="panel" id="createPanel">
+      <section class="frame">
 
-          <div class="input-wrap">
-            <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off" spellcheck="false">
-            <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
+        <div class="input-wrap">
+          <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off" spellcheck="false">
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
+          </svg>
+        </div>
+
+        <div class="input-wrap textarea-wrap">
+          <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6h16M4 12h16M4 18h10"/>
+          </svg>
+        </div>
+
+        <div class="drop" id="drop">
+          <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="3"/>
+            <circle cx="9" cy="9" r="2"/>
+            <path d="M21 15l-5-5L5 21"/>
+          </svg>
+          <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
+          <div class="drop-hint">до 5 фото · Ctrl+V — вставить из буфера</div>
+        </div>
+        <input type="file" id="fileInput" accept="image/*" multiple hidden>
+        <div class="previews" id="previews"></div>
+
+        <div class="row">
+          <button class="btn primary" id="submitBtn" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+              <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
             </svg>
-          </div>
-
-          <div class="input-wrap textarea-wrap">
-            <textarea class="field" id="content" placeholder="Содержимое"></textarea>
-            <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 6h16M4 12h16M4 18h10"/>
+            <span>Опубликовать</span>
+          </button>
+          <button class="btn" id="resetBtn" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+              <path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
             </svg>
-          </div>
+            <span>Очистить</span>
+          </button>
+        </div>
 
-          <div class="drop" id="drop">
-            <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="3"/>
-              <circle cx="9" cy="9" r="2"/>
-              <path d="M21 15l-5-5L5 21"/>
-            </svg>
-            <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
-            <div class="drop-hint">до 5 фото · Ctrl+V — вставить из буфера</div>
-          </div>
-          <input type="file" id="fileInput" accept="image/*" multiple hidden>
-          <div class="previews" id="previews"></div>
-
-          <div class="row">
-            <button class="btn primary" id="submitBtn" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
-                <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
-              </svg>
-              <span>Опубликовать</span>
-            </button>
-            <button class="btn" id="resetBtn" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
-                <path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
-              </svg>
-              <span>Очистить</span>
-            </button>
-          </div>
-
-          <div id="createMsg"></div>
-        </section>
-      </div>
-
-      <!-- ================= ПОИСК ================= -->
-      <div class="panel" id="findPanel">
-        <section class="frame">
-          <div class="otp" id="otp" autocomplete="off">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
-            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
-          </div>
-        </section>
-
-        <section class="frame" id="searchFrame" hidden></section>
-      </div>
-
+        <div id="createMsg"></div>
+      </section>
     </div>
+
+    <!-- ================= ПОИСК ================= -->
+    <div class="panel" id="findPanel">
+      <section class="frame">
+        <div class="otp" id="otp" autocomplete="off">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
+        </div>
+      </section>
+
+      <section class="frame" id="searchFrame" hidden></section>
+    </div>
+
   </div>
 </main>
 
-<!-- ================= МОДАЛКА (код созданного поста) ================= -->
+<!-- ================= МОДАЛКА ================= -->
 <div class="modal" id="createdModal" hidden>
   <div class="modal-card" id="modalCard">
     <div class="modal-icon">
@@ -716,10 +727,8 @@ PAGE = r"""<!DOCTYPE html>
   "use strict";
   const $ = (id) => document.getElementById(id);
 
-  /* ---------- глобально отключаем ПКМ ---------- */
   document.addEventListener("contextmenu", (e) => e.preventDefault());
 
-  /* ---------- иконки ---------- */
   const ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -735,7 +744,6 @@ PAGE = r"""<!DOCTYPE html>
     return d;
   }
 
-  /* ---------- форматирование размера ---------- */
   function formatBytes(b) {
     if (b < 1024) return b + " Б";
     if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " КБ";
@@ -744,10 +752,9 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ (сдвиг ленты + плавная высота)
+     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ
      ========================================================= */
   const stage       = $("stage");
-  const track       = $("track");
   const createPanel = $("createPanel");
   const findPanel   = $("findPanel");
   const btnCreate   = $("btnCreate");
@@ -759,21 +766,29 @@ PAGE = r"""<!DOCTYPE html>
     return mode === "create" ? createPanel : findPanel;
   }
 
-  function syncHeight() {
+  function syncHeight(animate = true) {
     if (mode === null || stage.hidden) return;
+    if (!animate) stage.style.transition = "none";
     stage.style.height = activePanel().offsetHeight + "px";
+    if (!animate) {
+      void stage.offsetHeight;
+      stage.style.transition = "";
+    }
   }
 
-  // Любое изменение размера панели (появление контента) → синхронизация высоты сцены
-  const ro = new ResizeObserver(() => syncHeight());
+  const ro = new ResizeObserver(() => {
+    if (!mode || stage.hidden) return;
+    // мгновенная синхронизация без анимации (высота панели изменилась — это не переключение)
+    stage.style.height = activePanel().offsetHeight + "px";
+  });
   ro.observe(createPanel);
   ro.observe(findPanel);
-  window.addEventListener("resize", syncHeight);
+  window.addEventListener("resize", () => syncHeight(false));
 
   function setMode(next) {
     const target = (next === mode) ? null : next;
-    const wasHidden = stage.hidden;
 
+    // закрытие
     if (target === null) {
       stage.hidden = true;
       mode = null;
@@ -782,28 +797,53 @@ PAGE = r"""<!DOCTYPE html>
       return;
     }
 
+    const firstShow = stage.hidden;
+    const incoming  = target === "create" ? createPanel : findPanel;
+    const outgoing  = target === "create" ? findPanel   : createPanel;
+
+    // create — «слева», find — «справа»
+    const goLeft = (target === "create");
+    const enterX = goLeft ? -26 : 26;
+    const exitX  = goLeft ?  26 : -26;
+
+    // включаем сцену
+    stage.hidden = false;
+    stage.style.transition = "none";
+    stage.style.height = incoming.offsetHeight + "px";
+
+    if (firstShow || mode === null) {
+      // первая отрисовка — без анимации
+      incoming.style.setProperty("--enter-x", "0px");
+      incoming.style.transition = "none";
+      outgoing.classList.remove("active");
+      incoming.classList.add("active");
+      void incoming.offsetWidth;
+      incoming.style.transition = "";
+      void stage.offsetWidth;
+      stage.style.transition = "";
+    } else {
+      // задаём направления
+      incoming.style.setProperty("--enter-x", enterX + "px");
+      outgoing.style.setProperty("--enter-x", exitX  + "px");
+
+      // сброс и старт анимации
+      void incoming.offsetWidth;
+
+      outgoing.classList.remove("active");
+      incoming.classList.add("active");
+
+      // синхронизируем высоту с анимацией
+      void stage.offsetWidth;
+      stage.style.transition = "";
+      stage.style.height = incoming.offsetHeight + "px";
+    }
+
     mode = target;
     btnCreate.classList.toggle("active", target === "create");
     btnFind.classList.toggle("active", target === "find");
 
-    if (wasHidden) {
-      // первое появление — без анимации сдвига
-      track.style.transition = "none";
-      stage.style.transition = "none";
-      stage.hidden = false;
-      track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
-      stage.style.height = activePanel().offsetHeight + "px";
-      void track.offsetWidth;
-      track.style.transition = "";
-      stage.style.transition = "";
-    } else {
-      // обычное переключение — с анимацией
-      track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
-      syncHeight();
-    }
-
-    if (target === "create") setTimeout(() => $("title").focus(), 100);
-    else setTimeout(() => otpCells[0].focus(), 100);
+    if (target === "create") setTimeout(() => $("title").focus(), 140);
+    else setTimeout(() => otpCells[0].focus(), 140);
   }
 
   btnCreate.addEventListener("click", () => setMode("create"));
@@ -841,7 +881,6 @@ PAGE = r"""<!DOCTYPE html>
     fileInput.value = "";
   });
 
-  // Ctrl+V — вставка изображения из буфера
   document.addEventListener("paste", (e) => {
     if (mode !== "create") return;
     const items = (e.clipboardData || window.clipboardData)?.items;
@@ -946,21 +985,18 @@ PAGE = r"""<!DOCTYPE html>
         return;
       }
 
-      // очищаем форму
       $("title").value = "";
       $("content").value = "";
       selectedFiles = [];
       renderPreviews();
       clearCreateMsg();
 
-      // авто-переход в режим поиска + подстановка кода + поиск
       const code = data.code;
       setMode("find");
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
       runSearch(code);
 
-      // модалка с кодом и кнопкой "копировать"
       showCreatedModal(code, data.compressed_bytes);
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
@@ -971,7 +1007,7 @@ PAGE = r"""<!DOCTYPE html>
   });
 
   /* =========================================================
-     МОДАЛЬНОЕ ОКНО (код созданного поста)
+     МОДАЛКА
      ========================================================= */
   const createdModal  = $("createdModal");
   const modalCard     = $("modalCard");
@@ -989,34 +1025,26 @@ PAGE = r"""<!DOCTYPE html>
     if (label) label.textContent = "Копировать";
     createdModal.hidden = false;
   }
-
-  function closeCreatedModal() {
-    createdModal.hidden = true;
-  }
+  function closeCreatedModal() { createdModal.hidden = true; }
 
   modalCopyBtn.addEventListener("click", async () => {
     const label = modalCopyBtn.querySelector("span");
     try {
       await navigator.clipboard.writeText(modalCode.textContent || "");
       if (label) label.textContent = "Скопировано";
-      clearTimeout(modalCopyTimer);
-      modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
     } catch {
       if (label) label.textContent = "Ошибка";
-      clearTimeout(modalCopyTimer);
-      modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
     }
+    clearTimeout(modalCopyTimer);
+    modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
   });
 
   modalCloseBtn.addEventListener("click", closeCreatedModal);
-
-  createdModal.addEventListener("click", (e) => {
-    if (e.target === createdModal) closeCreatedModal();
-  });
+  createdModal.addEventListener("click", (e) => { if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", (e) => e.stopPropagation());
 
   /* =========================================================
-     ПОИСК ПО КОДУ (OTP)
+     ПОИСК
      ========================================================= */
   const otp         = $("otp");
   const otpCells    = Array.from(document.querySelectorAll(".otp-cell"));
@@ -1103,8 +1131,7 @@ PAGE = r"""<!DOCTYPE html>
     searchFrame.style.animation = "none";
     void searchFrame.offsetWidth;
     searchFrame.style.animation = "";
-    // синхронизируем высоту сцены после вставки контента
-    requestAnimationFrame(syncHeight);
+    requestAnimationFrame(() => syncHeight(false));
   }
 
   function renderSpinner() {
@@ -1240,7 +1267,7 @@ PAGE = r"""<!DOCTYPE html>
     }
   }
 
-  /* ---------- общий Esc ---------- */
+  /* ---------- Esc ---------- */
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (!lightbox.hidden) { closeLightbox(); return; }
