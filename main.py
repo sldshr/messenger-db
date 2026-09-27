@@ -146,17 +146,18 @@ PAGE = r"""<!DOCTYPE html>
 <link rel="icon" href="__FAVICON__">
 <style>
   *,*::before,*::after{box-sizing:border-box}
-
-  /* прячем скроллбары, но скролл оставляем */
   ::-webkit-scrollbar{width:0;height:0;display:none}
-  *{scrollbar-width:none;-ms-overflow-style:none}
+  *{scrollbar-width:none;-ms-overflow-style:none;-webkit-tap-highlight-color:transparent}
+
+  /* отключаем выделение везде, кроме полей */
+  html,body{user-select:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none}
+  input,textarea,[contenteditable]{user-select:text;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text}
 
   :root{
-    --glass-bg:rgba(255,255,255,.06);
+    --glass-bg:rgba(255,255,255,.055);
     --glass-bg-hi:rgba(255,255,255,.10);
     --glass-border:rgba(255,255,255,.10);
-    --glass-border-hi:rgba(255,255,255,.18);
-    --glass-highlight:rgba(255,255,255,.14);
+    --glass-border-hi:rgba(255,255,255,.22);
     --text:#EDEDF2;
     --text-dim:#9A9AA6;
     --text-mute:#61616E;
@@ -165,22 +166,14 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   html,body{
-    margin:0;padding:0;
-    background:#0b0b10;
-    color:var(--text);
+    margin:0;padding:0;background:#0b0b10;color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,"Helvetica Neue",Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;
-    -moz-osx-font-smoothing:grayscale;
-    font-size:14px;
-    line-height:1.5;
-    min-height:100%;
-    overflow-x:hidden;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+    font-size:14px;line-height:1.5;min-height:100%;overflow-x:hidden;
   }
 
-  /* ---------- фон (статичный, дешёвый) ---------- */
   body::before{
-    content:"";
-    position:fixed;inset:0;z-index:-1;pointer-events:none;
+    content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
     background:
       radial-gradient(ellipse 70% 55% at 15% 5%, rgba(124,94,214,.35), transparent 65%),
       radial-gradient(ellipse 65% 55% at 90% 95%, rgba(56,140,190,.30), transparent 65%),
@@ -191,120 +184,108 @@ PAGE = r"""<!DOCTYPE html>
   /* ---------- каркас ---------- */
   .app{
     min-height:100dvh;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
+    display:flex;flex-direction:column;align-items:center;
     padding:clamp(44px,10vh,110px) 16px 48px;
-    gap:24px;
+    gap:22px;
   }
 
   /* ---------- кнопки ---------- */
   .menu{
-    display:flex;
-    gap:12px;
-    justify-content:center;
-    align-items:stretch;
-    flex-wrap:nowrap;
-    width:100%;
-    max-width:520px;
+    display:flex;gap:12px;justify-content:center;align-items:stretch;
+    flex-wrap:nowrap;width:100%;max-width:520px;
   }
-
   .btn{
-    flex:1 1 0;
-    min-width:0;
-    height:52px;                 /* одинаковая высота у обеих */
-    display:inline-flex;
-    align-items:center;
-    justify-content:center;
-    gap:9px;
+    flex:1 1 0;min-width:0;height:52px;
+    display:inline-flex;align-items:center;justify-content:center;gap:9px;
     padding:0 20px;
-
     border:1px solid var(--glass-border);
     border-radius:100px;
     background:var(--glass-bg);
     color:var(--text);
-    font:inherit;
-    font-size:14.5px;
-    font-weight:500;
-    letter-spacing:.15px;
-    cursor:pointer;
-    user-select:none;
-    -webkit-tap-highlight-color:transparent;
-
+    font:inherit;font-size:14.5px;font-weight:500;letter-spacing:.15px;
+    cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;
     backdrop-filter:blur(18px) saturate(150%);
     -webkit-backdrop-filter:blur(18px) saturate(150%);
-
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.10),
-      0 6px 20px rgba(0,0,0,.28);
-
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 6px 20px rgba(0,0,0,.28);
     transition:background .18s ease,border-color .18s ease,color .18s ease,transform .08s ease;
   }
   .btn svg{width:18px;height:18px;flex-shrink:0;display:block}
   .btn:hover{background:var(--glass-bg-hi);border-color:var(--glass-border-hi)}
   .btn:active{transform:scale(.98)}
   .btn.active{
-    background:rgba(255,255,255,.92);
-    color:#0b0b10;
+    background:rgba(255,255,255,.92);color:#0b0b10;
     border-color:rgba(255,255,255,.95);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.6),
-      0 6px 22px rgba(255,255,255,.10);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 6px 22px rgba(255,255,255,.10);
   }
 
-  /* ---------- панели ---------- */
-  .panel{
-    width:100%;
-    max-width:520px;
-    padding:22px;
+  /* ---------- сцена со слайдом ---------- */
+  .stage{
+    width:100%;max-width:520px;
+    overflow:hidden;position:relative;
+    transition:height .4s cubic-bezier(.2,.9,.3,1);
+  }
+  .stage[hidden]{display:none}
 
+  .track{
+    display:flex;align-items:flex-start;
+    width:100%;
+    transition:transform .42s cubic-bezier(.2,.9,.3,1);
+    will-change:transform;
+  }
+
+  .panel{
+    flex:0 0 100%;min-width:0;width:100%;
+    display:flex;flex-direction:column;gap:12px;
+  }
+
+  /* ---------- стеклянные фреймы ---------- */
+  .frame{
     border:1px solid var(--glass-border);
-    border-radius:24px;
+    border-radius:22px;
     background:var(--glass-bg);
     backdrop-filter:blur(22px) saturate(160%);
     -webkit-backdrop-filter:blur(22px) saturate(160%);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.09),
-      0 18px 45px rgba(0,0,0,.35);
-
-    animation:panelIn .22s cubic-bezier(.2,.9,.3,1);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 14px 34px rgba(0,0,0,.32);
+    padding:22px;
+    animation:frameIn .28s cubic-bezier(.2,.9,.3,1);
   }
-  .panel[hidden]{display:none}
-  @keyframes panelIn{
-    from{opacity:0;transform:translateY(-8px) scale(.98)}
+  .frame[hidden]{display:none}
+  @keyframes frameIn{
+    from{opacity:0;transform:translateY(6px) scale(.985)}
     to{opacity:1;transform:none}
   }
 
-  /* ---------- поля ---------- */
+  /* ---------- поля с иконками ---------- */
+  .input-wrap{position:relative;display:flex}
+  .input-wrap + .input-wrap{margin-top:12px}
+  .input-wrap .iw-icon{
+    position:absolute;left:14px;width:18px;height:18px;
+    color:var(--text-dim);pointer-events:none;
+    transition:color .15s ease;
+  }
+  .input-wrap input.field,
+  .input-wrap textarea.field{padding-left:44px}
+  .input-wrap input.field + .iw-icon,
+  .input-wrap textarea.field + .iw-icon{top:14px}
+  .input-wrap.textarea-wrap .iw-icon{top:15px}
+  .input-wrap:focus-within .iw-icon{color:var(--text)}
+
   .field{
     width:100%;
     background:rgba(255,255,255,.04);
     border:1px solid var(--glass-border);
     border-radius:14px;
     padding:13px 16px;
-    color:var(--text);
-    font:inherit;
-    font-size:14.5px;
+    color:var(--text);font:inherit;font-size:14.5px;
     outline:none;
     transition:border-color .15s ease,background .15s ease;
-    -webkit-appearance:none;
-    appearance:none;
+    -webkit-appearance:none;appearance:none;
   }
-  .field + .field{margin-top:12px}
   .field::placeholder{color:var(--text-mute)}
-  .field:focus{
-    border-color:var(--glass-border-hi);
-    background:rgba(255,255,255,.07);
-  }
+  .field:focus{border-color:var(--glass-border-hi);background:rgba(255,255,255,.07)}
+  textarea.field{min-height:132px;resize:vertical;line-height:1.55;font-family:inherit}
 
-  textarea.field{
-    min-height:132px;
-    resize:vertical;
-    line-height:1.55;
-    font-family:inherit;
-  }
-
-  /* ---------- фото ---------- */
+  /* ---------- зона фото ---------- */
   .drop{
     margin-top:12px;
     border:1px dashed rgba(255,255,255,.18);
@@ -312,88 +293,65 @@ PAGE = r"""<!DOCTYPE html>
     padding:20px 16px;
     text-align:center;
     color:var(--text-dim);
-    font-size:13.5px;
     cursor:pointer;
     background:rgba(255,255,255,.02);
     line-height:1.6;
     transition:border-color .15s ease,color .15s ease,background .15s ease;
+    display:flex;flex-direction:column;align-items:center;gap:8px;
   }
-  .drop:hover{
-    border-color:rgba(255,255,255,.32);
-    color:var(--text);
-    background:rgba(255,255,255,.05);
-  }
+  .drop .drop-icon{width:26px;height:26px;color:var(--text-dim);transition:color .15s ease}
+  .drop .drop-label{font-size:13.5px;color:var(--text-dim);transition:color .15s ease}
+  .drop .drop-hint{font-size:11.5px;color:var(--text-mute)}
+  .drop:hover{border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.05)}
+  .drop:hover .drop-icon,.drop:hover .drop-label{color:var(--text)}
   .drop.filled{
-    border-style:solid;
-    border-color:rgba(255,255,255,.25);
-    color:var(--text);
+    border-style:solid;border-color:rgba(255,255,255,.25);
   }
+  .drop.filled .drop-icon,.drop.filled .drop-label{color:var(--text)}
 
   .previews{
-    display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(76px,1fr));
-    gap:8px;
-    margin-top:12px;
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(76px,1fr));
+    gap:8px;margin-top:12px;
   }
   .preview{
-    position:relative;
-    aspect-ratio:1/1;
-    border-radius:12px;
-    overflow:hidden;
+    position:relative;aspect-ratio:1/1;border-radius:12px;overflow:hidden;
     background:rgba(255,255,255,.04);
     border:1px solid var(--glass-border);
+    animation:frameIn .2s ease;
   }
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
   .preview button{
-    position:absolute;top:4px;right:4px;
-    width:22px;height:22px;
-    border-radius:50%;
+    position:absolute;top:4px;right:4px;width:22px;height:22px;border-radius:50%;
     border:1px solid rgba(255,255,255,.15);
-    background:rgba(10,10,14,.72);
-    color:var(--text);
+    background:rgba(10,10,14,.72);color:var(--text);
     font-size:13px;line-height:1;
-    cursor:pointer;
-    display:flex;align-items:center;justify-content:center;
-    -webkit-backdrop-filter:blur(8px);
-    backdrop-filter:blur(8px);
+    cursor:pointer;display:flex;align-items:center;justify-content:center;
+    -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
   }
   .preview button:hover{background:rgba(70,26,26,.9)}
 
   .row{
-    display:flex;
-    gap:10px;
-    margin-top:20px;
-    justify-content:center;
-    flex-wrap:wrap;
+    display:flex;gap:10px;margin-top:20px;justify-content:center;flex-wrap:wrap;
   }
   .row .btn{flex:0 1 auto;min-width:130px;padding:0 22px}
 
   /* ---------- OTP ---------- */
   .otp{
-    display:flex;
-    gap:8px;
-    justify-content:center;
-    align-items:center;
+    display:flex;gap:8px;justify-content:center;align-items:center;
     margin:2px 0;
   }
   .otp-cell{
-    width:clamp(38px,11vw,50px);
-    height:clamp(50px,13vw,60px);
-    padding:0;
-    text-align:center;
+    width:clamp(38px,11vw,50px);height:clamp(50px,13vw,60px);
+    padding:0;text-align:center;
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    font-size:clamp(18px,5vw,22px);
-    font-weight:600;
+    font-size:clamp(18px,5vw,22px);font-weight:600;
     color:var(--text);
     background:rgba(255,255,255,.05);
     border:1.5px solid var(--glass-border);
     border-radius:14px;
-    outline:none;
-    caret-color:transparent;
-    -webkit-appearance:none;
-    appearance:none;
+    outline:none;caret-color:transparent;
+    -webkit-appearance:none;appearance:none;
     transition:background .15s ease,border-color .15s ease,transform .1s ease,box-shadow .15s ease;
-    -webkit-tap-highlight-color:transparent;
   }
   .otp-cell:hover{background:rgba(255,255,255,.08)}
   .otp-cell:focus{
@@ -417,56 +375,50 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* ---------- статусы ---------- */
-  #searchState,#createMsg{margin-top:14px}
-  .center{text-align:center;padding:16px 0}
+  .center{text-align:center;padding:10px 0}
   .spinner{
     width:26px;height:26px;border-radius:50%;
     border:2.5px solid rgba(255,255,255,.12);
     border-top-color:rgba(255,255,255,.75);
-    animation:spin .7s linear infinite;
-    margin:0 auto;
+    animation:spin .7s linear infinite;margin:0 auto;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
   .spinner-label{margin-top:10px;font-size:12.5px;color:var(--text-dim);text-align:center}
 
   .msg{
-    border-radius:14px;
-    padding:12px 16px;
-    font-size:13.5px;
-    background:rgba(255,255,255,.05);
-    color:var(--text);
-    line-height:1.5;
-    border:1px solid var(--glass-border);
+    display:flex;align-items:flex-start;gap:10px;
+    border-radius:14px;padding:12px 14px;font-size:13.5px;
+    background:rgba(255,255,255,.05);color:var(--text);
+    line-height:1.5;border:1px solid var(--glass-border);
   }
+  .msg svg{width:18px;height:18px;flex-shrink:0;margin-top:1px}
   .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
   .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
-  .result{
-    margin-top:14px;
-    padding:20px;
-    border-radius:18px;
-    background:rgba(255,255,255,.05);
-    border:1px solid var(--glass-border);
-    animation:panelIn .2s cubic-bezier(.2,.9,.3,1);
+  /* ---------- результат поста ---------- */
+  .post-title{
+    margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);
+    word-break:break-word;
   }
-  .result h3{margin:0 0 10px;font-size:18px;font-weight:600;line-height:1.3;color:var(--text)}
-  .result .meta{
+  .post-meta{
     font-size:12px;color:var(--text-dim);margin-bottom:14px;
-    display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+    display:flex;gap:10px;flex-wrap:wrap;align-items:center;
   }
-  .result .body{font-size:14px;line-height:1.6;color:#d8d8de;white-space:pre-wrap;word-break:break-word}
-  .result .gallery{
-    display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
+  .post-body{
+    font-size:14px;line-height:1.6;color:#d8d8de;
+    white-space:pre-wrap;word-break:break-word;
+  }
+  .post-gallery{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
     gap:8px;margin-top:16px;
   }
-  .result .gallery img{
+  .post-gallery img{
     width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:12px;
     cursor:zoom-in;background:rgba(255,255,255,.04);
     border:1px solid var(--glass-border);
-    transition:transform .15s ease;
+    transition:transform .15s ease,border-color .15s ease;
   }
-  .result .gallery img:hover{transform:scale(1.02)}
+  .post-gallery img:hover{transform:scale(1.02);border-color:var(--glass-border-hi)}
 
   .code-chip{
     display:inline-flex;align-items:center;
@@ -474,17 +426,69 @@ PAGE = r"""<!DOCTYPE html>
     font-size:13px;letter-spacing:3px;color:var(--text);
     background:rgba(255,255,255,.06);
     border:1px solid var(--glass-border);
-    border-radius:10px;
-    padding:4px 10px;
+    border-radius:10px;padding:4px 10px;
   }
   .big-code{
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     font-size:38px;font-weight:700;
     letter-spacing:12px;text-indent:12px;
-    text-align:center;color:var(--text);
-    margin:10px 0 4px;
+    text-align:center;color:var(--text);margin:10px 0 4px;
   }
   .hint{font-size:12px;color:var(--text-dim);text-align:center;margin-top:4px}
+
+  /* ---------- лайтбокс ---------- */
+  .lightbox{
+    position:fixed;inset:0;z-index:1000;
+    display:flex;align-items:center;justify-content:center;
+    background:rgba(6,6,10,.86);
+    backdrop-filter:blur(16px) saturate(140%);
+    -webkit-backdrop-filter:blur(16px) saturate(140%);
+    animation:lbIn .2s ease;
+    padding:60px 70px;
+  }
+  .lightbox[hidden]{display:none}
+  @keyframes lbIn{from{opacity:0}to{opacity:1}}
+
+  .lb-img{
+    max-width:100%;max-height:100%;
+    object-fit:contain;border-radius:14px;
+    box-shadow:0 20px 60px rgba(0,0,0,.5);
+    background:#0e0e13;
+    animation:lbImgIn .25s cubic-bezier(.2,.9,.3,1);
+  }
+  @keyframes lbImgIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
+
+  .lb-btn{
+    position:absolute;width:44px;height:44px;border-radius:50%;
+    border:1px solid var(--glass-border);
+    background:rgba(255,255,255,.08);
+    color:var(--text);
+    display:flex;align-items:center;justify-content:center;
+    cursor:pointer;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    transition:background .15s ease,transform .1s ease;
+  }
+  .lb-btn svg{width:20px;height:20px}
+  .lb-btn:hover{background:rgba(255,255,255,.16)}
+  .lb-btn:active{transform:scale(.94)}
+  .lb-btn[hidden]{display:none}
+
+  .lb-close{top:18px;right:18px}
+  .lb-prev{left:18px;top:50%;transform:translateY(-50%)}
+  .lb-prev:active{transform:translateY(-50%) scale(.94)}
+  .lb-next{right:18px;top:50%;transform:translateY(-50%)}
+  .lb-next:active{transform:translateY(-50%) scale(.94)}
+
+  .lb-counter{
+    position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
+    padding:6px 14px;border-radius:100px;
+    background:rgba(255,255,255,.10);
+    border:1px solid var(--glass-border);
+    font-size:13px;color:var(--text);
+    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    letter-spacing:1px;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  }
 
   /* ---------- адаптив ---------- */
   @media (max-width:560px){
@@ -492,12 +496,16 @@ PAGE = r"""<!DOCTYPE html>
     .menu{gap:10px}
     .btn{padding:0 14px;font-size:14px}
     .btn svg{width:16px;height:16px}
-    .panel{padding:18px;border-radius:20px}
+    .frame{padding:18px;border-radius:20px}
     .big-code{font-size:30px;letter-spacing:9px;text-indent:9px}
     .row .btn{min-width:0;flex:1}
+    .lightbox{padding:54px 12px 74px}
+    .lb-prev{left:8px}
+    .lb-next{right:8px}
+    .lb-close{top:10px;right:10px}
   }
   @media (max-width:380px){
-    .btn span{display:none}
+    .btn span.btn-label{display:none}
     .btn{padding:0 12px}
   }
 </style>
@@ -509,83 +517,198 @@ PAGE = r"""<!DOCTYPE html>
   <nav class="menu">
     <button class="btn" id="btnCreate" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-      <span>Создать пост</span>
+      <span class="btn-label">Создать пост</span>
     </button>
     <button class="btn" id="btnFind" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-      <span>Найти пост</span>
+      <span class="btn-label">Найти пост</span>
     </button>
   </nav>
 
-  <!-- ================= СОЗДАНИЕ ================= -->
-  <section class="panel" id="createPanel" hidden>
-    <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off">
-    <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+  <div class="stage" id="stage" hidden>
+    <div class="track" id="track">
 
-    <div class="drop" id="drop">Нажмите или перетащите фото (до 5)</div>
-    <input type="file" id="fileInput" accept="image/*" multiple hidden>
-    <div class="previews" id="previews"></div>
+      <!-- ================= СОЗДАНИЕ ================= -->
+      <div class="panel" id="createPanel">
+        <section class="frame">
 
-    <div class="row">
-      <button class="btn" id="submitBtn" type="button">Опубликовать</button>
-      <button class="btn" id="resetBtn" type="button">Очистить</button>
+          <div class="input-wrap">
+            <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off" spellcheck="false">
+            <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
+            </svg>
+          </div>
+
+          <div class="input-wrap textarea-wrap">
+            <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+            <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 6h16M4 12h16M4 18h10"/>
+            </svg>
+          </div>
+
+          <div class="drop" id="drop">
+            <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="3"/>
+              <circle cx="9" cy="9" r="2"/>
+              <path d="M21 15l-5-5L5 21"/>
+            </svg>
+            <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
+            <div class="drop-hint">до 5 фото · Ctrl+V — вставить из буфера</div>
+          </div>
+          <input type="file" id="fileInput" accept="image/*" multiple hidden>
+          <div class="previews" id="previews"></div>
+
+          <div class="row">
+            <button class="btn" id="submitBtn" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+                <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
+              </svg>
+              <span>Опубликовать</span>
+            </button>
+            <button class="btn" id="resetBtn" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
+                <path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+              </svg>
+              <span>Очистить</span>
+            </button>
+          </div>
+
+          <div id="createMsg"></div>
+        </section>
+      </div>
+
+      <!-- ================= ПОИСК ================= -->
+      <div class="panel" id="findPanel">
+        <section class="frame">
+          <div class="otp" id="otp" autocomplete="off">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
+          </div>
+        </section>
+
+        <section class="frame" id="searchFrame" hidden></section>
+      </div>
+
     </div>
-
-    <div id="createMsg"></div>
-  </section>
-
-  <!-- ================= ПОИСК ================= -->
-  <section class="panel" id="findPanel" hidden>
-    <div class="otp" id="otp" autocomplete="off">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
-      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
-    </div>
-    <div id="searchState"></div>
-  </section>
-
+  </div>
 </main>
+
+<!-- ================= ЛАЙТБОКС ================= -->
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+    </svg>
+  </button>
+  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Предыдущее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="15 18 9 12 15 6"/>
+    </svg>
+  </button>
+  <img class="lb-img" id="lbImg" alt="">
+  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Следующее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="9 18 15 12 9 6"/>
+    </svg>
+  </button>
+  <div class="lb-counter" id="lbCounter">1 / 1</div>
+</div>
 
 <script>
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
 
+  /* ---------- глобально отключаем ПКМ ---------- */
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  /* ---------- иконки ---------- */
+  const ICONS = {
+    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>',
+    copy:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
+    plus:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+  };
+
+  function makeMsg(kind, text) {
+    const d = document.createElement("div");
+    d.className = "msg " + kind;
+    d.innerHTML = (kind === "err" ? ICONS.error : ICONS.ok);
+    const s = document.createElement("span");
+    s.textContent = text;
+    d.appendChild(s);
+    return d;
+  }
+
+  /* ---------- форматирование размера ---------- */
+  function formatBytes(b) {
+    if (b < 1024) return b + " Б";
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " КБ";
+    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2).replace(".", ",") + " МБ";
+    return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " ГБ";
+  }
+
+  /* =========================================================
+     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ (сдвиг ленты)
+     ========================================================= */
+  const stage       = $("stage");
+  const track       = $("track");
   const createPanel = $("createPanel");
   const findPanel   = $("findPanel");
   const btnCreate   = $("btnCreate");
   const btnFind     = $("btnFind");
 
-  /* ---------- переключение панелей (tab) ---------- */
-  function closeAll() {
-    createPanel.hidden = true;
-    findPanel.hidden   = true;
-    btnCreate.classList.remove("active");
-    btnFind.classList.remove("active");
+  let mode = null;  // 'create' | 'find' | null
+
+  function syncHeight() {
+    if (mode === null) return;
+    const p = (mode === "create") ? createPanel : findPanel;
+    stage.style.height = p.offsetHeight + "px";
   }
 
-  btnCreate.addEventListener("click", () => {
-    const willOpen = createPanel.hidden;
-    closeAll();
-    if (willOpen) {
-      createPanel.hidden = false;
-      btnCreate.classList.add("active");
-      setTimeout(() => $("title").focus(), 0);
-    }
-  });
+  const ro = new ResizeObserver(() => syncHeight());
+  ro.observe(createPanel);
+  ro.observe(findPanel);
+  window.addEventListener("resize", syncHeight);
 
-  btnFind.addEventListener("click", () => {
-    const willOpen = findPanel.hidden;
-    closeAll();
-    if (willOpen) {
-      findPanel.hidden = false;
-      btnFind.classList.add("active");
-      setTimeout(() => otpCells[0].focus(), 0);
+  function setMode(next) {
+    const target = (next === mode) ? null : next;
+    const wasHidden = stage.hidden;
+
+    if (target === null) {
+      stage.hidden = true;
+      mode = null;
+      btnCreate.classList.remove("active");
+      btnFind.classList.remove("active");
+      return;
     }
-  });
+
+    mode = target;
+    btnCreate.classList.toggle("active", target === "create");
+    btnFind.classList.toggle("active", target === "find");
+    stage.hidden = false;
+
+    if (wasHidden) track.style.transition = "none";
+    track.style.transform = (target === "create") ? "translateX(0)" : "translateX(-100%)";
+
+    // Принудительный reflow, чтобы при следующем кадре включилась анимация
+    void track.offsetWidth;
+
+    if (wasHidden) {
+      track.style.transition = "";
+    }
+    syncHeight();
+
+    if (target === "create") setTimeout(() => $("title").focus(), 100);
+    else setTimeout(() => otpCells[0].focus(), 100);
+  }
+
+  btnCreate.addEventListener("click", () => setMode("create"));
+  btnFind.addEventListener("click", () => setMode("find"));
 
   /* =========================================================
      СОЗДАНИЕ ПОСТА
@@ -593,22 +716,56 @@ PAGE = r"""<!DOCTYPE html>
   const MAX_PHOTOS = 5;
   let selectedFiles = [];
 
-  const drop      = $("drop");
-  const fileInput = $("fileInput");
-  const previews  = $("previews");
-  const createMsg = $("createMsg");
-  const submitBtn = $("submitBtn");
+  const drop       = $("drop");
+  const dropLabel  = $("dropLabel");
+  const fileInput  = $("fileInput");
+  const previews   = $("previews");
+  const createMsg  = $("createMsg");
+  const submitBtn  = $("submitBtn");
+
+  function defaultDropLabel() {
+    return selectedFiles.length
+      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
+      : "Нажмите или перетащите фото";
+  }
 
   drop.addEventListener("click", () => fileInput.click());
   drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "rgba(255,255,255,.4)"; });
   drop.addEventListener("dragleave", () => { drop.style.borderColor = ""; });
   drop.addEventListener("drop", (e) => {
-    e.preventDefault(); drop.style.borderColor = "";
+    e.preventDefault();
+    drop.style.borderColor = "";
     addFiles(Array.from(e.dataTransfer.files || []));
   });
   fileInput.addEventListener("change", () => {
     addFiles(Array.from(fileInput.files || []));
     fileInput.value = "";
+  });
+
+  // Ctrl+V — вставка изображения из буфера
+  document.addEventListener("paste", (e) => {
+    if (mode !== "create") return;
+    const items = (e.clipboardData || window.clipboardData)?.items;
+    if (!items) return;
+    const files = [];
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const f = item.getAsFile();
+        if (f) {
+          const ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg");
+          const named = new File(
+            [f],
+            "pasted_" + Date.now() + "_" + (files.length + 1) + "." + ext,
+            { type: f.type }
+          );
+          files.push(named);
+        }
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      addFiles(files);
+    }
   });
 
   function addFiles(list) {
@@ -618,8 +775,11 @@ PAGE = r"""<!DOCTYPE html>
       if (selectedFiles.length >= MAX_PHOTOS) { rejected++; continue; }
       selectedFiles.push(f);
     }
-    if (rejected > 0) showCreateMsg("err", rejected + " файл(ов) пропущено: только изображения и не больше " + MAX_PHOTOS + ".");
-    else clearCreateMsg();
+    if (rejected > 0) {
+      showCreateMsg("err", rejected + " файл(ов) пропущено: только изображения и не больше " + MAX_PHOTOS + ".");
+    } else {
+      clearCreateMsg();
+    }
     renderPreviews();
   }
 
@@ -627,39 +787,47 @@ PAGE = r"""<!DOCTYPE html>
     previews.innerHTML = "";
     selectedFiles.forEach((file, index) => {
       const url = URL.createObjectURL(file);
-      const box = document.createElement("div"); box.className = "preview";
+      const box = document.createElement("div");
+      box.className = "preview";
       const img = document.createElement("img");
       img.src = url; img.alt = file.name;
       img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
       const rm = document.createElement("button");
       rm.type = "button"; rm.textContent = "×"; rm.title = "Убрать";
-      rm.addEventListener("click", () => { selectedFiles.splice(index, 1); renderPreviews(); });
-      box.append(img, rm); previews.appendChild(box);
+      rm.addEventListener("click", () => {
+        selectedFiles.splice(index, 1);
+        renderPreviews();
+      });
+      box.append(img, rm);
+      previews.appendChild(box);
     });
     drop.classList.toggle("filled", selectedFiles.length > 0);
-    drop.textContent = selectedFiles.length
-      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
-      : "Нажмите или перетащите фото (до 5)";
+    dropLabel.textContent = defaultDropLabel();
   }
 
   function showCreateMsg(kind, text) {
     createMsg.innerHTML = "";
-    const d = document.createElement("div");
-    d.className = "msg " + kind; d.textContent = text;
-    createMsg.appendChild(d);
+    createMsg.appendChild(makeMsg(kind, text));
   }
   function clearCreateMsg() { createMsg.innerHTML = ""; }
 
   $("resetBtn").addEventListener("click", () => {
-    $("title").value = ""; $("content").value = "";
-    selectedFiles = []; renderPreviews(); clearCreateMsg();
+    $("title").value = "";
+    $("content").value = "";
+    selectedFiles = [];
+    renderPreviews();
+    clearCreateMsg();
     $("title").focus();
   });
 
   submitBtn.addEventListener("click", async () => {
     const title = $("title").value.trim();
     const content = $("content").value.trim();
-    if (!title) { showCreateMsg("err", "Введите название поста."); $("title").focus(); return; }
+    if (!title) {
+      showCreateMsg("err", "Введите название поста.");
+      $("title").focus();
+      return;
+    }
 
     const fd = new FormData();
     fd.append("title", title);
@@ -667,59 +835,79 @@ PAGE = r"""<!DOCTYPE html>
     selectedFiles.forEach((f) => fd.append("files", f, f.name));
 
     submitBtn.disabled = true;
-    const oldLabel = submitBtn.textContent;
+    const oldHTML = submitBtn.innerHTML;
     submitBtn.textContent = "Публикация...";
     clearCreateMsg();
 
     try {
       const res = await fetch("/api/posts", { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) { showCreateMsg("err", data.detail || "Не удалось создать пост."); return; }
+      if (!res.ok) {
+        showCreateMsg("err", data.detail || "Не удалось создать пост.");
+        return;
+      }
 
       createMsg.innerHTML = "";
-      const ok = document.createElement("div");
-      ok.className = "msg ok"; ok.textContent = "Пост создан. Сохраните код:";
-      createMsg.appendChild(ok);
+      createMsg.appendChild(makeMsg("ok", "Пост создан и зашифрован. Сохраните код:"));
 
       const code = document.createElement("div");
-      code.className = "big-code"; code.textContent = data.code;
+      code.className = "big-code";
+      code.textContent = data.code;
       createMsg.appendChild(code);
 
       const hint = document.createElement("div");
-      hint.className = "hint"; hint.textContent = "Сжатый размер в памяти: " + data.compressed_bytes + " байт";
+      hint.className = "hint";
+      hint.textContent = "Занято в памяти: " + formatBytes(data.compressed_bytes);
       createMsg.appendChild(hint);
 
-      const row = document.createElement("div"); row.className = "row";
+      const row = document.createElement("div");
+      row.className = "row";
+
       const copyBtn = document.createElement("button");
-      copyBtn.className = "btn"; copyBtn.type = "button"; copyBtn.textContent = "Скопировать";
+      copyBtn.className = "btn";
+      copyBtn.type = "button";
+      copyBtn.innerHTML = ICONS.copy + "<span>Скопировать</span>";
       copyBtn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(data.code);
-          copyBtn.textContent = "Готово";
-          setTimeout(() => (copyBtn.textContent = "Скопировать"), 1500);
-        } catch { copyBtn.textContent = "Ошибка"; }
+          const label = copyBtn.querySelector("span");
+          if (label) label.textContent = "Готово";
+          setTimeout(() => { if (label) label.textContent = "Скопировать"; }, 1500);
+        } catch {
+          const label = copyBtn.querySelector("span");
+          if (label) label.textContent = "Ошибка";
+        }
       });
-      const againBtn = document.createElement("button");
-      againBtn.className = "btn"; againBtn.type = "button"; againBtn.textContent = "Ещё";
-      againBtn.addEventListener("click", () => $("resetBtn").click());
-      row.append(copyBtn, againBtn); createMsg.appendChild(row);
 
-      $("title").value = ""; $("content").value = "";
-      selectedFiles = []; renderPreviews();
+      const againBtn = document.createElement("button");
+      againBtn.className = "btn";
+      againBtn.type = "button";
+      againBtn.innerHTML = ICONS.plus + "<span>Ещё</span>";
+      againBtn.addEventListener("click", () => $("resetBtn").click());
+
+      row.append(copyBtn, againBtn);
+      createMsg.appendChild(row);
+
+      // очищаем форму, результат оставляем
+      $("title").value = "";
+      $("content").value = "";
+      selectedFiles = [];
+      renderPreviews();
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
       submitBtn.disabled = false;
-      submitBtn.textContent = oldLabel;
+      submitBtn.innerHTML = oldHTML;
     }
   });
 
   /* =========================================================
-     ПОИСК ПО 6-ЗНАЧНОМУ КОДУ (OTP-инпут)
+     ПОИСК ПО КОДУ (OTP)
      ========================================================= */
-  const otp       = $("otp");
-  const otpCells  = Array.from(document.querySelectorAll(".otp-cell"));
-  const searchState = $("searchState");
+  const otp         = $("otp");
+  const otpCells    = Array.from(document.querySelectorAll(".otp-cell"));
+  const searchFrame = $("searchFrame");
+
   let searchSeq = 0;
   let lastSubmitted = "";
 
@@ -738,6 +926,11 @@ PAGE = r"""<!DOCTYPE html>
     setTimeout(() => otp.classList.remove("shake"), 400);
   }
 
+  function hideSearchFrame() {
+    searchFrame.hidden = true;
+    searchFrame.innerHTML = "";
+  }
+
   function maybeSearch() {
     const code = getCode();
     if (code.length === 6) {
@@ -746,7 +939,7 @@ PAGE = r"""<!DOCTYPE html>
       runSearch(code);
     } else {
       searchSeq++;
-      searchState.innerHTML = "";
+      hideSearchFrame();
       lastSubmitted = "";
     }
   }
@@ -768,16 +961,12 @@ PAGE = r"""<!DOCTYPE html>
           otpCells[i - 1].value = "";
           otpCells[i - 1].focus();
           e.preventDefault();
-        } else if (cell.value) {
-          // обычное удаление — обработчик input сделает всё
         }
         setTimeout(maybeSearch, 0);
       } else if (e.key === "ArrowLeft" && i > 0) {
-        otpCells[i - 1].focus();
-        e.preventDefault();
+        otpCells[i - 1].focus(); e.preventDefault();
       } else if (e.key === "ArrowRight" && i < otpCells.length - 1) {
-        otpCells[i + 1].focus();
-        e.preventDefault();
+        otpCells[i + 1].focus(); e.preventDefault();
       } else if (e.key === "Enter") {
         const c = getCode();
         if (c.length === 6) { lastSubmitted = c; runSearch(c); }
@@ -795,28 +984,92 @@ PAGE = r"""<!DOCTYPE html>
     });
   });
 
+  function showSearchFrame() {
+    searchFrame.hidden = false;
+    // перезапускаем анимацию появления
+    searchFrame.style.animation = "none";
+    void searchFrame.offsetWidth;
+    searchFrame.style.animation = "";
+  }
+
   function renderSpinner() {
-    searchState.innerHTML =
+    searchFrame.innerHTML =
       '<div class="center"><div class="spinner"></div>' +
       '<div class="spinner-label">Ищем пост...</div></div>';
+    showSearchFrame();
   }
 
   function renderError(text) {
-    searchState.innerHTML = "";
-    const d = document.createElement("div");
-    d.className = "msg err"; d.textContent = text;
-    searchState.appendChild(d);
+    searchFrame.innerHTML = "";
+    searchFrame.appendChild(makeMsg("err", text));
+    showSearchFrame();
   }
 
-  function renderPost(post) {
-    searchState.innerHTML = "";
-    const box = document.createElement("div"); box.className = "result";
+  /* ---------- лайтбокс ---------- */
+  const lightbox  = $("lightbox");
+  const lbImg     = $("lbImg");
+  const lbCounter = $("lbCounter");
+  const lbPrev    = $("lbPrev");
+  const lbNext    = $("lbNext");
+  const lbClose   = $("lbClose");
 
-    const h = document.createElement("h3"); h.textContent = post.title;
-    const meta = document.createElement("div"); meta.className = "meta";
+  let lbPhotos = [];
+  let lbIndex = 0;
+
+  function openLightbox(photos, index) {
+    lbPhotos = photos;
+    lbIndex = index;
+    lbImg.src = "data:" + photos[index].mime + ";base64," + photos[index].data;
+    lbCounter.textContent = (index + 1) + " / " + photos.length;
+    lbPrev.hidden = photos.length < 2;
+    lbNext.hidden = photos.length < 2;
+    lightbox.hidden = false;
+  }
+
+  function closeLightbox() {
+    lightbox.hidden = true;
+    lbImg.src = "";
+    lbPhotos = [];
+  }
+
+  function lbStep(dir) {
+    if (lbPhotos.length < 2) return;
+    lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
+    // лёгкая перерисовка
+    lbImg.style.animation = "none";
+    void lbImg.offsetWidth;
+    lbImg.style.animation = "";
+    lbImg.src = "data:" + lbPhotos[lbIndex].mime + ";base64," + lbPhotos[lbIndex].data;
+    lbCounter.textContent = (lbIndex + 1) + " / " + lbPhotos.length;
+  }
+
+  lbPrev.addEventListener("click", (e) => { e.stopPropagation(); lbStep(-1); });
+  lbNext.addEventListener("click", (e) => { e.stopPropagation(); lbStep(1); });
+  lbClose.addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
+  lightbox.addEventListener("click", (e) => {
+    if (e.target === lightbox) closeLightbox();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (lightbox.hidden) return;
+    if (e.key === "Escape") closeLightbox();
+    else if (e.key === "ArrowLeft") lbStep(-1);
+    else if (e.key === "ArrowRight") lbStep(1);
+  });
+
+  function renderPost(post) {
+    searchFrame.innerHTML = "";
+
+    const title = document.createElement("h3");
+    title.className = "post-title";
+    title.textContent = post.title;
+
+    const meta = document.createElement("div");
+    meta.className = "post-meta";
 
     const chip = document.createElement("span");
-    chip.className = "code-chip"; chip.textContent = post.code;
+    chip.className = "code-chip";
+    chip.textContent = post.code;
+
     const date = document.createElement("span");
     try { date.textContent = new Date(post.created).toLocaleString("ru-RU"); } catch {}
     meta.append(chip, date);
@@ -826,26 +1079,31 @@ PAGE = r"""<!DOCTYPE html>
       cnt.textContent = "Фото: " + post.photos.length;
       meta.appendChild(cnt);
     }
-    box.append(h, meta);
+
+    searchFrame.append(title, meta);
 
     if (post.content) {
       const body = document.createElement("div");
-      body.className = "body"; body.textContent = post.content;
-      box.appendChild(body);
+      body.className = "post-body";
+      body.textContent = post.content;
+      searchFrame.appendChild(body);
     }
 
     if (post.photos && post.photos.length) {
-      const g = document.createElement("div"); g.className = "gallery";
-      post.photos.forEach((p) => {
+      const gallery = document.createElement("div");
+      gallery.className = "post-gallery";
+      post.photos.forEach((p, idx) => {
         const img = document.createElement("img");
         img.src = "data:" + p.mime + ";base64," + p.data;
-        img.alt = p.name || "photo"; img.title = p.name || "";
-        img.addEventListener("click", () => window.open(img.src, "_blank"));
-        g.appendChild(img);
+        img.alt = p.name || "photo";
+        img.title = p.name || "";
+        img.addEventListener("click", () => openLightbox(post.photos, idx));
+        gallery.appendChild(img);
       });
-      box.appendChild(g);
+      searchFrame.appendChild(gallery);
     }
-    searchState.appendChild(box);
+
+    showSearchFrame();
   }
 
   async function runSearch(code) {
@@ -861,7 +1119,7 @@ PAGE = r"""<!DOCTYPE html>
         const data = await res.json().catch(() => ({}));
         renderError(data.detail || "Пост не найден.");
         shakeOtp();
-        setTimeout(clearOtp, 300);
+        setTimeout(clearOtp, 320);
         return;
       }
       const post = await res.json();
@@ -871,7 +1129,7 @@ PAGE = r"""<!DOCTYPE html>
       if (mySeq !== searchSeq) return;
       renderError("Ошибка сети: " + e.message);
       shakeOtp();
-      setTimeout(clearOtp, 300);
+      setTimeout(clearOtp, 320);
     }
   }
 })();
