@@ -1,6 +1,7 @@
 """
 Sld-Networking — посты с 6-значным кодом.
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
+Автоперевод: MyMemory API.
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
 
@@ -9,19 +10,22 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 import secrets
 import string
 import threading
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import uvicorn
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse
 
-# ---------- сжатие (zstd, если доступен) ----------
+# ---------- сжатие ----------
 try:
     import zstandard as _zstd_mod
     _HAS_ZSTD = True
@@ -33,7 +37,6 @@ _ZSTD_D = _zstd_mod.ZstdDecompressor() if _HAS_ZSTD else None
 
 
 def _compress(b: bytes) -> bytes:
-    """b'Z' + zstd | b'G' + gzip"""
     if _HAS_ZSTD:
         return b"Z" + _ZSTD_C.compress(b)
     return b"G" + gzip.compress(b, compresslevel=6)
@@ -48,9 +51,9 @@ def _decompress(b: bytes) -> bytes:
     raise ValueError("unknown codec")
 
 
-# ---------- шифрование (AES-256-GCM) ----------
+# ---------- шифрование ----------
 _AES = AESGCM(AESGCM.generate_key(bit_length=256))
-_NONCE = 12  # 96-bit стандарт для GCM
+_NONCE = 12
 
 
 def _encrypt(data: bytes) -> bytes:
@@ -73,13 +76,84 @@ def _unpack_meta(blob: bytes) -> dict:
     return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
 
 
+# ---------- автоперевод (MyMemory) ----------
+SUPPORTED_LANGS = {"ru", "en"}
+_translation_cache: Dict[str, str] = {}
+_translation_lock = threading.Lock()
+_MM_ENDPOINT = "https://api.mymemory.translated.net/get"
+_TRANSLATE_MAX = 450
+
+
+def _split_chunks(text: str, max_len: int = _TRANSLATE_MAX) -> List[str]:
+    if len(text) <= max_len:
+        return [text] if text else []
+    chunks, current = [], ""
+    parts = re.split(r'(?<=[.!?…])\s+|\n+', text)
+    for part in parts:
+        if not part:
+            continue
+        if len(part) > max_len:
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(part), max_len):
+                chunks.append(part[i:i + max_len])
+            continue
+        if not current:
+            current = part
+        elif len(current) + 1 + len(part) <= max_len:
+            current = current + " " + part
+        else:
+            chunks.append(current)
+            current = part
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _translate_one(text: str, source: str, target: str) -> str:
+    if not text.strip() or source == target:
+        return text
+    key = f"{source}|{target}|{text}"
+    with _translation_lock:
+        cached = _translation_cache.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        params = urllib.parse.urlencode({
+            "q": text,
+            "langpair": f"{source}|{target}",
+        })
+        req = urllib.request.Request(
+            _MM_ENDPOINT + "?" + params,
+            headers={"User-Agent": "Sld-Networking/1.0 (+translation)"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        result = (data.get("responseData") or {}).get("translatedText") or text
+    except Exception:
+        result = text
+
+    with _translation_lock:
+        if len(_translation_cache) > 5000:
+            _translation_cache.clear()
+        _translation_cache[key] = result
+    return result
+
+
+def translate_text(text: str, target: str, source: str = "auto") -> str:
+    if not text or not text.strip():
+        return text
+    if source == target:
+        return text
+    chunks = _split_chunks(text)
+    if not chunks:
+        return text
+    return " ".join(_translate_one(c, source, target) for c in chunks)
+
+
 # ---------- память ----------
-# code -> {
-#   "meta": bytes,                     # encrypted+gzipped JSON без фото
-#   "photos": [ {"name","mime","size","enc"} ],
-#   "created": iso str,
-#   "size": int                        # байт в памяти всего
-# }
 _store: Dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -112,23 +186,23 @@ async def create_post(
     content = (content or "").strip()
 
     if not title:
-        raise HTTPException(400, "Название не может быть пустым")
+        raise HTTPException(400, "Title is required")
     if len(title) > MAX_TITLE_LEN:
-        raise HTTPException(400, f"Название длиннее {MAX_TITLE_LEN} символов")
+        raise HTTPException(400, f"Title longer than {MAX_TITLE_LEN}")
     if len(content) > MAX_CONTENT_LEN:
-        raise HTTPException(400, f"Содержимое длиннее {MAX_CONTENT_LEN} символов")
+        raise HTTPException(400, f"Content longer than {MAX_CONTENT_LEN}")
 
     files = [f for f in (files or []) if f and f.filename]
     if len(files) > MAX_PHOTOS:
-        raise HTTPException(400, f"Максимум {MAX_PHOTOS} фото")
+        raise HTTPException(400, f"Max {MAX_PHOTOS} photos")
 
     photos = []
     total = 0
     for f in files:
         data = await f.read()
         if len(data) > MAX_PHOTO_BYTES:
-            raise HTTPException(400, f"Файл «{f.filename}» больше {MAX_PHOTO_BYTES // (1024*1024)} МБ")
-        enc = _encrypt(data)          # фото уже сжато (jpeg/png/webp) — не пережимаем
+            raise HTTPException(400, f"File «{f.filename}» larger than {MAX_PHOTO_BYTES // (1024*1024)} MB")
+        enc = _encrypt(data)
         total += len(enc)
         photos.append({
             "name": f.filename,
@@ -154,33 +228,47 @@ async def create_post(
             "photos": photos,
             "created": created,
             "size": total,
+            "source_lang": None,   # определим при первом запросе перевода
         }
 
     return {"code": code, "compressed_bytes": total, "photos": len(photos)}
 
 
 @app.get("/api/posts/{code}")
-async def get_post(code: str):
+async def get_post(code: str, request: Request):
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
-        raise HTTPException(400, "Код должен состоять из 6 цифр")
+        raise HTTPException(400, "Code must be 6 digits")
 
     with _lock:
         entry = _store.get(code)
     if entry is None:
-        raise HTTPException(404, "Пост с таким кодом не найден")
+        raise HTTPException(404, "Post not found")
 
     try:
         meta = _unpack_meta(entry["meta"])
     except (InvalidTag, ValueError, OSError):
-        raise HTTPException(500, "Не удалось расшифровать пост")
+        raise HTTPException(500, "Decryption failed")
 
     meta["code"] = code
-    # количество фото и метаданные — без base64, только ссылки
     meta["photos"] = [
         {"idx": i, "name": p["name"], "mime": p["mime"], "size": p["size"]}
         for i, p in enumerate(entry["photos"])
     ]
+
+    # Перевод на запрошенный язык
+    lang = (request.query_params.get("lang") or "").strip().lower()
+    if lang in SUPPORTED_LANGS:
+        src = entry.get("source_lang") or "auto"
+        if not meta.get("_translated_to") or meta.get("_translated_to") != lang:
+            try:
+                meta["title"] = translate_text(meta["title"], lang, src)
+                if meta.get("content"):
+                    meta["content"] = translate_text(meta["content"], lang, src)
+                meta["_translated_to"] = lang
+            except Exception:
+                pass
+
     return meta
 
 
@@ -189,23 +277,22 @@ async def get_photo(code: str, idx: int):
     with _lock:
         entry = _store.get(code)
     if entry is None:
-        raise HTTPException(404, "Пост не найден")
+        raise HTTPException(404, "Post not found")
 
     photos = entry["photos"]
     if idx < 0 or idx >= len(photos):
-        raise HTTPException(404, "Фото не найдено")
+        raise HTTPException(404, "Photo not found")
 
     p = photos[idx]
     try:
         data = _decrypt(p["enc"])
     except (InvalidTag, ValueError):
-        raise HTTPException(500, "Ошибка расшифровки")
+        raise HTTPException(500, "Decryption failed")
 
     return Response(
         content=data,
         media_type=p["mime"],
         headers={
-            # фото immutable — код уникален и не переиспользуется
             "Cache-Control": "public, max-age=31536000, immutable",
             "Content-Length": str(len(data)),
         },
@@ -235,7 +322,7 @@ FAVICON = (
 )
 
 PAGE = r"""<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
@@ -292,7 +379,6 @@ PAGE = r"""<!DOCTYPE html>
     gap:22px;
   }
 
-  /* ---------- кнопки ---------- */
   .menu{
     display:flex;gap:12px;justify-content:center;align-items:stretch;
     flex-wrap:nowrap;width:100%;max-width:520px;
@@ -326,7 +412,6 @@ PAGE = r"""<!DOCTYPE html>
   }
   .btn.primary:hover{background:#fff}
 
-  /* ---------- сцена ---------- */
   .stage{
     position:relative;
     width:100%;max-width:520px;
@@ -394,7 +479,6 @@ PAGE = r"""<!DOCTYPE html>
 
   textarea.field{min-height:180px;resize:none;line-height:1.55;font-family:inherit}
 
-  /* ---------- drop ---------- */
   .drop{
     margin-top:12px;
     border:1px dashed rgba(255,255,255,.18);
@@ -436,16 +520,10 @@ PAGE = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:rgba(70,26,26,.9)}
 
-  .row{
-    display:flex;gap:10px;margin-top:20px;justify-content:center;flex-wrap:wrap;
-  }
+  .row{display:flex;gap:10px;margin-top:20px;justify-content:center;flex-wrap:wrap}
   .row .btn{flex:0 1 auto;min-width:130px;padding:0 22px}
 
-  /* ---------- OTP ---------- */
-  .otp{
-    display:flex;gap:8px;justify-content:center;align-items:center;
-    margin:2px 0;
-  }
+  .otp{display:flex;gap:8px;justify-content:center;align-items:center;margin:2px 0}
   .otp-cell{
     width:clamp(38px,11vw,50px);height:clamp(50px,13vw,60px);
     padding:0;text-align:center;
@@ -475,12 +553,8 @@ PAGE = r"""<!DOCTYPE html>
     80%{transform:translateX(5px)}
   }
   .otp.shake{animation:shake .34s ease}
-  .otp.shake .otp-cell{
-    border-color:rgba(200,90,90,.65);
-    background:rgba(90,20,20,.15);
-  }
+  .otp.shake .otp-cell{border-color:rgba(200,90,90,.65);background:rgba(90,20,20,.15)}
 
-  /* ---------- статусы ---------- */
   .center{text-align:center;padding:10px 0}
   .spinner{
     width:26px;height:26px;border-radius:50%;
@@ -503,23 +577,10 @@ PAGE = r"""<!DOCTYPE html>
   .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
   .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
-  /* ---------- пост ---------- */
-  .post-title{
-    margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);
-    word-break:break-word;
-  }
-  .post-meta{
-    font-size:12px;color:var(--text-dim);margin-bottom:14px;
-    display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-  }
-  .post-body{
-    font-size:14px;line-height:1.6;color:#d8d8de;
-    white-space:pre-wrap;word-break:break-word;
-  }
-  .post-gallery{
-    display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
-    gap:8px;margin-top:16px;
-  }
+  .post-title{margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);word-break:break-word}
+  .post-meta{font-size:12px;color:var(--text-dim);margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .post-body{font-size:14px;line-height:1.6;color:#d8d8de;white-space:pre-wrap;word-break:break-word}
+  .post-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin-top:16px}
   .post-gallery img{
     width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:12px;
     cursor:zoom-in;background:rgba(255,255,255,.04);
@@ -537,7 +598,6 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:10px;padding:4px 10px;
   }
 
-  /* ---------- лайтбокс ---------- */
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
@@ -552,26 +612,20 @@ PAGE = r"""<!DOCTYPE html>
   .lb-viewport{
     position:absolute;inset:0;
     display:flex;align-items:center;justify-content:center;
-    overflow:hidden;
-    cursor:default;
+    overflow:hidden;cursor:default;
   }
   .lb-viewport.grabbing{cursor:grabbing}
 
   .lb-transform{
     display:flex;align-items:center;justify-content:center;
-    transform-origin:center center;
-    will-change:transform;
+    transform-origin:center center;will-change:transform;
   }
 
   .lb-img{
-    display:block;
-    max-width:82vw;max-height:78vh;
-    object-fit:contain;
-    border-radius:12px;
+    display:block;max-width:82vw;max-height:78vh;
+    object-fit:contain;border-radius:12px;
     box-shadow:0 20px 60px rgba(0,0,0,.5);
-    user-select:none;-webkit-user-select:none;
-    -webkit-user-drag:none;
-    /* шахматка для прозрачных */
+    user-select:none;-webkit-user-select:none;-webkit-user-drag:none;
     background-color:#1c1c22;
     background-image:
       linear-gradient(45deg, rgba(255,255,255,.06) 25%, transparent 25%),
@@ -606,8 +660,7 @@ PAGE = r"""<!DOCTYPE html>
   .lb-counter{
     position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
     padding:6px 14px;border-radius:100px;
-    background:rgba(255,255,255,.10);
-    border:1px solid var(--glass-border);
+    background:rgba(255,255,255,.10);border:1px solid var(--glass-border);
     font-size:13px;color:var(--text);
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     letter-spacing:1px;
@@ -618,8 +671,7 @@ PAGE = r"""<!DOCTYPE html>
   .lb-zoom-badge{
     position:absolute;top:18px;left:18px;
     padding:5px 12px;border-radius:100px;
-    background:rgba(255,255,255,.10);
-    border:1px solid var(--glass-border);
+    background:rgba(255,255,255,.10);border:1px solid var(--glass-border);
     font-size:12px;color:var(--text);
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     letter-spacing:1px;
@@ -632,11 +684,9 @@ PAGE = r"""<!DOCTYPE html>
   .lb-hint{
     position:absolute;bottom:56px;left:50%;transform:translateX(-50%);
     font-size:11.5px;color:var(--text-mute);
-    z-index:2;pointer-events:none;
-    white-space:nowrap;
+    z-index:2;pointer-events:none;white-space:nowrap;
   }
 
-  /* ---------- модалка ---------- */
   .modal{
     position:fixed;inset:0;z-index:900;
     display:flex;align-items:center;justify-content:center;
@@ -655,9 +705,7 @@ PAGE = r"""<!DOCTYPE html>
     background:rgba(28,28,36,.92);
     backdrop-filter:blur(22px) saturate(160%);
     -webkit-backdrop-filter:blur(22px) saturate(160%);
-    box-shadow:
-      inset 0 1px 0 rgba(255,255,255,.09),
-      0 20px 50px rgba(0,0,0,.5);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 20px 50px rgba(0,0,0,.5);
     text-align:center;
     animation:modalIn .32s var(--ease-out);
   }
@@ -670,8 +718,7 @@ PAGE = r"""<!DOCTYPE html>
     width:52px;height:52px;margin:0 auto 14px;
     border-radius:50%;
     display:flex;align-items:center;justify-content:center;
-    background:rgba(120,200,150,.14);
-    color:var(--ok);
+    background:rgba(120,200,150,.14);color:var(--ok);
     border:1px solid rgba(120,200,150,.28);
   }
   .modal-icon svg{width:26px;height:26px}
@@ -688,7 +735,6 @@ PAGE = r"""<!DOCTYPE html>
   .modal-actions{display:flex;gap:10px}
   .modal-actions .btn{flex:1;height:46px;padding:0 14px;font-size:14px}
 
-  /* ---------- адаптив ---------- */
   @media (max-width:560px){
     .app{padding:44px 14px 40px;gap:18px}
     .menu{gap:10px}
@@ -717,11 +763,11 @@ PAGE = r"""<!DOCTYPE html>
   <nav class="menu">
     <button class="btn" id="btnCreate" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-      <span class="btn-label">Создать пост</span>
+      <span class="btn-label" data-i18n="createPost">Создать пост</span>
     </button>
     <button class="btn" id="btnFind" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-      <span class="btn-label">Найти пост</span>
+      <span class="btn-label" data-i18n="findPost">Найти пост</span>
     </button>
   </nav>
 
@@ -729,16 +775,16 @@ PAGE = r"""<!DOCTYPE html>
 
     <div class="panel" id="createPanel">
       <section class="frame">
-
         <div class="input-wrap">
-          <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off" spellcheck="false">
+          <input class="field" id="title" type="text" maxlength="120" autocomplete="off" spellcheck="false"
+                 placeholder="Название" data-i18n-ph="titlePh">
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
           </svg>
         </div>
 
         <div class="input-wrap textarea-wrap">
-          <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+          <textarea class="field" id="content" placeholder="Содержимое" data-i18n-ph="contentPh"></textarea>
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 6h16M4 12h16M4 18h10"/>
           </svg>
@@ -750,8 +796,8 @@ PAGE = r"""<!DOCTYPE html>
             <circle cx="9" cy="9" r="2"/>
             <path d="M21 15l-5-5L5 21"/>
           </svg>
-          <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
-          <div class="drop-hint">до 5 фото · Ctrl+V — вставить из буфера</div>
+          <div class="drop-label" id="dropLabel" data-i18n="dropLabel">Нажмите или перетащите фото</div>
+          <div class="drop-hint" data-i18n="dropHint">до 5 фото · Ctrl+V — вставить из буфера</div>
         </div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
@@ -761,13 +807,13 @@ PAGE = r"""<!DOCTYPE html>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
               <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
             </svg>
-            <span>Опубликовать</span>
+            <span data-i18n="publish">Опубликовать</span>
           </button>
           <button class="btn" id="resetBtn" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
               <path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
             </svg>
-            <span>Очистить</span>
+            <span data-i18n="clear">Очистить</span>
           </button>
         </div>
 
@@ -778,12 +824,12 @@ PAGE = r"""<!DOCTYPE html>
     <div class="panel" id="findPanel">
       <section class="frame">
         <div class="otp" id="otp" autocomplete="off">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
-          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="1">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="2">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="3">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="4">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="5">
+          <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="6">
         </div>
       </section>
 
@@ -793,7 +839,6 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </main>
 
-<!-- ================= МОДАЛКА ================= -->
 <div class="modal" id="createdModal" hidden>
   <div class="modal-card" id="modalCard">
     <div class="modal-icon">
@@ -801,8 +846,8 @@ PAGE = r"""<!DOCTYPE html>
         <path d="M20 6L9 17l-5-5"/>
       </svg>
     </div>
-    <h3 class="modal-title">Пост создан</h3>
-    <p class="modal-sub">Сохраните код — по нему можно найти пост в любое время</p>
+    <h3 class="modal-title" data-i18n="postCreated">Пост создан</h3>
+    <p class="modal-sub" data-i18n="postCreatedSub">Сохраните код — по нему можно найти пост в любое время</p>
     <div class="modal-code" id="modalCode">000000</div>
     <div class="modal-hint" id="modalHint"></div>
     <div class="modal-actions">
@@ -811,40 +856,37 @@ PAGE = r"""<!DOCTYPE html>
           <rect x="9" y="9" width="13" height="13" rx="2"/>
           <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
         </svg>
-        <span>Копировать</span>
+        <span data-i18n="copy">Копировать</span>
       </button>
-      <button class="btn primary" id="modalCloseBtn" type="button">Готово</button>
+      <button class="btn primary" id="modalCloseBtn" type="button" data-i18n="done">Готово</button>
     </div>
   </div>
 </div>
 
-<!-- ================= ЛАЙТБОКС ================= -->
 <div class="lightbox" id="lightbox" hidden>
   <div class="lb-viewport" id="lbViewport">
     <div class="lb-transform" id="lbTransform">
       <img class="lb-img" id="lbImg" alt="" draggable="false">
     </div>
   </div>
-
   <div class="lb-zoom-badge" id="lbZoomBadge">100%</div>
-
-  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
+  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Close">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
     </svg>
   </button>
-  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Предыдущее">
+  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Prev">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="15 18 9 12 15 6"/>
     </svg>
   </button>
-  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Следующее">
+  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Next">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="9 18 15 12 9 6"/>
     </svg>
   </button>
   <div class="lb-counter" id="lbCounter">1 / 1</div>
-  <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
+  <div class="lb-hint" data-i18n="lbHint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
 </div>
 
 <script>
@@ -854,6 +896,127 @@ PAGE = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", (e) => e.preventDefault());
 
+  /* =========================================================
+     i18n
+     ========================================================= */
+  const SUPPORTED = ["ru", "en"];
+
+  const I18N = {
+    ru: {
+      createPost: "Создать пост",
+      findPost: "Найти пост",
+      titlePh: "Название",
+      contentPh: "Содержимое",
+      dropLabel: "Нажмите или перетащите фото",
+      dropLabelFilled: "Выбрано: {n} / {max}",
+      dropHint: "до 5 фото · Ctrl+V — вставить из буфера",
+      publish: "Опубликовать",
+      publishing: "Публикация...",
+      clear: "Очистить",
+      searching: "Ищем пост...",
+      postCreated: "Пост создан",
+      postCreatedSub: "Сохраните код — по нему можно найти пост в любое время",
+      memoryUsage: "Занято в памяти: {size}",
+      copy: "Копировать",
+      copied: "Скопировано",
+      copyError: "Ошибка",
+      done: "Готово",
+      photoCount: "Фото: {n}",
+      enterTitle: "Введите название поста.",
+      notFound: "Пост не найден",
+      networkError: "Ошибка сети: {msg}",
+      rejectedFiles: "{n} файл(ов) пропущено: только изображения и не больше {max}.",
+      lbHint: "колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама"
+    },
+    en: {
+      createPost: "Create post",
+      findPost: "Find post",
+      titlePh: "Title",
+      contentPh: "Content",
+      dropLabel: "Click or drop photos",
+      dropLabelFilled: "Selected: {n} / {max}",
+      dropHint: "up to 5 photos · Ctrl+V to paste",
+      publish: "Publish",
+      publishing: "Publishing...",
+      clear: "Clear",
+      searching: "Searching...",
+      postCreated: "Post created",
+      postCreatedSub: "Save the code — you can find the post anytime with it",
+      memoryUsage: "Memory used: {size}",
+      copy: "Copy",
+      copied: "Copied",
+      copyError: "Error",
+      done: "Done",
+      photoCount: "Photos: {n}",
+      enterTitle: "Please enter a title.",
+      notFound: "Post not found",
+      networkError: "Network error: {msg}",
+      rejectedFiles: "{n} file(s) skipped: images only, max {max}.",
+      lbHint: "wheel — zoom · RMB — 1×/2× · dblclick — reset · LMB — pan"
+    }
+  };
+
+  let currentLang = "en";
+
+  function t(key, params) {
+    let s = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key] || key;
+    if (params) {
+      for (const k in params) s = s.replace("{" + k + "}", params[k]);
+    }
+    return s;
+  }
+
+  function applyI18n(lang) {
+    currentLang = SUPPORTED.includes(lang) ? lang : "en";
+    document.documentElement.lang = currentLang;
+
+    document.querySelectorAll("[data-i18n]").forEach(el => {
+      const key = el.getAttribute("data-i18n");
+      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
+      if (txt) el.textContent = txt;
+    });
+    document.querySelectorAll("[data-i18n-ph]").forEach(el => {
+      const key = el.getAttribute("data-i18n-ph");
+      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
+      if (txt) el.placeholder = txt;
+    });
+
+    // динамика
+    dropLabel.textContent = defaultDropLabel();
+    if (modalHint && modalHint.dataset.size) {
+      modalHint.textContent = t("memoryUsage", { size: modalHint.dataset.size });
+    }
+  }
+
+  /* =========================================================
+     Определение языка: URL → navigator → en
+     ========================================================= */
+  function parseHash() {
+    const h = (window.location.hash || "").replace(/^#/, "");
+    if (!h) return { code: null, lang: null };
+    const qIdx = h.indexOf("?");
+    const codePart = (qIdx >= 0 ? h.slice(0, qIdx) : h).trim();
+    const params = new URLSearchParams(qIdx >= 0 ? h.slice(qIdx + 1) : "");
+    const code = /^\d{6}$/.test(codePart) ? codePart : null;
+    const langRaw = (params.get("lang") || "").toLowerCase().split("-")[0];
+    const lang = SUPPORTED.includes(langRaw) ? langRaw : null;
+    return { code, lang };
+  }
+
+  function detectLang() {
+    const { lang } = parseHash();
+    if (lang) return lang;
+    const nav = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || "en"];
+    for (const l of nav) {
+      const code = String(l || "").toLowerCase().split("-")[0];
+      if (SUPPORTED.includes(code)) return code;
+    }
+    return "en";
+  }
+
+  /* =========================================================
+     Иконки
+     ========================================================= */
   const ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -870,14 +1033,14 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   function formatBytes(b) {
-    if (b < 1024) return b + " Б";
-    if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " КБ";
-    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2).replace(".", ",") + " МБ";
-    return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " ГБ";
+    if (b < 1024) return b + " B";
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " KB";
+    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2).replace(".", ",") + " MB";
+    return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " GB";
   }
 
   /* =========================================================
-     ТАБЫ (только переключение, без закрытия)
+     Табы
      ========================================================= */
   const stage       = $("stage");
   const createPanel = $("createPanel");
@@ -885,7 +1048,7 @@ PAGE = r"""<!DOCTYPE html>
   const btnCreate   = $("btnCreate");
   const btnFind     = $("btnFind");
 
-  let mode = null;  // 'create' | 'find' | null
+  let mode = null;
 
   function activePanel() { return mode === "create" ? createPanel : findPanel; }
 
@@ -904,15 +1067,13 @@ PAGE = r"""<!DOCTYPE html>
   ro.observe(findPanel);
   window.addEventListener("resize", () => syncHeight(false));
 
-  function setMode(next) {
-    // клик по активной вкладке НИЧЕГО не делает
-    if (next === mode) return;
+  function setMode(next, instant = false) {
+    if (next === mode && !instant) return;
 
     const firstShow = stage.hidden;
     const incoming  = next === "create" ? createPanel : findPanel;
     const outgoing  = next === "create" ? findPanel   : createPanel;
 
-    // create — «слева», find — «справа»
     const goLeft = (next === "create");
     const enterX = goLeft ? -26 : 26;
     const exitX  = goLeft ?  26 : -26;
@@ -921,7 +1082,7 @@ PAGE = r"""<!DOCTYPE html>
     stage.style.transition = "none";
     stage.style.height = incoming.offsetHeight + "px";
 
-    if (firstShow || mode === null) {
+    if (firstShow || mode === null || instant) {
       incoming.style.setProperty("--enter-x", "0px");
       incoming.style.transition = "none";
       outgoing.classList.remove("active");
@@ -953,7 +1114,7 @@ PAGE = r"""<!DOCTYPE html>
   btnFind.addEventListener("click", () => setMode("find"));
 
   /* =========================================================
-     СОЗДАНИЕ
+     Создание поста
      ========================================================= */
   const MAX_PHOTOS = 5;
   let selectedFiles = [];
@@ -964,11 +1125,13 @@ PAGE = r"""<!DOCTYPE html>
   const previews   = $("previews");
   const createMsg  = $("createMsg");
   const submitBtn  = $("submitBtn");
+  const titleInput = $("title");
+  const contentInput = $("content");
 
   function defaultDropLabel() {
     return selectedFiles.length
-      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
-      : "Нажмите или перетащите фото";
+      ? t("dropLabelFilled", { n: selectedFiles.length, max: MAX_PHOTOS })
+      : t("dropLabel");
   }
 
   drop.addEventListener("click", () => fileInput.click());
@@ -1017,7 +1180,7 @@ PAGE = r"""<!DOCTYPE html>
       selectedFiles.push(f);
     }
     if (rejected > 0) {
-      showCreateMsg("err", rejected + " файл(ов) пропущено: только изображения и не больше " + MAX_PHOTOS + ".");
+      showCreateMsg("err", t("rejectedFiles", { n: rejected, max: MAX_PHOTOS }));
     } else {
       clearCreateMsg();
     }
@@ -1034,7 +1197,7 @@ PAGE = r"""<!DOCTYPE html>
       img.src = url; img.alt = file.name;
       img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
       const rm = document.createElement("button");
-      rm.type = "button"; rm.textContent = "×"; rm.title = "Убрать";
+      rm.type = "button"; rm.textContent = "×"; rm.title = "×";
       rm.addEventListener("click", () => {
         selectedFiles.splice(index, 1);
         renderPreviews();
@@ -1053,20 +1216,20 @@ PAGE = r"""<!DOCTYPE html>
   function clearCreateMsg() { createMsg.innerHTML = ""; }
 
   $("resetBtn").addEventListener("click", () => {
-    $("title").value = "";
-    $("content").value = "";
+    titleInput.value = "";
+    contentInput.value = "";
     selectedFiles = [];
     renderPreviews();
     clearCreateMsg();
-    $("title").focus();
+    titleInput.focus();
   });
 
   submitBtn.addEventListener("click", async () => {
-    const title = $("title").value.trim();
-    const content = $("content").value.trim();
+    const title = titleInput.value.trim();
+    const content = contentInput.value.trim();
     if (!title) {
-      showCreateMsg("err", "Введите название поста.");
-      $("title").focus();
+      showCreateMsg("err", t("enterTitle"));
+      titleInput.focus();
       return;
     }
 
@@ -1077,24 +1240,31 @@ PAGE = r"""<!DOCTYPE html>
 
     submitBtn.disabled = true;
     const oldHTML = submitBtn.innerHTML;
-    submitBtn.textContent = "Публикация...";
+    submitBtn.textContent = t("publishing");
     clearCreateMsg();
 
     try {
       const res = await fetch("/api/posts", { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        showCreateMsg("err", data.detail || "Не удалось создать пост.");
+        showCreateMsg("err", data.detail || "Error");
         return;
       }
 
-      $("title").value = "";
-      $("content").value = "";
+      titleInput.value = "";
+      contentInput.value = "";
       selectedFiles = [];
       renderPreviews();
       clearCreateMsg();
 
       const code = data.code;
+
+      // отражаем код в URL (без перезагрузки)
+      const newHash = "#" + code + "?lang=" + currentLang;
+      if (window.location.hash !== newHash) {
+        history.replaceState(null, "", newHash);
+      }
+
       setMode("find");
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
@@ -1102,7 +1272,7 @@ PAGE = r"""<!DOCTYPE html>
 
       showCreatedModal(code, data.compressed_bytes);
     } catch (e) {
-      showCreateMsg("err", "Ошибка сети: " + e.message);
+      showCreateMsg("err", t("networkError", { msg: e.message }));
     } finally {
       submitBtn.disabled = false;
       submitBtn.innerHTML = oldHTML;
@@ -1110,7 +1280,7 @@ PAGE = r"""<!DOCTYPE html>
   });
 
   /* =========================================================
-     МОДАЛКА
+     Модалка
      ========================================================= */
   const createdModal  = $("createdModal");
   const modalCard     = $("modalCard");
@@ -1120,12 +1290,15 @@ PAGE = r"""<!DOCTYPE html>
   const modalCloseBtn = $("modalCloseBtn");
 
   let modalCopyTimer = null;
+  let modalSizeValue = null;
 
   function showCreatedModal(code, bytes) {
     modalCode.textContent = code;
-    modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
+    modalSizeValue = bytes;
+    modalHint.dataset.size = formatBytes(bytes);
+    modalHint.textContent = t("memoryUsage", { size: formatBytes(bytes) });
     const label = modalCopyBtn.querySelector("span");
-    if (label) label.textContent = "Копировать";
+    if (label) label.textContent = t("copy");
     createdModal.hidden = false;
   }
   function closeCreatedModal() { createdModal.hidden = true; }
@@ -1134,12 +1307,12 @@ PAGE = r"""<!DOCTYPE html>
     const label = modalCopyBtn.querySelector("span");
     try {
       await navigator.clipboard.writeText(modalCode.textContent || "");
-      if (label) label.textContent = "Скопировано";
+      if (label) label.textContent = t("copied");
     } catch {
-      if (label) label.textContent = "Ошибка";
+      if (label) label.textContent = t("copyError");
     }
     clearTimeout(modalCopyTimer);
-    modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
+    modalCopyTimer = setTimeout(() => { if (label) label.textContent = t("copy"); }, 1500);
   });
 
   modalCloseBtn.addEventListener("click", closeCreatedModal);
@@ -1147,7 +1320,7 @@ PAGE = r"""<!DOCTYPE html>
   modalCard.addEventListener("click", (e) => e.stopPropagation());
 
   /* =========================================================
-     ПОИСК
+     Поиск
      ========================================================= */
   const otp         = $("otp");
   const otpCells    = Array.from(document.querySelectorAll(".otp-cell"));
@@ -1237,7 +1410,7 @@ PAGE = r"""<!DOCTYPE html>
   function renderSpinner() {
     searchFrame.innerHTML =
       '<div class="center"><div class="spinner"></div>' +
-      '<div class="spinner-label">Ищем пост...</div></div>';
+      '<div class="spinner-label">' + t("searching") + '</div></div>';
     showSearchFrame();
   }
 
@@ -1248,7 +1421,7 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     ЛАЙТБОКС С ЗУМОМ
+     Лайтбокс с зумом
      ========================================================= */
   const lightbox    = $("lightbox");
   const lbViewport  = $("lbViewport");
@@ -1264,7 +1437,6 @@ PAGE = r"""<!DOCTYPE html>
   let lbPhotos = [];
   let lbIndex = 0;
 
-  // state зума
   let zoom = 1, panX = 0, panY = 0;
   const MIN_ZOOM = 1, MAX_ZOOM = 8;
   let isPanning = false, panStartX = 0, panStartY = 0;
@@ -1290,12 +1462,10 @@ PAGE = r"""<!DOCTYPE html>
     showZoomBadge();
   }
 
-  // зум относительно точки (clientX, clientY)
   function zoomAt(clientX, clientY, newZoom) {
     newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
     if (Math.abs(newZoom - zoom) < 1e-4) return;
 
-    // центр области просмотра — изображение центрируется флексом внутри viewport
     const vrect = lbViewport.getBoundingClientRect();
     const Cx = vrect.left + vrect.width  / 2;
     const Cy = vrect.top  + vrect.height / 2;
@@ -1341,12 +1511,9 @@ PAGE = r"""<!DOCTYPE html>
   function lbStep(dir) {
     if (lbPhotos.length < 2) return;
     lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
-
-    // сброс зума при смене фото
     zoom = 1; panX = 0; panY = 0;
     lbTransform.style.transition = "";
     applyTransform();
-
     lbImg.src = "/api/photos/" + encodeURIComponent(lbCode) + "/" + lbIndex;
     lbImg.alt = (lbPhotos[lbIndex] && lbPhotos[lbIndex].name) || "";
     lbCounter.textContent = (lbIndex + 1) + " / " + lbPhotos.length;
@@ -1356,30 +1523,23 @@ PAGE = r"""<!DOCTYPE html>
   lbNext.addEventListener("click", (e) => { e.stopPropagation(); lbStep(1); });
   lbClose.addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
 
-  // клик по пустому фону (не по img, не по кнопкам) — закрыть
   lbViewport.addEventListener("click", (e) => {
     if (e.target === lbViewport && zoom <= 1.001) closeLightbox();
   });
 
-  // колесо — зум к курсору
   lbViewport.addEventListener("wheel", (e) => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
     zoomAt(e.clientX, e.clientY, zoom * factor);
   }, { passive: false });
 
-  // ПКМ — переключение 1× / 2× относительно курсора
   lbViewport.addEventListener("mousedown", (e) => {
     if (e.button === 2) {
       e.preventDefault();
-      if (zoom > 1.05) {
-        resetZoom(true);
-      } else {
-        zoomAt(e.clientX, e.clientY, 2);
-      }
+      if (zoom > 1.05) resetZoom(true);
+      else zoomAt(e.clientX, e.clientY, 2);
       return;
     }
-    // ЛКМ — панорама, если есть зум
     if (e.button === 0 && zoom > 1.001) {
       e.preventDefault();
       isPanning = true;
@@ -1390,14 +1550,12 @@ PAGE = r"""<!DOCTYPE html>
     }
   });
 
-  // двойной клик — сброс/зум
   lbViewport.addEventListener("dblclick", (e) => {
     e.preventDefault();
     if (zoom > 1.05) resetZoom(true);
     else zoomAt(e.clientX, e.clientY, 2);
   });
 
-  // движение мыши — панорама
   window.addEventListener("mousemove", (e) => {
     if (!isPanning) return;
     panX = e.clientX - panStartX;
@@ -1413,7 +1571,6 @@ PAGE = r"""<!DOCTYPE html>
     }
   });
 
-  // тач-жесты (pinch) для тач-устройств
   let touchStartDist = 0, touchStartZoom = 1;
   lbViewport.addEventListener("touchstart", (e) => {
     if (e.touches.length === 2) {
@@ -1441,7 +1598,7 @@ PAGE = r"""<!DOCTYPE html>
   lbViewport.addEventListener("touchend", () => { touchStartDist = 0; });
 
   /* =========================================================
-     ОТРИСОВКА ПОСТА
+     Отрисовка поста
      ========================================================= */
   function renderPost(post) {
     searchFrame.innerHTML = "";
@@ -1458,12 +1615,12 @@ PAGE = r"""<!DOCTYPE html>
     chip.textContent = post.code;
 
     const date = document.createElement("span");
-    try { date.textContent = new Date(post.created).toLocaleString("ru-RU"); } catch {}
+    try { date.textContent = new Date(post.created).toLocaleString(currentLang); } catch {}
     meta.append(chip, date);
 
     if (post.photos && post.photos.length) {
       const cnt = document.createElement("span");
-      cnt.textContent = "Фото: " + post.photos.length;
+      cnt.textContent = t("photoCount", { n: post.photos.length });
       meta.appendChild(cnt);
     }
 
@@ -1502,11 +1659,12 @@ PAGE = r"""<!DOCTYPE html>
     if (mySeq !== searchSeq) return;
 
     try {
-      const res = await fetch("/api/posts/" + encodeURIComponent(code));
+      const url = "/api/posts/" + encodeURIComponent(code) + "?lang=" + encodeURIComponent(currentLang);
+      const res = await fetch(url);
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        renderError(data.detail || "Пост не найден.");
+        renderError(data.detail || t("notFound"));
         shakeOtp();
         setTimeout(clearOtp, 320);
         return;
@@ -1516,13 +1674,59 @@ PAGE = r"""<!DOCTYPE html>
       renderPost(post);
     } catch (e) {
       if (mySeq !== searchSeq) return;
-      renderError("Ошибка сети: " + e.message);
+      renderError(t("networkError", { msg: e.message }));
       shakeOtp();
       setTimeout(clearOtp, 320);
     }
   }
 
-  /* ---------- клавиатура ---------- */
+  /* =========================================================
+     Инициализация: язык + deep-link
+     ========================================================= */
+  function initFromUrl() {
+    const { code, lang } = parseHash();
+    const targetLang = lang || detectLang();
+
+    if (targetLang !== currentLang) {
+      applyI18n(targetLang);
+    } else {
+      applyI18n(currentLang);
+    }
+
+    if (code) {
+      // открыть поиск, вписать код, запустить поиск
+      setMode("find", true);
+      otpCells.forEach((c, i) => { c.value = code[i] || ""; });
+      lastSubmitted = code;
+      runSearch(code);
+    } else {
+      // по умолчанию — создание поста
+      setMode("create", true);
+    }
+  }
+
+  // Запуск
+  initFromUrl();
+
+  // hashchange — если пользователь поменял URL вручную
+  window.addEventListener("hashchange", () => {
+    const { code, lang } = parseHash();
+    if (lang && lang !== currentLang) {
+      applyI18n(lang);
+      // если открыт пост — перезапросить с новым языком
+      if (mode === "find" && getCode().length === 6) {
+        lastSubmitted = "";
+        runSearch(getCode());
+      }
+    }
+    if (code && mode !== "find") {
+      setMode("find", true);
+      otpCells.forEach((c, i) => { c.value = code[i] || ""; });
+      lastSubmitted = code;
+      runSearch(code);
+    }
+  });
+
   document.addEventListener("keydown", (e) => {
     if (!lightbox.hidden) {
       if (e.key === "Escape") { closeLightbox(); return; }
