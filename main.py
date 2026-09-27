@@ -6,6 +6,7 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 
 from __future__ import annotations
 
+import random
 import gzip
 import json
 import logging
