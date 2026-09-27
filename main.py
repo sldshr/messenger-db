@@ -6,7 +6,6 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 
 from __future__ import annotations
 
-import random
 import gzip
 import json
 import logging
@@ -88,10 +87,15 @@ MAX_CONTENT_LEN = 20_000
 
 
 def _new_code() -> str:
-    """6-значный код БЕЗ повторяющихся цифр."""
+    """6-значный код БЕЗ повторяющихся цифр. Совместимо с любым Python 3."""
     with _lock:
         for _ in range(5000):
-            code = "".join(secrets.sample(string.digits, 6))
+            digits = list(string.digits)
+            code_chars = []
+            for _ in range(6):
+                idx = secrets.randbelow(len(digits))
+                code_chars.append(digits.pop(idx))
+            code = "".join(code_chars)
             if code not in _store:
                 return code
     raise HTTPException(503, "Storage overflow")
@@ -425,7 +429,6 @@ PAGE = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:#4a2020;border-color:#6a3030}
 
-  /* ---------- кнопки на всю ширину фрейма ---------- */
   .row{
     display:flex;
     gap:8px;
@@ -985,16 +988,13 @@ PAGE = r"""<!DOCTYPE html>
     return d;
   }
 
-  /* ---------- красивое чтение ошибки из ответа ---------- */
   async function readError(res) {
-    // 1) JSON с detail
     const ct = (res.headers.get("content-type") || "").toLowerCase();
     if (ct.includes("application/json")) {
       const data = await res.json().catch(() => null);
       if (data) {
         if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
         if (Array.isArray(data.detail) && data.detail.length) {
-          // FastAPI 422
           const first = data.detail[0] || {};
           const loc = Array.isArray(first.loc) ? first.loc.filter(x => x !== "body").join(".") : "";
           const msg = first.msg || "Invalid input";
@@ -1003,10 +1003,8 @@ PAGE = r"""<!DOCTYPE html>
         if (typeof data.message === "string" && data.message.trim()) return data.message;
       }
     }
-    // 2) текстом
     const txt = await res.text().catch(() => "");
     if (txt && txt.trim() && txt.length < 400) return txt.trim();
-    // 3) fallback — HTTP статус
     const statusText = res.statusText ? (" — " + res.statusText) : "";
     return t("httpError", { code: res.status }) + statusText;
   }
@@ -1089,7 +1087,6 @@ PAGE = r"""<!DOCTYPE html>
     else setTimeout(() => otpCells[0].focus(), 100);
   }
 
-  // Вкладка "Создать" — плюс сброс URL до дефолтного (без хэша)
   btnCreate.addEventListener("click", () => {
     if (window.location.hash) {
       history.replaceState(null, "", window.location.pathname + window.location.search);
@@ -1198,7 +1195,6 @@ PAGE = r"""<!DOCTYPE html>
   function showCreateMsg(kind, text) {
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
-    // при появлении сообщения пересчитываем высоту сцены
     requestAnimationFrame(() => syncHeight(false));
   }
   function clearCreateMsg() {
