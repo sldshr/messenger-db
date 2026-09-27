@@ -162,34 +162,32 @@ PAGE = r"""<!DOCTYPE html>
 <style>
   *{box-sizing:border-box}
   :root{
-    --bg:#0a0a0c;
-    --panel:#141417;
-    --panel-2:#1b1b20;
-    --field:#0f0f12;
-    --border:#2a2a31;
-    --border-hi:#45454f;
+    --bg:#17171a;
+    --panel:#202024;
+    --panel-2:#2d2d33;
+    --field:#131316;
+    --border:#3c3c44;
+    --border-hi:#5a5a66;
     --text:#e9e9ec;
-    --muted:#85858f;
-    --accent:#31313a;
+    --muted:#9a9aa3;
+    --accent:#3f3f48;
   }
   html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
     -webkit-font-smoothing:antialiased}
   body{min-height:100vh;background:
-    radial-gradient(900px 480px at 50% -12%, #191920 0%, rgba(10,10,12,0) 70%)}
+    radial-gradient(900px 480px at 50% -12%, #1f1f24 0%, rgba(23,23,26,0) 70%)}
 
-  header{max-width:840px;margin:0 auto;padding:34px 20px 10px;
-    display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between}
-  .brand{font-size:19px;font-weight:600;letter-spacing:.4px;display:flex;align-items:center;gap:10px}
-  .brand span.dot{width:9px;height:9px;border-radius:50%;background:#6f6f7d;
-    box-shadow:0 0 12px #6f6f7d}
-  .actions{display:flex;gap:10px;flex-wrap:wrap}
+  header{max-width:840px;margin:0 auto;padding:40px 20px 10px;
+    display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:center}
+  .actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;width:100%}
 
   .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:8px;
     border:1px solid var(--border);
     background:var(--panel-2);
     color:var(--text);
-    padding:11px 18px;
+    padding:12px 20px;
     border-radius:14px;
     font-size:14px;
     font-family:inherit;
@@ -197,17 +195,19 @@ PAGE = r"""<!DOCTYPE html>
     transition:background .15s,border-color .15s,transform .08s;
     white-space:nowrap;
   }
+  .btn svg{width:18px;height:18px;stroke:currentColor;stroke-width:2;
+    fill:none;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
   .btn:hover{background:var(--accent);border-color:var(--border-hi)}
   .btn:active{transform:scale(.98)}
-  .btn.active{background:#33333d;border-color:#55555f}
-  .btn.primary{background:#2c2c35}
-  .btn.primary:hover{background:#3a3a45}
+  .btn.active{background:#41414a;border-color:#6a6a78}
+  .btn.primary{background:#35353d}
+  .btn.primary:hover{background:#42424c}
   .btn:disabled{opacity:.5;cursor:not-allowed}
 
   main{max-width:840px;margin:0 auto;padding:0 20px 80px}
 
   .panel{
-    background:linear-gradient(180deg,#16161a 0%,#131316 100%);
+    background:linear-gradient(180deg,#232328 0%,#1d1d21 100%);
     border:1px solid var(--border);
     border-radius:22px;
     padding:24px;
@@ -216,8 +216,7 @@ PAGE = r"""<!DOCTYPE html>
   }
   @keyframes pop{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
   .panel.hidden{display:none}
-  .panel h2{margin:0 0 4px;font-size:16px;font-weight:600;letter-spacing:.2px}
-  .panel .sub{margin:0 0 8px;font-size:13px;color:var(--muted)}
+  .panel h2{margin:0 0 16px;font-size:16px;font-weight:600;letter-spacing:.2px;text-align:center}
 
   label{display:block;font-size:12.5px;color:var(--muted);margin:16px 0 7px;
     text-transform:uppercase;letter-spacing:.7px}
@@ -227,22 +226,22 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:14px;padding:13px 15px;color:var(--text);font-size:14.5px;
     font-family:inherit;outline:none;transition:border-color .15s,background .15s;
   }
-  input[type=text]:focus,textarea:focus{border-color:var(--border-hi);background:#121216}
+  input[type=text]:focus,textarea:focus{border-color:var(--border-hi);background:#17171b}
   input[type=text]::placeholder,textarea::placeholder{color:#5b5b66}
   textarea{min-height:130px;resize:vertical;line-height:1.5}
 
   .drop{
-    border:1px dashed #35353f;border-radius:16px;padding:20px;text-align:center;
-    color:var(--muted);font-size:13.5px;cursor:pointer;background:#101013;
+    border:1px dashed #4a4a54;border-radius:16px;padding:20px;text-align:center;
+    color:var(--muted);font-size:13.5px;cursor:pointer;background:#1a1a1e;
     transition:border-color .15s,color .15s,background .15s;line-height:1.6;
   }
-  .drop:hover{border-color:var(--border-hi);color:#b6b6c0;background:#131318}
-  .drop.filled{border-style:solid;border-color:#3a3a45;color:#a9a9b4}
+  .drop:hover{border-color:var(--border-hi);color:#b6b6c0;background:#1e1e23}
+  .drop.filled{border-style:solid;border-color:#55555f;color:#a9a9b4}
 
   .previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));
     gap:10px;margin-top:12px}
   .preview{position:relative;aspect-ratio:1/1;border-radius:14px;overflow:hidden;
-    border:1px solid var(--border);background:#0f0f12;animation:pop .18s ease}
+    border:1px solid var(--border);background:#131316;animation:pop .18s ease}
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
   .preview button{
     position:absolute;top:5px;right:5px;width:22px;height:22px;border-radius:50%;
@@ -252,7 +251,7 @@ PAGE = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:rgba(90,20,20,.9)}
 
-  .row{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+  .row{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;justify-content:center}
 
   .code-input{
     width:100%;text-align:center;font-size:36px;font-weight:600;
@@ -262,7 +261,7 @@ PAGE = r"""<!DOCTYPE html>
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
     transition:border-color .15s,background .15s;
   }
-  .code-input:focus{border-color:var(--border-hi);background:#121216}
+  .code-input:focus{border-color:var(--border-hi);background:#17171b}
   .code-input::placeholder{color:#3d3d47;letter-spacing:16px}
 
   #searchState{margin-top:6px}
@@ -270,11 +269,11 @@ PAGE = r"""<!DOCTYPE html>
 
   .spinner{
     width:30px;height:30px;border-radius:50%;
-    border:3px solid #2c2c34;border-top-color:#9a9aa8;
+    border:3px solid #3c3c44;border-top-color:#9a9aa8;
     animation:spin .75s linear infinite;margin:0 auto;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
-  .spinner-label{margin-top:12px;font-size:13px;color:var(--muted)}
+  .spinner-label{margin-top:12px;font-size:13px;color:var(--muted);text-align:center}
 
   .msg{border-radius:16px;padding:14px 16px;font-size:14px;margin-top:14px;
     border:1px solid var(--border);background:var(--panel-2)}
@@ -298,7 +297,7 @@ PAGE = r"""<!DOCTYPE html>
     display:inline-flex;align-items:center;gap:10px;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
     font-size:15px;letter-spacing:4px;color:#cfcfd8;
-    background:#101013;border:1px solid var(--border);
+    background:#131316;border:1px solid var(--border);
     border-radius:12px;padding:6px 12px;
   }
   .big-code{
@@ -309,14 +308,9 @@ PAGE = r"""<!DOCTYPE html>
   }
   .hint{font-size:12.5px;color:var(--muted);text-align:center}
 
-  .footer{max-width:840px;margin:0 auto;padding:0 20px 40px;
-    font-size:12px;color:#4e4e58;text-align:center}
-
   @media (max-width:560px){
     header{padding-top:24px}
-    .brand{width:100%}
-    .actions{width:100%}
-    .actions .btn{flex:1;text-align:center}
+    .actions .btn{flex:1;text-align:center;padding:12px 14px}
     .code-input{font-size:28px;letter-spacing:12px;text-indent:12px}
     .big-code{font-size:34px;letter-spacing:10px;text-indent:10px}
   }
@@ -325,10 +319,15 @@ PAGE = r"""<!DOCTYPE html>
 <body>
 
 <header>
-  <div class="brand"><span class="dot"></span> PostVault</div>
   <div class="actions">
-    <button class="btn" id="btnCreate">＋ Создать пост</button>
-    <button class="btn" id="btnFind">⌕ Найти пост по коду</button>
+    <button class="btn" id="btnCreate">
+      <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+      Создать пост
+    </button>
+    <button class="btn" id="btnFind">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+      Найти пост по коду
+    </button>
   </div>
 </header>
 
@@ -336,7 +335,6 @@ PAGE = r"""<!DOCTYPE html>
   <!-- ================= СОЗДАНИЕ ================= -->
   <section class="panel hidden" id="createPanel">
     <h2>Новый пост</h2>
-    <p class="sub">Заполните поля и при желании прикрепите до 5 фотографий.</p>
 
     <label for="title">Название</label>
     <input id="title" type="text" maxlength="120" placeholder="Например: Отчёт за неделю" autocomplete="off">
@@ -360,7 +358,6 @@ PAGE = r"""<!DOCTYPE html>
   <!-- ================= ПОИСК ================= -->
   <section class="panel hidden" id="findPanel">
     <h2>Поиск поста</h2>
-    <p class="sub">Введите 6-значный код — поиск начнётся автоматически.</p>
 
     <input id="codeInput" class="code-input" inputmode="numeric" autocomplete="off"
            maxlength="6" placeholder="––––––">
@@ -368,8 +365,6 @@ PAGE = r"""<!DOCTYPE html>
     <div id="searchState"></div>
   </section>
 </main>
-
-<div class="footer">Данные хранятся в оперативной памяти в сжатом и зашифрованном виде.</div>
 
 <script>
 (() => {
@@ -416,7 +411,7 @@ PAGE = r"""<!DOCTYPE html>
 
   drop.addEventListener("dragover", (e) => {
     e.preventDefault();
-    drop.style.borderColor = "#55555f";
+    drop.style.borderColor = "#6a6a78";
   });
   drop.addEventListener("dragleave", () => { drop.style.borderColor = ""; });
   drop.addEventListener("drop", (e) => {
@@ -542,7 +537,6 @@ PAGE = r"""<!DOCTYPE html>
 
       const row = document.createElement("div");
       row.className = "row";
-      row.style.justifyContent = "center";
 
       const copyBtn = document.createElement("button");
       copyBtn.className = "btn";
