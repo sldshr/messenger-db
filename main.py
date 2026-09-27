@@ -1,14 +1,14 @@
 """
 Sld-Networking — посты с 6-значным кодом.
-Хранение: оперативная память, сжатие (gzip) + шифрование (Fernet/AES).
-Запуск: pip install fastapi uvicorn python-multipart cryptography && python main.py
+Хранение: оперативная память, AES-256-GCM + zstd/gzip.
+Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
 
 from __future__ import annotations
 
-import base64
 import gzip
 import json
+import os
 import secrets
 import string
 import threading
@@ -16,28 +16,77 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import uvicorn
-from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse
 
+# ---------- сжатие (zstd, если доступен) ----------
+try:
+    import zstandard as _zstd_mod
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+
+_ZSTD_C = _zstd_mod.ZstdCompressor(level=3) if _HAS_ZSTD else None
+_ZSTD_D = _zstd_mod.ZstdDecompressor() if _HAS_ZSTD else None
+
+
+def _compress(b: bytes) -> bytes:
+    """b'Z' + zstd | b'G' + gzip"""
+    if _HAS_ZSTD:
+        return b"Z" + _ZSTD_C.compress(b)
+    return b"G" + gzip.compress(b, compresslevel=6)
+
+
+def _decompress(b: bytes) -> bytes:
+    marker, payload = b[:1], b[1:]
+    if marker == b"Z" and _HAS_ZSTD:
+        return _ZSTD_D.decompress(payload)
+    if marker == b"G":
+        return gzip.decompress(payload)
+    raise ValueError("unknown codec")
+
+
+# ---------- шифрование (AES-256-GCM) ----------
+_AES = AESGCM(AESGCM.generate_key(bit_length=256))
+_NONCE = 12  # 96-bit стандарт для GCM
+
+
+def _encrypt(data: bytes) -> bytes:
+    nonce = os.urandom(_NONCE)
+    return nonce + _AES.encrypt(nonce, data, None)
+
+
+def _decrypt(blob: bytes) -> bytes:
+    if len(blob) < _NONCE + 16:
+        raise ValueError("too short")
+    return _AES.decrypt(blob[:_NONCE], blob[_NONCE:], None)
+
+
+def _pack_meta(meta: dict) -> bytes:
+    raw = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _encrypt(_compress(raw))
+
+
+def _unpack_meta(blob: bytes) -> dict:
+    return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
+
+
 # ---------- память ----------
-_fernet = Fernet(Fernet.generate_key())
-_store: Dict[str, bytes] = {}
+# code -> {
+#   "meta": bytes,                     # encrypted+gzipped JSON без фото
+#   "photos": [ {"name","mime","size","enc"} ],
+#   "created": iso str,
+#   "size": int                        # байт в памяти всего
+# }
+_store: Dict[str, dict] = {}
 _lock = threading.Lock()
 
 MAX_PHOTOS = 5
-MAX_PHOTO_BYTES = 8 * 1024 * 1024
+MAX_PHOTO_BYTES = 12 * 1024 * 1024
 MAX_TITLE_LEN = 120
 MAX_CONTENT_LEN = 20_000
-
-
-def _pack(payload: dict) -> bytes:
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return _fernet.encrypt(gzip.compress(raw, compresslevel=9))
-
-
-def _unpack(blob: bytes) -> dict:
-    return json.loads(gzip.decompress(_fernet.decrypt(blob)).decode("utf-8"))
 
 
 def _new_code() -> str:
@@ -74,27 +123,40 @@ async def create_post(
         raise HTTPException(400, f"Максимум {MAX_PHOTOS} фото")
 
     photos = []
+    total = 0
     for f in files:
         data = await f.read()
         if len(data) > MAX_PHOTO_BYTES:
             raise HTTPException(400, f"Файл «{f.filename}» больше {MAX_PHOTO_BYTES // (1024*1024)} МБ")
+        enc = _encrypt(data)          # фото уже сжато (jpeg/png/webp) — не пережимаем
+        total += len(enc)
         photos.append({
             "name": f.filename,
             "mime": f.content_type or "image/jpeg",
-            "data": base64.b64encode(data).decode("ascii"),
+            "size": len(data),
+            "enc": enc,
         })
 
-    payload = {
+    created = datetime.now(timezone.utc).isoformat()
+    meta = {
         "title": title,
         "content": content,
-        "photos": photos,
-        "created": datetime.now(timezone.utc).isoformat(),
+        "created": created,
+        "photos": [{"name": p["name"], "mime": p["mime"], "size": p["size"]} for p in photos],
     }
-    blob = _pack(payload)
+    enc_meta = _pack_meta(meta)
+    total += len(enc_meta)
+
     code = _new_code()
     with _lock:
-        _store[code] = blob
-    return {"code": code, "compressed_bytes": len(blob), "photos": len(photos)}
+        _store[code] = {
+            "meta": enc_meta,
+            "photos": photos,
+            "created": created,
+            "size": total,
+        }
+
+    return {"code": code, "compressed_bytes": total, "photos": len(photos)}
 
 
 @app.get("/api/posts/{code}")
@@ -102,16 +164,52 @@ async def get_post(code: str):
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
         raise HTTPException(400, "Код должен состоять из 6 цифр")
+
     with _lock:
-        blob = _store.get(code)
-    if blob is None:
+        entry = _store.get(code)
+    if entry is None:
         raise HTTPException(404, "Пост с таким кодом не найден")
+
     try:
-        payload = _unpack(blob)
-    except (InvalidToken, OSError, ValueError):
+        meta = _unpack_meta(entry["meta"])
+    except (InvalidTag, ValueError, OSError):
         raise HTTPException(500, "Не удалось расшифровать пост")
-    payload["code"] = code
-    return payload
+
+    meta["code"] = code
+    # количество фото и метаданные — без base64, только ссылки
+    meta["photos"] = [
+        {"idx": i, "name": p["name"], "mime": p["mime"], "size": p["size"]}
+        for i, p in enumerate(entry["photos"])
+    ]
+    return meta
+
+
+@app.get("/api/photos/{code}/{idx}")
+async def get_photo(code: str, idx: int):
+    with _lock:
+        entry = _store.get(code)
+    if entry is None:
+        raise HTTPException(404, "Пост не найден")
+
+    photos = entry["photos"]
+    if idx < 0 or idx >= len(photos):
+        raise HTTPException(404, "Фото не найдено")
+
+    p = photos[idx]
+    try:
+        data = _decrypt(p["enc"])
+    except (InvalidTag, ValueError):
+        raise HTTPException(500, "Ошибка расшифровки")
+
+    return Response(
+        content=data,
+        media_type=p["mime"],
+        headers={
+            # фото immutable — код уникален и не переиспользуется
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Length": str(len(data)),
+        },
+    )
 
 
 @app.get("/api/stats")
@@ -152,7 +250,6 @@ PAGE = r"""<!DOCTYPE html>
   html,body{user-select:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none}
   input,textarea,[contenteditable],.modal-code{user-select:text;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text}
 
-  /* ---------- своё выделение текста ---------- */
   ::selection{background:rgba(167,139,250,.38);color:#fff}
   ::-moz-selection{background:rgba(167,139,250,.38);color:#fff}
   input::selection,textarea::selection{background:rgba(167,139,250,.45);color:#fff}
@@ -229,7 +326,7 @@ PAGE = r"""<!DOCTYPE html>
   }
   .btn.primary:hover{background:#fff}
 
-  /* ---------- сцена с панелями ---------- */
+  /* ---------- сцена ---------- */
   .stage{
     position:relative;
     width:100%;max-width:520px;
@@ -267,7 +364,6 @@ PAGE = r"""<!DOCTYPE html>
     padding:22px;
   }
 
-  /* ---------- поля ---------- */
   .input-wrap{position:relative;display:flex}
   .input-wrap + .input-wrap{margin-top:12px}
   .input-wrap .iw-icon{
@@ -296,15 +392,9 @@ PAGE = r"""<!DOCTYPE html>
   .field::placeholder{color:var(--text-mute)}
   .field:focus{border-color:var(--glass-border-hi);background:rgba(255,255,255,.07)}
 
-  /* textarea: без ресайза и выше */
-  textarea.field{
-    min-height:180px;
-    resize:none;
-    line-height:1.55;
-    font-family:inherit;
-  }
+  textarea.field{min-height:180px;resize:none;line-height:1.55;font-family:inherit}
 
-  /* ---------- зона фото ---------- */
+  /* ---------- drop ---------- */
   .drop{
     margin-top:12px;
     border:1px dashed rgba(255,255,255,.18);
@@ -413,7 +503,7 @@ PAGE = r"""<!DOCTYPE html>
   .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
   .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
-  /* ---------- результат ---------- */
+  /* ---------- пост ---------- */
   .post-title{
     margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);
     word-break:break-word;
@@ -446,30 +536,42 @@ PAGE = r"""<!DOCTYPE html>
     border:1px solid var(--glass-border);
     border-radius:10px;padding:4px 10px;
   }
-  .big-code{
-    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    font-size:38px;font-weight:700;
-    letter-spacing:12px;text-indent:12px;
-    text-align:center;color:var(--text);margin:10px 0 4px;
-  }
-  .hint{font-size:12px;color:var(--text-dim);text-align:center;margin-top:4px}
 
   /* ---------- лайтбокс ---------- */
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
-    background:rgba(6,6,10,.86);
+    background:rgba(6,6,10,.9);
     backdrop-filter:blur(16px) saturate(140%);
     -webkit-backdrop-filter:blur(16px) saturate(140%);
-    animation:lbIn .2s ease;padding:60px 70px;
+    animation:lbIn .2s ease;
   }
   .lightbox[hidden]{display:none}
   @keyframes lbIn{from{opacity:0}to{opacity:1}}
 
+  .lb-viewport{
+    position:absolute;inset:0;
+    display:flex;align-items:center;justify-content:center;
+    overflow:hidden;
+    cursor:default;
+  }
+  .lb-viewport.grabbing{cursor:grabbing}
+
+  .lb-transform{
+    display:flex;align-items:center;justify-content:center;
+    transform-origin:center center;
+    will-change:transform;
+  }
+
   .lb-img{
-    max-width:100%;max-height:100%;
-    object-fit:contain;border-radius:14px;
+    display:block;
+    max-width:82vw;max-height:78vh;
+    object-fit:contain;
+    border-radius:12px;
     box-shadow:0 20px 60px rgba(0,0,0,.5);
+    user-select:none;-webkit-user-select:none;
+    -webkit-user-drag:none;
+    /* шахматка для прозрачных */
     background-color:#1c1c22;
     background-image:
       linear-gradient(45deg, rgba(255,255,255,.06) 25%, transparent 25%),
@@ -478,9 +580,7 @@ PAGE = r"""<!DOCTYPE html>
       linear-gradient(-45deg, transparent 75%, rgba(255,255,255,.06) 75%);
     background-size:18px 18px;
     background-position:0 0, 0 9px, 9px -9px, -9px 0px;
-    animation:lbImgIn .25s var(--ease-out);
   }
-  @keyframes lbImgIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
 
   .lb-btn{
     position:absolute;width:44px;height:44px;border-radius:50%;
@@ -488,11 +588,11 @@ PAGE = r"""<!DOCTYPE html>
     background:rgba(255,255,255,.08);
     color:var(--text);
     display:flex;align-items:center;justify-content:center;
-    cursor:pointer;
+    cursor:pointer;z-index:2;
     backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
     transition:background .15s ease,transform .1s ease;
   }
-  .lb-btn svg{width:20px;height:20px}
+  .lb-btn svg{width:20px;height:20px;pointer-events:none}
   .lb-btn:hover{background:rgba(255,255,255,.16)}
   .lb-btn:active{transform:scale(.94)}
   .lb-btn[hidden]{display:none}
@@ -512,6 +612,28 @@ PAGE = r"""<!DOCTYPE html>
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     letter-spacing:1px;
     backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    z-index:2;pointer-events:none;
+  }
+
+  .lb-zoom-badge{
+    position:absolute;top:18px;left:18px;
+    padding:5px 12px;border-radius:100px;
+    background:rgba(255,255,255,.10);
+    border:1px solid var(--glass-border);
+    font-size:12px;color:var(--text);
+    font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    letter-spacing:1px;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+    z-index:2;pointer-events:none;
+    opacity:0;transition:opacity .15s ease;
+  }
+  .lb-zoom-badge.visible{opacity:1}
+
+  .lb-hint{
+    position:absolute;bottom:56px;left:50%;transform:translateX(-50%);
+    font-size:11.5px;color:var(--text-mute);
+    z-index:2;pointer-events:none;
+    white-space:nowrap;
   }
 
   /* ---------- модалка ---------- */
@@ -556,17 +678,13 @@ PAGE = r"""<!DOCTYPE html>
 
   .modal-title{font-size:17px;font-weight:600;margin:0 0 6px}
   .modal-sub{font-size:13px;color:var(--text-dim);margin:0 0 18px;line-height:1.5}
-
   .modal-code{
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     font-size:40px;font-weight:700;
     letter-spacing:12px;text-indent:12px;
-    color:var(--text);
-    margin:6px 0 6px;
+    color:var(--text);margin:6px 0 6px;
   }
-
   .modal-hint{font-size:12px;color:var(--text-dim);margin-bottom:22px}
-
   .modal-actions{display:flex;gap:10px}
   .modal-actions .btn{flex:1;height:46px;padding:0 14px;font-size:14px}
 
@@ -577,13 +695,14 @@ PAGE = r"""<!DOCTYPE html>
     .btn{padding:0 14px;font-size:14px}
     .btn svg{width:16px;height:16px}
     .frame{padding:18px;border-radius:20px}
-    .big-code{font-size:30px;letter-spacing:9px;text-indent:9px}
     .row .btn{min-width:0;flex:1}
-    .lightbox{padding:54px 12px 74px}
     .lb-prev{left:8px}
     .lb-next{right:8px}
     .lb-close{top:10px;right:10px}
+    .lb-zoom-badge{top:10px;left:10px}
     .modal-code{font-size:34px;letter-spacing:9px;text-indent:9px}
+    .lb-img{max-width:96vw;max-height:82vh}
+    .lb-hint{display:none}
   }
   @media (max-width:380px){
     .btn span.btn-label{display:none}
@@ -608,7 +727,6 @@ PAGE = r"""<!DOCTYPE html>
 
   <div class="stage" id="stage" hidden>
 
-    <!-- ================= СОЗДАНИЕ ================= -->
     <div class="panel" id="createPanel">
       <section class="frame">
 
@@ -657,7 +775,6 @@ PAGE = r"""<!DOCTYPE html>
       </section>
     </div>
 
-    <!-- ================= ПОИСК ================= -->
     <div class="panel" id="findPanel">
       <section class="frame">
         <div class="otp" id="otp" autocomplete="off">
@@ -703,6 +820,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <!-- ================= ЛАЙТБОКС ================= -->
 <div class="lightbox" id="lightbox" hidden>
+  <div class="lb-viewport" id="lbViewport">
+    <div class="lb-transform" id="lbTransform">
+      <img class="lb-img" id="lbImg" alt="" draggable="false">
+    </div>
+  </div>
+
+  <div class="lb-zoom-badge" id="lbZoomBadge">100%</div>
+
   <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -713,13 +838,13 @@ PAGE = r"""<!DOCTYPE html>
       <polyline points="15 18 9 12 15 6"/>
     </svg>
   </button>
-  <img class="lb-img" id="lbImg" alt="">
   <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Следующее">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <polyline points="9 18 15 12 9 6"/>
     </svg>
   </button>
   <div class="lb-counter" id="lbCounter">1 / 1</div>
+  <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
 </div>
 
 <script>
@@ -752,7 +877,7 @@ PAGE = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     ПЕРЕКЛЮЧЕНИЕ ПАНЕЛЕЙ
+     ТАБЫ (только переключение, без закрытия)
      ========================================================= */
   const stage       = $("stage");
   const createPanel = $("createPanel");
@@ -762,23 +887,17 @@ PAGE = r"""<!DOCTYPE html>
 
   let mode = null;  // 'create' | 'find' | null
 
-  function activePanel() {
-    return mode === "create" ? createPanel : findPanel;
-  }
+  function activePanel() { return mode === "create" ? createPanel : findPanel; }
 
   function syncHeight(animate = true) {
     if (mode === null || stage.hidden) return;
     if (!animate) stage.style.transition = "none";
     stage.style.height = activePanel().offsetHeight + "px";
-    if (!animate) {
-      void stage.offsetHeight;
-      stage.style.transition = "";
-    }
+    if (!animate) { void stage.offsetHeight; stage.style.transition = ""; }
   }
 
   const ro = new ResizeObserver(() => {
     if (!mode || stage.hidden) return;
-    // мгновенная синхронизация без анимации (высота панели изменилась — это не переключение)
     stage.style.height = activePanel().offsetHeight + "px";
   });
   ro.observe(createPanel);
@@ -786,33 +905,23 @@ PAGE = r"""<!DOCTYPE html>
   window.addEventListener("resize", () => syncHeight(false));
 
   function setMode(next) {
-    const target = (next === mode) ? null : next;
-
-    // закрытие
-    if (target === null) {
-      stage.hidden = true;
-      mode = null;
-      btnCreate.classList.remove("active");
-      btnFind.classList.remove("active");
-      return;
-    }
+    // клик по активной вкладке НИЧЕГО не делает
+    if (next === mode) return;
 
     const firstShow = stage.hidden;
-    const incoming  = target === "create" ? createPanel : findPanel;
-    const outgoing  = target === "create" ? findPanel   : createPanel;
+    const incoming  = next === "create" ? createPanel : findPanel;
+    const outgoing  = next === "create" ? findPanel   : createPanel;
 
     // create — «слева», find — «справа»
-    const goLeft = (target === "create");
+    const goLeft = (next === "create");
     const enterX = goLeft ? -26 : 26;
     const exitX  = goLeft ?  26 : -26;
 
-    // включаем сцену
     stage.hidden = false;
     stage.style.transition = "none";
     stage.style.height = incoming.offsetHeight + "px";
 
     if (firstShow || mode === null) {
-      // первая отрисовка — без анимации
       incoming.style.setProperty("--enter-x", "0px");
       incoming.style.transition = "none";
       outgoing.classList.remove("active");
@@ -822,27 +931,21 @@ PAGE = r"""<!DOCTYPE html>
       void stage.offsetWidth;
       stage.style.transition = "";
     } else {
-      // задаём направления
       incoming.style.setProperty("--enter-x", enterX + "px");
       outgoing.style.setProperty("--enter-x", exitX  + "px");
-
-      // сброс и старт анимации
       void incoming.offsetWidth;
-
       outgoing.classList.remove("active");
       incoming.classList.add("active");
-
-      // синхронизируем высоту с анимацией
       void stage.offsetWidth;
       stage.style.transition = "";
       stage.style.height = incoming.offsetHeight + "px";
     }
 
-    mode = target;
-    btnCreate.classList.toggle("active", target === "create");
-    btnFind.classList.toggle("active", target === "find");
+    mode = next;
+    btnCreate.classList.toggle("active", next === "create");
+    btnFind.classList.toggle("active", next === "find");
 
-    if (target === "create") setTimeout(() => $("title").focus(), 140);
+    if (next === "create") setTimeout(() => $("title").focus(), 140);
     else setTimeout(() => otpCells[0].focus(), 140);
   }
 
@@ -850,7 +953,7 @@ PAGE = r"""<!DOCTYPE html>
   btnFind.addEventListener("click", () => setMode("find"));
 
   /* =========================================================
-     СОЗДАНИЕ ПОСТА
+     СОЗДАНИЕ
      ========================================================= */
   const MAX_PHOTOS = 5;
   let selectedFiles = [];
@@ -1088,7 +1191,6 @@ PAGE = r"""<!DOCTYPE html>
 
   otpCells.forEach((cell, i) => {
     cell.addEventListener("focus", () => cell.select());
-
     cell.addEventListener("input", (e) => {
       const v = (e.target.value || "").replace(/\D/g, "");
       if (!v) { e.target.value = ""; maybeSearch(); return; }
@@ -1096,7 +1198,6 @@ PAGE = r"""<!DOCTYPE html>
       if (i < otpCells.length - 1) otpCells[i + 1].focus();
       maybeSearch();
     });
-
     cell.addEventListener("keydown", (e) => {
       if (e.key === "Backspace") {
         if (!cell.value && i > 0) {
@@ -1114,7 +1215,6 @@ PAGE = r"""<!DOCTYPE html>
         if (c.length === 6) { lastSubmitted = c; runSearch(c); }
       }
     });
-
     cell.addEventListener("paste", (e) => {
       e.preventDefault();
       const text = (e.clipboardData || window.clipboardData).getData("text") || "";
@@ -1147,21 +1247,84 @@ PAGE = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* ---------- лайтбокс ---------- */
-  const lightbox  = $("lightbox");
-  const lbImg     = $("lbImg");
-  const lbCounter = $("lbCounter");
-  const lbPrev    = $("lbPrev");
-  const lbNext    = $("lbNext");
-  const lbClose   = $("lbClose");
+  /* =========================================================
+     ЛАЙТБОКС С ЗУМОМ
+     ========================================================= */
+  const lightbox    = $("lightbox");
+  const lbViewport  = $("lbViewport");
+  const lbTransform = $("lbTransform");
+  const lbImg       = $("lbImg");
+  const lbCounter   = $("lbCounter");
+  const lbPrev      = $("lbPrev");
+  const lbNext      = $("lbNext");
+  const lbClose     = $("lbClose");
+  const lbZoomBadge = $("lbZoomBadge");
 
+  let lbCode = null;
   let lbPhotos = [];
   let lbIndex = 0;
 
-  function openLightbox(photos, index) {
+  // state зума
+  let zoom = 1, panX = 0, panY = 0;
+  const MIN_ZOOM = 1, MAX_ZOOM = 8;
+  let isPanning = false, panStartX = 0, panStartY = 0;
+  let badgeTimer = null;
+
+  function applyTransform() {
+    lbTransform.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    lbViewport.style.cursor = (zoom > 1.001) ? (isPanning ? "grabbing" : "grab") : "default";
+  }
+
+  function showZoomBadge() {
+    lbZoomBadge.textContent = Math.round(zoom * 100) + "%";
+    lbZoomBadge.classList.add("visible");
+    clearTimeout(badgeTimer);
+    badgeTimer = setTimeout(() => lbZoomBadge.classList.remove("visible"), 900);
+  }
+
+  function resetZoom(animate) {
+    if (animate) lbTransform.style.transition = "transform .22s cubic-bezier(.22,1,.36,1)";
+    zoom = 1; panX = 0; panY = 0;
+    applyTransform();
+    if (animate) setTimeout(() => { lbTransform.style.transition = ""; }, 240);
+    showZoomBadge();
+  }
+
+  // зум относительно точки (clientX, clientY)
+  function zoomAt(clientX, clientY, newZoom) {
+    newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+    if (Math.abs(newZoom - zoom) < 1e-4) return;
+
+    // центр области просмотра — изображение центрируется флексом внутри viewport
+    const vrect = lbViewport.getBoundingClientRect();
+    const Cx = vrect.left + vrect.width  / 2;
+    const Cy = vrect.top  + vrect.height / 2;
+
+    const dcx = clientX - Cx;
+    const dcy = clientY - Cy;
+
+    const ratio = newZoom / zoom;
+    panX = dcx - (dcx - panX) * ratio;
+    panY = dcy - (dcy - panY) * ratio;
+    zoom = newZoom;
+
+    lbTransform.style.transition = "";
+    applyTransform();
+    showZoomBadge();
+  }
+
+  function openLightbox(code, photos, index) {
+    lbCode = code;
     lbPhotos = photos;
     lbIndex = index;
-    lbImg.src = "data:" + photos[index].mime + ";base64," + photos[index].data;
+
+    zoom = 1; panX = 0; panY = 0;
+    lbTransform.style.transition = "";
+    applyTransform();
+
+    lbImg.src = "/api/photos/" + encodeURIComponent(code) + "/" + index;
+    lbImg.alt = (photos[index] && photos[index].name) || "";
+
     lbCounter.textContent = (index + 1) + " / " + photos.length;
     lbPrev.hidden = photos.length < 2;
     lbNext.hidden = photos.length < 2;
@@ -1170,26 +1333,116 @@ PAGE = r"""<!DOCTYPE html>
 
   function closeLightbox() {
     lightbox.hidden = true;
-    lbImg.src = "";
+    lbImg.removeAttribute("src");
     lbPhotos = [];
+    lbCode = null;
   }
 
   function lbStep(dir) {
     if (lbPhotos.length < 2) return;
     lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
-    lbImg.style.animation = "none";
-    void lbImg.offsetWidth;
-    lbImg.style.animation = "";
-    lbImg.src = "data:" + lbPhotos[lbIndex].mime + ";base64," + lbPhotos[lbIndex].data;
+
+    // сброс зума при смене фото
+    zoom = 1; panX = 0; panY = 0;
+    lbTransform.style.transition = "";
+    applyTransform();
+
+    lbImg.src = "/api/photos/" + encodeURIComponent(lbCode) + "/" + lbIndex;
+    lbImg.alt = (lbPhotos[lbIndex] && lbPhotos[lbIndex].name) || "";
     lbCounter.textContent = (lbIndex + 1) + " / " + lbPhotos.length;
   }
 
   lbPrev.addEventListener("click", (e) => { e.stopPropagation(); lbStep(-1); });
   lbNext.addEventListener("click", (e) => { e.stopPropagation(); lbStep(1); });
   lbClose.addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
-  lightbox.addEventListener("click", (e) => { if (e.target === lightbox) closeLightbox(); });
 
-  /* ---------- отрисовка поста ---------- */
+  // клик по пустому фону (не по img, не по кнопкам) — закрыть
+  lbViewport.addEventListener("click", (e) => {
+    if (e.target === lbViewport && zoom <= 1.001) closeLightbox();
+  });
+
+  // колесо — зум к курсору
+  lbViewport.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+    zoomAt(e.clientX, e.clientY, zoom * factor);
+  }, { passive: false });
+
+  // ПКМ — переключение 1× / 2× относительно курсора
+  lbViewport.addEventListener("mousedown", (e) => {
+    if (e.button === 2) {
+      e.preventDefault();
+      if (zoom > 1.05) {
+        resetZoom(true);
+      } else {
+        zoomAt(e.clientX, e.clientY, 2);
+      }
+      return;
+    }
+    // ЛКМ — панорама, если есть зум
+    if (e.button === 0 && zoom > 1.001) {
+      e.preventDefault();
+      isPanning = true;
+      panStartX = e.clientX - panX;
+      panStartY = e.clientY - panY;
+      lbTransform.style.transition = "none";
+      lbViewport.style.cursor = "grabbing";
+    }
+  });
+
+  // двойной клик — сброс/зум
+  lbViewport.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    if (zoom > 1.05) resetZoom(true);
+    else zoomAt(e.clientX, e.clientY, 2);
+  });
+
+  // движение мыши — панорама
+  window.addEventListener("mousemove", (e) => {
+    if (!isPanning) return;
+    panX = e.clientX - panStartX;
+    panY = e.clientY - panStartY;
+    applyTransform();
+  });
+
+  window.addEventListener("mouseup", (e) => {
+    if (e.button === 0 && isPanning) {
+      isPanning = false;
+      lbTransform.style.transition = "";
+      lbViewport.style.cursor = zoom > 1.001 ? "grab" : "default";
+    }
+  });
+
+  // тач-жесты (pinch) для тач-устройств
+  let touchStartDist = 0, touchStartZoom = 1;
+  lbViewport.addEventListener("touchstart", (e) => {
+    if (e.touches.length === 2) {
+      touchStartDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      touchStartZoom = zoom;
+    }
+  }, { passive: true });
+
+  lbViewport.addEventListener("touchmove", (e) => {
+    if (e.touches.length === 2 && touchStartDist > 0) {
+      e.preventDefault();
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      zoomAt(cx, cy, touchStartZoom * (dist / touchStartDist));
+    }
+  }, { passive: false });
+
+  lbViewport.addEventListener("touchend", () => { touchStartDist = 0; });
+
+  /* =========================================================
+     ОТРИСОВКА ПОСТА
+     ========================================================= */
   function renderPost(post) {
     searchFrame.innerHTML = "";
 
@@ -1228,10 +1481,12 @@ PAGE = r"""<!DOCTYPE html>
       gallery.className = "post-gallery";
       post.photos.forEach((p, idx) => {
         const img = document.createElement("img");
-        img.src = "data:" + p.mime + ";base64," + p.data;
+        img.src = "/api/photos/" + encodeURIComponent(post.code) + "/" + idx;
         img.alt = p.name || "photo";
         img.title = p.name || "";
-        img.addEventListener("click", () => openLightbox(post.photos, idx));
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.addEventListener("click", () => openLightbox(post.code, post.photos, idx));
         gallery.appendChild(img);
       });
       searchFrame.appendChild(gallery);
@@ -1243,7 +1498,7 @@ PAGE = r"""<!DOCTYPE html>
   async function runSearch(code) {
     const mySeq = ++searchSeq;
     renderSpinner();
-    await new Promise((r) => setTimeout(r, 480));
+    await new Promise((r) => setTimeout(r, 420));
     if (mySeq !== searchSeq) return;
 
     try {
@@ -1267,11 +1522,16 @@ PAGE = r"""<!DOCTYPE html>
     }
   }
 
-  /* ---------- Esc ---------- */
+  /* ---------- клавиатура ---------- */
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
-    if (!lightbox.hidden) { closeLightbox(); return; }
-    if (!createdModal.hidden) { closeCreatedModal(); return; }
+    if (!lightbox.hidden) {
+      if (e.key === "Escape") { closeLightbox(); return; }
+      if (e.key === "ArrowLeft")  { lbStep(-1); return; }
+      if (e.key === "ArrowRight") { lbStep(1);  return; }
+      if (e.key === "0") { resetZoom(true); return; }
+      return;
+    }
+    if (!createdModal.hidden && e.key === "Escape") { closeCreatedModal(); return; }
   });
 })();
 </script>
