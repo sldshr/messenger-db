@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import secrets
 import string
@@ -18,8 +19,11 @@ from typing import Dict, List, Optional
 import uvicorn
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("sld")
 
 # ---------- сжатие ----------
 try:
@@ -96,6 +100,16 @@ def _new_code() -> str:
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Любая необработанная ошибка → JSON с detail (чтобы фронт показал причину)."""
+    log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+    )
+
+
 @app.post("/api/posts")
 async def create_post(
     title: str = Form(...),
@@ -121,7 +135,10 @@ async def create_post(
     for f in files:
         data = await f.read()
         if len(data) > MAX_PHOTO_BYTES:
-            raise HTTPException(400, f"File «{f.filename}» larger than {MAX_PHOTO_BYTES // (1024*1024)} MB")
+            raise HTTPException(
+                400,
+                f"File «{f.filename}» larger than {MAX_PHOTO_BYTES // (1024 * 1024)} MB",
+            )
         enc = _encrypt(data)
         total += len(enc)
         photos.append({
@@ -166,8 +183,8 @@ async def get_post(code: str):
 
     try:
         meta = _unpack_meta(entry["meta"])
-    except (InvalidTag, ValueError, OSError):
-        raise HTTPException(500, "Decryption failed")
+    except (InvalidTag, ValueError, OSError) as e:
+        raise HTTPException(500, f"Decryption failed: {e}")
 
     meta["code"] = code
     meta["photos"] = [
@@ -191,8 +208,8 @@ async def get_photo(code: str, idx: int):
     p = photos[idx]
     try:
         data = _decrypt(p["enc"])
-    except (InvalidTag, ValueError):
-        raise HTTPException(500, "Decryption failed")
+    except (InvalidTag, ValueError) as e:
+        raise HTTPException(500, f"Decryption failed: {e}")
 
     return Response(
         content=data,
@@ -274,7 +291,6 @@ PAGE = r"""<!DOCTYPE html>
     gap:20px;
   }
 
-  /* ---------- вкладки ---------- */
   .menu{
     display:flex;gap:8px;justify-content:center;align-items:stretch;
     flex-wrap:nowrap;width:100%;max-width:520px;
@@ -307,7 +323,6 @@ PAGE = r"""<!DOCTYPE html>
   .btn.primary:hover{background:#43698f;border-color:#557aa5}
   .btn:disabled{opacity:.5;cursor:not-allowed}
 
-  /* ---------- сцена ---------- */
   .stage{
     position:relative;
     width:100%;max-width:520px;
@@ -339,7 +354,6 @@ PAGE = r"""<!DOCTYPE html>
     padding:20px;
   }
 
-  /* ---------- поля ---------- */
   .input-wrap{position:relative;display:flex}
   .input-wrap + .input-wrap{margin-top:10px}
   .input-wrap .iw-icon{
@@ -370,7 +384,6 @@ PAGE = r"""<!DOCTYPE html>
 
   textarea.field{min-height:160px;resize:none;line-height:1.55;font-family:inherit}
 
-  /* ---------- drop ---------- */
   .drop{
     margin-top:10px;
     border:1px dashed var(--border-hi);
@@ -411,10 +424,19 @@ PAGE = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:#4a2020;border-color:#6a3030}
 
-  .row{display:flex;gap:8px;margin-top:16px;justify-content:flex-end;flex-wrap:wrap}
-  .row .btn{flex:0 1 auto;min-width:120px;padding:0 18px}
+  /* ---------- кнопки на всю ширину фрейма ---------- */
+  .row{
+    display:flex;
+    gap:8px;
+    margin-top:16px;
+    flex-wrap:nowrap;
+  }
+  .row .btn{
+    flex:1 1 0;
+    min-width:0;
+    padding:0 14px;
+  }
 
-  /* ---------- OTP ---------- */
   .otp-row{
     display:flex;
     gap:10px;
@@ -455,7 +477,6 @@ PAGE = r"""<!DOCTYPE html>
     cursor:pointer;
     -webkit-appearance:none;appearance:none;
     transition:background .12s ease,border-color .12s ease,color .12s ease;
-    position:relative;
   }
   .otp-copy svg{width:18px;height:18px;pointer-events:none}
   .otp-copy:hover:not(:disabled){
@@ -483,7 +504,6 @@ PAGE = r"""<!DOCTYPE html>
   .otp.shake{animation:shake .32s ease}
   .otp.shake .otp-cell{border-color:rgba(217,92,92,.7);background:rgba(217,92,92,.08)}
 
-  /* ---------- статусы ---------- */
   .center{text-align:center;padding:8px 0}
   .spinner{
     width:22px;height:22px;border-radius:50%;
@@ -500,13 +520,14 @@ PAGE = r"""<!DOCTYPE html>
     background:var(--panel-2);color:var(--text);
     line-height:1.5;border:1px solid var(--border);
     margin-top:12px;
+    word-break:break-word;
   }
   .msg:first-child{margin-top:0}
   .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px}
+  .msg span{min-width:0;word-break:break-word}
   .msg.err{background:rgba(217,92,92,.08);border-color:rgba(217,92,92,.35);color:#e8a8a8}
   .msg.ok{background:rgba(92,184,138,.08);border-color:rgba(92,184,138,.3);color:#a8dfc0}
 
-  /* ---------- пост ---------- */
   .post-title{
     margin:0 0 6px;
     font-size:17px;font-weight:600;line-height:1.3;
@@ -533,7 +554,6 @@ PAGE = r"""<!DOCTYPE html>
   }
   .post-gallery img:hover{border-color:var(--border-hi)}
 
-  /* ---------- лайтбокс ---------- */
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
@@ -611,7 +631,6 @@ PAGE = r"""<!DOCTYPE html>
     z-index:2;pointer-events:none;white-space:nowrap;
   }
 
-  /* ---------- модалка ---------- */
   .modal{
     position:fixed;inset:0;z-index:900;
     display:flex;align-items:center;justify-content:center;
@@ -651,14 +670,12 @@ PAGE = r"""<!DOCTYPE html>
   .modal-actions{display:flex;gap:8px}
   .modal-actions .btn{flex:1;height:38px;padding:0 12px;font-size:13px}
 
-  /* ---------- адаптив ---------- */
   @media (max-width:560px){
     .app{padding:40px 12px 40px;gap:16px}
     .menu{gap:8px}
     .btn{padding:0 12px;font-size:13px}
     .btn svg{width:14px;height:14px}
     .frame{padding:16px}
-    .row .btn{min-width:0;flex:1}
     .lb-prev{left:6px}
     .lb-next{right:6px}
     .lb-close{top:8px;right:8px}
@@ -856,7 +873,8 @@ PAGE = r"""<!DOCTYPE html>
       enterTitle: "Введите название поста.",
       notFound: "Пост не найден",
       networkError: "Ошибка сети: {msg}",
-      rejectedFiles: "{n} файл(ов) пропущено: только изображения и не больше {max}.",
+      httpError: "Ошибка {code}",
+      rejectedFiles: "Пропущено файлов: {n}. Разрешены только изображения и не больше {max}.",
       lbHint: "колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама"
     },
     en: {
@@ -883,7 +901,8 @@ PAGE = r"""<!DOCTYPE html>
       enterTitle: "Please enter a title.",
       notFound: "Post not found",
       networkError: "Network error: {msg}",
-      rejectedFiles: "{n} file(s) skipped: images only, max {max}.",
+      httpError: "Error {code}",
+      rejectedFiles: "Skipped files: {n}. Images only, max {max}.",
       lbHint: "wheel — zoom · RMB — 1×/2× · dblclick — reset · LMB — pan"
     }
   };
@@ -960,9 +979,35 @@ PAGE = r"""<!DOCTYPE html>
     d.className = "msg " + kind;
     d.innerHTML = (kind === "err" ? ICONS.error : ICONS.ok);
     const s = document.createElement("span");
-    s.textContent = text;
+    s.textContent = String(text == null ? "" : text);
     d.appendChild(s);
     return d;
+  }
+
+  /* ---------- красивое чтение ошибки из ответа ---------- */
+  async function readError(res) {
+    // 1) JSON с detail
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("application/json")) {
+      const data = await res.json().catch(() => null);
+      if (data) {
+        if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
+        if (Array.isArray(data.detail) && data.detail.length) {
+          // FastAPI 422
+          const first = data.detail[0] || {};
+          const loc = Array.isArray(first.loc) ? first.loc.filter(x => x !== "body").join(".") : "";
+          const msg = first.msg || "Invalid input";
+          return loc ? (loc + ": " + msg) : msg;
+        }
+        if (typeof data.message === "string" && data.message.trim()) return data.message;
+      }
+    }
+    // 2) текстом
+    const txt = await res.text().catch(() => "");
+    if (txt && txt.trim() && txt.length < 400) return txt.trim();
+    // 3) fallback — HTTP статус
+    const statusText = res.statusText ? (" — " + res.statusText) : "";
+    return t("httpError", { code: res.status }) + statusText;
   }
 
   function formatBytes(b) {
@@ -1043,7 +1088,14 @@ PAGE = r"""<!DOCTYPE html>
     else setTimeout(() => otpCells[0].focus(), 100);
   }
 
-  btnCreate.addEventListener("click", () => setMode("create"));
+  // Вкладка "Создать" — плюс сброс URL до дефолтного (без хэша)
+  btnCreate.addEventListener("click", () => {
+    if (window.location.hash) {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+    setMode("create");
+  });
+
   btnFind.addEventListener("click", () => setMode("find"));
 
   /* =========================================================
@@ -1145,8 +1197,13 @@ PAGE = r"""<!DOCTYPE html>
   function showCreateMsg(kind, text) {
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
+    // при появлении сообщения пересчитываем высоту сцены
+    requestAnimationFrame(() => syncHeight(false));
   }
-  function clearCreateMsg() { createMsg.innerHTML = ""; }
+  function clearCreateMsg() {
+    createMsg.innerHTML = "";
+    requestAnimationFrame(() => syncHeight(false));
+  }
 
   $("resetBtn").addEventListener("click", () => {
     titleInput.value = "";
@@ -1178,9 +1235,16 @@ PAGE = r"""<!DOCTYPE html>
 
     try {
       const res = await fetch("/api/posts", { method: "POST", body: fd });
-      const data = await res.json().catch(() => ({}));
+
       if (!res.ok) {
-        showCreateMsg("err", data.detail || "Error");
+        const msg = await readError(res);
+        showCreateMsg("err", msg);
+        return;
+      }
+
+      const data = await res.json().catch(() => null);
+      if (!data || !data.code) {
+        showCreateMsg("err", "Invalid server response");
         return;
       }
 
@@ -1547,7 +1611,7 @@ PAGE = r"""<!DOCTYPE html>
   lbViewport.addEventListener("touchend", () => { touchStartDist = 0; });
 
   /* =========================================================
-     Отрисовка поста (без чипа с кодом)
+     Отрисовка поста
      ========================================================= */
   function renderPost(post) {
     searchFrame.innerHTML = "";
@@ -1607,14 +1671,15 @@ PAGE = r"""<!DOCTYPE html>
       const res = await fetch("/api/posts/" + encodeURIComponent(code));
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        renderError(data.detail || t("notFound"));
+        const msg = await readError(res);
+        renderError(msg || t("notFound"));
         shakeOtp();
         setTimeout(clearOtp, 320);
         return;
       }
-      const post = await res.json();
+      const post = await res.json().catch(() => null);
       if (mySeq !== searchSeq) return;
+      if (!post) { renderError(t("notFound")); return; }
       renderPost(post);
     } catch (e) {
       if (mySeq !== searchSeq) return;
