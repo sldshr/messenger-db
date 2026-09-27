@@ -1,7 +1,6 @@
 """
 Sld-Networking — посты с 6-значным кодом.
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
-Автоперевод: MyMemory API.
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
 
@@ -10,12 +9,9 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import re
 import secrets
 import string
 import threading
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -76,83 +72,6 @@ def _unpack_meta(blob: bytes) -> dict:
     return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
 
 
-# ---------- автоперевод (MyMemory) ----------
-SUPPORTED_LANGS = {"ru", "en"}
-_translation_cache: Dict[str, str] = {}
-_translation_lock = threading.Lock()
-_MM_ENDPOINT = "https://api.mymemory.translated.net/get"
-_TRANSLATE_MAX = 450
-
-
-def _split_chunks(text: str, max_len: int = _TRANSLATE_MAX) -> List[str]:
-    if len(text) <= max_len:
-        return [text] if text else []
-    chunks, current = [], ""
-    parts = re.split(r'(?<=[.!?…])\s+|\n+', text)
-    for part in parts:
-        if not part:
-            continue
-        if len(part) > max_len:
-            if current:
-                chunks.append(current)
-                current = ""
-            for i in range(0, len(part), max_len):
-                chunks.append(part[i:i + max_len])
-            continue
-        if not current:
-            current = part
-        elif len(current) + 1 + len(part) <= max_len:
-            current = current + " " + part
-        else:
-            chunks.append(current)
-            current = part
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def _translate_one(text: str, source: str, target: str) -> str:
-    if not text.strip() or source == target:
-        return text
-    key = f"{source}|{target}|{text}"
-    with _translation_lock:
-        cached = _translation_cache.get(key)
-    if cached is not None:
-        return cached
-
-    try:
-        params = urllib.parse.urlencode({
-            "q": text,
-            "langpair": f"{source}|{target}",
-        })
-        req = urllib.request.Request(
-            _MM_ENDPOINT + "?" + params,
-            headers={"User-Agent": "Sld-Networking/1.0 (+translation)"},
-        )
-        with urllib.request.urlopen(req, timeout=6) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace"))
-        result = (data.get("responseData") or {}).get("translatedText") or text
-    except Exception:
-        result = text
-
-    with _translation_lock:
-        if len(_translation_cache) > 5000:
-            _translation_cache.clear()
-        _translation_cache[key] = result
-    return result
-
-
-def translate_text(text: str, target: str, source: str = "auto") -> str:
-    if not text or not text.strip():
-        return text
-    if source == target:
-        return text
-    chunks = _split_chunks(text)
-    if not chunks:
-        return text
-    return " ".join(_translate_one(c, source, target) for c in chunks)
-
-
 # ---------- память ----------
 _store: Dict[str, dict] = {}
 _lock = threading.Lock()
@@ -169,7 +88,7 @@ def _new_code() -> str:
             code = "".join(secrets.choice(string.digits) for _ in range(6))
             if code not in _store:
                 return code
-    raise HTTPException(503, "Хранилище переполнено")
+    raise HTTPException(503, "Storage overflow")
 
 
 # ---------- приложение ----------
@@ -228,14 +147,13 @@ async def create_post(
             "photos": photos,
             "created": created,
             "size": total,
-            "source_lang": None,   # определим при первом запросе перевода
         }
 
     return {"code": code, "compressed_bytes": total, "photos": len(photos)}
 
 
 @app.get("/api/posts/{code}")
-async def get_post(code: str, request: Request):
+async def get_post(code: str):
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
         raise HTTPException(400, "Code must be 6 digits")
@@ -255,20 +173,6 @@ async def get_post(code: str, request: Request):
         {"idx": i, "name": p["name"], "mime": p["mime"], "size": p["size"]}
         for i, p in enumerate(entry["photos"])
     ]
-
-    # Перевод на запрошенный язык
-    lang = (request.query_params.get("lang") or "").strip().lower()
-    if lang in SUPPORTED_LANGS:
-        src = entry.get("source_lang") or "auto"
-        if not meta.get("_translated_to") or meta.get("_translated_to") != lang:
-            try:
-                meta["title"] = translate_text(meta["title"], lang, src)
-                if meta.get("content"):
-                    meta["content"] = translate_text(meta["content"], lang, src)
-                meta["_translated_to"] = lang
-            except Exception:
-                pass
-
     return meta
 
 
@@ -343,8 +247,9 @@ PAGE = r"""<!DOCTYPE html>
   input::-moz-selection,textarea::-moz-selection{background:rgba(167,139,250,.45);color:#fff}
 
   :root{
-    --glass-bg:rgba(255,255,255,.055);
-    --glass-bg-hi:rgba(255,255,255,.10);
+    /* более плотная подложка — меньше визуального шума от blur */
+    --glass-bg:rgba(28,28,36,.55);
+    --glass-bg-hi:rgba(38,38,48,.65);
     --glass-border:rgba(255,255,255,.10);
     --glass-border-hi:rgba(255,255,255,.22);
     --text:#EDEDF2;
@@ -363,12 +268,12 @@ PAGE = r"""<!DOCTYPE html>
     font-size:14px;line-height:1.5;min-height:100%;overflow-x:hidden;
   }
 
+  /* фон — статичный, без анимаций, чтобы blur не «играл» */
   body::before{
     content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
     background:
-      radial-gradient(ellipse 70% 55% at 15% 5%, rgba(124,94,214,.35), transparent 65%),
-      radial-gradient(ellipse 65% 55% at 90% 95%, rgba(56,140,190,.30), transparent 65%),
-      radial-gradient(ellipse 90% 60% at 50% 50%, rgba(20,20,30,.6), transparent 80%),
+      radial-gradient(ellipse 70% 55% at 15% 5%, rgba(124,94,214,.30), transparent 65%),
+      radial-gradient(ellipse 65% 55% at 90% 95%, rgba(56,140,190,.26), transparent 65%),
       #0b0b10;
   }
 
@@ -379,6 +284,7 @@ PAGE = r"""<!DOCTYPE html>
     gap:22px;
   }
 
+  /* ---------- кнопки ---------- */
   .menu{
     display:flex;gap:12px;justify-content:center;align-items:stretch;
     flex-wrap:nowrap;width:100%;max-width:520px;
@@ -393,14 +299,17 @@ PAGE = r"""<!DOCTYPE html>
     color:var(--text);
     font:inherit;font-size:14.5px;font-weight:500;letter-spacing:.15px;
     cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent;
-    backdrop-filter:blur(18px) saturate(150%);
-    -webkit-backdrop-filter:blur(18px) saturate(150%);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 6px 20px rgba(0,0,0,.28);
+    backdrop-filter:blur(14px) saturate(140%);
+    -webkit-backdrop-filter:blur(14px) saturate(140%);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 6px 20px rgba(0,0,0,.28);
     transition:background .18s ease,border-color .18s ease,color .18s ease,transform .08s ease;
+    transform:translateZ(0);
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
   }
   .btn svg{width:18px;height:18px;flex-shrink:0;display:block}
   .btn:hover{background:var(--glass-bg-hi);border-color:var(--glass-border-hi)}
-  .btn:active{transform:scale(.98)}
+  .btn:active{transform:translateZ(0) scale(.98)}
   .btn.active{
     background:rgba(255,255,255,.92);color:#0b0b10;
     border-color:rgba(255,255,255,.95);
@@ -412,11 +321,18 @@ PAGE = r"""<!DOCTYPE html>
   }
   .btn.primary:hover{background:#fff}
 
+  /* ---------- сцена ---------- */
   .stage{
     position:relative;
     width:100%;max-width:520px;
     overflow:hidden;
     transition:height var(--dur) var(--ease-out);
+    /* изоляция графического контекста — убирает артефакты blur при трансформациях */
+    isolation:isolate;
+    contain:paint layout style;
+    transform:translateZ(0);
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
   }
   .stage[hidden]{display:none}
 
@@ -426,29 +342,48 @@ PAGE = r"""<!DOCTYPE html>
     display:flex;flex-direction:column;gap:12px;
     opacity:0;
     pointer-events:none;
-    transform:translateX(var(--enter-x,26px)) scale(.985);
+    /* translate3d — принудительно GPU-слой */
+    transform:translate3d(var(--enter-x,26px),0,0) scale(.985);
     transition:
-      opacity .32s cubic-bezier(.4,0,.2,1),
+      opacity .30s cubic-bezier(.4,0,.2,1),
       transform var(--dur) var(--ease-out);
     will-change:transform,opacity;
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
+    /* изолируем стек-контекст, чтобы blur соседней панели не протекал */
+    isolation:isolate;
   }
   .panel.active{
     position:relative;
     opacity:1;
     pointer-events:auto;
-    transform:translateX(0) scale(1);
+    transform:translate3d(0,0,0) scale(1);
   }
 
   .frame{
     border:1px solid var(--glass-border);
     border-radius:22px;
     background:var(--glass-bg);
-    backdrop-filter:blur(22px) saturate(160%);
-    -webkit-backdrop-filter:blur(22px) saturate(160%);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 14px 34px rgba(0,0,0,.32);
+    backdrop-filter:blur(16px) saturate(150%);
+    -webkit-backdrop-filter:blur(16px) saturate(150%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.09),
+      0 14px 34px rgba(0,0,0,.32);
     padding:22px;
+    transform:translateZ(0);
+    -webkit-backface-visibility:hidden;
+    backface-visibility:hidden;
+    /* не даём blur-слою «гулять» при перерисовке */
+    isolation:isolate;
   }
 
+  /* fallback, если браузер не поддерживает backdrop-filter */
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+    .frame{background:rgba(28,28,36,.88)}
+    .btn{background:rgba(28,28,36,.85)}
+  }
+
+  /* ---------- поля ---------- */
   .input-wrap{position:relative;display:flex}
   .input-wrap + .input-wrap{margin-top:12px}
   .input-wrap .iw-icon{
@@ -523,6 +458,7 @@ PAGE = r"""<!DOCTYPE html>
   .row{display:flex;gap:10px;margin-top:20px;justify-content:center;flex-wrap:wrap}
   .row .btn{flex:0 1 auto;min-width:130px;padding:0 22px}
 
+  /* ---------- OTP ---------- */
   .otp{display:flex;gap:8px;justify-content:center;align-items:center;margin:2px 0}
   .otp-cell{
     width:clamp(38px,11vw,50px);height:clamp(50px,13vw,60px);
@@ -555,6 +491,7 @@ PAGE = r"""<!DOCTYPE html>
   .otp.shake{animation:shake .34s ease}
   .otp.shake .otp-cell{border-color:rgba(200,90,90,.65);background:rgba(90,20,20,.15)}
 
+  /* ---------- статусы ---------- */
   .center{text-align:center;padding:10px 0}
   .spinner{
     width:26px;height:26px;border-radius:50%;
@@ -577,6 +514,7 @@ PAGE = r"""<!DOCTYPE html>
   .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
   .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
+  /* ---------- пост ---------- */
   .post-title{margin:0 0 10px;font-size:19px;font-weight:600;line-height:1.3;color:var(--text);word-break:break-word}
   .post-meta{font-size:12px;color:var(--text-dim);margin-bottom:14px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .post-body{font-size:14px;line-height:1.6;color:#d8d8de;white-space:pre-wrap;word-break:break-word}
@@ -598,12 +536,13 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:10px;padding:4px 10px;
   }
 
+  /* ---------- лайтбокс ---------- */
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
     background:rgba(6,6,10,.9);
-    backdrop-filter:blur(16px) saturate(140%);
-    -webkit-backdrop-filter:blur(16px) saturate(140%);
+    backdrop-filter:blur(14px) saturate(140%);
+    -webkit-backdrop-filter:blur(14px) saturate(140%);
     animation:lbIn .2s ease;
   }
   .lightbox[hidden]{display:none}
@@ -639,43 +578,42 @@ PAGE = r"""<!DOCTYPE html>
   .lb-btn{
     position:absolute;width:44px;height:44px;border-radius:50%;
     border:1px solid var(--glass-border);
-    background:rgba(255,255,255,.08);
+    background:rgba(28,28,36,.7);
     color:var(--text);
     display:flex;align-items:center;justify-content:center;
     cursor:pointer;z-index:2;
     backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
     transition:background .15s ease,transform .1s ease;
+    transform:translateZ(0);
   }
   .lb-btn svg{width:20px;height:20px;pointer-events:none}
-  .lb-btn:hover{background:rgba(255,255,255,.16)}
-  .lb-btn:active{transform:scale(.94)}
+  .lb-btn:hover{background:rgba(48,48,60,.85)}
+  .lb-btn:active{transform:translateZ(0) scale(.94)}
   .lb-btn[hidden]{display:none}
 
   .lb-close{top:18px;right:18px}
-  .lb-prev{left:18px;top:50%;transform:translateY(-50%)}
-  .lb-prev:active{transform:translateY(-50%) scale(.94)}
-  .lb-next{right:18px;top:50%;transform:translateY(-50%)}
-  .lb-next:active{transform:translateY(-50%) scale(.94)}
+  .lb-prev{left:18px;top:50%;transform:translateY(-50%) translateZ(0)}
+  .lb-prev:active{transform:translateY(-50%) translateZ(0) scale(.94)}
+  .lb-next{right:18px;top:50%;transform:translateY(-50%) translateZ(0)}
+  .lb-next:active{transform:translateY(-50%) translateZ(0) scale(.94)}
 
   .lb-counter{
     position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
     padding:6px 14px;border-radius:100px;
-    background:rgba(255,255,255,.10);border:1px solid var(--glass-border);
+    background:rgba(28,28,36,.75);border:1px solid var(--glass-border);
     font-size:13px;color:var(--text);
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     letter-spacing:1px;
-    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
     z-index:2;pointer-events:none;
   }
 
   .lb-zoom-badge{
     position:absolute;top:18px;left:18px;
     padding:5px 12px;border-radius:100px;
-    background:rgba(255,255,255,.10);border:1px solid var(--glass-border);
+    background:rgba(28,28,36,.75);border:1px solid var(--glass-border);
     font-size:12px;color:var(--text);
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     letter-spacing:1px;
-    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
     z-index:2;pointer-events:none;
     opacity:0;transition:opacity .15s ease;
   }
@@ -687,6 +625,7 @@ PAGE = r"""<!DOCTYPE html>
     z-index:2;pointer-events:none;white-space:nowrap;
   }
 
+  /* ---------- модалка ---------- */
   .modal{
     position:fixed;inset:0;z-index:900;
     display:flex;align-items:center;justify-content:center;
@@ -702,16 +641,17 @@ PAGE = r"""<!DOCTYPE html>
     padding:26px 24px;
     border:1px solid var(--glass-border);
     border-radius:22px;
-    background:rgba(28,28,36,.92);
-    backdrop-filter:blur(22px) saturate(160%);
-    -webkit-backdrop-filter:blur(22px) saturate(160%);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 20px 50px rgba(0,0,0,.5);
+    background:rgba(28,28,36,.94);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.09),
+      0 20px 50px rgba(0,0,0,.5);
     text-align:center;
     animation:modalIn .32s var(--ease-out);
+    transform:translateZ(0);
   }
   @keyframes modalIn{
-    from{opacity:0;transform:translateY(12px) scale(.95)}
-    to{opacity:1;transform:none}
+    from{opacity:0;transform:translateY(12px) scale(.95) translateZ(0)}
+    to{opacity:1;transform:translateY(0) scale(1) translateZ(0)}
   }
 
   .modal-icon{
@@ -763,11 +703,11 @@ PAGE = r"""<!DOCTYPE html>
   <nav class="menu">
     <button class="btn" id="btnCreate" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-      <span class="btn-label" data-i18n="createPost">Создать пост</span>
+      <span class="btn-label" data-i18n="createPost">Create post</span>
     </button>
     <button class="btn" id="btnFind" type="button">
       <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-      <span class="btn-label" data-i18n="findPost">Найти пост</span>
+      <span class="btn-label" data-i18n="findPost">Find post</span>
     </button>
   </nav>
 
@@ -777,14 +717,14 @@ PAGE = r"""<!DOCTYPE html>
       <section class="frame">
         <div class="input-wrap">
           <input class="field" id="title" type="text" maxlength="120" autocomplete="off" spellcheck="false"
-                 placeholder="Название" data-i18n-ph="titlePh">
+                 placeholder="Title" data-i18n-ph="titlePh">
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
           </svg>
         </div>
 
         <div class="input-wrap textarea-wrap">
-          <textarea class="field" id="content" placeholder="Содержимое" data-i18n-ph="contentPh"></textarea>
+          <textarea class="field" id="content" placeholder="Content" data-i18n-ph="contentPh"></textarea>
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 6h16M4 12h16M4 18h10"/>
           </svg>
@@ -796,8 +736,8 @@ PAGE = r"""<!DOCTYPE html>
             <circle cx="9" cy="9" r="2"/>
             <path d="M21 15l-5-5L5 21"/>
           </svg>
-          <div class="drop-label" id="dropLabel" data-i18n="dropLabel">Нажмите или перетащите фото</div>
-          <div class="drop-hint" data-i18n="dropHint">до 5 фото · Ctrl+V — вставить из буфера</div>
+          <div class="drop-label" id="dropLabel" data-i18n="dropLabel">Click or drop photos</div>
+          <div class="drop-hint" data-i18n="dropHint">up to 5 photos · Ctrl+V to paste</div>
         </div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
@@ -807,13 +747,13 @@ PAGE = r"""<!DOCTYPE html>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
               <path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>
             </svg>
-            <span data-i18n="publish">Опубликовать</span>
+            <span data-i18n="publish">Publish</span>
           </button>
           <button class="btn" id="resetBtn" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px">
               <path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
             </svg>
-            <span data-i18n="clear">Очистить</span>
+            <span data-i18n="clear">Clear</span>
           </button>
         </div>
 
@@ -846,8 +786,8 @@ PAGE = r"""<!DOCTYPE html>
         <path d="M20 6L9 17l-5-5"/>
       </svg>
     </div>
-    <h3 class="modal-title" data-i18n="postCreated">Пост создан</h3>
-    <p class="modal-sub" data-i18n="postCreatedSub">Сохраните код — по нему можно найти пост в любое время</p>
+    <h3 class="modal-title" data-i18n="postCreated">Post created</h3>
+    <p class="modal-sub" data-i18n="postCreatedSub">Save the code — you can find the post anytime with it</p>
     <div class="modal-code" id="modalCode">000000</div>
     <div class="modal-hint" id="modalHint"></div>
     <div class="modal-actions">
@@ -856,9 +796,9 @@ PAGE = r"""<!DOCTYPE html>
           <rect x="9" y="9" width="13" height="13" rx="2"/>
           <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
         </svg>
-        <span data-i18n="copy">Копировать</span>
+        <span data-i18n="copy">Copy</span>
       </button>
-      <button class="btn primary" id="modalCloseBtn" type="button" data-i18n="done">Готово</button>
+      <button class="btn primary" id="modalCloseBtn" type="button" data-i18n="done">Done</button>
     </div>
   </div>
 </div>
@@ -886,7 +826,7 @@ PAGE = r"""<!DOCTYPE html>
     </svg>
   </button>
   <div class="lb-counter" id="lbCounter">1 / 1</div>
-  <div class="lb-hint" data-i18n="lbHint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
+  <div class="lb-hint" data-i18n="lbHint">wheel — zoom · RMB — 1×/2× · dblclick — reset · LMB — pan</div>
 </div>
 
 <script>
@@ -981,16 +921,12 @@ PAGE = r"""<!DOCTYPE html>
       if (txt) el.placeholder = txt;
     });
 
-    // динамика
     dropLabel.textContent = defaultDropLabel();
     if (modalHint && modalHint.dataset.size) {
       modalHint.textContent = t("memoryUsage", { size: modalHint.dataset.size });
     }
   }
 
-  /* =========================================================
-     Определение языка: URL → navigator → en
-     ========================================================= */
   function parseHash() {
     const h = (window.location.hash || "").replace(/^#/, "");
     if (!h) return { code: null, lang: null };
@@ -1259,7 +1195,6 @@ PAGE = r"""<!DOCTYPE html>
 
       const code = data.code;
 
-      // отражаем код в URL (без перезагрузки)
       const newHash = "#" + code + "?lang=" + currentLang;
       if (window.location.hash !== newHash) {
         history.replaceState(null, "", newHash);
@@ -1290,11 +1225,9 @@ PAGE = r"""<!DOCTYPE html>
   const modalCloseBtn = $("modalCloseBtn");
 
   let modalCopyTimer = null;
-  let modalSizeValue = null;
 
   function showCreatedModal(code, bytes) {
     modalCode.textContent = code;
-    modalSizeValue = bytes;
     modalHint.dataset.size = formatBytes(bytes);
     modalHint.textContent = t("memoryUsage", { size: formatBytes(bytes) });
     const label = modalCopyBtn.querySelector("span");
@@ -1443,7 +1376,7 @@ PAGE = r"""<!DOCTYPE html>
   let badgeTimer = null;
 
   function applyTransform() {
-    lbTransform.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    lbTransform.style.transform = `translate3d(${panX}px, ${panY}px, 0) scale(${zoom})`;
     lbViewport.style.cursor = (zoom > 1.001) ? (isPanning ? "grabbing" : "grab") : "default";
   }
 
@@ -1659,8 +1592,7 @@ PAGE = r"""<!DOCTYPE html>
     if (mySeq !== searchSeq) return;
 
     try {
-      const url = "/api/posts/" + encodeURIComponent(code) + "?lang=" + encodeURIComponent(currentLang);
-      const res = await fetch(url);
+      const res = await fetch("/api/posts/" + encodeURIComponent(code));
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -1686,34 +1618,24 @@ PAGE = r"""<!DOCTYPE html>
   function initFromUrl() {
     const { code, lang } = parseHash();
     const targetLang = lang || detectLang();
-
-    if (targetLang !== currentLang) {
-      applyI18n(targetLang);
-    } else {
-      applyI18n(currentLang);
-    }
+    applyI18n(targetLang);
 
     if (code) {
-      // открыть поиск, вписать код, запустить поиск
       setMode("find", true);
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
       lastSubmitted = code;
       runSearch(code);
     } else {
-      // по умолчанию — создание поста
       setMode("create", true);
     }
   }
 
-  // Запуск
   initFromUrl();
 
-  // hashchange — если пользователь поменял URL вручную
   window.addEventListener("hashchange", () => {
     const { code, lang } = parseHash();
     if (lang && lang !== currentLang) {
       applyI18n(lang);
-      // если открыт пост — перезапросить с новым языком
       if (mode === "find" && getCode().length === 6) {
         lastSubmitted = "";
         runSearch(getCode());
