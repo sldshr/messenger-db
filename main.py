@@ -124,8 +124,11 @@ async def stats():
 FAVICON = (
     "data:image/svg+xml,"
     "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-    "%3Crect width='32' height='32' rx='8' fill='%231B1B1F'/%3E"
-    "%3Cg fill='none' stroke='%23E5E5E8' stroke-width='1.7' stroke-linecap='round'%3E"
+    "%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E"
+    "%3Cstop offset='0' stop-color='%23a78bfa'/%3E"
+    "%3Cstop offset='1' stop-color='%2338bdf8'/%3E%3C/linearGradient%3E%3C/defs%3E"
+    "%3Crect width='32' height='32' rx='8' fill='%230b0b10'/%3E"
+    "%3Cg fill='none' stroke='url(%23g)' stroke-width='1.8' stroke-linecap='round'%3E"
     "%3Ccircle cx='16' cy='10' r='3'/%3E"
     "%3Ccircle cx='10' cy='22' r='3'/%3E"
     "%3Ccircle cx='22' cy='22' r='3'/%3E"
@@ -137,120 +140,165 @@ PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="theme-color" content="#0b0b10">
 <title>Sld-Networking</title>
 <link rel="icon" href="__FAVICON__">
 <style>
-  *{box-sizing:border-box}
+  *,*::before,*::after{box-sizing:border-box}
+
+  /* прячем скроллбары, но скролл оставляем */
   ::-webkit-scrollbar{width:0;height:0;display:none}
   *{scrollbar-width:none;-ms-overflow-style:none}
 
   :root{
-    --bg:#131316;
-    --surface:#1B1B1F;
-    --s-cont:#1F1F23;
-    --s-cont-high:#29292E;
-    --s-cont-highest:#34343A;
-    --outline:#46464D;
-    --outline-v:#2E2E34;
-    --on-surface:#E5E5E8;
-    --on-surface-v:#A8A8B0;
-    --danger:#E28A8A;
-    --ok:#9ED2AE;
+    --glass-bg:rgba(255,255,255,.06);
+    --glass-bg-hi:rgba(255,255,255,.10);
+    --glass-border:rgba(255,255,255,.10);
+    --glass-border-hi:rgba(255,255,255,.18);
+    --glass-highlight:rgba(255,255,255,.14);
+    --text:#EDEDF2;
+    --text-dim:#9A9AA6;
+    --text-mute:#61616E;
+    --danger:#F0A0A0;
+    --ok:#9BDCB0;
   }
 
   html,body{
-    margin:0;padding:0;background:var(--bg);color:var(--on-surface);
-    font-family:'Roboto',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,Roboto,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;font-size:14px;line-height:1.5;
+    margin:0;padding:0;
+    background:#0b0b10;
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,"Helvetica Neue",Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    font-size:14px;
+    line-height:1.5;
+    min-height:100%;
+    overflow-x:hidden;
+  }
+
+  /* ---------- фон (статичный, дешёвый) ---------- */
+  body::before{
+    content:"";
+    position:fixed;inset:0;z-index:-1;pointer-events:none;
+    background:
+      radial-gradient(ellipse 70% 55% at 15% 5%, rgba(124,94,214,.35), transparent 65%),
+      radial-gradient(ellipse 65% 55% at 90% 95%, rgba(56,140,190,.30), transparent 65%),
+      radial-gradient(ellipse 90% 60% at 50% 50%, rgba(20,20,30,.6), transparent 80%),
+      #0b0b10;
   }
 
   /* ---------- каркас ---------- */
   .app{
-    min-height:100vh;
     min-height:100dvh;
     display:flex;
     flex-direction:column;
     align-items:center;
-    justify-content:center;
-    padding:24px 16px;
-    gap:20px;
+    padding:clamp(44px,10vh,110px) 16px 48px;
+    gap:24px;
   }
 
+  /* ---------- кнопки ---------- */
   .menu{
     display:flex;
     gap:12px;
     justify-content:center;
-    flex-wrap:wrap;
+    align-items:stretch;
+    flex-wrap:nowrap;
+    width:100%;
+    max-width:520px;
   }
 
-  /* ---------- кнопки (Material 3 tonal) ---------- */
   .btn{
+    flex:1 1 0;
+    min-width:0;
+    height:52px;                 /* одинаковая высота у обеих */
     display:inline-flex;
     align-items:center;
     justify-content:center;
-    gap:10px;
-    padding:14px 26px;
-    min-height:52px;
-    border:none;
+    gap:9px;
+    padding:0 20px;
+
+    border:1px solid var(--glass-border);
     border-radius:100px;
-    background:var(--s-cont-high);
-    color:var(--on-surface);
+    background:var(--glass-bg);
+    color:var(--text);
     font:inherit;
     font-size:14.5px;
     font-weight:500;
     letter-spacing:.15px;
     cursor:pointer;
     user-select:none;
-    transition:background .15s ease,color .15s ease,transform .08s ease;
-    box-shadow:0 1px 2px rgba(0,0,0,.25);
+    -webkit-tap-highlight-color:transparent;
+
+    backdrop-filter:blur(18px) saturate(150%);
+    -webkit-backdrop-filter:blur(18px) saturate(150%);
+
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.10),
+      0 6px 20px rgba(0,0,0,.28);
+
+    transition:background .18s ease,border-color .18s ease,color .18s ease,transform .08s ease;
   }
-  .btn:hover{background:var(--s-cont-highest)}
+  .btn svg{width:18px;height:18px;flex-shrink:0;display:block}
+  .btn:hover{background:var(--glass-bg-hi);border-color:var(--glass-border-hi)}
   .btn:active{transform:scale(.98)}
-  .btn.active{background:var(--on-surface);color:var(--bg)}
-  .btn svg{width:20px;height:20px;flex-shrink:0;display:block}
-  .btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+  .btn.active{
+    background:rgba(255,255,255,.92);
+    color:#0b0b10;
+    border-color:rgba(255,255,255,.95);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.6),
+      0 6px 22px rgba(255,255,255,.10);
+  }
 
   /* ---------- панели ---------- */
   .panel{
     width:100%;
     max-width:520px;
-    background:var(--s-cont);
+    padding:22px;
+
+    border:1px solid var(--glass-border);
     border-radius:24px;
-    padding:24px;
-    animation:fade .18s ease;
+    background:var(--glass-bg);
+    backdrop-filter:blur(22px) saturate(160%);
+    -webkit-backdrop-filter:blur(22px) saturate(160%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.09),
+      0 18px 45px rgba(0,0,0,.35);
+
+    animation:panelIn .22s cubic-bezier(.2,.9,.3,1);
   }
   .panel[hidden]{display:none}
-  @keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-
-  /* ---------- поля ввода ---------- */
-  .label{
-    display:block;
-    font-size:12.5px;
-    font-weight:500;
-    color:var(--on-surface-v);
-    margin:18px 0 8px;
-    letter-spacing:.15px;
+  @keyframes panelIn{
+    from{opacity:0;transform:translateY(-8px) scale(.98)}
+    to{opacity:1;transform:none}
   }
-  .label:first-child{margin-top:0}
 
+  /* ---------- поля ---------- */
   .field{
     width:100%;
-    background:transparent;
-    border:1px solid var(--outline);
+    background:rgba(255,255,255,.04);
+    border:1px solid var(--glass-border);
     border-radius:14px;
-    padding:14px 16px;
-    color:var(--on-surface);
+    padding:13px 16px;
+    color:var(--text);
     font:inherit;
-    font-size:15px;
+    font-size:14.5px;
     outline:none;
-    transition:border-color .15s ease;
+    transition:border-color .15s ease,background .15s ease;
+    -webkit-appearance:none;
+    appearance:none;
   }
-  .field::placeholder{color:var(--on-surface-v);opacity:.55}
-  .field:focus{border-color:var(--on-surface-v)}
+  .field + .field{margin-top:12px}
+  .field::placeholder{color:var(--text-mute)}
+  .field:focus{
+    border-color:var(--glass-border-hi);
+    background:rgba(255,255,255,.07);
+  }
 
   textarea.field{
-    min-height:130px;
+    min-height:132px;
     resize:vertical;
     line-height:1.55;
     font-family:inherit;
@@ -258,23 +306,32 @@ PAGE = r"""<!DOCTYPE html>
 
   /* ---------- фото ---------- */
   .drop{
-    border:1px dashed var(--outline);
+    margin-top:12px;
+    border:1px dashed rgba(255,255,255,.18);
     border-radius:14px;
-    padding:22px 16px;
+    padding:20px 16px;
     text-align:center;
-    color:var(--on-surface-v);
+    color:var(--text-dim);
     font-size:13.5px;
     cursor:pointer;
-    background:var(--surface);
+    background:rgba(255,255,255,.02);
     line-height:1.6;
-    transition:border-color .15s ease,color .15s ease;
+    transition:border-color .15s ease,color .15s ease,background .15s ease;
   }
-  .drop:hover{border-color:var(--on-surface-v);color:var(--on-surface)}
-  .drop.filled{border-style:solid}
+  .drop:hover{
+    border-color:rgba(255,255,255,.32);
+    color:var(--text);
+    background:rgba(255,255,255,.05);
+  }
+  .drop.filled{
+    border-style:solid;
+    border-color:rgba(255,255,255,.25);
+    color:var(--text);
+  }
 
   .previews{
     display:grid;
-    grid-template-columns:repeat(auto-fill,minmax(80px,1fr));
+    grid-template-columns:repeat(auto-fill,minmax(76px,1fr));
     gap:8px;
     margin-top:12px;
   }
@@ -283,91 +340,121 @@ PAGE = r"""<!DOCTYPE html>
     aspect-ratio:1/1;
     border-radius:12px;
     overflow:hidden;
-    background:var(--surface);
+    background:rgba(255,255,255,.04);
+    border:1px solid var(--glass-border);
   }
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
   .preview button{
     position:absolute;top:4px;right:4px;
-    width:22px;height:22px;border-radius:50%;
-    border:none;background:rgba(19,19,22,.85);color:var(--on-surface);
-    font-size:13px;line-height:1;cursor:pointer;
+    width:22px;height:22px;
+    border-radius:50%;
+    border:1px solid rgba(255,255,255,.15);
+    background:rgba(10,10,14,.72);
+    color:var(--text);
+    font-size:13px;line-height:1;
+    cursor:pointer;
     display:flex;align-items:center;justify-content:center;
+    -webkit-backdrop-filter:blur(8px);
+    backdrop-filter:blur(8px);
   }
-  .preview button:hover{background:rgba(70,26,26,.95)}
+  .preview button:hover{background:rgba(70,26,26,.9)}
 
   .row{
     display:flex;
     gap:10px;
-    margin-top:22px;
-    flex-wrap:wrap;
+    margin-top:20px;
     justify-content:center;
+    flex-wrap:wrap;
   }
+  .row .btn{flex:0 1 auto;min-width:130px;padding:0 22px}
 
-  /* ---------- поле кода ---------- */
-  .code-field{
-    width:100%;
+  /* ---------- OTP ---------- */
+  .otp{
+    display:flex;
+    gap:8px;
+    justify-content:center;
+    align-items:center;
+    margin:2px 0;
+  }
+  .otp-cell{
+    width:clamp(38px,11vw,50px);
+    height:clamp(50px,13vw,60px);
+    padding:0;
     text-align:center;
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    font-size:34px;
+    font-size:clamp(18px,5vw,22px);
     font-weight:600;
-    letter-spacing:14px;
-    text-indent:14px;
-    background:transparent;
-    border:1px solid var(--outline);
-    border-radius:18px;
-    padding:16px 10px;
-    color:var(--on-surface);
+    color:var(--text);
+    background:rgba(255,255,255,.05);
+    border:1.5px solid var(--glass-border);
+    border-radius:14px;
     outline:none;
-    transition:border-color .15s ease;
+    caret-color:transparent;
+    -webkit-appearance:none;
+    appearance:none;
+    transition:background .15s ease,border-color .15s ease,transform .1s ease,box-shadow .15s ease;
+    -webkit-tap-highlight-color:transparent;
   }
-  .code-field:focus{border-color:var(--on-surface-v)}
-  .code-field::placeholder{color:var(--outline);letter-spacing:14px}
+  .otp-cell:hover{background:rgba(255,255,255,.08)}
+  .otp-cell:focus{
+    background:rgba(255,255,255,.11);
+    border-color:rgba(255,255,255,.55);
+    box-shadow:0 0 0 3px rgba(255,255,255,.08);
+    transform:translateY(-1px);
+  }
 
   @keyframes shake{
     0%,100%{transform:translateX(0)}
-    20%{transform:translateX(-9px)}
-    40%{transform:translateX(9px)}
-    60%{transform:translateX(-6px)}
-    80%{transform:translateX(6px)}
+    20%{transform:translateX(-8px)}
+    40%{transform:translateX(8px)}
+    60%{transform:translateX(-5px)}
+    80%{transform:translateX(5px)}
   }
-  .shake{animation:shake .34s ease;border-color:#6a2a2a !important}
+  .otp.shake{animation:shake .34s ease}
+  .otp.shake .otp-cell{
+    border-color:rgba(200,90,90,.65);
+    background:rgba(90,20,20,.15);
+  }
 
   /* ---------- статусы ---------- */
-  #searchState,#createMsg{margin-top:4px}
-  .center{text-align:center;padding:20px 0}
+  #searchState,#createMsg{margin-top:14px}
+  .center{text-align:center;padding:16px 0}
   .spinner{
     width:26px;height:26px;border-radius:50%;
-    border:2.5px solid var(--outline);
-    border-top-color:var(--on-surface);
+    border:2.5px solid rgba(255,255,255,.12);
+    border-top-color:rgba(255,255,255,.75);
     animation:spin .7s linear infinite;
     margin:0 auto;
   }
   @keyframes spin{to{transform:rotate(360deg)}}
-  .spinner-label{margin-top:10px;font-size:12.5px;color:var(--on-surface-v);text-align:center}
+  .spinner-label{margin-top:10px;font-size:12.5px;color:var(--text-dim);text-align:center}
 
   .msg{
     border-radius:14px;
     padding:12px 16px;
     font-size:13.5px;
-    margin-top:14px;
-    background:var(--s-cont-high);
-    color:var(--on-surface);
+    background:rgba(255,255,255,.05);
+    color:var(--text);
     line-height:1.5;
+    border:1px solid var(--glass-border);
   }
-  .msg.err{background:#2A1B1B;color:var(--danger)}
-  .msg.ok{background:#16201A;color:var(--ok)}
+  .msg.err{background:rgba(120,40,40,.18);border-color:rgba(200,90,90,.28);color:var(--danger)}
+  .msg.ok{background:rgba(30,80,50,.18);border-color:rgba(120,200,150,.25);color:var(--ok)}
 
   .result{
-    margin-top:16px;
-    background:var(--s-cont-high);
-    border-radius:18px;
+    margin-top:14px;
     padding:20px;
-    animation:fade .18s ease;
+    border-radius:18px;
+    background:rgba(255,255,255,.05);
+    border:1px solid var(--glass-border);
+    animation:panelIn .2s cubic-bezier(.2,.9,.3,1);
   }
-  .result h3{margin:0 0 10px;font-size:18px;font-weight:600;line-height:1.3}
-  .result .meta{font-size:12px;color:var(--on-surface-v);margin-bottom:14px;
-    display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-  .result .body{font-size:14px;line-height:1.6;color:#d5d5da;white-space:pre-wrap;word-break:break-word}
+  .result h3{margin:0 0 10px;font-size:18px;font-weight:600;line-height:1.3;color:var(--text)}
+  .result .meta{
+    font-size:12px;color:var(--text-dim);margin-bottom:14px;
+    display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+  }
+  .result .body{font-size:14px;line-height:1.6;color:#d8d8de;white-space:pre-wrap;word-break:break-word}
   .result .gallery{
     display:grid;
     grid-template-columns:repeat(auto-fill,minmax(110px,1fr));
@@ -375,14 +462,18 @@ PAGE = r"""<!DOCTYPE html>
   }
   .result .gallery img{
     width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:12px;
-    cursor:zoom-in;background:var(--surface);
+    cursor:zoom-in;background:rgba(255,255,255,.04);
+    border:1px solid var(--glass-border);
+    transition:transform .15s ease;
   }
+  .result .gallery img:hover{transform:scale(1.02)}
 
   .code-chip{
     display:inline-flex;align-items:center;
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
-    font-size:13px;letter-spacing:3px;color:var(--on-surface-v);
-    background:var(--surface);
+    font-size:13px;letter-spacing:3px;color:var(--text);
+    background:rgba(255,255,255,.06);
+    border:1px solid var(--glass-border);
     border-radius:10px;
     padding:4px 10px;
   }
@@ -390,22 +481,24 @@ PAGE = r"""<!DOCTYPE html>
     font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     font-size:38px;font-weight:700;
     letter-spacing:12px;text-indent:12px;
-    text-align:center;color:var(--on-surface);
+    text-align:center;color:var(--text);
     margin:10px 0 4px;
   }
-  .hint{font-size:12px;color:var(--on-surface-v);text-align:center;margin-top:4px}
+  .hint{font-size:12px;color:var(--text-dim);text-align:center;margin-top:4px}
 
   /* ---------- адаптив ---------- */
   @media (max-width:560px){
-    .app{padding:20px 14px;gap:16px}
-    .menu{flex-direction:column;width:100%;max-width:420px}
-    .menu .btn{width:100%}
-    .panel{padding:20px;border-radius:20px}
-    .code-field{font-size:26px;letter-spacing:11px;text-indent:11px}
+    .app{padding:44px 14px 40px;gap:18px}
+    .menu{gap:10px}
+    .btn{padding:0 14px;font-size:14px}
+    .btn svg{width:16px;height:16px}
+    .panel{padding:18px;border-radius:20px}
     .big-code{font-size:30px;letter-spacing:9px;text-indent:9px}
+    .row .btn{min-width:0;flex:1}
   }
-  @media (min-width:900px){
-    .panel{max-width:560px;padding:28px}
+  @media (max-width:380px){
+    .btn span{display:none}
+    .btn{padding:0 12px}
   }
 </style>
 </head>
@@ -426,14 +519,10 @@ PAGE = r"""<!DOCTYPE html>
 
   <!-- ================= СОЗДАНИЕ ================= -->
   <section class="panel" id="createPanel" hidden>
-    <label class="label" for="title">Название</label>
-    <input class="field" id="title" type="text" maxlength="120" placeholder="Например: Отчёт за неделю" autocomplete="off">
+    <input class="field" id="title" type="text" maxlength="120" placeholder="Название" autocomplete="off">
+    <textarea class="field" id="content" placeholder="Содержимое"></textarea>
 
-    <label class="label" for="content">Содержимое</label>
-    <textarea class="field" id="content" placeholder="Введите текст поста..."></textarea>
-
-    <label class="label">Фотографии — до 5 шт.</label>
-    <div class="drop" id="drop">Нажмите, чтобы выбрать фото</div>
+    <div class="drop" id="drop">Нажмите или перетащите фото (до 5)</div>
     <input type="file" id="fileInput" accept="image/*" multiple hidden>
     <div class="previews" id="previews"></div>
 
@@ -447,8 +536,14 @@ PAGE = r"""<!DOCTYPE html>
 
   <!-- ================= ПОИСК ================= -->
   <section class="panel" id="findPanel" hidden>
-    <input class="code-field" id="codeInput" inputmode="numeric" autocomplete="off"
-           maxlength="6" placeholder="––––––">
+    <div class="otp" id="otp" autocomplete="off">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 1">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 2">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 3">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 4">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 5">
+      <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="цифра 6">
+    </div>
     <div id="searchState"></div>
   </section>
 
@@ -464,7 +559,7 @@ PAGE = r"""<!DOCTYPE html>
   const btnCreate   = $("btnCreate");
   const btnFind     = $("btnFind");
 
-  /* ---------- переключение панелей (tab-режим) ---------- */
+  /* ---------- переключение панелей (tab) ---------- */
   function closeAll() {
     createPanel.hidden = true;
     findPanel.hidden   = true;
@@ -488,7 +583,7 @@ PAGE = r"""<!DOCTYPE html>
     if (willOpen) {
       findPanel.hidden = false;
       btnFind.classList.add("active");
-      setTimeout(() => codeInput.focus(), 0);
+      setTimeout(() => otpCells[0].focus(), 0);
     }
   });
 
@@ -505,7 +600,7 @@ PAGE = r"""<!DOCTYPE html>
   const submitBtn = $("submitBtn");
 
   drop.addEventListener("click", () => fileInput.click());
-  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "#5c5c66"; });
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.style.borderColor = "rgba(255,255,255,.4)"; });
   drop.addEventListener("dragleave", () => { drop.style.borderColor = ""; });
   drop.addEventListener("drop", (e) => {
     e.preventDefault(); drop.style.borderColor = "";
@@ -543,8 +638,8 @@ PAGE = r"""<!DOCTYPE html>
     });
     drop.classList.toggle("filled", selectedFiles.length > 0);
     drop.textContent = selectedFiles.length
-      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS + " — нажмите, чтобы добавить ещё"
-      : "Нажмите, чтобы выбрать фото";
+      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
+      : "Нажмите или перетащите фото (до 5)";
   }
 
   function showCreateMsg(kind, text) {
@@ -572,6 +667,7 @@ PAGE = r"""<!DOCTYPE html>
     selectedFiles.forEach((f) => fd.append("files", f, f.name));
 
     submitBtn.disabled = true;
+    const oldLabel = submitBtn.textContent;
     submitBtn.textContent = "Публикация...";
     clearCreateMsg();
 
@@ -582,7 +678,7 @@ PAGE = r"""<!DOCTYPE html>
 
       createMsg.innerHTML = "";
       const ok = document.createElement("div");
-      ok.className = "msg ok"; ok.textContent = "Пост создан и зашифрован. Сохраните код:";
+      ok.className = "msg ok"; ok.textContent = "Пост создан. Сохраните код:";
       createMsg.appendChild(ok);
 
       const code = document.createElement("div");
@@ -595,16 +691,16 @@ PAGE = r"""<!DOCTYPE html>
 
       const row = document.createElement("div"); row.className = "row";
       const copyBtn = document.createElement("button");
-      copyBtn.className = "btn"; copyBtn.type = "button"; copyBtn.textContent = "Скопировать код";
+      copyBtn.className = "btn"; copyBtn.type = "button"; copyBtn.textContent = "Скопировать";
       copyBtn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(data.code);
-          copyBtn.textContent = "Скопировано";
-          setTimeout(() => (copyBtn.textContent = "Скопировать код"), 1500);
-        } catch { copyBtn.textContent = "Не удалось"; }
+          copyBtn.textContent = "Готово";
+          setTimeout(() => (copyBtn.textContent = "Скопировать"), 1500);
+        } catch { copyBtn.textContent = "Ошибка"; }
       });
       const againBtn = document.createElement("button");
-      againBtn.className = "btn"; againBtn.type = "button"; againBtn.textContent = "Создать ещё";
+      againBtn.className = "btn"; againBtn.type = "button"; againBtn.textContent = "Ещё";
       againBtn.addEventListener("click", () => $("resetBtn").click());
       row.append(copyBtn, againBtn); createMsg.appendChild(row);
 
@@ -614,40 +710,97 @@ PAGE = r"""<!DOCTYPE html>
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
       submitBtn.disabled = false;
-      submitBtn.textContent = "Опубликовать";
+      submitBtn.textContent = oldLabel;
     }
   });
 
   /* =========================================================
-     ПОИСК ПО КОДУ
+     ПОИСК ПО 6-ЗНАЧНОМУ КОДУ (OTP-инпут)
      ========================================================= */
-  const codeInput   = $("codeInput");
+  const otp       = $("otp");
+  const otpCells  = Array.from(document.querySelectorAll(".otp-cell"));
   const searchState = $("searchState");
   let searchSeq = 0;
+  let lastSubmitted = "";
 
-  codeInput.addEventListener("input", () => {
-    const cleaned = codeInput.value.replace(/\D/g, "").slice(0, 6);
-    if (cleaned !== codeInput.value) codeInput.value = cleaned;
-    if (cleaned.length === 6) runSearch(cleaned);
-    else { searchSeq++; searchState.innerHTML = ""; }
-  });
-  codeInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && codeInput.value.length === 6) runSearch(codeInput.value);
-  });
+  function getCode() { return otpCells.map(c => c.value).join(""); }
 
-  function triggerShakeAndClear() {
-    codeInput.value = "";
-    codeInput.classList.remove("shake");
-    void codeInput.offsetWidth;
-    codeInput.classList.add("shake");
-    setTimeout(() => codeInput.classList.remove("shake"), 400);
+  function clearOtp() {
+    otpCells.forEach(c => c.value = "");
+    otpCells[0].focus();
+    lastSubmitted = "";
   }
+
+  function shakeOtp() {
+    otp.classList.remove("shake");
+    void otp.offsetWidth;
+    otp.classList.add("shake");
+    setTimeout(() => otp.classList.remove("shake"), 400);
+  }
+
+  function maybeSearch() {
+    const code = getCode();
+    if (code.length === 6) {
+      if (code === lastSubmitted) return;
+      lastSubmitted = code;
+      runSearch(code);
+    } else {
+      searchSeq++;
+      searchState.innerHTML = "";
+      lastSubmitted = "";
+    }
+  }
+
+  otpCells.forEach((cell, i) => {
+    cell.addEventListener("focus", () => cell.select());
+
+    cell.addEventListener("input", (e) => {
+      const v = (e.target.value || "").replace(/\D/g, "");
+      if (!v) { e.target.value = ""; maybeSearch(); return; }
+      e.target.value = v.slice(-1);
+      if (i < otpCells.length - 1) otpCells[i + 1].focus();
+      maybeSearch();
+    });
+
+    cell.addEventListener("keydown", (e) => {
+      if (e.key === "Backspace") {
+        if (!cell.value && i > 0) {
+          otpCells[i - 1].value = "";
+          otpCells[i - 1].focus();
+          e.preventDefault();
+        } else if (cell.value) {
+          // обычное удаление — обработчик input сделает всё
+        }
+        setTimeout(maybeSearch, 0);
+      } else if (e.key === "ArrowLeft" && i > 0) {
+        otpCells[i - 1].focus();
+        e.preventDefault();
+      } else if (e.key === "ArrowRight" && i < otpCells.length - 1) {
+        otpCells[i + 1].focus();
+        e.preventDefault();
+      } else if (e.key === "Enter") {
+        const c = getCode();
+        if (c.length === 6) { lastSubmitted = c; runSearch(c); }
+      }
+    });
+
+    cell.addEventListener("paste", (e) => {
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData("text") || "";
+      const digits = text.replace(/\D/g, "").slice(0, 6).split("");
+      digits.forEach((d, j) => { if (otpCells[j]) otpCells[j].value = d; });
+      const next = Math.min(digits.length, otpCells.length - 1);
+      otpCells[next].focus();
+      maybeSearch();
+    });
+  });
 
   function renderSpinner() {
     searchState.innerHTML =
       '<div class="center"><div class="spinner"></div>' +
       '<div class="spinner-label">Ищем пост...</div></div>';
   }
+
   function renderError(text) {
     searchState.innerHTML = "";
     const d = document.createElement("div");
@@ -698,7 +851,7 @@ PAGE = r"""<!DOCTYPE html>
   async function runSearch(code) {
     const mySeq = ++searchSeq;
     renderSpinner();
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 480));
     if (mySeq !== searchSeq) return;
 
     try {
@@ -707,7 +860,8 @@ PAGE = r"""<!DOCTYPE html>
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         renderError(data.detail || "Пост не найден.");
-        triggerShakeAndClear();
+        shakeOtp();
+        setTimeout(clearOtp, 300);
         return;
       }
       const post = await res.json();
@@ -716,7 +870,8 @@ PAGE = r"""<!DOCTYPE html>
     } catch (e) {
       if (mySeq !== searchSeq) return;
       renderError("Ошибка сети: " + e.message);
-      triggerShakeAndClear();
+      shakeOtp();
+      setTimeout(clearOtp, 300);
     }
   }
 })();
