@@ -5,7 +5,7 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 Маршруты:
   /           — лендинг
   /app        — рабочая область (SPA)
-  /p/{code}   — страница поста с OpenGraph-метатегами
+  /p/{code}   — единая ссылка на пост (с OpenGraph-метатегами)
   /api/*      — REST API
 
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
@@ -93,12 +93,10 @@ MAX_PHOTO_BYTES = 5 * 1024 * 1024
 MAX_TITLE_LEN = 120
 MAX_CONTENT_LEN = 20_000
 
-# Публичный адрес (для OpenGraph ссылок на картинки)
-PUBLIC_BASE_URL = os.environ.get("SLD_BASE_URL", "https://sld-net.ddns.net").rstrip("/")
+PUBLIC_BASE_URL = os.environ.get("SLD_BASE_URL", "").rstrip("/")
 
 
 def _gen_code() -> str:
-    """Генерирует 6-значный код без повторяющихся цифр (без проверки занятости)."""
     digits = list(string.digits)
     chars = []
     for _ in range(6):
@@ -116,6 +114,15 @@ def _new_code() -> str:
     raise HTTPException(503, "Хранилище переполнено")
 
 
+def _base_url(request: Request) -> str:
+    """Абсолютный базовый URL. Учитывает X-Forwarded-* и PUBLIC_BASE_URL."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
+
 # ---------- приложение ----------
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
 
@@ -131,6 +138,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.post("/api/posts")
 async def create_post(
+    request: Request,
     title: str = Form(...),
     content: str = Form(""),
     og_enabled: str = Form("true"),
@@ -190,11 +198,12 @@ async def create_post(
             "og_enabled": og_flag,
         }
 
+    base = _base_url(request)
     return {
         "code": code,
         "compressed_bytes": total,
         "photos": len(photos),
-        "share_url": f"{PUBLIC_BASE_URL}/p/{code}",
+        "share_url": f"{base}/p/{code}",
     }
 
 
@@ -280,24 +289,6 @@ FAVICON = (
     "%3Ccircle cx='22' cy='22' r='3'/%3E"
     "%3Cpath d='M14 12.5L11 19M18 12.5L21 19M13 22h6'/%3E"
     "%3C/g%3E%3C/svg%3E"
-)
-
-VK_ICON = (
-    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
-    '<path d="M12.785 16.241s.288-.032.436-.194c.136-.148.132-.427.132-.427'
-    's-.02-1.304.576-1.496c.588-.19 1.341 1.26 2.14 1.817.605.42 1.064.328 '
-    '1.064.328l2.137-.03s1.117-.071.586-.951c-.043-.072-.307-.659-1.579-1.861'
-    '-1.333-1.253-1.153-1.05.451-3.218.977-1.32 1.367-2.125 1.244-2.47'
-    '-.117-.335-.842-.247-.842-.247l-2.407.015s-.178-.024-.31.056c-.13.079'
-    '-.213.264-.213.264s-.382 1.036-.891 1.916c-1.075 1.86-1.505 1.959'
-    '-1.68 1.844-.409-.27-.307-1.08-.307-1.66 0-1.804.267-2.554-.52-2.747'
-    '-.261-.064-.454-.106-1.124-.113-.859-.01-1.586.003-1.998.207'
-    '-.273.135-.484.438-.356.455.159.021.519.099.71.362.246.34.237 1.105.237 '
-    '1.105s.142 2.13-.266 2.393c-.26.178-.617-.185-1.383-1.849'
-    '-.524-1.115-.919-2.347-.919-2.347s-.076-.19-.212-.29c-.165-.124-.396-.163'
-    '-.396-.163l-2.288.015s-.343.01-.47.163c-.112.136-.009.416-.009.416'
-    's1.792 4.273 3.822 6.424c1.859 1.969 3.97 1.84 3.97 1.84h.955z"/>'
-    '</svg>'
 )
 
 # ============================================================
@@ -518,42 +509,51 @@ LANDING = r"""<!DOCTYPE html>
   }
   .btn-ghost:active{transform:translateY(0) scale(.985)}
 
-  .hero{padding:190px 0 0;position:relative;overflow:hidden}
+  .hero{padding:220px 0 0;position:relative;overflow:hidden}
   .hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
 
   .badge{
-    display:inline-flex;align-items:center;gap:10px;
-    padding:8px 16px 8px 10px;
+    display:inline-flex;align-items:center;gap:12px;
+    padding:10px 20px 10px 12px;
     border-radius:100px;
-    background:rgba(255,255,255,0.05);
-    border:1px solid var(--border-3);
-    backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-    font-size:13px;font-weight:500;color:#e8e8ea;
+    background:rgba(255,255,255,0.075);
+    border:1px solid rgba(255,255,255,0.32);
+    backdrop-filter:blur(14px) saturate(160%);
+    -webkit-backdrop-filter:blur(14px) saturate(160%);
+    font-size:13.5px;font-weight:600;color:#fff;
     letter-spacing:-0.005em;
-    margin-bottom:50px;
-    box-shadow:0 6px 24px -12px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.06);
+    margin-bottom:52px;
+    box-shadow:
+      0 10px 36px -12px rgba(0,0,0,0.7),
+      0 0 0 1px rgba(255,255,255,0.04),
+      inset 0 1px 0 rgba(255,255,255,0.14);
     animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
-    transition:transform .3s,border-color .3s,background .3s;
+    transition:transform .3s cubic-bezier(.2,.8,.2,1),border-color .3s,background .3s,box-shadow .3s;
   }
   .badge:hover{
-    transform:translateY(-1px);
-    border-color:rgba(255,255,255,0.3);
-    background:rgba(255,255,255,0.075);
+    transform:translateY(-2px);
+    border-color:rgba(255,255,255,0.5);
+    background:rgba(255,255,255,0.1);
+    box-shadow:
+      0 16px 44px -12px rgba(0,0,0,0.8),
+      0 0 0 1px rgba(255,255,255,0.06),
+      inset 0 1px 0 rgba(255,255,255,0.2);
   }
   .badge-dot{
-    width:24px;height:24px;border-radius:50%;
-    background:linear-gradient(140deg,#fff,#b5b5ba);
+    width:26px;height:26px;border-radius:50%;
+    background:linear-gradient(140deg,#fff,#c8c8cc);
     display:grid;place-items:center;color:#0a0a0a;
     position:relative;flex-shrink:0;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4);
+    box-shadow:0 2px 10px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.1);
   }
   .badge-dot::after{
-    content:'';position:absolute;inset:-4px;border-radius:50%;
-    border:1px solid rgba(255,255,255,0.22);
+    content:'';position:absolute;inset:-5px;border-radius:50%;
+    border:1px solid rgba(255,255,255,0.35);
     animation:ping 2.4s ease-out infinite;
   }
-  @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.7);opacity:0}}
-  .badge-dot svg{width:11px;height:11px;display:block}
+  @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.75);opacity:0}}
+  .badge-dot svg{width:12px;height:12px;display:block}
+  .badge-sep{color:rgba(255,255,255,0.35);font-weight:400;margin:0 -2px}
 
   h1{
     font-family:'Unbounded',sans-serif;font-weight:700;
@@ -832,7 +832,6 @@ LANDING = r"""<!DOCTYPE html>
     mask-composite:exclude;
     pointer-events:none;
   }
-
   .mock-head{
     display:flex;align-items:center;justify-content:space-between;
     margin-bottom:20px;
@@ -982,25 +981,12 @@ LANDING = r"""<!DOCTYPE html>
   .foot-col a:hover{color:#fff;transform:translateX(3px)}
 
   .foot-bottom{
-    display:flex;justify-content:space-between;align-items:center;
-    gap:20px;flex-wrap:wrap;
+    display:flex;justify-content:center;align-items:center;
     padding-top:30px;border-top:1px solid var(--border);
     color:var(--text-mute);font-size:12.5px;
     font-family:'JetBrains Mono',monospace;letter-spacing:0.05em;
+    text-align:center;
   }
-  .socials{display:flex;gap:8px}
-  .socials a{
-    width:38px;height:38px;border-radius:11px;
-    display:grid;place-items:center;
-    background:var(--glass);border:1px solid var(--border-2);
-    color:var(--text-dim);
-    transition:all .3s cubic-bezier(.2,.8,.2,1);
-  }
-  .socials a:hover{
-    background:rgba(255,255,255,0.09);border-color:var(--border-3);
-    color:#fff;transform:translateY(-2px);
-  }
-  .socials svg{width:16px;height:16px;display:block}
 
   .reveal{
     opacity:0;transform:translateY(32px);
@@ -1030,7 +1016,7 @@ LANDING = r"""<!DOCTYPE html>
     .logo{font-size:13.5px}
     .logo-mark{width:28px;height:28px}
     .logo-mark svg{width:14px;height:14px}
-    .hero{padding:130px 0 0}
+    .hero{padding:165px 0 0}
     section{padding:80px 0}
     .bento{grid-template-columns:1fr;gap:14px}
     .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
@@ -1043,14 +1029,15 @@ LANDING = r"""<!DOCTYPE html>
     .hero-cta{flex-direction:column;align-items:stretch}
     .hero-cta .btn{justify-content:center;width:100%}
     .foot-cols{gap:44px}
-    .foot-bottom{justify-content:center;text-align:center}
+    .foot-bottom{font-size:11.5px}
     .marquee-track span{font-size:12px;gap:36px}
     .marquee-track{gap:36px}
     .marquee{margin-top:80px}
     .code-show{margin-top:56px;gap:6px}
     .code-cell{max-width:46px;border-radius:11px}
-    .badge{font-size:12px;padding:7px 14px 7px 9px;margin-bottom:36px}
+    .badge{font-size:12.5px;padding:9px 16px 9px 10px;margin-bottom:40px;gap:10px}
     .badge-dot{width:22px;height:22px}
+    .badge-dot svg{width:10px;height:10px}
   }
   @media (max-width:420px){
     .stats{grid-template-columns:1fr}
@@ -1108,7 +1095,11 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
           </svg>
         </span>
-        Без регистрации · до 5 фото · код из 6 цифр
+        <span>Без регистрации</span>
+        <span class="badge-sep">·</span>
+        <span>до 5 фото</span>
+        <span class="badge-sep">·</span>
+        <span>код из 6 цифр</span>
       </div>
 
       <h1>
@@ -1151,7 +1142,7 @@ LANDING = r"""<!DOCTYPE html>
           <rect x="4" y="10" width="16" height="10" rx="2"/>
           <path d="M8 10V6a4 4 0 018 0v4"/>
         </svg>
-        <span id="codeCaptionText">151 200 комбинаций · цифры не повторяются</span>
+        <span>151 200 комбинаций · цифры не повторяются</span>
       </div>
     </div>
   </div>
@@ -1216,7 +1207,7 @@ LANDING = r"""<!DOCTYPE html>
           </svg>
         </div>
         <h3>OpenGraph-превью</h3>
-        <p>Ссылка <code>/p/482163</code> разворачивается в Telegram, VK и Discord: заголовок, краткое описание и первое фото.</p>
+        <p>Ссылка <code>/p/482163</code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
       </div>
 
       <div class="glass b-sm reveal">
@@ -1268,16 +1259,15 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M20 6 9 17l-5-5"/>
           </svg>
         </div>
-        <h3>Ссылка на пост</h3>
-        <p>Каждый пост живёт по адресу <code>/p/482163</code>. Отправьте его в чат — ссылка сразу откроет нужный пост с превью.</p>
+        <h3>Единая ссылка на пост</h3>
+        <p>Каждый пост живёт по одному адресу — <code>/p/482163</code>. Одна ссылка и для копирования, и для мессенджеров, и для перехода.</p>
       </div>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/>
-            <path d="M9 20h6"/>
-            <path d="M12 4v16"/>
+            <path d="M14 3v4a1 1 0 001 1h4"/>
+            <path d="M17 21H7a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z"/>
           </svg>
         </div>
         <h3>Автосжатие до 60 КБ</h3>
@@ -1298,7 +1288,9 @@ LANDING = r"""<!DOCTYPE html>
       <div class="glass b-sm reveal">
         <div class="icon-box">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 7c.5 5 3.5 10 8 10h1v-3.5c1.8.3 3.4 1.6 4 3.5h3c-.5-2.3-2-4.2-4-5 1.8-.9 3-2.5 3.5-5h-2.8c-.4 1.6-1.5 3-3.2 3.5V7"/>
+            <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/>
+            <path d="M9 20h6"/>
+            <path d="M12 4v16"/>
           </svg>
         </div>
         <h3>Лимит 5 МБ на файл</h3>
@@ -1331,7 +1323,7 @@ LANDING = r"""<!DOCTYPE html>
           </li>
           <li>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
-            <span><strong>Превью для мессенджеров</strong> — включается или выключается при создании</span>
+            <span><strong>Кнопка «копировать ссылку»</strong> — рядом с каждым найденным постом</span>
           </li>
         </ul>
       </div>
@@ -1494,17 +1486,7 @@ LANDING = r"""<!DOCTYPE html>
     </div>
 
     <div class="foot-bottom">
-      <span>© 2026 СЛД·NET. Все права защищены.</span>
-      <div class="socials">
-        <a href="https://t.me/sld_net" aria-label="Telegram" title="Telegram">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="m21 3-9 9M21 3l-7 18-4-7-7-4 18-7z"/>
-          </svg>
-        </a>
-        <a href="https://vk.com/sld_net" aria-label="VK" title="VK">
-          __VK_ICON__
-        </a>
-      </div>
+      © 2026 СЛД·NET. Все права защищены.
     </div>
   </div>
 </footer>
@@ -1559,11 +1541,8 @@ LANDING = r"""<!DOCTYPE html>
       const code = String(data.code || '').padStart(6, '0');
       if (!/^\d{6}$/.test(code)) return;
 
-      // обновим код в mock-карточке тоже
       const mockCode = document.getElementById('mockCode');
       if (mockCode) mockCode.textContent = '#' + code;
-
-      // и в текстах lead? нет, оставим как есть.
 
       cells.forEach((cell, i) => {
         cell.textContent = code[i] || '0';
@@ -1572,13 +1551,10 @@ LANDING = r"""<!DOCTYPE html>
         cell.classList.add('flip');
         cell.style.animationDelay = (i * 0.06) + 's';
       });
-      // очистим inline delay после анимации
       setTimeout(() => {
         cells.forEach(c => { c.style.animationDelay = ''; c.classList.remove('flip'); });
       }, 1200);
-    } catch (e) {
-      // тихо игнорируем — оставим стартовые цифры
-    }
+    } catch (e) {}
   })();
 
   /* ===== REVEAL ===== */
@@ -1697,7 +1673,7 @@ APP = r"""<!DOCTYPE html>
     -moz-osx-font-smoothing:grayscale;
     -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
   }
-  input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title{
+  input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.share-link-url{
     -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
   }
 
@@ -1943,7 +1919,6 @@ APP = r"""<!DOCTYPE html>
     line-height:1.55;font-family:inherit;
   }
 
-  /* ===== CHECKBOX ===== */
   .checkbox-wrap{
     display:flex;align-items:flex-start;gap:11px;
     margin-top:12px;
@@ -1965,7 +1940,7 @@ APP = r"""<!DOCTYPE html>
     background:transparent;
     display:grid;place-items:center;
     margin-top:1px;
-    transition:background .2s,border-color .2s,transform .2s;
+    transition:background .2s,border-color .2s;
   }
   .checkbox-box svg{
     width:12px;height:12px;
@@ -2228,9 +2203,10 @@ APP = r"""<!DOCTYPE html>
     transform:translateY(-2px);
   }
 
+  /* ===== SHARE LINK ===== */
   .share-link{
-    margin-top:12px;
-    padding:11px 13px;
+    margin-top:14px;
+    padding:10px 12px 10px 14px;
     border-radius:12px;
     background:rgba(255,255,255,0.03);
     border:1px solid var(--border);
@@ -2238,10 +2214,46 @@ APP = r"""<!DOCTYPE html>
     font-family:'JetBrains Mono',monospace;
     font-size:12px;
     color:var(--text-dim);
-    word-break:break-all;
+    transition:border-color .2s,background .2s;
   }
-  .share-link svg{width:15px;height:15px;flex-shrink:0;color:var(--text-mute);display:block}
-  .share-link span{min-width:0;color:var(--text)}
+  .share-link:hover{border-color:var(--border-2);background:rgba(255,255,255,0.045)}
+  .share-link-icon{
+    width:15px;height:15px;flex-shrink:0;color:var(--text-mute);display:block;
+  }
+  .share-link-url{
+    flex:1 1 auto;
+    min-width:0;
+    color:var(--text);
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .share-link-copy{
+    flex-shrink:0;
+    width:34px;height:34px;
+    border-radius:9px;
+    border:1px solid var(--border);
+    background:var(--input);
+    color:var(--text-mute);
+    display:grid;place-items:center;
+    cursor:pointer;
+    -webkit-appearance:none;appearance:none;
+    transition:background .18s,border-color .18s,color .18s;
+  }
+  .share-link-copy:hover{
+    background:var(--input-focus);
+    border-color:var(--border-3);
+    color:#fff;
+  }
+  .share-link-copy.copied{
+    color:var(--ok);
+    border-color:rgba(126,200,153,0.5);
+    background:rgba(126,200,153,0.08);
+  }
+  .share-link-copy svg{width:14px;height:14px;pointer-events:none;display:block}
+  .share-link-copy .sl-check{display:none}
+  .share-link-copy.copied .sl-copy{display:none}
+  .share-link-copy.copied .sl-check{display:block}
 
   .lightbox{
     position:fixed;inset:0;z-index:1000;
@@ -2364,9 +2376,9 @@ APP = r"""<!DOCTYPE html>
   .modal-url{
     font-family:'JetBrains Mono',monospace;
     font-size:11.5px;
-    color:var(--text-dim);
-    padding:8px 10px;
-    border-radius:8px;
+    color:var(--text);
+    padding:10px 12px;
+    border-radius:10px;
     background:rgba(255,255,255,0.03);
     border:1px solid var(--border);
     word-break:break-all;
@@ -2515,7 +2527,7 @@ APP = r"""<!DOCTYPE html>
             </svg>
           </span>
           <span class="checkbox-label">
-            <strong>Превью для ссылок (OpenGraph)</strong> — при отправке в Telegram, VK или Discord покажет заголовок, краткое описание и первое фото.
+            <strong>Превью для ссылок (OpenGraph)</strong> — при отправке в Telegram или Discord покажет заголовок, краткое описание и первое фото.
           </span>
         </label>
 
@@ -2660,7 +2672,7 @@ APP = r"""<!DOCTYPE html>
   document.addEventListener('mousedown', () => ring.classList.add('click'));
   document.addEventListener('mouseup', () => ring.classList.remove('click'));
 
-  document.querySelectorAll('a, button, input, textarea, label.checkbox-wrap, .tab, .drop, .post-gallery img').forEach(el => {
+  document.querySelectorAll('a, button, input, textarea, label.checkbox-wrap, .tab, .drop, .post-gallery img, .share-link-copy').forEach(el => {
     el.addEventListener('mouseenter', () => ring.classList.add('hover'));
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
@@ -2700,8 +2712,7 @@ APP = r"""<!DOCTYPE html>
         if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
         if (Array.isArray(data.detail) && data.detail.length) {
           const first = data.detail[0] || {};
-          const msg = first.msg || "Некорректные данные";
-          return msg;
+          return first.msg || "Некорректные данные";
         }
         if (typeof data.message === "string" && data.message.trim()) return data.message;
       }
@@ -2718,20 +2729,32 @@ APP = r"""<!DOCTYPE html>
     return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " ГБ";
   }
 
-  // Поддерживаем и /p/CODE, и #CODE
+  function postUrl(code) {
+    return window.location.origin + "/p/" + code;
+  }
+
+  // Единая точка входа: работаем и с /p/CODE, и с /app (без хэша)
   function parseLocation() {
     const pathMatch = window.location.pathname.match(/^\/p\/(\d{6})\/?$/);
     if (pathMatch) return { code: pathMatch[1] };
-    const h = (window.location.hash || "").replace(/^#/, "");
-    if (!h) return { code: null };
-    const qIdx = h.indexOf("?");
-    const codePart = (qIdx >= 0 ? h.slice(0, qIdx) : h).trim();
-    const code = /^\d{6}$/.test(codePart) ? codePart : null;
-    return { code };
+    return { code: null };
+  }
+
+  function setUrlForCode(code) {
+    const target = "/p/" + code;
+    if (window.location.pathname !== target) {
+      history.replaceState(null, "", target);
+    }
+  }
+
+  function setUrlForApp() {
+    if (window.location.pathname !== "/app") {
+      history.replaceState(null, "", "/app");
+    }
   }
 
   /* =========================================================
-     TABS + PILL
+     TABS
      ========================================================= */
   const stage       = $("stage");
   const createPanel = $("createPanel");
@@ -2821,15 +2844,14 @@ APP = r"""<!DOCTYPE html>
   }
 
   btnCreate.addEventListener("click", () => {
-    if (window.location.pathname.startsWith("/p/")) {
-      history.replaceState(null, "", "/app");
-    } else if (window.location.hash) {
-      history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
+    setUrlForApp();
     setMode("create");
   });
 
-  btnFind.addEventListener("click", () => setMode("find"));
+  btnFind.addEventListener("click", () => {
+    setUrlForApp();
+    setMode("find");
+  });
 
   /* =========================================================
      IMAGE COMPRESSION
@@ -3070,13 +3092,9 @@ APP = r"""<!DOCTYPE html>
       clearCreateMsg();
 
       const code = data.code;
-      const shareUrl = data.share_url || (window.location.origin + "/p/" + code);
 
-      // Обновим URL — короткий хеш
-      const newHash = "#" + code;
-      if (window.location.hash !== newHash) {
-        history.replaceState(null, "", "/app" + newHash);
-      }
+      // Единая ссылка — обновляем URL на /p/CODE
+      setUrlForCode(code);
 
       setMode("find");
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
@@ -3084,7 +3102,7 @@ APP = r"""<!DOCTYPE html>
       updateOtpCopyState();
       runSearch(code);
 
-      showCreatedModal(code, data.compressed_bytes, shareUrl);
+      showCreatedModal(code, data.compressed_bytes, data.share_url || postUrl(code));
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
@@ -3109,7 +3127,7 @@ APP = r"""<!DOCTYPE html>
 
   function showCreatedModal(code, bytes, shareUrl) {
     modalCode.textContent = code;
-    modalShareUrl = shareUrl || (window.location.origin + "/p/" + code);
+    modalShareUrl = shareUrl || postUrl(code);
     modalUrl.textContent = modalShareUrl;
     modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
     const label = modalCopyBtn.querySelector("span");
@@ -3174,6 +3192,7 @@ APP = r"""<!DOCTYPE html>
   function maybeSearch() {
     const code = getCode();
     if (code.length === 6) {
+      setUrlForCode(code);
       if (code === lastSubmitted) return;
       lastSubmitted = code;
       runSearch(code);
@@ -3181,6 +3200,7 @@ APP = r"""<!DOCTYPE html>
       searchSeq++;
       hideSearchFrame();
       lastSubmitted = "";
+      setUrlForApp();
     }
     updateOtpCopyState();
   }
@@ -3426,7 +3446,7 @@ APP = r"""<!DOCTYPE html>
   lbViewport.addEventListener("touchend", () => { touchStartDist = 0; });
 
   /* =========================================================
-     POST RENDER
+     POST RENDER (с кнопкой копирования ссылки)
      ========================================================= */
   function renderPost(post) {
     searchFrame.innerHTML = "";
@@ -3473,13 +3493,55 @@ APP = r"""<!DOCTYPE html>
       searchFrame.appendChild(gallery);
     }
 
-    // Ссылка на пост — чтобы удобно переслать
+    // Единая ссылка с кнопкой копирования
     const shareBox = document.createElement("div");
     shareBox.className = "share-link";
-    shareBox.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/></svg>';
+
+    const shareIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    shareIcon.setAttribute("viewBox", "0 0 24 24");
+    shareIcon.setAttribute("fill", "none");
+    shareIcon.setAttribute("stroke", "currentColor");
+    shareIcon.setAttribute("stroke-width", "1.9");
+    shareIcon.setAttribute("stroke-linecap", "round");
+    shareIcon.setAttribute("stroke-linejoin", "round");
+    shareIcon.setAttribute("aria-hidden", "true");
+    shareIcon.setAttribute("class", "share-link-icon");
+    shareIcon.innerHTML = '<path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/>';
+
     const shareSpan = document.createElement("span");
-    shareSpan.textContent = window.location.origin + "/p/" + post.code;
-    shareBox.appendChild(shareSpan);
+    shareSpan.className = "share-link-url";
+    const url = postUrl(post.code);
+    shareSpan.textContent = url;
+    shareSpan.title = url;
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "share-link-copy";
+    copyBtn.title = "Копировать ссылку";
+    copyBtn.setAttribute("aria-label", "Копировать ссылку");
+    copyBtn.innerHTML =
+      '<svg class="sl-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<rect x="9" y="9" width="13" height="13" rx="2"/>' +
+        '<path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>' +
+      '</svg>' +
+      '<svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<path d="M20 6L9 17l-5-5"/>' +
+      '</svg>';
+
+    let copyTimer = null;
+    copyBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(url);
+        copyBtn.classList.add("copied");
+      } catch {
+        copyBtn.classList.remove("copied");
+      }
+      clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => copyBtn.classList.remove("copied"), 1500);
+    });
+
+    shareBox.append(shareIcon, shareSpan, copyBtn);
     searchFrame.appendChild(shareBox);
 
     showSearchFrame();
@@ -3536,17 +3598,6 @@ APP = r"""<!DOCTYPE html>
 
   initFromUrl();
 
-  window.addEventListener("hashchange", () => {
-    const { code } = parseLocation();
-    if (code && mode !== "find") {
-      setMode("find", true);
-      otpCells.forEach((c, i) => { c.value = code[i] || ""; });
-      lastSubmitted = code;
-      updateOtpCopyState();
-      runSearch(code);
-    }
-  });
-
   document.addEventListener("keydown", (e) => {
     if (!lightbox.hidden) {
       if (e.key === "Escape") { closeLightbox(); return; }
@@ -3568,8 +3619,7 @@ APP = r"""<!DOCTYPE html>
 # OpenGraph-метатеги для страницы /p/{code}
 # ============================================================
 
-def _build_og_tags(code: str, meta: dict, photos_count: int) -> str:
-    """Собирает теги <meta property="og:..."> для конкретного поста."""
+def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     title = str(meta.get("title", "")).strip() or f"Пост #{code}"
     content_raw = str(meta.get("content", "")).strip()
 
@@ -3582,7 +3632,7 @@ def _build_og_tags(code: str, meta: dict, photos_count: int) -> str:
 
     title_esc = _html.escape(title, quote=True)
     desc_esc = _html.escape(desc, quote=True)
-    url = f"{PUBLIC_BASE_URL}/p/{code}"
+    url = f"{base}/p/{code}"
 
     lines = [
         '<meta property="og:type" content="article">',
@@ -3596,7 +3646,7 @@ def _build_og_tags(code: str, meta: dict, photos_count: int) -> str:
     ]
 
     if photos_count > 0:
-        img = f"{PUBLIC_BASE_URL}/api/photos/{code}/0"
+        img = f"{base}/api/photos/{code}/0"
         img_esc = _html.escape(img, quote=True)
         lines.append(f'<meta property="og:image" content="{img_esc}">')
         lines.append(f'<meta property="og:image:alt" content="{title_esc}">')
@@ -3612,25 +3662,19 @@ def _build_og_tags(code: str, meta: dict, photos_count: int) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(
-        LANDING.replace("__FAVICON__", FAVICON).replace("__VK_ICON__", VK_ICON)
-    )
+    return HTMLResponse(LANDING.replace("__FAVICON__", FAVICON))
 
 
 @app.get("/app", response_class=HTMLResponse)
 async def app_page():
-    html = (
-        APP.replace("__FAVICON__", FAVICON)
-           .replace("<!-- OG_TAGS -->", "")
-    )
+    html = APP.replace("__FAVICON__", FAVICON).replace("<!-- OG_TAGS -->", "")
     return HTMLResponse(html)
 
 
 @app.get("/p/{code}", response_class=HTMLResponse)
-async def post_page(code: str):
+async def post_page(code: str, request: Request):
     code = (code or "").strip()
     if not (len(code) == 6 and code.isdigit()):
-        # Пусть SPA покажет "не найдено"
         return HTMLResponse(
             APP.replace("__FAVICON__", FAVICON).replace("<!-- OG_TAGS -->", "")
         )
@@ -3645,7 +3689,8 @@ async def post_page(code: str):
         try:
             meta = _unpack_meta(entry["meta"])
             if meta.get("og_enabled", True):
-                og_tags = _build_og_tags(code, meta, len(entry["photos"]))
+                base = _base_url(request)
+                og_tags = _build_og_tags(code, meta, len(entry["photos"]), base)
                 t = str(meta.get("title", "")).strip()
                 if t:
                     title_override = t
