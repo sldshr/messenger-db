@@ -104,7 +104,7 @@ def _new_code() -> str:
             code = "".join(code_chars)
             if code not in _store:
                 return code
-    raise HTTPException(503, "Storage overflow")
+    raise HTTPException(503, "Хранилище переполнено")
 
 
 # ---------- приложение ----------
@@ -116,7 +116,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     log.exception("Unhandled error on %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"{type(exc).__name__}: {exc}"},
+        content={"detail": f"Внутренняя ошибка: {type(exc).__name__}"},
     )
 
 
@@ -130,15 +130,15 @@ async def create_post(
     content = (content or "").strip()
 
     if not title:
-        raise HTTPException(400, "Title is required")
+        raise HTTPException(400, "Требуется название поста")
     if len(title) > MAX_TITLE_LEN:
-        raise HTTPException(400, f"Title longer than {MAX_TITLE_LEN}")
+        raise HTTPException(400, f"Название длиннее {MAX_TITLE_LEN} символов")
     if len(content) > MAX_CONTENT_LEN:
-        raise HTTPException(400, f"Content longer than {MAX_CONTENT_LEN}")
+        raise HTTPException(400, f"Содержимое длиннее {MAX_CONTENT_LEN} символов")
 
     files = [f for f in (files or []) if f and f.filename]
     if len(files) > MAX_PHOTOS:
-        raise HTTPException(400, f"Max {MAX_PHOTOS} photos")
+        raise HTTPException(400, f"Максимум {MAX_PHOTOS} фото")
 
     photos = []
     total = 0
@@ -147,7 +147,7 @@ async def create_post(
         if len(data) > MAX_PHOTO_BYTES:
             raise HTTPException(
                 400,
-                f"File «{f.filename}» larger than {MAX_PHOTO_BYTES // (1024 * 1024)} MB",
+                f"Файл «{f.filename}» больше {MAX_PHOTO_BYTES // (1024 * 1024)} МБ",
             )
         enc = _encrypt(data)
         total += len(enc)
@@ -184,17 +184,17 @@ async def create_post(
 async def get_post(code: str):
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
-        raise HTTPException(400, "Code must be 6 digits")
+        raise HTTPException(400, "Код должен содержать 6 цифр")
 
     with _lock:
         entry = _store.get(code)
     if entry is None:
-        raise HTTPException(404, "Post not found")
+        raise HTTPException(404, "Пост не найден")
 
     try:
         meta = _unpack_meta(entry["meta"])
     except (InvalidTag, ValueError, OSError) as e:
-        raise HTTPException(500, f"Decryption failed: {e}")
+        raise HTTPException(500, f"Ошибка расшифровки: {e}")
 
     meta["code"] = code
     meta["photos"] = [
@@ -209,17 +209,17 @@ async def get_photo(code: str, idx: int):
     with _lock:
         entry = _store.get(code)
     if entry is None:
-        raise HTTPException(404, "Post not found")
+        raise HTTPException(404, "Пост не найден")
 
     photos = entry["photos"]
     if idx < 0 or idx >= len(photos):
-        raise HTTPException(404, "Photo not found")
+        raise HTTPException(404, "Фото не найдено")
 
     p = photos[idx]
     try:
         data = _decrypt(p["enc"])
     except (InvalidTag, ValueError) as e:
-        raise HTTPException(500, f"Decryption failed: {e}")
+        raise HTTPException(500, f"Ошибка расшифровки: {e}")
 
     return Response(
         content=data,
@@ -307,6 +307,16 @@ LANDING = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
   ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
+  /* ===== PAGE TRANSITION ===== */
+  @keyframes pageEnter{from{opacity:0}to{opacity:1}}
+  body{animation:pageEnter .4s cubic-bezier(.2,.8,.2,1) both}
+  body.page-exit{
+    opacity:0;
+    transform:scale(.995);
+    transition:opacity .28s ease,transform .28s ease;
+    pointer-events:none;
+  }
+
   @media (hover:hover) and (pointer:fine){
     body,a,button,input,textarea{cursor:none}
   }
@@ -360,7 +370,6 @@ LANDING = r"""<!DOCTYPE html>
   .cursor-glow{
     position:fixed;inset:0;z-index:-2;pointer-events:none;
     background:radial-gradient(650px circle at var(--mx, 50%) var(--my, 30%), rgba(255,255,255,0.028), transparent 60%);
-    transition:opacity .4s;
   }
 
   .grid-bg{
@@ -420,7 +429,7 @@ LANDING = r"""<!DOCTYPE html>
     background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);
     pointer-events:none;
   }
-  .logo-mark svg{width:15px;height:15px;position:relative;z-index:1;color:#08080a}
+  .logo-mark svg{width:15px;height:15px;position:relative;z-index:1;color:#08080a;display:block}
   .logo-word{display:inline-flex;align-items:baseline;gap:1px}
   .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
   .logo-word .lnet{color:var(--text-dim);font-weight:500}
@@ -445,7 +454,7 @@ LANDING = r"""<!DOCTYPE html>
     transition:transform .3s cubic-bezier(.2,.8,.2,1),background .25s,border-color .25s,color .25s,box-shadow .3s;
     -webkit-tap-highlight-color:transparent;user-select:none;
   }
-  .btn svg{width:15px;height:15px;flex-shrink:0;transition:transform .35s cubic-bezier(.2,.8,.2,1)}
+  .btn svg{width:15px;height:15px;flex-shrink:0;display:block;transition:transform .35s cubic-bezier(.2,.8,.2,1)}
 
   .btn-primary{
     background:#f4f4f5;color:#08080a;
@@ -471,24 +480,34 @@ LANDING = r"""<!DOCTYPE html>
   .btn-ghost:active{transform:translateY(0) scale(.985)}
 
   /* ===== HERO ===== */
-  .hero{padding:200px 0 100px;position:relative}
+  .hero{padding:170px 0 100px;position:relative}
   .hero-inner{max-width:880px;margin:0 auto;text-align:center}
 
   .badge{
     display:inline-flex;align-items:center;gap:10px;
-    padding:7px 15px 7px 9px;
+    padding:8px 16px 8px 10px;
     border-radius:100px;
-    background:var(--glass);border:1px solid var(--border-2);
+    background:rgba(255,255,255,0.05);
+    border:1px solid var(--border-3);
     backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-    font-size:12.5px;font-weight:500;color:var(--text-dim);
-    letter-spacing:-0.005em;margin-bottom:36px;
+    font-size:13px;font-weight:500;color:#e8e8ea;
+    letter-spacing:-0.005em;
+    margin-bottom:46px;
+    box-shadow:0 6px 24px -12px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.06);
     animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
+    transition:transform .3s,border-color .3s,background .3s;
+  }
+  .badge:hover{
+    transform:translateY(-1px);
+    border-color:rgba(255,255,255,0.28);
+    background:rgba(255,255,255,0.07);
   }
   .badge-dot{
-    width:22px;height:22px;border-radius:50%;
+    width:24px;height:24px;border-radius:50%;
     background:linear-gradient(140deg,#fff,#b5b5ba);
     display:grid;place-items:center;color:#0a0a0a;
     position:relative;flex-shrink:0;
+    box-shadow:0 2px 8px rgba(0,0,0,0.4);
   }
   .badge-dot::after{
     content:'';position:absolute;inset:-4px;border-radius:50%;
@@ -496,7 +515,7 @@ LANDING = r"""<!DOCTYPE html>
     animation:ping 2.4s ease-out infinite;
   }
   @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.7);opacity:0}}
-  .badge-dot svg{width:10px;height:10px}
+  .badge-dot svg{width:11px;height:11px;display:block}
 
   h1{
     font-family:'Unbounded',sans-serif;font-weight:700;
@@ -565,7 +584,7 @@ LANDING = r"""<!DOCTYPE html>
     display:inline-flex;align-items:center;gap:9px;
     font-family:'JetBrains Mono',monospace;
   }
-  .code-caption svg{width:13px;height:13px;opacity:.6}
+  .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
   .marquee{
     margin-top:100px;padding:22px 0;
@@ -638,7 +657,6 @@ LANDING = r"""<!DOCTYPE html>
   .glass:hover::after{transform:translateX(120%)}
   .glass:hover{transform:translateY(-2px)}
 
-  /* Bento: 6 cols */
   .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
   .bento .glass{padding:30px;display:flex;flex-direction:column}
   .b-lg{grid-column:span 4;min-height:300px}
@@ -653,7 +671,7 @@ LANDING = r"""<!DOCTYPE html>
     transition:transform .4s cubic-bezier(.2,.8,.2,1),color .3s,border-color .3s;
     flex-shrink:0;
   }
-  .icon-box svg{width:20px;height:20px}
+  .icon-box svg{width:20px;height:20px;display:block}
   .glass:hover .icon-box{transform:translateY(-2px) scale(1.05);color:#fff;border-color:var(--border-3)}
 
   .bento h3{
@@ -828,7 +846,7 @@ LANDING = r"""<!DOCTYPE html>
     nav{padding:10px 10px 10px 16px;top:12px;width:calc(100% - 24px)}
     .logo{font-size:13.5px}
     .logo-mark{width:28px;height:28px}
-    .hero{padding:150px 0 60px}
+    .hero{padding:140px 0 60px}
     section{padding:70px 0}
     .bento{grid-template-columns:1fr;gap:14px}
     .bento .glass{grid-column:span 1 !important;padding:24px;min-height:auto}
@@ -862,7 +880,7 @@ LANDING = r"""<!DOCTYPE html>
 <nav id="nav">
   <a href="/" class="logo">
     <span class="logo-mark">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="5" r="2.4"/>
         <circle cx="5" cy="19" r="2.4"/>
         <circle cx="19" cy="19" r="2.4"/>
@@ -876,9 +894,9 @@ LANDING = r"""<!DOCTYPE html>
     <a href="#how">Как это работает</a>
     <a href="#specs">Технологии</a>
   </div>
-  <a href="/app" class="btn btn-primary">
+  <a href="/app" class="btn btn-primary js-app-link">
     <span>Открыть приложение</span>
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <path d="M5 12h14M13 6l6 6-6 6"/>
     </svg>
   </a>
@@ -889,7 +907,7 @@ LANDING = r"""<!DOCTYPE html>
     <div class="hero-inner">
       <div class="badge">
         <span class="badge-dot">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
           </svg>
         </span>
@@ -908,14 +926,14 @@ LANDING = r"""<!DOCTYPE html>
       </p>
 
       <div class="hero-cta">
-        <a href="/app" class="btn btn-primary">
+        <a href="/app" class="btn btn-primary js-app-link">
           <span>Создать пост</span>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M5 12h14M13 6l6 6-6 6"/>
           </svg>
         </a>
         <a href="#how" class="btn btn-ghost">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9"/>
             <path d="M12 8v8M8 12h8"/>
           </svg>
@@ -932,7 +950,7 @@ LANDING = r"""<!DOCTYPE html>
         <div class="code-cell">9</div>
       </div>
       <div class="code-caption">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="4" y="10" width="16" height="10" rx="2"/>
           <path d="M8 10V6a4 4 0 018 0v4"/>
         </svg>
@@ -972,7 +990,7 @@ LANDING = r"""<!DOCTYPE html>
       <div class="glass b-lg reveal">
         <div>
           <div class="icon-box">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="3" y="4" width="18" height="16" rx="2.5"/>
               <path d="M3 9h18"/>
               <path d="M9 4v5"/>
@@ -994,7 +1012,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 3 3 8l9 5 9-5-9-5z"/>
             <path d="M3 13l9 5 9-5"/>
             <path d="M3 17.5l9 5 9-5"/>
@@ -1006,7 +1024,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
           </svg>
         </div>
@@ -1016,7 +1034,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9"/>
             <path d="M12 7v5l3 2"/>
           </svg>
@@ -1027,7 +1045,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 3v18M3 12h18"/>
           </svg>
         </div>
@@ -1037,7 +1055,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-md reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="3" y="3" width="18" height="18" rx="3"/>
             <circle cx="9" cy="9" r="1.7"/>
             <path d="M21 15l-5-5L5 21"/>
@@ -1049,7 +1067,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-md reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M20 6 9 17l-5-5"/>
           </svg>
         </div>
@@ -1059,7 +1077,7 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/>
             <path d="M9 20h6"/>
             <path d="M12 4v16"/>
@@ -1071,18 +1089,18 @@ LANDING = r"""<!DOCTYPE html>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9"/>
             <path d="M3 12h18M12 3a15 15 0 0 0 0 18M12 3a15 15 0 0 1 0 18"/>
           </svg>
         </div>
-        <h3>RU / EN</h3>
-        <p>Язык подставляется из браузера или параметра <code>?lang</code> в ссылке. Работает мгновенно, без перезагрузки.</p>
+        <h3>Работает везде</h3>
+        <p>Один HTML-файл, никаких сборщиков и фреймворков. Открывается в любом современном браузере.</p>
       </div>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M4 7c.5 5 3.5 10 8 10h1v-3.5c1.8.3 3.4 1.6 4 3.5h3c-.5-2.3-2-4.2-4-5 1.8-.9 3-2.5 3.5-5h-2.8c-.4 1.6-1.5 3-3.2 3.5V7"/>
           </svg>
         </div>
@@ -1157,9 +1175,9 @@ LANDING = r"""<!DOCTYPE html>
       <h2>Опубликовать первый пост</h2>
       <p>Заголовок, текст, до пяти фото — и шесть цифр, чтобы поделиться результатом.</p>
 
-      <a href="/app" class="btn btn-primary">
+      <a href="/app" class="btn btn-primary js-app-link">
         <span>Открыть приложение</span>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M5 12h14M13 6l6 6-6 6"/>
         </svg>
       </a>
@@ -1175,7 +1193,7 @@ LANDING = r"""<!DOCTYPE html>
       <div class="foot-brand">
         <a href="/" class="logo">
           <span class="logo-mark">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="12" cy="5" r="2.4"/>
               <circle cx="5" cy="19" r="2.4"/>
               <circle cx="19" cy="19" r="2.4"/>
@@ -1196,8 +1214,8 @@ LANDING = r"""<!DOCTYPE html>
         </div>
         <div class="foot-col">
           <h4>Приложение</h4>
-          <a href="/app">Создать пост</a>
-          <a href="/app#find">Найти пост</a>
+          <a href="/app" class="js-app-link">Создать пост</a>
+          <a href="/app" class="js-app-link">Найти пост</a>
         </div>
         <div class="foot-col">
           <h4>Технологии</h4>
@@ -1217,7 +1235,7 @@ LANDING = r"""<!DOCTYPE html>
 (() => {
   "use strict";
 
-  // Курсор
+  /* ===== CURSOR ===== */
   const dot  = document.querySelector('.cur-dot');
   const ring = document.querySelector('.cur-ring');
   let mx = window.innerWidth / 2, my = window.innerHeight / 2;
@@ -1255,7 +1273,17 @@ LANDING = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
 
-  // Reveal
+  /* ===== PAGE TRANSITION на /app ===== */
+  document.querySelectorAll('.js-app-link').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const href = a.getAttribute('href');
+      document.body.classList.add('page-exit');
+      setTimeout(() => { window.location.href = href; }, 260);
+    });
+  });
+
+  /* ===== REVEAL ===== */
   const io = new IntersectionObserver((entries) => {
     entries.forEach((entry, i) => {
       if (entry.isIntersecting) {
@@ -1266,7 +1294,7 @@ LANDING = r"""<!DOCTYPE html>
   }, { threshold: 0.1, rootMargin: '0px 0px -60px 0px' });
   document.querySelectorAll('.reveal').forEach(el => io.observe(el));
 
-  // Navbar on scroll
+  /* ===== NAVBAR ON SCROLL ===== */
   const nav = document.getElementById('nav');
   let ticking = false;
   window.addEventListener('scroll', () => {
@@ -1279,7 +1307,7 @@ LANDING = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
-  // Anchors
+  /* ===== ANCHORS ===== */
   document.querySelectorAll('a[href^="#"]').forEach(a => {
     a.addEventListener('click', (e) => {
       const href = a.getAttribute('href');
@@ -1356,7 +1384,11 @@ APP = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
   ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-  /* ========== CURSOR ========== */
+  /* ===== PAGE ENTER ===== */
+  @keyframes pageEnter{from{opacity:0;transform:scale(.995)}to{opacity:1;transform:scale(1)}}
+  body{animation:pageEnter .42s cubic-bezier(.2,.8,.2,1) both}
+
+  /* ===== CURSOR ===== */
   @media (hover:hover) and (pointer:fine){
     body,a,button,input,textarea{cursor:none}
   }
@@ -1383,7 +1415,7 @@ APP = r"""<!DOCTYPE html>
   .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
   @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-  /* ========== BACKGROUND ========== */
+  /* ===== BACKGROUND ===== */
   .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
   .halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55}
   .halo-1{
@@ -1422,7 +1454,7 @@ APP = r"""<!DOCTYPE html>
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
 
-  /* ========== TOPBAR ========== */
+  /* ===== TOPBAR ===== */
   .topbar{
     position:fixed;top:14px;left:50%;transform:translateX(-50%);
     z-index:100;
@@ -1462,12 +1494,14 @@ APP = r"""<!DOCTYPE html>
     background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);
     pointer-events:none;
   }
-  .logo-mark svg{width:14px;height:14px;position:relative;z-index:1;color:#08080a}
+  .logo-mark svg{width:14px;height:14px;position:relative;z-index:1;color:#08080a;display:block}
   .logo-word{display:inline-flex;align-items:baseline;gap:1px}
   .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
   .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
+  /* ===== MENU (with pill indicator) ===== */
   .menu{
+    position:relative;
     display:inline-flex;gap:4px;
     padding:4px;
     border-radius:12px;
@@ -1475,7 +1509,21 @@ APP = r"""<!DOCTYPE html>
     border:1px solid var(--border);
     flex-shrink:0;
   }
+  .menu-pill{
+    position:absolute;
+    top:4px;bottom:4px;left:0;
+    width:0;
+    border-radius:9px;
+    background:rgba(255,255,255,0.09);
+    border:1px solid rgba(255,255,255,0.13);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,0.09);
+    transform:translateX(0);
+    transition:transform .34s cubic-bezier(.2,.8,.2,1),width .34s cubic-bezier(.2,.8,.2,1);
+    z-index:0;
+    pointer-events:none;
+  }
   .tab{
+    position:relative;z-index:1;
     display:inline-flex;align-items:center;gap:8px;
     padding:8px 15px;
     border-radius:9px;
@@ -1483,17 +1531,12 @@ APP = r"""<!DOCTYPE html>
     color:var(--text-dim);
     font:inherit;font-size:13px;font-weight:500;
     cursor:pointer;
-    transition:background .22s,color .22s,border-color .22s,box-shadow .22s;
+    transition:color .22s;
     -webkit-tap-highlight-color:transparent;white-space:nowrap;
   }
-  .tab svg{width:15px;height:15px;flex-shrink:0}
-  .tab:hover{color:#fff;background:rgba(255,255,255,0.05)}
-  .tab.active{
-    background:rgba(255,255,255,0.09);
-    border-color:rgba(255,255,255,0.13);
-    color:#fff;
-    box-shadow:inset 0 1px 0 rgba(255,255,255,0.09);
-  }
+  .tab svg{width:15px;height:15px;flex-shrink:0;display:block}
+  .tab:hover{color:#fff}
+  .tab.active{color:#fff}
 
   .back-btn{
     display:inline-flex;align-items:center;gap:7px;
@@ -1503,10 +1546,10 @@ APP = r"""<!DOCTYPE html>
     transition:color .2s,background .2s;
     white-space:nowrap;flex-shrink:0;
   }
-  .back-btn svg{width:14px;height:14px}
+  .back-btn svg{width:14px;height:14px;display:block}
   .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
 
-  /* ========== APP — центрирование по вертикали ========== */
+  /* ===== APP ===== */
   .app{
     min-height:100dvh;
     display:flex;
@@ -1521,7 +1564,7 @@ APP = r"""<!DOCTYPE html>
     position:relative;
     width:100%;max-width:560px;
     overflow:hidden;
-    transition:height .28s ease;
+    transition:height .32s cubic-bezier(.2,.8,.2,1);
     will-change:height;
   }
   .stage[hidden]{display:none}
@@ -1530,15 +1573,16 @@ APP = r"""<!DOCTYPE html>
     position:absolute;top:0;left:0;right:0;
     display:flex;flex-direction:column;gap:12px;
     opacity:0;pointer-events:none;
-    transform:translateX(var(--enter-x,20px));
-    transition:opacity .24s ease,transform .3s cubic-bezier(.2,.8,.2,1);
+    transform:scale(.985);
+    transition:opacity .24s ease,transform .32s cubic-bezier(.2,.8,.2,1);
+    will-change:opacity,transform;
   }
   .panel.active{
     position:relative;opacity:1;pointer-events:auto;
-    transform:translateX(0);
+    transform:scale(1);
   }
 
-  /* ========== CARD ========== */
+  /* ===== CARD ===== */
   .card{
     position:relative;
     border-radius:18px;
@@ -1550,7 +1594,7 @@ APP = r"""<!DOCTYPE html>
     padding:18px;
   }
 
-  /* ========== INPUTS ========== */
+  /* ===== INPUTS ===== */
   .input-wrap{position:relative;display:flex}
   .input-wrap + .input-wrap{margin-top:10px}
   .input-wrap .iw-icon{
@@ -1589,7 +1633,7 @@ APP = r"""<!DOCTYPE html>
     line-height:1.55;font-family:inherit;
   }
 
-  /* ========== DROP ========== */
+  /* ===== DROP ===== */
   .drop{
     margin-top:10px;
     border:1px dashed var(--border-2);
@@ -1603,7 +1647,7 @@ APP = r"""<!DOCTYPE html>
     transition:border-color .18s,color .18s,background .18s;
     display:flex;flex-direction:column;align-items:center;gap:7px;
   }
-  .drop .drop-icon{width:22px;height:22px;color:var(--text-mute);transition:color .18s}
+  .drop .drop-icon{width:22px;height:22px;color:var(--text-mute);transition:color .18s;display:block}
   .drop .drop-label{font-size:13px;color:var(--text-dim);transition:color .18s}
   .drop .drop-hint{font-size:11.5px;color:var(--text-mute)}
   .drop:hover{border-color:var(--border-3);background:var(--input-focus)}
@@ -1650,14 +1694,14 @@ APP = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:rgba(224,128,128,0.25);border-color:rgba(224,128,128,0.5)}
 
-  /* ========== ROW ========== */
+  /* ===== ROW ===== */
   .row{
     display:flex;gap:10px;
     margin-top:16px;
     flex-wrap:nowrap;
   }
 
-  /* ========== BUTTONS ========== */
+  /* ===== BUTTONS ===== */
   .btn{
     flex:1 1 0;min-width:0;
     height:46px;
@@ -1673,7 +1717,7 @@ APP = r"""<!DOCTYPE html>
     transition:transform .25s cubic-bezier(.2,.8,.2,1),background .22s,border-color .22s,color .22s,box-shadow .25s;
     white-space:nowrap;
   }
-  .btn svg{width:15px;height:15px;flex-shrink:0;transition:transform .3s cubic-bezier(.2,.8,.2,1)}
+  .btn svg{width:15px;height:15px;flex-shrink:0;display:block;transition:transform .3s cubic-bezier(.2,.8,.2,1)}
   .btn:disabled{opacity:.5;cursor:not-allowed}
 
   .btn.primary{
@@ -1702,7 +1746,7 @@ APP = r"""<!DOCTYPE html>
   }
   .btn.ghost:active:not(:disabled){transform:translateY(0) scale(.985)}
 
-  /* ========== OTP ========== */
+  /* ===== OTP ===== */
   .otp-row{
     display:flex;gap:10px;
     justify-content:center;align-items:center;
@@ -1743,7 +1787,7 @@ APP = r"""<!DOCTYPE html>
     -webkit-appearance:none;appearance:none;
     transition:background .18s,border-color .18s,color .18s;
   }
-  .otp-copy svg{width:18px;height:18px;pointer-events:none}
+  .otp-copy svg{width:18px;height:18px;pointer-events:none;display:block}
   .otp-copy:hover:not(:disabled){
     background:var(--input-focus);
     border-color:var(--border-3);
@@ -1769,7 +1813,7 @@ APP = r"""<!DOCTYPE html>
   .otp.shake{animation:shake .32s ease}
   .otp.shake .otp-cell{border-color:rgba(224,128,128,0.7);background:rgba(224,128,128,0.08)}
 
-  /* ========== LOADER ========== */
+  /* ===== LOADER ===== */
   .center{text-align:center;padding:8px 0}
   .spinner{
     width:22px;height:22px;border-radius:50%;
@@ -1780,7 +1824,7 @@ APP = r"""<!DOCTYPE html>
   @keyframes spin{to{transform:rotate(360deg)}}
   .spinner-label{margin-top:10px;font-size:12px;color:var(--text-dim);text-align:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em}
 
-  /* ========== MESSAGES ========== */
+  /* ===== MESSAGES ===== */
   .msg{
     display:flex;align-items:flex-start;gap:8px;
     border-radius:12px;padding:11px 13px;font-size:13px;
@@ -1792,12 +1836,12 @@ APP = r"""<!DOCTYPE html>
   }
   @keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
   .msg:first-child{margin-top:0}
-  .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px}
+  .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px;display:block}
   .msg span{min-width:0;word-break:break-word}
   .msg.err{background:rgba(224,128,128,0.08);border-color:rgba(224,128,128,0.3);color:#e8b1b1}
   .msg.ok{background:rgba(126,200,153,0.08);border-color:rgba(126,200,153,0.3);color:#b1dfc2}
 
-  /* ========== POST ========== */
+  /* ===== POST ===== */
   .post-title{
     margin:0 0 8px;
     font-family:'Unbounded',sans-serif;
@@ -1833,7 +1877,7 @@ APP = r"""<!DOCTYPE html>
     transform:translateY(-2px);
   }
 
-  /* ========== LIGHTBOX ========== */
+  /* ===== LIGHTBOX ===== */
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
@@ -1877,7 +1921,7 @@ APP = r"""<!DOCTYPE html>
     cursor:pointer;z-index:2;
     transition:background .18s,border-color .18s;
   }
-  .lb-btn svg{width:18px;height:18px;pointer-events:none}
+  .lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
   .lb-btn:hover{background:rgba(30,30,30,0.9);border-color:var(--border-3)}
   .lb-btn[hidden]{display:none}
 
@@ -1917,7 +1961,7 @@ APP = r"""<!DOCTYPE html>
     font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
   }
 
-  /* ========== MODAL ========== */
+  /* ===== MODAL ===== */
   .modal{
     position:fixed;inset:0;z-index:900;
     display:flex;align-items:center;justify-content:center;
@@ -1949,7 +1993,7 @@ APP = r"""<!DOCTYPE html>
     color:var(--ok);
     border:1px solid rgba(126,200,153,0.3);
   }
-  .modal-icon svg{width:22px;height:22px}
+  .modal-icon svg{width:22px;height:22px;display:block}
 
   .modal-title{
     font-family:'Unbounded',sans-serif;
@@ -1971,7 +2015,7 @@ APP = r"""<!DOCTYPE html>
   .modal-actions{display:flex;gap:8px}
   .modal-actions .btn{flex:1;height:42px;font-size:13px}
 
-  /* ========== RESPONSIVE ========== */
+  /* ===== RESPONSIVE ===== */
   @media (max-width:820px){
     .topbar{padding:9px 10px 9px 14px}
     .logo-word{display:none}
@@ -2031,7 +2075,7 @@ APP = r"""<!DOCTYPE html>
   <div class="topbar-inner">
     <a href="/" class="logo">
       <span class="logo-mark">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="12" cy="5" r="2.4"/>
           <circle cx="5" cy="19" r="2.4"/>
           <circle cx="19" cy="19" r="2.4"/>
@@ -2041,24 +2085,25 @@ APP = r"""<!DOCTYPE html>
       <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>
     </a>
 
-    <div class="menu">
+    <div class="menu" id="menu">
+      <span class="menu-pill" id="menuPill" aria-hidden="true"></span>
       <button class="tab" id="btnCreate" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M12 5v14M5 12h14"/>
         </svg>
-        <span data-i18n="createPost">Создать пост</span>
+        <span>Создать пост</span>
       </button>
       <button class="tab" id="btnFind" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="11" cy="11" r="7"/>
           <path d="m20 20-3.5-3.5"/>
         </svg>
-        <span data-i18n="findPost">Найти пост</span>
+        <span>Найти пост</span>
       </button>
     </div>
 
     <a href="/" class="back-btn">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M19 12H5M11 6l-6 6 6 6"/>
       </svg>
       <span>На главную</span>
@@ -2074,8 +2119,8 @@ APP = r"""<!DOCTYPE html>
       <section class="card">
         <div class="input-wrap">
           <input class="field" id="title" type="text" maxlength="120" autocomplete="off" spellcheck="false"
-                 placeholder="Название" data-i18n-ph="titlePh">
-          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                 placeholder="Название">
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/>
             <path d="M9 20h6"/>
             <path d="M12 4v16"/>
@@ -2083,39 +2128,39 @@ APP = r"""<!DOCTYPE html>
         </div>
 
         <div class="input-wrap textarea-wrap">
-          <textarea class="field" id="content" placeholder="Содержимое" data-i18n-ph="contentPh"></textarea>
-          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M4 6h16M4 12h16M4 18h10"/>
           </svg>
         </div>
 
         <div class="drop" id="drop">
-          <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <rect x="3" y="3" width="18" height="18" rx="2.5"/>
             <circle cx="9" cy="9" r="1.6"/>
             <path d="M21 15l-5-5L5 21"/>
           </svg>
-          <div class="drop-label" id="dropLabel" data-i18n="dropLabel">Нажмите или перетащите фото</div>
-          <div class="drop-hint" data-i18n="dropHint">до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V</div>
+          <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
+          <div class="drop-hint">до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V</div>
         </div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
 
         <div class="row">
           <button class="btn ghost" id="resetBtn" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M3 6h18"/>
               <path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/>
               <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
             </svg>
-            <span data-i18n="clear">Очистить</span>
+            <span>Очистить</span>
           </button>
           <button class="btn primary" id="submitBtn" type="button">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M22 2L11 13"/>
               <path d="M22 2l-7 20-4-9-9-4 20-7z"/>
             </svg>
-            <span data-i18n="publish">Опубликовать</span>
+            <span>Опубликовать</span>
           </button>
         </div>
 
@@ -2135,12 +2180,12 @@ APP = r"""<!DOCTYPE html>
             <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="6">
           </div>
           <button class="otp-copy" id="otpCopyBtn" type="button" disabled
-                  data-i18n-title="copyCode" title="Скопировать код" aria-label="Скопировать код">
-            <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  title="Скопировать код" aria-label="Скопировать код">
+            <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="9" y="9" width="13" height="13" rx="2"/>
               <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
             </svg>
-            <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M20 6L9 17l-5-5"/>
             </svg>
           </button>
@@ -2156,23 +2201,23 @@ APP = r"""<!DOCTYPE html>
 <div class="modal" id="createdModal" hidden>
   <div class="modal-card" id="modalCard">
     <div class="modal-icon">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M20 6L9 17l-5-5"/>
       </svg>
     </div>
-    <h3 class="modal-title" data-i18n="postCreated">Пост создан</h3>
-    <p class="modal-sub" data-i18n="postCreatedSub">Сохраните код — по нему можно найти пост в любое время</p>
+    <h3 class="modal-title">Пост создан</h3>
+    <p class="modal-sub">Сохраните код — по нему можно найти пост в любое время</p>
     <div class="modal-code" id="modalCode">000000</div>
     <div class="modal-hint" id="modalHint"></div>
     <div class="modal-actions">
       <button class="btn ghost" id="modalCopyBtn" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="9" y="9" width="13" height="13" rx="2"/>
           <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
         </svg>
-        <span data-i18n="copy">Копировать</span>
+        <span>Копировать</span>
       </button>
-      <button class="btn primary" id="modalCloseBtn" type="button" data-i18n="done">Готово</button>
+      <button class="btn primary" id="modalCloseBtn" type="button">Готово</button>
     </div>
   </div>
 </div>
@@ -2184,24 +2229,24 @@ APP = r"""<!DOCTYPE html>
     </div>
   </div>
   <div class="lb-zoom-badge" id="lbZoomBadge">100%</div>
-  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Close">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <line x1="18" y1="6" x2="6" y2="18"/>
       <line x1="6" y1="6" x2="18" y2="18"/>
     </svg>
   </button>
-  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Prev">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Предыдущее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <polyline points="15 18 9 12 15 6"/>
     </svg>
   </button>
-  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Next">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Следующее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <polyline points="9 18 15 12 9 6"/>
     </svg>
   </button>
   <div class="lb-counter" id="lbCounter">1 / 1</div>
-  <div class="lb-hint" data-i18n="lbHint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
+  <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
 </div>
 
 <script>
@@ -2211,7 +2256,7 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", (e) => e.preventDefault());
 
-  /* ========== CURSOR ========== */
+  /* ===== CURSOR ===== */
   const dot  = document.querySelector('.cur-dot');
   const ring = document.querySelector('.cur-ring');
   let mx = window.innerWidth / 2, my = window.innerHeight / 2;
@@ -2246,7 +2291,7 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
 
-  /* ========== TOPBAR HEIGHT ========== */
+  /* ===== TOPBAR HEIGHT ===== */
   const topbar = $('topbar');
   function measureTopbar() {
     const h = topbar.offsetHeight;
@@ -2256,144 +2301,11 @@ APP = r"""<!DOCTYPE html>
   measureTopbar();
 
   /* =========================================================
-     i18n
-     ========================================================= */
-  const SUPPORTED = ["ru", "en"];
-
-  const I18N = {
-    ru: {
-      createPost: "Создать пост",
-      findPost: "Найти пост",
-      titlePh: "Название",
-      contentPh: "Содержимое",
-      dropLabel: "Нажмите или перетащите фото",
-      dropLabelFilled: "Выбрано: {n} / {max}",
-      dropHint: "до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V",
-      publish: "Опубликовать",
-      publishing: "Публикация...",
-      clear: "Очистить",
-      searching: "Ищем пост...",
-      compressing: "Сжимаем фото...",
-      postCreated: "Пост создан",
-      postCreatedSub: "Сохраните код — по нему можно найти пост в любое время",
-      memoryUsage: "Занято в памяти: {size}",
-      copy: "Копировать",
-      copyCode: "Скопировать код",
-      copied: "Скопировано",
-      copyError: "Ошибка",
-      done: "Готово",
-      photoCount: "Фото: {n}",
-      enterTitle: "Введите название поста.",
-      notFound: "Пост не найден",
-      networkError: "Ошибка сети: {msg}",
-      httpError: "Ошибка {code}",
-      rejectedFiles: "Пропущено: {n}. Только изображения, не больше {max} и не тяжелее 5 МБ.",
-      sizeBadge: "{kb} КБ",
-      lbHint: "колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама"
-    },
-    en: {
-      createPost: "Create post",
-      findPost: "Find post",
-      titlePh: "Title",
-      contentPh: "Content",
-      dropLabel: "Click or drop photos",
-      dropLabelFilled: "Selected: {n} / {max}",
-      dropHint: "up to 5 photos · max 5 MB · compressed to ~60 KB · Ctrl+V",
-      publish: "Publish",
-      publishing: "Publishing...",
-      clear: "Clear",
-      searching: "Searching...",
-      compressing: "Compressing photos...",
-      postCreated: "Post created",
-      postCreatedSub: "Save the code — you can find the post anytime with it",
-      memoryUsage: "Memory used: {size}",
-      copy: "Copy",
-      copyCode: "Copy code",
-      copied: "Copied",
-      copyError: "Error",
-      done: "Done",
-      photoCount: "Photos: {n}",
-      enterTitle: "Please enter a title.",
-      notFound: "Post not found",
-      networkError: "Network error: {msg}",
-      httpError: "Error {code}",
-      rejectedFiles: "Skipped: {n}. Images only, max {max} and up to 5 MB.",
-      sizeBadge: "{kb} KB",
-      lbHint: "wheel — zoom · RMB — 1×/2× · dblclick — reset · LMB — pan"
-    }
-  };
-
-  let currentLang = "ru";
-
-  function t(key, params) {
-    let s = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key] || key;
-    if (params) {
-      for (const k in params) s = s.replace("{" + k + "}", params[k]);
-    }
-    return s;
-  }
-
-  function applyI18n(lang) {
-    currentLang = SUPPORTED.includes(lang) ? lang : "ru";
-    document.documentElement.lang = currentLang;
-
-    document.querySelectorAll("[data-i18n]").forEach(el => {
-      const key = el.getAttribute("data-i18n");
-      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
-      if (txt) el.textContent = txt;
-    });
-    document.querySelectorAll("[data-i18n-ph]").forEach(el => {
-      const key = el.getAttribute("data-i18n-ph");
-      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
-      if (txt) el.placeholder = txt;
-    });
-    document.querySelectorAll("[data-i18n-title]").forEach(el => {
-      const key = el.getAttribute("data-i18n-title");
-      const txt = (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key];
-      if (txt) { el.title = txt; el.setAttribute("aria-label", txt); }
-    });
-
-    dropLabel.textContent = defaultDropLabel();
-    if (modalHint && modalHint.dataset.size) {
-      modalHint.textContent = t("memoryUsage", { size: modalHint.dataset.size });
-    }
-    // Обновить бейджи размеров в превью
-    document.querySelectorAll(".preview .pv-badge").forEach(b => {
-      if (b.dataset.kb) {
-        b.textContent = t("sizeBadge", { kb: b.dataset.kb });
-      }
-    });
-  }
-
-  function parseHash() {
-    const h = (window.location.hash || "").replace(/^#/, "");
-    if (!h) return { code: null, lang: null };
-    const qIdx = h.indexOf("?");
-    const codePart = (qIdx >= 0 ? h.slice(0, qIdx) : h).trim();
-    const params = new URLSearchParams(qIdx >= 0 ? h.slice(qIdx + 1) : "");
-    const code = /^\d{6}$/.test(codePart) ? codePart : null;
-    const langRaw = (params.get("lang") || "").toLowerCase().split("-")[0];
-    const lang = SUPPORTED.includes(langRaw) ? langRaw : null;
-    return { code, lang };
-  }
-
-  function detectLang() {
-    const { lang } = parseHash();
-    if (lang) return lang;
-    const nav = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || "ru"];
-    for (const l of nav) {
-      const code = String(l || "").toLowerCase().split("-")[0];
-      if (SUPPORTED.includes(code)) return code;
-    }
-    return "ru";
-  }
-
-  /* =========================================================
-     ICONS
+     HELPERS
      ========================================================= */
   const ICONS = {
-    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
-    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
+    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
   };
 
   function makeMsg(kind, text) {
@@ -2415,7 +2327,7 @@ APP = r"""<!DOCTYPE html>
         if (Array.isArray(data.detail) && data.detail.length) {
           const first = data.detail[0] || {};
           const loc = Array.isArray(first.loc) ? first.loc.filter(x => x !== "body").join(".") : "";
-          const msg = first.msg || "Invalid input";
+          const msg = first.msg || "Некорректные данные";
           return loc ? (loc + ": " + msg) : msg;
         }
         if (typeof data.message === "string" && data.message.trim()) return data.message;
@@ -2423,25 +2335,35 @@ APP = r"""<!DOCTYPE html>
     }
     const txt = await res.text().catch(() => "");
     if (txt && txt.trim() && txt.length < 400) return txt.trim();
-    const statusText = res.statusText ? (" — " + res.statusText) : "";
-    return t("httpError", { code: res.status }) + statusText;
+    return `Ошибка ${res.status}`;
   }
 
   function formatBytes(b) {
-    if (b < 1024) return b + " B";
-    if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " KB";
-    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2).replace(".", ",") + " MB";
-    return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " GB";
+    if (b < 1024) return b + " Б";
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1).replace(".", ",") + " КБ";
+    if (b < 1024 * 1024 * 1024) return (b / (1024 * 1024)).toFixed(2).replace(".", ",") + " МБ";
+    return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " ГБ";
+  }
+
+  function parseHash() {
+    const h = (window.location.hash || "").replace(/^#/, "");
+    if (!h) return { code: null };
+    const qIdx = h.indexOf("?");
+    const codePart = (qIdx >= 0 ? h.slice(0, qIdx) : h).trim();
+    const code = /^\d{6}$/.test(codePart) ? codePart : null;
+    return { code };
   }
 
   /* =========================================================
-     TABS
+     TABS + PILL INDICATOR
      ========================================================= */
   const stage       = $("stage");
   const createPanel = $("createPanel");
   const findPanel   = $("findPanel");
   const btnCreate   = $("btnCreate");
   const btnFind     = $("btnFind");
+  const menuEl      = $("menu");
+  const menuPill    = $("menuPill");
 
   let mode = null;
 
@@ -2454,13 +2376,32 @@ APP = r"""<!DOCTYPE html>
     if (!animate) { void stage.offsetHeight; stage.style.transition = ""; }
   }
 
+  function updateMenuPill() {
+    if (!menuPill || !mode) return;
+    const activeTab = mode === "create" ? btnCreate : btnFind;
+    const menuRect = menuEl.getBoundingClientRect();
+    const tabRect = activeTab.getBoundingClientRect();
+    const left = tabRect.left - menuRect.left;
+    menuPill.style.transform = `translateX(${left}px)`;
+    menuPill.style.width = tabRect.width + "px";
+  }
+
   const ro = new ResizeObserver(() => {
     if (!mode || stage.hidden) return;
     stage.style.height = activePanel().offsetHeight + "px";
+    updateMenuPill();
   });
   ro.observe(createPanel);
   ro.observe(findPanel);
-  window.addEventListener("resize", () => syncHeight(false), { passive: true });
+
+  window.addEventListener("resize", () => {
+    syncHeight(false);
+    updateMenuPill();
+  }, { passive: true });
+
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(updateMenuPill);
+  }
 
   function setMode(next, instant = false) {
     if (next === mode && !instant) return;
@@ -2469,16 +2410,11 @@ APP = r"""<!DOCTYPE html>
     const incoming  = next === "create" ? createPanel : findPanel;
     const outgoing  = next === "create" ? findPanel   : createPanel;
 
-    const goLeft = (next === "create");
-    const enterX = goLeft ? -20 : 20;
-    const exitX  = goLeft ?  20 : -20;
-
     stage.hidden = false;
     stage.style.transition = "none";
     stage.style.height = incoming.offsetHeight + "px";
 
     if (firstShow || mode === null || instant) {
-      incoming.style.setProperty("--enter-x", "0px");
       incoming.style.transition = "none";
       outgoing.classList.remove("active");
       incoming.classList.add("active");
@@ -2487,9 +2423,6 @@ APP = r"""<!DOCTYPE html>
       void stage.offsetWidth;
       stage.style.transition = "";
     } else {
-      incoming.style.setProperty("--enter-x", enterX + "px");
-      outgoing.style.setProperty("--enter-x", exitX  + "px");
-      void incoming.offsetWidth;
       outgoing.classList.remove("active");
       incoming.classList.add("active");
       void stage.offsetWidth;
@@ -2500,6 +2433,12 @@ APP = r"""<!DOCTYPE html>
     mode = next;
     btnCreate.classList.toggle("active", next === "create");
     btnFind.classList.toggle("active", next === "find");
+
+    // Подсветка-пилюля сдвигается
+    updateMenuPill();
+    // Дополнительный вызов через кадр — на случай анимации шрифтов
+    requestAnimationFrame(updateMenuPill);
+    setTimeout(updateMenuPill, 60);
 
     if (next === "create") setTimeout(() => $("title").focus(), 100);
     else setTimeout(() => otpCells[0].focus(), 100);
@@ -2519,8 +2458,8 @@ APP = r"""<!DOCTYPE html>
   /* =========================================================
      IMAGE COMPRESSION
      ========================================================= */
-  const TARGET_PHOTO_BYTES = 60 * 1024;   // ~60 КБ
-  const SOURCE_MAX_BYTES   = 5 * 1024 * 1024; // 5 МБ
+  const TARGET_PHOTO_BYTES = 60 * 1024;
+  const SOURCE_MAX_BYTES   = 5 * 1024 * 1024;
 
   async function compressImage(file, targetBytes = TARGET_PHOTO_BYTES) {
     if (!file.type.startsWith("image/")) return file;
@@ -2558,7 +2497,6 @@ APP = r"""<!DOCTYPE html>
 
         if (candidate) { best = candidate; break; }
 
-        // fallback: уменьшаем габариты
         const fallback = await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.5));
         if (fallback) best = fallback;
         maxDim = Math.round(maxDim * 0.72);
@@ -2593,8 +2531,8 @@ APP = r"""<!DOCTYPE html>
 
   function defaultDropLabel() {
     return selectedFiles.length
-      ? t("dropLabelFilled", { n: selectedFiles.length, max: MAX_PHOTOS })
-      : t("dropLabel");
+      ? `Выбрано: ${selectedFiles.length} / ${MAX_PHOTOS}`
+      : "Нажмите или перетащите фото";
   }
 
   drop.addEventListener("click", () => fileInput.click());
@@ -2646,7 +2584,7 @@ APP = r"""<!DOCTYPE html>
     }
 
     if (rejected > 0) {
-      showCreateMsg("err", t("rejectedFiles", { n: rejected, max: MAX_PHOTOS }));
+      showCreateMsg("err", `Пропущено: ${rejected}. Только изображения, не больше ${MAX_PHOTOS} и не тяжелее 5 МБ.`);
     } else {
       clearCreateMsg();
     }
@@ -2654,11 +2592,10 @@ APP = r"""<!DOCTYPE html>
     if (!accepted.length) return;
 
     drop.classList.add("busy");
-    dropLabel.textContent = t("compressing");
+    dropLabel.textContent = "Сжимаем фото...";
 
     try {
       const compressed = await Promise.all(accepted.map(f => compressImage(f)));
-      // фильтруем null/undefined (на всякий случай)
       for (const c of compressed) {
         if (c) selectedFiles.push(c);
       }
@@ -2679,12 +2616,10 @@ APP = r"""<!DOCTYPE html>
       img.src = url; img.alt = file.name;
       img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
 
-      // Размер в КБ
       const kb = Math.max(1, Math.round(file.size / 1024));
       const badge = document.createElement("div");
       badge.className = "pv-badge";
-      badge.dataset.kb = kb;
-      badge.textContent = t("sizeBadge", { kb });
+      badge.textContent = kb + " КБ";
 
       const rm = document.createElement("button");
       rm.type = "button"; rm.textContent = "×"; rm.title = "×";
@@ -2722,7 +2657,7 @@ APP = r"""<!DOCTYPE html>
     const title = titleInput.value.trim();
     const content = contentInput.value.trim();
     if (!title) {
-      showCreateMsg("err", t("enterTitle"));
+      showCreateMsg("err", "Введите название поста.");
       titleInput.focus();
       return;
     }
@@ -2734,7 +2669,7 @@ APP = r"""<!DOCTYPE html>
 
     submitBtn.disabled = true;
     const oldHTML = submitBtn.innerHTML;
-    submitBtn.textContent = t("publishing");
+    submitBtn.textContent = "Публикация...";
     clearCreateMsg();
 
     try {
@@ -2748,7 +2683,7 @@ APP = r"""<!DOCTYPE html>
 
       const data = await res.json().catch(() => null);
       if (!data || !data.code) {
-        showCreateMsg("err", "Invalid server response");
+        showCreateMsg("err", "Некорректный ответ сервера");
         return;
       }
 
@@ -2760,7 +2695,7 @@ APP = r"""<!DOCTYPE html>
 
       const code = data.code;
 
-      const newHash = "#" + code + "?lang=" + currentLang;
+      const newHash = "#" + code;
       if (window.location.hash !== newHash) {
         history.replaceState(null, "", newHash);
       }
@@ -2773,7 +2708,7 @@ APP = r"""<!DOCTYPE html>
 
       showCreatedModal(code, data.compressed_bytes);
     } catch (e) {
-      showCreateMsg("err", t("networkError", { msg: e.message }));
+      showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
       submitBtn.disabled = false;
       submitBtn.innerHTML = oldHTML;
@@ -2794,10 +2729,9 @@ APP = r"""<!DOCTYPE html>
 
   function showCreatedModal(code, bytes) {
     modalCode.textContent = code;
-    modalHint.dataset.size = formatBytes(bytes);
-    modalHint.textContent = t("memoryUsage", { size: formatBytes(bytes) });
+    modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
     const label = modalCopyBtn.querySelector("span");
-    if (label) label.textContent = t("copy");
+    if (label) label.textContent = "Копировать";
     createdModal.hidden = false;
   }
   function closeCreatedModal() { createdModal.hidden = true; }
@@ -2806,12 +2740,12 @@ APP = r"""<!DOCTYPE html>
     const label = modalCopyBtn.querySelector("span");
     try {
       await navigator.clipboard.writeText(modalCode.textContent || "");
-      if (label) label.textContent = t("copied");
+      if (label) label.textContent = "Скопировано";
     } catch {
-      if (label) label.textContent = t("copyError");
+      if (label) label.textContent = "Ошибка";
     }
     clearTimeout(modalCopyTimer);
-    modalCopyTimer = setTimeout(() => { if (label) label.textContent = t("copy"); }, 1500);
+    modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
   });
 
   modalCloseBtn.addEventListener("click", closeCreatedModal);
@@ -2927,7 +2861,7 @@ APP = r"""<!DOCTYPE html>
   function renderSpinner() {
     searchFrame.innerHTML =
       '<div class="center"><div class="spinner"></div>' +
-      '<div class="spinner-label">' + t("searching") + '</div></div>';
+      '<div class="spinner-label">Ищем пост...</div></div>';
     showSearchFrame();
   }
 
@@ -3128,12 +3062,12 @@ APP = r"""<!DOCTYPE html>
     meta.className = "post-meta";
 
     const date = document.createElement("span");
-    try { date.textContent = new Date(post.created).toLocaleString(currentLang); } catch {}
+    try { date.textContent = new Date(post.created).toLocaleString("ru-RU"); } catch {}
     meta.appendChild(date);
 
     if (post.photos && post.photos.length) {
       const cnt = document.createElement("span");
-      cnt.textContent = t("photoCount", { n: post.photos.length });
+      cnt.textContent = "Фото: " + post.photos.length;
       meta.appendChild(cnt);
     }
 
@@ -3176,18 +3110,18 @@ APP = r"""<!DOCTYPE html>
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
         const msg = await readError(res);
-        renderError(msg || t("notFound"));
+        renderError(msg || "Пост не найден");
         shakeOtp();
         setTimeout(clearOtp, 320);
         return;
       }
       const post = await res.json().catch(() => null);
       if (mySeq !== searchSeq) return;
-      if (!post) { renderError(t("notFound")); return; }
+      if (!post) { renderError("Пост не найден"); return; }
       renderPost(post);
     } catch (e) {
       if (mySeq !== searchSeq) return;
-      renderError(t("networkError", { msg: e.message }));
+      renderError("Ошибка сети: " + e.message);
       shakeOtp();
       setTimeout(clearOtp, 320);
     }
@@ -3197,9 +3131,7 @@ APP = r"""<!DOCTYPE html>
      INIT
      ========================================================= */
   function initFromUrl() {
-    const { code, lang } = parseHash();
-    const targetLang = lang || detectLang();
-    applyI18n(targetLang);
+    const { code } = parseHash();
 
     if (code) {
       setMode("find", true);
@@ -3210,20 +3142,16 @@ APP = r"""<!DOCTYPE html>
     } else {
       setMode("create", true);
     }
-    requestAnimationFrame(() => syncHeight(false));
+    requestAnimationFrame(() => {
+      syncHeight(false);
+      updateMenuPill();
+    });
   }
 
   initFromUrl();
 
   window.addEventListener("hashchange", () => {
-    const { code, lang } = parseHash();
-    if (lang && lang !== currentLang) {
-      applyI18n(lang);
-      if (mode === "find" && getCode().length === 6) {
-        lastSubmitted = "";
-        runSearch(getCode());
-      }
-    }
+    const { code } = parseHash();
     if (code && mode !== "find") {
       setMode("find", true);
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
@@ -3265,4 +3193,4 @@ async def app_page():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level=info)
