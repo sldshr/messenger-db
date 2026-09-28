@@ -87,7 +87,7 @@ _store: Dict[str, dict] = {}
 _lock = threading.Lock()
 
 MAX_PHOTOS = 5
-MAX_PHOTO_BYTES = 12 * 1024 * 1024
+MAX_PHOTO_BYTES = 5 * 1024 * 1024   # 5 МБ — на входе (клиент жмёт до ~60 КБ)
 MAX_TITLE_LEN = 120
 MAX_CONTENT_LEN = 20_000
 
@@ -261,13 +261,12 @@ LANDING = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>СЛД·NET — нетворкинг на 6 цифрах</title>
+<title>СЛД·NET — посты по 6-значному коду</title>
 <link rel="icon" href="__FAVICON__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script>
-  // редирект на /app, если в URL есть 6-значный код поста
   if (/^#\d{6}/.test(location.hash)) {
     location.replace('/app' + location.hash);
   }
@@ -290,16 +289,16 @@ LANDING = r"""<!DOCTYPE html>
 
   html{scroll-behavior:smooth}
 
-  body{
-    background:var(--bg);
-    color:var(--text);
-    font-family:'Manrope',system-ui,sans-serif;
-    font-size:16px;
-    line-height:1.6;
-    overflow-x:hidden;
-    min-height:100vh;
+  html,body{
+    background:var(--bg);color:var(--text);
+    font-family:'Manrope',system-ui,-apple-system,sans-serif;
+    font-size:16px;line-height:1.6;
+    overflow-x:hidden;min-height:100vh;
     -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+    -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
   }
+  input,textarea,[contenteditable]{-webkit-user-select:text;-moz-user-select:text;user-select:text}
 
   ::selection{background:#fff;color:#000}
 
@@ -312,85 +311,82 @@ LANDING = r"""<!DOCTYPE html>
     body,a,button,input,textarea{cursor:none}
   }
   .cur-dot,.cur-ring{
-    position:fixed;top:0;left:0;
-    pointer-events:none;z-index:99999;
-    border-radius:50%;
-    will-change:transform;
+    position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
+    border-radius:50%;will-change:transform;
   }
   .cur-dot{
-    width:6px;height:6px;
-    background:#fff;
-    box-shadow:0 0 0 1px rgba(255,255,255,0.3);
+    width:7px;height:7px;background:#fff;
+    box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25);
   }
   .cur-ring{
-    width:36px;height:36px;
-    border:1px solid rgba(255,255,255,0.35);
-    transition:width .25s cubic-bezier(.2,.8,.2,1),
-               height .25s cubic-bezier(.2,.8,.2,1),
+    width:34px;height:34px;
+    border:1.5px solid rgba(255,255,255,0.35);
+    transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
                border-color .25s,background .25s;
   }
   .cur-ring.hover{
-    width:64px;height:64px;
-    border-color:rgba(255,255,255,0.15);
-    background:rgba(255,255,255,0.06);
-    backdrop-filter:blur(4px);
-    -webkit-backdrop-filter:blur(4px);
+    width:60px;height:60px;
+    border-color:rgba(255,255,255,0.2);
+    background:rgba(255,255,255,0.05);
+    backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
   }
-  .cur-ring.click{width:26px;height:26px;background:rgba(255,255,255,0.15)}
+  .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
   @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-  .bg{position:fixed;inset:0;z-index:-2;overflow:hidden;background:var(--bg)}
-  .halo{position:absolute;border-radius:50%;filter:blur(120px);opacity:.5}
+  .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
+  .halo{position:absolute;border-radius:50%;filter:blur(130px);opacity:.55}
   .halo-1{
-    width:640px;height:640px;
-    background:radial-gradient(circle,rgba(255,255,255,0.09),transparent 65%);
-    top:-220px;left:-120px;
-    animation:drift1 26s ease-in-out infinite;
+    width:720px;height:720px;
+    background:radial-gradient(circle,rgba(255,255,255,0.085),transparent 65%);
+    top:-260px;left:-140px;
+    animation:drift1 28s ease-in-out infinite;
   }
   .halo-2{
-    width:520px;height:520px;
-    background:radial-gradient(circle,rgba(255,255,255,0.055),transparent 65%);
-    top:35%;right:-160px;
-    animation:drift2 32s ease-in-out infinite;
+    width:560px;height:560px;
+    background:radial-gradient(circle,rgba(255,255,255,0.05),transparent 65%);
+    top:38%;right:-180px;
+    animation:drift2 34s ease-in-out infinite;
   }
   .halo-3{
-    width:560px;height:560px;
-    background:radial-gradient(circle,rgba(255,255,255,0.04),transparent 65%);
-    bottom:-180px;left:30%;
-    animation:drift3 36s ease-in-out infinite;
+    width:620px;height:620px;
+    background:radial-gradient(circle,rgba(255,255,255,0.035),transparent 65%);
+    bottom:-200px;left:32%;
+    animation:drift3 38s ease-in-out infinite;
   }
-  @keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(100px,80px) scale(1.12)}}
-  @keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-120px,60px) scale(1.15)}}
-  @keyframes drift3{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(70px,-90px) scale(.92)}}
+  @keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(110px,90px) scale(1.12)}}
+  @keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-130px,70px) scale(1.15)}}
+  @keyframes drift3{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(80px,-100px) scale(.92)}}
+
+  .cursor-glow{
+    position:fixed;inset:0;z-index:-2;pointer-events:none;
+    background:radial-gradient(650px circle at var(--mx, 50%) var(--my, 30%), rgba(255,255,255,0.028), transparent 60%);
+    transition:opacity .4s;
+  }
 
   .grid-bg{
     position:fixed;inset:0;z-index:-1;pointer-events:none;
     background-image:
-      linear-gradient(rgba(255,255,255,0.022) 1px,transparent 1px),
-      linear-gradient(90deg,rgba(255,255,255,0.022) 1px,transparent 1px);
-    background-size:72px 72px;
-    mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 15%,transparent 80%);
-    -webkit-mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 15%,transparent 80%);
+      linear-gradient(rgba(255,255,255,0.02) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,0.02) 1px,transparent 1px);
+    background-size:76px 76px;
+    mask-image:radial-gradient(ellipse 95% 75% at 50% 0%,#000 15%,transparent 82%);
+    -webkit-mask-image:radial-gradient(ellipse 95% 75% at 50% 0%,#000 15%,transparent 82%);
   }
 
   .grain{
     position:fixed;inset:0;z-index:9998;pointer-events:none;
-    opacity:.035;mix-blend-mode:overlay;
+    opacity:.03;mix-blend-mode:overlay;
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
 
   .wrap{max-width:1200px;margin:0 auto;padding:0 28px}
 
   nav{
-    position:fixed;top:20px;left:50%;
-    transform:translateX(-50%);
+    position:fixed;top:20px;left:50%;transform:translateX(-50%);
     z-index:100;
-    width:calc(100% - 40px);
-    max-width:1160px;
-    border-radius:18px;
-    padding:11px 12px 11px 22px;
-    display:flex;align-items:center;justify-content:space-between;
-    gap:20px;
+    width:calc(100% - 40px);max-width:1160px;
+    border-radius:18px;padding:11px 12px 11px 22px;
+    display:flex;align-items:center;justify-content:space-between;gap:20px;
     background:rgba(15,15,15,0.6);
     backdrop-filter:blur(24px) saturate(160%);
     -webkit-backdrop-filter:blur(24px) saturate(160%);
@@ -406,17 +402,12 @@ LANDING = r"""<!DOCTYPE html>
 
   .logo{
     display:inline-flex;align-items:center;gap:11px;
-    font-family:'Unbounded',sans-serif;
-    font-weight:700;
-    font-size:14.5px;
-    letter-spacing:-0.01em;
-    text-decoration:none;
-    color:#fff;
-    white-space:nowrap;
+    font-family:'Unbounded',sans-serif;font-weight:700;
+    font-size:14.5px;letter-spacing:-0.01em;
+    text-decoration:none;color:#fff;white-space:nowrap;
   }
   .logo-mark{
-    width:30px;height:30px;
-    border-radius:9px;
+    width:30px;height:30px;border-radius:9px;
     background:linear-gradient(140deg,#fff,#c4c4c8);
     display:grid;place-items:center;
     position:relative;overflow:hidden;
@@ -446,18 +437,13 @@ LANDING = r"""<!DOCTYPE html>
   .btn{
     display:inline-flex;align-items:center;justify-content:center;
     gap:8px;
-    font-family:'Manrope',sans-serif;
-    font-weight:600;font-size:13.5px;
+    font-family:'Manrope',sans-serif;font-weight:600;font-size:13.5px;
     letter-spacing:-0.005em;
-    padding:11px 20px;
-    height:42px;
-    border-radius:11px;
-    border:1px solid transparent;
-    text-decoration:none;
-    position:relative;overflow:hidden;white-space:nowrap;
+    padding:11px 20px;height:42px;
+    border-radius:11px;border:1px solid transparent;
+    text-decoration:none;position:relative;overflow:hidden;white-space:nowrap;
     transition:transform .3s cubic-bezier(.2,.8,.2,1),background .25s,border-color .25s,color .25s,box-shadow .3s;
-    -webkit-tap-highlight-color:transparent;
-    user-select:none;
+    -webkit-tap-highlight-color:transparent;user-select:none;
   }
   .btn svg{width:15px;height:15px;flex-shrink:0;transition:transform .35s cubic-bezier(.2,.8,.2,1)}
 
@@ -466,8 +452,7 @@ LANDING = r"""<!DOCTYPE html>
     box-shadow:0 1px 0 rgba(255,255,255,0.7) inset,0 -1px 0 rgba(0,0,0,0.12) inset,0 6px 22px -6px rgba(255,255,255,0.22);
   }
   .btn-primary:hover{
-    transform:translateY(-1px);
-    background:#fff;
+    transform:translateY(-1px);background:#fff;
     box-shadow:0 1px 0 rgba(255,255,255,0.9) inset,0 -1px 0 rgba(0,0,0,0.15) inset,0 10px 32px -6px rgba(255,255,255,0.3);
   }
   .btn-primary:active{transform:translateY(0) scale(.985)}
@@ -479,24 +464,24 @@ LANDING = r"""<!DOCTYPE html>
     box-shadow:inset 0 1px 0 rgba(255,255,255,0.08),0 4px 14px rgba(0,0,0,0.25);
   }
   .btn-ghost:hover{
-    background:var(--glass-hi);
-    border-color:var(--border-3);
+    background:var(--glass-hi);border-color:var(--border-3);
     transform:translateY(-1px);
     box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 8px 22px rgba(0,0,0,0.35);
   }
   .btn-ghost:active{transform:translateY(0) scale(.985)}
 
+  /* ===== HERO ===== */
   .hero{padding:200px 0 100px;position:relative}
-  .hero-inner{max-width:820px;margin:0 auto;text-align:center}
+  .hero-inner{max-width:880px;margin:0 auto;text-align:center}
 
   .badge{
-    display:inline-flex;align-items:center;gap:9px;
-    padding:6px 14px 6px 8px;
+    display:inline-flex;align-items:center;gap:10px;
+    padding:7px 15px 7px 9px;
     border-radius:100px;
     background:var(--glass);border:1px solid var(--border-2);
     backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
     font-size:12.5px;font-weight:500;color:var(--text-dim);
-    letter-spacing:-0.005em;margin-bottom:34px;
+    letter-spacing:-0.005em;margin-bottom:36px;
     animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
   }
   .badge-dot{
@@ -507,18 +492,16 @@ LANDING = r"""<!DOCTYPE html>
   }
   .badge-dot::after{
     content:'';position:absolute;inset:-4px;border-radius:50%;
-    border:1px solid rgba(255,255,255,0.25);
-    animation:ping 2.2s ease-out infinite;
+    border:1px solid rgba(255,255,255,0.22);
+    animation:ping 2.4s ease-out infinite;
   }
   @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.7);opacity:0}}
   .badge-dot svg{width:10px;height:10px}
 
   h1{
-    font-family:'Unbounded',sans-serif;
-    font-weight:700;
-    font-size:clamp(38px,7.6vw,86px);
-    line-height:0.98;letter-spacing:-0.045em;
-    margin-bottom:26px;
+    font-family:'Unbounded',sans-serif;font-weight:700;
+    font-size:clamp(38px,7.4vw,84px);line-height:0.98;
+    letter-spacing:-0.045em;margin-bottom:28px;
     animation:rise .9s .05s cubic-bezier(.2,.8,.2,1) both;
   }
   h1 .dim{color:var(--text-mute);font-weight:400}
@@ -526,14 +509,21 @@ LANDING = r"""<!DOCTYPE html>
   .lead{
     font-size:clamp(15.5px,1.7vw,18px);
     line-height:1.65;color:var(--text-dim);
-    max-width:580px;margin:0 auto 40px;
+    max-width:620px;margin:0 auto 40px;
     animation:rise 1s .12s cubic-bezier(.2,.8,.2,1) both;
   }
   .lead strong{color:#e8e8ea;font-weight:600}
+  .lead code{
+    font-family:'JetBrains Mono',monospace;
+    font-size:.92em;
+    color:var(--text);
+    background:rgba(255,255,255,0.05);
+    padding:2px 7px;border-radius:6px;
+    border:1px solid var(--border);
+  }
 
   .hero-cta{
-    display:flex;gap:12px;justify-content:center;
-    flex-wrap:wrap;
+    display:flex;gap:12px;justify-content:center;flex-wrap:wrap;
     animation:rise 1s .22s cubic-bezier(.2,.8,.2,1) both;
   }
   .hero-cta .btn{padding:14px 26px;height:auto;font-size:14.5px;border-radius:13px}
@@ -542,14 +532,14 @@ LANDING = r"""<!DOCTYPE html>
   @keyframes rise{from{opacity:0;transform:translateY(24px);filter:blur(6px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
   .code-show{
-    margin:70px auto 0;max-width:520px;
+    margin:72px auto 0;max-width:540px;
     display:flex;gap:8px;justify-content:center;flex-wrap:nowrap;
     animation:rise 1s .32s cubic-bezier(.2,.8,.2,1) both;
   }
   .code-cell{
-    flex:1 1 0;max-width:64px;aspect-ratio:2/3;
+    flex:1 1 0;max-width:66px;aspect-ratio:2/3;
     border-radius:12px;
-    background:linear-gradient(160deg,rgba(255,255,255,0.05),rgba(255,255,255,0.015));
+    background:linear-gradient(160deg,rgba(255,255,255,0.055),rgba(255,255,255,0.015));
     border:1px solid var(--border-2);
     backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
     display:grid;place-items:center;
@@ -569,10 +559,11 @@ LANDING = r"""<!DOCTYPE html>
   @keyframes cellIn{from{opacity:0;transform:translateY(18px) scale(.9)}to{opacity:1;transform:translateY(0) scale(1)}}
 
   .code-caption{
-    margin-top:18px;font-size:13px;color:var(--text-mute);
+    margin-top:20px;font-size:12.5px;color:var(--text-mute);
     letter-spacing:0.01em;
     animation:rise 1s .9s cubic-bezier(.2,.8,.2,1) both;
-    display:inline-flex;align-items:center;gap:8px;
+    display:inline-flex;align-items:center;gap:9px;
+    font-family:'JetBrains Mono',monospace;
   }
   .code-caption svg{width:13px;height:13px;opacity:.6}
 
@@ -585,12 +576,12 @@ LANDING = r"""<!DOCTYPE html>
   }
   .marquee-track{
     display:flex;gap:52px;width:max-content;
-    animation:scroll 40s linear infinite;
+    animation:scroll 44s linear infinite;
     will-change:transform;
   }
   .marquee-track span{
-    font-family:'Unbounded',sans-serif;font-size:15px;font-weight:500;
-    letter-spacing:0.05em;text-transform:uppercase;color:var(--text-mute);
+    font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+    letter-spacing:0.12em;text-transform:uppercase;color:var(--text-mute);
     display:inline-flex;align-items:center;gap:52px;white-space:nowrap;
   }
   .marquee-track span::after{
@@ -601,12 +592,12 @@ LANDING = r"""<!DOCTYPE html>
 
   section{padding:110px 0;position:relative}
 
-  .sec-head{max-width:600px;margin-bottom:56px}
+  .sec-head{max-width:640px;margin-bottom:56px}
   .eyebrow{
     display:inline-flex;align-items:center;gap:10px;
     font-family:'JetBrains Mono',monospace;
     font-size:11.5px;font-weight:500;
-    letter-spacing:0.12em;text-transform:uppercase;
+    letter-spacing:0.14em;text-transform:uppercase;
     color:var(--text-mute);margin-bottom:20px;
   }
   .eyebrow::before{content:'';width:24px;height:1px;background:linear-gradient(90deg,var(--text-mute),transparent)}
@@ -647,11 +638,12 @@ LANDING = r"""<!DOCTYPE html>
   .glass:hover::after{transform:translateX(120%)}
   .glass:hover{transform:translateY(-2px)}
 
+  /* Bento: 6 cols */
   .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
   .bento .glass{padding:30px;display:flex;flex-direction:column}
   .b-lg{grid-column:span 4;min-height:300px}
-  .b-md{grid-column:span 3;min-height:250px}
-  .b-sm{grid-column:span 2;min-height:240px}
+  .b-md{grid-column:span 3;min-height:240px}
+  .b-sm{grid-column:span 2;min-height:230px}
 
   .icon-box{
     width:46px;height:46px;border-radius:13px;
@@ -666,11 +658,17 @@ LANDING = r"""<!DOCTYPE html>
 
   .bento h3{
     font-family:'Unbounded',sans-serif;font-weight:600;
-    font-size:17.5px;letter-spacing:-0.02em;line-height:1.25;
+    font-size:17px;letter-spacing:-0.02em;line-height:1.3;
     margin-bottom:10px;
   }
   .bento p{color:var(--text-dim);font-size:14px;line-height:1.6;max-width:48ch}
-  .bento p code{font-family:'JetBrains Mono',monospace;color:var(--text-dim);font-size:.92em}
+  .bento p code,.step p code{
+    font-family:'JetBrains Mono',monospace;
+    color:var(--text);font-size:.92em;
+    background:rgba(255,255,255,0.04);
+    padding:1px 6px;border-radius:5px;
+    border:1px solid var(--border);
+  }
 
   .b-lg{justify-content:space-between}
   .b-lg .big-num{
@@ -684,7 +682,7 @@ LANDING = r"""<!DOCTYPE html>
     font-size:0.32em;vertical-align:super;
     color:var(--text-mute);
     -webkit-text-fill-color:var(--text-mute);
-    margin-left:2px;
+    margin-left:4px;letter-spacing:0.02em;
   }
 
   .avatars{display:flex;margin-top:auto;padding-top:22px}
@@ -734,21 +732,22 @@ LANDING = r"""<!DOCTYPE html>
   }
   .spec-lbl{
     font-family:'JetBrains Mono',monospace;font-size:11.5px;
-    color:var(--text-mute);letter-spacing:0.04em;text-transform:uppercase;
+    color:var(--text-mute);letter-spacing:0.06em;text-transform:uppercase;
   }
 
   .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
   .step{padding:30px;display:flex;flex-direction:column;position:relative}
   .step-num{
     font-family:'JetBrains Mono',monospace;font-size:11.5px;
-    color:var(--text-mute);letter-spacing:0.1em;margin-bottom:20px;
+    color:var(--text-mute);letter-spacing:0.12em;margin-bottom:20px;
+    text-transform:uppercase;
   }
   .step-num::before{content:'— '}
   .step h3{
     font-family:'Unbounded',sans-serif;font-weight:600;
-    font-size:18px;letter-spacing:-0.02em;margin-bottom:10px;
+    font-size:17.5px;letter-spacing:-0.02em;margin-bottom:10px;
   }
-  .step p{color:var(--text-dim);font-size:14px;line-height:1.6}
+  .step p{color:var(--text-dim);font-size:14px;line-height:1.65}
 
   .cta{
     position:relative;border-radius:32px;padding:80px 40px;
@@ -768,13 +767,13 @@ LANDING = r"""<!DOCTYPE html>
   }
   .cta > *{position:relative;z-index:1}
   .cta h2{font-size:clamp(30px,5vw,54px);margin-bottom:18px}
-  .cta p{color:var(--text-dim);font-size:16px;max-width:460px;margin:0 auto 34px}
+  .cta p{color:var(--text-dim);font-size:16px;max-width:480px;margin:0 auto 34px}
   .cta .btn{padding:16px 34px;height:auto;font-size:15px;border-radius:14px}
   .cta .btn svg{width:17px;height:17px}
   .cta-note{
     font-size:12.5px;color:var(--text-mute);
-    margin-top:20px;margin-bottom:0;
-    font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+    margin-top:22px;margin-bottom:0;
+    font-family:'JetBrains Mono',monospace;letter-spacing:0.04em;
   }
 
   footer{padding:70px 0 44px;border-top:1px solid var(--border);margin-top:80px}
@@ -783,7 +782,7 @@ LANDING = r"""<!DOCTYPE html>
     align-items:flex-start;gap:40px;flex-wrap:wrap;
     margin-bottom:48px;
   }
-  .foot-brand{max-width:280px}
+  .foot-brand{max-width:300px}
   .foot-brand .logo{margin-bottom:16px}
   .foot-brand p{color:var(--text-mute);font-size:13.5px;line-height:1.6}
 
@@ -801,24 +800,12 @@ LANDING = r"""<!DOCTYPE html>
   .foot-col a:hover{color:#fff;transform:translateX(3px)}
 
   .foot-bottom{
-    display:flex;justify-content:space-between;
-    align-items:center;gap:20px;flex-wrap:wrap;
-    padding-top:26px;border-top:1px solid var(--border);
+    display:flex;justify-content:center;align-items:center;
+    padding-top:28px;border-top:1px solid var(--border);
     color:var(--text-mute);font-size:12.5px;
+    font-family:'JetBrains Mono',monospace;letter-spacing:0.04em;
+    text-align:center;
   }
-  .socials{display:flex;gap:8px}
-  .socials a{
-    width:36px;height:36px;border-radius:10px;
-    display:grid;place-items:center;
-    background:var(--glass);border:1px solid var(--border-2);
-    color:var(--text-dim);
-    transition:all .3s cubic-bezier(.2,.8,.2,1);
-  }
-  .socials a:hover{
-    background:rgba(255,255,255,0.09);border-color:var(--border-3);
-    color:#fff;transform:translateY(-2px);
-  }
-  .socials svg{width:15px;height:15px}
 
   .reveal{
     opacity:0;transform:translateY(30px);
@@ -850,7 +837,7 @@ LANDING = r"""<!DOCTYPE html>
     .spec{padding:30px 20px}
     .cta{padding:54px 22px;border-radius:24px}
     .foot-cols{gap:36px}
-    .marquee-track span{font-size:13px;gap:32px}
+    .marquee-track span{font-size:12px;gap:32px}
     .marquee-track{gap:32px}
     .code-cell{max-width:48px}
     .hero-cta{flex-direction:column;align-items:stretch}
@@ -868,6 +855,7 @@ LANDING = r"""<!DOCTYPE html>
   <div class="halo halo-2"></div>
   <div class="halo halo-3"></div>
 </div>
+<div class="cursor-glow"></div>
 <div class="grid-bg"></div>
 <div class="grain"></div>
 
@@ -889,7 +877,7 @@ LANDING = r"""<!DOCTYPE html>
     <a href="#specs">Технологии</a>
   </div>
   <a href="/app" class="btn btn-primary">
-    <span>Войти</span>
+    <span>Открыть приложение</span>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M5 12h14M13 6l6 6-6 6"/>
     </svg>
@@ -905,22 +893,23 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
           </svg>
         </span>
-        Открыт ранний доступ · приглашения по коду
+        Без регистрации · до 5 фото · код из 6 цифр
       </div>
 
       <h1>
-        Нетворкинг<br>
-        <span class="dim">на шести цифрах</span>
+        Публикуйте посты.<br>
+        <span class="dim">Делитесь шестью цифрами.</span>
       </h1>
 
       <p class="lead">
-        Публикуйте посты с фото и находите их по <strong>уникальному 6-значному коду</strong>.
-        Без регистрации, без профиля, без лишнего. Только вы и люди, с которыми стоит поговорить.
+        Заголовок, текст, до 5 фотографий — сервер вернёт <strong>уникальный 6-значный код</strong>.
+        Отправьте код кому угодно: они откроют пост по адресу
+        <code>/app#482163</code>. Ни аккаунтов, ни паролей, ни подтверждений.
       </p>
 
       <div class="hero-cta">
         <a href="/app" class="btn btn-primary">
-          <span>Получить доступ</span>
+          <span>Создать пост</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 12h14M13 6l6 6-6 6"/>
           </svg>
@@ -947,7 +936,7 @@ LANDING = r"""<!DOCTYPE html>
           <rect x="4" y="10" width="16" height="10" rx="2"/>
           <path d="M8 10V6a4 4 0 018 0v4"/>
         </svg>
-        Коды без повторяющихся цифр — 151 200 комбинаций
+        151 200 комбинаций · цифры не повторяются
       </div>
     </div>
   </div>
@@ -956,16 +945,16 @@ LANDING = r"""<!DOCTYPE html>
     <div class="marquee-track">
       <span>AES-256-GCM</span>
       <span>6-значные коды</span>
-      <span>Без аккаунтов</span>
-      <span>Умное сжатие</span>
+      <span>Автосжатие фото</span>
+      <span>zstd / gzip</span>
       <span>До 5 фото</span>
-      <span>Мгновенный поиск</span>
+      <span>Без аккаунтов</span>
       <span>AES-256-GCM</span>
       <span>6-значные коды</span>
-      <span>Без аккаунтов</span>
-      <span>Умное сжатие</span>
+      <span>Автосжатие фото</span>
+      <span>zstd / gzip</span>
       <span>До 5 фото</span>
-      <span>Мгновенный поиск</span>
+      <span>Без аккаунтов</span>
     </div>
   </div>
 </header>
@@ -973,12 +962,13 @@ LANDING = r"""<!DOCTYPE html>
 <section id="features">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="eyebrow">Что внутри</div>
-      <h2>Минимум интерфейса.<br><span class="dim">Максимум смысла.</span></h2>
-      <p>Всё построено вокруг одной идеи: поделиться чем-то важным и получить короткий код, по которому вас найдут.</p>
+      <div class="eyebrow">Что умеет СЛД·NET</div>
+      <h2>Всё, что нужно.<br><span class="dim">Ничего лишнего.</span></h2>
+      <p>Механика из десяти пунктов — от публикации до поиска чужого поста по чужому коду.</p>
     </div>
 
     <div class="bento">
+
       <div class="glass b-lg reveal">
         <div>
           <div class="icon-box">
@@ -988,8 +978,8 @@ LANDING = r"""<!DOCTYPE html>
               <path d="M9 4v5"/>
             </svg>
           </div>
-          <h3>Посты без регистрации</h3>
-          <p>Заголовок, текст, до пяти фотографий — публикуется за секунды. Никаких анкет и подтверждений на почту.</p>
+          <h3>Публикация без аккаунта</h3>
+          <p>Заголовок до 120 символов, тело поста до 20 000, до пяти фотографий. Отправили — получили код. Ни почты, ни пароля, ни подтверждений.</p>
         </div>
         <div class="big-num">5<sup>фото</sup></div>
         <div class="avatars">
@@ -1010,8 +1000,18 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M3 17.5l9 5 9-5"/>
           </svg>
         </div>
-        <h3>Шифрование</h3>
-        <p>Каждый пост и каждое фото шифруются AES-256-GCM перед попаданием в память сервера.</p>
+        <h3>AES-256-GCM</h3>
+        <p>Посты и фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
+      </div>
+
+      <div class="glass b-sm reveal">
+        <div class="icon-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
+          </svg>
+        </div>
+        <h3>Коды без повторов</h3>
+        <p>Все шесть цифр кода — разные. Легко продиктовать голосом, трудно перепутать при наборе.</p>
       </div>
 
       <div class="glass b-sm reveal">
@@ -1021,8 +1021,18 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M12 7v5l3 2"/>
           </svg>
         </div>
-        <h3>Мгновенно</h3>
-        <p>Публикация и поиск работают за доли секунды — всё хранится в оперативной памяти.</p>
+        <h3>Мгновенный поиск</h3>
+        <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
+      </div>
+
+      <div class="glass b-sm reveal">
+        <div class="icon-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v18M3 12h18"/>
+          </svg>
+        </div>
+        <h3>Сжатие zstd / gzip</h3>
+        <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
       </div>
 
       <div class="glass b-md reveal">
@@ -1034,10 +1044,20 @@ LANDING = r"""<!DOCTYPE html>
           </svg>
         </div>
         <h3>Галерея с зумом</h3>
-        <p>Просмотр фотографий как в настоящем редакторе: колесо — зум, ПКМ — 1×/2×, двойной клик — сброс, ЛКМ — панорама.</p>
+        <p>Колесо мыши, двойной клик, правая кнопка мыши, панорама по левой — как в настоящем просмотрщике. На тач-экранах — pinch двумя пальцами.</p>
       </div>
 
       <div class="glass b-md reveal">
+        <div class="icon-box">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 6 9 17l-5-5"/>
+          </svg>
+        </div>
+        <h3>Ссылка на пост</h3>
+        <p>Каждый пост живёт по адресу <code>/app#482163</code>. Просто отправьте его в чат — ссылка сразу откроет нужный пост.</p>
+      </div>
+
+      <div class="glass b-sm reveal">
         <div class="icon-box">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/>
@@ -1045,18 +1065,8 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M12 4v16"/>
           </svg>
         </div>
-        <h3>Заголовок и текст</h3>
-        <p>До 120 символов в заголовке и до 20 000 в теле поста. Достаточно для манифеста, вакансии или анонса.</p>
-      </div>
-
-      <div class="glass b-sm reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
-          </svg>
-        </div>
-        <h3>Коды без повторов</h3>
-        <p>Алгоритм исключает одинаковые цифры в коде — так его легче запомнить и невозможно перепутать.</p>
+        <h3>Автосжатие до 60 КБ</h3>
+        <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
       </div>
 
       <div class="glass b-sm reveal">
@@ -1067,28 +1077,19 @@ LANDING = r"""<!DOCTYPE html>
           </svg>
         </div>
         <h3>RU / EN</h3>
-        <p>Интерфейс автоматически подстраивается под язык браузера или параметр <code>?lang</code> в ссылке.</p>
+        <p>Язык подставляется из браузера или параметра <code>?lang</code> в ссылке. Работает мгновенно, без перезагрузки.</p>
       </div>
 
       <div class="glass b-sm reveal">
         <div class="icon-box">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20 6 9 17l-5-5"/>
+            <path d="M4 7c.5 5 3.5 10 8 10h1v-3.5c1.8.3 3.4 1.6 4 3.5h3c-.5-2.3-2-4.2-4-5 1.8-.9 3-2.5 3.5-5h-2.8c-.4 1.6-1.5 3-3.2 3.5V7"/>
           </svg>
         </div>
-        <h3>Ссылка на пост</h3>
-        <p>Каждый пост живёт по адресу вида <code>/app#482163</code>. Отправьте — и человек сразу увидит его.</p>
+        <h3>Лимит 5 МБ на файл</h3>
+        <p>Ограничение по размеру исходника — 5 МБ. Всё, что больше, отклоняется ещё до отправки.</p>
       </div>
 
-      <div class="glass b-sm reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 3v18M3 12h18"/>
-          </svg>
-        </div>
-        <h3>Сжатие zstd / gzip</h3>
-        <p>Метаданные сжимаются перед шифрованием — экономия памяти без потери качества.</p>
-      </div>
     </div>
   </div>
 </section>
@@ -1097,25 +1098,25 @@ LANDING = r"""<!DOCTYPE html>
   <div class="wrap">
     <div class="sec-head reveal">
       <div class="eyebrow">Как это работает</div>
-      <h2>Три шага <span class="dim">до нужного человека</span></h2>
-      <p>Без онбордингов, прогресс-баров и подтверждений. Публикуете, запоминаете, находите.</p>
+      <h2>Три шага от идеи <span class="dim">до кода</span></h2>
+      <p>Никаких онбордингов и прогресс-баров. Заполнили, получили код, отправили.</p>
     </div>
 
     <div class="steps">
       <div class="glass step reveal">
         <div class="step-num">Шаг 01</div>
-        <h3>Публикуете пост</h3>
-        <p>Заголовок, описание, до пяти фото. Можно перетащить файлы, выбрать через диалог или вставить из буфера по Ctrl+V.</p>
+        <h3>Заполняете пост</h3>
+        <p>Заголовок, текст и до 5 фото. Перетащите файлы, выберите через диалог или вставьте из буфера по <code>Ctrl+V</code>.</p>
       </div>
       <div class="glass step reveal">
         <div class="step-num">Шаг 02</div>
         <h3>Получаете код</h3>
-        <p>Сервер генерирует уникальные 6 цифр без повторов и показывает их в модальном окне. Копируется одной кнопкой.</p>
+        <p>Сервер генерирует шесть уникальных цифр и показывает их в модальном окне. Копируется одной кнопкой.</p>
       </div>
       <div class="glass step reveal">
         <div class="step-num">Шаг 03</div>
-        <h3>Делитесь или ищете</h3>
-        <p>Вставьте код на вкладке «Найти пост» — или откройте ссылку с этим кодом. Пост найдётся мгновенно.</p>
+        <h3>Делитесь ссылкой</h3>
+        <p>Отправьте код или ссылку <code>/app#482163</code>. Получатель сразу откроет пост — регистрация не нужна.</p>
       </div>
     </div>
   </div>
@@ -1124,9 +1125,9 @@ LANDING = r"""<!DOCTYPE html>
 <section id="specs" style="padding-top:20px">
   <div class="wrap">
     <div class="sec-head reveal">
-      <div class="eyebrow">Технологии</div>
-      <h2>Всё серьёзно</h2>
-      <p>Мы не храним ничего лишнего и не храним ничего дольше, чем нужно.</p>
+      <div class="eyebrow">Параметры</div>
+      <h2>Коротко о главном</h2>
+      <p>Четыре числа, которые описывают весь сервис.</p>
     </div>
 
     <div class="specs reveal">
@@ -1143,7 +1144,7 @@ LANDING = r"""<!DOCTYPE html>
         <div class="spec-lbl">Фото на пост</div>
       </div>
       <div class="spec">
-        <div class="spec-val">12 МБ</div>
+        <div class="spec-val">5 МБ</div>
         <div class="spec-lbl">Лимит на файл</div>
       </div>
     </div>
@@ -1153,11 +1154,11 @@ LANDING = r"""<!DOCTYPE html>
 <section id="join" style="padding-top:20px">
   <div class="wrap">
     <div class="cta reveal">
-      <h2>Войти в СЛД·NET</h2>
-      <p>Публикуйте посты, находите людей по шести цифрам и делитесь ссылками.</p>
+      <h2>Опубликовать первый пост</h2>
+      <p>Заголовок, текст, до пяти фото — и шесть цифр, чтобы поделиться результатом.</p>
 
       <a href="/app" class="btn btn-primary">
-        <span>Войти на сайт</span>
+        <span>Открыть приложение</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M5 12h14M13 6l6 6-6 6"/>
         </svg>
@@ -1183,7 +1184,7 @@ LANDING = r"""<!DOCTYPE html>
           </span>
           <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>
         </a>
-        <p>Соцсеть для тех, кто ценит короткие пути к нужным людям.</p>
+        <p>Публикация постов и поиск по шестизначному коду. Работает без аккаунтов и хранит данные только в памяти.</p>
       </div>
 
       <div class="foot-cols">
@@ -1191,42 +1192,23 @@ LANDING = r"""<!DOCTYPE html>
           <h4>Продукт</h4>
           <a href="#features">Возможности</a>
           <a href="#how">Как это работает</a>
-          <a href="#specs">Технологии</a>
+          <a href="#specs">Параметры</a>
         </div>
         <div class="foot-col">
-          <h4>Компания</h4>
-          <a href="/app">О проекте</a>
-          <a href="/app">Блог</a>
-          <a href="/app">Контакты</a>
+          <h4>Приложение</h4>
+          <a href="/app">Создать пост</a>
+          <a href="/app#find">Найти пост</a>
         </div>
         <div class="foot-col">
-          <h4>Правовое</h4>
-          <a href="/app">Приватность</a>
-          <a href="/app">Условия</a>
+          <h4>Технологии</h4>
+          <a href="#specs">AES-256-GCM</a>
+          <a href="#specs">zstd / gzip</a>
         </div>
       </div>
     </div>
 
     <div class="foot-bottom">
-      <span>© 2026 СЛД·NET. Все права защищены.</span>
-      <div class="socials">
-        <a href="/app" aria-label="Telegram">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="m22 2-7 20-4-9-9-4 20-7z"/>
-          </svg>
-        </a>
-        <a href="/app" aria-label="VK">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 7c.5 5 3.5 10 8 10h1v-3.5c1.8.3 3.4 1.6 4 3.5h3c-.5-2.3-2-4.2-4-5 1.8-.9 3-2.5 3.5-5h-2.8c-.4 1.6-1.5 3-3.2 3.5V7h-1.2c-4 0-7 3.5-7.8 8"/>
-          </svg>
-        </a>
-        <a href="/app" aria-label="Email">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="5" width="18" height="14" rx="3"/>
-            <path d="m4 7 8 6 8-6"/>
-          </svg>
-        </a>
-      </div>
+      © 2026 СЛД·NET. Все права защищены.
     </div>
   </div>
 </footer>
@@ -1234,23 +1216,32 @@ LANDING = r"""<!DOCTYPE html>
 <script>
 (() => {
   "use strict";
+
+  // Курсор
   const dot  = document.querySelector('.cur-dot');
   const ring = document.querySelector('.cur-ring');
   let mx = window.innerWidth / 2, my = window.innerHeight / 2;
   let rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
 
-  window.addEventListener('mousemove', (e) => { mx = e.clientX; my = e.clientY; }, { passive: true });
+  window.addEventListener('mousemove', (e) => {
+    mx = e.clientX; my = e.clientY;
+    document.documentElement.style.setProperty('--mx', e.clientX + 'px');
+    document.documentElement.style.setProperty('--my', e.clientY + 'px');
+  }, { passive: true });
 
   function loop() {
     dot.style.transform = `translate3d(${mx}px, ${my}px, 0) translate(-50%, -50%)`;
-    rx += (mx - rx) * 0.18;
-    ry += (my - ry) * 0.18;
+    rx += (mx - rx) * 0.22;
+    ry += (my - ry) * 0.22;
+
     const dx = mx - lastX, dy = my - lastY;
-    vel = Math.min(Math.hypot(dx, dy), 36);
+    vel = Math.min(Math.hypot(dx, dy), 40);
     lastX = mx; lastY = my;
+
     const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    const stretch = 1 + vel / 100;
-    const squash = 1 - vel / 150;
+    const stretch = 1 + vel / 260;
+    const squash  = 1 - vel / 380;
+
     ring.style.transform = `translate3d(${rx}px, ${ry}px, 0) translate(-50%, -50%) rotate(${angle}deg) scale(${stretch}, ${squash})`;
     requestAnimationFrame(loop);
   }
@@ -1259,11 +1250,12 @@ LANDING = r"""<!DOCTYPE html>
   document.addEventListener('mousedown', () => ring.classList.add('click'));
   document.addEventListener('mouseup', () => ring.classList.remove('click'));
 
-  document.querySelectorAll('a, button, input, .glass, .code-cell').forEach(el => {
+  document.querySelectorAll('a, button, .glass, .code-cell').forEach(el => {
     el.addEventListener('mouseenter', () => ring.classList.add('hover'));
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
 
+  // Reveal
   const io = new IntersectionObserver((entries) => {
     entries.forEach((entry, i) => {
       if (entry.isIntersecting) {
@@ -1274,6 +1266,7 @@ LANDING = r"""<!DOCTYPE html>
   }, { threshold: 0.1, rootMargin: '0px 0px -60px 0px' });
   document.querySelectorAll('.reveal').forEach(el => io.observe(el));
 
+  // Navbar on scroll
   const nav = document.getElementById('nav');
   let ticking = false;
   window.addEventListener('scroll', () => {
@@ -1286,6 +1279,7 @@ LANDING = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
+  // Anchors
   document.querySelectorAll('a[href^="#"]').forEach(a => {
     a.addEventListener('click', (e) => {
       const href = a.getAttribute('href');
@@ -1349,6 +1343,10 @@ APP = r"""<!DOCTYPE html>
     min-height:100%;overflow-x:hidden;
     -webkit-font-smoothing:antialiased;
     -moz-osx-font-smoothing:grayscale;
+    -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  }
+  input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title{
+    -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
   }
 
   ::selection{background:#fff;color:#000}
@@ -1367,40 +1365,46 @@ APP = r"""<!DOCTYPE html>
     border-radius:50%;will-change:transform;
   }
   .cur-dot{
-    width:6px;height:6px;background:#fff;
-    box-shadow:0 0 0 1px rgba(255,255,255,0.3);
+    width:7px;height:7px;background:#fff;
+    box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25);
   }
   .cur-ring{
-    width:36px;height:36px;
-    border:1px solid rgba(255,255,255,0.35);
-    transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),border-color .25s,background .25s;
+    width:34px;height:34px;
+    border:1.5px solid rgba(255,255,255,0.35);
+    transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
+               border-color .25s,background .25s;
   }
   .cur-ring.hover{
-    width:60px;height:60px;
-    border-color:rgba(255,255,255,0.15);
-    background:rgba(255,255,255,0.06);
-    backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
+    width:58px;height:58px;
+    border-color:rgba(255,255,255,0.2);
+    background:rgba(255,255,255,0.05);
+    backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
   }
-  .cur-ring.click{width:26px;height:26px;background:rgba(255,255,255,0.15)}
+  .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
   @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
   /* ========== BACKGROUND ========== */
-  .bg{position:fixed;inset:0;z-index:-2;overflow:hidden;background:var(--bg)}
-  .halo{position:absolute;border-radius:50%;filter:blur(130px);opacity:.5}
+  .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
+  .halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55}
   .halo-1{
-    width:600px;height:600px;
+    width:660px;height:660px;
     background:radial-gradient(circle,rgba(255,255,255,0.07),transparent 65%);
-    top:-240px;left:-140px;
-    animation:drift1 30s ease-in-out infinite;
+    top:-260px;left:-160px;
+    animation:drift1 32s ease-in-out infinite;
   }
   .halo-2{
-    width:520px;height:520px;
+    width:560px;height:560px;
     background:radial-gradient(circle,rgba(255,255,255,0.045),transparent 65%);
-    bottom:-180px;right:-160px;
-    animation:drift2 34s ease-in-out infinite;
+    bottom:-200px;right:-180px;
+    animation:drift2 36s ease-in-out infinite;
   }
-  @keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(90px,80px) scale(1.1)}}
-  @keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-100px,-70px) scale(1.12)}}
+  @keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(100px,80px) scale(1.1)}}
+  @keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-110px,-80px) scale(1.12)}}
+
+  .cursor-glow{
+    position:fixed;inset:0;z-index:-2;pointer-events:none;
+    background:radial-gradient(560px circle at var(--mx, 50%) var(--my, 50%), rgba(255,255,255,0.03), transparent 60%);
+  }
 
   .grid-bg{
     position:fixed;inset:0;z-index:-1;pointer-events:none;
@@ -1420,11 +1424,9 @@ APP = r"""<!DOCTYPE html>
 
   /* ========== TOPBAR ========== */
   .topbar{
-    position:fixed;top:14px;left:50%;
-    transform:translateX(-50%);
+    position:fixed;top:14px;left:50%;transform:translateX(-50%);
     z-index:100;
-    width:calc(100% - 28px);
-    max-width:1160px;
+    width:calc(100% - 28px);max-width:1160px;
     border-radius:16px;
     padding:10px 12px 10px 18px;
     background:rgba(10,10,10,0.62);
@@ -1436,8 +1438,7 @@ APP = r"""<!DOCTYPE html>
   }
   .topbar-inner{
     display:flex;align-items:center;gap:14px;
-    justify-content:space-between;
-    flex-wrap:nowrap;
+    justify-content:space-between;flex-wrap:nowrap;
   }
 
   .logo{
@@ -1466,7 +1467,6 @@ APP = r"""<!DOCTYPE html>
   .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
   .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-  /* menu (segmented control) */
   .menu{
     display:inline-flex;gap:4px;
     padding:4px;
@@ -1484,8 +1484,7 @@ APP = r"""<!DOCTYPE html>
     font:inherit;font-size:13px;font-weight:500;
     cursor:pointer;
     transition:background .22s,color .22s,border-color .22s,box-shadow .22s;
-    -webkit-tap-highlight-color:transparent;
-    white-space:nowrap;
+    -webkit-tap-highlight-color:transparent;white-space:nowrap;
   }
   .tab svg{width:15px;height:15px;flex-shrink:0}
   .tab:hover{color:#fff;background:rgba(255,255,255,0.05)}
@@ -1496,7 +1495,6 @@ APP = r"""<!DOCTYPE html>
     box-shadow:inset 0 1px 0 rgba(255,255,255,0.09);
   }
 
-  /* back */
   .back-btn{
     display:inline-flex;align-items:center;gap:7px;
     color:var(--text-dim);text-decoration:none;
@@ -1508,19 +1506,23 @@ APP = r"""<!DOCTYPE html>
   .back-btn svg{width:14px;height:14px}
   .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
 
-  /* ========== APP ========== */
+  /* ========== APP — центрирование по вертикали ========== */
   .app{
     min-height:100dvh;
-    display:flex;flex-direction:column;align-items:center;
-    padding:calc(var(--topbar-h, 80px) + 24px) 20px 60px;
-    gap:20px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
+    gap:0;
   }
 
   .stage{
+    margin:auto 0;
     position:relative;
     width:100%;max-width:560px;
     overflow:hidden;
     transition:height .28s ease;
+    will-change:height;
   }
   .stage[hidden]{display:none}
 
@@ -1529,7 +1531,7 @@ APP = r"""<!DOCTYPE html>
     display:flex;flex-direction:column;gap:12px;
     opacity:0;pointer-events:none;
     transform:translateX(var(--enter-x,20px));
-    transition:opacity .22s ease,transform .28s ease;
+    transition:opacity .24s ease,transform .3s cubic-bezier(.2,.8,.2,1);
   }
   .panel.active{
     position:relative;opacity:1;pointer-events:auto;
@@ -1572,7 +1574,7 @@ APP = r"""<!DOCTYPE html>
     color:var(--text);
     font:inherit;font-size:14px;
     outline:none;
-    transition:border-color .18s ease,background .18s ease;
+    transition:border-color .18s ease,background .18s ease,box-shadow .18s ease;
     -webkit-appearance:none;appearance:none;
   }
   .field::placeholder{color:var(--text-mute)}
@@ -1608,6 +1610,7 @@ APP = r"""<!DOCTYPE html>
   .drop:hover .drop-icon,.drop:hover .drop-label{color:var(--text)}
   .drop.filled{border-style:solid;border-color:var(--border-3)}
   .drop.filled .drop-icon,.drop.filled .drop-label{color:var(--text)}
+  .drop.busy{pointer-events:none;opacity:.7}
 
   .previews{
     display:grid;
@@ -1619,8 +1622,22 @@ APP = r"""<!DOCTYPE html>
     border-radius:10px;overflow:hidden;
     background:var(--input);
     border:1px solid var(--border);
+    animation:popIn .35s cubic-bezier(.2,.8,.2,1);
   }
+  @keyframes popIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
   .preview img{width:100%;height:100%;object-fit:cover;display:block}
+  .preview .pv-badge{
+    position:absolute;bottom:5px;left:5px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:9.5px;
+    padding:2px 6px;border-radius:5px;
+    background:rgba(10,10,10,0.8);
+    border:1px solid rgba(255,255,255,0.1);
+    color:var(--text-dim);
+    backdrop-filter:blur(6px);
+    -webkit-backdrop-filter:blur(6px);
+    letter-spacing:0.02em;
+  }
   .preview button{
     position:absolute;top:5px;right:5px;
     width:22px;height:22px;border-radius:7px;
@@ -1633,7 +1650,7 @@ APP = r"""<!DOCTYPE html>
   }
   .preview button:hover{background:rgba(224,128,128,0.25);border-color:rgba(224,128,128,0.5)}
 
-  /* ========== ROW (buttons) ========== */
+  /* ========== ROW ========== */
   .row{
     display:flex;gap:10px;
     margin-top:16px;
@@ -1771,7 +1788,9 @@ APP = r"""<!DOCTYPE html>
     line-height:1.5;border:1px solid var(--border);
     margin-top:12px;
     word-break:break-word;
+    animation:msgIn .3s cubic-bezier(.2,.8,.2,1);
   }
+  @keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
   .msg:first-child{margin-top:0}
   .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px}
   .msg span{min-width:0;word-break:break-word}
@@ -1963,22 +1982,11 @@ APP = r"""<!DOCTYPE html>
   }
 
   @media (max-width:640px){
-    .topbar-inner{
-      flex-wrap:wrap;
-      row-gap:8px;
-    }
-    .menu{
-      order:3;
-      width:100%;
-      justify-content:center;
-    }
-    .tab{
-      flex:1 1 0;
-      justify-content:center;
-    }
+    .topbar-inner{flex-wrap:wrap;row-gap:8px}
+    .menu{order:3;width:100%;justify-content:center}
+    .tab{flex:1 1 0;justify-content:center}
     .app{
-      padding:calc(var(--topbar-h, 110px) + 18px) 14px 40px;
-      gap:16px;
+      padding:calc(var(--topbar-h, 110px) + 18px) 14px 32px;
     }
     .card{padding:15px;border-radius:16px}
     .field{padding:11px 14px;font-size:14px}
@@ -2015,6 +2023,7 @@ APP = r"""<!DOCTYPE html>
   <div class="halo halo-1"></div>
   <div class="halo halo-2"></div>
 </div>
+<div class="cursor-glow"></div>
 <div class="grid-bg"></div>
 <div class="grain"></div>
 
@@ -2087,7 +2096,7 @@ APP = r"""<!DOCTYPE html>
             <path d="M21 15l-5-5L5 21"/>
           </svg>
           <div class="drop-label" id="dropLabel" data-i18n="dropLabel">Нажмите или перетащите фото</div>
-          <div class="drop-hint" data-i18n="dropHint">до 5 фото · Ctrl+V — вставить из буфера</div>
+          <div class="drop-hint" data-i18n="dropHint">до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V</div>
         </div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
@@ -2208,18 +2217,22 @@ APP = r"""<!DOCTYPE html>
   let mx = window.innerWidth / 2, my = window.innerHeight / 2;
   let rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
 
-  window.addEventListener('mousemove', (e) => { mx = e.clientX; my = e.clientY; }, { passive: true });
+  window.addEventListener('mousemove', (e) => {
+    mx = e.clientX; my = e.clientY;
+    document.documentElement.style.setProperty('--mx', e.clientX + 'px');
+    document.documentElement.style.setProperty('--my', e.clientY + 'px');
+  }, { passive: true });
 
   function loop() {
     dot.style.transform = `translate3d(${mx}px, ${my}px, 0) translate(-50%, -50%)`;
-    rx += (mx - rx) * 0.18;
-    ry += (my - ry) * 0.18;
+    rx += (mx - rx) * 0.22;
+    ry += (my - ry) * 0.22;
     const dx = mx - lastX, dy = my - lastY;
-    vel = Math.min(Math.hypot(dx, dy), 36);
+    vel = Math.min(Math.hypot(dx, dy), 40);
     lastX = mx; lastY = my;
     const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    const stretch = 1 + vel / 100;
-    const squash = 1 - vel / 150;
+    const stretch = 1 + vel / 260;
+    const squash  = 1 - vel / 380;
     ring.style.transform = `translate3d(${rx}px, ${ry}px, 0) translate(-50%, -50%) rotate(${angle}deg) scale(${stretch}, ${squash})`;
     requestAnimationFrame(loop);
   }
@@ -2255,11 +2268,12 @@ APP = r"""<!DOCTYPE html>
       contentPh: "Содержимое",
       dropLabel: "Нажмите или перетащите фото",
       dropLabelFilled: "Выбрано: {n} / {max}",
-      dropHint: "до 5 фото · Ctrl+V — вставить из буфера",
+      dropHint: "до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V",
       publish: "Опубликовать",
       publishing: "Публикация...",
       clear: "Очистить",
       searching: "Ищем пост...",
+      compressing: "Сжимаем фото...",
       postCreated: "Пост создан",
       postCreatedSub: "Сохраните код — по нему можно найти пост в любое время",
       memoryUsage: "Занято в памяти: {size}",
@@ -2273,7 +2287,8 @@ APP = r"""<!DOCTYPE html>
       notFound: "Пост не найден",
       networkError: "Ошибка сети: {msg}",
       httpError: "Ошибка {code}",
-      rejectedFiles: "Пропущено файлов: {n}. Разрешены только изображения и не больше {max}.",
+      rejectedFiles: "Пропущено: {n}. Только изображения, не больше {max} и не тяжелее 5 МБ.",
+      sizeBadge: "{kb} КБ",
       lbHint: "колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама"
     },
     en: {
@@ -2283,11 +2298,12 @@ APP = r"""<!DOCTYPE html>
       contentPh: "Content",
       dropLabel: "Click or drop photos",
       dropLabelFilled: "Selected: {n} / {max}",
-      dropHint: "up to 5 photos · Ctrl+V to paste",
+      dropHint: "up to 5 photos · max 5 MB · compressed to ~60 KB · Ctrl+V",
       publish: "Publish",
       publishing: "Publishing...",
       clear: "Clear",
       searching: "Searching...",
+      compressing: "Compressing photos...",
       postCreated: "Post created",
       postCreatedSub: "Save the code — you can find the post anytime with it",
       memoryUsage: "Memory used: {size}",
@@ -2301,7 +2317,8 @@ APP = r"""<!DOCTYPE html>
       notFound: "Post not found",
       networkError: "Network error: {msg}",
       httpError: "Error {code}",
-      rejectedFiles: "Skipped files: {n}. Images only, max {max}.",
+      rejectedFiles: "Skipped: {n}. Images only, max {max} and up to 5 MB.",
+      sizeBadge: "{kb} KB",
       lbHint: "wheel — zoom · RMB — 1×/2× · dblclick — reset · LMB — pan"
     }
   };
@@ -2340,6 +2357,12 @@ APP = r"""<!DOCTYPE html>
     if (modalHint && modalHint.dataset.size) {
       modalHint.textContent = t("memoryUsage", { size: modalHint.dataset.size });
     }
+    // Обновить бейджи размеров в превью
+    document.querySelectorAll(".preview .pv-badge").forEach(b => {
+      if (b.dataset.kb) {
+        b.textContent = t("sizeBadge", { kb: b.dataset.kb });
+      }
+    });
   }
 
   function parseHash() {
@@ -2494,6 +2517,66 @@ APP = r"""<!DOCTYPE html>
   btnFind.addEventListener("click", () => setMode("find"));
 
   /* =========================================================
+     IMAGE COMPRESSION
+     ========================================================= */
+  const TARGET_PHOTO_BYTES = 60 * 1024;   // ~60 КБ
+  const SOURCE_MAX_BYTES   = 5 * 1024 * 1024; // 5 МБ
+
+  async function compressImage(file, targetBytes = TARGET_PHOTO_BYTES) {
+    if (!file.type.startsWith("image/")) return file;
+    try {
+      const bitmap = await createImageBitmap(file);
+      let maxDim = 1600;
+      let best = null;
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+        const w = Math.max(1, Math.round(bitmap.width * scale));
+        const h = Math.max(1, Math.round(bitmap.height * scale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(bitmap, 0, 0, w, h);
+
+        let lo = 0.35, hi = 0.92;
+        let candidate = null;
+        for (let i = 0; i < 7; i++) {
+          const q = (lo + hi) / 2;
+          const blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", q));
+          if (!blob) break;
+          if (blob.size <= targetBytes) {
+            candidate = blob;
+            lo = q;
+          } else {
+            hi = q;
+          }
+        }
+
+        if (candidate) { best = candidate; break; }
+
+        // fallback: уменьшаем габариты
+        const fallback = await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.5));
+        if (fallback) best = fallback;
+        maxDim = Math.round(maxDim * 0.72);
+        if (maxDim < 500) break;
+      }
+
+      if (bitmap.close) bitmap.close();
+      if (!best) return file;
+
+      const newName = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+      return new File([best], newName, { type: "image/jpeg" });
+    } catch (e) {
+      console.warn("compress failed:", e);
+      return file;
+    }
+  }
+
+  /* =========================================================
      CREATE
      ========================================================= */
   const MAX_PHOTOS = 5;
@@ -2552,19 +2635,38 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  function addFiles(list) {
+  async function addFiles(list) {
     let rejected = 0;
+    const accepted = [];
     for (const f of list) {
       if (!f.type.startsWith("image/")) { rejected++; continue; }
-      if (selectedFiles.length >= MAX_PHOTOS) { rejected++; continue; }
-      selectedFiles.push(f);
+      if (f.size > SOURCE_MAX_BYTES) { rejected++; continue; }
+      if (selectedFiles.length + accepted.length >= MAX_PHOTOS) { rejected++; continue; }
+      accepted.push(f);
     }
+
     if (rejected > 0) {
       showCreateMsg("err", t("rejectedFiles", { n: rejected, max: MAX_PHOTOS }));
     } else {
       clearCreateMsg();
     }
-    renderPreviews();
+
+    if (!accepted.length) return;
+
+    drop.classList.add("busy");
+    dropLabel.textContent = t("compressing");
+
+    try {
+      const compressed = await Promise.all(accepted.map(f => compressImage(f)));
+      // фильтруем null/undefined (на всякий случай)
+      for (const c of compressed) {
+        if (c) selectedFiles.push(c);
+      }
+      renderPreviews();
+    } finally {
+      drop.classList.remove("busy");
+      dropLabel.textContent = defaultDropLabel();
+    }
   }
 
   function renderPreviews() {
@@ -2576,13 +2678,21 @@ APP = r"""<!DOCTYPE html>
       const img = document.createElement("img");
       img.src = url; img.alt = file.name;
       img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+
+      // Размер в КБ
+      const kb = Math.max(1, Math.round(file.size / 1024));
+      const badge = document.createElement("div");
+      badge.className = "pv-badge";
+      badge.dataset.kb = kb;
+      badge.textContent = t("sizeBadge", { kb });
+
       const rm = document.createElement("button");
       rm.type = "button"; rm.textContent = "×"; rm.title = "×";
       rm.addEventListener("click", () => {
         selectedFiles.splice(index, 1);
         renderPreviews();
       });
-      box.append(img, rm);
+      box.append(img, badge, rm);
       previews.appendChild(box);
     });
     drop.classList.toggle("filled", selectedFiles.length > 0);
@@ -3058,7 +3168,7 @@ APP = r"""<!DOCTYPE html>
   async function runSearch(code) {
     const mySeq = ++searchSeq;
     renderSpinner();
-    await new Promise((r) => setTimeout(r, 380));
+    await new Promise((r) => setTimeout(r, 340));
     if (mySeq !== searchSeq) return;
 
     try {
