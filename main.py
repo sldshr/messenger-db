@@ -3,9 +3,10 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
 
 Маршруты:
-  /      — лендинг
-  /app   — рабочая область (создание / поиск постов)
-  /api/* — REST API
+  /           — лендинг
+  /app        — рабочая область (SPA)
+  /p/{code}   — страница поста с OpenGraph-метатегами
+  /api/*      — REST API
 
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
@@ -13,6 +14,7 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 from __future__ import annotations
 
 import gzip
+import html as _html
 import json
 import logging
 import os
@@ -91,17 +93,24 @@ MAX_PHOTO_BYTES = 5 * 1024 * 1024
 MAX_TITLE_LEN = 120
 MAX_CONTENT_LEN = 20_000
 
+# Публичный адрес (для OpenGraph ссылок на картинки)
+PUBLIC_BASE_URL = os.environ.get("SLD_BASE_URL", "https://sld-net.ddns.net").rstrip("/")
+
+
+def _gen_code() -> str:
+    """Генерирует 6-значный код без повторяющихся цифр (без проверки занятости)."""
+    digits = list(string.digits)
+    chars = []
+    for _ in range(6):
+        idx = secrets.randbelow(len(digits))
+        chars.append(digits.pop(idx))
+    return "".join(chars)
+
 
 def _new_code() -> str:
-    """6-значный код БЕЗ повторяющихся цифр."""
     with _lock:
         for _ in range(5000):
-            digits = list(string.digits)
-            code_chars = []
-            for _ in range(6):
-                idx = secrets.randbelow(len(digits))
-                code_chars.append(digits.pop(idx))
-            code = "".join(code_chars)
+            code = _gen_code()
             if code not in _store:
                 return code
     raise HTTPException(503, "Хранилище переполнено")
@@ -124,10 +133,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 async def create_post(
     title: str = Form(...),
     content: str = Form(""),
+    og_enabled: str = Form("true"),
     files: Optional[List[UploadFile]] = File(None),
 ):
     title = (title or "").strip()
     content = (content or "").strip()
+    og_flag = og_enabled.strip().lower() in ("1", "true", "on", "yes", "да")
 
     if not title:
         raise HTTPException(400, "Требуется название поста")
@@ -163,6 +174,7 @@ async def create_post(
         "title": title,
         "content": content,
         "created": created,
+        "og_enabled": og_flag,
         "photos": [{"name": p["name"], "mime": p["mime"], "size": p["size"]} for p in photos],
     }
     enc_meta = _pack_meta(meta)
@@ -175,9 +187,15 @@ async def create_post(
             "photos": photos,
             "created": created,
             "size": total,
+            "og_enabled": og_flag,
         }
 
-    return {"code": code, "compressed_bytes": total, "photos": len(photos)}
+    return {
+        "code": code,
+        "compressed_bytes": total,
+        "photos": len(photos),
+        "share_url": f"{PUBLIC_BASE_URL}/p/{code}",
+    }
 
 
 @app.get("/api/posts/{code}")
@@ -231,6 +249,17 @@ async def get_photo(code: str, idx: int):
     )
 
 
+@app.get("/api/random-code")
+async def random_code():
+    """Свободный 6-значный код — не встречается в хранилище."""
+    with _lock:
+        for _ in range(5000):
+            code = _gen_code()
+            if code not in _store:
+                return {"code": code}
+    raise HTTPException(503, "Хранилище переполнено")
+
+
 @app.get("/api/stats")
 async def stats():
     with _lock:
@@ -253,6 +282,24 @@ FAVICON = (
     "%3C/g%3E%3C/svg%3E"
 )
 
+VK_ICON = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M12.785 16.241s.288-.032.436-.194c.136-.148.132-.427.132-.427'
+    's-.02-1.304.576-1.496c.588-.19 1.341 1.26 2.14 1.817.605.42 1.064.328 '
+    '1.064.328l2.137-.03s1.117-.071.586-.951c-.043-.072-.307-.659-1.579-1.861'
+    '-1.333-1.253-1.153-1.05.451-3.218.977-1.32 1.367-2.125 1.244-2.47'
+    '-.117-.335-.842-.247-.842-.247l-2.407.015s-.178-.024-.31.056c-.13.079'
+    '-.213.264-.213.264s-.382 1.036-.891 1.916c-1.075 1.86-1.505 1.959'
+    '-1.68 1.844-.409-.27-.307-1.08-.307-1.66 0-1.804.267-2.554-.52-2.747'
+    '-.261-.064-.454-.106-1.124-.113-.859-.01-1.586.003-1.998.207'
+    '-.273.135-.484.438-.356.455.159.021.519.099.71.362.246.34.237 1.105.237 '
+    '1.105s.142 2.13-.266 2.393c-.26.178-.617-.185-1.383-1.849'
+    '-.524-1.115-.919-2.347-.919-2.347s-.076-.19-.212-.29c-.165-.124-.396-.163'
+    '-.396-.163l-2.288.015s-.343.01-.47.163c-.112.136-.009.416-.009.416'
+    's1.792 4.273 3.822 6.424c1.859 1.969 3.97 1.84 3.97 1.84h.955z"/>'
+    '</svg>'
+)
+
 # ============================================================
 # ЛЕНДИНГ  (/)
 # ============================================================
@@ -262,6 +309,7 @@ LANDING = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>СЛД·NET — посты по 6-значному коду</title>
+<meta name="description" content="Публикуйте посты с фото, делитесь шестью цифрами. Без аккаунтов, с шифрованием и автосжатием.">
 <link rel="icon" href="__FAVICON__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -276,7 +324,6 @@ LANDING = r"""<!DOCTYPE html>
 
   :root{
     --bg:#080808;
-    --bg-2:#0a0a0a;
     --border:rgba(255,255,255,0.07);
     --border-2:rgba(255,255,255,0.12);
     --border-3:rgba(255,255,255,0.22);
@@ -308,7 +355,6 @@ LANDING = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
   ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-  /* ===== CURSOR ===== */
   @media (hover:hover) and (pointer:fine){
     body,a,button,input,textarea{cursor:none}
   }
@@ -335,7 +381,6 @@ LANDING = r"""<!DOCTYPE html>
   .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
   @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-  /* ===== BACKGROUND ===== */
   .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
   .halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55}
   .halo-1{
@@ -383,7 +428,6 @@ LANDING = r"""<!DOCTYPE html>
 
   .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-  /* ===== NAV ===== */
   nav{
     position:fixed;top:20px;left:50%;transform:translateX(-50%);
     z-index:100;
@@ -474,7 +518,6 @@ LANDING = r"""<!DOCTYPE html>
   }
   .btn-ghost:active{transform:translateY(0) scale(.985)}
 
-  /* ===== HERO ===== */
   .hero{padding:190px 0 0;position:relative;overflow:hidden}
   .hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
 
@@ -547,7 +590,6 @@ LANDING = r"""<!DOCTYPE html>
 
   @keyframes rise{from{opacity:0;transform:translateY(26px);filter:blur(6px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
-  /* ===== CODE SHOWCASE ===== */
   .code-show{
     margin:80px auto 0;max-width:580px;
     display:flex;gap:10px;justify-content:center;flex-wrap:nowrap;
@@ -572,7 +614,7 @@ LANDING = r"""<!DOCTYPE html>
     font-size:clamp(22px,3.6vw,28px);color:#fff;
     box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 12px 28px -12px rgba(0,0,0,0.7);
     animation:cellIn .6s cubic-bezier(.2,.8,.2,1) both;
-    transition:transform .35s cubic-bezier(.2,.8,.2,1),border-color .3s,box-shadow .35s;
+    transition:transform .35s cubic-bezier(.2,.8,.2,1),border-color .3s,box-shadow .35s,color .25s;
   }
   .code-cell:nth-child(1){animation-delay:.4s}
   .code-cell:nth-child(2){animation-delay:.48s}
@@ -585,6 +627,13 @@ LANDING = r"""<!DOCTYPE html>
     border-color:rgba(255,255,255,0.3);
     box-shadow:inset 0 1px 0 rgba(255,255,255,0.15),0 18px 34px -12px rgba(0,0,0,0.8);
   }
+  .code-cell.flip{
+    animation:flipIn .55s cubic-bezier(.2,.8,.2,1) both;
+  }
+  @keyframes flipIn{
+    0%{opacity:.35;transform:translateY(-8px) rotateX(-70deg);color:transparent}
+    100%{opacity:1;transform:translateY(0) rotateX(0);color:#fff}
+  }
   @keyframes cellIn{from{opacity:0;transform:translateY(20px) scale(.88)}to{opacity:1;transform:translateY(0) scale(1)}}
 
   .code-caption{
@@ -596,7 +645,6 @@ LANDING = r"""<!DOCTYPE html>
   }
   .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
-  /* ===== MARQUEE ===== */
   .marquee{
     margin-top:120px;padding:24px 0;
     border-top:1px solid var(--border);border-bottom:1px solid var(--border);
@@ -620,9 +668,7 @@ LANDING = r"""<!DOCTYPE html>
   }
   @keyframes scroll{to{transform:translateX(-50%)}}
 
-  /* ===== SECTION ===== */
   section{padding:120px 0;position:relative}
-
   .sec-head{max-width:660px;margin-bottom:60px}
   .eyebrow{
     display:inline-flex;align-items:center;gap:10px;
@@ -641,7 +687,6 @@ LANDING = r"""<!DOCTYPE html>
   h2 .dim{color:var(--text-mute);font-weight:400}
   .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
 
-  /* ===== GLASS ===== */
   .glass{
     position:relative;border-radius:var(--radius);
     background:linear-gradient(150deg,rgba(255,255,255,0.055),rgba(255,255,255,0.014));
@@ -671,7 +716,6 @@ LANDING = r"""<!DOCTYPE html>
   .glass:hover::after{transform:translateX(120%)}
   .glass:hover{transform:translateY(-3px)}
 
-  /* ===== BENTO ===== */
   .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
   .bento .glass{padding:32px;display:flex;flex-direction:column}
   .b-lg{grid-column:span 4;min-height:320px}
@@ -695,7 +739,7 @@ LANDING = r"""<!DOCTYPE html>
     margin-bottom:11px;
   }
   .bento p{color:var(--text-dim);font-size:14px;line-height:1.65;max-width:48ch}
-  .bento p code,.step p code{
+  .bento p code,.step p code,.showcase-list code{
     font-family:'JetBrains Mono',monospace;
     color:var(--text);font-size:.92em;
     background:rgba(255,255,255,0.04);
@@ -746,14 +790,12 @@ LANDING = r"""<!DOCTYPE html>
     font-size:11px;border-color:rgba(255,255,255,0.1);
   }
 
-  /* ===== SHOWCASE (mock post) ===== */
   .showcase{
     display:grid;
     grid-template-columns:1fr 1fr;
     gap:60px;
     align-items:center;
   }
-  .showcase-text .eyebrow{margin-bottom:18px}
   .showcase-text h2{margin-bottom:20px}
   .showcase-text p{color:var(--text-dim);font-size:15.5px;line-height:1.7;margin-bottom:28px;max-width:48ch}
   .showcase-list{display:flex;flex-direction:column;gap:14px;list-style:none}
@@ -837,7 +879,6 @@ LANDING = r"""<!DOCTYPE html>
   .mock-thumb:nth-child(2)::after{background:linear-gradient(45deg,rgba(255,255,255,0.08),transparent 60%)}
   .mock-thumb:nth-child(3)::after{background:linear-gradient(160deg,rgba(255,255,255,0.12),transparent 60%)}
 
-  /* ===== STATS ===== */
   .stats{
     display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
     border-radius:var(--radius);overflow:hidden;
@@ -862,7 +903,6 @@ LANDING = r"""<!DOCTYPE html>
     color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;
   }
 
-  /* ===== STEPS ===== */
   .steps{
     display:grid;grid-template-columns:repeat(3,1fr);gap:18px;
     position:relative;
@@ -891,7 +931,6 @@ LANDING = r"""<!DOCTYPE html>
   }
   .step p{color:var(--text-dim);font-size:14px;line-height:1.65}
 
-  /* ===== CTA ===== */
   .cta{
     position:relative;border-radius:36px;padding:90px 40px;
     text-align:center;overflow:hidden;
@@ -919,7 +958,6 @@ LANDING = r"""<!DOCTYPE html>
     font-family:'JetBrains Mono',monospace;letter-spacing:0.06em;
   }
 
-  /* ===== FOOTER ===== */
   footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
   .foot-top{
     display:flex;justify-content:space-between;
@@ -944,14 +982,26 @@ LANDING = r"""<!DOCTYPE html>
   .foot-col a:hover{color:#fff;transform:translateX(3px)}
 
   .foot-bottom{
-    display:flex;justify-content:center;align-items:center;
+    display:flex;justify-content:space-between;align-items:center;
+    gap:20px;flex-wrap:wrap;
     padding-top:30px;border-top:1px solid var(--border);
     color:var(--text-mute);font-size:12.5px;
     font-family:'JetBrains Mono',monospace;letter-spacing:0.05em;
-    text-align:center;
   }
+  .socials{display:flex;gap:8px}
+  .socials a{
+    width:38px;height:38px;border-radius:11px;
+    display:grid;place-items:center;
+    background:var(--glass);border:1px solid var(--border-2);
+    color:var(--text-dim);
+    transition:all .3s cubic-bezier(.2,.8,.2,1);
+  }
+  .socials a:hover{
+    background:rgba(255,255,255,0.09);border-color:var(--border-3);
+    color:#fff;transform:translateY(-2px);
+  }
+  .socials svg{width:16px;height:16px;display:block}
 
-  /* ===== REVEAL ===== */
   .reveal{
     opacity:0;transform:translateY(32px);
     transition:opacity .9s cubic-bezier(.2,.8,.2,1),transform .9s cubic-bezier(.2,.8,.2,1);
@@ -959,13 +1009,11 @@ LANDING = r"""<!DOCTYPE html>
   }
   .reveal.in{opacity:1;transform:translateY(0)}
 
-  /* ===== RESPONSIVE ===== */
   @media (max-width:1080px){
     .showcase{grid-template-columns:1fr;gap:48px}
     .mock{transform:none;max-width:520px;margin:0 auto}
     .mock:hover{transform:none}
   }
-
   @media (max-width:1000px){
     .bento{grid-template-columns:repeat(4,1fr)}
     .b-lg{grid-column:span 4}
@@ -976,46 +1024,34 @@ LANDING = r"""<!DOCTYPE html>
     .steps::before{display:none}
     .nav-links{display:none}
   }
-
   @media (max-width:720px){
     .wrap{padding:0 20px}
     nav{padding:10px 10px 10px 16px;top:12px;width:calc(100% - 24px);border-radius:16px}
     .logo{font-size:13.5px}
     .logo-mark{width:28px;height:28px}
     .logo-mark svg{width:14px;height:14px}
-
     .hero{padding:130px 0 0}
     section{padding:80px 0}
-    .hero h1{margin-bottom:24px}
-    .lead{margin-bottom:36px}
-
     .bento{grid-template-columns:1fr;gap:14px}
     .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
     .b-lg{min-height:auto}
     .b-lg .big-num{padding-top:20px}
-
     .stats{grid-template-columns:1fr 1fr}
     .stat{padding:32px 18px}
-
     .cta{padding:60px 24px;border-radius:26px}
     .cta .btn{padding:15px 28px;font-size:14px;width:100%}
     .hero-cta{flex-direction:column;align-items:stretch}
     .hero-cta .btn{justify-content:center;width:100%}
-
     .foot-cols{gap:44px}
-    .foot-bottom{font-size:11.5px}
-
+    .foot-bottom{justify-content:center;text-align:center}
     .marquee-track span{font-size:12px;gap:36px}
     .marquee-track{gap:36px}
     .marquee{margin-top:80px}
-
     .code-show{margin-top:56px;gap:6px}
     .code-cell{max-width:46px;border-radius:11px}
-
     .badge{font-size:12px;padding:7px 14px 7px 9px;margin-bottom:36px}
     .badge-dot{width:22px;height:22px}
   }
-
   @media (max-width:420px){
     .stats{grid-template-columns:1fr}
     .mock{padding:20px}
@@ -1082,8 +1118,8 @@ LANDING = r"""<!DOCTYPE html>
 
       <p class="lead">
         Заголовок, текст, до 5 фотографий — сервер вернёт <strong>уникальный 6-значный код</strong>.
-        Отправьте код кому угодно: они откроют пост по адресу
-        <code>/app#482163</code>. Ни аккаунтов, ни паролей, ни подтверждений.
+        Отправьте код или ссылку — пост откроется с превью прямо в мессенджере.
+        Ни аккаунтов, ни паролей, ни подтверждений.
       </p>
 
       <div class="hero-cta">
@@ -1102,38 +1138,38 @@ LANDING = r"""<!DOCTYPE html>
         </a>
       </div>
 
-      <div class="code-show" aria-hidden="true">
-        <div class="code-cell">4</div>
-        <div class="code-cell">8</div>
-        <div class="code-cell">1</div>
-        <div class="code-cell">6</div>
-        <div class="code-cell">3</div>
-        <div class="code-cell">9</div>
+      <div class="code-show" id="codeShow" aria-hidden="true">
+        <div class="code-cell" data-idx="0">4</div>
+        <div class="code-cell" data-idx="1">8</div>
+        <div class="code-cell" data-idx="2">1</div>
+        <div class="code-cell" data-idx="3">6</div>
+        <div class="code-cell" data-idx="4">3</div>
+        <div class="code-cell" data-idx="5">9</div>
       </div>
       <div class="code-caption">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="4" y="10" width="16" height="10" rx="2"/>
           <path d="M8 10V6a4 4 0 018 0v4"/>
         </svg>
-        151 200 комбинаций · цифры не повторяются
+        <span id="codeCaptionText">151 200 комбинаций · цифры не повторяются</span>
       </div>
     </div>
   </div>
 
   <div class="marquee">
     <div class="marquee-track">
+      <span>OpenGraph-превью</span>
       <span>AES-256-GCM</span>
       <span>6-значные коды</span>
       <span>Автосжатие фото</span>
       <span>zstd / gzip</span>
       <span>До 5 фото</span>
-      <span>Без аккаунтов</span>
+      <span>OpenGraph-превью</span>
       <span>AES-256-GCM</span>
       <span>6-значные коды</span>
       <span>Автосжатие фото</span>
       <span>zstd / gzip</span>
       <span>До 5 фото</span>
-      <span>Без аккаунтов</span>
     </div>
   </div>
 </header>
@@ -1143,7 +1179,7 @@ LANDING = r"""<!DOCTYPE html>
     <div class="sec-head reveal">
       <div class="eyebrow">Что умеет СЛД·NET</div>
       <h2>Всё, что нужно.<br><span class="dim">Ничего лишнего.</span></h2>
-      <p>Механика из десяти пунктов — от публикации до поиска чужого поста по чужому коду.</p>
+      <p>Механика из десяти пунктов — от публикации до красивой ссылки с превью.</p>
     </div>
 
     <div class="bento">
@@ -1179,8 +1215,8 @@ LANDING = r"""<!DOCTYPE html>
             <path d="M3 17.5l9 5 9-5"/>
           </svg>
         </div>
-        <h3>AES-256-GCM</h3>
-        <p>Посты и фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
+        <h3>OpenGraph-превью</h3>
+        <p>Ссылка <code>/p/482163</code> разворачивается в Telegram, VK и Discord: заголовок, краткое описание и первое фото.</p>
       </div>
 
       <div class="glass b-sm reveal">
@@ -1233,7 +1269,7 @@ LANDING = r"""<!DOCTYPE html>
           </svg>
         </div>
         <h3>Ссылка на пост</h3>
-        <p>Каждый пост живёт по адресу <code>/app#482163</code>. Просто отправьте его в чат — ссылка сразу откроет нужный пост.</p>
+        <p>Каждый пост живёт по адресу <code>/p/482163</code>. Отправьте его в чат — ссылка сразу откроет нужный пост с превью.</p>
       </div>
 
       <div class="glass b-sm reveal">
@@ -1295,21 +1331,21 @@ LANDING = r"""<!DOCTYPE html>
           </li>
           <li>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
-            <span><strong>Код из 6 цифр</strong> — единственное, что нужно запомнить или переслать</span>
+            <span><strong>Превью для мессенджеров</strong> — включается или выключается при создании</span>
           </li>
         </ul>
       </div>
 
       <div class="mock reveal" aria-hidden="true">
         <div class="mock-head">
-          <span class="mock-code">#482163</span>
+          <span class="mock-code" id="mockCode">#482163</span>
           <div class="mock-dots">
             <span></span><span></span><span></span>
           </div>
         </div>
         <div class="mock-title">Как подготовить питч за 5 минут</div>
         <div class="mock-body">
-          Если у вас есть всего одна минута на то, чтобы объяснить идею — используйте структуру «проблема → решение → результат». Работает в 9 из 10 случаев. Сохранил свой шаблон, делюсь.
+          Если у вас есть всего одна минута на то, чтобы объяснить идею — используйте структуру «проблема → решение → результат». Работает в 9 из 10 случаев.
         </div>
         <div class="mock-gallery">
           <div class="mock-thumb"></div>
@@ -1366,7 +1402,7 @@ LANDING = r"""<!DOCTYPE html>
       <div class="glass step reveal">
         <div class="step-num">Шаг 03</div>
         <h3>Делитесь ссылкой</h3>
-        <p>Отправьте код или ссылку <code>/app#482163</code>. Получатель сразу откроет пост — регистрация не нужна.</p>
+        <p>Отправьте ссылку <code>/p/482163</code> — она развернётся в превью, а переход откроет сам пост.</p>
       </div>
     </div>
   </div>
@@ -1380,22 +1416,22 @@ LANDING = r"""<!DOCTYPE html>
       <p>Шифрование, сжатие и мгновенный поиск — под капотом работают промышленные алгоритмы.</p>
     </div>
 
-    <div class="specs reveal" style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border-radius:var(--radius);overflow:hidden;background:var(--border);border:1px solid var(--border)">
-      <div class="spec" style="background:rgba(10,10,10,0.7);backdrop-filter:blur(20px);padding:44px 26px;text-align:center">
+    <div class="stats reveal">
+      <div class="stat">
         <div class="stat-val">AES-256</div>
         <div class="stat-lbl">GCM шифрование</div>
       </div>
-      <div class="spec" style="background:rgba(10,10,10,0.7);backdrop-filter:blur(20px);padding:44px 26px;text-align:center">
+      <div class="stat">
         <div class="stat-val">zstd</div>
         <div class="stat-lbl">Сжатие метаданных</div>
       </div>
-      <div class="spec" style="background:rgba(10,10,10,0.7);backdrop-filter:blur(20px);padding:44px 26px;text-align:center">
+      <div class="stat">
         <div class="stat-val">RAM</div>
         <div class="stat-lbl">Хранение в памяти</div>
       </div>
-      <div class="spec" style="background:rgba(10,10,10,0.7);backdrop-filter:blur(20px);padding:44px 26px;text-align:center">
-        <div class="stat-val">HTTP</div>
-        <div class="stat-lbl">REST API</div>
+      <div class="stat">
+        <div class="stat-val">OG</div>
+        <div class="stat-lbl">OpenGraph-превью</div>
       </div>
     </div>
   </div>
@@ -1458,7 +1494,17 @@ LANDING = r"""<!DOCTYPE html>
     </div>
 
     <div class="foot-bottom">
-      © 2026 СЛД·NET. Все права защищены.
+      <span>© 2026 СЛД·NET. Все права защищены.</span>
+      <div class="socials">
+        <a href="https://t.me/sld_net" aria-label="Telegram" title="Telegram">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m21 3-9 9M21 3l-7 18-4-7-7-4 18-7z"/>
+          </svg>
+        </a>
+        <a href="https://vk.com/sld_net" aria-label="VK" title="VK">
+          __VK_ICON__
+        </a>
+      </div>
     </div>
   </div>
 </footer>
@@ -1483,15 +1529,12 @@ LANDING = r"""<!DOCTYPE html>
     dot.style.transform = `translate3d(${mx}px, ${my}px, 0) translate(-50%, -50%)`;
     rx += (mx - rx) * 0.22;
     ry += (my - ry) * 0.22;
-
     const dx = mx - lastX, dy = my - lastY;
     vel = Math.min(Math.hypot(dx, dy), 40);
     lastX = mx; lastY = my;
-
     const angle = Math.atan2(dy, dx) * 180 / Math.PI;
     const stretch = 1 + vel / 260;
     const squash  = 1 - vel / 380;
-
     ring.style.transform = `translate3d(${rx}px, ${ry}px, 0) translate(-50%, -50%) rotate(${angle}deg) scale(${stretch}, ${squash})`;
     requestAnimationFrame(loop);
   }
@@ -1504,6 +1547,39 @@ LANDING = r"""<!DOCTYPE html>
     el.addEventListener('mouseenter', () => ring.classList.add('hover'));
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
+
+  /* ===== RANDOM CODE ===== */
+  (async function loadRandomCode() {
+    const cells = document.querySelectorAll('#codeShow .code-cell');
+    if (!cells.length) return;
+    try {
+      const res = await fetch('/api/random-code', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const code = String(data.code || '').padStart(6, '0');
+      if (!/^\d{6}$/.test(code)) return;
+
+      // обновим код в mock-карточке тоже
+      const mockCode = document.getElementById('mockCode');
+      if (mockCode) mockCode.textContent = '#' + code;
+
+      // и в текстах lead? нет, оставим как есть.
+
+      cells.forEach((cell, i) => {
+        cell.textContent = code[i] || '0';
+        cell.classList.remove('flip');
+        void cell.offsetWidth;
+        cell.classList.add('flip');
+        cell.style.animationDelay = (i * 0.06) + 's';
+      });
+      // очистим inline delay после анимации
+      setTimeout(() => {
+        cells.forEach(c => { c.style.animationDelay = ''; c.classList.remove('flip'); });
+      }, 1200);
+    } catch (e) {
+      // тихо игнорируем — оставим стартовые цифры
+    }
+  })();
 
   /* ===== REVEAL ===== */
   const io = new IntersectionObserver((entries) => {
@@ -1575,7 +1651,7 @@ LANDING = r"""<!DOCTYPE html>
 """
 
 # ============================================================
-# РАБОЧАЯ ОБЛАСТЬ  (/app)
+# РАБОЧАЯ ОБЛАСТЬ  (/app и /p/{code})
 # ============================================================
 APP = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -1584,6 +1660,7 @@ APP = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#080808">
 <title>СЛД·NET — рабочая область</title>
+<!-- OG_TAGS -->
 <link rel="icon" href="__FAVICON__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1631,7 +1708,6 @@ APP = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
   ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-  /* ===== CURSOR ===== */
   @media (hover:hover) and (pointer:fine){
     body,a,button,input,textarea{cursor:none}
   }
@@ -1658,7 +1734,6 @@ APP = r"""<!DOCTYPE html>
   .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
   @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-  /* ===== BACKGROUND ===== */
   .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
   .halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55}
   .halo-1{
@@ -1697,7 +1772,6 @@ APP = r"""<!DOCTYPE html>
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   }
 
-  /* ===== TOPBAR ===== */
   .topbar{
     position:fixed;top:14px;left:50%;transform:translateX(-50%);
     z-index:100;
@@ -1709,7 +1783,6 @@ APP = r"""<!DOCTYPE html>
     -webkit-backdrop-filter:blur(24px) saturate(160%);
     border:1px solid var(--border);
     box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
-    transition:background .3s,box-shadow .3s,border-color .3s;
   }
   .topbar-inner{
     display:flex;align-items:center;gap:14px;
@@ -1742,7 +1815,6 @@ APP = r"""<!DOCTYPE html>
   .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
   .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-  /* ===== MENU (with pill) ===== */
   .menu{
     position:relative;
     display:inline-flex;gap:4px;
@@ -1792,12 +1864,9 @@ APP = r"""<!DOCTYPE html>
   .back-btn svg{width:14px;height:14px;display:block}
   .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
 
-  /* ===== APP ===== */
   .app{
     min-height:100dvh;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
+    display:flex;flex-direction:column;align-items:center;
     padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
     gap:0;
   }
@@ -1873,6 +1942,54 @@ APP = r"""<!DOCTYPE html>
     min-height:150px;resize:none;
     line-height:1.55;font-family:inherit;
   }
+
+  /* ===== CHECKBOX ===== */
+  .checkbox-wrap{
+    display:flex;align-items:flex-start;gap:11px;
+    margin-top:12px;
+    padding:12px 14px;
+    border-radius:12px;
+    background:var(--input);
+    border:1px solid var(--border);
+    cursor:pointer;
+    user-select:none;
+    transition:border-color .18s,background .18s;
+  }
+  .checkbox-wrap:hover{border-color:var(--border-2);background:var(--input-focus)}
+  .checkbox-wrap input{position:absolute;opacity:0;pointer-events:none}
+  .checkbox-box{
+    flex-shrink:0;
+    width:20px;height:20px;
+    border-radius:6px;
+    border:1.5px solid var(--border-3);
+    background:transparent;
+    display:grid;place-items:center;
+    margin-top:1px;
+    transition:background .2s,border-color .2s,transform .2s;
+  }
+  .checkbox-box svg{
+    width:12px;height:12px;
+    color:#08080a;
+    opacity:0;
+    transform:scale(.6);
+    transition:opacity .18s,transform .18s;
+    display:block;
+  }
+  .checkbox-wrap input:checked + .checkbox-box{
+    background:#fff;
+    border-color:#fff;
+  }
+  .checkbox-wrap input:checked + .checkbox-box svg{
+    opacity:1;
+    transform:scale(1);
+  }
+  .checkbox-label{
+    font-size:13px;
+    color:var(--text-dim);
+    line-height:1.5;
+    min-width:0;
+  }
+  .checkbox-label strong{color:var(--text);font-weight:600}
 
   .drop{
     margin-top:10px;
@@ -2111,6 +2228,21 @@ APP = r"""<!DOCTYPE html>
     transform:translateY(-2px);
   }
 
+  .share-link{
+    margin-top:12px;
+    padding:11px 13px;
+    border-radius:12px;
+    background:rgba(255,255,255,0.03);
+    border:1px solid var(--border);
+    display:flex;align-items:center;gap:10px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:12px;
+    color:var(--text-dim);
+    word-break:break-all;
+  }
+  .share-link svg{width:15px;height:15px;flex-shrink:0;color:var(--text-mute);display:block}
+  .share-link span{min-width:0;color:var(--text)}
+
   .lightbox{
     position:fixed;inset:0;z-index:1000;
     display:flex;align-items:center;justify-content:center;
@@ -2124,12 +2256,10 @@ APP = r"""<!DOCTYPE html>
     display:flex;align-items:center;justify-content:center;
     overflow:hidden;cursor:default;
   }
-
   .lb-transform{
     display:flex;align-items:center;justify-content:center;
     transform-origin:center center;will-change:transform;
   }
-
   .lb-img{
     display:block;max-width:82vw;max-height:78vh;
     object-fit:contain;border-radius:8px;
@@ -2143,7 +2273,6 @@ APP = r"""<!DOCTYPE html>
     background-size:16px 16px;
     background-position:0 0, 0 8px, 8px -8px, -8px 0px;
   }
-
   .lb-btn{
     position:absolute;width:40px;height:40px;border-radius:11px;
     border:1px solid var(--border-2);
@@ -2157,11 +2286,9 @@ APP = r"""<!DOCTYPE html>
   .lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
   .lb-btn:hover{background:rgba(30,30,30,0.9);border-color:var(--border-3)}
   .lb-btn[hidden]{display:none}
-
   .lb-close{top:16px;right:16px}
   .lb-prev{left:16px;top:50%;transform:translateY(-50%)}
   .lb-next{right:16px;top:50%;transform:translateY(-50%)}
-
   .lb-counter{
     position:absolute;bottom:18px;left:50%;transform:translateX(-50%);
     padding:6px 14px;border-radius:10px;
@@ -2173,7 +2300,6 @@ APP = r"""<!DOCTYPE html>
     letter-spacing:.06em;
     z-index:2;pointer-events:none;
   }
-
   .lb-zoom-badge{
     position:absolute;top:16px;left:16px;
     padding:5px 11px;border-radius:10px;
@@ -2186,7 +2312,6 @@ APP = r"""<!DOCTYPE html>
     opacity:0;transition:opacity .18s ease;
   }
   .lb-zoom-badge.visible{opacity:1}
-
   .lb-hint{
     position:absolute;bottom:56px;left:50%;transform:translateX(-50%);
     font-size:11.5px;color:var(--text-mute);
@@ -2204,9 +2329,8 @@ APP = r"""<!DOCTYPE html>
   }
   .modal[hidden]{display:none}
   @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-
   .modal-card{
-    width:100%;max-width:380px;
+    width:100%;max-width:400px;
     padding:28px 24px 22px;
     border-radius:20px;
     background:linear-gradient(155deg,rgba(20,20,20,0.95),rgba(12,12,12,0.95));
@@ -2216,7 +2340,6 @@ APP = r"""<!DOCTYPE html>
     animation:popIn .32s cubic-bezier(.2,.8,.2,1);
   }
   @keyframes popIn{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
-
   .modal-icon{
     width:48px;height:48px;margin:0 auto 14px;
     border-radius:50%;
@@ -2226,7 +2349,6 @@ APP = r"""<!DOCTYPE html>
     border:1px solid rgba(126,200,153,0.3);
   }
   .modal-icon svg{width:22px;height:22px;display:block}
-
   .modal-title{
     font-family:'Unbounded',sans-serif;
     font-size:16px;font-weight:600;margin:0 0 6px;color:#fff;
@@ -2237,7 +2359,19 @@ APP = r"""<!DOCTYPE html>
     font-family:'JetBrains Mono',monospace;
     font-size:38px;font-weight:600;
     letter-spacing:12px;text-indent:12px;
-    color:#fff;margin:8px 0 8px;
+    color:#fff;margin:8px 0 10px;
+  }
+  .modal-url{
+    font-family:'JetBrains Mono',monospace;
+    font-size:11.5px;
+    color:var(--text-dim);
+    padding:8px 10px;
+    border-radius:8px;
+    background:rgba(255,255,255,0.03);
+    border:1px solid var(--border);
+    word-break:break-all;
+    margin-bottom:8px;
+    -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
   }
   .modal-hint{
     font-size:11.5px;color:var(--text-mute);
@@ -2255,14 +2389,11 @@ APP = r"""<!DOCTYPE html>
     .menu{padding:3px}
     .tab{padding:8px 13px;font-size:12.5px}
   }
-
   @media (max-width:640px){
     .topbar-inner{flex-wrap:wrap;row-gap:8px}
     .menu{order:3;width:100%;justify-content:center}
     .tab{flex:1 1 0;justify-content:center}
-    .app{
-      padding:calc(var(--topbar-h, 110px) + 18px) 14px 32px;
-    }
+    .app{padding:calc(var(--topbar-h, 110px) + 18px) 14px 32px}
     .card{padding:15px;border-radius:16px}
     .field{padding:11px 14px;font-size:14px}
     .input-wrap input.field,
@@ -2281,7 +2412,6 @@ APP = r"""<!DOCTYPE html>
     .lb-hint{display:none}
     .post-gallery{grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px}
   }
-
   @media (max-width:380px){
     .tab span{display:none}
     .tab{padding:9px 12px}
@@ -2377,6 +2507,18 @@ APP = r"""<!DOCTYPE html>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
 
+        <label class="checkbox-wrap" for="ogEnabled">
+          <input type="checkbox" id="ogEnabled" checked>
+          <span class="checkbox-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 6L9 17l-5-5"/>
+            </svg>
+          </span>
+          <span class="checkbox-label">
+            <strong>Превью для ссылок (OpenGraph)</strong> — при отправке в Telegram, VK или Discord покажет заголовок, краткое описание и первое фото.
+          </span>
+        </label>
+
         <div class="row">
           <button class="btn ghost" id="resetBtn" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2437,8 +2579,9 @@ APP = r"""<!DOCTYPE html>
       </svg>
     </div>
     <h3 class="modal-title">Пост создан</h3>
-    <p class="modal-sub">Сохраните код — по нему можно найти пост в любое время</p>
+    <p class="modal-sub">Скопируйте ссылку — она развернётся в превью и откроет пост в приложении</p>
     <div class="modal-code" id="modalCode">000000</div>
+    <div class="modal-url" id="modalUrl">https://.../p/000000</div>
     <div class="modal-hint" id="modalHint"></div>
     <div class="modal-actions">
       <button class="btn ghost" id="modalCopyBtn" type="button">
@@ -2446,7 +2589,7 @@ APP = r"""<!DOCTYPE html>
           <rect x="9" y="9" width="13" height="13" rx="2"/>
           <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
         </svg>
-        <span>Копировать</span>
+        <span>Копировать ссылку</span>
       </button>
       <button class="btn primary" id="modalCloseBtn" type="button">Готово</button>
     </div>
@@ -2517,7 +2660,7 @@ APP = r"""<!DOCTYPE html>
   document.addEventListener('mousedown', () => ring.classList.add('click'));
   document.addEventListener('mouseup', () => ring.classList.remove('click'));
 
-  document.querySelectorAll('a, button, input, textarea, .tab, .drop, .post-gallery img').forEach(el => {
+  document.querySelectorAll('a, button, input, textarea, label.checkbox-wrap, .tab, .drop, .post-gallery img').forEach(el => {
     el.addEventListener('mouseenter', () => ring.classList.add('hover'));
     el.addEventListener('mouseleave', () => ring.classList.remove('hover'));
   });
@@ -2557,9 +2700,8 @@ APP = r"""<!DOCTYPE html>
         if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
         if (Array.isArray(data.detail) && data.detail.length) {
           const first = data.detail[0] || {};
-          const loc = Array.isArray(first.loc) ? first.loc.filter(x => x !== "body").join(".") : "";
           const msg = first.msg || "Некорректные данные";
-          return loc ? (loc + ": " + msg) : msg;
+          return msg;
         }
         if (typeof data.message === "string" && data.message.trim()) return data.message;
       }
@@ -2576,7 +2718,10 @@ APP = r"""<!DOCTYPE html>
     return (b / (1024 * 1024 * 1024)).toFixed(2).replace(".", ",") + " ГБ";
   }
 
-  function parseHash() {
+  // Поддерживаем и /p/CODE, и #CODE
+  function parseLocation() {
+    const pathMatch = window.location.pathname.match(/^\/p\/(\d{6})\/?$/);
+    if (pathMatch) return { code: pathMatch[1] };
     const h = (window.location.hash || "").replace(/^#/, "");
     if (!h) return { code: null };
     const qIdx = h.indexOf("?");
@@ -2586,7 +2731,7 @@ APP = r"""<!DOCTYPE html>
   }
 
   /* =========================================================
-     TABS + PILL INDICATOR
+     TABS + PILL
      ========================================================= */
   const stage       = $("stage");
   const createPanel = $("createPanel");
@@ -2676,7 +2821,9 @@ APP = r"""<!DOCTYPE html>
   }
 
   btnCreate.addEventListener("click", () => {
-    if (window.location.hash) {
+    if (window.location.pathname.startsWith("/p/")) {
+      history.replaceState(null, "", "/app");
+    } else if (window.location.hash) {
       history.replaceState(null, "", window.location.pathname + window.location.search);
     }
     setMode("create");
@@ -2716,12 +2863,8 @@ APP = r"""<!DOCTYPE html>
           const q = (lo + hi) / 2;
           const blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", q));
           if (!blob) break;
-          if (blob.size <= targetBytes) {
-            candidate = blob;
-            lo = q;
-          } else {
-            hi = q;
-          }
+          if (blob.size <= targetBytes) { candidate = blob; lo = q; }
+          else { hi = q; }
         }
 
         if (candidate) { best = candidate; break; }
@@ -2757,6 +2900,7 @@ APP = r"""<!DOCTYPE html>
   const submitBtn  = $("submitBtn");
   const titleInput = $("title");
   const contentInput = $("content");
+  const ogCheckbox = $("ogEnabled");
 
   function defaultDropLabel() {
     return selectedFiles.length
@@ -2877,6 +3021,7 @@ APP = r"""<!DOCTYPE html>
     titleInput.value = "";
     contentInput.value = "";
     selectedFiles = [];
+    ogCheckbox.checked = true;
     renderPreviews();
     clearCreateMsg();
     titleInput.focus();
@@ -2894,6 +3039,7 @@ APP = r"""<!DOCTYPE html>
     const fd = new FormData();
     fd.append("title", title);
     fd.append("content", content);
+    fd.append("og_enabled", ogCheckbox.checked ? "true" : "false");
     selectedFiles.forEach((f) => fd.append("files", f, f.name));
 
     submitBtn.disabled = true;
@@ -2918,15 +3064,18 @@ APP = r"""<!DOCTYPE html>
 
       titleInput.value = "";
       contentInput.value = "";
+      ogCheckbox.checked = true;
       selectedFiles = [];
       renderPreviews();
       clearCreateMsg();
 
       const code = data.code;
+      const shareUrl = data.share_url || (window.location.origin + "/p/" + code);
 
+      // Обновим URL — короткий хеш
       const newHash = "#" + code;
       if (window.location.hash !== newHash) {
-        history.replaceState(null, "", newHash);
+        history.replaceState(null, "", "/app" + newHash);
       }
 
       setMode("find");
@@ -2935,7 +3084,7 @@ APP = r"""<!DOCTYPE html>
       updateOtpCopyState();
       runSearch(code);
 
-      showCreatedModal(code, data.compressed_bytes);
+      showCreatedModal(code, data.compressed_bytes, shareUrl);
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
@@ -2950,17 +3099,21 @@ APP = r"""<!DOCTYPE html>
   const createdModal  = $("createdModal");
   const modalCard     = $("modalCard");
   const modalCode     = $("modalCode");
+  const modalUrl      = $("modalUrl");
   const modalHint     = $("modalHint");
   const modalCopyBtn  = $("modalCopyBtn");
   const modalCloseBtn = $("modalCloseBtn");
 
   let modalCopyTimer = null;
+  let modalShareUrl  = "";
 
-  function showCreatedModal(code, bytes) {
+  function showCreatedModal(code, bytes, shareUrl) {
     modalCode.textContent = code;
+    modalShareUrl = shareUrl || (window.location.origin + "/p/" + code);
+    modalUrl.textContent = modalShareUrl;
     modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
     const label = modalCopyBtn.querySelector("span");
-    if (label) label.textContent = "Копировать";
+    if (label) label.textContent = "Копировать ссылку";
     createdModal.hidden = false;
   }
   function closeCreatedModal() { createdModal.hidden = true; }
@@ -2968,13 +3121,13 @@ APP = r"""<!DOCTYPE html>
   modalCopyBtn.addEventListener("click", async () => {
     const label = modalCopyBtn.querySelector("span");
     try {
-      await navigator.clipboard.writeText(modalCode.textContent || "");
+      await navigator.clipboard.writeText(modalShareUrl);
       if (label) label.textContent = "Скопировано";
     } catch {
       if (label) label.textContent = "Ошибка";
     }
     clearTimeout(modalCopyTimer);
-    modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать"; }, 1500);
+    modalCopyTimer = setTimeout(() => { if (label) label.textContent = "Копировать ссылку"; }, 1500);
   });
 
   modalCloseBtn.addEventListener("click", closeCreatedModal);
@@ -3113,10 +3266,7 @@ APP = r"""<!DOCTYPE html>
   const lbClose     = $("lbClose");
   const lbZoomBadge = $("lbZoomBadge");
 
-  let lbCode = null;
-  let lbPhotos = [];
-  let lbIndex = 0;
-
+  let lbCode = null, lbPhotos = [], lbIndex = 0;
   let zoom = 1, panX = 0, panY = 0;
   const MIN_ZOOM = 1, MAX_ZOOM = 8;
   let isPanning = false, panStartX = 0, panStartY = 0;
@@ -3149,10 +3299,8 @@ APP = r"""<!DOCTYPE html>
     const vrect = lbViewport.getBoundingClientRect();
     const Cx = vrect.left + vrect.width  / 2;
     const Cy = vrect.top  + vrect.height / 2;
-
     const dcx = clientX - Cx;
     const dcy = clientY - Cy;
-
     const ratio = newZoom / zoom;
     panX = dcx - (dcx - panX) * ratio;
     panY = dcy - (dcy - panY) * ratio;
@@ -3325,6 +3473,15 @@ APP = r"""<!DOCTYPE html>
       searchFrame.appendChild(gallery);
     }
 
+    // Ссылка на пост — чтобы удобно переслать
+    const shareBox = document.createElement("div");
+    shareBox.className = "share-link";
+    shareBox.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/></svg>';
+    const shareSpan = document.createElement("span");
+    shareSpan.textContent = window.location.origin + "/p/" + post.code;
+    shareBox.appendChild(shareSpan);
+    searchFrame.appendChild(shareBox);
+
     showSearchFrame();
   }
 
@@ -3360,7 +3517,7 @@ APP = r"""<!DOCTYPE html>
      INIT
      ========================================================= */
   function initFromUrl() {
-    const { code } = parseHash();
+    const { code } = parseLocation();
 
     if (code) {
       setMode("find", true);
@@ -3380,7 +3537,7 @@ APP = r"""<!DOCTYPE html>
   initFromUrl();
 
   window.addEventListener("hashchange", () => {
-    const { code } = parseHash();
+    const { code } = parseLocation();
     if (code && mode !== "find") {
       setMode("find", true);
       otpCells.forEach((c, i) => { c.value = code[i] || ""; });
@@ -3408,17 +3565,102 @@ APP = r"""<!DOCTYPE html>
 
 
 # ============================================================
+# OpenGraph-метатеги для страницы /p/{code}
+# ============================================================
+
+def _build_og_tags(code: str, meta: dict, photos_count: int) -> str:
+    """Собирает теги <meta property="og:..."> для конкретного поста."""
+    title = str(meta.get("title", "")).strip() or f"Пост #{code}"
+    content_raw = str(meta.get("content", "")).strip()
+
+    if content_raw:
+        desc = content_raw.replace("\n", " ").strip()
+        if len(desc) > 180:
+            desc = desc[:177].rstrip() + "…"
+    else:
+        desc = f"Пост #{code} в СЛД·NET. Откройте, чтобы прочитать полностью."
+
+    title_esc = _html.escape(title, quote=True)
+    desc_esc = _html.escape(desc, quote=True)
+    url = f"{PUBLIC_BASE_URL}/p/{code}"
+
+    lines = [
+        '<meta property="og:type" content="article">',
+        '<meta property="og:site_name" content="СЛД·NET">',
+        f'<meta property="og:title" content="{title_esc}">',
+        f'<meta property="og:description" content="{desc_esc}">',
+        f'<meta property="og:url" content="{_html.escape(url, quote=True)}">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{title_esc}">',
+        f'<meta name="twitter:description" content="{desc_esc}">',
+    ]
+
+    if photos_count > 0:
+        img = f"{PUBLIC_BASE_URL}/api/photos/{code}/0"
+        img_esc = _html.escape(img, quote=True)
+        lines.append(f'<meta property="og:image" content="{img_esc}">')
+        lines.append(f'<meta property="og:image:alt" content="{title_esc}">')
+        lines.append(f'<meta name="twitter:image" content="{img_esc}">')
+
+    lines.append(f'<link rel="canonical" href="{_html.escape(url, quote=True)}">')
+    return "\n".join(lines)
+
+
+# ============================================================
 # РОУТЫ
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(LANDING.replace("__FAVICON__", FAVICON))
+    return HTMLResponse(
+        LANDING.replace("__FAVICON__", FAVICON).replace("__VK_ICON__", VK_ICON)
+    )
 
 
 @app.get("/app", response_class=HTMLResponse)
 async def app_page():
-    return HTMLResponse(APP.replace("__FAVICON__", FAVICON))
+    html = (
+        APP.replace("__FAVICON__", FAVICON)
+           .replace("<!-- OG_TAGS -->", "")
+    )
+    return HTMLResponse(html)
+
+
+@app.get("/p/{code}", response_class=HTMLResponse)
+async def post_page(code: str):
+    code = (code or "").strip()
+    if not (len(code) == 6 and code.isdigit()):
+        # Пусть SPA покажет "не найдено"
+        return HTMLResponse(
+            APP.replace("__FAVICON__", FAVICON).replace("<!-- OG_TAGS -->", "")
+        )
+
+    og_tags = ""
+    title_override = None
+
+    with _lock:
+        entry = _store.get(code)
+
+    if entry is not None:
+        try:
+            meta = _unpack_meta(entry["meta"])
+            if meta.get("og_enabled", True):
+                og_tags = _build_og_tags(code, meta, len(entry["photos"]))
+                t = str(meta.get("title", "")).strip()
+                if t:
+                    title_override = t
+        except Exception:
+            pass
+
+    html = APP.replace("__FAVICON__", FAVICON).replace("<!-- OG_TAGS -->", og_tags)
+
+    if title_override:
+        html = html.replace(
+            "<title>СЛД·NET — рабочая область</title>",
+            f"<title>{_html.escape(title_override, quote=True)} — СЛД·NET</title>",
+        )
+
+    return HTMLResponse(html)
 
 
 if __name__ == "__main__":
