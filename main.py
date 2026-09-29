@@ -305,7 +305,7 @@ ARROW_SVG = (
 )
 
 # ============================================================
-# ОБЩИЙ CSS — сброс, курсор, фон, навбар, лоадер, футер
+# ОБЩИЙ CSS
 # ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -326,7 +326,6 @@ html,body{
   background:var(--bg);color:var(--text);
   font-family:'Manrope',system-ui,-apple-system,sans-serif;
   font-size:16px;line-height:1.6;
-  /* clip вместо hidden — не ломает position:sticky в дочерних элементах */
   overflow-x:clip;min-height:100vh;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
   -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
@@ -338,7 +337,7 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-/* === CURSOR (единый для всех страниц) === */
+/* === CURSOR === */
 @media (hover:hover) and (pointer:fine){
   *{cursor:none !important}
 }
@@ -357,7 +356,7 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* === LOADER === */
+/* === PAGE LOADER === */
 .page-loader{
   position:fixed;inset:0;z-index:99998;
   background:var(--bg);
@@ -378,20 +377,13 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
   0%,100%{transform:scale(1);box-shadow:0 8px 28px -8px rgba(255,255,255,0.35),0 0 0 0 rgba(255,255,255,0.35)}
   50%{transform:scale(1.06);box-shadow:0 12px 34px -8px rgba(255,255,255,0.45),0 0 0 14px rgba(255,255,255,0)}
 }
-.loader-bar{
-  width:140px;height:2px;
-  background:rgba(255,255,255,0.08);
-  border-radius:2px;overflow:hidden;position:relative;
-}
+.loader-bar{width:140px;height:2px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;position:relative}
 .loader-bar::after{
   content:'';position:absolute;left:0;top:0;bottom:0;
   width:40%;background:#fff;border-radius:2px;
   animation:loaderSlide 1.3s cubic-bezier(.5,0,.5,1) infinite;
 }
-@keyframes loaderSlide{
-  0%{transform:translateX(-100%)}
-  100%{transform:translateX(300%)}
-}
+@keyframes loaderSlide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
 
 /* === BACKGROUND === */
 .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
@@ -435,8 +427,8 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-/* === NAV === */
-nav{
+/* === NAV — только главный, чтобы не конфликтовать с TOC в docs === */
+body > nav.top-nav{
   position:fixed;top:20px;left:50%;transform:translateX(-50%);
   z-index:100;
   width:calc(100% - 40px);max-width:1180px;
@@ -449,7 +441,7 @@ nav{
   box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
   transition:background .3s,box-shadow .3s,border-color .3s;
 }
-nav.scrolled{
+body > nav.top-nav.scrolled{
   background:rgba(8,8,8,0.85);
   border-color:var(--border-2);
   box-shadow:0 16px 50px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.08);
@@ -587,11 +579,11 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 .eyebrow::before{content:'';width:26px;height:1px;background:linear-gradient(90deg,var(--text-mute),transparent)}
 
-/* === RESPONSIVE (shared) === */
+/* === RESPONSIVE === */
 @media (max-width:1000px){.nav-links{display:none}}
 @media (max-width:720px){
   .wrap{padding:0 20px}
-  nav{padding:10px 10px 10px 16px;top:12px;width:calc(100% - 24px);border-radius:16px}
+  body > nav.top-nav{padding:10px 10px 10px 16px;top:12px;width:calc(100% - 24px);border-radius:16px}
   .logo{font-size:13.5px}
   .logo-mark{width:28px;height:28px}
   .logo-mark svg{width:14px;height:14px}
@@ -600,12 +592,11 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 """
 
-# Универсальный JS: курсор, навбар, reveal, плавный скролл, лоадер, единый код
 SHELL_JS = r"""
 (function(){
   "use strict";
 
-  // --- Cursor ---
+  // Cursor
   var dot = document.querySelector(".cur-dot");
   var ring = document.querySelector(".cur-ring");
   if (dot && ring) {
@@ -631,27 +622,21 @@ SHELL_JS = r"""
     addEventListener("mousedown", function(){ ring.classList.add("click"); });
     addEventListener("mouseup", function(){ ring.classList.remove("click"); });
 
-    // Hover на интерактивных элементах
     document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, .doc-card, .endpoint, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
       el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
       el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
     });
   }
 
-  // --- Loader ---
+  // Loader
   var loader = document.getElementById("pageLoader");
   if (loader) {
     var hide = function(){ loader.classList.add("hidden"); };
-    if (document.readyState === "complete") {
-      setTimeout(hide, 250);
-    } else {
-      addEventListener("load", function(){ setTimeout(hide, 250); });
-      // страховка — если load не срабатывает
-      setTimeout(hide, 2500);
-    }
+    if (document.readyState === "complete") setTimeout(hide, 250);
+    else { addEventListener("load", function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  // --- Navbar scroll ---
+  // Navbar scroll
   var nav = document.getElementById("nav");
   if (nav) {
     var ticking = false;
@@ -666,7 +651,7 @@ SHELL_JS = r"""
     }, { passive: true });
   }
 
-  // --- Reveal ---
+  // Reveal
   var io = new IntersectionObserver(function(es){
     es.forEach(function(e, i){
       if (e.isIntersecting) {
@@ -677,7 +662,7 @@ SHELL_JS = r"""
   }, { threshold: 0.1, rootMargin: "0px 0px -60px 0px" });
   document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
 
-  // --- Smooth anchors ---
+  // Smooth anchors
   document.querySelectorAll('a[href^="#"]').forEach(function(a){
     a.addEventListener("click", function(e){
       var h = a.getAttribute("href");
@@ -689,7 +674,7 @@ SHELL_JS = r"""
     });
   });
 
-  // --- Единый код на странице ---
+  // Единый код
   var codeEls = document.querySelectorAll("[data-code]");
   if (codeEls.length) {
     fetch("/api/random-code", { cache: "no-store" })
@@ -700,23 +685,19 @@ SHELL_JS = r"""
         var cells = document.querySelectorAll(".code-cell");
         cells.forEach(function(c, i){
           c.textContent = d.code[i] || "0";
-          c.classList.remove("flip");
-          void c.offsetWidth;
-          c.classList.add("flip");
+          c.classList.remove("flip"); void c.offsetWidth; c.classList.add("flip");
           c.style.animationDelay = (i * 0.06) + "s";
         });
         setTimeout(function(){
           cells.forEach(function(c){ c.style.animationDelay = ""; c.classList.remove("flip"); });
         }, 1200);
-      })
-      .catch(function(){});
+      }).catch(function(){});
   }
 })();
 """
 
 
 def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "") -> str:
-    """Общий каркас HTML: head + nav + body + footer + скрипты."""
     nav_links = [
         ("/", "Главная"),
         ("/#features", "Возможности"),
@@ -738,7 +719,6 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">\n'
         '<style>\n' + SHELL_CSS + '\n/* PAGE CSS */\n' + extra_css + '\n</style>\n'
         '</head>\n<body>\n'
-        '<!-- PAGE LOADER -->\n'
         '<div class="page-loader" id="pageLoader" aria-hidden="true">\n'
         '  <div class="loader-inner">\n'
         '    <div class="loader-mark">' + LOGO_SVG + '</div>\n'
@@ -748,7 +728,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '<div class="cur-dot"></div>\n<div class="cur-ring"></div>\n'
         '<div class="bg"><div class="halo halo-1"></div><div class="halo halo-2"></div><div class="halo halo-3"></div></div>\n'
         '<div class="cursor-glow"></div>\n<div class="grid-bg"></div>\n<div class="grain"></div>\n'
-        '<nav id="nav">\n'
+        '<nav id="nav" class="top-nav">\n'
         '  <a href="/" class="logo">\n'
         '    <span class="logo-mark">' + LOGO_SVG + '</span>\n'
         '    <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
@@ -820,9 +800,8 @@ LANDING_CSS = r"""
   letter-spacing:-0.005em;margin-bottom:44px;
   box-shadow:0 10px 30px -14px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.12);
   animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
-  transition:transform .3s cubic-bezier(.2,.8,.2,1),border-color .3s,background .3s,box-shadow .3s;
-  position:relative;z-index:2;
-  max-width:100%;
+  transition:transform .3s cubic-bezier(.2,.8,.2,1),border-color .3s,background .3s;
+  position:relative;z-index:2;max-width:100%;
 }
 .badge:hover{
   transform:translateY(-2px);
@@ -875,7 +854,6 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 .hero-cta .btn{padding:15px 28px;height:auto;font-size:14.5px;border-radius:14px}
 .hero-cta .btn svg{width:16px;height:16px}
 
-/* ключевой фикс: без filter:blur, без stacking-контекст глюков */
 @keyframes rise{
   from{opacity:0;transform:translateY(26px)}
   to{opacity:1;transform:translateY(0)}
@@ -978,7 +956,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .glass:hover::after{transform:translateX(120%)}
 
-/* Разные hover-анимации для разных плиточек */
 .glass.hover-lift:hover{transform:translateY(-6px);box-shadow:0 32px 70px -28px rgba(0,0,0,0.85),inset 0 1px 0 rgba(255,255,255,0.09)}
 .glass.hover-tilt:hover{transform:perspective(900px) rotateY(-3.5deg) rotateX(2deg);box-shadow:0 32px 70px -28px rgba(0,0,0,0.85)}
 .glass.hover-tilt-r:hover{transform:perspective(900px) rotateY(3.5deg) rotateX(-2deg);box-shadow:0 32px 70px -28px rgba(0,0,0,0.85)}
@@ -1499,26 +1476,29 @@ DOCS_CSS = r"""
 .doc-hero p{color:var(--text-dim);font-size:clamp(15px,1.7vw,17.5px);max-width:640px;line-height:1.7}
 .doc-hero .eyebrow{margin-bottom:20px}
 
+/* Сетка: слева sticky-сайдбар 260px, справа контент */
 .doc-layout{
   display:grid;
-  grid-template-columns:230px minmax(0,1fr);
-  gap:48px;
+  grid-template-columns:260px minmax(0,1fr);
+  gap:40px;
   padding:40px 0 100px;
   align-items:start;
-  position:relative;
 }
 
-/* Sticky сайдбар, не накладывается на текст */
 .doc-toc{
-  position:sticky;top:110px;
+  position:sticky;
+  top:110px;
   display:flex;flex-direction:column;gap:4px;
   padding:14px;
   border-radius:16px;
-  background:rgba(18,18,18,0.75);
+  background:rgba(20,20,20,0.85);
   border:1px solid var(--border);
   backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
   z-index:3;
-  box-shadow:0 12px 32px -16px rgba(0,0,0,0.6);
+  box-shadow:0 12px 32px -16px rgba(0,0,0,0.7);
+  align-self:start;
+  max-height:calc(100vh - 140px);
+  overflow-y:auto;
 }
 .doc-toc a{
   color:var(--text-dim);text-decoration:none;
@@ -1532,7 +1512,7 @@ DOCS_CSS = r"""
 .doc-toc a:hover{color:#fff;background:rgba(255,255,255,0.04)}
 .doc-toc a.active{color:#fff;background:rgba(255,255,255,0.06);border-left-color:#fff}
 
-.doc-content{display:flex;flex-direction:column;gap:56px;min-width:0;position:relative;z-index:1}
+.doc-content{display:flex;flex-direction:column;gap:56px;min-width:0}
 .doc-section{scroll-margin-top:130px}
 .doc-section h2{
   font-family:'Unbounded',sans-serif;font-weight:600;
@@ -1549,15 +1529,6 @@ DOCS_CSS = r"""
   background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:6px;
   border:1px solid var(--border);white-space:nowrap;
 }
-
-.doc-card{
-  position:relative;padding:22px;border-radius:16px;
-  background:linear-gradient(150deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01));
-  border:1px solid var(--border);
-  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
-  transition:border-color .25s,background .25s,transform .3s cubic-bezier(.2,.8,.2,1);
-}
-.doc-card:hover{border-color:var(--border-2);background:rgba(255,255,255,0.05);transform:translateY(-2px)}
 
 .doc-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:6px}
 .doc-step{
@@ -1669,9 +1640,10 @@ pre code{background:none;padding:0;border:none;color:inherit;font-size:inherit}
   .doc-toc{
     position:sticky;top:80px;
     flex-direction:row;flex-wrap:nowrap;
-    overflow-x:auto;
+    overflow-x:auto;overflow-y:hidden;
     padding:8px;
     scrollbar-width:none;
+    max-height:none;
   }
   .doc-toc::-webkit-scrollbar{display:none}
   .doc-toc a{
@@ -1707,7 +1679,7 @@ def build_docs() -> str:
 <section class="wrap">
   <div class="doc-layout">
 
-    <nav class="doc-toc" id="toc">
+    <aside class="doc-toc" id="toc">
       <a href="#intro">Введение</a>
       <a href="#quickstart">Быстрый старт</a>
       <a href="#limits">Ограничения</a>
@@ -1715,7 +1687,7 @@ def build_docs() -> str:
       <a href="#api">REST API</a>
       <a href="#security">Безопасность</a>
       <a href="#faq">Вопросы</a>
-    </nav>
+    </aside>
 
     <div class="doc-content">
 
@@ -1899,7 +1871,6 @@ def build_docs() -> str:
     var y = scrollY + 150, best = 0;
     sections.forEach(function(s, i){ if (s.offsetTop <= y) best = i; });
     links.forEach(function(l, i){ l.classList.toggle('active', i === best); });
-    // прокрутка активного таба TOC в вид (для мобильного горизонтального режима)
     if (links[best] && window.innerWidth < 980) {
       links[best].scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
     }
@@ -2016,7 +1987,6 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
 }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
-/* topbar */
 .topbar{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:100;width:calc(100% - 28px);max-width:1160px;border-radius:16px;
@@ -2090,18 +2060,20 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
 }
 .stage{
   margin:auto 0;position:relative;
-  width:100%;max-width:560px;overflow:hidden;
-  transition:height .32s cubic-bezier(.2,.8,.2,1);will-change:height;
+  width:100%;max-width:560px;
+  transition:height .32s cubic-bezier(.2,.8,.2,1);
+  will-change:height;
+  /* НЕ используем overflow: hidden — чтобы сообщения не резались */
 }
 .stage[hidden]{display:none}
 .panel{
   position:absolute;top:0;left:0;right:0;
   display:flex;flex-direction:column;gap:12px;
-  opacity:0;pointer-events:none;transform:scale(.985);
-  transition:opacity .24s ease,transform .32s cubic-bezier(.2,.8,.2,1);
-  will-change:opacity,transform;
+  opacity:0;pointer-events:none;
+  transition:opacity .24s ease;
+  will-change:opacity;
 }
-.panel.active{position:relative;opacity:1;pointer-events:auto;transform:scale(1)}
+.panel.active{position:relative;opacity:1;pointer-events:auto}
 
 .card{
   position:relative;border-radius:18px;
@@ -2110,8 +2082,10 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
   backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
   box-shadow:0 20px 50px -28px rgba(0,0,0,0.8),inset 0 1px 0 rgba(255,255,255,0.05);
   padding:18px;
-  overflow:hidden; /* фикс: сообщения об ошибках не вылезают */
 }
+/* Отдельно: searchFrame тоже карточка */
+.card#searchFrame:not([hidden]){display:block}
+
 .input-wrap{position:relative;display:flex}
 .input-wrap + .input-wrap{margin-top:10px}
 .input-wrap .iw-icon{position:absolute;left:13px;width:16px;height:16px;color:var(--text-mute);pointer-events:none;transition:color .18s}
@@ -2254,8 +2228,17 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner-label{margin-top:10px;font-size:12px;color:var(--text-dim);text-align:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em}
 
-/* === FIX: сообщения об ошибках внутри карточки === */
-#createMsg, #searchFrame { margin: 0; }
+/* ================================================================
+   СООБЩЕНИЯ ОБ ОШИБКАХ
+   Отступ между кнопками/полями и сообщением обеспечивает
+   контейнер #createMsg:not(:empty), а не сам .msg.
+   Это гарантирует, что сообщение не наезжает ни на что.
+   ================================================================ */
+#createMsg,
+#searchFrame { display: block; }
+#createMsg:not(:empty) { margin-top: 14px; }
+#createMsg .msg { margin-top: 0; }
+
 .msg{
   display:flex;align-items:flex-start;gap:10px;
   border-radius:11px;
@@ -2265,12 +2248,10 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   color:var(--text);
   line-height:1.5;
   border:1px solid var(--border);
-  margin-top:12px;
   word-break:break-word;
   animation:msgIn .3s cubic-bezier(.2,.8,.2,1);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);
 }
-.msg:first-child{margin-top:0}
 .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px;display:block}
 .msg span{min-width:0;word-break:break-word}
 .msg.err{
@@ -2422,7 +2403,6 @@ APP = r"""<!DOCTYPE html>
 </head>
 <body>
 
-<!-- PAGE LOADER -->
 <div class="page-loader" id="pageLoader" aria-hidden="true">
   <div class="loader-inner">
     <div class="loader-mark">__LOGO_SVG__</div>
@@ -2586,41 +2566,35 @@ APP = r"""<!DOCTYPE html>
   var $ = function(id){ return document.getElementById(id); };
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
-  /* ===== CURSOR ===== */
+  /* CURSOR */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
   var rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
-
   addEventListener('mousemove', function(e){
     mx = e.clientX; my = e.clientY;
     document.documentElement.style.setProperty('--mx', e.clientX + 'px');
     document.documentElement.style.setProperty('--my', e.clientY + 'px');
   }, { passive: true });
-
   (function loop(){
     dot.style.transform = 'translate3d(' + mx + 'px,' + my + 'px,0) translate(-50%,-50%)';
-    rx += (mx - rx) * 0.22;
-    ry += (my - ry) * 0.22;
+    rx += (mx - rx) * 0.22; ry += (my - ry) * 0.22;
     var dx = mx - lastX, dy = my - lastY;
     vel = Math.min(Math.hypot(dx, dy), 40);
     lastX = mx; lastY = my;
     var angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    var stretch = 1 + vel / 260;
-    var squash  = 1 - vel / 380;
+    var stretch = 1 + vel / 260, squash = 1 - vel / 380;
     ring.style.transform = 'translate3d(' + rx + 'px,' + ry + 'px,0) translate(-50%,-50%) rotate(' + angle + 'deg) scale(' + stretch + ',' + squash + ')';
     requestAnimationFrame(loop);
   })();
-
   addEventListener('mousedown', function(){ ring.classList.add('click'); });
   addEventListener('mouseup', function(){ ring.classList.remove('click'); });
-
   document.querySelectorAll('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .share-link-copy').forEach(function(el){
     el.addEventListener('mouseenter', function(){ ring.classList.add('hover'); });
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
-  /* ===== LOADER ===== */
+  /* LOADER */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2628,15 +2602,13 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* ===== TOPBAR HEIGHT ===== */
+  /* TOPBAR */
   var topbar = $('topbar');
-  function measureTopbar(){
-    document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px');
-  }
+  function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
   measureTopbar();
 
-  /* ===== HELPERS ===== */
+  /* HELPERS */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2656,9 +2628,7 @@ APP = r"""<!DOCTYPE html>
       var data = await res.json().catch(function(){ return null; });
       if (data) {
         if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
-        if (Array.isArray(data.detail) && data.detail.length) {
-          return (data.detail[0] || {}).msg || "Некорректные данные";
-        }
+        if (Array.isArray(data.detail) && data.detail.length) return (data.detail[0] || {}).msg || "Некорректные данные";
         if (typeof data.message === "string" && data.message.trim()) return data.message;
       }
     }
@@ -2686,7 +2656,7 @@ APP = r"""<!DOCTYPE html>
     if (location.pathname !== "/app") history.replaceState(null, "", "/app");
   }
 
-  /* ===== TABS ===== */
+  /* TABS */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
@@ -2754,7 +2724,7 @@ APP = r"""<!DOCTYPE html>
   btnCreate.addEventListener("click", function(){ setUrlForApp(); setMode("create"); });
   btnFind.addEventListener("click", function(){ setUrlForApp(); setMode("find"); });
 
-  /* ===== COMPRESSION ===== */
+  /* COMPRESSION */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
   async function compressImage(file, targetBytes){
@@ -2794,7 +2764,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* ===== CREATE ===== */
+  /* CREATE */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -2889,11 +2859,16 @@ APP = r"""<!DOCTYPE html>
   function showCreateMsg(kind, text){
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
-    requestAnimationFrame(function(){ syncHeight(false); });
+    // двойной rAF — ждём, пока браузер применит стили к новому элементу
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ syncHeight(false); });
+    });
   }
   function clearCreateMsg(){
     createMsg.innerHTML = "";
-    requestAnimationFrame(function(){ syncHeight(false); });
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ syncHeight(false); });
+    });
   }
 
   $("resetBtn").addEventListener("click", function(){
@@ -2941,7 +2916,7 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* ===== MODAL ===== */
+  /* MODAL */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -2969,7 +2944,7 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
-  /* ===== SEARCH ===== */
+  /* SEARCH */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
@@ -3052,7 +3027,7 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* ===== LIGHTBOX ===== */
+  /* LIGHTBOX */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3159,7 +3134,7 @@ APP = r"""<!DOCTYPE html>
   }, { passive: false });
   lbViewport.addEventListener("touchend", function(){ touchStartDist = 0; });
 
-  /* ===== POST RENDER ===== */
+  /* POST RENDER */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -3193,7 +3168,6 @@ APP = r"""<!DOCTYPE html>
       });
       searchFrame.appendChild(gallery);
     }
-    // Share-link с копированием
     var shareBox = document.createElement("div");
     shareBox.className = "share-link";
     var shareIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -3252,7 +3226,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* ===== INIT ===== */
+  /* INIT */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
