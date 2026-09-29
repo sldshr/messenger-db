@@ -274,7 +274,7 @@ async def stats():
 
 
 # ============================================================
-# ФРОНТЕНД — ОБЩАЯ ЧАСТЬ
+# ФРОНТЕНД
 # ============================================================
 
 FAVICON = (
@@ -303,6 +303,9 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
+# ============================================================
+# ОБЩИЙ CSS
+# ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -318,39 +321,38 @@ SHELL_CSS = r"""
   --radius:22px;
 }
 html{scroll-behavior:smooth}
+
+/* Скрываем выделение текста везде — включаем только в полях ввода */
 html,body{
   background:var(--bg);color:var(--text);
   font-family:'Manrope',system-ui,-apple-system,sans-serif;
   font-size:16px;line-height:1.6;
   overflow-x:clip;min-height:100vh;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  -webkit-tap-highlight-color:transparent;
 }
-input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-select:text;user-select:text}
+input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.otp-cell,.share-link-url{
+  -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
+}
+
+/* Принудительное скрытие элементов с атрибутом hidden — иначе display из стилей перебивает */
+[hidden]{display:none !important}
+
 ::selection{background:#fff;color:#000}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:#0a0a0a}
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-/* === CURSOR — показывается только после первого движения мыши === */
+/* === CURSOR — системный скрыт сразу, кастомный появляется после первого движения === */
 @media (hover:hover) and (pointer:fine){
-  body.cursor-ready a,
-  body.cursor-ready button,
-  body.cursor-ready input,
-  body.cursor-ready textarea,
-  body.cursor-ready label,
-  body.cursor-ready select,
-  body.cursor-ready [role="button"],
-  body.cursor-ready .glass,
-  body.cursor-ready .code-cell,
-  body.cursor-ready .tab,
-  body.cursor-ready .drop,
-  body.cursor-ready .share-link-copy { cursor:none !important; }
+  *, *::before, *::after { cursor:none !important; }
 }
 .cur-dot,.cur-ring{
   position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
   border-radius:50%;will-change:transform;
-  opacity:0;transition:opacity .25s ease;
+  opacity:0;transition:opacity .2s ease;
 }
 body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
@@ -358,7 +360,7 @@ body.cursor-ready .cur-ring { opacity:1; }
 .cur-ring{
   width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
   transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
-             border-color .25s,background .25s,opacity .25s;
+             border-color .25s,background .25s,opacity .2s;
 }
 .cur-ring.hover{
   width:60px;height:60px;border-color:rgba(255,255,255,0.2);
@@ -368,7 +370,7 @@ body.cursor-ready .cur-ring { opacity:1; }
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* === PAGE LOADER === */
+/* === LOADER === */
 .page-loader{
   position:fixed;inset:0;z-index:99998;
   background:var(--bg);
@@ -608,7 +610,10 @@ SHELL_JS = r"""
 (function(){
   "use strict";
 
-  // Cursor — включаем только после первого движения мыши
+  // === ПКМ отключено на всей странице ===
+  document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+
+  // Cursor
   var dot = document.querySelector(".cur-dot");
   var ring = document.querySelector(".cur-ring");
   if (dot && ring) {
@@ -642,7 +647,7 @@ SHELL_JS = r"""
     addEventListener("mousedown", function(){ ring.classList.add("click"); });
     addEventListener("mouseup", function(){ ring.classList.remove("click"); });
 
-    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, .endpoint, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
+    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
       el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
       el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
     });
@@ -1509,31 +1514,26 @@ html,body{
   font-size:15px;line-height:1.55;
   min-height:100%;overflow-x:clip;
   -webkit-font-smoothing:antialiased;
+  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  -webkit-tap-highlight-color:transparent;
 }
 input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.share-link-url{
   -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
 }
+[hidden]{display:none !important}
 ::selection{background:#fff;color:#000}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:#0a0a0a}
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 
+/* CURSOR — системный скрыт на десктопе, кастомный появляется после первого движения */
 @media (hover:hover) and (pointer:fine){
-  body.cursor-ready a,
-  body.cursor-ready button,
-  body.cursor-ready input,
-  body.cursor-ready textarea,
-  body.cursor-ready label,
-  body.cursor-ready .tab,
-  body.cursor-ready .drop,
-  body.cursor-ready .share-link-copy,
-  body.cursor-ready .otp-cell,
-  body.cursor-ready .otp-copy { cursor:none !important; }
+  *, *::before, *::after { cursor:none !important; }
 }
 .cur-dot,.cur-ring{
   position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
   border-radius:50%;will-change:transform;
-  opacity:0;transition:opacity .25s ease;
+  opacity:0;transition:opacity .2s ease;
 }
 body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
@@ -1541,7 +1541,7 @@ body.cursor-ready .cur-ring { opacity:1; }
 .cur-ring{
   width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
   transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
-             border-color .25s,background .25s,opacity .25s;
+             border-color .25s,background .25s,opacity .2s;
 }
 .cur-ring.hover{width:58px;height:58px;border-color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
@@ -1829,7 +1829,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner-label{margin-top:10px;font-size:12px;color:var(--text-dim);text-align:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em}
 
-#createMsg,#searchFrame{display:block}
 #createMsg:not(:empty){margin-top:14px}
 #createMsg .msg{margin-top:0}
 
@@ -1848,16 +1847,8 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 }
 .msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px;display:block}
 .msg span{min-width:0;word-break:break-word}
-.msg.err{
-  background:rgba(224,128,128,0.08);
-  border-color:rgba(224,128,128,0.32);
-  color:#eab8b8;
-}
-.msg.ok{
-  background:rgba(126,200,153,0.08);
-  border-color:rgba(126,200,153,0.3);
-  color:#b1dfc2;
-}
+.msg.err{background:rgba(224,128,128,0.08);border-color:rgba(224,128,128,0.32);color:#eab8b8}
+.msg.ok{background:rgba(126,200,153,0.08);border-color:rgba(126,200,153,0.3);color:#b1dfc2}
 @keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
 
 .post-title{margin:0 0 8px;font-family:'Unbounded',sans-serif;font-size:17px;font-weight:600;line-height:1.3;color:#fff;word-break:break-word;letter-spacing:-0.02em}
@@ -1951,11 +1942,30 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .menu{padding:3px}
   .tab{padding:8px 13px;font-size:12.5px}
 }
-@media (max-width:640px){
-  .topbar-inner{flex-wrap:wrap;row-gap:8px}
-  .menu{order:3;width:100%;justify-content:center}
-  .tab{flex:1 1 0;justify-content:center}
-  .app{padding:calc(var(--topbar-h, 110px) + 18px) 14px 32px}
+
+/* === MOBILE: убираем скролл всей страницы, разрешаем только внутри .stage при большом посте === */
+@media (max-width: 720px){
+  html, body{
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  .app{
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    padding: calc(var(--topbar-h, 80px) + 18px) 14px 16px;
+  }
+  .stage{
+    max-height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    padding-bottom: 4px;
+  }
+  .stage::-webkit-scrollbar{ display:none; }
   .card{padding:15px;border-radius:16px}
   .field{padding:11px 14px;font-size:14px}
   .input-wrap input.field,.input-wrap textarea.field{padding-left:38px}
@@ -1973,6 +1983,11 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .lb-hint{display:none}
   .post-gallery{grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px}
 }
+@media (max-width:640px){
+  .topbar-inner{flex-wrap:wrap;row-gap:8px}
+  .menu{order:3;width:100%;justify-content:center}
+  .tab{flex:1 1 0;justify-content:center}
+}
 @media (max-width:380px){
   .tab span{display:none}
   .tab{padding:9px 12px}
@@ -1985,7 +2000,7 @@ APP = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
 <meta name="theme-color" content="#080808">
 <title>СЛД·NET — рабочая область</title>
 <!-- OG_TAGS -->
@@ -2158,6 +2173,9 @@ APP = r"""<!DOCTYPE html>
 (function(){
   "use strict";
   var $ = function(id){ return document.getElementById(id); };
+
+  /* ПКМ отключено на всей странице */
+  document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
   /* CURSOR */
   var dot  = document.querySelector('.cur-dot');
