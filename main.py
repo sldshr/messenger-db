@@ -6,7 +6,6 @@ Sld-Networking — посты с 6-значным кодом (без повто�
   /           — лендинг
   /app        — рабочая область (SPA)
   /p/{code}   — единая ссылка на пост (с OpenGraph-метатегами)
-  /doc_s      — документация
   /api/*      — REST API
 
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
@@ -304,9 +303,6 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
-# ============================================================
-# ОБЩИЙ CSS
-# ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -328,7 +324,6 @@ html,body{
   font-size:16px;line-height:1.6;
   overflow-x:clip;min-height:100vh;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
-  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
 }
 input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-select:text;user-select:text}
 ::selection{background:#fff;color:#000}
@@ -337,16 +332,33 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-/* === CURSOR === */
+/* === CURSOR — показывается только после первого движения мыши === */
 @media (hover:hover) and (pointer:fine){
-  *{cursor:none !important}
+  body.cursor-ready a,
+  body.cursor-ready button,
+  body.cursor-ready input,
+  body.cursor-ready textarea,
+  body.cursor-ready label,
+  body.cursor-ready select,
+  body.cursor-ready [role="button"],
+  body.cursor-ready .glass,
+  body.cursor-ready .code-cell,
+  body.cursor-ready .tab,
+  body.cursor-ready .drop,
+  body.cursor-ready .share-link-copy { cursor:none !important; }
 }
-.cur-dot,.cur-ring{position:fixed;top:0;left:0;pointer-events:none;z-index:99999;border-radius:50%;will-change:transform}
+.cur-dot,.cur-ring{
+  position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
+  border-radius:50%;will-change:transform;
+  opacity:0;transition:opacity .25s ease;
+}
+body.cursor-ready .cur-dot,
+body.cursor-ready .cur-ring { opacity:1; }
 .cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25)}
 .cur-ring{
   width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
   transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
-             border-color .25s,background .25s;
+             border-color .25s,background .25s,opacity .25s;
 }
 .cur-ring.hover{
   width:60px;height:60px;border-color:rgba(255,255,255,0.2);
@@ -427,7 +439,7 @@ input,textarea,[contenteditable],pre,code{-webkit-user-select:text;-moz-user-sel
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-/* === NAV — только главный, чтобы не конфликтовать с TOC в docs === */
+/* === NAV === */
 body > nav.top-nav{
   position:fixed;top:20px;left:50%;transform:translateX(-50%);
   z-index:100;
@@ -596,17 +608,24 @@ SHELL_JS = r"""
 (function(){
   "use strict";
 
-  // Cursor
+  // Cursor — включаем только после первого движения мыши
   var dot = document.querySelector(".cur-dot");
   var ring = document.querySelector(".cur-ring");
   if (dot && ring) {
     var mx = innerWidth/2, my = innerHeight/2;
     var rx = mx, ry = my, lx = mx, ly = my, vel = 0;
+    var cursorReady = false;
+
     addEventListener("mousemove", function(e){
+      if (!cursorReady) {
+        cursorReady = true;
+        document.body.classList.add("cursor-ready");
+      }
       mx = e.clientX; my = e.clientY;
       document.documentElement.style.setProperty("--mx", mx + "px");
       document.documentElement.style.setProperty("--my", my + "px");
     }, { passive: true });
+
     (function loop(){
       dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
       rx += (mx - rx) * 0.22;
@@ -619,10 +638,11 @@ SHELL_JS = r"""
       ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + a + "deg) scale(" + s + "," + q + ")";
       requestAnimationFrame(loop);
     })();
+
     addEventListener("mousedown", function(){ ring.classList.add("click"); });
     addEventListener("mouseup", function(){ ring.classList.remove("click"); });
 
-    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, .doc-card, .endpoint, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
+    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, .endpoint, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
       el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
       el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
     });
@@ -674,7 +694,7 @@ SHELL_JS = r"""
     });
   });
 
-  // Единый код
+  // Единый код на странице
   var codeEls = document.querySelectorAll("[data-code]");
   if (codeEls.length) {
     fetch("/api/random-code", { cache: "no-store" })
@@ -701,7 +721,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
     nav_links = [
         ("/", "Главная"),
         ("/#features", "Возможности"),
-        ("/doc_s", "Документация"),
+        ("/#how", "Как это работает"),
     ]
     links_html = "".join(
         f'<a href="{href}"{" class=\"active\"" if active == href else ""}>{label}</a>'
@@ -764,9 +784,9 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '          <a href="/app">Найти пост</a>\n'
         '        </div>\n'
         '        <div class="foot-col">\n'
-        '          <h4>Ресурсы</h4>\n'
-        '          <a href="/doc_s">Документация</a>\n'
-        '          <a href="/doc_s#api">REST API</a>\n'
+        '          <h4>Контакты</h4>\n'
+        '          <a href="/">СЛД-Нетворкинг Гроуп</a>\n'
+        '          <a href="/">support@sld-net</a>\n'
         '        </div>\n'
         '      </div>\n'
         '    </div>\n'
@@ -785,31 +805,31 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
 # ============================================================
 
 LANDING_CSS = r"""
-.hero{padding:220px 0 0;position:relative;overflow:hidden}
+.hero{padding:170px 0 0;position:relative;overflow:hidden}
 .hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
 
 .badge{
   display:inline-flex;align-items:center;gap:10px;
-  padding:9px 18px 9px 10px;
+  padding:8px 16px 8px 9px;
   border-radius:100px;
-  background:rgba(255,255,255,0.06);
-  border:1px solid rgba(255,255,255,0.24);
+  background:rgba(255,255,255,0.055);
+  border:1px solid rgba(255,255,255,0.2);
   backdrop-filter:blur(14px) saturate(160%);
   -webkit-backdrop-filter:blur(14px) saturate(160%);
-  font-size:13px;font-weight:600;color:#fff;
-  letter-spacing:-0.005em;margin-bottom:44px;
-  box-shadow:0 10px 30px -14px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.12);
+  font-size:12.5px;font-weight:600;color:#fff;
+  letter-spacing:-0.005em;margin-bottom:38px;
+  box-shadow:0 10px 30px -14px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.1);
   animation:rise .8s cubic-bezier(.2,.8,.2,1) both;
   transition:transform .3s cubic-bezier(.2,.8,.2,1),border-color .3s,background .3s;
   position:relative;z-index:2;max-width:100%;
 }
 .badge:hover{
   transform:translateY(-2px);
-  border-color:rgba(255,255,255,0.4);
-  background:rgba(255,255,255,0.085);
+  border-color:rgba(255,255,255,0.34);
+  background:rgba(255,255,255,0.08);
 }
 .badge-dot{
-  width:22px;height:22px;border-radius:50%;
+  width:20px;height:20px;border-radius:50%;
   background:linear-gradient(140deg,#fff,#c8c8cc);
   display:grid;place-items:center;color:#0a0a0a;
   position:relative;flex-shrink:0;
@@ -821,25 +841,25 @@ LANDING_CSS = r"""
   animation:ping 2.6s ease-out infinite;
 }
 @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.55);opacity:0}}
-.badge-dot svg{width:11px;height:11px;display:block}
+.badge-dot svg{width:10px;height:10px;display:block}
 .badge-sep{color:rgba(255,255,255,0.3);font-weight:400;margin:0 -1px}
 
 h1{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(40px,7.6vw,88px);line-height:0.98;
-  letter-spacing:-0.045em;margin-bottom:30px;
+  font-size:clamp(38px,7.2vw,84px);line-height:0.98;
+  letter-spacing:-0.045em;margin-bottom:26px;
   animation:rise .9s .05s cubic-bezier(.2,.8,.2,1) both;
   text-wrap:balance;position:relative;z-index:1;
 }
 h1 .dim{color:var(--text-mute);font-weight:400}
 
 .lead{
-  font-size:clamp(15.5px,1.75vw,18px);line-height:1.65;
-  color:var(--text-dim);max-width:640px;margin:0 auto 44px;
+  font-size:clamp(15px,1.7vw,17.5px);line-height:1.65;
+  color:var(--text-dim);max-width:620px;margin:0 auto 40px;
   animation:rise 1s .12s cubic-bezier(.2,.8,.2,1) both;
   position:relative;z-index:1;
 }
-.lead strong{color:#e8e8ea;font-weight:600}
+.lead strong{color:#e8e8ea;font-weight:600;white-space:nowrap}
 .lead code{
   font-family:'JetBrains Mono',monospace;font-size:.92em;color:var(--text);
   background:rgba(255,255,255,0.05);padding:3px 8px;border-radius:7px;
@@ -855,13 +875,13 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 .hero-cta .btn svg{width:16px;height:16px}
 
 @keyframes rise{
-  from{opacity:0;transform:translateY(26px)}
+  from{opacity:0;transform:translateY(22px)}
   to{opacity:1;transform:translateY(0)}
 }
 
 .code-show{
-  margin:80px auto 0;max-width:580px;
-  display:flex;gap:10px;justify-content:center;flex-wrap:nowrap;
+  margin:70px auto 0;max-width:560px;
+  display:flex;gap:9px;justify-content:center;flex-wrap:nowrap;
   animation:rise 1s .32s cubic-bezier(.2,.8,.2,1) both;
   position:relative;z-index:1;
 }
@@ -871,13 +891,13 @@ h1 .dim{color:var(--text-mute);font-weight:400}
   filter:blur(40px);pointer-events:none;z-index:-1;
 }
 .code-cell{
-  flex:1 1 0;max-width:72px;aspect-ratio:2/3;border-radius:14px;
+  flex:1 1 0;max-width:70px;aspect-ratio:2/3;border-radius:13px;
   background:linear-gradient(160deg,rgba(255,255,255,0.065),rgba(255,255,255,0.018));
   border:1px solid var(--border-2);
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   display:grid;place-items:center;
   font-family:'JetBrains Mono',monospace;font-weight:600;
-  font-size:clamp(22px,3.6vw,28px);color:#fff;
+  font-size:clamp(21px,3.4vw,27px);color:#fff;
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 12px 28px -12px rgba(0,0,0,0.7);
   animation:cellIn .6s cubic-bezier(.2,.8,.2,1) both;
   transition:transform .35s cubic-bezier(.2,.8,.2,1),border-color .3s,box-shadow .35s,color .25s;
@@ -897,7 +917,7 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 @keyframes cellIn{from{opacity:0;transform:translateY(20px) scale(.88)}to{opacity:1;transform:translateY(0) scale(1)}}
 
 .code-caption{
-  margin-top:24px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
+  margin-top:22px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
   animation:rise 1s .9s cubic-bezier(.2,.8,.2,1) both;
   display:inline-flex;align-items:center;gap:9px;
   font-family:'JetBrains Mono',monospace;
@@ -905,7 +925,7 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
 .marquee{
-  margin-top:120px;padding:24px 0;
+  margin-top:110px;padding:22px 0;
   border-top:1px solid var(--border);border-bottom:1px solid var(--border);
   overflow:hidden;
   mask-image:linear-gradient(90deg,transparent,#000 10%,#000 90%,transparent);
@@ -1136,7 +1156,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .steps::before{display:none}
 }
 @media (max-width:720px){
-  .hero{padding:150px 0 0}
+  .hero{padding:130px 0 0}
   section{padding:80px 0}
   .bento{grid-template-columns:1fr;gap:14px}
   .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
@@ -1151,11 +1171,11 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .marquee-track span{font-size:12px;gap:36px}
   .marquee-track{gap:36px}
   .marquee{margin-top:80px}
-  .code-show{margin-top:56px;gap:6px}
-  .code-cell{max-width:46px;border-radius:11px}
-  .badge{font-size:11.5px;padding:7px 14px 7px 9px;margin-bottom:36px;gap:7px}
-  .badge-dot{width:20px;height:20px}
-  .badge-dot svg{width:10px;height:10px}
+  .code-show{margin-top:52px;gap:6px}
+  .code-cell{max-width:44px;border-radius:11px}
+  .badge{font-size:11.5px;padding:7px 13px 7px 8px;margin-bottom:32px;gap:8px}
+  .badge-dot{width:18px;height:18px}
+  .badge-dot svg{width:9px;height:9px}
 }
 @media (max-width:420px){
   .stats{grid-template-columns:1fr}
@@ -1190,7 +1210,7 @@ def build_landing() -> str:
       </h1>
 
       <p class="lead">
-        Заголовок, текст, до 5 фотографий — сервер вернёт <strong>уникальный 6-значный код</strong>.
+        Заголовок, текст, до 5 фотографий — сервер вернёт <strong>уникальный 6-значный&nbsp;код</strong>.
         Отправьте код или ссылку — пост откроется с превью прямо в мессенджере.
         Ни аккаунтов, ни паролей, ни подтверждений.
       </p>
@@ -1462,434 +1482,6 @@ def build_landing() -> str:
 
 
 # ============================================================
-# ДОКУМЕНТАЦИЯ  (/doc_s)
-# ============================================================
-
-DOCS_CSS = r"""
-.doc-hero{padding:190px 0 40px;position:relative}
-.doc-hero h1{
-  font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(34px,6vw,68px);line-height:1.02;
-  letter-spacing:-0.04em;margin-bottom:22px;text-wrap:balance;
-}
-.doc-hero h1 .dim{color:var(--text-mute);font-weight:400}
-.doc-hero p{color:var(--text-dim);font-size:clamp(15px,1.7vw,17.5px);max-width:640px;line-height:1.7}
-.doc-hero .eyebrow{margin-bottom:20px}
-
-/* Сетка: слева sticky-сайдбар 260px, справа контент */
-.doc-layout{
-  display:grid;
-  grid-template-columns:260px minmax(0,1fr);
-  gap:40px;
-  padding:40px 0 100px;
-  align-items:start;
-}
-
-.doc-toc{
-  position:sticky;
-  top:110px;
-  display:flex;flex-direction:column;gap:4px;
-  padding:14px;
-  border-radius:16px;
-  background:rgba(20,20,20,0.85);
-  border:1px solid var(--border);
-  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
-  z-index:3;
-  box-shadow:0 12px 32px -16px rgba(0,0,0,0.7);
-  align-self:start;
-  max-height:calc(100vh - 140px);
-  overflow-y:auto;
-}
-.doc-toc a{
-  color:var(--text-dim);text-decoration:none;
-  font-size:13.5px;font-weight:500;
-  padding:8px 12px;border-radius:9px;
-  transition:color .2s,background .2s;
-  border-left:2px solid transparent;
-  white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis;
-}
-.doc-toc a:hover{color:#fff;background:rgba(255,255,255,0.04)}
-.doc-toc a.active{color:#fff;background:rgba(255,255,255,0.06);border-left-color:#fff}
-
-.doc-content{display:flex;flex-direction:column;gap:56px;min-width:0}
-.doc-section{scroll-margin-top:130px}
-.doc-section h2{
-  font-family:'Unbounded',sans-serif;font-weight:600;
-  font-size:clamp(22px,3vw,30px);line-height:1.15;
-  letter-spacing:-0.025em;margin-bottom:14px;
-}
-.doc-section h3{
-  font-family:'Unbounded',sans-serif;font-weight:600;
-  font-size:17px;letter-spacing:-0.015em;margin:26px 0 10px;
-}
-.doc-section p{color:var(--text-dim);font-size:15px;line-height:1.7;margin-bottom:14px;max-width:70ch}
-.doc-section p code,li code,p code{
-  font-family:'JetBrains Mono',monospace;font-size:.9em;color:var(--text);
-  background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:6px;
-  border:1px solid var(--border);white-space:nowrap;
-}
-
-.doc-steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:6px}
-.doc-step{
-  padding:20px;border-radius:16px;
-  background:linear-gradient(150deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01));
-  border:1px solid var(--border);
-  transition:border-color .25s,transform .3s cubic-bezier(.2,.8,.2,1);
-}
-.doc-step:hover{border-color:var(--border-2);transform:translateY(-3px)}
-.doc-step-num{
-  font-family:'JetBrains Mono',monospace;font-size:11px;
-  letter-spacing:0.14em;text-transform:uppercase;
-  color:var(--text-mute);margin-bottom:14px;
-  display:inline-flex;align-items:center;gap:8px;
-}
-.doc-step-num::before{content:'';width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.1);display:inline-block}
-.doc-step h4{font-family:'Unbounded',sans-serif;font-weight:600;font-size:15px;letter-spacing:-0.015em;margin-bottom:8px;color:#fff}
-.doc-step p{color:var(--text-dim);font-size:13.5px;line-height:1.6;margin:0;max-width:none}
-
-.endpoint{
-  padding:20px;border-radius:16px;
-  background:linear-gradient(150deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01));
-  border:1px solid var(--border);
-  margin-top:14px;
-  transition:border-color .25s,background .25s;
-}
-.endpoint:hover{border-color:var(--border-2);background:rgba(255,255,255,0.05)}
-.endpoint-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-.method{
-  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
-  padding:4px 10px;border-radius:7px;letter-spacing:0.06em;flex-shrink:0;
-}
-.method.get{background:rgba(126,200,153,0.15);color:#a4dcbb;border:1px solid rgba(126,200,153,0.35)}
-.method.post{background:rgba(140,170,255,0.15);color:#b0c1ff;border:1px solid rgba(140,170,255,0.35)}
-.endpoint-path{font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:#fff;word-break:break-all}
-.endpoint-desc{color:var(--text-dim);font-size:14px;line-height:1.65;margin-bottom:12px}
-.endpoint-meta{
-  display:flex;gap:16px;flex-wrap:wrap;
-  font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-mute);
-}
-.endpoint-meta span{display:inline-flex;align-items:center;gap:6px}
-
-pre{
-  font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7;
-  background:rgba(0,0,0,0.35);
-  border:1px solid var(--border);
-  border-radius:12px;
-  padding:16px 18px;
-  overflow-x:auto;color:var(--text-dim);
-  margin:12px 0 0;-webkit-overflow-scrolling:touch;
-}
-pre code{background:none;padding:0;border:none;color:inherit;font-size:inherit}
-
-.callout{
-  display:flex;align-items:flex-start;gap:12px;
-  padding:14px 16px;border-radius:12px;
-  background:rgba(255,255,255,0.03);
-  border:1px solid var(--border);
-  margin-top:14px;font-size:14px;color:var(--text-dim);line-height:1.6;
-}
-.callout svg{width:18px;height:18px;flex-shrink:0;margin-top:2px;color:var(--text)}
-.callout strong{color:var(--text);font-weight:600}
-
-.faq-list{display:flex;flex-direction:column;gap:10px}
-.faq-item{
-  border-radius:14px;
-  background:rgba(255,255,255,0.03);
-  border:1px solid var(--border);
-  overflow:hidden;transition:border-color .25s,background .25s;
-}
-.faq-item[open]{border-color:var(--border-2);background:rgba(255,255,255,0.045)}
-.faq-item summary{
-  list-style:none;cursor:pointer;padding:16px 18px;
-  font-weight:600;font-size:15px;color:#fff;
-  display:flex;align-items:center;justify-content:space-between;gap:16px;
-  transition:background .2s;
-}
-.faq-item summary::-webkit-details-marker{display:none}
-.faq-item summary::after{
-  content:'+';font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:400;
-  color:var(--text-mute);
-  transition:transform .3s cubic-bezier(.2,.8,.2,1),color .25s;
-  flex-shrink:0;
-}
-.faq-item[open] summary::after{content:'−';color:#fff}
-.faq-item summary:hover{background:rgba(255,255,255,0.03)}
-.faq-item .faq-body{padding:0 18px 18px;color:var(--text-dim);font-size:14px;line-height:1.7}
-.faq-item .faq-body p{margin-bottom:10px;max-width:70ch}
-.faq-item .faq-body p:last-child{margin-bottom:0}
-
-.limits-table{
-  width:100%;border-collapse:separate;border-spacing:0;margin-top:6px;
-  border-radius:14px;overflow:hidden;
-  border:1px solid var(--border);font-size:14px;
-}
-.limits-table th,.limits-table td{padding:13px 16px;text-align:left;border-bottom:1px solid var(--border)}
-.limits-table th{
-  font-family:'JetBrains Mono',monospace;font-size:11px;
-  letter-spacing:0.1em;text-transform:uppercase;
-  color:var(--text-mute);font-weight:500;
-  background:rgba(255,255,255,0.028);
-}
-.limits-table tr:last-child td{border-bottom:none}
-.limits-table td:first-child{color:#fff;font-weight:500}
-.limits-table td:last-child{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)}
-
-@media (max-width:980px){
-  .doc-layout{grid-template-columns:1fr;gap:26px}
-  .doc-toc{
-    position:sticky;top:80px;
-    flex-direction:row;flex-wrap:nowrap;
-    overflow-x:auto;overflow-y:hidden;
-    padding:8px;
-    scrollbar-width:none;
-    max-height:none;
-  }
-  .doc-toc::-webkit-scrollbar{display:none}
-  .doc-toc a{
-    white-space:nowrap;
-    border-left:none;border-bottom:2px solid transparent;
-    padding:8px 12px;flex-shrink:0;
-  }
-  .doc-toc a.active{border-left-color:transparent;border-bottom-color:#fff}
-  .doc-steps{grid-template-columns:1fr}
-}
-@media (max-width:720px){
-  .doc-hero{padding:140px 0 20px}
-  .doc-layout{padding:20px 0 60px;gap:22px}
-  .doc-toc{top:74px}
-  .limits-table th,.limits-table td{padding:11px 12px;font-size:13px}
-  .endpoint{padding:16px}
-  .endpoint-path{font-size:13px}
-  pre{font-size:12px;padding:14px}
-}
-"""
-
-
-def build_docs() -> str:
-    body = r"""
-<header class="doc-hero">
-  <div class="wrap">
-    <div class="eyebrow">Документация</div>
-    <h1>Как работает СЛД·NET<br><span class="dim">полное руководство</span></h1>
-    <p>Сервис для публикации постов по шестизначному коду. Без регистрации, без базы данных, с шифрованием AES-256-GCM и OpenGraph-превью для мессенджеров.</p>
-  </div>
-</header>
-
-<section class="wrap">
-  <div class="doc-layout">
-
-    <aside class="doc-toc" id="toc">
-      <a href="#intro">Введение</a>
-      <a href="#quickstart">Быстрый старт</a>
-      <a href="#limits">Ограничения</a>
-      <a href="#og">OpenGraph-превью</a>
-      <a href="#api">REST API</a>
-      <a href="#security">Безопасность</a>
-      <a href="#faq">Вопросы</a>
-    </aside>
-
-    <div class="doc-content">
-
-      <div class="doc-section" id="intro">
-        <h2>Введение</h2>
-        <p><strong style="color:#fff">СЛД·NET</strong> — это минималистичный сервис для обмена контентом. Вы публикуете пост (заголовок, текст, до пяти фото), сервер возвращает уникальный 6-значный код и постоянную ссылку вида <code>/p/<span data-code>482163</span></code>.</p>
-        <p>Код уникален для каждого поста, все шесть цифр различаются между собой — так его проще продиктовать или запомнить. Никаких аккаунтов, паролей и подтверждений.</p>
-
-        <div class="callout">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-          <div><strong>Данные живут в оперативной памяти.</strong> Перезапуск сервера очищает все посты. Это осознанный выбор в пользу приватности.</div>
-        </div>
-      </div>
-
-      <div class="doc-section" id="quickstart">
-        <h2>Быстрый старт</h2>
-        <p>Три шага — от идеи до готовой ссылки.</p>
-
-        <div class="doc-steps">
-          <div class="doc-step">
-            <div class="doc-step-num">Шаг 01</div>
-            <h4>Заполните пост</h4>
-            <p>Откройте <code>/app</code>, введите заголовок, текст и при необходимости прикрепите до пяти фото (drag&drop или Ctrl+V).</p>
-          </div>
-          <div class="doc-step">
-            <div class="doc-step-num">Шаг 02</div>
-            <h4>Нажмите «Опубликовать»</h4>
-            <p>Сервер зашифрует данные, вернёт код и покажет его в модальном окне вместе с постоянной ссылкой.</p>
-          </div>
-          <div class="doc-step">
-            <div class="doc-step-num">Шаг 03</div>
-            <h4>Поделитесь ссылкой</h4>
-            <p>Скопируйте URL <code>/p/<span data-code>482163</span></code> и отправьте его. В Telegram и Discord развернётся превью с заголовком и первым фото.</p>
-          </div>
-        </div>
-
-        <h3>Поиск по коду</h3>
-        <p>Вкладка «Найти пост» принимает 6 цифр. Как только введены все шесть — пост подгружается автоматически, и рядом появляется кнопка «копировать ссылку».</p>
-      </div>
-
-      <div class="doc-section" id="limits">
-        <h2>Ограничения</h2>
-        <p>Все лимиты проверяются на стороне сервера и клиента.</p>
-
-        <table class="limits-table">
-          <thead><tr><th>Параметр</th><th>Значение</th></tr></thead>
-          <tbody>
-            <tr><td>Длина заголовка</td><td>до 120 символов</td></tr>
-            <tr><td>Длина содержимого</td><td>до 20 000 символов</td></tr>
-            <tr><td>Количество фото</td><td>до 5 на пост</td></tr>
-            <tr><td>Размер исходника фото</td><td>до 5 МБ</td></tr>
-            <tr><td>Размер после сжатия</td><td>~60 КБ</td></tr>
-            <tr><td>Длина кода</td><td>6 цифр, без повторов</td></tr>
-            <tr><td>Всего кодов</td><td>151 200 комбинаций</td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div class="doc-section" id="og">
-        <h2>OpenGraph-превью</h2>
-        <p>Каждый пост доступен по адресу <code>/p/<span data-code>482163</span></code>. Для этого адреса сервер генерирует метатеги, которые читают мессенджеры и соцсети:</p>
-
-        <pre><code>&lt;meta property="og:type"        content="article"&gt;
-&lt;meta property="og:site_name"   content="СЛД·NET"&gt;
-&lt;meta property="og:title"       content="Заголовок поста"&gt;
-&lt;meta property="og:description" content="Краткое описание..."&gt;
-&lt;meta property="og:url"         content="https://.../p/482163"&gt;
-&lt;meta property="og:image"       content="https://.../api/photos/482163/0"&gt;
-&lt;meta name="twitter:card"       content="summary_large_image"&gt;</code></pre>
-
-        <p>При создании поста можно снять галочку <strong style="color:#fff">«Превью для ссылок»</strong> — тогда метатеги не будут генерироваться, и мессенджер покажет обычную ссылку без карточки.</p>
-
-        <div class="callout">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-          <div><strong>Для корректной работы в проде</strong> задайте переменную окружения <code>SLD_BASE_URL</code> (например, <code>https://sld-net.ddns.net</code>) — она подставится в абсолютные ссылки og:image и og:url.</div>
-        </div>
-      </div>
-
-      <div class="doc-section" id="api">
-        <h2>REST API</h2>
-        <p>Все ответы — JSON. Ошибки возвращают <code>{"detail": "..."}</code> и соответствующий HTTP-код.</p>
-
-        <div class="endpoint">
-          <div class="endpoint-head"><span class="method post">POST</span><span class="endpoint-path">/api/posts</span></div>
-          <div class="endpoint-desc">Создаёт пост. Принимает <code>multipart/form-data</code>.</div>
-          <div class="endpoint-meta"><span>Поля: title, content, og_enabled, files</span></div>
-          <pre><code>{
-  "code": "482163",
-  "compressed_bytes": 58321,
-  "photos": 2,
-  "share_url": "https://sld-net.ddns.net/p/482163"
-}</code></pre>
-        </div>
-
-        <div class="endpoint">
-          <div class="endpoint-head"><span class="method get">GET</span><span class="endpoint-path">/api/posts/{code}</span></div>
-          <div class="endpoint-desc">Возвращает метаданные поста по шестизначному коду.</div>
-          <pre><code>{
-  "title": "Как подготовить питч за 5 минут",
-  "content": "Если у вас есть всего одна минута...",
-  "created": "2026-01-15T12:34:56+00:00",
-  "og_enabled": true,
-  "code": "482163",
-  "photos": [
-    {"idx": 0, "name": "cover.jpg", "mime": "image/jpeg", "size": 61234}
-  ]
-}</code></pre>
-        </div>
-
-        <div class="endpoint">
-          <div class="endpoint-head"><span class="method get">GET</span><span class="endpoint-path">/api/photos/{code}/{idx}</span></div>
-          <div class="endpoint-desc">Отдаёт фото по коду поста и индексу (0..4). На выходе — оригинальный MIME-тип.</div>
-          <div class="endpoint-meta"><span>Cache-Control: public, max-age=31536000, immutable</span></div>
-        </div>
-
-        <div class="endpoint">
-          <div class="endpoint-head"><span class="method get">GET</span><span class="endpoint-path">/api/random-code</span></div>
-          <div class="endpoint-desc">Возвращает свободный 6-значный код, которого нет в хранилище.</div>
-          <pre><code>{ "code": "518374" }</code></pre>
-        </div>
-
-        <div class="endpoint">
-          <div class="endpoint-head"><span class="method get">GET</span><span class="endpoint-path">/api/stats</span></div>
-          <div class="endpoint-desc">Количество постов в памяти прямо сейчас.</div>
-          <pre><code>{ "posts": 42 }</code></pre>
-        </div>
-      </div>
-
-      <div class="doc-section" id="security">
-        <h2>Безопасность</h2>
-        <p>Данные не хранятся на диске и не пишутся в лог. Каждый пост и каждое фото шифруются симметричным ключом AES-256-GCM, который генерируется при старте процесса. Nonce — 12 случайных байт для каждого блока.</p>
-        <p>Метаданные сжимаются перед шифрованием через zstd (или gzip в фолбэке), что снижает объём в памяти без потери читаемости.</p>
-        <p>Доступ к посту возможен только при знании кода. Коды без повторяющихся цифр генерируются криптостойким <code>secrets.randbelow</code>, а не стандартным <code>random</code>.</p>
-
-        <div class="callout">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2 4 6v6c0 5 3.4 9.3 8 10 4.6-.7 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/></svg>
-          <div><strong>Сервер не хранит логи о содержимом.</strong> Записывается только метод, путь и код ответа — для отладки.</div>
-        </div>
-      </div>
-
-      <div class="doc-section" id="faq">
-        <h2>Вопросы</h2>
-        <div class="faq-list">
-          <details class="faq-item" open>
-            <summary>Нужна ли регистрация?</summary>
-            <div class="faq-body"><p>Нет. Достаточно открыть <code>/app</code> и заполнить форму. Ваш пост не привязан ни к какому аккаунту.</p></div>
-          </details>
-          <details class="faq-item">
-            <summary>Сколько живут посты?</summary>
-            <div class="faq-body"><p>Пока работает процесс сервера. При перезапуске все данные теряются. Мы не сохраняем их на диск.</p></div>
-          </details>
-          <details class="faq-item">
-            <summary>Можно ли отредактировать пост?</summary>
-            <div class="faq-body"><p>Нет. Пост неизменяем — если нужны правки, создайте новый и разошлите новый код.</p></div>
-          </details>
-          <details class="faq-item">
-            <summary>Что происходит с фото при загрузке?</summary>
-            <div class="faq-body"><p>Фото пережимаются прямо в браузере (canvas + JPEG, бинарный поиск качества) — обычно до ~60 КБ без потери читаемости. Исходник до 5 МБ. Если файл больше — он отклоняется.</p></div>
-          </details>
-          <details class="faq-item">
-            <summary>Как работает превью в Telegram?</summary>
-            <div class="faq-body"><p>Telegram открывает URL <code>/p/&lt;код&gt;</code> без выполнения JS, читает OG-метатеги и рисует карточку. Если превью отключено при создании — метатегов нет, отображается обычная ссылка.</p></div>
-          </details>
-          <details class="faq-item">
-            <summary>Есть ли мобильная версия?</summary>
-            <div class="faq-body"><p>Интерфейс адаптивен и работает в любом браузере: от 320 px до 4K. Специальное приложение не требуется.</p></div>
-          </details>
-        </div>
-      </div>
-
-    </div>
-  </div>
-</section>
-
-<script>
-(function(){
-  var sections = [].slice.call(document.querySelectorAll('.doc-section'));
-  var links = [].slice.call(document.querySelectorAll('.doc-toc a'));
-  if (!sections.length) return;
-  function update(){
-    var y = scrollY + 150, best = 0;
-    sections.forEach(function(s, i){ if (s.offsetTop <= y) best = i; });
-    links.forEach(function(l, i){ l.classList.toggle('active', i === best); });
-    if (links[best] && window.innerWidth < 980) {
-      links[best].scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
-    }
-  }
-  addEventListener('scroll', function(){ requestAnimationFrame(update); }, { passive: true });
-  update();
-})();
-</script>
-"""
-    return render_shell(
-        title="Документация — СЛД·NET",
-        body=body,
-        extra_css=DOCS_CSS,
-        og='<meta name="description" content="Документация СЛД·NET: быстрый старт, ограничения, OpenGraph, REST API и безопасность.">',
-        active="/doc_s",
-    )
-
-
-# ============================================================
 # РАБОЧАЯ ОБЛАСТЬ  (/app, /p/{code})
 # ============================================================
 
@@ -1917,7 +1509,6 @@ html,body{
   font-size:15px;line-height:1.55;
   min-height:100%;overflow-x:clip;
   -webkit-font-smoothing:antialiased;
-  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
 }
 input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.share-link-url{
   -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
@@ -1927,22 +1518,35 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
 ::-webkit-scrollbar-track{background:#0a0a0a}
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 
-/* === CURSOR (единый) === */
 @media (hover:hover) and (pointer:fine){
-  *{cursor:none !important}
+  body.cursor-ready a,
+  body.cursor-ready button,
+  body.cursor-ready input,
+  body.cursor-ready textarea,
+  body.cursor-ready label,
+  body.cursor-ready .tab,
+  body.cursor-ready .drop,
+  body.cursor-ready .share-link-copy,
+  body.cursor-ready .otp-cell,
+  body.cursor-ready .otp-copy { cursor:none !important; }
 }
-.cur-dot,.cur-ring{position:fixed;top:0;left:0;pointer-events:none;z-index:99999;border-radius:50%;will-change:transform}
+.cur-dot,.cur-ring{
+  position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
+  border-radius:50%;will-change:transform;
+  opacity:0;transition:opacity .25s ease;
+}
+body.cursor-ready .cur-dot,
+body.cursor-ready .cur-ring { opacity:1; }
 .cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25)}
 .cur-ring{
   width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
   transition:width .25s cubic-bezier(.2,.8,.2,1),height .25s cubic-bezier(.2,.8,.2,1),
-             border-color .25s,background .25s;
+             border-color .25s,background .25s,opacity .25s;
 }
 .cur-ring.hover{width:58px;height:58px;border-color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* === LOADER === */
 .page-loader{
   position:fixed;inset:0;z-index:99998;
   background:var(--bg);
@@ -2063,7 +1667,6 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
   width:100%;max-width:560px;
   transition:height .32s cubic-bezier(.2,.8,.2,1);
   will-change:height;
-  /* НЕ используем overflow: hidden — чтобы сообщения не резались */
 }
 .stage[hidden]{display:none}
 .panel{
@@ -2083,8 +1686,6 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
   box-shadow:0 20px 50px -28px rgba(0,0,0,0.8),inset 0 1px 0 rgba(255,255,255,0.05);
   padding:18px;
 }
-/* Отдельно: searchFrame тоже карточка */
-.card#searchFrame:not([hidden]){display:block}
 
 .input-wrap{position:relative;display:flex}
 .input-wrap + .input-wrap{margin-top:10px}
@@ -2228,16 +1829,9 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner-label{margin-top:10px;font-size:12px;color:var(--text-dim);text-align:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em}
 
-/* ================================================================
-   СООБЩЕНИЯ ОБ ОШИБКАХ
-   Отступ между кнопками/полями и сообщением обеспечивает
-   контейнер #createMsg:not(:empty), а не сам .msg.
-   Это гарантирует, что сообщение не наезжает ни на что.
-   ================================================================ */
-#createMsg,
-#searchFrame { display: block; }
-#createMsg:not(:empty) { margin-top: 14px; }
-#createMsg .msg { margin-top: 0; }
+#createMsg,#searchFrame{display:block}
+#createMsg:not(:empty){margin-top:14px}
+#createMsg .msg{margin-top:0}
 
 .msg{
   display:flex;align-items:flex-start;gap:10px;
@@ -2564,14 +2158,15 @@ APP = r"""<!DOCTYPE html>
 (function(){
   "use strict";
   var $ = function(id){ return document.getElementById(id); };
-  document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
   /* CURSOR */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
   var rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
+  var cursorReady = false;
   addEventListener('mousemove', function(e){
+    if (!cursorReady) { cursorReady = true; document.body.classList.add('cursor-ready'); }
     mx = e.clientX; my = e.clientY;
     document.documentElement.style.setProperty('--mx', e.clientX + 'px');
     document.documentElement.style.setProperty('--my', e.clientY + 'px');
@@ -2859,7 +2454,6 @@ APP = r"""<!DOCTYPE html>
   function showCreateMsg(kind, text){
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
-    // двойной rAF — ждём, пока браузер применит стили к новому элементу
     requestAnimationFrame(function(){
       requestAnimationFrame(function(){ syncHeight(false); });
     });
@@ -3304,11 +2898,6 @@ def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(build_landing())
-
-
-@app.get("/doc_s", response_class=HTMLResponse)
-async def docs_page():
-    return HTMLResponse(build_docs())
 
 
 @app.get("/app", response_class=HTMLResponse)
