@@ -72,7 +72,7 @@ def _encrypt(data: bytes) -> bytes:
 def _decrypt(blob: bytes) -> bytes:
     if len(blob) < _NONCE + 16:
         raise ValueError("too short")
-    return _AES.decrypt(blob[:_NONCE], blob[_NONCE:])
+    return _AES.decrypt(blob[:_NONCE], blob[_NONCE:], None)
 
 
 def _pack_meta(meta: dict) -> bytes:
@@ -303,7 +303,6 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
-
 # ============================================================
 # ОБЩИЙ CSS
 # ============================================================
@@ -341,19 +340,6 @@ input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.ot
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
 ::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-/* === SCROLL PROGRESS BAR === */
-.scroll-progress{
-  position:fixed;top:0;left:0;right:0;height:2px;z-index:200;
-  pointer-events:none;background:transparent;
-}
-.scroll-progress-fill{
-  height:100%;width:0;
-  background:linear-gradient(90deg,rgba(255,255,255,0.4),#fff);
-  box-shadow:0 0 8px rgba(255,255,255,0.5);
-  transition:width .08s linear;
-}
-
-/* === CURSOR — системный скрыт всегда на десктопе, кастомный появляется после первого движения === */
 @media (hover:hover) and (pointer:fine){
   *, *::before, *::after { cursor:none !important; }
 }
@@ -376,18 +362,8 @@ body.cursor-ready .cur-ring { opacity:1; }
   backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
 }
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
-.cur-ring.scroll-hint::before,
-.cur-ring.scroll-hint::after{
-  content:'';position:absolute;left:50%;width:3px;height:8px;
-  background:#fff;border-radius:2px;
-  animation:hintBob .9s ease-in-out infinite;
-}
-.cur-ring.scroll-hint::before{top:6px;transform:translateX(-50%)}
-.cur-ring.scroll-hint::after{bottom:6px;transform:translateX(-50%);animation-delay:.15s}
-@keyframes hintBob{0%,100%{opacity:.3}50%{opacity:1}}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* === PAGE LOADER === */
 .page-loader{
   position:fixed;inset:0;z-index:99998;
   background:var(--bg);
@@ -416,9 +392,8 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 @keyframes loaderSlide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
 
-/* === BACKGROUND === */
 .bg{position:fixed;inset:0;z-index:-3;overflow:hidden;background:var(--bg)}
-.halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55;will-change:transform}
+.halo{position:absolute;border-radius:50%;filter:blur(140px);opacity:.55}
 .halo-1{
   width:780px;height:780px;
   background:radial-gradient(circle,rgba(255,255,255,0.09),transparent 65%);
@@ -437,29 +412,10 @@ body.cursor-ready .cur-ring { opacity:1; }
 @keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(120px,100px) scale(1.12)}}
 @keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-140px,80px) scale(1.15)}}
 @keyframes drift3{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(90px,-110px) scale(.92)}}
-
 .cursor-glow{
   position:fixed;inset:0;z-index:-2;pointer-events:none;
   background:radial-gradient(700px circle at var(--mx,50%) var(--my,30%),rgba(255,255,255,0.03),transparent 60%);
 }
-
-/* === SPARKLES === */
-.sparkles{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
-.sparkles span{
-  position:absolute;
-  left:var(--x);top:var(--y);
-  width:2px;height:2px;border-radius:50%;
-  background:#fff;
-  box-shadow:0 0 6px rgba(255,255,255,0.85),0 0 14px rgba(255,255,255,0.35);
-  animation:twinkle var(--d,3.6s) ease-in-out infinite;
-  animation-delay:var(--delay,0s);
-  opacity:.1;
-}
-@keyframes twinkle{
-  0%,100%{opacity:.08;transform:scale(.5)}
-  50%{opacity:.95;transform:scale(1.15)}
-}
-
 .grid-bg{
   position:fixed;inset:0;z-index:-1;pointer-events:none;
   background-image:
@@ -477,7 +433,6 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-/* === NAV === */
 body > nav.top-nav{
   position:fixed;top:20px;left:50%;transform:translateX(-50%);
   z-index:100;
@@ -530,7 +485,6 @@ body > nav.top-nav.scrolled{
 .nav-links a:hover{color:#fff;background:rgba(255,255,255,0.05)}
 .nav-links a.active{color:#fff;background:rgba(255,255,255,0.06)}
 
-/* === BUTTONS === */
 .btn{
   display:inline-flex;align-items:center;justify-content:center;
   gap:8px;
@@ -565,7 +519,6 @@ body > nav.top-nav.scrolled{
 }
 .btn-ghost:active{transform:translateY(0) scale(.985)}
 
-/* === FOOTER === */
 footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 .foot-top{
   display:flex;justify-content:space-between;
@@ -611,7 +564,6 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 .foot-bottom .group{color:var(--text-dim)}
 .foot-bottom .group strong{color:#fff;font-weight:600}
 
-/* === REVEAL === */
 .reveal{
   opacity:0;transform:translateY(32px);
   transition:opacity .9s cubic-bezier(.2,.8,.2,1),transform .9s cubic-bezier(.2,.8,.2,1);
@@ -619,7 +571,6 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 .reveal.in{opacity:1;transform:translateY(0)}
 
-/* === HELPER === */
 .eyebrow{
   display:inline-flex;align-items:center;gap:10px;
   font-family:'JetBrains Mono',monospace;
@@ -629,7 +580,6 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 .eyebrow::before{content:'';width:26px;height:1px;background:linear-gradient(90deg,var(--text-mute),transparent)}
 
-/* === RESPONSIVE === */
 @media (max-width:1000px){.nav-links{display:none}}
 @media (max-width:720px){
   .wrap{padding:0 20px}
@@ -646,21 +596,14 @@ SHELL_JS = r"""
 (function(){
   "use strict";
 
-  /* ПКМ отключено */
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
-  /* === CURSOR + AUTO-SCROLL === */
   var dot = document.querySelector(".cur-dot");
   var ring = document.querySelector(".cur-ring");
-  var scrollSpeed = 0;
-  var edgeZone = 110;
-  var maxSpeed = 16;
-  var blockAuto = false;
-  var cursorReady = false;
-
   if (dot && ring) {
     var mx = innerWidth/2, my = innerHeight/2;
     var rx = mx, ry = my, lx = mx, ly = my, vel = 0;
+    var cursorReady = false;
 
     addEventListener("mousemove", function(e){
       if (!cursorReady) {
@@ -670,36 +613,7 @@ SHELL_JS = r"""
       mx = e.clientX; my = e.clientY;
       document.documentElement.style.setProperty("--mx", mx + "px");
       document.documentElement.style.setProperty("--my", my + "px");
-
-      /* авто-скролл */
-      if (!blockAuto) {
-        var h = innerHeight;
-        if (my < edgeZone) {
-          scrollSpeed = -maxSpeed * (1 - my / edgeZone);
-        } else if (my > h - edgeZone) {
-          scrollSpeed = maxSpeed * (1 - (h - my) / edgeZone);
-        } else {
-          scrollSpeed = 0;
-        }
-        ring.classList.toggle("scroll-hint", scrollSpeed !== 0);
-      } else {
-        scrollSpeed = 0;
-        ring.classList.remove("scroll-hint");
-      }
     }, { passive: true });
-
-    document.addEventListener("mouseleave", function(){
-      scrollSpeed = 0;
-      ring.classList.remove("scroll-hint");
-    });
-
-    addEventListener("mousedown", function(){ ring.classList.add("click"); });
-    addEventListener("mouseup", function(){ ring.classList.remove("click"); });
-
-    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy, .section-tile, .hero-side-card').forEach(function(el){
-      el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
-      el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
-    });
 
     (function loop(){
       dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
@@ -714,46 +628,15 @@ SHELL_JS = r"""
       requestAnimationFrame(loop);
     })();
 
-    (function autoScrollLoop(){
-      if (scrollSpeed !== 0 && !blockAuto) {
-        window.scrollBy(0, scrollSpeed);
-      }
-      requestAnimationFrame(autoScrollLoop);
-    })();
+    addEventListener("mousedown", function(){ ring.classList.add("click"); });
+    addEventListener("mouseup", function(){ ring.classList.remove("click"); });
 
-    /* Блокировка автоскролла при фокусе в поле ввода */
-    document.addEventListener("focusin", function(e){
-      var t = e.target;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
-        blockAuto = true;
-        scrollSpeed = 0;
-        ring.classList.remove("scroll-hint");
-      }
+    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
+      el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
+      el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
     });
-    document.addEventListener("focusout", function(){ blockAuto = false; });
-
-    /* Блокировка при открытых модалках/лайтбоксах */
-    setInterval(function(){
-      if (blockAuto) return;
-      var modal = document.getElementById("createdModal");
-      var lb = document.getElementById("lightbox");
-      if ((modal && !modal.hidden) || (lb && !lb.hidden)) {
-        scrollSpeed = 0;
-        ring.classList.remove("scroll-hint");
-      }
-    }, 200);
   }
 
-  /* === SCROLL PROGRESS === */
-  var sp = document.getElementById("scrollProgress");
-  if (sp) {
-    addEventListener("scroll", function(){
-      var h = document.documentElement.scrollHeight - innerHeight;
-      sp.style.width = h > 0 ? (scrollY / h * 100) + "%" : "0%";
-    }, { passive: true });
-  }
-
-  /* === LOADER === */
   var loader = document.getElementById("pageLoader");
   if (loader) {
     var hide = function(){ loader.classList.add("hidden"); };
@@ -761,7 +644,6 @@ SHELL_JS = r"""
     else { addEventListener("load", function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* === NAVBAR SCROLL === */
   var nav = document.getElementById("nav");
   if (nav) {
     var ticking = false;
@@ -776,19 +658,6 @@ SHELL_JS = r"""
     }, { passive: true });
   }
 
-  /* === PARALLAX === */
-  var pxEls = document.querySelectorAll("[data-parallax]");
-  if (pxEls.length) {
-    addEventListener("scroll", function(){
-      var y = scrollY;
-      pxEls.forEach(function(el){
-        var speed = parseFloat(el.dataset.parallax) || 0.1;
-        el.style.setProperty("--py", (-y * speed) + "px");
-      });
-    }, { passive: true });
-  }
-
-  /* === REVEAL === */
   var io = new IntersectionObserver(function(es){
     es.forEach(function(e, i){
       if (e.isIntersecting) {
@@ -799,7 +668,6 @@ SHELL_JS = r"""
   }, { threshold: 0.1, rootMargin: "0px 0px -60px 0px" });
   document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
 
-  /* === SMOOTH ANCHORS === */
   document.querySelectorAll('a[href^="#"]').forEach(function(a){
     a.addEventListener("click", function(e){
       var h = a.getAttribute("href");
@@ -811,15 +679,14 @@ SHELL_JS = r"""
     });
   });
 
-  /* === CODE — единый код + бесконечный цикл флипов === */
   var codeEls = document.querySelectorAll("[data-code]");
-  var cells = document.querySelectorAll(".code-cell");
-  if (codeEls.length || cells.length) {
+  if (codeEls.length) {
     fetch("/api/random-code", { cache: "no-store" })
       .then(function(r){ return r.json(); })
       .then(function(d){
         if (!d || !/^\d{6}$/.test(d.code)) return;
         codeEls.forEach(function(el){ el.textContent = d.code; });
+        var cells = document.querySelectorAll(".code-cell");
         cells.forEach(function(c, i){
           c.textContent = d.code[i] || "0";
           c.classList.remove("flip"); void c.offsetWidth; c.classList.add("flip");
@@ -829,76 +696,14 @@ SHELL_JS = r"""
           cells.forEach(function(c){ c.style.animationDelay = ""; c.classList.remove("flip"); });
         }, 1200);
       }).catch(function(){});
-
-    /* Живой цикл — каждые 1.6s случайная ячейка флипает на новую цифру */
-    if (cells.length) {
-      setInterval(function(){
-        var idx = Math.floor(Math.random() * cells.length);
-        var cell = cells[idx];
-        var oldDigit = cell.textContent;
-        var newDigit;
-        do { newDigit = String(Math.floor(Math.random() * 10)); } while (newDigit === oldDigit);
-        cell.textContent = newDigit;
-        cell.classList.remove("flip"); void cell.offsetWidth; cell.classList.add("flip");
-        setTimeout(function(){ cell.classList.remove("flip"); }, 600);
-      }, 1600);
-    }
-  }
-
-  /* === ANIMATED COUNTERS === */
-  var counters = document.querySelectorAll("[data-count]");
-  if (counters.length) {
-    var cIO = new IntersectionObserver(function(entries){
-      entries.forEach(function(entry){
-        if (!entry.isIntersecting) return;
-        var el = entry.target;
-        var target = parseFloat(el.dataset.count);
-        var suffix = el.dataset.suffix || "";
-        var dur = 1700;
-        var start = performance.now();
-        var isFloat = el.dataset.float === "1";
-        function tick(now){
-          var p = Math.min((now - start) / dur, 1);
-          var eased = 1 - Math.pow(1 - p, 3);
-          var val = target * eased;
-          el.textContent = (isFloat ? val.toFixed(1) : Math.floor(val).toLocaleString("ru-RU")) + suffix;
-          if (p < 1) requestAnimationFrame(tick);
-          else el.textContent = (isFloat ? target.toFixed(1) : target.toLocaleString("ru-RU")) + suffix;
-        }
-        requestAnimationFrame(tick);
-        cIO.unobserve(el);
-      });
-    }, { threshold: 0.4 });
-    counters.forEach(function(c){ cIO.observe(c); });
-  }
-
-  /* === LIVE TICKER (top bar под навбаром) === */
-  var liveEl = document.getElementById("liveNow");
-  if (liveEl) {
-    var baseVal = 6 + Math.floor(Math.random() * 12);
-    var update = function(){
-      baseVal += Math.random() < 0.5 ? 1 : -1;
-      if (baseVal < 3) baseVal = 3;
-      if (baseVal > 24) baseVal = 24;
-      liveEl.textContent = baseVal + " " + plural(baseVal, ["пост", "поста", "постов"]) + " создано за 10 минут";
-    };
-    var plural = function(n, forms){
-      var n10 = n % 10, n100 = n % 100;
-      if (n10 === 1 && n100 !== 11) return forms[0];
-      if (n10 >= 2 && n10 <= 4 && (n100 < 10 || n100 >= 20)) return forms[1];
-      return forms[2];
-    };
-    update();
-    setInterval(update, 2400);
   }
 })();
 """
 
 
-def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "") -> str:
+def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "", extra_js: str = "") -> str:
     nav_links = [
         ("/", "Главная"),
-        ("/#sections", "Разделы"),
         ("/#features", "Возможности"),
         ("/#how", "Как это работает"),
     ]
@@ -906,17 +711,6 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         f'<a href="{href}"{" class=\"active\"" if active == href else ""}>{label}</a>'
         for href, label in nav_links
     )
-
-    # Плёночные блёстки
-    sparkles = ""
-    import random as _rnd
-    _rnd.seed(42)
-    for _ in range(38):
-        x = round(_rnd.uniform(2, 98), 2)
-        y = round(_rnd.uniform(2, 98), 2)
-        d = round(_rnd.uniform(2.4, 5.6), 2)
-        delay = round(_rnd.uniform(0, 4), 2)
-        sparkles += f'<span style="--x:{x}%;--y:{y}%;--d:{d}s;--delay:{delay}s"></span>'
 
     return (
         '<!DOCTYPE html>\n<html lang="ru">\n<head>\n'
@@ -929,7 +723,6 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">\n'
         '<style>\n' + SHELL_CSS + '\n/* PAGE CSS */\n' + extra_css + '\n</style>\n'
         '</head>\n<body>\n'
-        '<div class="scroll-progress" aria-hidden="true"><div class="scroll-progress-fill" id="scrollProgress"></div></div>\n'
         '<div class="page-loader" id="pageLoader" aria-hidden="true">\n'
         '  <div class="loader-inner">\n'
         '    <div class="loader-mark">' + LOGO_SVG + '</div>\n'
@@ -938,9 +731,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '</div>\n'
         '<div class="cur-dot"></div>\n<div class="cur-ring"></div>\n'
         '<div class="bg"><div class="halo halo-1"></div><div class="halo halo-2"></div><div class="halo halo-3"></div></div>\n'
-        '<div class="cursor-glow"></div>\n'
-        '<div class="sparkles" aria-hidden="true">' + sparkles + '</div>\n'
-        '<div class="grid-bg"></div>\n<div class="grain"></div>\n'
+        '<div class="cursor-glow"></div>\n<div class="grid-bg"></div>\n<div class="grain"></div>\n'
         '<nav id="nav" class="top-nav">\n'
         '  <a href="/" class="logo">\n'
         '    <span class="logo-mark">' + LOGO_SVG + '</span>\n'
@@ -966,10 +757,10 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '      </div>\n'
         '      <div class="foot-cols">\n'
         '        <div class="foot-col">\n'
-        '          <h4>Разделы</h4>\n'
-        '          <a href="/#sections">Все разделы</a>\n'
+        '          <h4>Продукт</h4>\n'
         '          <a href="/#features">Возможности</a>\n'
         '          <a href="/#how">Как это работает</a>\n'
+        '          <a href="/#specs">Технологии</a>\n'
         '        </div>\n'
         '        <div class="foot-col">\n'
         '          <h4>Приложение</h4>\n'
@@ -989,48 +780,18 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '    </div>\n'
         '  </div>\n</footer>\n'
         '<script>' + SHELL_JS + '</script>\n'
+        + extra_js +
         '</body>\n</html>'
     )
 
 
 # ============================================================
-# ЛЕНДИНГ CSS
+# ЛЕНДИНГ  (/)
 # ============================================================
 
 LANDING_CSS = r"""
-/* === LIVE TICKER под навбаром === */
-.live-bar{
-  position:fixed;top:76px;left:50%;transform:translateX(-50%);
-  z-index:99;pointer-events:none;
-  display:inline-flex;align-items:center;gap:10px;
-  padding:6px 14px 6px 10px;
-  border-radius:100px;
-  background:rgba(12,12,12,0.6);
-  backdrop-filter:blur(18px) saturate(160%);
-  -webkit-backdrop-filter:blur(18px) saturate(160%);
-  border:1px solid var(--border);
-  font-family:'JetBrains Mono',monospace;
-  font-size:11.5px;letter-spacing:0.04em;
-  color:var(--text-dim);
-  transition:opacity .3s,transform .3s;
-}
-.live-bar.hide{opacity:0;transform:translate(-50%,-8px)}
-.live-dot{
-  width:6px;height:6px;border-radius:50%;background:#7ec899;
-  box-shadow:0 0 0 0 rgba(126,200,153,0.6),0 0 10px rgba(126,200,153,0.8);
-  animation:livePulse 1.6s ease-out infinite;
-  flex-shrink:0;
-}
-@keyframes livePulse{
-  0%{box-shadow:0 0 0 0 rgba(126,200,153,0.65),0 0 10px rgba(126,200,153,0.9)}
-  70%{box-shadow:0 0 0 10px rgba(126,200,153,0),0 0 10px rgba(126,200,153,0.9)}
-  100%{box-shadow:0 0 0 0 rgba(126,200,153,0),0 0 10px rgba(126,200,153,0.9)}
-}
-@media (max-width:1000px){.live-bar{display:none}}
-
-/* === HERO === */
-.hero{padding:200px 0 0;position:relative;overflow:visible}
-.hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:2}
+.hero{padding:170px 0 0;position:relative;overflow:hidden}
+.hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
 
 .badge{
   display:inline-flex;align-items:center;gap:10px;
@@ -1103,61 +864,6 @@ h1 .dim{color:var(--text-mute);font-weight:400}
   to{opacity:1;transform:translateY(0)}
 }
 
-/* === HERO SIDE CARDS === */
-.hero-side{
-  position:absolute;top:50%;transform:translate3d(0, calc(-50% + var(--py, 0px)), 0);
-  display:flex;flex-direction:column;gap:16px;
-  z-index:1;
-  transition:transform .1s linear;
-}
-.hero-side-left{left:max(24px, calc(50% - 700px))}
-.hero-side-right{right:max(24px, calc(50% - 700px));align-items:flex-end}
-@media (max-width:1280px){.hero-side{display:none}}
-
-.hero-side-card{
-  position:relative;
-  width:220px;padding:16px 18px;
-  border-radius:18px;
-  background:linear-gradient(150deg,rgba(255,255,255,0.06),rgba(255,255,255,0.012));
-  border:1px solid var(--border-2);
-  backdrop-filter:blur(20px) saturate(160%);
-  -webkit-backdrop-filter:blur(20px) saturate(160%);
-  box-shadow:0 20px 50px -28px rgba(0,0,0,0.8),inset 0 1px 0 rgba(255,255,255,0.06);
-  animation:floatCard 6s ease-in-out infinite;
-  transition:transform .4s cubic-bezier(.2,.8,.2,1),border-color .3s,background .3s;
-}
-.hero-side-card:nth-child(2){animation-delay:-3s;animation-duration:7s}
-.hero-side-card:hover{
-  transform:translateY(-4px) scale(1.02);
-  border-color:var(--border-3);
-  background:linear-gradient(150deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02));
-}
-@keyframes floatCard{
-  0%,100%{transform:translateY(0) rotate(0deg)}
-  50%{transform:translateY(-10px) rotate(-.4deg)}
-}
-.hero-side-card .hsc-label{
-  font-family:'JetBrains Mono',monospace;
-  font-size:10px;letter-spacing:0.14em;text-transform:uppercase;
-  color:var(--text-mute);margin-bottom:8px;display:block;
-}
-.hero-side-card .hsc-num{
-  font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:22px;letter-spacing:-0.03em;color:#fff;
-  line-height:1;display:block;margin-bottom:6px;
-  font-variant-numeric:tabular-nums;
-}
-.hero-side-card .hsc-sub{
-  font-size:12px;color:var(--text-dim);line-height:1.5;
-}
-.hero-side-card .hsc-dot{
-  position:absolute;top:14px;right:14px;
-  width:6px;height:6px;border-radius:50%;
-  background:#7ec899;box-shadow:0 0 10px rgba(126,200,153,0.7);
-  animation:livePulse 2s ease-out infinite;
-}
-
-/* === CODE SHOWCASE === */
 .code-show{
   margin:70px auto 0;max-width:560px;
   display:flex;gap:9px;justify-content:center;flex-wrap:nowrap;
@@ -1203,7 +909,6 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 }
 .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
-/* === MARQUEE === */
 .marquee{
   margin-top:110px;padding:22px 0;
   border-top:1px solid var(--border);border-bottom:1px solid var(--border);
@@ -1212,7 +917,6 @@ h1 .dim{color:var(--text-mute);font-weight:400}
   -webkit-mask-image:linear-gradient(90deg,transparent,#000 10%,#000 90%,transparent);
 }
 .marquee-track{display:flex;gap:56px;width:max-content;animation:scroll 46s linear infinite;will-change:transform}
-.marquee-track.reverse{animation-direction:reverse;animation-duration:56s;padding-top:14px}
 .marquee-track span{
   font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
   letter-spacing:0.14em;text-transform:uppercase;color:var(--text-mute);
@@ -1222,7 +926,7 @@ h1 .dim{color:var(--text-mute);font-weight:400}
 @keyframes scroll{to{transform:translateX(-50%)}}
 
 section{padding:120px 0;position:relative}
-.sec-head{max-width:660px;margin-bottom:60px}
+.sec-head{max-width:660px;margin-bottom:56px}
 h2{
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:clamp(28px,4.6vw,50px);line-height:1.05;
@@ -1231,102 +935,32 @@ h2{
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
 
-/* === SECTION TILES (Разделы) === */
-.section-tiles{
-  display:grid;
-  grid-template-columns:repeat(3,1fr);
-  gap:16px;
+/* === Группы-разделы с плитками === */
+.tile-groups{display:flex;flex-direction:column;gap:52px}
+.tile-group{display:flex;flex-direction:column;gap:18px}
+.group-head{
+  display:flex;align-items:baseline;justify-content:space-between;
+  gap:18px;flex-wrap:wrap;
+  padding-bottom:14px;
+  border-bottom:1px solid var(--border);
 }
-.section-tile{
-  position:relative;
-  display:flex;flex-direction:column;
-  padding:28px 26px 30px;
-  min-height:230px;
-  border-radius:var(--radius);
-  background:linear-gradient(150deg,rgba(255,255,255,0.055),rgba(255,255,255,0.012));
-  border:1px solid transparent;
-  text-decoration:none;color:inherit;
-  overflow:hidden;
-  transition:transform .5s cubic-bezier(.2,.8,.2,1),box-shadow .5s,border-color .3s;
-  box-shadow:0 24px 60px -28px rgba(0,0,0,0.75),inset 0 1px 0 rgba(255,255,255,0.06);
-  backdrop-filter:blur(20px) saturate(150%);
-  -webkit-backdrop-filter:blur(20px) saturate(150%);
-  isolation:isolate;
+.group-title{
+  display:inline-flex;align-items:center;gap:12px;
+  font-family:'Unbounded',sans-serif;font-weight:600;
+  font-size:clamp(18px,2.4vw,22px);
+  letter-spacing:-0.02em;color:#fff;
 }
-.section-tile::before{
-  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
-  background:linear-gradient(150deg,rgba(255,255,255,0.3),rgba(255,255,255,0.03) 40%,rgba(255,255,255,0.14));
-  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-  -webkit-mask-composite:xor;
-  mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
-  mask-composite:exclude;pointer-events:none;
-}
-.section-tile::after{
-  content:'';position:absolute;top:-60%;left:-60%;width:100%;height:220%;
-  background:linear-gradient(115deg,transparent 42%,rgba(255,255,255,0.09) 50%,transparent 58%);
-  transform:translateX(0);
-  transition:transform 1s cubic-bezier(.2,.8,.2,1);pointer-events:none;z-index:0;
-}
-.section-tile:hover::after{transform:translateX(120%)}
-.section-tile:hover{
-  transform:translateY(-6px) scale(1.01);
-  border-color:rgba(255,255,255,0.18);
-  box-shadow:0 34px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.1);
-}
-.section-tile > *{position:relative;z-index:1}
-.st-icon{
-  width:48px;height:48px;border-radius:14px;
-  display:grid;place-items:center;
-  background:linear-gradient(150deg,rgba(255,255,255,0.11),rgba(255,255,255,0.02));
-  border:1px solid var(--border-2);
-  color:var(--text-dim);
-  margin-bottom:22px;
-  transition:transform .45s cubic-bezier(.2,.8,.2,1),color .3s,border-color .3s;
+.group-title::before{
+  content:'';width:10px;height:10px;border-radius:50%;
+  background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.08);
   flex-shrink:0;
 }
-.st-icon svg{width:22px;height:22px;display:block}
-.section-tile:hover .st-icon{transform:translateY(-2px) scale(1.08) rotate(-4deg);color:#fff;border-color:var(--border-3)}
-.st-tag{
-  display:inline-flex;align-items:center;gap:6px;
+.group-meta{
   font-family:'JetBrains Mono',monospace;
-  font-size:10.5px;letter-spacing:0.14em;text-transform:uppercase;
-  color:var(--text-mute);margin-bottom:14px;
-  transition:color .25s;
-}
-.st-tag::before{
-  content:'';width:16px;height:1px;
-  background:currentColor;opacity:.55;
-}
-.section-tile:hover .st-tag{color:var(--text)}
-.section-tile h3{
-  font-family:'Unbounded',sans-serif;font-weight:600;
-  font-size:19px;letter-spacing:-0.02em;line-height:1.25;
-  margin-bottom:10px;color:#fff;
-}
-.section-tile p{
-  color:var(--text-dim);font-size:14px;line-height:1.6;
-  margin-bottom:auto;
-}
-.st-arrow{
-  display:inline-flex;align-items:center;gap:6px;
-  margin-top:22px;
-  font-family:'JetBrains Mono',monospace;
-  font-size:11px;letter-spacing:0.12em;text-transform:uppercase;
+  font-size:11.5px;letter-spacing:0.1em;text-transform:uppercase;
   color:var(--text-mute);
-  transition:color .25s,transform .35s cubic-bezier(.2,.8,.2,1);
-}
-.st-arrow svg{width:14px;height:14px;display:block;transition:transform .35s cubic-bezier(.2,.8,.2,1)}
-.section-tile:hover .st-arrow{color:#fff;transform:translateX(4px)}
-.section-tile:hover .st-arrow svg{transform:translateX(2px)}
-
-@media (max-width:1000px){
-  .section-tiles{grid-template-columns:repeat(2,1fr)}
-}
-@media (max-width:640px){
-  .section-tiles{grid-template-columns:1fr}
 }
 
-/* === GLASS === */
 .glass{
   position:relative;border-radius:var(--radius);
   background:linear-gradient(150deg,rgba(255,255,255,0.055),rgba(255,255,255,0.014));
@@ -1415,7 +1049,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .av-5{background:linear-gradient(140deg,#b8b8bc,#68686e)}
 .av-more{background:rgba(255,255,255,0.08);color:#fff;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);font-size:11px;border-color:rgba(255,255,255,0.1)}
 
-/* === SHOWCASE === */
 .showcase{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center}
 .showcase-text h2{margin-bottom:20px}
 .showcase-text p{color:var(--text-dim);font-size:15.5px;line-height:1.7;margin-bottom:28px;max-width:48ch}
@@ -1463,7 +1096,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .mock-thumb:nth-child(2)::after{background:linear-gradient(45deg,rgba(255,255,255,0.08),transparent 60%)}
 .mock-thumb:nth-child(3)::after{background:linear-gradient(160deg,rgba(255,255,255,0.12),transparent 60%)}
 
-/* === STATS === */
 .stats{
   display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
   border-radius:var(--radius);overflow:hidden;
@@ -1484,7 +1116,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .stat-lbl{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase}
 
-/* === STEPS === */
 .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
 .steps::before{
   content:'';position:absolute;top:80px;left:12%;right:12%;height:1px;
@@ -1501,7 +1132,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .step h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:18px;letter-spacing:-0.02em;margin-bottom:11px}
 .step p{color:var(--text-dim);font-size:14px;line-height:1.65}
 
-/* === CTA === */
 .cta{
   position:relative;border-radius:36px;padding:90px 40px;
   text-align:center;overflow:hidden;
@@ -1522,7 +1152,17 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .cta .btn svg{width:17px;height:17px}
 .cta-note{font-size:12.5px;color:var(--text-mute);margin-top:24px;margin-bottom:0;font-family:'JetBrains Mono',monospace;letter-spacing:0.06em}
 
-/* === RESPONSIVE === */
+/* Auto-scroll zone indicator (тонкая полоска сверху/снизу при активном автоскролле) */
+.autoscroll-edge{
+  position:fixed;left:0;right:0;height:2px;z-index:90;
+  pointer-events:none;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.35),transparent);
+  opacity:0;transition:opacity .2s ease;
+}
+.autoscroll-edge.top{top:0}
+.autoscroll-edge.bottom{bottom:0}
+.autoscroll-edge.active{opacity:1}
+
 @media (max-width:1080px){
   .showcase{grid-template-columns:1fr;gap:48px}
   .mock{transform:none;max-width:520px;margin:0 auto}
@@ -1531,15 +1171,16 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 @media (max-width:1000px){
   .bento{grid-template-columns:repeat(4,1fr)}
   .b-lg{grid-column:span 4}
-  .b-md{grid-column:span 2}
+  .b-md{grid-column:span 4}
   .b-sm{grid-column:span 2}
   .stats{grid-template-columns:repeat(2,1fr)}
   .steps{grid-template-columns:1fr}
   .steps::before{display:none}
 }
 @media (max-width:720px){
-  .hero{padding:150px 0 0}
+  .hero{padding:130px 0 0}
   section{padding:80px 0}
+  .tile-groups{gap:36px}
   .bento{grid-template-columns:1fr;gap:14px}
   .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
   .b-lg{min-height:auto}
@@ -1558,6 +1199,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .badge{font-size:11.5px;padding:7px 13px 7px 8px;margin-bottom:32px;gap:8px}
   .badge-dot{width:18px;height:18px}
   .badge-dot svg{width:9px;height:9px}
+  .group-head{flex-direction:column;gap:8px;align-items:flex-start}
 }
 @media (max-width:420px){
   .stats{grid-template-columns:1fr}
@@ -1570,52 +1212,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 
 def build_landing() -> str:
     body = r"""
-<div class="live-bar" id="liveBar">
-  <span class="live-dot"></span>
-  <span id="liveNow">7 постов создано за 10 минут</span>
-</div>
-
 <header class="hero">
-  <!-- Левая колонка с карточками -->
-  <div class="hero-side hero-side-left" aria-hidden="true">
-    <div class="hero-side-card" data-parallax="0.06">
-      <span class="hsc-dot"></span>
-      <span class="hsc-label">За сутки</span>
-      <span class="hsc-num">+120</span>
-      <span class="hsc-sub">новых постов публикуются каждый день</span>
-    </div>
-    <div class="hero-side-card" data-parallax="0.09">
-      <span class="hsc-label">Сжатие</span>
-      <span class="hsc-num">96%</span>
-      <span class="hsc-sub">средний процент уменьшения веса фото</span>
-    </div>
-    <div class="hero-side-card" data-parallax="0.12">
-      <span class="hsc-label">Задержка</span>
-      <span class="hsc-num">~340 мс</span>
-      <span class="hsc-sub">от ввода последней цифры до показа</span>
-    </div>
-  </div>
-
-  <!-- Правая колонка с карточками -->
-  <div class="hero-side hero-side-right" aria-hidden="true">
-    <div class="hero-side-card" data-parallax="0.07">
-      <span class="hsc-dot"></span>
-      <span class="hsc-label">Шифрование</span>
-      <span class="hsc-num">AES-256</span>
-      <span class="hsc-sub">GCM-режим, уникальный nonce для каждого блока</span>
-    </div>
-    <div class="hero-side-card" data-parallax="0.1">
-      <span class="hsc-label">Коды</span>
-      <span class="hsc-num">151 200</span>
-      <span class="hsc-sub">уникальных комбинаций без повторяющихся цифр</span>
-    </div>
-    <div class="hero-side-card" data-parallax="0.13">
-      <span class="hsc-label">Хранение</span>
-      <span class="hsc-num">RAM</span>
-      <span class="hsc-sub">данные нигде не сохраняются на диск</span>
-    </div>
-  </div>
-
   <div class="wrap">
     <div class="hero-inner">
       <div class="badge">
@@ -1647,9 +1244,9 @@ def build_landing() -> str:
           <span>Создать пост</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
         </a>
-        <a href="#sections" class="btn btn-ghost">
+        <a href="#features" class="btn btn-ghost">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
-          Все разделы
+          Что внутри
         </a>
       </div>
 
@@ -1678,224 +1275,168 @@ def build_landing() -> str:
       <span>OpenGraph-превью</span><span>AES-256-GCM</span><span>6-значные коды</span>
       <span>Автосжатие фото</span><span>zstd / gzip</span><span>До 5 фото</span>
     </div>
-    <div class="marquee-track reverse" style="margin-top:14px">
-      <span>Без аккаунтов</span><span>Шифрование в памяти</span><span>Мгновенный поиск</span>
-      <span>Единая ссылка</span><span>Автоочистка при перезапуске</span><span>RAM-only</span>
-      <span>Без аккаунтов</span><span>Шифрование в памяти</span><span>Мгновенный поиск</span>
-      <span>Единая ссылка</span><span>Автоочистка при перезапуске</span><span>RAM-only</span>
-    </div>
   </div>
 </header>
 
-<!-- === РАЗДЕЛЫ === -->
-<section id="sections">
-  <div class="wrap">
-    <div class="sec-head reveal">
-      <div class="eyebrow">Разделы</div>
-      <h2>Выберите, куда <span class="dim">хотите попасть</span></h2>
-      <p>Шесть разделов приложения — от создания поста до технических деталей хранения.</p>
-    </div>
-
-    <div class="section-tiles">
-      <a href="/app" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14"/>
-          </svg>
-        </div>
-        <span class="st-tag">Создание</span>
-        <h3>Создать пост</h3>
-        <p>Заголовок, текст, до 5 фото с автосжатием до ~60 КБ. Через пару секунд вы получите короткий код и ссылку.</p>
-        <span class="st-arrow">Открыть<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-
-      <a href="/app" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
-          </svg>
-        </div>
-        <span class="st-tag">Поиск</span>
-        <h3>Найти пост</h3>
-        <p>Введите 6 цифр — пост подгрузится автоматически. Рядом появится кнопка, чтобы сразу скопировать ссылку.</p>
-        <span class="st-arrow">Открыть<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-
-      <a href="#features" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="M3 13l9 5 9-5"/><path d="M3 17.5l9 5 9-5"/>
-          </svg>
-        </div>
-        <span class="st-tag">Возможности</span>
-        <h3>Что умеет сервис</h3>
-        <p>Десять пунктов механики: от шифрования AES-256-GCM до галереи с зумом и OpenGraph-превью.</p>
-        <span class="st-arrow">Читать<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-
-      <a href="#how" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
-          </svg>
-        </div>
-        <span class="st-tag">Механика</span>
-        <h3>Как это работает</h3>
-        <p>Три шага от идеи до готовой ссылки. Заполнили форму, получили код, отправили. Без лишних движений.</p>
-        <span class="st-arrow">Читать<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-
-      <a href="#showcase" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.7"/><path d="M21 15l-5-5L5 21"/>
-          </svg>
-        </div>
-        <span class="st-tag">Внешний вид</span>
-        <h3>Как выглядит пост</h3>
-        <p>Заголовок до 120 символов, тело до 20 000, галерея с зумом и кнопка «копировать ссылку» под постом.</p>
-        <span class="st-arrow">Смотреть<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-
-      <a href="#specs" class="section-tile reveal">
-        <div class="st-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 2 4 6v6c0 5 3.4 9.3 8 10 4.6-.7 8-5 8-10V6l-8-4z"/><path d="m9 12 2 2 4-4"/>
-          </svg>
-        </div>
-        <span class="st-tag">Технологии</span>
-        <h3>Под капотом</h3>
-        <p>AES-256-GCM, zstd/gzip, хранение только в оперативной памяти и полное отсутствие базы данных.</p>
-        <span class="st-arrow">Читать<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
-      </a>
-    </div>
-  </div>
-</section>
-
-<!-- === ВОЗМОЖНОСТИ === -->
-<section id="features" style="padding-top:0">
+<section id="features">
   <div class="wrap">
     <div class="sec-head reveal">
       <div class="eyebrow">Что умеет СЛД·NET</div>
-      <h2>Всё, что нужно.<br><span class="dim">Ничего лишнего.</span></h2>
-      <p>Механика из десяти пунктов — от публикации до красивой ссылки с превью.</p>
+      <h2>Всё по разделам.<br><span class="dim">Ничего лишнего.</span></h2>
+      <p>Четыре группы — от публикации до технологий и экспорта. Всё, что действительно есть в сервисе.</p>
     </div>
 
-    <div class="bento">
+    <div class="tile-groups">
 
-      <div class="glass b-lg hover-lift reveal">
-        <div>
-          <div class="icon-box">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18"/><path d="M9 4v5"/>
-            </svg>
+      <!-- === Группа 1: Публикация === -->
+      <div class="tile-group reveal">
+        <div class="group-head">
+          <div class="group-title">Публикация</div>
+          <div class="group-meta">Без аккаунтов · без подтверждений</div>
+        </div>
+        <div class="bento">
+          <div class="glass b-lg hover-lift">
+            <div>
+              <div class="icon-box">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18"/><path d="M9 4v5"/>
+                </svg>
+              </div>
+              <h3>Публикация без аккаунта</h3>
+              <p>Заголовок до 120 символов, тело поста до 20 000, до пяти фотографий. Отправили — получили код. Ни почты, ни пароля, ни подтверждений.</p>
+            </div>
+            <div class="big-num">5<sup>фото</sup></div>
+            <div class="avatars">
+              <div class="av av-1">С</div><div class="av av-2">Л</div><div class="av av-3">Д</div>
+              <div class="av av-4">N</div><div class="av av-5">T</div><div class="av av-more">+∞</div>
+            </div>
           </div>
-          <h3>Публикация без аккаунта</h3>
-          <p>Заголовок до 120 символов, тело поста до 20 000, до пяти фотографий. Отправили — получили код. Ни почты, ни пароля, ни подтверждений.</p>
-        </div>
-        <div class="big-num">5<sup>фото</sup></div>
-        <div class="avatars">
-          <div class="av av-1">С</div><div class="av av-2">Л</div><div class="av av-3">Д</div>
-          <div class="av av-4">N</div><div class="av av-5">T</div><div class="av av-more">+∞</div>
+
+          <div class="glass b-sm hover-scale">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
+              </svg>
+            </div>
+            <h3>Коды без повторов</h3>
+            <p>Все шесть цифр кода — разные. Легко продиктовать голосом, трудно перепутать при наборе.</p>
+          </div>
         </div>
       </div>
 
-      <div class="glass b-sm hover-tilt reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="M3 13l9 5 9-5"/><path d="M3 17.5l9 5 9-5"/>
-          </svg>
+      <!-- === Группа 2: Технологии === -->
+      <div class="tile-group reveal">
+        <div class="group-head">
+          <div class="group-title">Технологии и хранение</div>
+          <div class="group-meta">AES-256 · zstd · RAM</div>
         </div>
-        <h3>OpenGraph-превью</h3>
-        <p>Ссылка <code>/p/<span data-code>482163</span></code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
+        <div class="bento">
+          <div class="glass b-sm hover-tilt">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="M3 13l9 5 9-5"/><path d="M3 17.5l9 5 9-5"/>
+              </svg>
+            </div>
+            <h3>AES-256-GCM</h3>
+            <p>Каждый пост и каждое фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
+          </div>
+
+          <div class="glass b-sm hover-tilt-r">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v18M3 12h18"/>
+              </svg>
+            </div>
+            <h3>Сжатие zstd / gzip</h3>
+            <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
+          </div>
+
+          <div class="glass b-sm hover-lift-soft">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="12" rx="2"/>
+                <path d="M8 20h8M12 16v4"/>
+              </svg>
+            </div>
+            <h3>Хранение в RAM</h3>
+            <p>Данные живут только в оперативной памяти. Перезапуск сервера полностью очищает все посты.</p>
+          </div>
+        </div>
       </div>
 
-      <div class="glass b-sm hover-scale reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
-          </svg>
+      <!-- === Группа 3: Ссылки и превью === -->
+      <div class="tile-group reveal">
+        <div class="group-head">
+          <div class="group-title">Ссылки и превью</div>
+          <div class="group-meta">OpenGraph · единый адрес</div>
         </div>
-        <h3>Коды без повторов</h3>
-        <p>Все шесть цифр кода — разные. Легко продиктовать голосом, трудно перепутать при наборе.</p>
+        <div class="bento">
+          <div class="glass b-md hover-lift">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="M3 13l9 5 9-5"/><path d="M3 17.5l9 5 9-5"/>
+              </svg>
+            </div>
+            <h3>OpenGraph-превью</h3>
+            <p>Ссылка <code>/p/<span data-code>482163</span></code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
+          </div>
+
+          <div class="glass b-md hover-tilt">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5"/>
+              </svg>
+            </div>
+            <h3>Единая ссылка на пост</h3>
+            <p>Каждый пост живёт по одному адресу — <code>/p/<span data-code>482163</span></code>. Одна ссылка и для копирования, и для мессенджеров, и для перехода.</p>
+          </div>
+        </div>
       </div>
 
-      <div class="glass b-sm hover-lift-soft reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
-          </svg>
+      <!-- === Группа 4: Удобство === -->
+      <div class="tile-group reveal">
+        <div class="group-head">
+          <div class="group-title">Удобство</div>
+          <div class="group-meta">Скорость · галерея · сжатие</div>
         </div>
-        <h3>Мгновенный поиск</h3>
-        <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
-      </div>
+        <div class="bento">
+          <div class="glass b-sm hover-scale">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
+              </svg>
+            </div>
+            <h3>Мгновенный поиск</h3>
+            <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
+          </div>
 
-      <div class="glass b-sm hover-shift reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M12 3v18M3 12h18"/>
-          </svg>
-        </div>
-        <h3>Сжатие zstd / gzip</h3>
-        <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
-      </div>
+          <div class="glass b-sm hover-lift">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M14 3v4a1 1 0 001 1h4"/><path d="M17 21H7a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z"/>
+              </svg>
+            </div>
+            <h3>Автосжатие до 60 КБ</h3>
+            <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
+          </div>
 
-      <div class="glass b-md hover-tilt-r reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.7"/><path d="M21 15l-5-5L5 21"/>
-          </svg>
+          <div class="glass b-sm hover-tilt-r">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="1.7"/><path d="M21 15l-5-5L5 21"/>
+              </svg>
+            </div>
+            <h3>Галерея с зумом</h3>
+            <p>Колесо мыши, двойной клик, правая кнопка мыши, панорама по левой — как в настоящем просмотрщике. На тач-экранах — pinch.</p>
+          </div>
         </div>
-        <h3>Галерея с зумом</h3>
-        <p>Колесо мыши, двойной клик, правая кнопка мыши, панорама по левой — как в настоящем просмотрщике. На тач-экранах — pinch двумя пальцами.</p>
-      </div>
-
-      <div class="glass b-md hover-lift reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M20 6 9 17l-5-5"/>
-          </svg>
-        </div>
-        <h3>Единая ссылка на пост</h3>
-        <p>Каждый пост живёт по одному адресу — <code>/p/<span data-code>482163</span></code>. Одна ссылка и для копирования, и для мессенджеров, и для перехода.</p>
-      </div>
-
-      <div class="glass b-sm hover-scale reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M14 3v4a1 1 0 001 1h4"/><path d="M17 21H7a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z"/>
-          </svg>
-        </div>
-        <h3>Автосжатие до 60 КБ</h3>
-        <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
-      </div>
-
-      <div class="glass b-sm hover-tilt reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 0 0 18M12 3a15 15 0 0 1 0 18"/>
-          </svg>
-        </div>
-        <h3>Работает везде</h3>
-        <p>Один HTML-файл, никаких сборщиков и фреймворков. Открывается в любом современном браузере.</p>
-      </div>
-
-      <div class="glass b-sm hover-lift-soft reveal">
-        <div class="icon-box">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/>
-          </svg>
-        </div>
-        <h3>Лимит 5 МБ на файл</h3>
-        <p>Ограничение по размеру исходника — 5 МБ. Всё, что больше, отклоняется ещё до отправки.</p>
       </div>
 
     </div>
   </div>
 </section>
 
-<!-- === SHOWCASE === -->
-<section id="showcase" style="padding-top:0">
+<section id="showcase">
   <div class="wrap">
     <div class="showcase">
       <div class="showcase-text reveal">
@@ -1923,19 +1464,17 @@ def build_landing() -> str:
   </div>
 </section>
 
-<!-- === STATS === -->
 <section id="stats" style="padding-top:0">
   <div class="wrap">
     <div class="stats reveal">
-      <div class="stat"><div class="stat-val" data-count="151200">0</div><div class="stat-lbl">Уникальных кодов</div></div>
-      <div class="stat"><div class="stat-val" data-count="20000">0</div><div class="stat-lbl">Символов в теле</div></div>
-      <div class="stat"><div class="stat-val" data-count="5" data-suffix=" МБ">0</div><div class="stat-lbl">Лимит на файл</div></div>
-      <div class="stat"><div class="stat-val" data-count="60" data-suffix=" КБ">0</div><div class="stat-lbl">После сжатия</div></div>
+      <div class="stat"><div class="stat-val">151 200</div><div class="stat-lbl">Уникальных кодов</div></div>
+      <div class="stat"><div class="stat-val">20К</div><div class="stat-lbl">Символов в теле</div></div>
+      <div class="stat"><div class="stat-val">5 МБ</div><div class="stat-lbl">Лимит на файл</div></div>
+      <div class="stat"><div class="stat-val">60 КБ</div><div class="stat-lbl">После сжатия</div></div>
     </div>
   </div>
 </section>
 
-<!-- === HOW IT WORKS === -->
 <section id="how" style="padding-top:0">
   <div class="wrap">
     <div class="sec-head reveal">
@@ -1964,7 +1503,6 @@ def build_landing() -> str:
   </div>
 </section>
 
-<!-- === SPECS === -->
 <section id="specs" style="padding-top:0">
   <div class="wrap">
     <div class="sec-head reveal">
@@ -1982,7 +1520,6 @@ def build_landing() -> str:
   </div>
 </section>
 
-<!-- === CTA === -->
 <section id="join" style="padding-top:0">
   <div class="wrap">
     <div class="cta reveal">
@@ -1997,16 +1534,94 @@ def build_landing() -> str:
   </div>
 </section>
 """
+
+    extra_js = r"""
+<!-- === AUTO-SCROLL: курсор у верхнего/нижнего края сам подкручивает страницу === -->
+<div class="autoscroll-edge top" id="autoscrollTop" aria-hidden="true"></div>
+<div class="autoscroll-edge bottom" id="autoscrollBottom" aria-hidden="true"></div>
+<script>
+(function(){
+  "use strict";
+  if (!matchMedia("(hover:hover) and (pointer:fine)").matches) return;
+  if (location.pathname !== "/") return;
+
+  var EDGE = 90;        // зона в пикселях от края
+  var MAX_SPEED = 16;   // макс. скорость скролла (px/кадр)
+
+  var currentY = -1;
+  var vh = innerHeight;
+  var active = false;
+  var rafId = 0;
+  var edgeTop = document.getElementById("autoscrollTop");
+  var edgeBottom = document.getElementById("autoscrollBottom");
+
+  function updateVH(){ vh = innerHeight; }
+  addEventListener("resize", updateVH, { passive: true });
+
+  function tick(){
+    if (!active) return;
+    if (currentY >= 0) {
+      if (currentY < EDGE) {
+        // сила от 0 до 1: чем ближе к краю — тем быстрее
+        var strength = 1 - (currentY / EDGE);
+        strength = Math.max(0, Math.min(1, strength));
+        window.scrollBy(0, -MAX_SPEED * strength);
+      } else if (currentY > vh - EDGE) {
+        var strength2 = 1 - ((vh - currentY) / EDGE);
+        strength2 = Math.max(0, Math.min(1, strength2));
+        window.scrollBy(0, MAX_SPEED * strength2);
+      }
+    }
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function stop(){
+    active = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (edgeTop) edgeTop.classList.remove("active");
+    if (edgeBottom) edgeBottom.classList.remove("active");
+  }
+
+  document.addEventListener("mousemove", function(e){
+    currentY = e.clientY;
+    // если страница короче вьюпорта — авт скролл не нужен
+    if (document.documentElement.scrollHeight <= vh + 4) {
+      stop();
+      return;
+    }
+    var inTopZone = currentY < EDGE;
+    var inBottomZone = currentY > vh - EDGE;
+    var shouldScroll = inTopZone || inBottomZone;
+
+    if (edgeTop) edgeTop.classList.toggle("active", inTopZone);
+    if (edgeBottom) edgeBottom.classList.toggle("active", inBottomZone);
+
+    if (shouldScroll && !active) {
+      active = true;
+      rafId = requestAnimationFrame(tick);
+    } else if (!shouldScroll && active) {
+      stop();
+    }
+  }, { passive: true });
+
+  // Если курсор уходит со страницы — останавливаем
+  document.addEventListener("mouseleave", stop);
+  addEventListener("blur", stop);
+})();
+</script>
+"""
+
     return render_shell(
         title="СЛД·NET — посты по 6-значному коду",
         body=body,
         extra_css=LANDING_CSS,
         og='<meta name="description" content="Публикуйте посты с фото, делитесь шестью цифрами. Без аккаунтов, с шифрованием и автосжатием.">',
+        extra_js=extra_js,
     )
 
 
 # ============================================================
-# РАБОЧАЯ ОБЛАСТЬ  (/app, /p/{code})  — без изменений
+# РАБОЧАЯ ОБЛАСТЬ  (/app, /p/{code})
 # ============================================================
 
 APP_CSS = r"""
@@ -2352,9 +1967,13 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 
 .msg{
   display:flex;align-items:flex-start;gap:10px;
-  border-radius:11px;padding:12px 14px;font-size:13px;
-  background:rgba(255,255,255,0.03);color:var(--text);
-  line-height:1.5;border:1px solid var(--border);
+  border-radius:11px;
+  padding:12px 14px;
+  font-size:13px;
+  background:rgba(255,255,255,0.03);
+  color:var(--text);
+  line-height:1.5;
+  border:1px solid var(--border);
   word-break:break-word;
   animation:msgIn .3s cubic-bezier(.2,.8,.2,1);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);
@@ -2456,7 +2075,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .menu{padding:3px}
   .tab{padding:8px 13px;font-size:12.5px}
 }
-@media (max-width:720px){
+@media (max-width: 720px){
   html, body{
     height: 100%;
     overflow: hidden;
@@ -2688,7 +2307,6 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
-  /* CURSOR */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
@@ -2718,7 +2336,6 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
-  /* LOADER */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2726,13 +2343,11 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* TOPBAR */
   var topbar = $('topbar');
   function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
   measureTopbar();
 
-  /* HELPERS */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2780,7 +2395,6 @@ APP = r"""<!DOCTYPE html>
     if (location.pathname !== "/app") history.replaceState(null, "", "/app");
   }
 
-  /* TABS */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
@@ -2848,7 +2462,6 @@ APP = r"""<!DOCTYPE html>
   btnCreate.addEventListener("click", function(){ setUrlForApp(); setMode("create"); });
   btnFind.addEventListener("click", function(){ setUrlForApp(); setMode("find"); });
 
-  /* COMPRESSION */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
   async function compressImage(file, targetBytes){
@@ -2888,7 +2501,6 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* CREATE */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -3039,7 +2651,6 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* MODAL */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -3067,7 +2678,6 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
-  /* SEARCH */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
@@ -3150,7 +2760,6 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* LIGHTBOX */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3257,7 +2866,6 @@ APP = r"""<!DOCTYPE html>
   }, { passive: false });
   lbViewport.addEventListener("touchend", function(){ touchStartDist = 0; });
 
-  /* POST RENDER */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -3349,7 +2957,6 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* INIT */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
