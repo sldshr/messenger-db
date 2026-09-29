@@ -33,7 +33,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sld")
 
-# ---------- сжатие ----------
 try:
     import zstandard as _zstd_mod
     _HAS_ZSTD = True
@@ -59,7 +58,6 @@ def _decompress(b: bytes) -> bytes:
     raise ValueError("unknown codec")
 
 
-# ---------- шифрование ----------
 _AES = AESGCM(AESGCM.generate_key(bit_length=256))
 _NONCE = 12
 
@@ -84,7 +82,6 @@ def _unpack_meta(blob: bytes) -> dict:
     return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
 
 
-# ---------- память ----------
 _store: Dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -122,7 +119,6 @@ def _base_url(request: Request) -> str:
     return f"{proto}://{host}".rstrip("/")
 
 
-# ---------- приложение ----------
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
 
 
@@ -303,9 +299,6 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
-# ============================================================
-# ОБЩИЙ CSS
-# ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -935,7 +928,6 @@ h2{
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
 
-/* === Группы-разделы с плитками === */
 .tile-groups{display:flex;flex-direction:column;gap:52px}
 .tile-group{display:flex;flex-direction:column;gap:18px}
 .group-head{
@@ -1152,17 +1144,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .cta .btn svg{width:17px;height:17px}
 .cta-note{font-size:12.5px;color:var(--text-mute);margin-top:24px;margin-bottom:0;font-family:'JetBrains Mono',monospace;letter-spacing:0.06em}
 
-/* Auto-scroll zone indicator (тонкая полоска сверху/снизу при активном автоскролле) */
-.autoscroll-edge{
-  position:fixed;left:0;right:0;height:2px;z-index:90;
-  pointer-events:none;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.35),transparent);
-  opacity:0;transition:opacity .2s ease;
-}
-.autoscroll-edge.top{top:0}
-.autoscroll-edge.bottom{bottom:0}
-.autoscroll-edge.active{opacity:1}
-
 @media (max-width:1080px){
   .showcase{grid-template-columns:1fr;gap:48px}
   .mock{transform:none;max-width:520px;margin:0 auto}
@@ -1288,7 +1269,6 @@ def build_landing() -> str:
 
     <div class="tile-groups">
 
-      <!-- === Группа 1: Публикация === -->
       <div class="tile-group reveal">
         <div class="group-head">
           <div class="group-title">Публикация</div>
@@ -1324,7 +1304,6 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- === Группа 2: Технологии === -->
       <div class="tile-group reveal">
         <div class="group-head">
           <div class="group-title">Технологии и хранение</div>
@@ -1364,7 +1343,6 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- === Группа 3: Ссылки и превью === -->
       <div class="tile-group reveal">
         <div class="group-head">
           <div class="group-title">Ссылки и превью</div>
@@ -1393,7 +1371,6 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- === Группа 4: Удобство === -->
       <div class="tile-group reveal">
         <div class="group-head">
           <div class="group-title">Удобство</div>
@@ -1534,89 +1511,11 @@ def build_landing() -> str:
   </div>
 </section>
 """
-
-    extra_js = r"""
-<!-- === AUTO-SCROLL: курсор у верхнего/нижнего края сам подкручивает страницу === -->
-<div class="autoscroll-edge top" id="autoscrollTop" aria-hidden="true"></div>
-<div class="autoscroll-edge bottom" id="autoscrollBottom" aria-hidden="true"></div>
-<script>
-(function(){
-  "use strict";
-  if (!matchMedia("(hover:hover) and (pointer:fine)").matches) return;
-  if (location.pathname !== "/") return;
-
-  var EDGE = 90;        // зона в пикселях от края
-  var MAX_SPEED = 16;   // макс. скорость скролла (px/кадр)
-
-  var currentY = -1;
-  var vh = innerHeight;
-  var active = false;
-  var rafId = 0;
-  var edgeTop = document.getElementById("autoscrollTop");
-  var edgeBottom = document.getElementById("autoscrollBottom");
-
-  function updateVH(){ vh = innerHeight; }
-  addEventListener("resize", updateVH, { passive: true });
-
-  function tick(){
-    if (!active) return;
-    if (currentY >= 0) {
-      if (currentY < EDGE) {
-        // сила от 0 до 1: чем ближе к краю — тем быстрее
-        var strength = 1 - (currentY / EDGE);
-        strength = Math.max(0, Math.min(1, strength));
-        window.scrollBy(0, -MAX_SPEED * strength);
-      } else if (currentY > vh - EDGE) {
-        var strength2 = 1 - ((vh - currentY) / EDGE);
-        strength2 = Math.max(0, Math.min(1, strength2));
-        window.scrollBy(0, MAX_SPEED * strength2);
-      }
-    }
-    rafId = requestAnimationFrame(tick);
-  }
-
-  function stop(){
-    active = false;
-    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
-    if (edgeTop) edgeTop.classList.remove("active");
-    if (edgeBottom) edgeBottom.classList.remove("active");
-  }
-
-  document.addEventListener("mousemove", function(e){
-    currentY = e.clientY;
-    // если страница короче вьюпорта — авт скролл не нужен
-    if (document.documentElement.scrollHeight <= vh + 4) {
-      stop();
-      return;
-    }
-    var inTopZone = currentY < EDGE;
-    var inBottomZone = currentY > vh - EDGE;
-    var shouldScroll = inTopZone || inBottomZone;
-
-    if (edgeTop) edgeTop.classList.toggle("active", inTopZone);
-    if (edgeBottom) edgeBottom.classList.toggle("active", inBottomZone);
-
-    if (shouldScroll && !active) {
-      active = true;
-      rafId = requestAnimationFrame(tick);
-    } else if (!shouldScroll && active) {
-      stop();
-    }
-  }, { passive: true });
-
-  // Если курсор уходит со страницы — останавливаем
-  document.addEventListener("mouseleave", stop);
-  addEventListener("blur", stop);
-})();
-</script>
-"""
-
     return render_shell(
         title="СЛД·NET — посты по 6-значному коду",
         body=body,
         extra_css=LANDING_CSS,
         og='<meta name="description" content="Публикуйте посты с фото, делитесь шестью цифрами. Без аккаунтов, с шифрованием и автосжатием.">',
-        extra_js=extra_js,
     )
 
 
@@ -1792,24 +1691,28 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 .app{
   min-height:100dvh;
-  display:flex;flex-direction:column;align-items:center;
-  padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;gap:0;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
 }
+
+/* ПРОСТАЯ, НАДЁЖНАЯ СХЕМА ТАБОВ:
+   активная панель - position: relative (даёт высоту stage)
+   неактивная - position: absolute (не влияет на layout) */
 .stage{
-  margin:auto 0;position:relative;
+  position:relative;
   width:100%;max-width:560px;
-  transition:height .32s cubic-bezier(.2,.8,.2,1);
-  will-change:height;
 }
 .stage[hidden]{display:none}
 .panel{
   position:absolute;top:0;left:0;right:0;
   display:flex;flex-direction:column;gap:12px;
-  opacity:0;pointer-events:none;
-  transition:opacity .24s ease;
-  will-change:opacity;
+  opacity:0;pointer-events:none;visibility:hidden;
+  transition:opacity .22s ease;
 }
-.panel.active{position:relative;opacity:1;pointer-events:auto}
+.panel.active{
+  position:relative;
+  opacity:1;pointer-events:auto;visibility:visible;
+}
 
 .card{
   position:relative;border-radius:18px;
@@ -1836,7 +1739,7 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .field::placeholder{color:var(--text-mute)}
 .field:focus{border-color:var(--border-3);background:var(--input-focus);box-shadow:0 0 0 3px rgba(255,255,255,0.04)}
-textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit}
+textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit;scrollbar-width:thin}
 
 .checkbox-wrap{
   display:flex;align-items:flex-start;gap:11px;
@@ -2075,28 +1978,11 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .menu{padding:3px}
   .tab{padding:8px 13px;font-size:12.5px}
 }
-@media (max-width: 720px){
-  html, body{
-    height: 100%;
-    overflow: hidden;
-    overscroll-behavior: none;
-  }
-  .app{
-    height: 100dvh;
-    min-height: 0;
-    overflow: hidden;
-    padding: calc(var(--topbar-h, 80px) + 18px) 14px 16px;
-  }
-  .stage{
-    max-height: 100%;
-    overflow-y: auto;
-    overflow-x: hidden;
-    -webkit-overflow-scrolling: touch;
-    overscroll-behavior: contain;
-    scrollbar-width: none;
-    padding-bottom: 4px;
-  }
-  .stage::-webkit-scrollbar{ display:none; }
+@media (max-width:640px){
+  .topbar-inner{flex-wrap:wrap;row-gap:8px}
+  .menu{order:3;width:100%;justify-content:center}
+  .tab{flex:1 1 0;justify-content:center}
+  .app{padding:calc(var(--topbar-h, 110px) + 18px) 14px 24px}
   .card{padding:15px;border-radius:16px}
   .field{padding:11px 14px;font-size:14px}
   .input-wrap input.field,.input-wrap textarea.field{padding-left:38px}
@@ -2114,11 +2000,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .lb-hint{display:none}
   .post-gallery{grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px}
 }
-@media (max-width:640px){
-  .topbar-inner{flex-wrap:wrap;row-gap:8px}
-  .menu{order:3;width:100%;justify-content:center}
-  .tab{flex:1 1 0;justify-content:center}
-}
 @media (max-width:380px){
   .tab span{display:none}
   .tab{padding:9px 12px}
@@ -2131,7 +2012,7 @@ APP = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#080808">
 <title>СЛД·NET — рабочая область</title>
 <!-- OG_TAGS -->
@@ -2400,67 +2281,42 @@ APP = r"""<!DOCTYPE html>
   var menuEl = $("menu"), menuPill = $("menuPill");
   var mode = null;
 
-  function activePanel(){ return mode === "create" ? createPanel : findPanel; }
-  function syncHeight(animate){
-    if (animate === undefined) animate = true;
-    if (mode === null || stage.hidden) return;
-    if (!animate) stage.style.transition = "none";
-    stage.style.height = activePanel().offsetHeight + "px";
-    if (!animate) { void stage.offsetHeight; stage.style.transition = ""; }
-  }
   function updateMenuPill(){
-    if (!menuPill || !mode) return;
-    var activeTab = mode === "create" ? btnCreate : btnFind;
+    if (!menuPill) return;
+    var activeTab = mode === "find" ? btnFind : btnCreate;
     var menuRect = menuEl.getBoundingClientRect();
     var tabRect = activeTab.getBoundingClientRect();
     menuPill.style.transform = "translateX(" + (tabRect.left - menuRect.left) + "px)";
     menuPill.style.width = tabRect.width + "px";
   }
 
-  var ro = new ResizeObserver(function(){
-    if (!mode || stage.hidden) return;
-    stage.style.height = activePanel().offsetHeight + "px";
-    updateMenuPill();
-  });
-  ro.observe(createPanel); ro.observe(findPanel);
-  addEventListener("resize", function(){ syncHeight(false); updateMenuPill(); }, { passive: true });
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
-
   function setMode(next, instant){
     if (next === mode && !instant) return;
-    var firstShow = stage.hidden;
     var incoming = next === "create" ? createPanel : findPanel;
     var outgoing = next === "create" ? findPanel : createPanel;
+
     stage.hidden = false;
-    stage.style.transition = "none";
-    stage.style.height = incoming.offsetHeight + "px";
-    if (firstShow || mode === null || instant) {
-      incoming.style.transition = "none";
-      outgoing.classList.remove("active");
-      incoming.classList.add("active");
-      void incoming.offsetWidth;
-      incoming.style.transition = "";
-      void stage.offsetWidth;
-      stage.style.transition = "";
-    } else {
-      outgoing.classList.remove("active");
-      incoming.classList.add("active");
-      void stage.offsetWidth;
-      stage.style.transition = "";
-      stage.style.height = incoming.offsetHeight + "px";
-    }
+    outgoing.classList.remove("active");
+    incoming.classList.add("active");
+
     mode = next;
     btnCreate.classList.toggle("active", next === "create");
     btnFind.classList.toggle("active", next === "find");
-    updateMenuPill();
+
+    // Обновляем пилюлю (с задержкой, чтобы DOM успел отрисоваться)
     requestAnimationFrame(updateMenuPill);
     setTimeout(updateMenuPill, 60);
-    if (next === "create") setTimeout(function(){ $("title").focus(); }, 100);
-    else setTimeout(function(){ otpCells[0].focus(); }, 100);
-    requestAnimationFrame(function(){ syncHeight(false); });
+
+    // Фокус
+    if (next === "create") setTimeout(function(){ $("title").focus(); }, 80);
+    else setTimeout(function(){ otpCells[0].focus(); }, 80);
   }
+
   btnCreate.addEventListener("click", function(){ setUrlForApp(); setMode("create"); });
   btnFind.addEventListener("click", function(){ setUrlForApp(); setMode("find"); });
+
+  addEventListener("resize", updateMenuPill, { passive: true });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
 
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
@@ -2595,15 +2451,9 @@ APP = r"""<!DOCTYPE html>
   function showCreateMsg(kind, text){
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
-    requestAnimationFrame(function(){
-      requestAnimationFrame(function(){ syncHeight(false); });
-    });
   }
   function clearCreateMsg(){
     createMsg.innerHTML = "";
-    requestAnimationFrame(function(){
-      requestAnimationFrame(function(){ syncHeight(false); });
-    });
   }
 
   $("resetBtn").addEventListener("click", function(){
@@ -2749,7 +2599,7 @@ APP = r"""<!DOCTYPE html>
   });
   updateOtpCopyState();
 
-  function showSearchFrame(){ searchFrame.hidden = false; requestAnimationFrame(function(){ syncHeight(false); }); }
+  function showSearchFrame(){ searchFrame.hidden = false; }
   function renderSpinner(){
     searchFrame.innerHTML = '<div class="center"><div class="spinner"></div><div class="spinner-label">Ищем пост...</div></div>';
     showSearchFrame();
@@ -2968,7 +2818,8 @@ APP = r"""<!DOCTYPE html>
     } else {
       setMode("create", true);
     }
-    requestAnimationFrame(function(){ syncHeight(false); updateMenuPill(); });
+    requestAnimationFrame(updateMenuPill);
+    setTimeout(updateMenuPill, 120);
   }
   initFromUrl();
 
@@ -2988,10 +2839,6 @@ APP = r"""<!DOCTYPE html>
 </html>
 """
 
-
-# ============================================================
-# OpenGraph-метатеги для /p/{code}
-# ============================================================
 
 def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     title = str(meta.get("title", "")).strip() or f"Пост #{code}"
@@ -3026,10 +2873,6 @@ def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     lines.append(f'<link rel="canonical" href="{_html.escape(url, quote=True)}">')
     return "\n".join(lines)
 
-
-# ============================================================
-# РОУТЫ
-# ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
