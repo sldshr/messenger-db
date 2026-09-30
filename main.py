@@ -299,6 +299,56 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
+# --- соцсети (заполненные иконки) ---
+YOUTUBE_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545'
+    's-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814'
+    'a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505'
+    'a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814z'
+    'M9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>'
+)
+
+MASTODON_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M23.268 5.313c-.35-2.578-2.617-4.61-5.304-5.004C17.51.242 15.792 0 11.813 0'
+    'h-.03c-3.98 0-4.835.242-5.288.309C3.882.692 1.496 2.518.917 5.127'
+    '.64 6.412.61 7.837.661 9.143c.074 1.874.088 3.745.26 5.611'
+    '.118 1.24.325 2.47.62 3.68.55 2.237 2.777 4.098 4.96 4.857'
+    '2.336.792 4.849.923 7.256.38.265-.061.527-.132.786-.213'
+    '.585-.184 1.27-.39 1.774-.753a.057.057 0 0 0 .023-.043v-1.809'
+    'a.052.052 0 0 0-.02-.041.053.053 0 0 0-.046-.01 20.282 20.282 0 0 1-4.709.545'
+    'c-2.73 0-3.463-1.284-3.674-1.818a5.593 5.593 0 0 1-.319-1.433'
+    '.053.053 0 0 1 .066-.054c1.517.363 3.072.546 4.632.546'
+    '.376 0 .75 0 1.125-.01 1.57-.044 3.224-.124 4.768-.422'
+    '.038-.008.077-.015.11-.024 2.435-.464 4.753-1.92 4.989-5.604'
+    '.008-.145.03-1.52.03-1.67.002-.512.167-3.63-.024-5.545z'
+    'm-3.748 9.195h-2.561V8.29c0-1.309-.55-1.976-1.67-1.976'
+    '-1.23 0-1.846.79-1.846 2.35v3.403h-2.546V8.663c0-1.56-.617-2.35-1.848-2.35'
+    '-1.112 0-1.668.668-1.67 1.977v6.218H4.822V8.102'
+    'c0-1.31.337-2.35 1.011-3.12.696-.77 1.608-1.164 2.74-1.164'
+    '1.311 0 2.302.5 2.962 1.498l.638 1.06.638-1.06c.66-.999 1.65-1.498 2.96-1.498'
+    '1.13 0 2.043.395 2.74 1.164.675.77 1.012 1.81 1.012 3.12z"/></svg>'
+)
+
+STEAM_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M11.979 0C5.678 0 .511 4.86.022 11.037l6.432 2.658'
+    'c.545-.371 1.203-.59 1.912-.59.063 0 .125.004.188.006l2.861-4.142V8.91'
+    'c0-2.495 2.028-4.524 4.524-4.524 2.494 0 4.524 2.031 4.524 4.527'
+    's-2.03 4.525-4.524 4.525h-.105l-4.076 2.911c0 .052.004.105.004.159'
+    '0 1.875-1.515 3.396-3.39 3.396-1.635 0-3.016-1.173-3.331-2.727L.436 15.27'
+    'C1.862 20.307 6.486 24 11.979 24c6.627 0 11.999-5.373 11.999-12S18.605 0 11.979 0z'
+    'M7.54 18.21l-1.473-.61c.262.543.714.999 1.314 1.25'
+    '1.297.539 2.793-.076 3.332-1.375.263-.63.264-1.319.005-1.949'
+    's-.75-1.121-1.377-1.383c-.624-.26-1.29-.249-1.878-.03l1.523.63'
+    'c.956.4 1.409 1.5 1.009 2.455-.397.957-1.497 1.41-2.454 1.012H7.54z'
+    'm11.415-9.303c0-1.662-1.353-3.015-3.015-3.015-1.665 0-3.015 1.353-3.015 3.015'
+    '0 1.665 1.35 3.015 3.015 3.015 1.663 0 3.015-1.35 3.015-3.015z'
+    'm-5.273-.005c0-1.252 1.013-2.266 2.265-2.266 1.249 0 2.266 1.014 2.266 2.266'
+    '0 1.251-1.017 2.265-2.266 2.265-1.253 0-2.265-1.014-2.265-2.265z"/></svg>'
+)
+
 # ============================================================
 # ОБЩИЙ CSS
 # ============================================================
@@ -515,12 +565,13 @@ body > nav.top-nav.scrolled{
 }
 .btn-ghost:active{transform:translateY(0) scale(.985)}
 
+/* ============ FOOTER ============ */
 footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 .foot-top{
   display:flex;justify-content:space-between;
   align-items:flex-start;gap:40px;flex-wrap:wrap;margin-bottom:54px;
 }
-.foot-brand{max-width:340px}
+.foot-brand{max-width:360px}
 .foot-brand .logo{margin-bottom:18px}
 .foot-brand p{color:var(--text-mute);font-size:13.5px;line-height:1.7}
 .foot-brand .dev{
@@ -547,18 +598,35 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
   display:block;color:var(--text-dim);text-decoration:none;
   font-size:14.5px;padding:6px 0;
   transition:color .25s,transform .25s;width:fit-content;
+  word-break:break-word;
 }
 .foot-col a:hover{color:#fff;transform:translateX(3px)}
 
 .foot-bottom{
   display:flex;justify-content:space-between;align-items:center;
-  gap:20px;flex-wrap:wrap;
+  gap:24px;flex-wrap:wrap;
   padding-top:30px;border-top:1px solid var(--border);
   color:var(--text-mute);font-size:12.5px;
   font-family:'JetBrains Mono',monospace;letter-spacing:0.05em;
 }
 .foot-bottom .group{color:var(--text-dim)}
 .foot-bottom .group strong{color:#fff;font-weight:600}
+
+/* Соцсети в подвале */
+.foot-socials{display:flex;gap:8px;align-items:center}
+.foot-socials a{
+  width:38px;height:38px;border-radius:11px;
+  display:grid;place-items:center;
+  background:var(--glass);border:1px solid var(--border-2);
+  color:var(--text-dim);
+  transition:all .3s cubic-bezier(.2,.8,.2,1);
+  text-decoration:none;
+}
+.foot-socials a:hover{
+  background:var(--glass-hi);border-color:var(--border-3);
+  color:#fff;transform:translateY(-2px);
+}
+.foot-socials svg{width:18px;height:18px;display:block}
 
 .reveal{
   opacity:0;transform:translateY(32px);
@@ -584,7 +652,7 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
   .logo-mark{width:28px;height:28px}
   .logo-mark svg{width:14px;height:14px}
   .foot-cols{gap:44px}
-  .foot-bottom{justify-content:center;text-align:center;flex-direction:column;gap:12px}
+  .foot-bottom{justify-content:center;text-align:center;flex-direction:column;gap:16px}
 }
 """
 
@@ -696,6 +764,51 @@ SHELL_JS = r"""
 })();
 """
 
+# Готовый блок футера — вынесен сюда, чтобы не дублировать
+FOOTER_HTML = (
+    '\n<footer>\n  <div class="wrap">\n    <div class="foot-top">\n'
+    '      <div class="foot-brand">\n'
+    '        <a href="/" class="logo">\n'
+    '          <span class="logo-mark">' + LOGO_SVG + '</span>\n'
+    '          <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
+    '        </a>\n'
+    '        <p>Нетворкинг на шести цифрах. Без аккаунтов, без лишнего — публикуйте посты, находите людей, делитесь ссылкой.</p>\n'
+    '        <div class="dev">\n'
+    '          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>\n'
+    '          <span>Разработчик · <strong>слдшр</strong></span>\n'
+    '        </div>\n'
+    '      </div>\n'
+    '      <div class="foot-cols">\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Продукт</h4>\n'
+    '          <a href="/#features">Возможности</a>\n'
+    '          <a href="/#how">Как это работает</a>\n'
+    '          <a href="/#specs">Технологии</a>\n'
+    '        </div>\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Приложение</h4>\n'
+    '          <a href="/app?mode=create">Создать пост</a>\n'
+    '          <a href="/app?mode=find">Найти пост</a>\n'
+    '        </div>\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Контакты</h4>\n'
+    '          <a href="mailto:sldshr.confirmation@gmail.com">sldshr.confirmation@gmail.com</a>\n'
+    '          <a rel="me" href="https://mastodon.social/@ru_sldshr" target="_blank">Mastodon</a>\n'
+    '        </div>\n'
+    '      </div>\n'
+    '    </div>\n'
+    '    <div class="foot-bottom">\n'
+    '      <span>© 2026 СЛД·NET. Все права защищены.</span>\n'
+    '      <div class="foot-socials">\n'
+    '        <a href="https://www.youtube.com/@слдшр" target="_blank" rel="noopener" aria-label="YouTube">' + YOUTUBE_SVG + '</a>\n'
+    '        <a rel="me" href="https://mastodon.social/@ru_sldshr" target="_blank" aria-label="Mastodon">' + MASTODON_SVG + '</a>\n'
+    '        <a href="https://steamcommunity.com/id/CSTOM_URL/" target="_blank" rel="noopener" aria-label="Steam">' + STEAM_SVG + '</a>\n'
+    '      </div>\n'
+    '      <span class="group">Сделано · <strong>слдшр</strong></span>\n'
+    '    </div>\n'
+    '  </div>\n</footer>\n'
+)
+
 
 def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "") -> str:
     nav_links = [
@@ -739,42 +852,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '  </a>\n'
         '</nav>\n'
         + body +
-        '\n<footer>\n  <div class="wrap">\n    <div class="foot-top">\n'
-        '      <div class="foot-brand">\n'
-        '        <a href="/" class="logo">\n'
-        '          <span class="logo-mark">' + LOGO_SVG + '</span>\n'
-        '          <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
-        '        </a>\n'
-        '        <p>Публикация постов и поиск по шестизначному коду. Работает без аккаунтов и хранит данные только в памяти.</p>\n'
-        '        <div class="dev">\n'
-        '          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>\n'
-        '          <span>Разработчик · <strong>СЛД-Нетворкинг Гроуп</strong></span>\n'
-        '        </div>\n'
-        '      </div>\n'
-        '      <div class="foot-cols">\n'
-        '        <div class="foot-col">\n'
-        '          <h4>Продукт</h4>\n'
-        '          <a href="/#features">Возможности</a>\n'
-        '          <a href="/#how">Как это работает</a>\n'
-        '          <a href="/#specs">Технологии</a>\n'
-        '        </div>\n'
-        '        <div class="foot-col">\n'
-        '          <h4>Приложение</h4>\n'
-        '          <a href="/app">Создать пост</a>\n'
-        '          <a href="/app">Найти пост</a>\n'
-        '        </div>\n'
-        '        <div class="foot-col">\n'
-        '          <h4>Контакты</h4>\n'
-        '          <a href="/">СЛД-Нетворкинг Гроуп</a>\n'
-        '          <a href="/">support@sld-net</a>\n'
-        '        </div>\n'
-        '      </div>\n'
-        '    </div>\n'
-        '    <div class="foot-bottom">\n'
-        '      <span>© 2026 СЛД·NET. Все права защищены.</span>\n'
-        '      <span class="group">Сделано в <strong>СЛД-Нетворкинг Гроуп</strong></span>\n'
-        '    </div>\n'
-        '  </div>\n</footer>\n'
+        FOOTER_HTML +
         '<script>' + SHELL_JS + '</script>\n'
         '</body>\n</html>'
     )
@@ -990,7 +1068,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 
 .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
 .bento .glass{padding:32px;display:flex;flex-direction:column}
-.b-lg{grid-column:span 4;min-height:320px}
+.b-lg{grid-column:span 4;min-height:300px}
 .b-md{grid-column:span 3;min-height:250px}
 .b-sm{grid-column:span 2;min-height:240px}
 .icon-box{
@@ -1010,38 +1088,23 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   background:rgba(255,255,255,0.04);padding:2px 7px;border-radius:6px;
   border:1px solid var(--border);white-space:nowrap;
 }
-.b-lg{justify-content:space-between}
-.b-lg .big-num{
-  font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(56px,8.5vw,104px);line-height:0.88;letter-spacing:-0.055em;
-  background:linear-gradient(160deg,#fff 25%,rgba(255,255,255,0.22));
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-  margin-top:auto;padding-top:28px;
+
+/* Список фич внутри большой плитки */
+.feature-list{
+  list-style:none;display:flex;flex-direction:column;gap:11px;
+  margin-top:24px;padding-top:22px;
+  border-top:1px solid var(--border);
 }
-.b-lg .big-num sup{
-  font-size:0.3em;vertical-align:super;color:var(--text-mute);
-  -webkit-text-fill-color:var(--text-mute);margin-left:6px;letter-spacing:0.02em;font-weight:600;
+.feature-list li{
+  display:flex;align-items:center;gap:11px;
+  font-size:13.5px;color:var(--text-dim);line-height:1.5;
 }
-.avatars{display:flex;margin-top:auto;padding-top:24px}
-.av{
-  width:38px;height:38px;border-radius:50%;
-  border:2px solid #0c0c0c;margin-left:-12px;
-  display:grid;place-items:center;
-  font-family:'Unbounded',sans-serif;font-size:12px;font-weight:700;color:#08080a;
-  transition:transform .3s cubic-bezier(.2,.8,.2,1);
+.feature-list li::before{
+  content:'';flex-shrink:0;
+  width:6px;height:6px;border-radius:50%;
+  background:#fff;box-shadow:0 0 0 3px rgba(255,255,255,0.08);
 }
-.av:first-child{margin-left:0}
-.glass:hover .av{transform:translateY(-3px)}
-.glass:hover .av:nth-child(2){transition-delay:.04s}
-.glass:hover .av:nth-child(3){transition-delay:.08s}
-.glass:hover .av:nth-child(4){transition-delay:.12s}
-.glass:hover .av:nth-child(5){transition-delay:.16s}
-.av-1{background:linear-gradient(140deg,#f0f0f2,#a8a8ae)}
-.av-2{background:linear-gradient(140deg,#d8d8dc,#8c8c92)}
-.av-3{background:linear-gradient(140deg,#c0c0c4,#70707a)}
-.av-4{background:linear-gradient(140deg,#e8e8ea,#98989e)}
-.av-5{background:linear-gradient(140deg,#b8b8bc,#68686e)}
-.av-more{background:rgba(255,255,255,0.08);color:#fff;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);font-size:11px;border-color:rgba(255,255,255,0.1)}
+.feature-list li strong{color:#fff;font-weight:600}
 
 .showcase{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center}
 .showcase-text h2{margin-bottom:20px}
@@ -1167,7 +1230,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .bento{grid-template-columns:1fr;gap:14px}
   .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
   .b-lg{min-height:auto}
-  .b-lg .big-num{padding-top:20px}
   .stats{grid-template-columns:1fr 1fr}
   .stat{padding:32px 18px}
   .cta{padding:60px 24px;border-radius:26px}
@@ -1223,7 +1285,7 @@ def build_landing() -> str:
       </p>
 
       <div class="hero-cta">
-        <a href="/app" class="btn btn-primary">
+        <a href="/app?mode=create" class="btn btn-primary">
           <span>Создать пост</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
         </a>
@@ -1285,13 +1347,13 @@ def build_landing() -> str:
                 </svg>
               </div>
               <h3>Публикация без аккаунта</h3>
-              <p>Заголовок до 120 символов, тело поста до 20 000, до пяти фотографий. Отправили — получили код. Ни почты, ни пароля, ни подтверждений.</p>
+              <p>Отправили — получили код. Ни почты, ни пароля, ни подтверждений. Всё, что нужно для поста — уже внутри формы.</p>
             </div>
-            <div class="big-num">5<sup>фото</sup></div>
-            <div class="avatars">
-              <div class="av av-1">С</div><div class="av av-2">Л</div><div class="av av-3">Д</div>
-              <div class="av av-4">N</div><div class="av av-5">T</div><div class="av av-more">+∞</div>
-            </div>
+            <ul class="feature-list">
+              <li><strong>120</strong> символов в заголовке</li>
+              <li><strong>20 000</strong> символов в теле поста</li>
+              <li><strong>5 фото</strong> · до 5 МБ каждое</li>
+            </ul>
           </div>
 
           <div class="glass b-sm hover-scale">
@@ -1504,7 +1566,7 @@ def build_landing() -> str:
     <div class="cta reveal">
       <h2>Опубликовать первый пост</h2>
       <p>Заголовок, текст, до пяти фото — и шесть цифр, чтобы поделиться результатом.</p>
-      <a href="/app" class="btn btn-primary">
+      <a href="/app?mode=create" class="btn btn-primary">
         <span>Открыть приложение</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
       </a>
@@ -1625,7 +1687,6 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
-/* ===== TOPBAR ===== */
 .topbar{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:100;width:calc(100% - 28px);max-width:1160px;border-radius:16px;
@@ -1692,49 +1753,31 @@ body.cursor-ready .cur-ring { opacity:1; }
 .back-btn svg{width:14px;height:14px;display:block}
 .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
 
-/* Кнопка "Выйти" — только для мобильной версии */
 .exit-btn{
   display:none;
-  align-items:center;
-  gap:7px;
-  padding:9px 14px;
-  border-radius:10px;
+  align-items:center;gap:7px;
+  padding:9px 14px;border-radius:10px;
   background:rgba(200,70,70,0.92);
   border:1px solid rgba(240,110,110,0.9);
-  color:#fff;
-  font:inherit;
-  font-size:13px;
-  font-weight:600;
-  cursor:pointer;
-  text-decoration:none;
-  white-space:nowrap;
+  color:#fff;font:inherit;font-size:13px;font-weight:600;
+  cursor:pointer;text-decoration:none;white-space:nowrap;
   transition:transform .22s cubic-bezier(.2,.8,.2,1),background .22s,border-color .22s,box-shadow .22s;
   box-shadow:0 6px 18px -8px rgba(200,70,70,0.5),inset 0 1px 0 rgba(255,255,255,0.18);
 }
 .exit-btn svg{width:14px;height:14px;display:block}
 .exit-btn:hover,.exit-btn:active{
-  background:rgba(220,80,80,1);
-  border-color:rgba(255,130,130,1);
+  background:rgba(220,80,80,1);border-color:rgba(255,130,130,1);
   transform:translateY(-1px);
   box-shadow:0 10px 24px -8px rgba(200,70,70,0.6),inset 0 1px 0 rgba(255,255,255,0.22);
 }
 .exit-btn:active{transform:translateY(0) scale(.98)}
 
-/* ===== APP LAYOUT ===== */
 .app{
   min-height:100dvh;
-  display:flex;
-  flex-direction:column;
-  align-items:center;
+  display:flex;flex-direction:column;align-items:center;
   padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
 }
-
-.stage{
-  width:100%;
-  max-width:560px;
-  margin:auto 0;
-  /* если контент не помещается — margin auto схлопнется, страница будет скроллиться на десктопе */
-}
+.stage{width:100%;max-width:560px;margin:auto 0}
 .stage[hidden]{display:none}
 .panel{
   position:absolute;top:0;left:0;right:0;
@@ -1742,10 +1785,7 @@ body.cursor-ready .cur-ring { opacity:1; }
   opacity:0;pointer-events:none;visibility:hidden;
   transition:opacity .22s ease;
 }
-.panel.active{
-  position:relative;
-  opacity:1;pointer-events:auto;visibility:visible;
-}
+.panel.active{position:relative;opacity:1;pointer-events:auto;visibility:visible}
 
 .card{
   position:relative;border-radius:18px;
@@ -1952,26 +1992,10 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .share-link-copy.copied .sl-copy{display:none}
 .share-link-copy.copied .sl-check{display:block}
 
-/* ===== LIGHTBOX ===== */
-.lightbox{
-  position:fixed;inset:0;z-index:1000;
-  display:flex;align-items:center;justify-content:center;
-  background:rgba(0,0,0,0.96);
-  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  user-select:none;-webkit-user-select:none;
-  touch-action:none;
-}
+.lightbox{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.96);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);user-select:none;-webkit-user-select:none;touch-action:none}
 .lightbox[hidden]{display:none}
-.lb-viewport{
-  position:absolute;inset:0;
-  display:flex;align-items:center;justify-content:center;
-  overflow:hidden;cursor:default;
-  touch-action:none;
-}
-.lb-transform{
-  display:flex;align-items:center;justify-content:center;
-  transform-origin:center center;will-change:transform;
-}
+.lb-viewport{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:default;touch-action:none}
+.lb-transform{display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}
 .lb-img{
   display:block;max-width:82vw;max-height:78vh;
   object-fit:contain;border-radius:8px;
@@ -1985,16 +2009,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   background-size:16px 16px;
   background-position:0 0,0 8px,8px -8px,-8px 0px;
 }
-.lb-btn{
-  position:absolute;width:42px;height:42px;border-radius:12px;
-  border:1px solid var(--border-2);
-  background:rgba(15,15,15,0.8);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  color:var(--text);
-  display:flex;align-items:center;justify-content:center;
-  cursor:pointer;z-index:2;
-  transition:background .18s,border-color .18s,transform .2s;
-}
+.lb-btn{position:absolute;width:42px;height:42px;border-radius:12px;border:1px solid var(--border-2);background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;transition:background .18s,border-color .18s,transform .2s}
 .lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
 .lb-btn:hover{background:rgba(30,30,30,0.95);border-color:var(--border-3)}
 .lb-btn:active{transform:scale(.94)}
@@ -2002,40 +2017,12 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .lb-close{top:16px;right:16px}
 .lb-prev{left:16px;top:50%;transform:translateY(-50%)}
 .lb-next{right:16px;top:50%;transform:translateY(-50%)}
-.lb-counter{
-  position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
-  padding:7px 16px;border-radius:11px;
-  background:rgba(15,15,15,0.8);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  border:1px solid var(--border-2);
-  font-size:12.5px;color:var(--text);
-  font-family:'JetBrains Mono',monospace;
-  letter-spacing:.06em;
-  z-index:2;pointer-events:none;
-}
-.lb-zoom-badge{
-  position:absolute;top:16px;left:16px;
-  padding:5px 11px;border-radius:10px;
-  background:rgba(15,15,15,0.8);
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
-  border:1px solid var(--border-2);
-  font-size:11.5px;color:var(--text);
-  font-family:'JetBrains Mono',monospace;
-  z-index:2;pointer-events:none;
-  opacity:0;transition:opacity .18s ease;
-}
+.lb-counter{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);padding:7px 16px;border-radius:11px;background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);font-size:12.5px;color:var(--text);font-family:'JetBrains Mono',monospace;letter-spacing:.06em;z-index:2;pointer-events:none}
+.lb-zoom-badge{position:absolute;top:16px;left:16px;padding:5px 11px;border-radius:10px;background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);font-size:11.5px;color:var(--text);font-family:'JetBrains Mono',monospace;z-index:2;pointer-events:none;opacity:0;transition:opacity .18s ease}
 .lb-zoom-badge.visible{opacity:1}
-.lb-hint{
-  position:absolute;bottom:64px;left:50%;transform:translateX(-50%);
-  font-size:11.5px;color:var(--text-mute);
-  z-index:2;pointer-events:none;white-space:nowrap;
-  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
-  text-align:center;
-  padding:0 16px;
-}
+.lb-hint{position:absolute;bottom:64px;left:50%;transform:translateX(-50%);font-size:11.5px;color:var(--text-mute);z-index:2;pointer-events:none;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;text-align:center;padding:0 16px}
 .lb-hint-mobile{display:none}
 
-/* ===== MODAL ===== */
 .modal{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:20px;animation:fadeIn .22s ease}
 .modal[hidden]{display:none}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
@@ -2058,7 +2045,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .modal-actions{display:flex;gap:8px}
 .modal-actions .btn{flex:1;height:42px;font-size:13px}
 
-/* ===== DESKTOP RESPONSIVE ===== */
 @media (max-width:820px){
   .topbar{padding:9px 10px 9px 14px}
 }
@@ -2079,12 +2065,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .tab svg{width:16px;height:16px}
 }
 
-/* ============================================================
-   МОБИЛЬНАЯ ВЕРСИЯ APP
-   - фиксируем высоту, чтобы не было скролла страницы впустую
-   - topbar: только 2 таба + красная "Выйти"
-   - .stage скроллится сам, только если контент больше
-   ============================================================ */
+/* ================= МОБИЛЬНАЯ ВЕРСИЯ APP ================= */
 @media (max-width: 720px){
   html, body {
     height: 100%;
@@ -2092,7 +2073,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     overscroll-behavior: none;
     background: var(--bg);
   }
-
   .app {
     position: fixed;
     inset: 0;
@@ -2104,7 +2084,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     flex-direction: column;
     align-items: center;
   }
-
   .stage {
     width: 100%;
     max-width: 560px;
@@ -2118,79 +2097,33 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     padding: 4px 0;
   }
   .stage::-webkit-scrollbar{ display:none; }
-
-  /* topbar: убираем лого и back-btn, показываем exit-btn */
-  .topbar{
-    top: 10px;
-    width: calc(100% - 20px);
-    padding: 8px 8px 8px 10px;
-    border-radius: 14px;
-  }
-  .topbar-inner{
-    flex-wrap: nowrap;
-    gap: 8px;
-    justify-content: space-between;
-  }
+  .topbar{ top: 10px; width: calc(100% - 20px); padding: 8px 8px 8px 10px; border-radius: 14px; }
+  .topbar-inner{ flex-wrap: nowrap; gap: 8px; justify-content: space-between; }
   .topbar .logo,
-  .topbar .back-btn{
-    display: none !important;
-  }
-  .topbar .menu{
-    flex: 1 1 auto;
-    min-width: 0;
-    justify-content: center;
-    padding: 3px;
-  }
-  .topbar .menu .tab{
-    flex: 1 1 0;
-    justify-content: center;
-    padding: 9px 10px;
-    font-size: 12.5px;
-  }
-  .topbar .exit-btn{
-    display: inline-flex;
-    flex-shrink: 0;
-    padding: 9px 13px;
-    font-size: 12.5px;
-  }
+  .topbar .back-btn{ display: none !important; }
+  .topbar .menu{ flex: 1 1 auto; min-width: 0; justify-content: center; padding: 3px; }
+  .topbar .menu .tab{ flex: 1 1 0; justify-content: center; padding: 9px 10px; font-size: 12.5px; }
+  .topbar .exit-btn{ display: inline-flex; flex-shrink: 0; padding: 9px 13px; font-size: 12.5px; }
 
-  /* lightbox: мобильный режим */
   .lb-btn{ width:44px; height:44px; }
   .lb-close{ top:12px; right:12px; }
   .lb-prev, .lb-next{
-    top: auto;
-    bottom: 84px;
-    transform: none;
-    width: 48px;
-    height: 48px;
-    opacity: .92;
+    top: auto; bottom: 84px; transform: none;
+    width: 48px; height: 48px; opacity: .92;
   }
   .lb-prev{ left: 20px; }
   .lb-next{ right: 20px; }
-  .lb-counter{
-    bottom: 20px;
-    font-size: 12px;
-    padding: 6px 14px;
-  }
+  .lb-counter{ bottom: 20px; font-size: 12px; padding: 6px 14px; }
   .lb-zoom-badge{ top:12px; left:12px; }
   .lb-img{ max-width: 96vw; max-height: 72vh; }
   .lb-hint{ display: none; }
   .lb-hint-mobile{
-    display: block;
-    position: absolute;
-    bottom: 60px;
-    left: 50%;
+    display: block; position: absolute; bottom: 60px; left: 50%;
     transform: translateX(-50%);
-    font-size: 11px;
-    color: var(--text-mute);
-    font-family:'JetBrains Mono',monospace;
-    letter-spacing: 0.02em;
-    z-index: 2;
-    pointer-events: none;
-    white-space: nowrap;
-    text-align: center;
-    max-width: 92vw;
-    padding: 0 12px;
+    font-size: 11px; color: var(--text-mute);
+    font-family:'JetBrains Mono',monospace; letter-spacing: 0.02em;
+    z-index: 2; pointer-events: none; white-space: nowrap;
+    text-align: center; max-width: 92vw; padding: 0 12px;
   }
 }
 @media (max-width: 480px){
@@ -2473,17 +2406,23 @@ APP = r"""<!DOCTYPE html>
     return (b/(1024*1024*1024)).toFixed(2).replace(".", ",") + " ГБ";
   }
   function postUrl(code){ return location.origin + "/p/" + code; }
+
   function parseLocation(){
     var m = location.pathname.match(/^\/p\/(\d{6})\/?$/);
     if (m) return { code: m[1] };
-    return { code: null };
+    var params = new URLSearchParams(location.search);
+    var mp = params.get("mode");
+    return { code: null, mode: (mp === "find" || mp === "create") ? mp : null };
   }
   function setUrlForCode(code){
     var t = "/p/" + code;
     if (location.pathname !== t) history.replaceState(null, "", t);
   }
-  function setUrlForApp(){
-    if (location.pathname !== "/app") history.replaceState(null, "", "/app");
+  function setUrlForApp(mode){
+    var target = "/app" + (mode ? ("?mode=" + mode) : "");
+    if (location.pathname + location.search !== target) {
+      history.replaceState(null, "", target);
+    }
   }
 
   /* ============ TABS ============ */
@@ -2517,8 +2456,8 @@ APP = r"""<!DOCTYPE html>
     else setTimeout(function(){ otpCells[0].focus(); }, 80);
   }
 
-  btnCreate.addEventListener("click", function(){ setUrlForApp(); setMode("create"); });
-  btnFind.addEventListener("click", function(){ setUrlForApp(); setMode("find"); });
+  btnCreate.addEventListener("click", function(){ setUrlForApp("create"); setMode("create"); });
+  btnFind.addEventListener("click", function(){ setUrlForApp("find"); setMode("find"); });
 
   addEventListener("resize", updateMenuPill, { passive: true });
   addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
@@ -2765,7 +2704,7 @@ APP = r"""<!DOCTYPE html>
       searchSeq++;
       hideSearchFrame();
       lastSubmitted = "";
-      setUrlForApp();
+      if (location.pathname !== "/app") setUrlForApp(mode || "find");
     }
     updateOtpCopyState();
   }
@@ -2908,11 +2847,12 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* === TOUCH GESTURES (mobile lightbox) === */
+  /* === MOBILE TOUCH GESTURES === */
   var touchStartDist = 0, touchStartZoom = 1;
   var tStartX = 0, tStartY = 0, tStartTime = 0;
   var tActive = false, tPinch = false;
   var lastTapTime = 0, lastTapX = 0, lastTapY = 0;
+  var lastPanX = 0, lastPanY = 0;
 
   lbViewport.addEventListener("touchstart", function(e){
     if (e.touches.length === 2) {
@@ -2929,6 +2869,8 @@ APP = r"""<!DOCTYPE html>
       tStartTime = Date.now();
       tActive = true;
       tPinch = false;
+      lastPanX = e.touches[0].clientX;
+      lastPanY = e.touches[0].clientY;
     }
   }, { passive: true });
 
@@ -2942,15 +2884,14 @@ APP = r"""<!DOCTYPE html>
       var cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       var cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
       zoomAt(cx, cy, touchStartZoom * (dist / touchStartDist));
-    } else if (e.touches.length === 1 && zoom > 1.001) {
-      e.preventDefault();
-      var dx = e.touches[0].clientX - tStartX;
-      var dy = e.touches[0].clientY - tStartY;
-      panX += (e.touches[0].clientX - (tStartX + (panX - panX))) * 0;
-      // simple pan: use delta from last frame via position tracking
-      // using direct translation of touch delta
-      tStartX = e.touches[0].clientX - 0;
-      // We'll accumulate via separate mousemove-style logic
+    } else if (e.touches.length === 1 && zoom > 1.001 && !tPinch) {
+      var dx = e.touches[0].clientX - lastPanX;
+      var dy = e.touches[0].clientY - lastPanY;
+      panX += dx;
+      panY += dy;
+      lastPanX = e.touches[0].clientX;
+      lastPanY = e.touches[0].clientY;
+      applyTransform();
     }
   }, { passive: false });
 
@@ -2969,11 +2910,9 @@ APP = r"""<!DOCTYPE html>
     var dt = Date.now() - tStartTime;
     var dist = Math.hypot(dx, dy);
 
-    // Swipe (when not zoomed)
     if (zoom <= 1.05 && dt < 600 && dist > 40) {
       if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
-        if (dx < 0) lbStep(1);
-        else lbStep(-1);
+        if (dx < 0) lbStep(1); else lbStep(-1);
         return;
       }
       if (dy > 90 && Math.abs(dy) > Math.abs(dx)) {
@@ -2981,13 +2920,11 @@ APP = r"""<!DOCTYPE html>
         return;
       }
     }
-    // Tap (single & double)
     if (dt < 260 && dist < 12) {
       var now = Date.now();
       if (now - lastTapTime < 320 &&
           Math.abs(t.clientX - lastTapX) < 44 &&
           Math.abs(t.clientY - lastTapY) < 44) {
-        // double tap
         if (zoom > 1.05) resetZoom(true);
         else zoomAt(t.clientX, t.clientY, 2.4);
         lastTapTime = 0;
@@ -2996,26 +2933,6 @@ APP = r"""<!DOCTYPE html>
         lastTapX = t.clientX;
         lastTapY = t.clientY;
       }
-    }
-  }, { passive: true });
-
-  /* === One-finger pan when zoomed (mobile) === */
-  var lastPanX = 0, lastPanY = 0;
-  lbViewport.addEventListener("touchstart", function(e){
-    if (e.touches.length === 1 && zoom > 1.001) {
-      lastPanX = e.touches[0].clientX;
-      lastPanY = e.touches[0].clientY;
-    }
-  }, { passive: true });
-  lbViewport.addEventListener("touchmove", function(e){
-    if (e.touches.length === 1 && zoom > 1.001 && !tPinch) {
-      var dx = e.touches[0].clientX - lastPanX;
-      var dy = e.touches[0].clientY - lastPanY;
-      panX += dx;
-      panY += dy;
-      lastPanX = e.touches[0].clientX;
-      lastPanY = e.touches[0].clientY;
-      applyTransform();
     }
   }, { passive: true });
 
@@ -3120,6 +3037,10 @@ APP = r"""<!DOCTYPE html>
       lastSubmitted = r.code;
       updateOtpCopyState();
       runSearch(r.code);
+    } else if (r.mode === "find") {
+      setMode("find", true);
+    } else if (r.mode === "create") {
+      setMode("create", true);
     } else {
       setMode("create", true);
     }
