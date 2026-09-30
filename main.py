@@ -149,7 +149,6 @@ def _etag_for_photo(code: str, idx: int, entry: dict) -> str:
 
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
 
-# GZip-middleware: сжимает всё, что больше 500 байт и умеет text/json
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -247,7 +246,6 @@ async def get_post(code: str, request: Request):
     if entry is None:
         raise HTTPException(404, "Пост не найден")
 
-    # ETag → 304 без тела
     etag = _etag_for_post(code, entry)
     if request.headers.get("if-none-match") == etag:
         return Response(
@@ -1985,6 +1983,12 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
+/* ============================================================
+   TOPBAR — меню «Создать / Найти» строго по центру.
+   Логотип — слева, вспомогательные кнопки — справа.
+   Центрирование через position:absolute, не через space-between:
+   так меню стоит ровно по центру шапки при любой ширине соседей.
+   ============================================================ */
 .topbar{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:100;width:calc(100% - 28px);max-width:1160px;border-radius:16px;
@@ -1995,12 +1999,19 @@ body.cursor-ready .cur-ring { opacity:1; }
   box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
   padding-top: max(10px, env(safe-area-inset-top, 0px) + 4px);
 }
-.topbar-inner{display:flex;align-items:center;gap:14px;justify-content:space-between;flex-wrap:nowrap}
+.topbar-inner{
+  position:relative;
+  display:flex;align-items:center;gap:12px;
+  min-height:44px;
+}
+.topbar .logo{flex-shrink:0;margin-right:auto;}
+.topbar .back-btn,
+.topbar .exit-btn{flex-shrink:0;margin-left:auto;}
 .logo{
   display:inline-flex;align-items:center;gap:10px;
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:13.5px;letter-spacing:-0.01em;
-  text-decoration:none;color:#fff;white-space:nowrap;flex-shrink:0;
+  text-decoration:none;color:#fff;white-space:nowrap;
 }
 .logo-mark{
   width:28px;height:28px;border-radius:8px;
@@ -2016,10 +2027,17 @@ body.cursor-ready .cur-ring { opacity:1; }
 .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
 .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
+/* Меню — центр шапки */
 .menu{
-  position:relative;display:inline-flex;gap:4px;padding:4px;
+  position:absolute;
+  left:50%;
+  top:50%;
+  transform:translate(-50%,-50%);
+  z-index:2;
+  display:inline-flex;gap:4px;padding:4px;
   border-radius:12px;background:rgba(255,255,255,0.028);
-  border:1px solid var(--border);flex-shrink:0;
+  border:1px solid var(--border);
+  flex-shrink:0;
 }
 .menu-pill{
   position:absolute;top:4px;bottom:4px;left:0;width:0;
@@ -2047,7 +2065,7 @@ body.cursor-ready .cur-ring { opacity:1; }
   color:var(--text-dim);text-decoration:none;
   font-size:13px;font-weight:500;
   padding:8px 12px;border-radius:10px;
-  transition:color .2s,background .2s;white-space:nowrap;flex-shrink:0;
+  transition:color .2s,background .2s;white-space:nowrap;
 }
 .back-btn svg{width:14px;height:14px;display:block}
 .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
@@ -2070,17 +2088,11 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .exit-btn:active{transform:scale(.98)}
 
-/* ===================================================================
-   PWA STANDALONE — прячем всё, что уводит из приложения.
-   Пользователь может просто закрыть приложение, отдельной "выход"
-   кнопки в установленном режиме не нужно.
-   =================================================================== */
 @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
   .topbar .back-btn,
   .topbar .exit-btn { display: none !important; }
   .topbar .logo { pointer-events: none; }
   .topbar-inner { gap: 12px; }
-  .topbar .menu { margin-left: auto; }
 }
 
 .app{
@@ -2306,7 +2318,18 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .share-link-copy.copied .sl-copy{display:none}
 .share-link-copy.copied .sl-check{display:block}
 
-.lightbox{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.96);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);user-select:none;-webkit-user-select:none;touch-action:none}
+/* ============================================================
+   LIGHTBOX
+   ============================================================ */
+.lightbox{
+  position:fixed;inset:0;z-index:1000;
+  display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,0.96);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  user-select:none;-webkit-user-select:none;touch-action:none;
+  transition:background-color .2s ease;
+  overscroll-behavior:contain;
+}
 .lightbox[hidden]{display:none}
 .lb-viewport{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:default;touch-action:none}
 .lb-transform{display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}
@@ -2322,8 +2345,22 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     linear-gradient(-45deg,transparent 75%,rgba(255,255,255,.04) 75%);
   background-size:16px 16px;
   background-position:0 0,0 8px,8px -8px,-8px 0px;
+  transition:opacity .18s ease;
 }
-.lb-btn{position:absolute;width:42px;height:42px;border-radius:12px;border:1px solid var(--border-2);background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;transition:background .18s,border-color .18s}
+.lb-img.loading{opacity:0.25}
+/* Спиннер загрузки поверх картинки */
+.lb-loading{
+  position:absolute;top:50%;left:50%;
+  width:30px;height:30px;margin:-15px 0 0 -15px;
+  border:2px solid rgba(255,255,255,0.15);
+  border-top-color:#fff;
+  border-radius:50%;
+  animation:spin .8s linear infinite;
+  z-index:3;pointer-events:none;
+  opacity:0;transition:opacity .18s ease;
+}
+.lightbox.loading .lb-loading{opacity:1}
+.lb-btn{position:absolute;width:42px;height:42px;border-radius:12px;border:1px solid var(--border-2);background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;transition:background .18s,border-color .18s,transform .18s}
 .lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
 .lb-btn:hover{background:rgba(30,30,30,0.95);border-color:var(--border-3)}
 .lb-btn:active{transform:scale(.94)}
@@ -2411,17 +2448,15 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   }
   .stage::-webkit-scrollbar{ display:none; }
   .topbar{ top: max(10px, env(safe-area-inset-top, 0px) + 6px); width: calc(100% - 20px); padding: 8px 8px 8px 10px; border-radius: 14px; }
-  .topbar-inner{ flex-wrap: nowrap; gap: 8px; justify-content: space-between; }
+  .topbar-inner{ min-height: 40px; gap: 8px; }
   .topbar .logo,
   .topbar .back-btn{ display: none !important; }
-  .topbar .menu{ flex: 1 1 auto; min-width: 0; justify-content: center; padding: 3px; }
-  .topbar .menu .tab{ flex: 1 1 0; justify-content: center; padding: 9px 10px; font-size: 12.5px; }
-  .topbar .exit-btn{ display: inline-flex; flex-shrink: 0; padding: 9px 13px; font-size: 12.5px; }
+  .topbar .menu{ padding: 3px; }
+  .topbar .menu .tab{ padding: 9px 10px; font-size: 12.5px; }
+  .topbar .exit-btn{ display: inline-flex; padding: 9px 13px; font-size: 12.5px; }
 
-  /* В standalone режиме на мобильном — выйти не показываем */
   @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
     .topbar .exit-btn { display: none !important; }
-    .topbar .menu { flex: 1 1 auto; }
   }
 
   .lb-btn{ width:44px; height:44px; }
@@ -2630,6 +2665,7 @@ APP = r"""<!DOCTYPE html>
       <img class="lb-img" id="lbImg" alt="" draggable="false">
     </div>
   </div>
+  <div class="lb-loading" aria-hidden="true"></div>
   <div class="lb-zoom-badge" id="lbZoomBadge">100%</div>
   <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -2669,8 +2705,6 @@ APP = r"""<!DOCTYPE html>
   } catch(e) {}
   if (isStandalone) {
     document.documentElement.classList.add('standalone');
-    // В standalone прячем кнопку "Выйти" (она всё равно скрыта CSS-ом,
-    // но уберём её из tab-order полностью)
     var eb = document.querySelector('.exit-btn');
     if (eb) eb.setAttribute('tabindex', '-1');
     var bb = document.querySelector('.back-btn');
@@ -2830,7 +2864,6 @@ APP = r"""<!DOCTYPE html>
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
 
-  // Проверка поддержки WebP (делается 1 раз)
   var SUPPORTS_WEBP = (function(){
     try {
       var c = document.createElement('canvas');
@@ -2846,7 +2879,6 @@ APP = r"""<!DOCTYPE html>
     if (targetBytes === undefined) targetBytes = TARGET_PHOTO_BYTES;
     if (file.type.indexOf("image/") !== 0) return file;
 
-    // Быстрый путь: если это уже подходящий формат и размер — не трогаем
     if (file.size <= targetBytes && (file.type === OUT_MIME)) return file;
 
     try {
@@ -2866,7 +2898,6 @@ APP = r"""<!DOCTYPE html>
         ctx.imageSmoothingQuality = "high";
         ctx.drawImage(bitmap, 0, 0, w, h);
 
-        // Бинарный поиск качества. Для WebP можно уходить ниже — он лучше держит детали.
         var lo = SUPPORTS_WEBP ? 0.4 : 0.35;
         var hi = SUPPORTS_WEBP ? 0.95 : 0.92;
         var candidate = null;
@@ -2963,7 +2994,6 @@ APP = r"""<!DOCTYPE html>
     dropLabel.textContent = "Сжимаем фото...";
 
     try {
-      // Параллельная компрессия, но не более 3 одновременно
       var CONCURRENCY = 3;
       var results = new Array(accepted.length);
       var idx = 0;
@@ -3033,7 +3063,6 @@ APP = r"""<!DOCTYPE html>
       var res = await fetch("/api/posts", { method: "POST", body: fd });
       return res;
     } catch (e) {
-      // Повтор при сетевой ошибке (1 retry)
       if (attempt < 1) {
         await new Promise(function(r){ setTimeout(r, 400); });
         return postForm(fd, attempt + 1);
@@ -3119,7 +3148,6 @@ APP = r"""<!DOCTYPE html>
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
   var searchSeq = 0, lastSubmitted = "", otpCopyTimer = null;
 
-  // Локальный кеш найденных постов (in-memory)
   var postCache = new Map();
   var postCacheETag = new Map();
 
@@ -3200,18 +3228,49 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* ============ LIGHTBOX ============ */
+  /* ============================================================
+     LIGHTBOX — улучшенный просмотр фото, особенно на телефоне.
+     Что нового:
+       • инерция панорамирования (после свайпа картинка «докатывается»)
+       • свайп вниз для закрытия с плавным затемнением фона
+       • быстрый и точный двойной тап (320 мс / 44 px)
+       • pinch с якорем в середине между пальцами
+       • анимированный snap-back, если зум ушёл ниже 1×
+       • спиннер загрузки фото поверх изображения
+     ============================================================ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
   var lbCode = null, lbPhotos = [], lbIndex = 0;
-  var zoom = 1, panX = 0, panY = 0;
+  var zoom = 1, panX = 0, panY = 0, swipeY = 0;
   var MIN_ZOOM = 1, MAX_ZOOM = 8;
   var isPanning = false, panStartX = 0, panStartY = 0, badgeTimer = null;
+  var inertiaRaf = 0, lbLoadTimer = null;
+
+  /* Спрятать спиннер и снять .loading, когда картинка загрузилась */
+  function lbStopLoading(){
+    clearTimeout(lbLoadTimer); lbLoadTimer = null;
+    lightbox.classList.remove('loading');
+  }
+  lbImg.addEventListener('load', function(){ lbStopLoading(); });
+  lbImg.addEventListener('error', function(){ lbStopLoading(); });
 
   function applyTransform(){
-    lbTransform.style.transform = "translate(" + panX + "px," + panY + "px) scale(" + zoom + ")";
+    var totalY = panY + swipeY;
+    lbTransform.style.transform = "translate(" + panX + "px," + totalY + "px) scale(" + zoom + ")";
     lbViewport.style.cursor = (zoom > 1.001) ? (isPanning ? "grabbing" : "grab") : "default";
+    if (swipeY > 0) {
+      // Затемняем фон, когда тянем вниз для закрытия
+      var fade = Math.max(0.15, 1 - swipeY / 420);
+      lightbox.style.background = "rgba(0,0,0," + (0.96 * fade).toFixed(3) + ")";
+      lbTransform.style.opacity = Math.max(0.35, fade).toFixed(3);
+    } else {
+      lightbox.style.background = "";
+      lbTransform.style.opacity = "";
+    }
+  }
+  function stopInertia(){
+    if (inertiaRaf) { cancelAnimationFrame(inertiaRaf); inertiaRaf = 0; }
   }
   function showZoomBadge(){
     lbZoomBadge.textContent = Math.round(zoom * 100) + "%";
@@ -3219,39 +3278,82 @@ APP = r"""<!DOCTYPE html>
     clearTimeout(badgeTimer);
     badgeTimer = setTimeout(function(){ lbZoomBadge.classList.remove("visible"); }, 900);
   }
+  function animateTransformTo(targetZoom, targetPanX, targetPanY, duration){
+    duration = duration || 220;
+    var sZ = zoom, sX = panX, sY = panY;
+    var t0 = performance.now();
+    function step(){
+      var t = Math.min(1, (performance.now() - t0) / duration);
+      var eased = 1 - Math.pow(1 - t, 3);
+      zoom = sZ + (targetZoom - sZ) * eased;
+      panX = sX + (targetPanX - sX) * eased;
+      panY = sY + (targetPanY - sY) * eased;
+      applyTransform();
+      if (t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
   function resetZoom(animate){
-    if (animate) lbTransform.style.transition = "transform .2s ease";
-    zoom = 1; panX = 0; panY = 0; applyTransform();
-    if (animate) setTimeout(function(){ lbTransform.style.transition = ""; }, 220);
+    if (animate) {
+      animateTransformTo(1, 0, 0, 220);
+    } else {
+      zoom = 1; panX = 0; panY = 0; swipeY = 0; applyTransform();
+    }
     showZoomBadge();
   }
-  function zoomAt(clientX, clientY, newZoom){
+  function zoomAt(clientX, clientY, newZoom, animate){
     newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
     if (Math.abs(newZoom - zoom) < 1e-4) return;
     var vrect = lbViewport.getBoundingClientRect();
     var Cx = vrect.left + vrect.width / 2, Cy = vrect.top + vrect.height / 2;
     var dcx = clientX - Cx, dcy = clientY - Cy;
     var ratio = newZoom / zoom;
-    panX = dcx - (dcx - panX) * ratio;
-    panY = dcy - (dcy - panY) * ratio;
-    zoom = newZoom;
-    lbTransform.style.transition = "";
-    applyTransform(); showZoomBadge();
+    var targetPanX = dcx - (dcx - panX) * ratio;
+    var targetPanY = dcy - (dcy - panY) * ratio;
+    if (animate) {
+      animateTransformTo(newZoom, targetPanX, targetPanY, 220);
+    } else {
+      panX = targetPanX;
+      panY = targetPanY;
+      zoom = newZoom;
+      lbTransform.style.transition = "";
+      applyTransform();
+    }
+    showZoomBadge();
   }
+
   function openLightbox(code, photos, index){
     lbCode = code; lbPhotos = photos; lbIndex = index;
-    zoom = 1; panX = 0; panY = 0; lbTransform.style.transition = ""; applyTransform();
+    zoom = 1; panX = 0; panY = 0; swipeY = 0;
+    lbTransform.style.transition = ""; applyTransform();
+    lightbox.classList.add('loading');
+    clearTimeout(lbLoadTimer);
+    lbLoadTimer = setTimeout(lbStopLoading, 8000);
     lbImg.src = "/api/photos/" + encodeURIComponent(code) + "/" + index;
     lbImg.alt = (photos[index] && photos[index].name) || "";
     lbCounter.textContent = (index + 1) + " / " + photos.length;
     lbPrev.hidden = photos.length < 2; lbNext.hidden = photos.length < 2;
     lightbox.hidden = false;
   }
-  function closeLightbox(){ lightbox.hidden = true; lbImg.removeAttribute("src"); lbPhotos = []; lbCode = null; }
+  function closeLightbox(){
+    stopInertia();
+    lightbox.hidden = true;
+    lbImg.removeAttribute("src");
+    lbPhotos = []; lbCode = null;
+    swipeY = 0; panX = 0; panY = 0; zoom = 1;
+    lbTransform.style.transform = "";
+    lbTransform.style.opacity = "";
+    lightbox.style.background = "";
+    lightbox.classList.remove('loading');
+  }
   function lbStep(dir){
     if (lbPhotos.length < 2) return;
     lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
-    zoom = 1; panX = 0; panY = 0; lbTransform.style.transition = ""; applyTransform();
+    zoom = 1; panX = 0; panY = 0; swipeY = 0;
+    lbTransform.style.transition = ""; applyTransform();
+    lightbox.classList.add('loading');
+    clearTimeout(lbLoadTimer);
+    lbLoadTimer = setTimeout(lbStopLoading, 8000);
     lbImg.src = "/api/photos/" + encodeURIComponent(lbCode) + "/" + lbIndex;
     lbImg.alt = (lbPhotos[lbIndex] && lbPhotos[lbIndex].name) || "";
     lbCounter.textContent = (lbIndex + 1) + " / " + lbPhotos.length;
@@ -3259,7 +3361,7 @@ APP = r"""<!DOCTYPE html>
   lbPrev.addEventListener("click", function(e){ e.stopPropagation(); lbStep(-1); });
   lbNext.addEventListener("click", function(e){ e.stopPropagation(); lbStep(1); });
   lbClose.addEventListener("click", function(e){ e.stopPropagation(); closeLightbox(); });
-  lbViewport.addEventListener("click", function(e){ if (e.target === lbViewport && zoom <= 1.001) closeLightbox(); });
+  lbViewport.addEventListener("click", function(e){ if (e.target === lbViewport && zoom <= 1.001 && swipeY === 0) closeLightbox(); });
   lbViewport.addEventListener("wheel", function(e){
     e.preventDefault();
     var factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
@@ -3269,6 +3371,7 @@ APP = r"""<!DOCTYPE html>
     if (e.button === 2) { e.preventDefault(); if (zoom > 1.05) resetZoom(true); else zoomAt(e.clientX, e.clientY, 2); return; }
     if (e.button === 0 && zoom > 1.001) {
       e.preventDefault();
+      stopInertia();
       isPanning = true;
       panStartX = e.clientX - panX; panStartY = e.clientY - panY;
       lbTransform.style.transition = "none";
@@ -3277,7 +3380,7 @@ APP = r"""<!DOCTYPE html>
   });
   lbViewport.addEventListener("dblclick", function(e){
     e.preventDefault();
-    if (zoom > 1.05) resetZoom(true); else zoomAt(e.clientX, e.clientY, 2);
+    if (zoom > 1.05) resetZoom(true); else zoomAt(e.clientX, e.clientY, 2, true);
   });
   addEventListener("mousemove", function(e){
     if (!isPanning) return;
@@ -3290,91 +3393,206 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  var touchStartDist = 0, touchStartZoom = 1;
-  var tStartX = 0, tStartY = 0, tStartTime = 0;
-  var tActive = false, tPinch = false;
-  var lastTapTime = 0, lastTapX = 0, lastTapY = 0;
-  var lastPanX = 0, lastPanY = 0;
+  /* ============ TOUCH: улучшенный мобильный просмотр ============ */
+  var tMode = 'idle'; // 'idle' | 'pan' | 'pinch' | 'swipe-down'
+  var tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0;
+  var tStartTime = 0, tLastFrameTime = 0;
+  var tStartPanX = 0, tStartPanY = 0;
+  var tPinchStartDist = 0, tPinchStartZoom = 1;
+  var tPinchMidX = 0, tPinchMidY = 0;
+  var tPinchStartPanX = 0, tPinchStartPanY = 0;
+  var tVelX = 0, tVelY = 0;
+  var tTapTime = 0, tTapX = 0, tTapY = 0;
+
+  function startInertia(vx, vy){
+    stopInertia();
+    function step(){
+      vx *= 0.94; vy *= 0.94;
+      panX += vx; panY += vy;
+      applyTransform();
+      if (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5) {
+        inertiaRaf = requestAnimationFrame(step);
+      } else {
+        inertiaRaf = 0;
+      }
+    }
+    inertiaRaf = requestAnimationFrame(step);
+  }
 
   lbViewport.addEventListener("touchstart", function(e){
+    stopInertia();
+    lbTransform.style.transition = "none";
+
     if (e.touches.length === 2) {
-      touchStartDist = Math.hypot(
+      tMode = 'pinch';
+      tPinchStartDist = Math.hypot(
         e.touches[0].clientX - e.touches[1].clientX,
         e.touches[0].clientY - e.touches[1].clientY
-      );
-      touchStartZoom = zoom;
-      tPinch = true;
-      tActive = false;
+      ) || 1;
+      tPinchStartZoom = zoom;
+      tPinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      tPinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      tPinchStartPanX = panX;
+      tPinchStartPanY = panY;
     } else if (e.touches.length === 1) {
       tStartX = e.touches[0].clientX;
       tStartY = e.touches[0].clientY;
-      tStartTime = Date.now();
-      tActive = true;
-      tPinch = false;
-      lastPanX = e.touches[0].clientX;
-      lastPanY = e.touches[0].clientY;
+      tLastX = tStartX; tLastY = tStartY;
+      tStartTime = performance.now();
+      tLastFrameTime = tStartTime;
+      tStartPanX = panX; tStartPanY = panY;
+      tVelX = 0; tVelY = 0;
+      swipeY = 0;
+      // если не приближено — начинаем со «свайп вниз» как гипотезы,
+      // по первому движению определимся (вниз = закрыть, вбок = листать)
+      tMode = (zoom <= 1.05) ? 'swipe-down' : 'pan';
     }
   }, { passive: true });
 
   lbViewport.addEventListener("touchmove", function(e){
-    if (e.touches.length === 2 && tPinch && touchStartDist > 0) {
-      e.preventDefault();
+    if (tMode === 'idle') return;
+    e.preventDefault();
+
+    if (tMode === 'pinch' && e.touches.length === 2) {
       var dist = Math.hypot(
         e.touches[0].clientX - e.touches[1].clientX,
         e.touches[0].clientY - e.touches[1].clientY
-      );
-      var cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-      var cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-      zoomAt(cx, cy, touchStartZoom * (dist / touchStartDist));
-    } else if (e.touches.length === 1 && zoom > 1.001 && !tPinch) {
-      var dx = e.touches[0].clientX - lastPanX;
-      var dy = e.touches[0].clientY - lastPanY;
-      panX += dx;
-      panY += dy;
-      lastPanX = e.touches[0].clientX;
-      lastPanY = e.touches[0].clientY;
+      ) || 1;
+      var scale = dist / tPinchStartDist;
+      var newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, tPinchStartZoom * scale));
+
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+
+      // анкор в центре pinch — точка под пальцами остаётся под пальцами
+      var vrect = lbViewport.getBoundingClientRect();
+      var cx = vrect.left + vrect.width / 2;
+      var cy = vrect.top + vrect.height / 2;
+      var relX = tPinchMidX - cx - tPinchStartPanX;
+      var relY = tPinchMidY - cy - tPinchStartPanY;
+      var ratio = newZoom / tPinchStartZoom;
+
+      panX = -relX * ratio + (midX - cx) + tPinchStartPanX;
+      panY = -relY * ratio + (midY - cy) + tPinchStartPanY;
+      zoom = newZoom;
       applyTransform();
+      showZoomBadge();
+      return;
+    }
+
+    if (e.touches.length === 1) {
+      var tx = e.touches[0].clientX;
+      var ty = e.touches[0].clientY;
+      var dx = tx - tLastX;
+      var dy = ty - tLastY;
+      var totalDx = tx - tStartX;
+      var totalDy = ty - tStartY;
+
+      // Определяемся с интентом по первому заметному движению
+      if (tMode === 'swipe-down') {
+        if (Math.abs(totalDx) > 12 && Math.abs(totalDx) > Math.abs(totalDy)) {
+          tMode = 'pan';
+        } else if (totalDy < -12 && Math.abs(totalDy) > Math.abs(totalDx)) {
+          // свайп вверх — тоже панорама, но картинка не закрывается
+          tMode = 'pan';
+        }
+      }
+
+      if (tMode === 'swipe-down' && zoom <= 1.05) {
+        // Свайп вниз — «тянем» картинку за пальцем
+        swipeY = Math.max(0, totalDy);
+        applyTransform();
+      } else if (tMode === 'pan') {
+        panX += dx;
+        panY += dy;
+        applyTransform();
+      }
+
+      // Скорость для инерции (сглаженная)
+      var now = performance.now();
+      var dt = now - tLastFrameTime;
+      if (dt > 8) {
+        tVelX = (tx - tLastX) / dt * 16;
+        tVelY = (ty - tLastY) / dt * 16;
+        tLastFrameTime = now;
+        tLastX = tx;
+        tLastY = ty;
+      }
     }
   }, { passive: false });
 
   lbViewport.addEventListener("touchend", function(e){
-    if (tPinch) {
-      tPinch = false;
-      touchStartDist = 0;
+    var modeAtEnd = tMode;
+    var wasPinch = (modeAtEnd === 'pinch');
+    tMode = 'idle';
+
+    if (wasPinch) {
+      // Если pinch «улетел» ниже 1× — мягко возвращаем
+      if (zoom < 1) {
+        animateTransformTo(1, 0, 0, 220);
+        zoom = 1;
+      } else if (zoom > MAX_ZOOM) {
+        animateTransformTo(MAX_ZOOM, panX, panY, 180);
+      }
       return;
     }
-    if (!tActive) return;
-    tActive = false;
-    if (!e.changedTouches.length) return;
+
     var t = e.changedTouches[0];
+    if (!t) return;
     var dx = t.clientX - tStartX;
     var dy = t.clientY - tStartY;
-    var dt = Date.now() - tStartTime;
+    var dt = performance.now() - tStartTime;
     var dist = Math.hypot(dx, dy);
 
-    if (zoom <= 1.05 && dt < 600 && dist > 40) {
+    if (modeAtEnd === 'swipe-down' && swipeY > 0) {
+      var velocity = dist / Math.max(1, dt) * 16; // пикс/кадр
+      if (swipeY > 120 || (dy > 60 && velocity > 12)) {
+        closeLightbox();
+        return;
+      }
+      // Мягкий откат вверх
+      var startSwipe = swipeY;
+      var t0 = performance.now();
+      (function easeBack(){
+        var t2 = (performance.now() - t0) / 220;
+        if (t2 >= 1) {
+          swipeY = 0; applyTransform();
+          return;
+        }
+        var eased = 1 - Math.pow(1 - t2, 3);
+        swipeY = startSwipe * (1 - eased);
+        applyTransform();
+        requestAnimationFrame(easeBack);
+      })();
+      return;
+    }
+
+    // Тап/двойной тап
+    if (dt < 300 && dist < 12) {
+      var now = performance.now();
+      if (now - tTapTime < 320 &&
+          Math.hypot(t.clientX - tTapX, t.clientY - tTapY) < 44) {
+        if (zoom > 1.05) resetZoom(true);
+        else zoomAt(t.clientX, t.clientY, 2.4, true);
+        tTapTime = 0;
+        return;
+      }
+      tTapTime = now;
+      tTapX = t.clientX;
+      tTapY = t.clientY;
+    }
+
+    // Свайп вбок — листать (только если не приближено)
+    if (modeAtEnd === 'pan' && zoom <= 1.05 && dt < 600 && dist > 40) {
       if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
         if (dx < 0) lbStep(1); else lbStep(-1);
         return;
       }
-      if (dy > 90 && Math.abs(dy) > Math.abs(dx)) {
-        closeLightbox();
-        return;
-      }
     }
-    if (dt < 260 && dist < 12) {
-      var now = Date.now();
-      if (now - lastTapTime < 320 &&
-          Math.abs(t.clientX - lastTapX) < 44 &&
-          Math.abs(t.clientY - lastTapY) < 44) {
-        if (zoom > 1.05) resetZoom(true);
-        else zoomAt(t.clientX, t.clientY, 2.4);
-        lastTapTime = 0;
-      } else {
-        lastTapTime = now;
-        lastTapX = t.clientX;
-        lastTapY = t.clientY;
-      }
+
+    // Инерция панорамы
+    if (modeAtEnd === 'pan' && zoom > 1.05 && (Math.abs(tVelX) > 1 || Math.abs(tVelY) > 1)) {
+      startInertia(tVelX, tVelY);
     }
   }, { passive: true });
 
@@ -3453,28 +3671,24 @@ APP = r"""<!DOCTYPE html>
     if (mySeq !== searchSeq) return;
 
     try {
-      // Кеш: если уже искали этот пост — показываем мгновенно
       if (postCache.has(code)) {
         renderPost(postCache.get(code));
-        // Параллельно ревалидируем в фоне через ETag
         (async function(){
           try {
             var etag = postCacheETag.get(code);
             var h = {};
             if (etag) h["If-None-Match"] = etag;
             var r = await fetch("/api/posts/" + encodeURIComponent(code), { headers: h });
-            if (r.status === 304) return; // всё актуально
+            if (r.status === 304) return;
             if (r.ok) {
               var fresh = await r.json();
               if (fresh && fresh.code) {
                 postCache.set(code, fresh);
                 var newTag = r.headers.get("etag");
                 if (newTag) postCacheETag.set(code, newTag);
-                // Если всё ещё на том же поиске — обновим карточку
                 if (mySeq === searchSeq) renderPost(fresh);
               }
             } else if (r.status === 404) {
-              // Пост исчез (перезапуск сервера) — чистим кеш и показываем ошибку
               postCache.delete(code);
               postCacheETag.delete(code);
               if (mySeq === searchSeq) renderError("Пост не найден");
@@ -3484,7 +3698,6 @@ APP = r"""<!DOCTYPE html>
         return;
       }
 
-      // Кеша нет — обычный запрос
       var res = await fetch("/api/posts/" + encodeURIComponent(code));
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
@@ -3496,7 +3709,6 @@ APP = r"""<!DOCTYPE html>
       if (mySeq !== searchSeq) return;
       if (!post) { renderError("Пост не найден"); return; }
 
-      // Запоминаем в кеш
       postCache.set(code, post);
       var tag = res.headers.get("etag");
       if (tag) postCacheETag.set(code, tag);
