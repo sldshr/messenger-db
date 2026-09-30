@@ -299,6 +299,9 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
+# ============================================================
+# ОБЩИЙ CSS
+# ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -694,7 +697,7 @@ SHELL_JS = r"""
 """
 
 
-def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "", extra_js: str = "") -> str:
+def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "") -> str:
     nav_links = [
         ("/", "Главная"),
         ("/#features", "Возможности"),
@@ -773,7 +776,6 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '    </div>\n'
         '  </div>\n</footer>\n'
         '<script>' + SHELL_JS + '</script>\n'
-        + extra_js +
         '</body>\n</html>'
     )
 
@@ -1623,11 +1625,12 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
+/* ===== TOPBAR ===== */
 .topbar{
   position:fixed;top:14px;left:50%;transform:translateX(-50%);
   z-index:100;width:calc(100% - 28px);max-width:1160px;border-radius:16px;
   padding:10px 12px 10px 18px;
-  background:rgba(10,10,10,0.62);
+  background:rgba(10,10,10,0.72);
   backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
   border:1px solid var(--border);
   box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
@@ -1689,18 +1692,48 @@ body.cursor-ready .cur-ring { opacity:1; }
 .back-btn svg{width:14px;height:14px;display:block}
 .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
 
+/* Кнопка "Выйти" — только для мобильной версии */
+.exit-btn{
+  display:none;
+  align-items:center;
+  gap:7px;
+  padding:9px 14px;
+  border-radius:10px;
+  background:rgba(200,70,70,0.92);
+  border:1px solid rgba(240,110,110,0.9);
+  color:#fff;
+  font:inherit;
+  font-size:13px;
+  font-weight:600;
+  cursor:pointer;
+  text-decoration:none;
+  white-space:nowrap;
+  transition:transform .22s cubic-bezier(.2,.8,.2,1),background .22s,border-color .22s,box-shadow .22s;
+  box-shadow:0 6px 18px -8px rgba(200,70,70,0.5),inset 0 1px 0 rgba(255,255,255,0.18);
+}
+.exit-btn svg{width:14px;height:14px;display:block}
+.exit-btn:hover,.exit-btn:active{
+  background:rgba(220,80,80,1);
+  border-color:rgba(255,130,130,1);
+  transform:translateY(-1px);
+  box-shadow:0 10px 24px -8px rgba(200,70,70,0.6),inset 0 1px 0 rgba(255,255,255,0.22);
+}
+.exit-btn:active{transform:translateY(0) scale(.98)}
+
+/* ===== APP LAYOUT ===== */
 .app{
   min-height:100dvh;
-  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
   padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
 }
 
-/* ПРОСТАЯ, НАДЁЖНАЯ СХЕМА ТАБОВ:
-   активная панель - position: relative (даёт высоту stage)
-   неактивная - position: absolute (не влияет на layout) */
 .stage{
-  position:relative;
-  width:100%;max-width:560px;
+  width:100%;
+  max-width:560px;
+  margin:auto 0;
+  /* если контент не помещается — margin auto схлопнется, страница будет скроллиться на десктопе */
 }
 .stage[hidden]{display:none}
 .panel{
@@ -1919,10 +1952,26 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .share-link-copy.copied .sl-copy{display:none}
 .share-link-copy.copied .sl-check{display:block}
 
-.lightbox{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.94);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+/* ===== LIGHTBOX ===== */
+.lightbox{
+  position:fixed;inset:0;z-index:1000;
+  display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,0.96);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  user-select:none;-webkit-user-select:none;
+  touch-action:none;
+}
 .lightbox[hidden]{display:none}
-.lb-viewport{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:default}
-.lb-transform{display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}
+.lb-viewport{
+  position:absolute;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  overflow:hidden;cursor:default;
+  touch-action:none;
+}
+.lb-transform{
+  display:flex;align-items:center;justify-content:center;
+  transform-origin:center center;will-change:transform;
+}
 .lb-img{
   display:block;max-width:82vw;max-height:78vh;
   object-fit:contain;border-radius:8px;
@@ -1936,18 +1985,57 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   background-size:16px 16px;
   background-position:0 0,0 8px,8px -8px,-8px 0px;
 }
-.lb-btn{position:absolute;width:40px;height:40px;border-radius:11px;border:1px solid var(--border-2);background:rgba(15,15,15,0.75);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;transition:background .18s,border-color .18s}
+.lb-btn{
+  position:absolute;width:42px;height:42px;border-radius:12px;
+  border:1px solid var(--border-2);
+  background:rgba(15,15,15,0.8);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;z-index:2;
+  transition:background .18s,border-color .18s,transform .2s;
+}
 .lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
-.lb-btn:hover{background:rgba(30,30,30,0.9);border-color:var(--border-3)}
+.lb-btn:hover{background:rgba(30,30,30,0.95);border-color:var(--border-3)}
+.lb-btn:active{transform:scale(.94)}
 .lb-btn[hidden]{display:none}
 .lb-close{top:16px;right:16px}
 .lb-prev{left:16px;top:50%;transform:translateY(-50%)}
 .lb-next{right:16px;top:50%;transform:translateY(-50%)}
-.lb-counter{position:absolute;bottom:18px;left:50%;transform:translateX(-50%);padding:6px 14px;border-radius:10px;background:rgba(15,15,15,0.75);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);font-size:12px;color:var(--text);font-family:'JetBrains Mono',monospace;letter-spacing:.06em;z-index:2;pointer-events:none}
-.lb-zoom-badge{position:absolute;top:16px;left:16px;padding:5px 11px;border-radius:10px;background:rgba(15,15,15,0.75);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border-2);font-size:11.5px;color:var(--text);font-family:'JetBrains Mono',monospace;z-index:2;pointer-events:none;opacity:0;transition:opacity .18s ease}
+.lb-counter{
+  position:absolute;bottom:20px;left:50%;transform:translateX(-50%);
+  padding:7px 16px;border-radius:11px;
+  background:rgba(15,15,15,0.8);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--border-2);
+  font-size:12.5px;color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  letter-spacing:.06em;
+  z-index:2;pointer-events:none;
+}
+.lb-zoom-badge{
+  position:absolute;top:16px;left:16px;
+  padding:5px 11px;border-radius:10px;
+  background:rgba(15,15,15,0.8);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--border-2);
+  font-size:11.5px;color:var(--text);
+  font-family:'JetBrains Mono',monospace;
+  z-index:2;pointer-events:none;
+  opacity:0;transition:opacity .18s ease;
+}
 .lb-zoom-badge.visible{opacity:1}
-.lb-hint{position:absolute;bottom:56px;left:50%;transform:translateX(-50%);font-size:11.5px;color:var(--text-mute);z-index:2;pointer-events:none;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.02em}
+.lb-hint{
+  position:absolute;bottom:64px;left:50%;transform:translateX(-50%);
+  font-size:11.5px;color:var(--text-mute);
+  z-index:2;pointer-events:none;white-space:nowrap;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+  text-align:center;
+  padding:0 16px;
+}
+.lb-hint-mobile{display:none}
 
+/* ===== MODAL ===== */
 .modal{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:20px;animation:fadeIn .22s ease}
 .modal[hidden]{display:none}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
@@ -1970,19 +2058,11 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .modal-actions{display:flex;gap:8px}
 .modal-actions .btn{flex:1;height:42px;font-size:13px}
 
+/* ===== DESKTOP RESPONSIVE ===== */
 @media (max-width:820px){
   .topbar{padding:9px 10px 9px 14px}
-  .logo-word{display:none}
-  .back-btn span{display:none}
-  .back-btn{padding:8px 10px}
-  .menu{padding:3px}
-  .tab{padding:8px 13px;font-size:12.5px}
 }
 @media (max-width:640px){
-  .topbar-inner{flex-wrap:wrap;row-gap:8px}
-  .menu{order:3;width:100%;justify-content:center}
-  .tab{flex:1 1 0;justify-content:center}
-  .app{padding:calc(var(--topbar-h, 110px) + 18px) 14px 24px}
   .card{padding:15px;border-radius:16px}
   .field{padding:11px 14px;font-size:14px}
   .input-wrap input.field,.input-wrap textarea.field{padding-left:38px}
@@ -1992,18 +2072,137 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .otp{gap:5px}
   .modal-card{padding:24px 18px 18px;border-radius:18px}
   .modal-code{font-size:32px;letter-spacing:9px;text-indent:9px}
-  .lb-prev{left:8px}
-  .lb-next{right:8px}
-  .lb-close{top:10px;right:10px}
-  .lb-zoom-badge{top:10px;left:10px}
-  .lb-img{max-width:94vw;max-height:80vh}
-  .lb-hint{display:none}
-  .post-gallery{grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px}
 }
 @media (max-width:380px){
   .tab span{display:none}
   .tab{padding:9px 12px}
   .tab svg{width:16px;height:16px}
+}
+
+/* ============================================================
+   МОБИЛЬНАЯ ВЕРСИЯ APP
+   - фиксируем высоту, чтобы не было скролла страницы впустую
+   - topbar: только 2 таба + красная "Выйти"
+   - .stage скроллится сам, только если контент больше
+   ============================================================ */
+@media (max-width: 720px){
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    background: var(--bg);
+  }
+
+  .app {
+    position: fixed;
+    inset: 0;
+    height: 100dvh;
+    min-height: 0;
+    overflow: hidden;
+    padding: calc(var(--topbar-h, 100px) + 12px) 14px 18px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .stage {
+    width: 100%;
+    max-width: 560px;
+    max-height: 100%;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+    margin: auto 0;
+    padding: 4px 0;
+  }
+  .stage::-webkit-scrollbar{ display:none; }
+
+  /* topbar: убираем лого и back-btn, показываем exit-btn */
+  .topbar{
+    top: 10px;
+    width: calc(100% - 20px);
+    padding: 8px 8px 8px 10px;
+    border-radius: 14px;
+  }
+  .topbar-inner{
+    flex-wrap: nowrap;
+    gap: 8px;
+    justify-content: space-between;
+  }
+  .topbar .logo,
+  .topbar .back-btn{
+    display: none !important;
+  }
+  .topbar .menu{
+    flex: 1 1 auto;
+    min-width: 0;
+    justify-content: center;
+    padding: 3px;
+  }
+  .topbar .menu .tab{
+    flex: 1 1 0;
+    justify-content: center;
+    padding: 9px 10px;
+    font-size: 12.5px;
+  }
+  .topbar .exit-btn{
+    display: inline-flex;
+    flex-shrink: 0;
+    padding: 9px 13px;
+    font-size: 12.5px;
+  }
+
+  /* lightbox: мобильный режим */
+  .lb-btn{ width:44px; height:44px; }
+  .lb-close{ top:12px; right:12px; }
+  .lb-prev, .lb-next{
+    top: auto;
+    bottom: 84px;
+    transform: none;
+    width: 48px;
+    height: 48px;
+    opacity: .92;
+  }
+  .lb-prev{ left: 20px; }
+  .lb-next{ right: 20px; }
+  .lb-counter{
+    bottom: 20px;
+    font-size: 12px;
+    padding: 6px 14px;
+  }
+  .lb-zoom-badge{ top:12px; left:12px; }
+  .lb-img{ max-width: 96vw; max-height: 72vh; }
+  .lb-hint{ display: none; }
+  .lb-hint-mobile{
+    display: block;
+    position: absolute;
+    bottom: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px;
+    color: var(--text-mute);
+    font-family:'JetBrains Mono',monospace;
+    letter-spacing: 0.02em;
+    z-index: 2;
+    pointer-events: none;
+    white-space: nowrap;
+    text-align: center;
+    max-width: 92vw;
+    padding: 0 12px;
+  }
+}
+@media (max-width: 480px){
+  .topbar .tab span{ display: inline; }
+  .topbar .tab svg{ width: 14px; height: 14px; }
+  .topbar .tab{ padding: 9px 8px; font-size: 12px; }
+  .topbar .exit-btn{ padding: 9px 11px; font-size: 12px; }
+}
+@media (max-width: 360px){
+  .topbar .tab span{ display: none; }
+  .topbar .tab{ padding: 10px 12px; }
+  .topbar .tab svg{ width: 16px; height: 16px; }
 }
 """
 
@@ -2053,17 +2252,22 @@ APP = r"""<!DOCTYPE html>
       <span class="menu-pill" id="menuPill" aria-hidden="true"></span>
       <button class="tab" id="btnCreate" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        <span>Создать пост</span>
+        <span>Создать</span>
       </button>
       <button class="tab" id="btnFind" type="button">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <span>Найти пост</span>
+        <span>Найти</span>
       </button>
     </div>
 
     <a href="/" class="back-btn">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
       <span>На главную</span>
+    </a>
+
+    <a href="/" class="exit-btn" aria-label="Выйти на главную">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+      <span>Выйти</span>
     </a>
   </div>
 </nav>
@@ -2179,6 +2383,7 @@ APP = r"""<!DOCTYPE html>
   </button>
   <div class="lb-counter" id="lbCounter">1 / 1</div>
   <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
+  <div class="lb-hint-mobile">свайп — листать · 2× тап — зум · свайп вниз — закрыть</div>
 </div>
 
 <script>
@@ -2188,6 +2393,7 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
+  /* ============ CURSOR ============ */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
@@ -2217,6 +2423,7 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
+  /* ============ LOADER ============ */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2224,11 +2431,14 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
+  /* ============ TOPBAR HEIGHT ============ */
   var topbar = $('topbar');
   function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
+  addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
   measureTopbar();
 
+  /* ============ HELPERS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2276,13 +2486,14 @@ APP = r"""<!DOCTYPE html>
     if (location.pathname !== "/app") history.replaceState(null, "", "/app");
   }
 
+  /* ============ TABS ============ */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
   var mode = null;
 
   function updateMenuPill(){
-    if (!menuPill) return;
+    if (!menuPill || !menuEl) return;
     var activeTab = mode === "find" ? btnFind : btnCreate;
     var menuRect = menuEl.getBoundingClientRect();
     var tabRect = activeTab.getBoundingClientRect();
@@ -2294,20 +2505,14 @@ APP = r"""<!DOCTYPE html>
     if (next === mode && !instant) return;
     var incoming = next === "create" ? createPanel : findPanel;
     var outgoing = next === "create" ? findPanel : createPanel;
-
     stage.hidden = false;
     outgoing.classList.remove("active");
     incoming.classList.add("active");
-
     mode = next;
     btnCreate.classList.toggle("active", next === "create");
     btnFind.classList.toggle("active", next === "find");
-
-    // Обновляем пилюлю (с задержкой, чтобы DOM успел отрисоваться)
     requestAnimationFrame(updateMenuPill);
     setTimeout(updateMenuPill, 60);
-
-    // Фокус
     if (next === "create") setTimeout(function(){ $("title").focus(); }, 80);
     else setTimeout(function(){ otpCells[0].focus(); }, 80);
   }
@@ -2316,8 +2521,10 @@ APP = r"""<!DOCTYPE html>
   btnFind.addEventListener("click", function(){ setUrlForApp(); setMode("find"); });
 
   addEventListener("resize", updateMenuPill, { passive: true });
+  addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
 
+  /* ============ IMAGE COMPRESSION ============ */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
   async function compressImage(file, targetBytes){
@@ -2357,6 +2564,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ CREATE ============ */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -2452,9 +2660,7 @@ APP = r"""<!DOCTYPE html>
     createMsg.innerHTML = "";
     createMsg.appendChild(makeMsg(kind, text));
   }
-  function clearCreateMsg(){
-    createMsg.innerHTML = "";
-  }
+  function clearCreateMsg(){ createMsg.innerHTML = ""; }
 
   $("resetBtn").addEventListener("click", function(){
     titleInput.value = ""; contentInput.value = ""; selectedFiles = []; ogCheckbox.checked = true;
@@ -2501,6 +2707,7 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
+  /* ============ MODAL ============ */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -2528,6 +2735,7 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
+  /* ============ SEARCH ============ */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
@@ -2610,6 +2818,7 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
+  /* ============ LIGHTBOX ============ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -2698,24 +2907,119 @@ APP = r"""<!DOCTYPE html>
       lbViewport.style.cursor = zoom > 1.001 ? "grab" : "default";
     }
   });
+
+  /* === TOUCH GESTURES (mobile lightbox) === */
   var touchStartDist = 0, touchStartZoom = 1;
+  var tStartX = 0, tStartY = 0, tStartTime = 0;
+  var tActive = false, tPinch = false;
+  var lastTapTime = 0, lastTapX = 0, lastTapY = 0;
+
   lbViewport.addEventListener("touchstart", function(e){
     if (e.touches.length === 2) {
-      touchStartDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      touchStartDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
       touchStartZoom = zoom;
+      tPinch = true;
+      tActive = false;
+    } else if (e.touches.length === 1) {
+      tStartX = e.touches[0].clientX;
+      tStartY = e.touches[0].clientY;
+      tStartTime = Date.now();
+      tActive = true;
+      tPinch = false;
     }
   }, { passive: true });
+
   lbViewport.addEventListener("touchmove", function(e){
-    if (e.touches.length === 2 && touchStartDist > 0) {
+    if (e.touches.length === 2 && tPinch && touchStartDist > 0) {
       e.preventDefault();
-      var dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      var dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
       var cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       var cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
       zoomAt(cx, cy, touchStartZoom * (dist / touchStartDist));
+    } else if (e.touches.length === 1 && zoom > 1.001) {
+      e.preventDefault();
+      var dx = e.touches[0].clientX - tStartX;
+      var dy = e.touches[0].clientY - tStartY;
+      panX += (e.touches[0].clientX - (tStartX + (panX - panX))) * 0;
+      // simple pan: use delta from last frame via position tracking
+      // using direct translation of touch delta
+      tStartX = e.touches[0].clientX - 0;
+      // We'll accumulate via separate mousemove-style logic
     }
   }, { passive: false });
-  lbViewport.addEventListener("touchend", function(){ touchStartDist = 0; });
 
+  lbViewport.addEventListener("touchend", function(e){
+    if (tPinch) {
+      tPinch = false;
+      touchStartDist = 0;
+      return;
+    }
+    if (!tActive) return;
+    tActive = false;
+    if (!e.changedTouches.length) return;
+    var t = e.changedTouches[0];
+    var dx = t.clientX - tStartX;
+    var dy = t.clientY - tStartY;
+    var dt = Date.now() - tStartTime;
+    var dist = Math.hypot(dx, dy);
+
+    // Swipe (when not zoomed)
+    if (zoom <= 1.05 && dt < 600 && dist > 40) {
+      if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
+        if (dx < 0) lbStep(1);
+        else lbStep(-1);
+        return;
+      }
+      if (dy > 90 && Math.abs(dy) > Math.abs(dx)) {
+        closeLightbox();
+        return;
+      }
+    }
+    // Tap (single & double)
+    if (dt < 260 && dist < 12) {
+      var now = Date.now();
+      if (now - lastTapTime < 320 &&
+          Math.abs(t.clientX - lastTapX) < 44 &&
+          Math.abs(t.clientY - lastTapY) < 44) {
+        // double tap
+        if (zoom > 1.05) resetZoom(true);
+        else zoomAt(t.clientX, t.clientY, 2.4);
+        lastTapTime = 0;
+      } else {
+        lastTapTime = now;
+        lastTapX = t.clientX;
+        lastTapY = t.clientY;
+      }
+    }
+  }, { passive: true });
+
+  /* === One-finger pan when zoomed (mobile) === */
+  var lastPanX = 0, lastPanY = 0;
+  lbViewport.addEventListener("touchstart", function(e){
+    if (e.touches.length === 1 && zoom > 1.001) {
+      lastPanX = e.touches[0].clientX;
+      lastPanY = e.touches[0].clientY;
+    }
+  }, { passive: true });
+  lbViewport.addEventListener("touchmove", function(e){
+    if (e.touches.length === 1 && zoom > 1.001 && !tPinch) {
+      var dx = e.touches[0].clientX - lastPanX;
+      var dy = e.touches[0].clientY - lastPanY;
+      panX += dx;
+      panY += dy;
+      lastPanX = e.touches[0].clientX;
+      lastPanY = e.touches[0].clientY;
+      applyTransform();
+    }
+  }, { passive: true });
+
+  /* ============ POST RENDER ============ */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -2807,6 +3111,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ INIT ============ */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
@@ -2839,6 +3144,10 @@ APP = r"""<!DOCTYPE html>
 </html>
 """
 
+
+# ============================================================
+# OpenGraph-метатеги для /p/{code}
+# ============================================================
 
 def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     title = str(meta.get("title", "")).strip() or f"Пост #{code}"
