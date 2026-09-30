@@ -273,7 +273,7 @@ async def stats():
 
 
 # ============================================================
-# PWA — манифест, service worker, иконка
+# PWA
 # ============================================================
 
 PWA_ICON_SVG = (
@@ -310,30 +310,15 @@ PWA_MANIFEST = {
     "dir": "ltr",
     "categories": ["social", "productivity", "utilities"],
     "icons": [
-        {
-            "src": "/icon.svg",
-            "sizes": "any",
-            "type": "image/svg+xml",
-            "purpose": "any",
-        },
-        {
-            "src": "/icon.svg",
-            "sizes": "any",
-            "type": "image/svg+xml",
-            "purpose": "maskable",
-        },
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"},
     ],
 }
 
 PWA_SW = r"""
-// СЛД·NET service worker — кеш оболочки + офлайн-доступ к /app
-const CACHE = 'sld-net-v2';
-const SHELL_URLS = [
-  '/app',
-  '/icon.svg',
-];
+const CACHE = 'sld-net-v3';
+const SHELL_URLS = ['/app', '/icon.svg'];
 
-// Установка — кешируем оболочку
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE)
@@ -342,7 +327,6 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// Активация — удаляем старые кеши
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
@@ -353,18 +337,13 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Стратегии
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
 
-  // Только GET
   if (req.method !== 'GET') return;
-
-  // API — всегда сеть (никогда не кешируем посты)
   if (url.pathname.startsWith('/api/')) return;
 
-  // Навигация — сеть в приоритете, кеш как fallback
   if (req.mode === 'navigate') {
     event.respondWith(
       fetch(req)
@@ -378,7 +357,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Шрифты Google — cache-first
   if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
     event.respondWith(
       caches.match(req).then((cached) => {
@@ -395,7 +373,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Иконка, манифест — cache-first
   if (url.pathname === '/icon.svg' || url.pathname === '/manifest.json') {
     event.respondWith(
       caches.match(req).then((cached) => cached || fetch(req).then((res) => {
@@ -409,7 +386,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Остальное — сеть, но кеш как fallback
   event.respondWith(
     fetch(req)
       .then((res) => {
@@ -427,10 +403,7 @@ self.addEventListener('fetch', (event) => {
 
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse(
-        content=PWA_MANIFEST,
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
+    return JSONResponse(content=PWA_MANIFEST, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/sw.js")
@@ -438,10 +411,7 @@ async def service_worker():
     return PlainTextResponse(
         content=PWA_SW,
         media_type="application/javascript",
-        headers={
-            "Cache-Control": "no-cache",
-            "Service-Worker-Allowed": "/",
-        },
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
     )
 
 
@@ -851,28 +821,23 @@ SHELL_JS = r"""
       document.documentElement.style.setProperty("--my", my + "px");
     }, { passive: true });
 
-    // Физика: чем быстрее движение — тем сильнее расползается кольцо
     (function loop(){
       dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
       rx += (mx - rx) * 0.26;
       ry += (my - ry) * 0.26;
 
       var dx = mx - lx, dy = my - ly;
-      // Ограничение скорости — 60 (было 40)
       vel = Math.min(Math.hypot(dx, dy), 60);
       lx = mx; ly = my;
 
       var angle = Math.atan2(dy, dx) * 180 / Math.PI;
-      // Сильнее выраженная деформация: до 1.4 при максимальной скорости
       var stretch = 1 + vel / 150;
       var squash  = 1 - vel / 220;
-      // Чем быстрее — тем прозрачнее рамка
-      var borderOp = 0.4 - (vel / 60) * 0.25;
+      var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
 
       ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + angle + "deg) scale(" + stretch + "," + squash + ")";
-
       if (!ring.classList.contains("hover")) {
-        ring.style.borderColor = "rgba(255,255,255," + Math.max(0.15, borderOp).toFixed(2) + ")";
+        ring.style.borderColor = "rgba(255,255,255," + borderOp.toFixed(2) + ")";
       }
       requestAnimationFrame(loop);
     })();
@@ -1048,8 +1013,18 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
 # ============================================================
 
 LANDING_CSS = r"""
-.hero{padding:170px 0 0;position:relative;overflow:hidden}
-.hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
+/* ===================================================================
+   HERO — фикс переполнения заголовка
+   =================================================================== */
+.hero{padding:150px 0 0;position:relative;overflow:hidden}
+.hero-inner{
+  max-width:1080px;
+  margin:0 auto;
+  text-align:center;
+  position:relative;
+  z-index:1;
+  padding:0 8px;    /* небольшая страховка от краёв */
+}
 
 .badge{
   display:inline-flex;align-items:center;gap:10px;
@@ -1060,7 +1035,7 @@ LANDING_CSS = r"""
   backdrop-filter:blur(14px) saturate(160%);
   -webkit-backdrop-filter:blur(14px) saturate(160%);
   font-size:12.5px;font-weight:600;color:#fff;
-  letter-spacing:-0.005em;margin-bottom:38px;
+  letter-spacing:-0.005em;margin-bottom:34px;
   box-shadow:0 10px 30px -14px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.1);
   opacity:0;transform:translateY(-14px);
   animation:badgeIn .75s var(--ease) .05s both;
@@ -1083,38 +1058,56 @@ LANDING_CSS = r"""
 .badge-sep{color:rgba(255,255,255,0.3);font-weight:400;margin:0 -1px}
 @keyframes badgeIn{from{opacity:0;transform:translateY(-14px);filter:blur(5px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
-/* Заголовок — анимация по словам, компактнее по времени */
+/* ===================================================================
+   H1 — без white-space: nowrap, чтобы слова могли переноситься
+   при узких вьюпортах и не вылезать за границу.
+   Размер подобран так, чтобы на десктопе фраза умещалась в одну строку.
+   =================================================================== */
 .hero-title{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(38px,7.2vw,84px);line-height:0.98;
-  letter-spacing:-0.045em;margin-bottom:30px;
-  display:flex;flex-direction:column;gap:4px;
-  text-wrap:balance;position:relative;z-index:1;
-  perspective:900px;
+  font-size:clamp(28px,5.2vw,60px);
+  line-height:1.08;
+  letter-spacing:-0.04em;
+  margin-bottom:28px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  position:relative;
+  z-index:1;
+  perspective:1000px;
+  text-wrap:balance;
+  max-width:100%;
+  overflow-wrap:break-word;
 }
-.h1-row{display:block;white-space:nowrap;text-align:center}
+.h1-row{
+  display:block;
+  text-align:center;
+  /* БЕЗ white-space: nowrap — иначе на средних экранах текст вылезает */
+}
 .h1-row.dim{color:var(--text-mute);font-weight:400}
 
 .hero-title .word{
   display:inline-block;
   opacity:0;
-  transform:translateY(50%) rotateX(-60deg) scale(.95);
-  filter:blur(7px);
+  transform:translateY(40%) rotateX(-55deg) scale(.96);
+  filter:blur(6px);
   transform-origin:bottom center;
-  animation:wordIn .8s var(--ease) both;
-  animation-delay:calc(var(--i,0) * 80ms + 140ms);
+  animation:wordIn .75s var(--ease) both;
+  animation-delay:calc(var(--i,0) * 75ms + 140ms);
   will-change:transform,opacity,filter;
+  /* разделяем слова пробелами — inline-block между ними не даёт их сам */
+  margin-right:0.24em;
 }
-.hero-title .word + .word{margin-left:0.22em}
+.hero-title .word:last-child{margin-right:0}
 @keyframes wordIn{
-  0%{opacity:0;transform:translateY(50%) rotateX(-60deg) scale(.95);filter:blur(7px)}
+  0%{opacity:0;transform:translateY(40%) rotateX(-55deg) scale(.96);filter:blur(6px)}
   55%{filter:blur(1.5px)}
   100%{opacity:1;transform:translateY(0) rotateX(0) scale(1);filter:blur(0)}
 }
 
 .lead{
-  font-size:clamp(15px,1.7vw,17.5px);line-height:1.65;
-  color:var(--text-dim);max-width:620px;margin:0 auto 40px;
+  font-size:clamp(15px,1.65vw,17px);line-height:1.65;
+  color:var(--text-dim);max-width:600px;margin:0 auto 40px;
   opacity:0;transform:translateY(18px);
   animation:leadIn .9s var(--ease) .75s both;
   position:relative;z-index:1;
@@ -1137,7 +1130,7 @@ LANDING_CSS = r"""
 .hero-cta .btn svg{width:16px;height:16px}
 
 .code-show{
-  margin:70px auto 0;max-width:560px;
+  margin:64px auto 0;max-width:540px;
   display:flex;gap:9px;justify-content:center;flex-wrap:nowrap;
   opacity:0;transform:translateY(24px);
   animation:leadIn .9s var(--ease) 1.1s both;
@@ -1149,13 +1142,13 @@ LANDING_CSS = r"""
   filter:blur(40px);pointer-events:none;z-index:-1;
 }
 .code-cell{
-  flex:1 1 0;max-width:70px;aspect-ratio:2/3;border-radius:13px;
+  flex:1 1 0;max-width:66px;aspect-ratio:2/3;border-radius:13px;
   background:linear-gradient(160deg,rgba(255,255,255,0.065),rgba(255,255,255,0.018));
   border:1px solid var(--border-2);
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   display:grid;place-items:center;
   font-family:'JetBrains Mono',monospace;font-weight:600;
-  font-size:clamp(21px,3.4vw,27px);color:#fff;
+  font-size:clamp(20px,3.2vw,25px);color:#fff;
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.12),0 12px 28px -12px rgba(0,0,0,0.7);
   animation:cellIn .6s var(--ease) both;
   transition:transform .35s var(--ease),border-color .3s,box-shadow .35s,color .25s;
@@ -1175,7 +1168,7 @@ LANDING_CSS = r"""
 @keyframes cellIn{from{opacity:0;transform:translateY(20px) scale(.88)}to{opacity:1;transform:translateY(0) scale(1)}}
 
 .code-caption{
-  margin-top:22px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
+  margin-top:20px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
   opacity:0;transform:translateY(12px);
   animation:leadIn .8s var(--ease) 1.3s both;
   display:inline-flex;align-items:center;gap:9px;
@@ -1184,7 +1177,7 @@ LANDING_CSS = r"""
 .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
 .marquee{
-  margin-top:110px;padding:22px 0;
+  margin-top:100px;padding:22px 0;
   border-top:1px solid var(--border);border-bottom:1px solid var(--border);
   overflow:hidden;
   mask-image:linear-gradient(90deg,transparent,#000 10%,#000 90%,transparent);
@@ -1199,12 +1192,14 @@ LANDING_CSS = r"""
 .marquee-track span::after{content:'';width:5px;height:5px;border-radius:50%;background:var(--text-mute);display:inline-block;opacity:.6}
 @keyframes scroll{to{transform:translateX(-50%)}}
 
-section{padding:120px 0;position:relative}
-.sec-head{max-width:660px;margin-bottom:56px}
+section{padding:110px 0;position:relative}
+.sec-head{max-width:660px;margin-bottom:52px}
 h2{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(28px,4.6vw,50px);line-height:1.05;
-  letter-spacing:-0.035em;margin-bottom:18px;text-wrap:balance;
+  font-size:clamp(26px,4.2vw,44px);line-height:1.08;
+  letter-spacing:-0.035em;margin-bottom:18px;
+  text-wrap:balance;
+  /* без ::after-подчёркивания — оно ломало композицию */
 }
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
@@ -1282,21 +1277,21 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .tile-skew:hover{transform:perspective(1000px) rotateX(3deg) translateY(-3px);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
 
 .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
-.bento .glass{padding:32px;display:flex;flex-direction:column}
-.b-lg{grid-column:span 4;min-height:300px}
-.b-md{grid-column:span 3;min-height:250px}
-.b-sm{grid-column:span 2;min-height:240px}
+.bento .glass{padding:30px;display:flex;flex-direction:column}
+.b-lg{grid-column:span 4;min-height:290px}
+.b-md{grid-column:span 3;min-height:240px}
+.b-sm{grid-column:span 2;min-height:230px}
 .icon-box{
   width:48px;height:48px;border-radius:14px;
   display:grid;place-items:center;
   background:linear-gradient(150deg,rgba(255,255,255,0.1),rgba(255,255,255,0.02));
-  border:1px solid var(--border-2);margin-bottom:24px;color:var(--text-dim);
+  border:1px solid var(--border-2);margin-bottom:22px;color:var(--text-dim);
   transition:color .3s,border-color .3s;
   flex-shrink:0;
 }
 .icon-box svg{width:21px;height:21px;display:block}
 .glass:hover .icon-box{color:#fff;border-color:var(--border-3)}
-.bento h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:17.5px;letter-spacing:-0.02em;line-height:1.3;margin-bottom:11px}
+.bento h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:17px;letter-spacing:-0.02em;line-height:1.3;margin-bottom:10px}
 .bento p{color:var(--text-dim);font-size:14px;line-height:1.65;max-width:48ch}
 .bento p code,.step p code,.showcase-list code{
   font-family:'JetBrains Mono',monospace;color:var(--text);font-size:.92em;
@@ -1306,7 +1301,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 
 .feature-list{
   list-style:none;display:flex;flex-direction:column;gap:12px;
-  margin-top:24px;padding-top:22px;
+  margin-top:22px;padding-top:20px;
   border-top:1px solid var(--border);
 }
 .feature-list li{
@@ -1320,7 +1315,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .feature-list li strong{color:#fff;font-weight:600}
 
-.showcase{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center}
+.showcase{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center}
 .showcase-text h2{margin-bottom:20px}
 .showcase-text p{color:var(--text-dim);font-size:15.5px;line-height:1.7;margin-bottom:28px;max-width:48ch}
 .showcase-list{display:flex;flex-direction:column;gap:14px;list-style:none}
@@ -1375,17 +1370,21 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .stat{
   background:rgba(10,10,10,0.7);
   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  padding:34px 22px;text-align:center;transition:background .35s;
+  padding:30px 20px;text-align:center;transition:background .35s;
 }
 .stat:hover{background:rgba(18,18,18,0.85)}
 .stat-val{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(22px,2.8vw,34px);letter-spacing:-0.035em;
+  font-size:clamp(20px,2.4vw,30px);letter-spacing:-0.035em;
   background:linear-gradient(160deg,#fff,rgba(255,255,255,0.5));
   -webkit-background-clip:text;background-clip:text;color:transparent;
-  line-height:1.05;margin-bottom:8px;font-variant-numeric:tabular-nums;
+  line-height:1.1;margin-bottom:8px;font-variant-numeric:tabular-nums;
 }
-.stat-lbl{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;line-height:1.35}
+.stat-lbl{
+  font-family:'JetBrains Mono',monospace;font-size:10.5px;
+  color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;
+  line-height:1.35;
+}
 
 .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
 .steps::before{
@@ -1393,18 +1392,18 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   background:linear-gradient(90deg,transparent,rgba(255,255,255,0.15) 20%,rgba(255,255,255,0.15) 80%,transparent);
   pointer-events:none;z-index:0;
 }
-.step{padding:32px;display:flex;flex-direction:column;position:relative;z-index:1}
+.step{padding:30px;display:flex;flex-direction:column;position:relative;z-index:1}
 .step-num{
   font-family:'JetBrains Mono',monospace;font-size:11.5px;
-  color:var(--text-mute);letter-spacing:0.14em;margin-bottom:22px;text-transform:uppercase;
+  color:var(--text-mute);letter-spacing:0.14em;margin-bottom:20px;text-transform:uppercase;
   display:inline-flex;align-items:center;gap:8px;
 }
 .step-num::before{content:'';width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.1);display:inline-block;flex-shrink:0}
-.step h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:18px;letter-spacing:-0.02em;margin-bottom:11px}
+.step h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:17.5px;letter-spacing:-0.02em;margin-bottom:10px}
 .step p{color:var(--text-dim);font-size:14px;line-height:1.65}
 
 .cta{
-  position:relative;border-radius:36px;padding:90px 40px;
+  position:relative;border-radius:36px;padding:80px 40px;
   text-align:center;overflow:hidden;
   background:linear-gradient(150deg,rgba(255,255,255,0.055),rgba(255,255,255,0.012));
   backdrop-filter:blur(26px) saturate(150%);-webkit-backdrop-filter:blur(26px) saturate(150%);
@@ -1417,14 +1416,14 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   top:-400px;left:50%;transform:translateX(-50%);filter:blur(60px);pointer-events:none;
 }
 .cta > *{position:relative;z-index:1}
-.cta h2{font-size:clamp(32px,5.2vw,58px);margin-bottom:20px;letter-spacing:-0.04em}
-.cta p{color:var(--text-dim);font-size:16.5px;max-width:500px;margin:0 auto 36px;line-height:1.65}
-.cta .btn{padding:17px 36px;height:auto;font-size:15px;border-radius:15px}
+.cta h2{font-size:clamp(28px,4.4vw,48px);margin-bottom:18px;letter-spacing:-0.04em}
+.cta p{color:var(--text-dim);font-size:16px;max-width:500px;margin:0 auto 34px;line-height:1.65}
+.cta .btn{padding:16px 34px;height:auto;font-size:15px;border-radius:14px}
 .cta .btn svg{width:17px;height:17px}
-.cta-note{font-size:12.5px;color:var(--text-mute);margin-top:24px;margin-bottom:0;font-family:'JetBrains Mono',monospace;letter-spacing:0.06em}
+.cta-note{font-size:12.5px;color:var(--text-mute);margin-top:22px;margin-bottom:0;font-family:'JetBrains Mono',monospace;letter-spacing:0.06em}
 
 @media (max-width:1080px){
-  .showcase{grid-template-columns:1fr;gap:48px}
+  .showcase{grid-template-columns:1fr;gap:44px}
   .mock{max-width:520px;margin:0 auto}
   .mock:hover{transform:none}
 }
@@ -1438,29 +1437,29 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .steps::before{display:none}
 }
 @media (max-width:720px){
-  .hero{padding:130px 0 0}
-  section{padding:80px 0}
+  .hero{padding:120px 0 0}
+  section{padding:70px 0}
+  .hero-inner{padding:0}
   .tile-groups{gap:36px}
   .bento{grid-template-columns:1fr;gap:14px}
   .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
   .b-lg{min-height:auto}
   .stats{grid-template-columns:1fr 1fr}
-  .stat{padding:26px 16px}
-  .stat-val{font-size:clamp(20px,5vw,28px)}
-  .cta{padding:60px 24px;border-radius:26px}
+  .stat{padding:24px 14px}
+  .stat-val{font-size:clamp(18px,4.4vw,24px)}
+  .cta{padding:56px 24px;border-radius:26px}
   .cta .btn{padding:15px 28px;font-size:14px;width:100%}
   .hero-cta{flex-direction:column;align-items:stretch}
   .hero-cta .btn{justify-content:center;width:100%}
   .marquee-track span{font-size:12px;gap:36px}
   .marquee-track{gap:36px}
-  .marquee{margin-top:80px}
-  .code-show{margin-top:52px;gap:6px}
-  .code-cell{max-width:44px;border-radius:11px}
-  .badge{font-size:11.5px;padding:7px 13px 7px 8px;margin-bottom:32px;gap:8px}
+  .marquee{margin-top:70px}
+  .code-show{margin-top:46px;gap:6px;max-width:100%}
+  .code-cell{max-width:42px;border-radius:11px}
+  .badge{font-size:11.5px;padding:7px 13px 7px 8px;margin-bottom:28px;gap:8px}
   .badge-dot{width:18px;height:18px}
   .badge-dot svg{width:9px;height:9px}
   .group-head{flex-direction:column;gap:8px;align-items:flex-start}
-  .h1-row{white-space:normal}
 }
 @media (max-width:420px){
   .stats{grid-template-columns:1fr}
@@ -1942,7 +1941,6 @@ body.cursor-ready .cur-ring { opacity:1; }
   backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
   border:1px solid var(--border);
   box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
-  /* Безопасные зоны на iPhone */
   padding-top: max(10px, env(safe-area-inset-top, 0px) + 4px);
 }
 .topbar-inner{display:flex;align-items:center;gap:14px;justify-content:space-between;flex-wrap:nowrap}
@@ -2583,7 +2581,6 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
-  /* ============ SERVICE WORKER (PWA) ============ */
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function(){
       navigator.serviceWorker.register('/sw.js', { scope: '/' })
@@ -2591,7 +2588,6 @@ APP = r"""<!DOCTYPE html>
     });
   }
 
-  /* ============ CURSOR — с «физикой»: кольцо расползается на скорости ============ */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
@@ -2633,7 +2629,6 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
-  /* ============ LOADER ============ */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2641,14 +2636,12 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* ============ TOPBAR HEIGHT ============ */
   var topbar = $('topbar');
   function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
   addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
   measureTopbar();
 
-  /* ============ HELPERS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2702,7 +2695,6 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* ============ TABS ============ */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
@@ -2740,7 +2732,6 @@ APP = r"""<!DOCTYPE html>
   addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
 
-  /* ============ IMAGE COMPRESSION ============ */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
   async function compressImage(file, targetBytes){
@@ -2780,7 +2771,6 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* ============ CREATE ============ */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -2923,7 +2913,6 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* ============ MODAL ============ */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -2951,7 +2940,6 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
-  /* ============ SEARCH ============ */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
@@ -3034,7 +3022,6 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* ============ LIGHTBOX ============ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3212,7 +3199,6 @@ APP = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
-  /* ============ POST RENDER ============ */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -3304,7 +3290,6 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  /* ============ INIT ============ */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
