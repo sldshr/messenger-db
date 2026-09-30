@@ -7,6 +7,9 @@ Sld-Networking — посты с 6-значным кодом (без повто�
   /app        — рабочая область (SPA)
   /p/{code}   — единая ссылка на пост (с OpenGraph-метатегами)
   /api/*      — REST API
+  /manifest.json  — PWA-манифест
+  /sw.js          — service worker
+  /icon.svg       — иконка приложения
 
 Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
@@ -28,7 +31,7 @@ import uvicorn
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sld")
@@ -270,6 +273,188 @@ async def stats():
 
 
 # ============================================================
+# PWA — манифест, service worker, иконка
+# ============================================================
+
+PWA_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    '<defs>'
+    '<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#ffffff"/>'
+    '<stop offset="1" stop-color="#c4c4c8"/>'
+    '</linearGradient>'
+    '</defs>'
+    '<rect width="512" height="512" rx="112" fill="#080808"/>'
+    '<rect x="96" y="96" width="320" height="320" rx="72" fill="url(#g)"/>'
+    '<g fill="none" stroke="#08080a" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="256" cy="186" r="34"/>'
+    '<circle cx="158" cy="336" r="34"/>'
+    '<circle cx="354" cy="336" r="34"/>'
+    '<path d="M232 208 178 314M280 208 334 314M192 336h128"/>'
+    '</g>'
+    '</svg>'
+)
+
+PWA_MANIFEST = {
+    "name": "СЛД·NET — нетворкинг",
+    "short_name": "СЛД·NET",
+    "description": "Посты по 6-значному коду. Без аккаунтов, с шифрованием.",
+    "start_url": "/app",
+    "scope": "/",
+    "display": "standalone",
+    "display_override": ["standalone", "minimal-ui"],
+    "orientation": "any",
+    "background_color": "#080808",
+    "theme_color": "#080808",
+    "lang": "ru",
+    "dir": "ltr",
+    "categories": ["social", "productivity", "utilities"],
+    "icons": [
+        {
+            "src": "/icon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any",
+        },
+        {
+            "src": "/icon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "maskable",
+        },
+    ],
+}
+
+PWA_SW = r"""
+// СЛД·NET service worker — кеш оболочки + офлайн-доступ к /app
+const CACHE = 'sld-net-v2';
+const SHELL_URLS = [
+  '/app',
+  '/icon.svg',
+];
+
+// Установка — кешируем оболочку
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((cache) => cache.addAll(SHELL_URLS).catch(() => {}))
+      .then(() => self.skipWaiting())
+  );
+});
+
+// Активация — удаляем старые кеши
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
+  );
+});
+
+// Стратегии
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  const url = new URL(req.url);
+
+  // Только GET
+  if (req.method !== 'GET') return;
+
+  // API — всегда сеть (никогда не кешируем посты)
+  if (url.pathname.startsWith('/api/')) return;
+
+  // Навигация — сеть в приоритете, кеш как fallback
+  if (req.mode === 'navigate') {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+          return res;
+        })
+        .catch(() => caches.match(req).then((m) => m || caches.match('/app')))
+    );
+    return;
+  }
+
+  // Шрифты Google — cache-first
+  if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
+    event.respondWith(
+      caches.match(req).then((cached) => {
+        if (cached) return cached;
+        return fetch(req).then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return res;
+        }).catch(() => cached);
+      })
+    );
+    return;
+  }
+
+  // Иконка, манифест — cache-first
+  if (url.pathname === '/icon.svg' || url.pathname === '/manifest.json') {
+    event.respondWith(
+      caches.match(req).then((cached) => cached || fetch(req).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }
+        return res;
+      }))
+    );
+    return;
+  }
+
+  // Остальное — сеть, но кеш как fallback
+  event.respondWith(
+    fetch(req)
+      .then((res) => {
+        if (res.ok && res.type === 'basic') {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(req))
+  );
+});
+"""
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(
+        content=PWA_MANIFEST,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return PlainTextResponse(
+        content=PWA_SW,
+        media_type="application/javascript",
+        headers={
+            "Cache-Control": "no-cache",
+            "Service-Worker-Allowed": "/",
+        },
+    )
+
+
+@app.get("/icon.svg")
+async def icon():
+    return Response(
+        content=PWA_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ============================================================
 # ФРОНТЕНД
 # ============================================================
 
@@ -299,7 +484,6 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
-# --- иконки соцсетей ---
 YOUTUBE_SVG = (
     '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
     '<path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545'
@@ -379,14 +563,20 @@ input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.ot
 }
 body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
-.cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25)}
+.cur-dot{
+  width:7px;height:7px;background:#fff;
+  box-shadow:0 0 0 1px rgba(255,255,255,0.5),
+             0 0 14px rgba(255,255,255,0.35);
+}
 .cur-ring{
-  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
-  transition:width .25s var(--ease),height .25s var(--ease),
-             border-color .25s,background .25s,opacity .2s;
+  width:34px;height:34px;
+  border:1.5px solid rgba(255,255,255,0.4);
+  transition:width .22s var(--ease),height .22s var(--ease),
+             border-color .22s,background .22s,opacity .2s;
 }
 .cur-ring.hover{
-  width:60px;height:60px;border-color:rgba(255,255,255,0.2);
+  width:60px;height:60px;
+  border-color:rgba(255,255,255,0.22);
   background:rgba(255,255,255,0.05);
   backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
 }
@@ -502,7 +692,6 @@ body > nav.top-nav.scrolled{
 .nav-links a:hover{color:#fff;background:rgba(255,255,255,0.05)}
 .nav-links a.active{color:#fff;background:rgba(255,255,255,0.06)}
 
-/* === КНОПКИ — без поднимания, только смена фона/границ === */
 .btn{
   display:inline-flex;align-items:center;justify-content:center;
   gap:8px;
@@ -536,7 +725,6 @@ body > nav.top-nav.scrolled{
 }
 .btn-ghost:active{transform:scale(.985)}
 
-/* === FOOTER === */
 footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 .foot-top{
   display:flex;justify-content:space-between;
@@ -598,7 +786,6 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 .foot-socials svg{width:18px;height:18px;display:block}
 
-/* === REVEAL: 10 уникальных входных анимаций === */
 .reveal{
   opacity:0;
   transition:
@@ -629,16 +816,6 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 }
 .eyebrow::before{content:'';width:26px;height:1px;background:linear-gradient(90deg,var(--text-mute),transparent)}
 
-/* Хедер секции + анимированное подчёркивание */
-.sec-head h2{position:relative;display:inline-block}
-.sec-head h2::after{
-  content:'';position:absolute;left:0;bottom:-12px;height:1px;width:0;
-  background:linear-gradient(90deg,#fff,rgba(255,255,255,0));
-  transition:width 1.2s var(--ease) .25s;
-}
-.sec-head.in h2::after{width:120px}
-
-/* === RESPONSIVE === */
 @media (max-width:1000px){.nav-links{display:none}}
 @media (max-width:720px){
   .wrap{padding:0 20px}
@@ -674,16 +851,29 @@ SHELL_JS = r"""
       document.documentElement.style.setProperty("--my", my + "px");
     }, { passive: true });
 
+    // Физика: чем быстрее движение — тем сильнее расползается кольцо
     (function loop(){
       dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
-      rx += (mx - rx) * 0.22;
-      ry += (my - ry) * 0.22;
+      rx += (mx - rx) * 0.26;
+      ry += (my - ry) * 0.26;
+
       var dx = mx - lx, dy = my - ly;
-      vel = Math.min(Math.hypot(dx, dy), 40);
+      // Ограничение скорости — 60 (было 40)
+      vel = Math.min(Math.hypot(dx, dy), 60);
       lx = mx; ly = my;
-      var a = Math.atan2(dy, dx) * 180 / Math.PI;
-      var s = 1 + vel / 260, q = 1 - vel / 380;
-      ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + a + "deg) scale(" + s + "," + q + ")";
+
+      var angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      // Сильнее выраженная деформация: до 1.4 при максимальной скорости
+      var stretch = 1 + vel / 150;
+      var squash  = 1 - vel / 220;
+      // Чем быстрее — тем прозрачнее рамка
+      var borderOp = 0.4 - (vel / 60) * 0.25;
+
+      ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + angle + "deg) scale(" + stretch + "," + squash + ")";
+
+      if (!ring.classList.contains("hover")) {
+        ring.style.borderColor = "rgba(255,255,255," + Math.max(0.15, borderOp).toFixed(2) + ")";
+      }
       requestAnimationFrame(loop);
     })();
 
@@ -717,7 +907,6 @@ SHELL_JS = r"""
     }, { passive: true });
   }
 
-  // Reveal: стаггер внутри групп + варианты анимаций
   var io = new IntersectionObserver(function(es){
     es.forEach(function(e){
       if (e.isIntersecting) {
@@ -762,7 +951,6 @@ SHELL_JS = r"""
 })();
 """
 
-# Футер — без Steam
 FOOTER_HTML = (
     '\n<footer>\n  <div class="wrap">\n    <div class="foot-top">\n'
     '      <div class="foot-brand">\n'
@@ -863,7 +1051,6 @@ LANDING_CSS = r"""
 .hero{padding:170px 0 0;position:relative;overflow:hidden}
 .hero-inner{max-width:900px;margin:0 auto;text-align:center;position:relative;z-index:1}
 
-/* === Badge === */
 .badge{
   display:inline-flex;align-items:center;gap:10px;
   padding:8px 16px 8px 9px;
@@ -875,14 +1062,9 @@ LANDING_CSS = r"""
   font-size:12.5px;font-weight:600;color:#fff;
   letter-spacing:-0.005em;margin-bottom:38px;
   box-shadow:0 10px 30px -14px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.1);
-  opacity:0;transform:translateY(-16px);
-  animation:badgeIn .8s var(--ease) .05s both;
-  transition:transform .3s var(--ease),border-color .3s,background .3s;
+  opacity:0;transform:translateY(-14px);
+  animation:badgeIn .75s var(--ease) .05s both;
   position:relative;z-index:2;max-width:100%;
-}
-.badge:hover{
-  border-color:rgba(255,255,255,0.34);
-  background:rgba(255,255,255,0.08);
 }
 .badge-dot{
   width:20px;height:20px;border-radius:50%;
@@ -899,45 +1081,42 @@ LANDING_CSS = r"""
 @keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.55);opacity:0}}
 .badge-dot svg{width:10px;height:10px;display:block}
 .badge-sep{color:rgba(255,255,255,0.3);font-weight:400;margin:0 -1px}
-@keyframes badgeIn{
-  from{opacity:0;transform:translateY(-16px);filter:blur(6px)}
-  to{opacity:1;transform:translateY(0);filter:blur(0)}
-}
+@keyframes badgeIn{from{opacity:0;transform:translateY(-14px);filter:blur(5px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
-/* === Заголовок: анимация по словам === */
+/* Заголовок — анимация по словам, компактнее по времени */
 .hero-title{
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:clamp(38px,7.2vw,84px);line-height:0.98;
   letter-spacing:-0.045em;margin-bottom:30px;
   display:flex;flex-direction:column;gap:4px;
   text-wrap:balance;position:relative;z-index:1;
-  perspective:800px;
+  perspective:900px;
 }
-.h1-row{display:block;white-space:nowrap}
+.h1-row{display:block;white-space:nowrap;text-align:center}
 .h1-row.dim{color:var(--text-mute);font-weight:400}
 
 .hero-title .word{
   display:inline-block;
   opacity:0;
-  transform:translateY(70%) rotateX(-72deg) scale(.94);
-  filter:blur(10px);
+  transform:translateY(50%) rotateX(-60deg) scale(.95);
+  filter:blur(7px);
   transform-origin:bottom center;
-  animation:wordIn 1.05s var(--ease) both;
-  animation-delay:calc(var(--i,0) * 110ms + 180ms);
+  animation:wordIn .8s var(--ease) both;
+  animation-delay:calc(var(--i,0) * 80ms + 140ms);
   will-change:transform,opacity,filter;
 }
+.hero-title .word + .word{margin-left:0.22em}
 @keyframes wordIn{
-  0%{opacity:0;transform:translateY(70%) rotateX(-72deg) scale(.94);filter:blur(10px)}
-  60%{filter:blur(2px)}
+  0%{opacity:0;transform:translateY(50%) rotateX(-60deg) scale(.95);filter:blur(7px)}
+  55%{filter:blur(1.5px)}
   100%{opacity:1;transform:translateY(0) rotateX(0) scale(1);filter:blur(0)}
 }
 
-/* === Lead === */
 .lead{
   font-size:clamp(15px,1.7vw,17.5px);line-height:1.65;
   color:var(--text-dim);max-width:620px;margin:0 auto 40px;
-  opacity:0;transform:translateY(20px);
-  animation:leadIn 1s var(--ease) .9s both;
+  opacity:0;transform:translateY(18px);
+  animation:leadIn .9s var(--ease) .75s both;
   position:relative;z-index:1;
 }
 .lead strong{color:#e8e8ea;font-weight:600;white-space:nowrap}
@@ -946,24 +1125,22 @@ LANDING_CSS = r"""
   background:rgba(255,255,255,0.05);padding:3px 8px;border-radius:7px;
   border:1px solid var(--border);white-space:nowrap;
 }
-@keyframes leadIn{from{opacity:0;transform:translateY(20px);filter:blur(4px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
+@keyframes leadIn{from{opacity:0;transform:translateY(18px);filter:blur(4px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
-/* === CTA === */
 .hero-cta{
   display:flex;gap:12px;justify-content:center;flex-wrap:wrap;
-  opacity:0;transform:translateY(20px);
-  animation:leadIn 1s var(--ease) 1.15s both;
+  opacity:0;transform:translateY(18px);
+  animation:leadIn .9s var(--ease) .95s both;
   position:relative;z-index:1;
 }
 .hero-cta .btn{padding:15px 28px;height:auto;font-size:14.5px;border-radius:14px}
 .hero-cta .btn svg{width:16px;height:16px}
 
-/* === Код на странице === */
 .code-show{
   margin:70px auto 0;max-width:560px;
   display:flex;gap:9px;justify-content:center;flex-wrap:nowrap;
-  opacity:0;transform:translateY(30px);
-  animation:leadIn 1s var(--ease) 1.3s both;
+  opacity:0;transform:translateY(24px);
+  animation:leadIn .9s var(--ease) 1.1s both;
   position:relative;z-index:1;
 }
 .code-show::before{
@@ -999,14 +1176,13 @@ LANDING_CSS = r"""
 
 .code-caption{
   margin-top:22px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
-  opacity:0;transform:translateY(14px);
-  animation:leadIn .9s var(--ease) 1.5s both;
+  opacity:0;transform:translateY(12px);
+  animation:leadIn .8s var(--ease) 1.3s both;
   display:inline-flex;align-items:center;gap:9px;
   font-family:'JetBrains Mono',monospace;
 }
 .code-caption svg{width:13px;height:13px;opacity:.6;display:block}
 
-/* === MARQUEE === */
 .marquee{
   margin-top:110px;padding:22px 0;
   border-top:1px solid var(--border);border-bottom:1px solid var(--border);
@@ -1023,7 +1199,6 @@ LANDING_CSS = r"""
 .marquee-track span::after{content:'';width:5px;height:5px;border-radius:50%;background:var(--text-mute);display:inline-block;opacity:.6}
 @keyframes scroll{to{transform:translateX(-50%)}}
 
-/* === SECTION === */
 section{padding:120px 0;position:relative}
 .sec-head{max-width:660px;margin-bottom:56px}
 h2{
@@ -1034,7 +1209,6 @@ h2{
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
 
-/* === Плитки-группы === */
 .tile-groups{display:flex;flex-direction:column;gap:56px}
 .tile-group{display:flex;flex-direction:column;gap:18px}
 .group-head{
@@ -1065,7 +1239,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   color:var(--text-mute);
 }
 
-/* === Glass основа === */
 .glass{
   position:relative;border-radius:var(--radius);
   background:linear-gradient(150deg,rgba(255,255,255,0.055),rgba(255,255,255,0.014));
@@ -1097,49 +1270,17 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .glass:hover::after{transform:translateX(120%)}
 
-/* === УНИКАЛЬНЫЕ hover-анимации плиток === */
-.tile-pop:hover{
-  transform:translateY(-8px) scale(1.01);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.1);
-}
-.tile-tilt-l:hover{
-  transform:perspective(1000px) rotateY(-4deg) rotateX(2deg);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-tilt-r:hover{
-  transform:perspective(1000px) rotateY(4deg) rotateX(-2deg);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-zoom:hover{
-  transform:scale(1.03);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-float-l:hover{
-  transform:translateY(-6px) rotate(-1.5deg);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-float-r:hover{
-  transform:translateY(-6px) rotate(1.5deg);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-slide:hover{
-  transform:translateX(10px);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-glow:hover{
-  transform:translateY(-4px);
-  box-shadow:0 0 44px -8px rgba(255,255,255,0.22),0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.12);
-}
-.tile-rotate:hover{
-  transform:rotate(-1.8deg) scale(1.01);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
-.tile-skew:hover{
-  transform:perspective(1000px) rotateX(3deg) translateY(-3px);
-  box-shadow:0 36px 80px -30px rgba(0,0,0,0.9);
-}
+.tile-pop:hover{transform:translateY(-8px) scale(1.01);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.1)}
+.tile-tilt-l:hover{transform:perspective(1000px) rotateY(-4deg) rotateX(2deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-tilt-r:hover{transform:perspective(1000px) rotateY(4deg) rotateX(-2deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-zoom:hover{transform:scale(1.03);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-float-l:hover{transform:translateY(-6px) rotate(-1.5deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-float-r:hover{transform:translateY(-6px) rotate(1.5deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-slide:hover{transform:translateX(10px);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-glow:hover{transform:translateY(-4px);box-shadow:0 0 44px -8px rgba(255,255,255,0.22),0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.12)}
+.tile-rotate:hover{transform:rotate(-1.8deg) scale(1.01);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
+.tile-skew:hover{transform:perspective(1000px) rotateX(3deg) translateY(-3px);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9)}
 
-/* === Bento === */
 .bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
 .bento .glass{padding:32px;display:flex;flex-direction:column}
 .b-lg{grid-column:span 4;min-height:300px}
@@ -1150,7 +1291,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   display:grid;place-items:center;
   background:linear-gradient(150deg,rgba(255,255,255,0.1),rgba(255,255,255,0.02));
   border:1px solid var(--border-2);margin-bottom:24px;color:var(--text-dim);
-  transition:transform .4s var(--ease),color .3s,border-color .3s;
+  transition:color .3s,border-color .3s;
   flex-shrink:0;
 }
 .icon-box svg{width:21px;height:21px;display:block}
@@ -1163,7 +1304,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   border:1px solid var(--border);white-space:nowrap;
 }
 
-/* Feature list внутри крупной плитки */
 .feature-list{
   list-style:none;display:flex;flex-direction:column;gap:12px;
   margin-top:24px;padding-top:22px;
@@ -1180,7 +1320,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .feature-list li strong{color:#fff;font-weight:600}
 
-/* === Showcase === */
 .showcase{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center}
 .showcase-text h2{margin-bottom:20px}
 .showcase-text p{color:var(--text-dim);font-size:15.5px;line-height:1.7;margin-bottom:28px;max-width:48ch}
@@ -1227,7 +1366,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .mock-thumb:nth-child(2)::after{background:linear-gradient(45deg,rgba(255,255,255,0.08),transparent 60%)}
 .mock-thumb:nth-child(3)::after{background:linear-gradient(160deg,rgba(255,255,255,0.12),transparent 60%)}
 
-/* === Stats === */
+/* Компактный блок статистики */
 .stats{
   display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
   border-radius:var(--radius);overflow:hidden;
@@ -1236,19 +1375,18 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .stat{
   background:rgba(10,10,10,0.7);
   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  padding:44px 26px;text-align:center;transition:background .35s;
+  padding:34px 22px;text-align:center;transition:background .35s;
 }
 .stat:hover{background:rgba(18,18,18,0.85)}
 .stat-val{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(28px,3.8vw,44px);letter-spacing:-0.04em;
-  background:linear-gradient(160deg,#fff,rgba(255,255,255,0.45));
+  font-size:clamp(22px,2.8vw,34px);letter-spacing:-0.035em;
+  background:linear-gradient(160deg,#fff,rgba(255,255,255,0.5));
   -webkit-background-clip:text;background-clip:text;color:transparent;
-  line-height:1;margin-bottom:12px;font-variant-numeric:tabular-nums;
+  line-height:1.05;margin-bottom:8px;font-variant-numeric:tabular-nums;
 }
-.stat-lbl{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase}
+.stat-lbl{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;line-height:1.35}
 
-/* === Шаги === */
 .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
 .steps::before{
   content:'';position:absolute;top:80px;left:12%;right:12%;height:1px;
@@ -1265,7 +1403,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .step h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:18px;letter-spacing:-0.02em;margin-bottom:11px}
 .step p{color:var(--text-dim);font-size:14px;line-height:1.65}
 
-/* === CTA === */
 .cta{
   position:relative;border-radius:36px;padding:90px 40px;
   text-align:center;overflow:hidden;
@@ -1308,7 +1445,8 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
   .b-lg{min-height:auto}
   .stats{grid-template-columns:1fr 1fr}
-  .stat{padding:32px 18px}
+  .stat{padding:26px 16px}
+  .stat-val{font-size:clamp(20px,5vw,28px)}
   .cta{padding:60px 24px;border-radius:26px}
   .cta .btn{padding:15px 28px;font-size:14px;width:100%}
   .hero-cta{flex-direction:column;align-items:stretch}
@@ -1353,13 +1491,10 @@ def build_landing() -> str:
 
       <h1 class="hero-title">
         <span class="h1-row">
-          <span class="word" style="--i:0">Публикуйте</span>
-          <span class="word" style="--i:1">посты.</span>
+          <span class="word" style="--i:0">Публикуйте</span><span class="word" style="--i:1">посты.</span>
         </span>
         <span class="h1-row dim">
-          <span class="word" style="--i:2">Делитесь</span>
-          <span class="word" style="--i:3">шестью</span>
-          <span class="word" style="--i:4">цифрами.</span>
+          <span class="word" style="--i:2">Делитесь</span><span class="word" style="--i:3">шестью</span><span class="word" style="--i:4">цифрами.</span>
         </span>
       </h1>
 
@@ -1418,14 +1553,12 @@ def build_landing() -> str:
 
     <div class="tile-groups">
 
-      <!-- ========== Группа 1: Публикация ========== -->
       <div class="tile-group">
         <div class="group-head reveal reveal--left" data-delay="0">
           <div class="group-title">Публикация</div>
           <div class="group-meta">Без аккаунтов · без подтверждений</div>
         </div>
         <div class="bento">
-          <!-- Крупная плитка: появление снизу, hover-подъём -->
           <div class="glass b-lg tile-pop reveal reveal--up" data-delay="60">
             <div>
               <div class="icon-box">
@@ -1445,7 +1578,6 @@ def build_landing() -> str:
             </ul>
           </div>
 
-          <!-- Коды: появление справа, hover-наклон влево -->
           <div class="glass b-sm tile-tilt-l reveal reveal--right" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1463,14 +1595,12 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- ========== Группа 2: Технологии ========== -->
       <div class="tile-group">
         <div class="group-head reveal reveal--right" data-delay="0">
           <div class="group-title">Технологии и хранение</div>
           <div class="group-meta">AES-256 · zstd · RAM</div>
         </div>
         <div class="bento">
-          <!-- AES: зум-появление, hover-наклон вправо -->
           <div class="glass b-sm tile-tilt-r reveal reveal--zoom" data-delay="60">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1483,7 +1613,6 @@ def build_landing() -> str:
             <p>Каждый пост и каждое фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
           </div>
 
-          <!-- zstd: слева, hover-плавный подъём -->
           <div class="glass b-sm tile-float-l reveal reveal--left" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1497,7 +1626,6 @@ def build_landing() -> str:
             <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
           </div>
 
-          <!-- RAM: blur-появление, hover-glow -->
           <div class="glass b-sm tile-glow reveal reveal--blur" data-delay="220">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1512,14 +1640,12 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- ========== Группа 3: Ссылки ========== -->
       <div class="tile-group">
         <div class="group-head reveal reveal--up" data-delay="0">
           <div class="group-title">Ссылки и превью</div>
           <div class="group-meta">OpenGraph · единый адрес</div>
         </div>
         <div class="bento">
-          <!-- OG: flip-появление, hover-наклон влево -->
           <div class="glass b-md tile-tilt-l reveal reveal--flip" data-delay="60">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1534,7 +1660,6 @@ def build_landing() -> str:
             <p>Ссылка <code>/p/<span data-code>482163</span></code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
           </div>
 
-          <!-- Единая ссылка: справа, hover-сдвиг -->
           <div class="glass b-md tile-slide reveal reveal--right" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1548,14 +1673,12 @@ def build_landing() -> str:
         </div>
       </div>
 
-      <!-- ========== Группа 4: Удобство ========== -->
       <div class="tile-group">
         <div class="group-head reveal reveal--left" data-delay="0">
           <div class="group-title">Удобство</div>
           <div class="group-meta">Скорость · галерея · сжатие</div>
         </div>
         <div class="bento">
-          <!-- Поиск: elastic, hover-zoom -->
           <div class="glass b-sm tile-zoom reveal reveal--elastic" data-delay="60">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1568,7 +1691,6 @@ def build_landing() -> str:
             <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
           </div>
 
-          <!-- Автосжатие: снизу, hover-подъём-вправо -->
           <div class="glass b-sm tile-float-r reveal reveal--up" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1581,7 +1703,6 @@ def build_landing() -> str:
             <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
           </div>
 
-          <!-- Галерея: rotate, hover-rotate -->
           <div class="glass b-sm tile-rotate reveal reveal--rotate" data-delay="220">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1634,7 +1755,7 @@ def build_landing() -> str:
   <div class="wrap">
     <div class="stats reveal reveal--zoom">
       <div class="stat"><div class="stat-val">151 200</div><div class="stat-lbl">Уникальных кодов</div></div>
-      <div class="stat"><div class="stat-val">20К</div><div class="stat-lbl">Символов в теле</div></div>
+      <div class="stat"><div class="stat-val">20 000</div><div class="stat-lbl">Символов в теле</div></div>
       <div class="stat"><div class="stat-val">5 МБ</div><div class="stat-lbl">Лимит на файл</div></div>
       <div class="stat"><div class="stat-val">60 КБ</div><div class="stat-lbl">После сжатия</div></div>
     </div>
@@ -1759,13 +1880,13 @@ input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.s
 }
 body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
-.cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.4),0 0 12px rgba(255,255,255,0.25)}
+.cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.35)}
 .cur-ring{
-  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.35);
-  transition:width .25s var(--ease),height .25s var(--ease),
-             border-color .25s,background .25s,opacity .2s;
+  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.4);
+  transition:width .22s var(--ease),height .22s var(--ease),
+             border-color .22s,background .22s,opacity .2s;
 }
-.cur-ring.hover{width:58px;height:58px;border-color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.cur-ring.hover{width:58px;height:58px;border-color:rgba(255,255,255,0.22);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
@@ -1821,6 +1942,8 @@ body.cursor-ready .cur-ring { opacity:1; }
   backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
   border:1px solid var(--border);
   box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
+  /* Безопасные зоны на iPhone */
+  padding-top: max(10px, env(safe-area-inset-top, 0px) + 4px);
 }
 .topbar-inner{display:flex;align-items:center;gap:14px;justify-content:space-between;flex-wrap:nowrap}
 .logo{
@@ -2206,7 +2329,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     height: 100dvh;
     min-height: 0;
     overflow: hidden;
-    padding: calc(var(--topbar-h, 100px) + 12px) 14px 18px;
+    padding: calc(var(--topbar-h, 100px) + 12px) 14px calc(18px + env(safe-area-inset-bottom, 0px));
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -2224,7 +2347,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     padding: 4px 0;
   }
   .stage::-webkit-scrollbar{ display:none; }
-  .topbar{ top: 10px; width: calc(100% - 20px); padding: 8px 8px 8px 10px; border-radius: 14px; }
+  .topbar{ top: max(10px, env(safe-area-inset-top, 0px) + 6px); width: calc(100% - 20px); padding: 8px 8px 8px 10px; border-radius: 14px; }
   .topbar-inner{ flex-wrap: nowrap; gap: 8px; justify-content: space-between; }
   .topbar .logo,
   .topbar .back-btn{ display: none !important; }
@@ -2240,7 +2363,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   }
   .lb-prev{ left: 20px; }
   .lb-next{ right: 20px; }
-  .lb-counter{ bottom: 20px; font-size: 12px; padding: 6px 14px; }
+  .lb-counter{ bottom: calc(20px + env(safe-area-inset-bottom, 0px)); font-size: 12px; padding: 6px 14px; }
   .lb-zoom-badge{ top:12px; left:12px; }
   .lb-img{ max-width: 96vw; max-height: 72vh; }
   .lb-hint{ display: none; }
@@ -2273,8 +2396,15 @@ APP = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#080808">
+<meta name="application-name" content="СЛД·NET">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="СЛД·NET">
+<meta name="mobile-web-app-capable" content="yes">
 <title>СЛД·NET — рабочая область</title>
 <!-- OG_TAGS -->
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
 <link rel="icon" href="__FAVICON__">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2453,28 +2583,49 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
+  /* ============ SERVICE WORKER (PWA) ============ */
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        .catch(function(err){ console.warn('SW register failed:', err); });
+    });
+  }
+
+  /* ============ CURSOR — с «физикой»: кольцо расползается на скорости ============ */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
   var rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
   var cursorReady = false;
+
   addEventListener('mousemove', function(e){
     if (!cursorReady) { cursorReady = true; document.body.classList.add('cursor-ready'); }
     mx = e.clientX; my = e.clientY;
     document.documentElement.style.setProperty('--mx', e.clientX + 'px');
     document.documentElement.style.setProperty('--my', e.clientY + 'px');
   }, { passive: true });
+
   (function loop(){
     dot.style.transform = 'translate3d(' + mx + 'px,' + my + 'px,0) translate(-50%,-50%)';
-    rx += (mx - rx) * 0.22; ry += (my - ry) * 0.22;
+    rx += (mx - rx) * 0.26;
+    ry += (my - ry) * 0.26;
+
     var dx = mx - lastX, dy = my - lastY;
-    vel = Math.min(Math.hypot(dx, dy), 40);
+    vel = Math.min(Math.hypot(dx, dy), 60);
     lastX = mx; lastY = my;
+
     var angle = Math.atan2(dy, dx) * 180 / Math.PI;
-    var stretch = 1 + vel / 260, squash = 1 - vel / 380;
+    var stretch = 1 + vel / 150;
+    var squash  = 1 - vel / 220;
+    var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
+
     ring.style.transform = 'translate3d(' + rx + 'px,' + ry + 'px,0) translate(-50%,-50%) rotate(' + angle + 'deg) scale(' + stretch + ',' + squash + ')';
+    if (!ring.classList.contains('hover')) {
+      ring.style.borderColor = 'rgba(255,255,255,' + borderOp.toFixed(2) + ')';
+    }
     requestAnimationFrame(loop);
   })();
+
   addEventListener('mousedown', function(){ ring.classList.add('click'); });
   addEventListener('mouseup', function(){ ring.classList.remove('click'); });
   document.querySelectorAll('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .share-link-copy').forEach(function(el){
@@ -2482,6 +2633,7 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
+  /* ============ LOADER ============ */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2489,12 +2641,14 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
+  /* ============ TOPBAR HEIGHT ============ */
   var topbar = $('topbar');
   function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
   addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
   measureTopbar();
 
+  /* ============ HELPERS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2548,6 +2702,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ TABS ============ */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
@@ -2585,6 +2740,7 @@ APP = r"""<!DOCTYPE html>
   addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
 
+  /* ============ IMAGE COMPRESSION ============ */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
   async function compressImage(file, targetBytes){
@@ -2624,6 +2780,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ CREATE ============ */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -2766,6 +2923,7 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
+  /* ============ MODAL ============ */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -2793,6 +2951,7 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
+  /* ============ SEARCH ============ */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
@@ -2875,6 +3034,7 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
+  /* ============ LIGHTBOX ============ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3052,6 +3212,7 @@ APP = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
+  /* ============ POST RENDER ============ */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -3143,6 +3304,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ INIT ============ */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
@@ -3179,10 +3341,6 @@ APP = r"""<!DOCTYPE html>
 </html>
 """
 
-
-# ============================================================
-# OpenGraph-метатеги для /p/{code}
-# ============================================================
 
 def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     title = str(meta.get("title", "")).strip() or f"Пост #{code}"
