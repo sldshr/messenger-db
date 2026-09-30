@@ -17,6 +17,7 @@ Sld-Networking — посты с 6-значным кодом (без повто�
 from __future__ import annotations
 
 import gzip
+import hashlib
 import html as _html
 import json
 import logging
@@ -31,11 +32,13 @@ import uvicorn
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sld")
 
+# ---------- сжатие ----------
 try:
     import zstandard as _zstd_mod
     _HAS_ZSTD = True
@@ -61,6 +64,7 @@ def _decompress(b: bytes) -> bytes:
     raise ValueError("unknown codec")
 
 
+# ---------- шифрование ----------
 _AES = AESGCM(AESGCM.generate_key(bit_length=256))
 _NONCE = 12
 
@@ -85,6 +89,7 @@ def _unpack_meta(blob: bytes) -> dict:
     return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
 
 
+# ---------- память ----------
 _store: Dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -122,7 +127,30 @@ def _base_url(request: Request) -> str:
     return f"{proto}://{host}".rstrip("/")
 
 
+def _etag_for_post(code: str, entry: dict) -> str:
+    """Стабильный ETag от метаданных и списка фото."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(code.encode("ascii"))
+    h.update(entry["meta"])
+    h.update(str(len(entry["photos"])).encode("ascii"))
+    for p in entry["photos"]:
+        h.update(p["name"].encode("utf-8", "ignore"))
+        h.update(str(p["size"]).encode("ascii"))
+    return '"' + h.hexdigest() + '"'
+
+
+def _etag_for_photo(code: str, idx: int, entry: dict) -> str:
+    h = hashlib.blake2b(digest_size=12)
+    h.update(code.encode("ascii"))
+    h.update(str(idx).encode("ascii"))
+    h.update(entry["photos"][idx]["enc"][:64])
+    return '"' + h.hexdigest() + '"'
+
+
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
+
+# GZip-middleware: сжимает всё, что больше 500 байт и умеет text/json
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 @app.exception_handler(Exception)
@@ -197,16 +225,19 @@ async def create_post(
         }
 
     base = _base_url(request)
-    return {
-        "code": code,
-        "compressed_bytes": total,
-        "photos": len(photos),
-        "share_url": f"{base}/p/{code}",
-    }
+    return JSONResponse(
+        content={
+            "code": code,
+            "compressed_bytes": total,
+            "photos": len(photos),
+            "share_url": f"{base}/p/{code}",
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/posts/{code}")
-async def get_post(code: str):
+async def get_post(code: str, request: Request):
     code = code.strip()
     if len(code) != 6 or not code.isdigit():
         raise HTTPException(400, "Код должен содержать 6 цифр")
@@ -215,6 +246,17 @@ async def get_post(code: str):
         entry = _store.get(code)
     if entry is None:
         raise HTTPException(404, "Пост не найден")
+
+    # ETag → 304 без тела
+    etag = _etag_for_post(code, entry)
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=300, must-revalidate",
+            },
+        )
 
     try:
         meta = _unpack_meta(entry["meta"])
@@ -226,11 +268,18 @@ async def get_post(code: str):
         {"idx": i, "name": p["name"], "mime": p["mime"], "size": p["size"]}
         for i, p in enumerate(entry["photos"])
     ]
-    return meta
+
+    return JSONResponse(
+        content=meta,
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=300, must-revalidate",
+        },
+    )
 
 
 @app.get("/api/photos/{code}/{idx}")
-async def get_photo(code: str, idx: int):
+async def get_photo(code: str, idx: int, request: Request):
     with _lock:
         entry = _store.get(code)
     if entry is None:
@@ -241,6 +290,17 @@ async def get_photo(code: str, idx: int):
         raise HTTPException(404, "Фото не найдено")
 
     p = photos[idx]
+
+    etag = _etag_for_photo(code, idx, entry)
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "public, max-age=31536000, immutable",
+            },
+        )
+
     try:
         data = _decrypt(p["enc"])
     except (InvalidTag, ValueError) as e:
@@ -250,6 +310,7 @@ async def get_photo(code: str, idx: int):
         content=data,
         media_type=p["mime"],
         headers={
+            "ETag": etag,
             "Cache-Control": "public, max-age=31536000, immutable",
             "Content-Length": str(len(data)),
         },
@@ -262,7 +323,10 @@ async def random_code():
         for _ in range(5000):
             code = _gen_code()
             if code not in _store:
-                return {"code": code}
+                return JSONResponse(
+                    content={"code": code},
+                    headers={"Cache-Control": "no-store"},
+                )
     raise HTTPException(503, "Хранилище переполнено")
 
 
@@ -316,7 +380,7 @@ PWA_MANIFEST = {
 }
 
 PWA_SW = r"""
-const CACHE = 'sld-net-v3';
+const CACHE = 'sld-net-v4';
 const SHELL_URLS = ['/app', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -403,7 +467,10 @@ self.addEventListener('fetch', (event) => {
 
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse(content=PWA_MANIFEST, headers={"Cache-Control": "public, max-age=3600"})
+    return JSONResponse(
+        content=PWA_MANIFEST,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.get("/sw.js")
@@ -485,9 +552,6 @@ MASTODON_SVG = (
     '1.13 0 2.043.395 2.74 1.164.675.77 1.012 1.81 1.012 3.12z"/></svg>'
 )
 
-# ============================================================
-# ОБЩИЙ CSS
-# ============================================================
 SHELL_CSS = r"""
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1013,9 +1077,6 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
 # ============================================================
 
 LANDING_CSS = r"""
-/* ===================================================================
-   HERO — фикс переполнения заголовка
-   =================================================================== */
 .hero{padding:150px 0 0;position:relative;overflow:hidden}
 .hero-inner{
   max-width:1080px;
@@ -1023,7 +1084,7 @@ LANDING_CSS = r"""
   text-align:center;
   position:relative;
   z-index:1;
-  padding:0 8px;    /* небольшая страховка от краёв */
+  padding:0 8px;
 }
 
 .badge{
@@ -1058,11 +1119,6 @@ LANDING_CSS = r"""
 .badge-sep{color:rgba(255,255,255,0.3);font-weight:400;margin:0 -1px}
 @keyframes badgeIn{from{opacity:0;transform:translateY(-14px);filter:blur(5px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
 
-/* ===================================================================
-   H1 — без white-space: nowrap, чтобы слова могли переноситься
-   при узких вьюпортах и не вылезать за границу.
-   Размер подобран так, чтобы на десктопе фраза умещалась в одну строку.
-   =================================================================== */
 .hero-title{
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:clamp(28px,5.2vw,60px);
@@ -1082,7 +1138,6 @@ LANDING_CSS = r"""
 .h1-row{
   display:block;
   text-align:center;
-  /* БЕЗ white-space: nowrap — иначе на средних экранах текст вылезает */
 }
 .h1-row.dim{color:var(--text-mute);font-weight:400}
 
@@ -1095,7 +1150,6 @@ LANDING_CSS = r"""
   animation:wordIn .75s var(--ease) both;
   animation-delay:calc(var(--i,0) * 75ms + 140ms);
   will-change:transform,opacity,filter;
-  /* разделяем слова пробелами — inline-block между ними не даёт их сам */
   margin-right:0.24em;
 }
 .hero-title .word:last-child{margin-right:0}
@@ -1199,7 +1253,6 @@ h2{
   font-size:clamp(26px,4.2vw,44px);line-height:1.08;
   letter-spacing:-0.035em;margin-bottom:18px;
   text-wrap:balance;
-  /* без ::after-подчёркивания — оно ломало композицию */
 }
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
@@ -1361,7 +1414,6 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .mock-thumb:nth-child(2)::after{background:linear-gradient(45deg,rgba(255,255,255,0.08),transparent 60%)}
 .mock-thumb:nth-child(3)::after{background:linear-gradient(160deg,rgba(255,255,255,0.12),transparent 60%)}
 
-/* Компактный блок статистики */
 .stats{
   display:grid;grid-template-columns:repeat(4,1fr);gap:1px;
   border-radius:var(--radius);overflow:hidden;
@@ -2018,6 +2070,19 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .exit-btn:active{transform:scale(.98)}
 
+/* ===================================================================
+   PWA STANDALONE — прячем всё, что уводит из приложения.
+   Пользователь может просто закрыть приложение, отдельной "выход"
+   кнопки в установленном режиме не нужно.
+   =================================================================== */
+@media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
+  .topbar .back-btn,
+  .topbar .exit-btn { display: none !important; }
+  .topbar .logo { pointer-events: none; }
+  .topbar-inner { gap: 12px; }
+  .topbar .menu { margin-left: auto; }
+}
+
 .app{
   min-height:100dvh;
   display:flex;flex-direction:column;align-items:center;
@@ -2353,6 +2418,12 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .topbar .menu .tab{ flex: 1 1 0; justify-content: center; padding: 9px 10px; font-size: 12.5px; }
   .topbar .exit-btn{ display: inline-flex; flex-shrink: 0; padding: 9px 13px; font-size: 12.5px; }
 
+  /* В standalone режиме на мобильном — выйти не показываем */
+  @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
+    .topbar .exit-btn { display: none !important; }
+    .topbar .menu { flex: 1 1 auto; }
+  }
+
   .lb-btn{ width:44px; height:44px; }
   .lb-close{ top:12px; right:12px; }
   .lb-prev, .lb-next{
@@ -2581,6 +2652,7 @@ APP = r"""<!DOCTYPE html>
 
   document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
+  /* ============ SERVICE WORKER ============ */
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function(){
       navigator.serviceWorker.register('/sw.js', { scope: '/' })
@@ -2588,6 +2660,24 @@ APP = r"""<!DOCTYPE html>
     });
   }
 
+  /* ============ PWA detection ============ */
+  var isStandalone = false;
+  try {
+    isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                || window.matchMedia('(display-mode: fullscreen)').matches
+                || window.navigator.standalone === true;
+  } catch(e) {}
+  if (isStandalone) {
+    document.documentElement.classList.add('standalone');
+    // В standalone прячем кнопку "Выйти" (она всё равно скрыта CSS-ом,
+    // но уберём её из tab-order полностью)
+    var eb = document.querySelector('.exit-btn');
+    if (eb) eb.setAttribute('tabindex', '-1');
+    var bb = document.querySelector('.back-btn');
+    if (bb) bb.setAttribute('tabindex', '-1');
+  }
+
+  /* ============ CURSOR ============ */
   var dot  = document.querySelector('.cur-dot');
   var ring = document.querySelector('.cur-ring');
   var mx = innerWidth/2, my = innerHeight/2;
@@ -2629,6 +2719,7 @@ APP = r"""<!DOCTYPE html>
     el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
+  /* ============ LOADER ============ */
   var loader = document.getElementById('pageLoader');
   if (loader) {
     var hide = function(){ loader.classList.add('hidden'); };
@@ -2636,12 +2727,14 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
+  /* ============ TOPBAR HEIGHT ============ */
   var topbar = $('topbar');
   function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
   addEventListener('resize', measureTopbar, { passive: true });
   addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
   measureTopbar();
 
+  /* ============ HELPERS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
@@ -2695,6 +2788,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ TABS ============ */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
   var menuEl = $("menu"), menuPill = $("menuPill");
@@ -2732,45 +2826,85 @@ APP = r"""<!DOCTYPE html>
   addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
 
+  /* ============ IMAGE COMPRESSION ============ */
   var TARGET_PHOTO_BYTES = 60 * 1024;
   var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
+
+  // Проверка поддержки WebP (делается 1 раз)
+  var SUPPORTS_WEBP = (function(){
+    try {
+      var c = document.createElement('canvas');
+      c.width = c.height = 1;
+      return c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
+    } catch(e) { return false; }
+  })();
+
+  var OUT_MIME = SUPPORTS_WEBP ? 'image/webp' : 'image/jpeg';
+  var OUT_EXT = SUPPORTS_WEBP ? '.webp' : '.jpg';
+
   async function compressImage(file, targetBytes){
     if (targetBytes === undefined) targetBytes = TARGET_PHOTO_BYTES;
     if (file.type.indexOf("image/") !== 0) return file;
+
+    // Быстрый путь: если это уже подходящий формат и размер — не трогаем
+    if (file.size <= targetBytes && (file.type === OUT_MIME)) return file;
+
     try {
       var bitmap = await createImageBitmap(file);
-      var maxDim = 1600, best = null;
+      var maxDim = 1600;
+      var best = null;
+
       for (var attempt = 0; attempt < 3; attempt++) {
         var scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
         var w = Math.max(1, Math.round(bitmap.width * scale));
         var h = Math.max(1, Math.round(bitmap.height * scale));
+
         var canvas = document.createElement("canvas");
         canvas.width = w; canvas.height = h;
         var ctx = canvas.getContext("2d");
-        ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
         ctx.drawImage(bitmap, 0, 0, w, h);
-        var lo = 0.35, hi = 0.92, candidate = null;
+
+        // Бинарный поиск качества. Для WebP можно уходить ниже — он лучше держит детали.
+        var lo = SUPPORTS_WEBP ? 0.4 : 0.35;
+        var hi = SUPPORTS_WEBP ? 0.95 : 0.92;
+        var candidate = null;
+
         for (var i = 0; i < 7; i++) {
           var q = (lo + hi) / 2;
-          var blob = await new Promise(function(r){ canvas.toBlob(r, "image/jpeg", q); });
+          var blob = await new Promise(function(r){ canvas.toBlob(r, OUT_MIME, q); });
           if (!blob) break;
-          if (blob.size <= targetBytes) { candidate = blob; lo = q; } else { hi = q; }
+          if (blob.size <= targetBytes) {
+            candidate = blob; lo = q;
+          } else {
+            hi = q;
+          }
         }
+
         if (candidate) { best = candidate; break; }
-        var fallback = await new Promise(function(r){ canvas.toBlob(r, "image/jpeg", 0.5); });
+
+        var fallback = await new Promise(function(r){
+          canvas.toBlob(r, OUT_MIME, SUPPORTS_WEBP ? 0.55 : 0.5);
+        });
         if (fallback) best = fallback;
+
         maxDim = Math.round(maxDim * 0.72);
         if (maxDim < 500) break;
       }
+
       if (bitmap.close) bitmap.close();
       if (!best) return file;
-      return new File([best], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+
+      var newName = file.name.replace(/\.[^.]+$/, "") + OUT_EXT;
+      return new File([best], newName, { type: OUT_MIME });
     } catch (e) {
       console.warn("compress failed:", e);
       return file;
     }
   }
 
+  /* ============ CREATE ============ */
   var MAX_PHOTOS = 5;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
@@ -2827,9 +2961,29 @@ APP = r"""<!DOCTYPE html>
 
     drop.classList.add("busy");
     dropLabel.textContent = "Сжимаем фото...";
+
     try {
-      var compressed = await Promise.all(accepted.map(function(f){ return compressImage(f); }));
-      for (var j = 0; j < compressed.length; j++) if (compressed[j]) selectedFiles.push(compressed[j]);
+      // Параллельная компрессия, но не более 3 одновременно
+      var CONCURRENCY = 3;
+      var results = new Array(accepted.length);
+      var idx = 0;
+
+      async function worker(){
+        while (true) {
+          var i = idx++;
+          if (i >= accepted.length) return;
+          results[i] = await compressImage(accepted[i]);
+        }
+      }
+
+      var workers = [];
+      var lim = Math.min(CONCURRENCY, accepted.length);
+      for (var w = 0; w < lim; w++) workers.push(worker());
+      await Promise.all(workers);
+
+      for (var j = 0; j < results.length; j++) {
+        if (results[j]) selectedFiles.push(results[j]);
+      }
       renderPreviews();
     } finally {
       drop.classList.remove("busy");
@@ -2873,24 +3027,42 @@ APP = r"""<!DOCTYPE html>
     renderPreviews(); clearCreateMsg(); titleInput.focus();
   });
 
+  async function postForm(fd, attempt){
+    if (attempt === undefined) attempt = 0;
+    try {
+      var res = await fetch("/api/posts", { method: "POST", body: fd });
+      return res;
+    } catch (e) {
+      // Повтор при сетевой ошибке (1 retry)
+      if (attempt < 1) {
+        await new Promise(function(r){ setTimeout(r, 400); });
+        return postForm(fd, attempt + 1);
+      }
+      throw e;
+    }
+  }
+
   submitBtn.addEventListener("click", async function(){
     var title = titleInput.value.trim();
     var content = contentInput.value.trim();
     if (!title) { showCreateMsg("err", "Введите название поста."); titleInput.focus(); return; }
+
     var fd = new FormData();
     fd.append("title", title);
     fd.append("content", content);
     fd.append("og_enabled", ogCheckbox.checked ? "true" : "false");
     selectedFiles.forEach(function(f){ fd.append("files", f, f.name); });
 
+    var label = submitBtn.querySelector("span");
     submitBtn.disabled = true;
-    var oldHTML = submitBtn.innerHTML;
-    submitBtn.textContent = "Публикация...";
+    var oldLabel = label ? label.textContent : "";
+    if (label) label.textContent = "Публикация...";
     clearCreateMsg();
 
     try {
-      var res = await fetch("/api/posts", { method: "POST", body: fd });
+      var res = await postForm(fd, 0);
       if (!res.ok) { showCreateMsg("err", await readError(res)); return; }
+
       var data = await res.json().catch(function(){ return null; });
       if (!data || !data.code) { showCreateMsg("err", "Некорректный ответ сервера"); return; }
 
@@ -2909,10 +3081,11 @@ APP = r"""<!DOCTYPE html>
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
       submitBtn.disabled = false;
-      submitBtn.innerHTML = oldHTML;
+      if (label) label.textContent = oldLabel;
     }
   });
 
+  /* ============ MODAL ============ */
   var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
   var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
   var modalCloseBtn = $("modalCloseBtn");
@@ -2940,10 +3113,15 @@ APP = r"""<!DOCTYPE html>
   createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
   modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
 
+  /* ============ SEARCH ============ */
   var otp = $("otp");
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
   var searchSeq = 0, lastSubmitted = "", otpCopyTimer = null;
+
+  // Локальный кеш найденных постов (in-memory)
+  var postCache = new Map();
+  var postCacheETag = new Map();
 
   function getCode(){ return otpCells.map(function(c){ return c.value; }).join(""); }
   function updateOtpCopyState(){ otpCopyBtn.disabled = getCode().length !== 6; }
@@ -3022,6 +3200,7 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
+  /* ============ LIGHTBOX ============ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3199,6 +3378,7 @@ APP = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
+  /* ============ POST RENDER ============ */
   function renderPost(post){
     searchFrame.innerHTML = "";
     var title = document.createElement("h3");
@@ -3269,9 +3449,42 @@ APP = r"""<!DOCTYPE html>
   async function runSearch(code){
     var mySeq = ++searchSeq;
     renderSpinner();
-    await new Promise(function(r){ setTimeout(r, 340); });
+    await new Promise(function(r){ setTimeout(r, 300); });
     if (mySeq !== searchSeq) return;
+
     try {
+      // Кеш: если уже искали этот пост — показываем мгновенно
+      if (postCache.has(code)) {
+        renderPost(postCache.get(code));
+        // Параллельно ревалидируем в фоне через ETag
+        (async function(){
+          try {
+            var etag = postCacheETag.get(code);
+            var h = {};
+            if (etag) h["If-None-Match"] = etag;
+            var r = await fetch("/api/posts/" + encodeURIComponent(code), { headers: h });
+            if (r.status === 304) return; // всё актуально
+            if (r.ok) {
+              var fresh = await r.json();
+              if (fresh && fresh.code) {
+                postCache.set(code, fresh);
+                var newTag = r.headers.get("etag");
+                if (newTag) postCacheETag.set(code, newTag);
+                // Если всё ещё на том же поиске — обновим карточку
+                if (mySeq === searchSeq) renderPost(fresh);
+              }
+            } else if (r.status === 404) {
+              // Пост исчез (перезапуск сервера) — чистим кеш и показываем ошибку
+              postCache.delete(code);
+              postCacheETag.delete(code);
+              if (mySeq === searchSeq) renderError("Пост не найден");
+            }
+          } catch(e){}
+        })();
+        return;
+      }
+
+      // Кеша нет — обычный запрос
       var res = await fetch("/api/posts/" + encodeURIComponent(code));
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
@@ -3282,6 +3495,12 @@ APP = r"""<!DOCTYPE html>
       var post = await res.json().catch(function(){ return null; });
       if (mySeq !== searchSeq) return;
       if (!post) { renderError("Пост не найден"); return; }
+
+      // Запоминаем в кеш
+      postCache.set(code, post);
+      var tag = res.headers.get("etag");
+      if (tag) postCacheETag.set(code, tag);
+
       renderPost(post);
     } catch (e) {
       if (mySeq !== searchSeq) return;
@@ -3290,6 +3509,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
+  /* ============ INIT ============ */
   function initFromUrl(){
     var r = parseLocation();
     if (r.code) {
