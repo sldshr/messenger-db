@@ -519,6 +519,12 @@ ARROW_SVG = (
     '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
 )
 
+SEARCH_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>'
+)
+
 YOUTUBE_SVG = (
     '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
     '<path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545'
@@ -672,24 +678,54 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
+/* ============================================================
+   ЛЕНДИНГ: ШАПКА-МОРФ
+   • Сверху страницы — полноширинная, крупные элементы, 2 кнопки.
+   • После 80px скролла — сжимается в компактную пилюлю по центру.
+   Всё анимируется через transition. Внешний .top-nav — fullwidth
+   fixed-обёртка с pointer-events:none, чтобы не блокировать клики;
+   интерактивная часть — внутри .top-nav-inner.
+   ============================================================ */
 body > nav.top-nav{
-  position:fixed;top:20px;left:50%;transform:translateX(-50%);
+  position:fixed;top:0;left:0;right:0;
   z-index:100;
-  width:calc(100% - 40px);max-width:1180px;
-  border-radius:20px;padding:12px 14px 12px 22px;
-  display:flex;align-items:center;justify-content:space-between;gap:20px;
-  background:rgba(15,15,15,0.6);
+  padding:0;
+  transition:padding .55s var(--ease);
+  pointer-events:none;
+}
+body > nav.top-nav.scrolled{ padding:20px; }
+
+body > nav.top-nav .top-nav-inner{
+  pointer-events:auto;
+  display:flex;align-items:center;justify-content:space-between;gap:24px;
+  max-width:100%;
+  margin:0 auto;
+  padding:20px 40px;
+  background:rgba(10,10,10,0.66);
   backdrop-filter:blur(24px) saturate(160%);
   -webkit-backdrop-filter:blur(24px) saturate(160%);
-  border:1px solid var(--border);
-  box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
-  transition:background .3s,box-shadow .3s,border-color .3s;
+  border:1px solid transparent;
+  border-bottom-color:var(--border);
+  border-radius:0;
+  box-shadow:0 6px 30px rgba(0,0,0,0.32);
+  transition:
+    max-width .55s var(--ease),
+    padding .55s var(--ease),
+    border-radius .55s var(--ease),
+    background .4s ease,
+    box-shadow .4s ease,
+    border-color .4s ease,
+    border-width .4s ease;
 }
-body > nav.top-nav.scrolled{
+body > nav.top-nav.scrolled .top-nav-inner{
+  max-width:1180px;
+  padding:12px 14px 12px 22px;
+  border-radius:20px;
   background:rgba(8,8,8,0.85);
   border-color:var(--border-2);
   box-shadow:0 16px 50px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.08);
 }
+
 .logo{
   display:inline-flex;align-items:center;gap:11px;
   font-family:'Unbounded',sans-serif;font-weight:700;
@@ -723,6 +759,67 @@ body > nav.top-nav.scrolled{
 }
 .nav-links a:hover{color:#fff;background:rgba(255,255,255,0.05)}
 .nav-links a.active{color:#fff;background:rgba(255,255,255,0.06)}
+
+.nav-right{display:flex;align-items:center;flex-shrink:0;}
+
+/* Кнопка «Найти» — на верхнем состоянии видна, при скролле плавно сворачивается */
+body > nav.top-nav .nav-extra{
+  max-width:220px;
+  opacity:1;
+  overflow:hidden;
+  white-space:nowrap;
+  margin-right:10px;
+  transition:
+    max-width .55s var(--ease),
+    margin-right .55s var(--ease),
+    opacity .3s ease,
+    padding .55s var(--ease),
+    height .55s var(--ease),
+    font-size .55s var(--ease),
+    border-radius .55s var(--ease),
+    background .28s,border-color .28s,color .28s,box-shadow .28s;
+}
+body > nav.top-nav.scrolled .nav-extra{
+  max-width:0;
+  margin-right:0;
+  opacity:0;
+  padding-left:0;
+  padding-right:0;
+  pointer-events:none;
+}
+
+/* Размеры элементов в раскрытом состоянии */
+body > nav.top-nav .logo{font-size:17px;transition:font-size .55s var(--ease);}
+body > nav.top-nav .logo-mark{
+  width:40px;height:40px;border-radius:12px;
+  transition:width .55s var(--ease),height .55s var(--ease),border-radius .55s var(--ease),transform .35s var(--ease);
+}
+body > nav.top-nav .logo-mark svg{
+  width:20px;height:20px;
+  transition:width .55s var(--ease),height .55s var(--ease);
+}
+body > nav.top-nav .nav-links a{
+  padding:12px 20px;font-size:15px;border-radius:13px;
+  transition:color .2s,background .2s,padding .55s var(--ease),font-size .55s var(--ease),border-radius .55s var(--ease);
+}
+body > nav.top-nav .btn{
+  height:50px;padding:0 26px;font-size:14.5px;border-radius:14px;
+  transition:background .28s,border-color .28s,color .28s,box-shadow .28s,
+             height .55s var(--ease),padding .55s var(--ease),
+             font-size .55s var(--ease),border-radius .55s var(--ease);
+}
+body > nav.top-nav .btn svg{
+  width:17px;height:17px;
+  transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease);
+}
+
+/* Размеры элементов в свёрнутом (scrolled) состоянии */
+body > nav.top-nav.scrolled .logo{font-size:15px;}
+body > nav.top-nav.scrolled .logo-mark{width:32px;height:32px;border-radius:10px;}
+body > nav.top-nav.scrolled .logo-mark svg{width:16px;height:16px;}
+body > nav.top-nav.scrolled .nav-links a{padding:9px 15px;font-size:13.5px;border-radius:11px;}
+body > nav.top-nav.scrolled .btn{height:44px;padding:0 20px;font-size:13.5px;border-radius:12px;}
+body > nav.top-nav.scrolled .btn svg{width:15px;height:15px;}
 
 .btn{
   display:inline-flex;align-items:center;justify-content:center;
@@ -851,10 +948,33 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 @media (max-width:1000px){.nav-links{display:none}}
 @media (max-width:720px){
   .wrap{padding:0 20px}
-  body > nav.top-nav{padding:10px 10px 10px 16px;top:12px;width:calc(100% - 24px);border-radius:16px}
-  .logo{font-size:13.5px}
-  .logo-mark{width:28px;height:28px}
-  .logo-mark svg{width:14px;height:14px}
+
+  /* Мобильная шапка: раскрытое состояние */
+  body > nav.top-nav .top-nav-inner{
+    padding:16px 20px;
+    gap:12px;
+  }
+  body > nav.top-nav.scrolled{ padding:10px; }
+  body > nav.top-nav.scrolled .top-nav-inner{
+    padding:9px 10px 9px 14px;
+    border-radius:14px;
+  }
+
+  .logo{font-size:13.5px;}
+  .logo-mark{width:28px;height:28px;}
+  .logo-mark svg{width:14px;height:14px;}
+
+  body > nav.top-nav .logo{font-size:15px;}
+  body > nav.top-nav .logo-mark{width:34px;height:34px;border-radius:10px;}
+  body > nav.top-nav .logo-mark svg{width:17px;height:17px;}
+  body > nav.top-nav .btn{height:44px;padding:0 18px;font-size:13px;}
+  body > nav.top-nav .nav-extra{display:none;}
+
+  body > nav.top-nav.scrolled .logo{font-size:13.5px;}
+  body > nav.top-nav.scrolled .logo-mark{width:28px;height:28px;border-radius:8px;}
+  body > nav.top-nav.scrolled .logo-mark svg{width:14px;height:14px;}
+  body > nav.top-nav.scrolled .btn{height:38px;padding:0 14px;font-size:12.5px;}
+
   .foot-cols{gap:44px}
   .foot-bottom{justify-content:center;text-align:center;flex-direction:column;gap:16px}
 }
@@ -920,18 +1040,31 @@ SHELL_JS = r"""
     else { addEventListener("load", function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
+  /* ============================================================
+     МОРФ ШАПКИ: сверху — раскрыто, при скролле — компактная пилюля.
+     Порог 80px. Тогглим класс .scrolled; CSS делает всё сам.
+     ============================================================ */
   var nav = document.getElementById("nav");
   if (nav) {
     var ticking = false;
+    var SCROLL_THRESHOLD = 80;
+
+    var applyState = function(){
+      nav.classList.toggle("scrolled", (window.scrollY || window.pageYOffset || 0) > SCROLL_THRESHOLD);
+    };
+
+    // Выставляем сразу, чтобы при перезагрузке в середине страницы не мигало
+    applyState();
+
     addEventListener("scroll", function(){
       if (!ticking) {
-        requestAnimationFrame(function(){
-          nav.classList.toggle("scrolled", scrollY > 40);
-          ticking = false;
-        });
+        requestAnimationFrame(function(){ applyState(); ticking = false; });
         ticking = true;
       }
     }, { passive: true });
+
+    // На всякий случай: если шрифты догрузились и высота поменялась
+    addEventListener("resize", applyState, { passive: true });
   }
 
   var io = new IntersectionObserver(function(es){
@@ -953,7 +1086,7 @@ SHELL_JS = r"""
       var tg = document.querySelector(h);
       if (!tg) return;
       e.preventDefault();
-      scrollTo({ top: tg.getBoundingClientRect().top + scrollY - 90, behavior: "smooth" });
+      scrollTo({ top: tg.getBoundingClientRect().top + scrollY - 110, behavior: "smooth" });
     });
   });
 
@@ -1054,14 +1187,21 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '<div class="bg"><div class="halo halo-1"></div><div class="halo halo-2"></div><div class="halo halo-3"></div></div>\n'
         '<div class="cursor-glow"></div>\n<div class="grid-bg"></div>\n<div class="grain"></div>\n'
         '<nav id="nav" class="top-nav">\n'
-        '  <a href="/" class="logo">\n'
-        '    <span class="logo-mark">' + LOGO_SVG + '</span>\n'
-        '    <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
-        '  </a>\n'
-        '  <div class="nav-links">' + links_html + '</div>\n'
-        '  <a href="/app?mode=create" class="btn btn-primary">\n'
-        '    <span>Открыть приложение</span>' + ARROW_SVG + '\n'
-        '  </a>\n'
+        '  <div class="top-nav-inner">\n'
+        '    <a href="/" class="logo">\n'
+        '      <span class="logo-mark">' + LOGO_SVG + '</span>\n'
+        '      <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
+        '    </a>\n'
+        '    <div class="nav-links">' + links_html + '</div>\n'
+        '    <div class="nav-right">\n'
+        '      <a href="/app?mode=find" class="btn btn-ghost nav-extra">\n'
+        + SEARCH_SVG + '<span>Найти</span>\n'
+        '      </a>\n'
+        '      <a href="/app?mode=create" class="btn btn-primary">\n'
+        '        <span>Открыть приложение</span>' + ARROW_SVG + '\n'
+        '      </a>\n'
+        '    </div>\n'
+        '  </div>\n'
         '</nav>\n'
         + body +
         FOOTER_HTML +
@@ -1075,7 +1215,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
 # ============================================================
 
 LANDING_CSS = r"""
-.hero{padding:150px 0 0;position:relative;overflow:hidden}
+.hero{padding:170px 0 0;position:relative;overflow:hidden}
 .hero-inner{
   max-width:1080px;
   margin:0 auto;
@@ -1487,7 +1627,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   .steps::before{display:none}
 }
 @media (max-width:720px){
-  .hero{padding:120px 0 0}
+  .hero{padding:140px 0 0}
   section{padding:70px 0}
   .hero-inner{padding:0}
   .tile-groups{gap:36px}
@@ -1984,50 +2124,79 @@ body.cursor-ready .cur-ring { opacity:1; }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
 /* ============================================================
-   TOPBAR — меню «Создать / Найти» строго по центру.
-   Логотип — слева, вспомогательные кнопки — справа.
-   Центрирование через position:absolute, не через space-between:
-   так меню стоит ровно по центру шапки при любой ширине соседей.
+   TOPBAR приложения — та же логика морфа, что и на лендинге:
+   сверху — полноширинная, при скролле — компактная пилюля.
    ============================================================ */
 .topbar{
-  position:fixed;top:14px;left:50%;transform:translateX(-50%);
-  z-index:100;width:calc(100% - 28px);max-width:1160px;border-radius:16px;
-  padding:10px 12px 10px 18px;
-  background:rgba(10,10,10,0.72);
-  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
-  border:1px solid var(--border);
-  box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
-  padding-top: max(10px, env(safe-area-inset-top, 0px) + 4px);
+  position:fixed;top:0;left:0;right:0;
+  z-index:100;
+  padding-top:env(safe-area-inset-top, 0px);
+  transition:padding .55s var(--ease);
+  pointer-events:none;
+}
+.topbar.scrolled{
+  padding:calc(env(safe-area-inset-top, 0px) + 14px) 14px 0;
 }
 .topbar-inner{
+  pointer-events:auto;
   position:relative;
-  display:flex;align-items:center;gap:12px;
-  min-height:44px;
+  display:flex;align-items:center;gap:14px;
+  max-width:100%;margin:0 auto;
+  min-height:60px;
+  padding:12px 26px;
+  background:rgba(10,10,10,0.72);
+  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
+  border:1px solid transparent;
+  border-bottom-color:var(--border);
+  border-radius:0;
+  box-shadow:0 6px 30px rgba(0,0,0,0.32);
+  transition:
+    max-width .55s var(--ease),
+    min-height .55s var(--ease),
+    padding .55s var(--ease),
+    border-radius .55s var(--ease),
+    background .4s ease,
+    box-shadow .4s ease,
+    border-color .4s ease;
 }
-.topbar .logo{flex-shrink:0;margin-right:auto;}
-.topbar .back-btn,
-.topbar .exit-btn{flex-shrink:0;margin-left:auto;}
+.topbar.scrolled .topbar-inner{
+  max-width:1160px;
+  min-height:44px;
+  padding:10px 12px 10px 18px;
+  border-radius:16px;
+  background:rgba(8,8,8,0.85);
+  border-color:var(--border-2);
+  box-shadow:0 16px 50px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
 .logo{
   display:inline-flex;align-items:center;gap:10px;
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:13.5px;letter-spacing:-0.01em;
+  font-size:15px;letter-spacing:-0.01em;
   text-decoration:none;color:#fff;white-space:nowrap;
+  transition:font-size .55s var(--ease);
+  flex-shrink:0;
+  margin-right:auto;
 }
 .logo-mark{
-  width:28px;height:28px;border-radius:8px;
+  width:34px;height:34px;border-radius:10px;
   background:linear-gradient(140deg,#fff,#c4c4c8);
   display:grid;place-items:center;position:relative;overflow:hidden;
   box-shadow:0 4px 14px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.15);
-  transition:transform .35s var(--ease);
+  transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease),border-radius .55s var(--ease);
+  flex-shrink:0;
 }
 .logo:hover .logo-mark{transform:rotate(-6deg) scale(1.05)}
 .logo-mark::after{content:'';position:absolute;inset:0;background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none}
-.logo-mark svg{width:14px;height:14px;position:relative;z-index:1;color:#08080a;display:block}
+.logo-mark svg{width:17px;height:17px;position:relative;z-index:1;color:#08080a;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
 .logo-word{display:inline-flex;align-items:baseline;gap:1px}
 .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
 .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-/* Меню — центр шапки */
+.topbar.scrolled .logo{ font-size:13.5px; }
+.topbar.scrolled .logo-mark{ width:28px; height:28px; border-radius:8px; }
+.topbar.scrolled .logo-mark svg{ width:14px; height:14px; }
+
 .menu{
   position:absolute;
   left:50%;
@@ -2038,6 +2207,7 @@ body.cursor-ready .cur-ring { opacity:1; }
   border-radius:12px;background:rgba(255,255,255,0.028);
   border:1px solid var(--border);
   flex-shrink:0;
+  transition:padding .55s var(--ease), border-radius .55s var(--ease);
 }
 .menu-pill{
   position:absolute;top:4px;bottom:4px;left:0;width:0;
@@ -2051,48 +2221,58 @@ body.cursor-ready .cur-ring { opacity:1; }
 .tab{
   position:relative;z-index:1;
   display:inline-flex;align-items:center;gap:8px;
-  padding:8px 15px;border-radius:9px;
+  padding:10px 18px;border-radius:10px;
   background:transparent;border:1px solid transparent;
-  color:var(--text-dim);font:inherit;font-size:13px;font-weight:500;
-  cursor:pointer;transition:color .22s;white-space:nowrap;
+  color:var(--text-dim);font:inherit;font-size:14px;font-weight:500;
+  cursor:pointer;transition:color .22s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);white-space:nowrap;
   -webkit-tap-highlight-color:transparent;
 }
-.tab svg{width:15px;height:15px;flex-shrink:0;display:block}
+.tab svg{width:16px;height:16px;flex-shrink:0;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
 .tab:hover{color:#fff}
 .tab.active{color:#fff}
+.topbar.scrolled .menu .tab{ padding:8px 15px; font-size:13px; border-radius:9px; }
+.topbar.scrolled .menu .tab svg{ width:15px; height:15px; }
+
 .back-btn{
   display:inline-flex;align-items:center;gap:7px;
   color:var(--text-dim);text-decoration:none;
-  font-size:13px;font-weight:500;
-  padding:8px 12px;border-radius:10px;
-  transition:color .2s,background .2s;white-space:nowrap;
+  font-size:14px;font-weight:500;
+  padding:10px 14px;border-radius:11px;
+  transition:color .2s,background .2s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);white-space:nowrap;
+  flex-shrink:0;
+  margin-left:auto;
 }
-.back-btn svg{width:14px;height:14px;display:block}
+.back-btn svg{width:15px;height:15px;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
 .back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
+.topbar.scrolled .back-btn{ padding:8px 12px; font-size:13px; border-radius:10px; }
+.topbar.scrolled .back-btn svg{ width:14px; height:14px; }
 
 .exit-btn{
   display:none;
   align-items:center;gap:7px;
-  padding:9px 14px;border-radius:10px;
+  padding:11px 18px;border-radius:12px;
   background:rgba(200,70,70,0.92);
   border:1px solid rgba(240,110,110,0.9);
-  color:#fff;font:inherit;font-size:13px;font-weight:600;
+  color:#fff;font:inherit;font-size:14px;font-weight:600;
   cursor:pointer;text-decoration:none;white-space:nowrap;
-  transition:background .22s,border-color .22s,box-shadow .22s;
+  transition:background .22s,border-color .22s,box-shadow .22s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);
   box-shadow:0 6px 18px -8px rgba(200,70,70,0.5),inset 0 1px 0 rgba(255,255,255,0.18);
+  flex-shrink:0;
+  margin-left:auto;
 }
-.exit-btn svg{width:14px;height:14px;display:block}
+.exit-btn svg{width:15px;height:15px;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
 .exit-btn:hover,.exit-btn:active{
   background:rgba(220,80,80,1);border-color:rgba(255,130,130,1);
   box-shadow:0 10px 24px -8px rgba(200,70,70,0.6),inset 0 1px 0 rgba(255,255,255,0.22);
 }
 .exit-btn:active{transform:scale(.98)}
+.topbar.scrolled .exit-btn{ padding:9px 14px; font-size:13px; border-radius:10px; }
+.topbar.scrolled .exit-btn svg{ width:14px; height:14px; }
 
 @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
   .topbar .back-btn,
   .topbar .exit-btn { display: none !important; }
   .topbar .logo { pointer-events: none; }
-  .topbar-inner { gap: 12px; }
 }
 
 .app{
@@ -2348,7 +2528,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   transition:opacity .18s ease;
 }
 .lb-img.loading{opacity:0.25}
-/* Спиннер загрузки поверх картинки */
 .lb-loading{
   position:absolute;top:50%;left:50%;
   width:30px;height:30px;margin:-15px 0 0 -15px;
@@ -2397,7 +2576,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .modal-actions .btn{flex:1;height:42px;font-size:13px}
 
 @media (max-width:820px){
-  .topbar{padding:9px 10px 9px 14px}
+  .topbar-inner{padding:10px 16px;}
 }
 @media (max-width:640px){
   .card{padding:15px;border-radius:16px}
@@ -2447,13 +2626,20 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     padding: 4px 0;
   }
   .stage::-webkit-scrollbar{ display:none; }
-  .topbar{ top: max(10px, env(safe-area-inset-top, 0px) + 6px); width: calc(100% - 20px); padding: 8px 8px 8px 10px; border-radius: 14px; }
-  .topbar-inner{ min-height: 40px; gap: 8px; }
+
+  /* Мобильная шапка приложения */
+  .topbar { padding-top: env(safe-area-inset-top, 0px); }
+  .topbar.scrolled { padding: calc(env(safe-area-inset-top, 0px) + 10px) 10px 0; }
+  .topbar-inner { min-height: 54px; padding: 10px 16px; gap: 10px; }
+  .topbar.scrolled .topbar-inner { min-height: 42px; padding: 8px 8px 8px 10px; border-radius: 14px; }
+
   .topbar .logo,
   .topbar .back-btn{ display: none !important; }
   .topbar .menu{ padding: 3px; }
-  .topbar .menu .tab{ padding: 9px 10px; font-size: 12.5px; }
-  .topbar .exit-btn{ display: inline-flex; padding: 9px 13px; font-size: 12.5px; }
+  .topbar .menu .tab{ padding: 10px 12px; font-size: 13px; }
+  .topbar.scrolled .menu .tab{ padding: 9px 10px; font-size: 12.5px; }
+  .topbar .exit-btn{ display: inline-flex; padding: 10px 15px; font-size: 13px; }
+  .topbar.scrolled .exit-btn{ padding: 8px 12px; font-size: 12.5px; }
 
   @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
     .topbar .exit-btn { display: none !important; }
@@ -2483,8 +2669,9 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 @media (max-width: 480px){
   .topbar .tab span{ display: inline; }
   .topbar .tab svg{ width: 14px; height: 14px; }
-  .topbar .tab{ padding: 9px 8px; font-size: 12px; }
-  .topbar .exit-btn{ padding: 9px 11px; font-size: 12px; }
+  .topbar .tab{ padding: 9px 10px; font-size: 12.5px; }
+  .topbar.scrolled .tab{ padding: 9px 9px; font-size: 12px; }
+  .topbar .exit-btn{ padding: 9px 13px; font-size: 12.5px; }
 }
 @media (max-width: 360px){
   .topbar .tab span{ display: none; }
@@ -2761,12 +2948,48 @@ APP = r"""<!DOCTYPE html>
     else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* ============ TOPBAR HEIGHT ============ */
+  /* ============================================================
+     TOPBAR: МОРФ ПРИ СКРОЛЛЕ
+     Сверху — раскрытое состояние, после 80px — компактное.
+     ============================================================ */
   var topbar = $('topbar');
-  function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
-  addEventListener('resize', measureTopbar, { passive: true });
-  addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
+  var SCROLL_THRESHOLD = 80;
+
+  function applyTopbarState(){
+    topbar.classList.toggle('scrolled', (window.scrollY || window.pageYOffset || 0) > SCROLL_THRESHOLD);
+  }
+
+  function measureTopbar(){
+    // Меряем раскрытое состояние — оно самое высокое. От него считаем
+    // отступ контента, чтобы ничего не пряталось за шапкой.
+    var wasScrolled = topbar.classList.contains('scrolled');
+    if (wasScrolled) topbar.classList.remove('scrolled');
+    var h = topbar.offsetHeight;
+    if (wasScrolled) topbar.classList.add('scrolled');
+    document.documentElement.style.setProperty('--topbar-h', h + 'px');
+  }
+
+  applyTopbarState();
   measureTopbar();
+
+  var ticking = false;
+  addEventListener('scroll', function(){
+    if (!ticking) {
+      requestAnimationFrame(function(){
+        applyTopbarState();
+        ticking = false;
+      });
+      ticking = true;
+    }
+  }, { passive: true });
+
+  addEventListener('resize', function(){
+    measureTopbar();
+    applyTopbarState();
+  }, { passive: true });
+  addEventListener('orientationchange', function(){
+    setTimeout(function(){ measureTopbar(); applyTopbarState(); }, 300);
+  });
 
   /* ============ HELPERS ============ */
   var ICONS = {
@@ -3230,7 +3453,6 @@ APP = r"""<!DOCTYPE html>
 
   /* ============================================================
      LIGHTBOX — улучшенный просмотр фото, особенно на телефоне.
-     Что нового:
        • инерция панорамирования (после свайпа картинка «докатывается»)
        • свайп вниз для закрытия с плавным затемнением фона
        • быстрый и точный двойной тап (320 мс / 44 px)
@@ -3247,7 +3469,6 @@ APP = r"""<!DOCTYPE html>
   var isPanning = false, panStartX = 0, panStartY = 0, badgeTimer = null;
   var inertiaRaf = 0, lbLoadTimer = null;
 
-  /* Спрятать спиннер и снять .loading, когда картинка загрузилась */
   function lbStopLoading(){
     clearTimeout(lbLoadTimer); lbLoadTimer = null;
     lightbox.classList.remove('loading');
@@ -3260,7 +3481,6 @@ APP = r"""<!DOCTYPE html>
     lbTransform.style.transform = "translate(" + panX + "px," + totalY + "px) scale(" + zoom + ")";
     lbViewport.style.cursor = (zoom > 1.001) ? (isPanning ? "grabbing" : "grab") : "default";
     if (swipeY > 0) {
-      // Затемняем фон, когда тянем вниз для закрытия
       var fade = Math.max(0.15, 1 - swipeY / 420);
       lightbox.style.background = "rgba(0,0,0," + (0.96 * fade).toFixed(3) + ")";
       lbTransform.style.opacity = Math.max(0.35, fade).toFixed(3);
@@ -3394,7 +3614,7 @@ APP = r"""<!DOCTYPE html>
   });
 
   /* ============ TOUCH: улучшенный мобильный просмотр ============ */
-  var tMode = 'idle'; // 'idle' | 'pan' | 'pinch' | 'swipe-down'
+  var tMode = 'idle';
   var tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0;
   var tStartTime = 0, tLastFrameTime = 0;
   var tStartPanX = 0, tStartPanY = 0;
@@ -3443,8 +3663,6 @@ APP = r"""<!DOCTYPE html>
       tStartPanX = panX; tStartPanY = panY;
       tVelX = 0; tVelY = 0;
       swipeY = 0;
-      // если не приближено — начинаем со «свайп вниз» как гипотезы,
-      // по первому движению определимся (вниз = закрыть, вбок = листать)
       tMode = (zoom <= 1.05) ? 'swipe-down' : 'pan';
     }
   }, { passive: true });
@@ -3464,7 +3682,6 @@ APP = r"""<!DOCTYPE html>
       var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
 
-      // анкор в центре pinch — точка под пальцами остаётся под пальцами
       var vrect = lbViewport.getBoundingClientRect();
       var cx = vrect.left + vrect.width / 2;
       var cy = vrect.top + vrect.height / 2;
@@ -3488,18 +3705,15 @@ APP = r"""<!DOCTYPE html>
       var totalDx = tx - tStartX;
       var totalDy = ty - tStartY;
 
-      // Определяемся с интентом по первому заметному движению
       if (tMode === 'swipe-down') {
         if (Math.abs(totalDx) > 12 && Math.abs(totalDx) > Math.abs(totalDy)) {
           tMode = 'pan';
         } else if (totalDy < -12 && Math.abs(totalDy) > Math.abs(totalDx)) {
-          // свайп вверх — тоже панорама, но картинка не закрывается
           tMode = 'pan';
         }
       }
 
       if (tMode === 'swipe-down' && zoom <= 1.05) {
-        // Свайп вниз — «тянем» картинку за пальцем
         swipeY = Math.max(0, totalDy);
         applyTransform();
       } else if (tMode === 'pan') {
@@ -3508,7 +3722,6 @@ APP = r"""<!DOCTYPE html>
         applyTransform();
       }
 
-      // Скорость для инерции (сглаженная)
       var now = performance.now();
       var dt = now - tLastFrameTime;
       if (dt > 8) {
@@ -3527,7 +3740,6 @@ APP = r"""<!DOCTYPE html>
     tMode = 'idle';
 
     if (wasPinch) {
-      // Если pinch «улетел» ниже 1× — мягко возвращаем
       if (zoom < 1) {
         animateTransformTo(1, 0, 0, 220);
         zoom = 1;
@@ -3545,12 +3757,11 @@ APP = r"""<!DOCTYPE html>
     var dist = Math.hypot(dx, dy);
 
     if (modeAtEnd === 'swipe-down' && swipeY > 0) {
-      var velocity = dist / Math.max(1, dt) * 16; // пикс/кадр
+      var velocity = dist / Math.max(1, dt) * 16;
       if (swipeY > 120 || (dy > 60 && velocity > 12)) {
         closeLightbox();
         return;
       }
-      // Мягкий откат вверх
       var startSwipe = swipeY;
       var t0 = performance.now();
       (function easeBack(){
@@ -3567,7 +3778,6 @@ APP = r"""<!DOCTYPE html>
       return;
     }
 
-    // Тап/двойной тап
     if (dt < 300 && dist < 12) {
       var now = performance.now();
       if (now - tTapTime < 320 &&
@@ -3582,7 +3792,6 @@ APP = r"""<!DOCTYPE html>
       tTapY = t.clientY;
     }
 
-    // Свайп вбок — листать (только если не приближено)
     if (modeAtEnd === 'pan' && zoom <= 1.05 && dt < 600 && dist > 40) {
       if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
         if (dx < 0) lbStep(1); else lbStep(-1);
@@ -3590,7 +3799,6 @@ APP = r"""<!DOCTYPE html>
       }
     }
 
-    // Инерция панорамы
     if (modeAtEnd === 'pan' && zoom > 1.05 && (Math.abs(tVelX) > 1 || Math.abs(tVelY) > 1)) {
       startInertia(tVelX, tVelY);
     }
