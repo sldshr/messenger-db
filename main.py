@@ -1,1228 +1,451 @@
-# main.py
-# Мини-соцнежь: FastAPI, всё в оперативной памяти, один файл.
-# Запуск:  pip install fastapi uvicorn
-#          uvicorn main:app --reload
-# Открыть: http://127.0.0.1:8000
-
-import hashlib
-import html
-import re
 import secrets
-import uuid
-from datetime import datetime
-from typing import Optional
+import time
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
 
-from fastapi import Cookie, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+app = FastAPI()
 
-app = FastAPI(title="MiniNet")
-
-# --------------------------------------------------------------------------
-# ХРАНИЛИЩЕ
-# --------------------------------------------------------------------------
-USERS: dict = {}          # username -> {"salt", "hash", "created"}
-POSTS: list = []          # [{"id","author","text","ts","likes": set()}]
-SESSIONS: dict = {}       # token -> username
-NOTIFICATIONS: list = []  # [{"id","user","from","kind","post_id","ts","read"}]
-
-MAX_POST = 500
-MENTION_RE = re.compile(r"@([A-Za-z0-9_]{3,20})")
+users: dict[str, str] = {}
+chats: dict[str, dict] = {}
+sockets: dict[str, dict[str, WebSocket]] = {}
 
 
-# --------------------------------------------------------------------------
-# ХЕЛПЕРЫ
-# --------------------------------------------------------------------------
-def hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return PAGE
 
 
-def current_user(session: Optional[str]) -> Optional[str]:
-    if session and session in SESSIONS:
-        return SESSIONS[session]
-    return None
+@app.post("/api/login")
+def login(data: dict):
+    nick = (data.get("nickname") or "").strip()
+    if not nick or len(nick) > 20:
+        raise HTTPException(400, "bad nickname")
+    token = secrets.token_urlsafe(16)
+    users[token] = nick
+    return {"token": token, "nickname": nick}
 
 
-def find_user(name: str) -> Optional[str]:
-    return next((u for u in USERS if u.lower() == name.lower()), None)
+@app.get("/api/chats")
+def my_chats(token: str):
+    nick = users.get(token)
+    if not nick:
+        raise HTTPException(401)
+    out = []
+    for cid, c in chats.items():
+        if nick in c["members"]:
+            last = c["messages"][-1]["text"] if c["messages"] else "Нет сообщений"
+            out.append({"id": cid, "name": c["name"], "last": last})
+    return out
 
 
-def add_notification(recipient: str, kind: str, from_user: str,
-                     post_id: Optional[str] = None) -> None:
-    if not recipient or recipient == from_user:
+@app.post("/api/chats")
+def create_chat(data: dict):
+    nick = users.get(data.get("token"))
+    if not nick:
+        raise HTTPException(401)
+    name = (data.get("name") or "").strip()[:40] or "Без названия"
+    cid = secrets.token_hex(3)
+    while cid in chats:
+        cid = secrets.token_hex(3)
+    chats[cid] = {"name": name, "members": {nick}, "messages": []}
+    return {"id": cid, "name": name}
+
+
+@app.post("/api/chats/join")
+def join_chat(data: dict):
+    nick = users.get(data.get("token"))
+    if not nick:
+        raise HTTPException(401)
+    cid = (data.get("id") or "").strip().lower()
+    if cid not in chats:
+        raise HTTPException(404, "not found")
+    chats[cid]["members"].add(nick)
+    return {"id": cid, "name": chats[cid]["name"]}
+
+
+@app.websocket("/ws/{cid}")
+async def chat_ws(websocket: WebSocket, cid: str, token: str = ""):
+    nick = users.get(token)
+    if not nick or cid not in chats:
+        await websocket.close(code=4001)
         return
-    NOTIFICATIONS.insert(0, {
-        "id": uuid.uuid4().hex[:12],
-        "user": recipient,
-        "from": from_user,
-        "kind": kind,
-        "post_id": post_id,
-        "ts": datetime.now().timestamp(),
-        "read": False,
-    })
+    await websocket.accept()
+    chats[cid]["members"].add(nick)
+    sockets.setdefault(cid, {})[token] = websocket
+    try:
+        for m in chats[cid]["messages"][-200:]:
+            await websocket.send_json({"type": "msg", **m})
+        while True:
+            data = await websocket.receive_json()
+            text = (data.get("text") or "").strip()[:2000]
+            if not text:
+                continue
+            msg = {"nick": nick, "text": text, "ts": int(time.time() * 1000)}
+            chats[cid]["messages"].append(msg)
+            for t, ws in list(sockets.get(cid, {}).items()):
+                try:
+                    await ws.send_json({"type": "msg", **msg})
+                except Exception:
+                    sockets.get(cid, {}).pop(t, None)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sockets.get(cid, {}).pop(token, None)
 
 
-def unread_count(user: Optional[str]) -> int:
-    if not user:
-        return 0
-    return sum(1 for n in NOTIFICATIONS if n["user"] == user and not n["read"])
-
-
-def fmt_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
-
-
-def back(request: Request) -> RedirectResponse:
-    return RedirectResponse(request.headers.get("referer") or "/", status_code=303)
-
-
-def render_text(text: str) -> str:
-    escaped = html.escape(text)
-
-    def repl(m):
-        name = m.group(1)
-        actual = find_user(name)
-        if actual:
-            return (f'<a class="mention" href="/u/{html.escape(actual)}">'
-                    f'@{html.escape(actual)}</a>')
-        return m.group(0)
-
-    return MENTION_RE.sub(repl, escaped)
-
-
-def avatar(name: str, cls: str = "avatar") -> str:
-    return f'<div class="{cls}">{html.escape(name[0].upper())}</div>'
-
-
-# --------------------------------------------------------------------------
-# СТИЛИ
-# --------------------------------------------------------------------------
-CSS = """
-* {
-  box-sizing: border-box;
-  -webkit-tap-highlight-color: transparent;
-  user-select: none;
-  -webkit-user-select: none;
+PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Чаты</title>
+<style>
+:root{
+  --primary:#6750A4;--on-primary:#FFFFFF;
+  --primary-container:#EADDFF;--on-primary-container:#21005D;
+  --surface:#FEF7FF;--on-surface:#1D1B20;
+  --surface-c:#F3EDF7;--surface-ch:#ECE6F0;--surface-cl:#E6E0E9;
+  --on-surface-v:#49454F;--outline:#79747E;--outline-v:#CAC4D0;
+  --error:#B3261E;
 }
-input, textarea {
-  user-select: text;
-  -webkit-user-select: text;
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overscroll-behavior:none}
+body{
+  font-family:Roboto,system-ui,-apple-system,"Segoe UI",sans-serif;
+  background:var(--surface);color:var(--on-surface);overflow:hidden;
 }
-* { scrollbar-width: none; -ms-overflow-style: none; }
-*::-webkit-scrollbar { display: none; width: 0; height: 0; }
+.screen{
+  position:fixed;inset:0;display:flex;flex-direction:column;
+  background:var(--surface);
+}
+.hidden{display:none!important}
 
-:root {
-  --bg: #f1f3f5;
-  --surface: #ffffff;
-  --surface-2: #f5f7f9;
-  --surface-3: #e8ecf0;
-  --text: #1a1d23;
-  --muted: #6b7785;
-  --border: #e3e7eb;
-  --primary: #4f5fd0;
-  --primary-hover: #3f4fc0;
-  --on-primary: #ffffff;
-  --like: #e91e63;
-  --danger: #e53935;
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
-  --shadow-md: 0 4px 16px rgba(0,0,0,.10);
-  --shadow-lg: 0 12px 40px rgba(0,0,0,.18);
-  --topbar-h: 56px;
-  --bottomnav-h: 62px;
-  --radius: 14px;
-  --radius-sm: 10px;
-  --radius-pill: 999px;
-  --icon-btn-size: 40px;
-}
-[data-theme="dark"] {
-  --bg: #0f1115;
-  --surface: #1a1d23;
-  --surface-2: #23272e;
-  --surface-3: #2c3138;
-  --text: #e8eaed;
-  --muted: #9aa3ad;
-  --border: #2c3138;
-  --primary: #8b98e0;
-  --primary-hover: #a3aee8;
-  --on-primary: #10131a;
-  --like: #f06292;
-  --danger: #ef5350;
-  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
-  --shadow-md: 0 4px 16px rgba(0,0,0,.5);
-  --shadow-lg: 0 12px 40px rgba(0,0,0,.7);
+/* login */
+#login{align-items:center;justify-content:center;padding:24px}
+.login-card{width:100%;max-width:400px;display:flex;flex-direction:column;gap:28px}
+.login-card h1{
+  font-size:38px;font-weight:400;letter-spacing:.5px;
+  text-align:center;color:var(--primary);
 }
 
-html, body { margin: 0; padding: 0; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-  font-size: 15px;
-  line-height: 1.5;
-  min-height: 100vh;
-  -webkit-font-smoothing: antialiased;
-  transition: background .2s, color .2s;
+/* text field */
+.tf{position:relative}
+.tf input{
+  width:100%;padding:16px;border:1px solid var(--outline);
+  border-radius:6px;background:transparent;font-size:16px;
+  color:var(--on-surface);outline:none;font-family:inherit;
+  transition:border-color .15s,border-width .15s;
 }
-a { color: var(--primary); text-decoration: none; }
-a:hover { text-decoration: underline; }
-.mention { color: var(--primary); font-weight: 500; }
-
-/* ---------- TOPBAR ---------- */
-.topbar {
-  position: sticky; top: 0; z-index: 90;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  height: var(--topbar-h);
+.tf input:focus{border:2px solid var(--primary);padding:15px}
+.tf label{
+  position:absolute;left:12px;top:50%;transform:translateY(-50%);
+  background:var(--surface);padding:0 4px;font-size:16px;
+  color:var(--on-surface-v);pointer-events:none;transition:.15s;
 }
-.topbar-inner {
-  max-width: 720px; margin: 0 auto;
-  height: 100%; padding: 0 10px;
-  display: flex; align-items: center; gap: 8px;
-}
-.brand {
-  font-weight: 700; font-size: 1.15rem;
-  color: var(--text);
-  letter-spacing: -.4px;
-  text-decoration: none;
-  margin-right: auto;
-  padding: 6px 8px;
-  border-radius: var(--radius-sm);
-}
-.brand:hover { text-decoration: none; }
-.topbar-actions { display: flex; align-items: center; gap: 4px; }
-
-/* ---------- ICON BUTTON ---------- */
-.icon-btn {
-  width: var(--icon-btn-size);
-  height: var(--icon-btn-size);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: none;
-  color: var(--text);
-  cursor: pointer;
-  text-decoration: none;
-  font-family: inherit;
-  position: relative;
-  transition: background .15s, color .15s;
-  flex-shrink: 0;
-}
-.icon-btn:hover { background: var(--surface-2); text-decoration: none; }
-.icon-btn:active { background: var(--surface-3); }
-.icon-btn .material-icons { font-size: 22px; }
-.icon-btn.liked { color: var(--like); }
-.icon-btn.danger:hover { color: var(--danger); }
-.icon-btn.avatar-btn {
-  background: var(--primary);
-  color: var(--on-primary);
-  font-weight: 700;
-  font-size: 1rem;
-}
-.icon-btn.avatar-btn:hover { background: var(--primary-hover); }
-
-/* ---------- BADGE ---------- */
-.badge {
-  position: absolute;
-  top: 3px; right: 3px;
-  background: #f44336; color: #fff;
-  font-size: 10px; font-weight: 700;
-  min-width: 16px; height: 16px;
-  padding: 0 4px;
-  border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  line-height: 1;
-  pointer-events: none;
+.tf input:focus + label,
+.tf input:not(:placeholder-shown) + label{
+  top:0;font-size:12px;color:var(--primary);
 }
 
-/* ---------- PRIMARY BUTTON ---------- */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 0 20px;
-  min-height: 40px;
-  border: none;
-  border-radius: var(--radius-pill);
-  background: var(--primary);
-  color: var(--on-primary);
-  font-family: inherit;
-  font-size: .92rem;
-  font-weight: 500;
-  cursor: pointer;
-  text-decoration: none;
-  transition: background .15s;
+/* buttons */
+.btn{
+  border:none;border-radius:100px;padding:16px 24px;
+  font-size:15px;font-weight:500;font-family:inherit;
+  cursor:pointer;transition:box-shadow .15s,opacity .15s;
 }
-.btn:hover { background: var(--primary-hover); text-decoration: none; }
-.btn:active { transform: scale(.98); }
-.btn-block { width: 100%; }
-.btn .material-icons { font-size: 18px; }
+.btn:active{opacity:.85}
+.btn-filled{background:var(--primary);color:var(--on-primary)}
+.btn-filled:hover{box-shadow:0 2px 6px rgba(0,0,0,.25)}
+.btn-tonal{background:var(--primary-container);color:var(--on-primary-container)}
+.btn-text{background:transparent;color:var(--primary);padding:12px 16px}
+.icon-btn{
+  background:transparent;border:none;color:var(--on-surface-v);
+  width:40px;height:40px;border-radius:50%;cursor:pointer;
+  font-size:20px;display:flex;align-items:center;justify-content:center;
+  transition:background .15s;font-family:inherit;
+}
+.icon-btn:hover{background:var(--surface-c)}
 
-/* ---------- CONTAINER ---------- */
-.container {
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 16px 12px 40px;
+/* top bar */
+.topbar{
+  display:flex;align-items:center;gap:12px;
+  padding:12px 20px;min-height:64px;
+  background:var(--surface);flex-shrink:0;
+  padding-top:calc(12px + env(safe-area-inset-top));
 }
+.topbar h2{font-size:22px;font-weight:400;flex:1;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 
-/* ---------- FEED SEARCH ---------- */
-.feed-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-pill);
-  padding: 0 16px;
-  height: 46px;
-  margin-bottom: 14px;
-  transition: border-color .15s, box-shadow .15s;
+/* chat list */
+.chat-list{flex:1;overflow-y:auto;padding:8px 0 100px}
+.chat-item{
+  display:flex;align-items:center;gap:16px;
+  padding:12px 20px;cursor:pointer;transition:background .15s;
 }
-.feed-search:focus-within {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+.chat-item:hover{background:var(--surface-c)}
+.avatar{
+  width:48px;height:48px;border-radius:50%;flex-shrink:0;
+  background:var(--primary-container);color:var(--on-primary-container);
+  display:flex;align-items:center;justify-content:center;
+  font-size:20px;font-weight:500;
 }
-.feed-search .material-icons { color: var(--muted); font-size: 20px; }
-.feed-search input {
-  flex: 1;
-  border: none;
-  background: none;
-  outline: none;
-  color: var(--text);
-  font-family: inherit;
-  font-size: .95rem;
-  height: 100%;
-  padding: 0;
-  min-width: 0;
-}
-.feed-search input::placeholder { color: var(--muted); }
-
-/* ---------- CARDS ---------- */
-.card {
-  background: var(--surface);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-sm);
-  margin-bottom: 14px;
-  overflow: hidden;
-  border: 1px solid var(--border);
-}
-.card-body { padding: 16px; }
-.card-footer {
-  padding: 4px 8px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.card-footer .spacer { flex: 1; }
-.likes-count {
-  font-size: .85rem;
-  color: var(--muted);
-  margin-left: 2px;
-  margin-right: 4px;
+.chat-info{flex:1;min-width:0}
+.chat-name{font-size:16px;font-weight:500;margin-bottom:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-last{font-size:14px;color:var(--on-surface-v);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.empty{
+  text-align:center;color:var(--on-surface-v);
+  padding:64px 24px;font-size:15px;line-height:1.5;
 }
 
-/* ---------- AVATAR ---------- */
-.avatar {
-  width: 44px; height: 44px;
-  border-radius: 50%;
-  background: var(--primary);
-  color: var(--on-primary);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 600;
-  font-size: 19px;
-  flex-shrink: 0;
-  user-select: none;
+/* fab */
+.fab{
+  position:fixed;right:20px;
+  bottom:calc(20px + env(safe-area-inset-bottom));
+  width:56px;height:56px;border-radius:16px;
+  background:var(--primary-container);color:var(--on-primary-container);
+  border:none;font-size:26px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 3px 10px rgba(0,0,0,.18);
+  transition:box-shadow .15s,transform .15s;
 }
-.avatar-lg { width: 72px; height: 72px; font-size: 30px; }
-.avatar-sm { width: 36px; height: 36px; font-size: 15px; }
+.fab:hover{box-shadow:0 5px 16px rgba(0,0,0,.25)}
+.fab:active{transform:scale(.96)}
 
-/* ---------- POST ---------- */
-.card-header-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
-.post-author { color: var(--text); font-weight: 600; }
-.post-author:hover { color: var(--primary); text-decoration: none; }
-.post-time { font-size: .82rem; color: var(--muted); }
-.post-text {
-  white-space: pre-wrap;
-  word-wrap: break-word;
-  font-size: 1rem;
-  line-height: 1.55;
+/* dialog */
+.backdrop{
+  position:fixed;inset:0;background:rgba(0,0,0,.4);
+  display:flex;align-items:center;justify-content:center;
+  padding:24px;z-index:100;
 }
+.dialog{
+  background:var(--surface-ch);border-radius:28px;padding:24px;
+  width:100%;max-width:420px;max-height:90vh;overflow-y:auto;
+  display:flex;flex-direction:column;gap:16px;
+}
+.dialog h3{font-size:22px;font-weight:400}
+.dialog .divider{height:1px;background:var(--outline-v);margin:4px 0}
+.dialog .row{display:flex;justify-content:flex-end;gap:8px}
 
-/* ---------- COMPOSER ---------- */
-.composer textarea {
-  width: 100%;
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px 14px;
-  font-family: inherit;
-  font-size: .95rem;
-  resize: vertical;
-  min-height: 72px;
-  line-height: 1.5;
-  outline: none;
-  transition: border-color .15s, box-shadow .15s;
+/* messages */
+.messages{
+  flex:1;overflow-y:auto;padding:12px 16px;
+  display:flex;flex-direction:column;gap:8px;
 }
-.composer textarea:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+.msg{
+  max-width:78%;padding:10px 14px;border-radius:18px;
+  font-size:15px;line-height:1.35;word-wrap:break-word;
+  white-space:pre-wrap;
 }
-.composer-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 10px;
-}
-.hint { font-size: .8rem; color: var(--muted); }
-.counter { font-size: .8rem; color: var(--muted); }
+.msg.own{align-self:flex-end;background:var(--primary);color:var(--on-primary);
+  border-bottom-right-radius:4px}
+.msg.other{align-self:flex-start;background:var(--surface-ch);
+  border-bottom-left-radius:4px}
+.msg .nick{font-size:12px;font-weight:500;opacity:.75;margin-bottom:2px;color:var(--primary)}
 
-/* ---------- INPUTS ---------- */
-.input-field { margin-bottom: 14px; }
-.input-field label {
-  display: block;
-  font-size: .82rem;
-  color: var(--muted);
-  margin-bottom: 6px;
-  font-weight: 500;
+/* msg form */
+.msg-form{
+  display:flex;gap:8px;padding:8px 12px;
+  padding-bottom:calc(12px + env(safe-area-inset-bottom));
+  background:var(--surface);flex-shrink:0;
 }
-.input-field input {
-  width: 100%;
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px 14px;
-  font-family: inherit;
-  font-size: .95rem;
-  outline: none;
-  transition: border-color .15s, box-shadow .15s;
+.msg-form input{
+  flex:1;border:none;background:var(--surface-ch);
+  border-radius:100px;padding:14px 20px;font-size:15px;
+  outline:none;color:var(--on-surface);font-family:inherit;
 }
-.input-field input:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+.msg-form input:focus{background:var(--surface-cl)}
+.send{
+  width:48px;height:48px;border-radius:50%;flex-shrink:0;
+  background:var(--primary);color:var(--on-primary);
+  border:none;cursor:pointer;font-size:20px;
+  display:flex;align-items:center;justify-content:center;
 }
+.send:hover{box-shadow:0 2px 6px rgba(0,0,0,.25)}
 
-/* ---------- AUTH ---------- */
-.auth-wrap { max-width: 420px; margin: 0 auto; }
-.auth-wrap h1 { font-weight: 300; font-size: 1.6rem; margin: 4px 0 20px; }
-.auth-alt { text-align: center; color: var(--muted); font-size: .9rem; margin-top: 14px; }
-.error-box {
-  background: rgba(229,57,53,.1);
-  color: var(--danger);
-  border: 1px solid rgba(229,57,53,.25);
-  padding: 10px 14px;
-  border-radius: var(--radius-sm);
-  margin-bottom: 14px;
-  font-size: .9rem;
+@media (min-width:720px){
+  .chat-list{padding-left:max(0px,calc(50vw - 360px));
+             padding-right:max(0px,calc(50vw - 360px))}
+  .messages{padding-left:max(16px,calc(50vw - 360px));
+            padding-right:max(16px,calc(50vw - 360px))}
+  .msg-form{padding-left:max(12px,calc(50vw - 360px));
+            padding-right:max(12px,calc(50vw - 360px))}
+  .fab{right:calc(50vw - 360px + 20px)}
 }
+</style>
+</head>
+<body>
 
-/* ---------- EMPTY ---------- */
-.empty { padding: 44px 20px; text-align: center; color: var(--muted); }
-.empty .material-icons {
-  font-size: 48px;
-  opacity: .35;
-  display: block;
-  margin: 0 auto 10px;
-}
+<div id="login" class="screen">
+  <div class="login-card">
+    <h1>Чаты</h1>
+    <div class="tf">
+      <input id="nick" placeholder=" " maxlength="20" autocomplete="off">
+      <label for="nick">Ваш ник</label>
+    </div>
+    <button class="btn btn-filled" id="continueBtn">Продолжить</button>
+  </div>
+</div>
 
-/* ---------- PROFILE ---------- */
-.profile-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.profile-name { margin: 0; font-weight: 500; font-size: 1.4rem; }
-.profile-stats { color: var(--muted); font-size: .9rem; margin-top: 4px; }
-.profile-actions { margin-left: auto; }
+<div id="listScreen" class="screen hidden">
+  <header class="topbar"><h2>Чаты</h2></header>
+  <div id="chatList" class="chat-list"></div>
+  <button class="fab" id="fab">+</button>
+</div>
 
-/* ---------- SEARCH RESULTS ---------- */
-.user-chip {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  color: var(--text);
-  text-decoration: none;
-}
-.user-chip:last-child { border-bottom: none; }
-.user-chip:hover { background: var(--surface-2); text-decoration: none; }
+<div id="roomScreen" class="screen hidden">
+  <header class="topbar">
+    <button class="icon-btn" id="back">&#8592;</button>
+    <h2 id="roomName"></h2>
+  </header>
+  <div id="messages" class="messages"></div>
+  <form id="msgForm" class="msg-form">
+    <input id="msgInput" placeholder="Сообщение..." autocomplete="off" maxlength="2000">
+    <button type="submit" class="send">&#10148;</button>
+  </form>
+</div>
 
-/* ---------- NOTIFICATIONS DROPDOWN ---------- */
-.notif-dropdown {
-  position: fixed;
-  top: calc(var(--topbar-h) + 8px);
-  right: 12px;
-  width: 360px;
-  max-width: calc(100vw - 24px);
-  max-height: calc(100vh - var(--topbar-h) - 24px);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-lg);
-  z-index: 200;
-  display: none;
-  overflow: hidden;
-  flex-direction: column;
-}
-.notif-dropdown.open { display: flex; }
-.notif-head {
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
-  font-weight: 600;
-  font-size: .95rem;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-shrink: 0;
-}
-.notif-head .muted { font-weight: 400; font-size: .85rem; }
-.notif-list { overflow-y: auto; flex: 1; min-height: 0; }
-.notif-item {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-  color: var(--text);
-  text-decoration: none;
-  transition: background .15s;
-}
-.notif-item:last-child { border-bottom: none; }
-.notif-item:hover { background: var(--surface-2); text-decoration: none; }
-.notif-item.unread { background: rgba(79,95,208,.07); }
-[data-theme="dark"] .notif-item.unread { background: rgba(139,152,224,.10); }
-.notif-icon {
-  width: 38px; height: 38px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--surface-2);
-  flex-shrink: 0;
-}
-.notif-icon .material-icons { font-size: 19px; color: var(--primary); }
-.notif-body { flex: 1; min-width: 0; }
-.notif-text { font-size: .92rem; line-height: 1.4; }
-.notif-text b { color: var(--text); font-weight: 600; }
-.notif-time { font-size: .76rem; color: var(--muted); margin-top: 3px; }
-.notif-empty {
-  padding: 40px 20px;
-  text-align: center;
-  color: var(--muted);
-  font-size: .9rem;
+<div id="dialog" class="backdrop hidden">
+  <div class="dialog">
+    <h3>Новый чат</h3>
+    <div class="tf">
+      <input id="chatName" placeholder=" " maxlength="40">
+      <label for="chatName">Название</label>
+    </div>
+    <button class="btn btn-tonal" id="createBtn">Создать</button>
+    <div class="divider"></div>
+    <h3>Найти чат</h3>
+    <div class="tf">
+      <input id="findId" placeholder=" " maxlength="20">
+      <label for="findId">ID чата</label>
+    </div>
+    <button class="btn btn-tonal" id="findBtn">Войти</button>
+    <div class="row">
+      <button class="btn btn-text" id="closeDialog">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let token = null, nick = null, currentChat = null, ws = null;
+
+const esc = s => String(s).replace(/[&<>"']/g, m =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+
+async function api(path, method='GET', body){
+  const r = await fetch(path, {
+    method,
+    headers: {'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 
-/* ---------- BOTTOM NAV ---------- */
-.bottomnav {
-  display: none;
-  position: fixed;
-  bottom: 0; left: 0; right: 0;
-  height: calc(var(--bottomnav-h) + env(safe-area-inset-bottom));
-  padding-bottom: env(safe-area-inset-bottom);
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  z-index: 95;
-}
-.bottomnav-inner {
-  height: var(--bottomnav-h);
-  max-width: 720px;
-  margin: 0 auto;
-  display: flex;
-  align-items: stretch;
-}
-.bottomnav .icon-btn {
-  flex: 1;
-  width: auto;
-  height: 100%;
-  border-radius: 0;
-}
-.bottomnav .icon-btn .material-icons { font-size: 24px; }
-.bottomnav .icon-btn.avatar-btn {
-  background: none;
-  color: var(--primary);
-}
-.bottomnav .icon-btn.avatar-btn:hover { background: var(--surface-2); }
-
-/* ---------- UTILITY ---------- */
-.muted { color: var(--muted); }
-.small { font-size: .85rem; }
-.page-title { font-size: 1.3rem; font-weight: 500; margin: 0 0 14px 4px; }
-.section-title {
-  font-size: .8rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: .5px;
-  margin: 18px 4px 8px;
+function show(id){
+  ['login','listScreen','roomScreen'].forEach(s =>
+    document.getElementById(s).classList.toggle('hidden', s !== id));
 }
 
-/* ---------- RESPONSIVE ---------- */
-@media (min-width: 641px) {
-  .only-mobile { display: none !important; }
-}
-@media (max-width: 640px) {
-  .only-desktop { display: none !important; }
-  .bottomnav { display: block; }
-  .container {
-    padding: 12px 8px calc(var(--bottomnav-h) + env(safe-area-inset-bottom) + 20px);
+$('#continueBtn').onclick = async () => {
+  const n = $('#nick').value.trim();
+  if(!n) return;
+  try {
+    const r = await api('/api/login','POST',{nickname:n});
+    token = r.token; nick = r.nickname;
+    openList();
+  } catch(e) { alert('Не удалось войти'); }
+};
+$('#nick').addEventListener('keydown', e => { if(e.key === 'Enter') $('#continueBtn').click(); });
+
+async function openList(){
+  show('listScreen');
+  const list = await api('/api/chats?token=' + encodeURIComponent(token));
+  const el = $('#chatList');
+  el.innerHTML = '';
+  if(!list.length){
+    el.innerHTML = '<div class="empty">Пока нет чатов.<br>Нажмите + чтобы создать или найти.</div>';
+    return;
   }
-  .topbar-inner { padding: 0 8px; gap: 4px; }
-  .brand { font-size: 1.05rem; padding: 6px 4px; }
-  .card-body { padding: 14px; }
-  .post-text { font-size: .97rem; }
-  .notif-dropdown {
-    top: auto;
-    bottom: calc(var(--bottomnav-h) + env(safe-area-inset-bottom) + 8px);
-    left: 8px; right: 8px;
-    width: auto;
-    max-width: none;
-    max-height: 65vh;
+  for(const c of list){
+    const d = document.createElement('div');
+    d.className = 'chat-item';
+    d.innerHTML = `
+      <div class="avatar">${esc((c.name[0] || '?').toUpperCase())}</div>
+      <div class="chat-info">
+        <div class="chat-name">${esc(c.name)}</div>
+        <div class="chat-last">${esc(c.last)}</div>
+      </div>`;
+    d.onclick = () => openRoom(c);
+    el.appendChild(d);
   }
-  .profile-header { gap: 12px; }
-  .profile-name { font-size: 1.2rem; }
-  .avatar-lg { width: 60px; height: 60px; font-size: 24px; }
 }
+
+function openRoom(chat){
+  currentChat = chat;
+  $('#roomName').textContent = chat.name + ' · #' + chat.id;
+  $('#messages').innerHTML = '';
+  show('roomScreen');
+  if(ws) ws.close();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/${chat.id}?token=${encodeURIComponent(token)}`);
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if(d.type === 'msg') addMessage(d);
+  };
+}
+
+function addMessage(d){
+  const box = $('#messages');
+  const m = document.createElement('div');
+  m.className = 'msg ' + (d.nick === nick ? 'own' : 'other');
+  m.innerHTML = (d.nick === nick ? '' : `<div class="nick">${esc(d.nick)}</div>`) + esc(d.text);
+  box.appendChild(m);
+  box.scrollTop = box.scrollHeight;
+}
+
+$('#back').onclick = () => { if(ws){ ws.close(); ws = null; } openList(); };
+
+$('#msgForm').onsubmit = e => {
+  e.preventDefault();
+  const v = $('#msgInput').value.trim();
+  if(!v || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({text: v}));
+  $('#msgInput').value = '';
+};
+
+$('#fab').onclick = () => $('#dialog').classList.remove('hidden');
+$('#closeDialog').onclick = () => $('#dialog').classList.add('hidden');
+$('#dialog').onclick = e => { if(e.target.id === 'dialog') $('#dialog').classList.add('hidden'); };
+
+$('#createBtn').onclick = async () => {
+  const name = $('#chatName').value.trim();
+  const c = await api('/api/chats','POST',{token, name});
+  $('#chatName').value = '';
+  $('#dialog').classList.add('hidden');
+  openRoom(c);
+};
+
+$('#findBtn').onclick = async () => {
+  const id = $('#findId').value.trim();
+  if(!id) return;
+  try {
+    const c = await api('/api/chats/join','POST',{token, id});
+    $('#findId').value = '';
+    $('#dialog').classList.add('hidden');
+    openRoom(c);
+  } catch(e) { alert('Чат не найден'); }
+};
+
+$('#nick').focus();
+</script>
+</body>
+</html>
 """
 
 
-# --------------------------------------------------------------------------
-# ФРАГМЕНТЫ
-# --------------------------------------------------------------------------
-def render_notif_item(n: dict) -> str:
-    if n["kind"] == "mention":
-        text = f'<b>{html.escape(n["from"])}</b> упомянул вас в посте'
-        icon = "alternate_email"
-    elif n["kind"] == "like":
-        text = f'<b>{html.escape(n["from"])}</b> оценил ваш пост'
-        icon = "favorite"
-    else:
-        text = html.escape(n["from"])
-        icon = "notifications"
-    href = f'/post/{n["post_id"]}' if n.get("post_id") else "/"
-    cls = "notif-item" + ("" if n["read"] else " unread")
-    return f"""
-<a class="{cls}" href="{href}">
-  <div class="notif-icon"><i class="material-icons">{icon}</i></div>
-  <div class="notif-body">
-    <div class="notif-text">{text}</div>
-    <div class="notif-time">{fmt_time(n['ts'])}</div>
-  </div>
-</a>"""
-
-
-def render_notif_dropdown(user: Optional[str]) -> str:
-    if not user:
-        return ""
-    mine = [n for n in NOTIFICATIONS if n["user"] == user][:40]
-    if mine:
-        items = "".join(render_notif_item(n) for n in mine)
-    else:
-        items = '<div class="notif-empty">Уведомлений пока нет</div>'
-    return f"""
-<div class="notif-dropdown" id="notifDropdown">
-  <div class="notif-head">
-    <span>Уведомления</span>
-    <span class="muted">последние {len(mine)}</span>
-  </div>
-  <div class="notif-list">{items}</div>
-</div>"""
-
-
-# --------------------------------------------------------------------------
-# LAYOUT
-# --------------------------------------------------------------------------
-def layout(title: str, content: str, user: Optional[str] = None,
-           theme: str = "light") -> str:
-    theme = "dark" if theme == "dark" else "light"
-    unread = unread_count(user)
-
-    bell_icon = "notifications" if unread else "notifications_none"
-    badge = (f'<span class="badge">{unread if unread < 100 else "99+"}</span>'
-             if unread else "")
-
-    # ---- верхняя панель: справа иконки ----
-    if user:
-        desktop_actions = (
-            f'<a href="/u/{html.escape(user)}" class="icon-btn avatar-btn only-desktop" '
-            f'title="{html.escape(user)}">{html.escape(user[0].upper())}</a>'
-            f'<form class="only-desktop" action="/logout" method="post" '
-            f'style="display:inline-flex;margin:0">'
-            f'<button class="icon-btn" type="submit" title="Выйти">'
-            f'<i class="material-icons">logout</i></button></form>'
-        )
-    else:
-        desktop_actions = (
-            '<a href="/login" class="icon-btn only-desktop" title="Войти">'
-            '<i class="material-icons">person_outline</i></a>'
-        )
-
-    theme_icon = "light_mode" if theme == "dark" else "dark_mode"
-
-    notif_btn_top = ""
-    if user:
-        notif_btn_top = (
-            f'<button class="icon-btn only-desktop" data-notif-toggle '
-            f'onclick="toggleNotif(event)" title="Уведомления">'
-            f'<i class="material-icons">{bell_icon}</i>{badge}</button>'
-        )
-
-    topbar = f"""
-<nav class="topbar">
-  <div class="topbar-inner">
-    <a href="/" class="brand">MiniNet</a>
-    <div class="topbar-actions">
-      {notif_btn_top}
-      <a href="/toggle-theme" class="icon-btn" title="Сменить тему">
-        <i class="material-icons">{theme_icon}</i>
-      </a>
-      {desktop_actions}
-    </div>
-  </div>
-</nav>"""
-
-    # ---- нижняя навигация (только мобильные) ----
-    if user:
-        bottom_profile = (
-            f'<a href="/u/{html.escape(user)}" class="icon-btn avatar-btn only-mobile" '
-            f'title="Профиль">{html.escape(user[0].upper())}</a>'
-        )
-        notif_btn_bottom = (
-            f'<button class="icon-btn" data-notif-toggle '
-            f'onclick="toggleNotif(event)" title="Уведомления">'
-            f'<i class="material-icons">{bell_icon}</i>{badge}</button>'
-        )
-    else:
-        bottom_profile = (
-            '<a href="/login" class="icon-btn only-mobile" title="Войти">'
-            '<i class="material-icons">person_outline</i></a>'
-        )
-        notif_btn_bottom = (
-            '<a href="/login" class="icon-btn" title="Войти">'
-            '<i class="material-icons">notifications_none</i></a>'
-        )
-
-    bottomnav = f"""
-<nav class="bottomnav">
-  <div class="bottomnav-inner">
-    <a href="/" class="icon-btn" title="Главная">
-      <i class="material-icons">home</i>
-    </a>
-    <a href="/#feedSearch" class="icon-btn" onclick="return goSearch(event)" title="Поиск">
-      <i class="material-icons">search</i>
-    </a>
-    {notif_btn_bottom}
-    {bottom_profile}
-  </div>
-</nav>"""
-
-    notif_dropdown = render_notif_dropdown(user)
-
-    return f"""<!DOCTYPE html>
-<html lang="ru" data-theme="{theme}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="light dark">
-<title>{html.escape(title)} · MiniNet</title>
-<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<style>{CSS}</style>
-</head>
-<body>
-{topbar}
-<main class="container">{content}</main>
-{bottomnav}
-{notif_dropdown}
-<script>
-// Запрет контекстного меню
-document.addEventListener('contextmenu', function (e) {{
-  var t = e.target;
-  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
-  e.preventDefault();
-}});
-
-// Счётчик символов
-document.querySelectorAll('textarea[maxlength]').forEach(function (ta) {{
-  var counter = ta.parentElement.querySelector('.counter');
-  if (!counter) return;
-  function upd() {{ counter.textContent = ta.value.length + ' / ' + ta.maxLength; }}
-  ta.addEventListener('input', upd); upd();
-}});
-
-// Уведомления
-function toggleNotif(e) {{
-  if (e) e.preventDefault();
-  var dd = document.getElementById('notifDropdown');
-  if (!dd) return;
-  var willOpen = !dd.classList.contains('open');
-  dd.classList.toggle('open');
-  if (willOpen) {{
-    fetch('/api/notifications/read', {{method: 'POST', credentials: 'same-origin'}})
-      .then(function () {{
-        document.querySelectorAll('.badge').forEach(function (b) {{ b.remove(); }});
-        document.querySelectorAll('.notif-item.unread').forEach(function (n) {{
-          n.classList.remove('unread');
-        }});
-      }})
-      .catch(function () {{}});
-  }}
-}}
-document.addEventListener('click', function (e) {{
-  var dd = document.getElementById('notifDropdown');
-  if (!dd || !dd.classList.contains('open')) return;
-  if (dd.contains(e.target)) return;
-  if (e.target.closest('[data-notif-toggle]')) return;
-  dd.classList.remove('open');
-}});
-document.addEventListener('keydown', function (e) {{
-  if (e.key === 'Escape') {{
-    var dd = document.getElementById('notifDropdown');
-    if (dd) dd.classList.remove('open');
-  }}
-}});
-
-// Поиск из нижней навигации
-function goSearch(e) {{
-  var inp = document.getElementById('feedSearch');
-  if (inp) {{
-    e.preventDefault();
-    inp.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-    setTimeout(function () {{ inp.focus(); }}, 250);
-    return false;
-  }}
-  return true;
-}}
-</script>
-</body>
-</html>"""
-
-
-# --------------------------------------------------------------------------
-# КОМПОНЕНТЫ
-# --------------------------------------------------------------------------
-def render_post(post: dict, user: Optional[str], show_delete: bool = True) -> str:
-    liked = user is not None and user in post["likes"]
-    likes_n = len(post["likes"])
-
-    if user:
-        like_btn = (
-            f'<form action="/like/{post["id"]}" method="post" style="display:inline;margin:0">'
-            f'<button class="icon-btn {"liked" if liked else ""}" type="submit" '
-            f'title="{"Убрать лайк" if liked else "Нравится"}">'
-            f'<i class="material-icons">{"favorite" if liked else "favorite_border"}</i>'
-            f'</button></form>'
-        )
-    else:
-        like_btn = (
-            '<a href="/login" class="icon-btn" title="Войдите, чтобы лайкать">'
-            '<i class="material-icons">favorite_border</i></a>'
-        )
-
-    delete_html = ""
-    if show_delete and user == post["author"]:
-        delete_html = (
-            f'<form action="/delete/{post["id"]}" method="post" '
-            f'style="display:inline;margin:0" '
-            f'onsubmit="return confirm(\'Удалить этот пост?\')">'
-            f'<button class="icon-btn danger" type="submit" title="Удалить">'
-            f'<i class="material-icons">delete_outline</i></button></form>'
-        )
-
-    return f"""
-<div class="card" id="post-{post['id']}">
-  <div class="card-body">
-    <div class="card-header-row">
-      {avatar(post['author'])}
-      <div style="min-width:0">
-        <a class="post-author" href="/u/{html.escape(post['author'])}">{html.escape(post['author'])}</a><br>
-        <span class="post-time">{fmt_time(post['ts'])}</span>
-      </div>
-    </div>
-    <div class="post-text">{render_text(post['text'])}</div>
-  </div>
-  <div class="card-footer">
-    {like_btn}
-    <span class="likes-count">{likes_n}</span>
-    <a class="icon-btn" href="/post/{post['id']}" title="Открыть пост">
-      <i class="material-icons">chat_bubble_outline</i>
-    </a>
-    <div class="spacer"></div>
-    {delete_html}
-  </div>
-</div>"""
-
-
-def composer_html(user: str) -> str:
-    return f"""
-<div class="card composer">
-  <div class="card-body">
-    <form action="/post" method="post">
-      <textarea name="text" maxlength="{MAX_POST}" required
-                placeholder="Что нового, {html.escape(user)}?"></textarea>
-      <div class="composer-footer">
-        <span class="hint">Используйте @username для упоминания</span>
-        <div style="display:flex;align-items:center;gap:12px">
-          <span class="counter">0 / {MAX_POST}</span>
-          <button class="btn" type="submit">
-            <i class="material-icons">send</i>Опубликовать
-          </button>
-        </div>
-      </div>
-    </form>
-  </div>
-</div>"""
-
-
-def guest_composer() -> str:
-    return """
-<div class="card"><div class="card-body" style="text-align:center">
-  <p class="muted" style="margin:0 0 12px">Войдите или зарегистрируйтесь, чтобы публиковать.</p>
-  <a class="btn" href="/login">Войти</a>
-  <a class="btn" href="/register" style="margin-left:6px">Регистрация</a>
-</div></div>"""
-
-
-def feed_search_html(q: str = "") -> str:
-    return f"""
-<form class="feed-search" action="/search" method="get">
-  <i class="material-icons">search</i>
-  <input id="feedSearch" type="text" name="q" placeholder="Поиск людей и постов"
-         autocomplete="off" value="{html.escape(q)}">
-</form>"""
-
-
-def empty_card(text: str, icon: str = "inbox") -> str:
-    return (f'<div class="card"><div class="empty">'
-            f'<i class="material-icons">{icon}</i>{html.escape(text)}</div></div>')
-
-
-# --------------------------------------------------------------------------
-# СТРАНИЦЫ
-# --------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def index(session: Optional[str] = Cookie(default=None),
-          theme: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    head = composer_html(user) if user else guest_composer()
-
-    if POSTS:
-        posts_html = "".join(render_post(p, user) for p in POSTS)
-    else:
-        posts_html = empty_card("Пока нет ни одного поста", "article")
-
-    stats = (f'<p class="muted small" style="margin:0 0 12px 4px">'
-             f'Постов: {len(POSTS)} · Пользователей: {len(USERS)}</p>')
-
-    content = feed_search_html() + head + stats + posts_html
-    return HTMLResponse(layout("Лента", content, user, theme or "light"))
-
-
-@app.get("/toggle-theme")
-def toggle_theme(request: Request, theme: Optional[str] = Cookie(default=None)):
-    new_theme = "light" if theme == "dark" else "dark"
-    resp = RedirectResponse(request.headers.get("referer") or "/", status_code=303)
-    resp.set_cookie("theme", new_theme, max_age=365 * 24 * 3600, samesite="lax")
-    return resp
-
-
-@app.post("/api/notifications/read")
-def mark_notifications_read(session: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    if not user:
-        return JSONResponse({"ok": False}, status_code=401)
-    for n in NOTIFICATIONS:
-        if n["user"] == user:
-            n["read"] = True
-    return JSONResponse({"ok": True})
-
-
-# ------------------------------ Авторизация ------------------------------
-def auth_field(name: str, label: str, type_: str = "text") -> str:
-    return (f'<div class="input-field">'
-            f'<label for="{name}">{html.escape(label)}</label>'
-            f'<input id="{name}" name="{name}" type="{type_}" required></div>')
-
-
-def auth_page(title: str, fields_html: str, action: str, submit: str,
-              alt_html: str, error: Optional[str] = None) -> str:
-    err = f'<div class="error-box">{html.escape(error)}</div>' if error else ""
-    return f"""
-<div class="auth-wrap">
-  <h1>{html.escape(title)}</h1>
-  {err}
-  <div class="card"><div class="card-body">
-    <form action="{action}" method="post">
-      {fields_html}
-      <button class="btn btn-block" type="submit" style="margin-top:6px">{html.escape(submit)}</button>
-    </form>
-  </div></div>
-  <p class="auth-alt">{alt_html}</p>
-</div>"""
-
-
-@app.get("/register", response_class=HTMLResponse)
-def register_page(session: Optional[str] = Cookie(default=None),
-                  theme: Optional[str] = Cookie(default=None)):
-    if current_user(session):
-        return RedirectResponse("/", status_code=303)
-    fields = (auth_field("username", "Имя пользователя") +
-              auth_field("password", "Пароль", "password") +
-              auth_field("password2", "Повторите пароль", "password"))
-    body = auth_page("Регистрация", fields, "/register", "Создать аккаунт",
-                     'Уже есть аккаунт? <a href="/login">Войти</a>')
-    return HTMLResponse(layout("Регистрация", body, None, theme or "light"))
-
-
-@app.post("/register")
-def register(username: str = Form(...),
-             password: str = Form(...),
-             password2: str = Form(...),
-             theme: Optional[str] = Cookie(default=None)):
-    username = username.strip()
-    err = None
-    if not (3 <= len(username) <= 20) or not username.replace("_", "").isalnum():
-        err = "Имя: 3–20 символов, только буквы, цифры и «_»."
-    elif len(password) < 4:
-        err = "Пароль должен быть не короче 4 символов."
-    elif password != password2:
-        err = "Пароли не совпадают."
-    elif find_user(username):
-        err = "Такое имя уже занято."
-
-    if err:
-        fields = (auth_field("username", "Имя пользователя") +
-                  auth_field("password", "Пароль", "password") +
-                  auth_field("password2", "Повторите пароль", "password"))
-        body = auth_page("Регистрация", fields, "/register", "Создать аккаунт",
-                         'Уже есть аккаунт? <a href="/login">Войти</a>', err)
-        return HTMLResponse(layout("Регистрация", body, None, theme or "light"),
-                            status_code=400)
-
-    salt = secrets.token_hex(16)
-    USERS[username] = {
-        "salt": salt,
-        "hash": hash_password(password, salt),
-        "created": datetime.now().timestamp(),
-    }
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = username
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True,
-                    max_age=7 * 24 * 3600, samesite="lax")
-    return resp
-
-
-@app.get("/login", response_class=HTMLResponse)
-def login_page(session: Optional[str] = Cookie(default=None),
-               theme: Optional[str] = Cookie(default=None)):
-    if current_user(session):
-        return RedirectResponse("/", status_code=303)
-    fields = (auth_field("username", "Имя пользователя") +
-              auth_field("password", "Пароль", "password"))
-    body = auth_page("Вход", fields, "/login", "Войти",
-                     'Нет аккаунта? <a href="/register">Зарегистрироваться</a>')
-    return HTMLResponse(layout("Вход", body, None, theme or "light"))
-
-
-@app.post("/login")
-def login(username: str = Form(...),
-          password: str = Form(...),
-          theme: Optional[str] = Cookie(default=None)):
-    username = username.strip()
-    user = find_user(username)
-    ok = False
-    if user:
-        ok = secrets.compare_digest(USERS[user]["hash"],
-                                    hash_password(password, USERS[user]["salt"]))
-    if not ok:
-        fields = (auth_field("username", "Имя пользователя") +
-                  auth_field("password", "Пароль", "password"))
-        body = auth_page("Вход", fields, "/login", "Войти",
-                         'Нет аккаунта? <a href="/register">Зарегистрироваться</a>',
-                         "Неверное имя пользователя или пароль.")
-        return HTMLResponse(layout("Вход", body, None, theme or "light"),
-                            status_code=401)
-
-    token = secrets.token_urlsafe(32)
-    SESSIONS[token] = user
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie("session", token, httponly=True,
-                    max_age=7 * 24 * 3600, samesite="lax")
-    return resp
-
-
-@app.post("/logout")
-def logout(session: Optional[str] = Cookie(default=None)):
-    if session:
-        SESSIONS.pop(session, None)
-    resp = RedirectResponse("/", status_code=303)
-    resp.delete_cookie("session")
-    return resp
-
-
-# ------------------------------ Посты ------------------------------
-@app.post("/post")
-def create_post(request: Request,
-                text: str = Form(...),
-                session: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    text = text.strip()[:MAX_POST]
-    if text:
-        post = {
-            "id": uuid.uuid4().hex[:12],
-            "author": user,
-            "text": text,
-            "ts": datetime.now().timestamp(),
-            "likes": set(),
-        }
-        POSTS.insert(0, post)
-
-        for name in set(MENTION_RE.findall(text)):
-            actual = find_user(name)
-            if actual:
-                add_notification(actual, "mention", user, post["id"])
-
-    return back(request)
-
-
-@app.post("/like/{post_id}")
-def like(post_id: str,
-         request: Request,
-         session: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    for p in POSTS:
-        if p["id"] == post_id:
-            if user in p["likes"]:
-                p["likes"].discard(user)
-            else:
-                p["likes"].add(user)
-                add_notification(p["author"], "like", user, p["id"])
-            break
-    return back(request)
-
-
-@app.post("/delete/{post_id}")
-def delete_post(post_id: str,
-                request: Request,
-                session: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    for i, p in enumerate(POSTS):
-        if p["id"] == post_id and p["author"] == user:
-            POSTS.pop(i)
-            break
-    return back(request)
-
-
-@app.get("/post/{post_id}", response_class=HTMLResponse)
-def post_page(post_id: str,
-              session: Optional[str] = Cookie(default=None),
-              theme: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    post = next((p for p in POSTS if p["id"] == post_id), None)
-    if not post:
-        return HTMLResponse(
-            layout("Пост не найден",
-                   empty_card("Пост не найден или удалён", "search_off"),
-                   user, theme or "light"),
-            status_code=404)
-    content = feed_search_html() + render_post(post, user)
-    return HTMLResponse(layout("Пост", content, user, theme or "light"))
-
-
-# ------------------------------ Профиль ------------------------------
-@app.get("/u/{username}", response_class=HTMLResponse)
-def profile(username: str,
-            session: Optional[str] = Cookie(default=None),
-            theme: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    target = find_user(username)
-
-    if not target:
-        return HTMLResponse(
-            layout("404", empty_card("Пользователь не найден", "person_off"),
-                   user, theme or "light"),
-            status_code=404)
-
-    user_posts = [p for p in POSTS if p["author"] == target]
-    likes_total = sum(len(p["likes"]) for p in user_posts)
-
-    logout_btn = ""
-    if user == target:
-        logout_btn = (
-            '<form class="profile-actions" action="/logout" method="post" style="margin:0">'
-            '<button class="btn" type="submit">Выйти</button></form>'
-        )
-
-    header = f"""
-<div class="card"><div class="card-body profile-header">
-  {avatar(target, "avatar avatar-lg")}
-  <div>
-    <h1 class="profile-name">{html.escape(target)}</h1>
-    <div class="profile-stats">Постов: {len(user_posts)} · Лайков получено: {likes_total}</div>
-  </div>
-  {logout_btn}
-</div></div>"""
-
-    if user_posts:
-        posts_html = "".join(render_post(p, user) for p in user_posts)
-    else:
-        posts_html = empty_card("Постов пока нет", "article")
-
-    content = feed_search_html() + header + posts_html
-    return HTMLResponse(layout(f"@{target}", content, user, theme or "light"))
-
-
-# ------------------------------ Поиск ------------------------------
-@app.get("/search", response_class=HTMLResponse)
-def search(q: str = "",
-           session: Optional[str] = Cookie(default=None),
-           theme: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    q = q.strip()
-
-    parts = [feed_search_html(q)]
-
-    if not q:
-        parts.append(empty_card("Введите запрос", "search"))
-        return HTMLResponse(layout("Поиск", "".join(parts), user, theme or "light"))
-
-    ql = q.lower()
-    users_found = [u for u in USERS if ql in u.lower()]
-    posts_found = [p for p in POSTS
-                   if ql in p["text"].lower() or ql in p["author"].lower()]
-
-    parts.append(f'<h2 class="page-title">Результаты: «{html.escape(q)}»</h2>')
-
-    if users_found:
-        chips = "".join(
-            f'<a class="user-chip" href="/u/{html.escape(u)}">'
-            f'{avatar(u, "avatar avatar-sm")}'
-            f'<div><b>{html.escape(u)}</b>'
-            f'<div class="small muted">'
-            f'Постов: {sum(1 for p in POSTS if p["author"] == u)}</div></div></a>'
-            for u in users_found
-        )
-        parts.append(f'<div class="section-title">Люди</div>'
-                     f'<div class="card">{chips}</div>')
-
-    if posts_found:
-        parts.append('<div class="section-title">Посты</div>')
-        parts.append("".join(render_post(p, user, show_delete=False)
-                             for p in posts_found))
-
-    if not users_found and not posts_found:
-        parts.append(empty_card("Ничего не найдено", "search_off"))
-
-    return HTMLResponse(layout("Поиск", "".join(parts), user, theme or "light"))
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
