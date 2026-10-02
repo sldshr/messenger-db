@@ -1,17 +1,6 @@
 """
 Sld-Networking — посты с 6-значным кодом (без повторяющихся цифр).
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
-
-Маршруты:
-  /           — лендинг
-  /app        — рабочая область (SPA)
-  /p/{code}   — единая ссылка на пост (с OpenGraph-метатегами)
-  /api/*      — REST API
-  /manifest.json  — PWA-манифест
-  /sw.js          — service worker
-  /icon.svg       — иконка приложения
-
-Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
 
 from __future__ import annotations
@@ -128,7 +117,6 @@ def _base_url(request: Request) -> str:
 
 
 def _etag_for_post(code: str, entry: dict) -> str:
-    """Стабильный ETag от метаданных и списка фото."""
     h = hashlib.blake2b(digest_size=16)
     h.update(code.encode("ascii"))
     h.update(entry["meta"])
@@ -148,7 +136,6 @@ def _etag_for_photo(code: str, idx: int, entry: dict) -> str:
 
 
 app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
-
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
@@ -378,7 +365,7 @@ PWA_MANIFEST = {
 }
 
 PWA_SW = r"""
-const CACHE = 'sld-net-v4';
+const CACHE = 'sld-net-v5';
 const SHELL_URLS = ['/app', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -402,7 +389,6 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
-
   if (req.method !== 'GET') return;
   if (url.pathname.startsWith('/api/')) return;
 
@@ -418,7 +404,6 @@ self.addEventListener('fetch', (event) => {
     );
     return;
   }
-
   if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
     event.respondWith(
       caches.match(req).then((cached) => {
@@ -434,7 +419,6 @@ self.addEventListener('fetch', (event) => {
     );
     return;
   }
-
   if (url.pathname === '/icon.svg' || url.pathname === '/manifest.json') {
     event.respondWith(
       caches.match(req).then((cached) => cached || fetch(req).then((res) => {
@@ -447,7 +431,6 @@ self.addEventListener('fetch', (event) => {
     );
     return;
   }
-
   event.respondWith(
     fetch(req)
       .then((res) => {
@@ -465,10 +448,7 @@ self.addEventListener('fetch', (event) => {
 
 @app.get("/manifest.json")
 async def manifest():
-    return JSONResponse(
-        content=PWA_MANIFEST,
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
+    return JSONResponse(content=PWA_MANIFEST, headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/sw.js")
@@ -487,6 +467,200 @@ async def icon():
         media_type="image/svg+xml",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+# ============================================================
+# UI-ФРЕЙМВОРК (используется и лендингом, и приложением)
+# ============================================================
+
+UI_FRAMEWORK_JS = r"""
+/* ============================================================
+   UI — мини-фреймворк
+   Хелперы для создания интерфейса: элементы, SVG, события,
+   классы, реактивное состояние, тосты, буфер обмена.
+   ============================================================ */
+var UI = (function(){
+  "use strict";
+
+  function h(tag, attrs, children){
+    var el = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        var v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'class' || k === 'className') {
+          el.className = Array.isArray(v) ? v.filter(Boolean).join(' ') : v;
+        } else if (k === 'style' && typeof v === 'object') {
+          for (var s in v) el.style[s] = v[s];
+        } else if (k === 'dataset' && typeof v === 'object') {
+          for (var d in v) el.dataset[d] = v[d];
+        } else if (k === 'on' && typeof v === 'object') {
+          for (var e in v) el.addEventListener(e, v[e]);
+        } else if (k === 'html') {
+          el.innerHTML = v;
+        } else if (k === 'text') {
+          el.textContent = v;
+        } else if (k === 'ref' && typeof v === 'function') {
+          v(el);
+        } else if (v === true) {
+          el.setAttribute(k, '');
+        } else {
+          el.setAttribute(k, v);
+        }
+      }
+    }
+    append(el, children);
+    return el;
+  }
+
+  function append(parent, children){
+    if (children == null) return parent;
+    if (!Array.isArray(children)) children = [children];
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (c == null || c === false || c === true) continue;
+      if (typeof c === 'string' || typeof c === 'number') {
+        parent.appendChild(document.createTextNode(String(c)));
+      } else if (c instanceof Node) {
+        parent.appendChild(c);
+      } else if (Array.isArray(c)) {
+        append(parent, c);
+      }
+    }
+    return parent;
+  }
+
+  function html(str){
+    var t = document.createElement('template');
+    t.innerHTML = str.trim();
+    return t.content.firstElementChild;
+  }
+  function svg(str){ return html(str); }
+  function frag(){
+    var f = document.createDocumentFragment();
+    append(f, Array.prototype.slice.call(arguments));
+    return f;
+  }
+
+  function on(el, evt, fn, opts){ el.addEventListener(evt, fn, opts); return el; }
+  function off(el, evt, fn, opts){ el.removeEventListener(evt, fn, opts); return el; }
+
+  function addClass(el){ for (var i = 1; i < arguments.length; i++) el.classList.add(arguments[i]); return el; }
+  function removeClass(el){ for (var i = 1; i < arguments.length; i++) el.classList.remove(arguments[i]); return el; }
+  function toggle(el, cls, force){ el.classList.toggle(cls, force); return el; }
+  function hasClass(el, cls){ return el.classList.contains(cls); }
+
+  function attr(el, name, val){
+    if (val === undefined) return el.getAttribute(name);
+    if (val == null) el.removeAttribute(name);
+    else el.setAttribute(name, val);
+    return el;
+  }
+  function text(el, t){ el.textContent = t == null ? '' : String(t); return el; }
+  function clear(el){ while (el.firstChild) el.removeChild(el.firstChild); return el; }
+
+  function show(el){ el.hidden = false; return el; }
+  function hide(el){ el.hidden = true; return el; }
+
+  function qs(sel, root){ return (root || document).querySelector(sel); }
+  function qsa(sel, root){ return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+  function state(initial){
+    var value = initial, subs = [];
+    return {
+      get: function(){ return value; },
+      set: function(v){
+        if (v === value) return;
+        var old = value; value = v;
+        for (var i = 0; i < subs.length; i++) subs[i](value, old);
+      },
+      subscribe: function(fn){
+        subs.push(fn);
+        fn(value, undefined);
+        return function(){
+          var i = subs.indexOf(fn);
+          if (i >= 0) subs.splice(i, 1);
+        };
+      }
+    };
+  }
+
+  function ensureToastContainer(){
+    var c = document.getElementById('uiToastContainer');
+    if (c) return c;
+    c = document.createElement('div');
+    c.id = 'uiToastContainer';
+    c.className = 'ui-toast-container';
+    document.body.appendChild(c);
+    return c;
+  }
+  function toast(message, opts){
+    opts = opts || {};
+    var c = ensureToastContainer();
+    var el = document.createElement('div');
+    el.className = 'ui-toast' + (opts.kind ? ' ui-toast--' + opts.kind : '');
+    el.textContent = String(message);
+    c.appendChild(el);
+    requestAnimationFrame(function(){ el.classList.add('is-visible'); });
+    var dur = opts.duration || 2400;
+    setTimeout(function(){
+      el.classList.remove('is-visible');
+      setTimeout(function(){
+        if (el.parentNode) el.parentNode.removeChild(el);
+      }, 320);
+    }, dur);
+    return el;
+  }
+
+  async function copy(value){
+    try { await navigator.clipboard.writeText(value); return true; }
+    catch(e){
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = value;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch(err){ return false; }
+    }
+  }
+
+  function debounce(fn, ms){
+    var t = 0;
+    return function(){
+      var ctx = this, args = arguments;
+      clearTimeout(t);
+      t = setTimeout(function(){ fn.apply(ctx, args); }, ms);
+    };
+  }
+  function throttle(fn, ms){
+    var last = 0, timer = 0;
+    return function(){
+      var ctx = this, args = arguments;
+      var now = Date.now();
+      if (now - last >= ms) { last = now; fn.apply(ctx, args); }
+      else if (!timer) {
+        timer = setTimeout(function(){
+          last = Date.now(); timer = 0; fn.apply(ctx, args);
+        }, ms - (now - last));
+      }
+    };
+  }
+
+  return {
+    h: h, svg: svg, html: html, frag: frag, append: append,
+    on: on, off: off,
+    addClass: addClass, removeClass: removeClass, toggle: toggle, hasClass: hasClass,
+    attr: attr, text: text, clear: clear,
+    show: show, hide: hide,
+    qs: qs, qsa: qsa,
+    state: state, toast: toast, copy: copy,
+    debounce: debounce, throttle: throttle
+  };
+})();
+"""
 
 
 # ============================================================
@@ -547,13 +721,7 @@ MASTODON_SVG = (
     '.053.053 0 0 1 .066-.054c1.517.363 3.072.546 4.632.546'
     '.376 0 .75 0 1.125-.01 1.57-.044 3.224-.124 4.768-.422'
     '.038-.008.077-.015.11-.024 2.435-.464 4.753-1.92 4.989-5.604'
-    '.008-.145.03-1.52.03-1.67.002-.512.167-3.63-.024-5.545z'
-    'm-3.748 9.195h-2.561V8.29c0-1.309-.55-1.976-1.67-1.976'
-    '-1.23 0-1.846.79-1.846 2.35v3.403h-2.546V8.663c0-1.56-.617-2.35-1.848-2.35'
-    '-1.112 0-1.668.668-1.67 1.977v6.218H4.822V8.102'
-    'c0-1.31.337-2.35 1.011-3.12.696-.77 1.608-1.164 2.74-1.164'
-    '1.311 0 2.302.5 2.962 1.498l.638 1.06.638-1.06c.66-.999 1.65-1.498 2.96-1.498'
-    '1.13 0 2.043.395 2.74 1.164.675.77 1.012 1.81 1.012 3.12z"/></svg>'
+    '.008-.145.03-1.52.03-1.67.002-.512.167-3.63-.024-5.545z"/></svg>'
 )
 
 SHELL_CSS = r"""
@@ -570,6 +738,8 @@ SHELL_CSS = r"""
   --glass-hi:rgba(255,255,255,0.07);
   --radius:22px;
   --ease:cubic-bezier(.2,.8,.2,1);
+  --ok:#7ec899;
+  --err:#e08080;
 }
 html{scroll-behavior:smooth}
 html,body{
@@ -589,7 +759,6 @@ input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.ot
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:#0a0a0a}
 ::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
-::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
 @media (hover:hover) and (pointer:fine){
   *, *::before, *::after { cursor:none !important; }
@@ -603,8 +772,7 @@ body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
 .cur-dot{
   width:7px;height:7px;background:#fff;
-  box-shadow:0 0 0 1px rgba(255,255,255,0.5),
-             0 0 14px rgba(255,255,255,0.35);
+  box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.35);
 }
 .cur-ring{
   width:34px;height:34px;
@@ -620,6 +788,35 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
+
+/* ============================================================
+   UI TOAST (мини-фреймворк)
+   ============================================================ */
+.ui-toast-container{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  z-index:9997;display:flex;flex-direction:column;gap:8px;
+  pointer-events:none;align-items:center;
+  padding:0 16px;max-width:100%;
+}
+.ui-toast{
+  background:rgba(20,20,20,0.92);
+  border:1px solid var(--border-2);
+  color:var(--text);
+  padding:10px 16px;
+  border-radius:12px;
+  font-size:13px;font-weight:500;
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  box-shadow:0 12px 40px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08);
+  opacity:0;transform:translateY(10px);
+  transition:opacity .24s ease, transform .24s var(--ease);
+  white-space:nowrap;max-width:calc(100vw - 32px);
+  overflow:hidden;text-overflow:ellipsis;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+}
+.ui-toast.is-visible{opacity:1;transform:translateY(0);}
+.ui-toast--ok{border-color:rgba(126,200,153,0.4);}
+.ui-toast--err{border-color:rgba(224,128,128,0.4);}
 
 .page-loader{
   position:fixed;inset:0;z-index:99998;
@@ -678,18 +875,10 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-/* ============================================================
-   ЛЕНДИНГ: ШАПКА-МОРФ
-   • Сверху страницы — полноширинная, крупные элементы, 2 кнопки.
-   • После 80px скролла — сжимается в компактную пилюлю по центру.
-   Всё анимируется через transition. Внешний .top-nav — fullwidth
-   fixed-обёртка с pointer-events:none, чтобы не блокировать клики;
-   интерактивная часть — внутри .top-nav-inner.
-   ============================================================ */
+/* --- Лендинг: морфящая шапка --- */
 body > nav.top-nav{
   position:fixed;top:0;left:0;right:0;
-  z-index:100;
-  padding:0;
+  z-index:100;padding:0;
   transition:padding .55s var(--ease);
   pointer-events:none;
 }
@@ -698,29 +887,21 @@ body > nav.top-nav.scrolled{ padding:20px; }
 body > nav.top-nav .top-nav-inner{
   pointer-events:auto;
   display:flex;align-items:center;justify-content:space-between;gap:24px;
-  max-width:100%;
-  margin:0 auto;
+  max-width:100%;margin:0 auto;
   padding:20px 40px;
   background:rgba(10,10,10,0.66);
   backdrop-filter:blur(24px) saturate(160%);
   -webkit-backdrop-filter:blur(24px) saturate(160%);
-  border:1px solid transparent;
-  border-bottom-color:var(--border);
+  border:1px solid transparent;border-bottom-color:var(--border);
   border-radius:0;
   box-shadow:0 6px 30px rgba(0,0,0,0.32);
   transition:
-    max-width .55s var(--ease),
-    padding .55s var(--ease),
-    border-radius .55s var(--ease),
-    background .4s ease,
-    box-shadow .4s ease,
-    border-color .4s ease,
-    border-width .4s ease;
+    max-width .55s var(--ease),padding .55s var(--ease),
+    border-radius .55s var(--ease),background .4s ease,
+    box-shadow .4s ease,border-color .4s ease;
 }
 body > nav.top-nav.scrolled .top-nav-inner{
-  max-width:1180px;
-  padding:12px 14px 12px 22px;
-  border-radius:20px;
+  max-width:1180px;padding:12px 14px 12px 22px;border-radius:20px;
   background:rgba(8,8,8,0.85);
   border-color:var(--border-2);
   box-shadow:0 16px 50px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.08);
@@ -735,16 +916,12 @@ body > nav.top-nav.scrolled .top-nav-inner{
 .logo-mark{
   width:32px;height:32px;border-radius:10px;
   background:linear-gradient(140deg,#fff,#c4c4c8);
-  display:grid;place-items:center;
-  position:relative;overflow:hidden;
+  display:grid;place-items:center;position:relative;overflow:hidden;
   box-shadow:0 4px 16px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.15);
   transition:transform .35s var(--ease);flex-shrink:0;
 }
 .logo:hover .logo-mark{transform:rotate(-6deg) scale(1.06)}
-.logo-mark::after{
-  content:'';position:absolute;inset:0;
-  background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none;
-}
+.logo-mark::after{content:'';position:absolute;inset:0;background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none}
 .logo-mark svg{width:16px;height:16px;position:relative;z-index:1;color:#08080a;display:block}
 .logo-word{display:inline-flex;align-items:baseline;gap:1px}
 .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
@@ -761,43 +938,23 @@ body > nav.top-nav.scrolled .top-nav-inner{
 .nav-links a.active{color:#fff;background:rgba(255,255,255,0.06)}
 
 .nav-right{display:flex;align-items:center;flex-shrink:0;}
-
-/* Кнопка «Найти» — на верхнем состоянии видна, при скролле плавно сворачивается */
 body > nav.top-nav .nav-extra{
-  max-width:220px;
-  opacity:1;
-  overflow:hidden;
-  white-space:nowrap;
-  margin-right:10px;
-  transition:
-    max-width .55s var(--ease),
-    margin-right .55s var(--ease),
-    opacity .3s ease,
-    padding .55s var(--ease),
-    height .55s var(--ease),
-    font-size .55s var(--ease),
-    border-radius .55s var(--ease),
-    background .28s,border-color .28s,color .28s,box-shadow .28s;
+  max-width:220px;opacity:1;overflow:hidden;white-space:nowrap;margin-right:10px;
+  transition:max-width .55s var(--ease),margin-right .55s var(--ease),
+             opacity .3s ease,padding .55s var(--ease),height .55s var(--ease),
+             font-size .55s var(--ease),border-radius .55s var(--ease),
+             background .28s,border-color .28s,color .28s,box-shadow .28s;
 }
 body > nav.top-nav.scrolled .nav-extra{
-  max-width:0;
-  margin-right:0;
-  opacity:0;
-  padding-left:0;
-  padding-right:0;
-  pointer-events:none;
+  max-width:0;margin-right:0;opacity:0;padding-left:0;padding-right:0;pointer-events:none;
 }
 
-/* Размеры элементов в раскрытом состоянии */
 body > nav.top-nav .logo{font-size:17px;transition:font-size .55s var(--ease);}
 body > nav.top-nav .logo-mark{
   width:40px;height:40px;border-radius:12px;
   transition:width .55s var(--ease),height .55s var(--ease),border-radius .55s var(--ease),transform .35s var(--ease);
 }
-body > nav.top-nav .logo-mark svg{
-  width:20px;height:20px;
-  transition:width .55s var(--ease),height .55s var(--ease);
-}
+body > nav.top-nav .logo-mark svg{width:20px;height:20px;transition:width .55s var(--ease),height .55s var(--ease);}
 body > nav.top-nav .nav-links a{
   padding:12px 20px;font-size:15px;border-radius:13px;
   transition:color .2s,background .2s,padding .55s var(--ease),font-size .55s var(--ease),border-radius .55s var(--ease);
@@ -808,12 +965,8 @@ body > nav.top-nav .btn{
              height .55s var(--ease),padding .55s var(--ease),
              font-size .55s var(--ease),border-radius .55s var(--ease);
 }
-body > nav.top-nav .btn svg{
-  width:17px;height:17px;
-  transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease);
-}
+body > nav.top-nav .btn svg{width:17px;height:17px;transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease);}
 
-/* Размеры элементов в свёрнутом (scrolled) состоянии */
 body > nav.top-nav.scrolled .logo{font-size:15px;}
 body > nav.top-nav.scrolled .logo-mark{width:32px;height:32px;border-radius:10px;}
 body > nav.top-nav.scrolled .logo-mark svg{width:16px;height:16px;}
@@ -822,8 +975,7 @@ body > nav.top-nav.scrolled .btn{height:44px;padding:0 20px;font-size:13.5px;bor
 body > nav.top-nav.scrolled .btn svg{width:15px;height:15px;}
 
 .btn{
-  display:inline-flex;align-items:center;justify-content:center;
-  gap:8px;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
   font-family:'Manrope',sans-serif;font-weight:600;font-size:13.5px;
   letter-spacing:-0.005em;
   padding:11px 20px;height:44px;
@@ -856,26 +1008,22 @@ body > nav.top-nav.scrolled .btn svg{width:15px;height:15px;}
 
 footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 .foot-top{
-  display:flex;justify-content:space-between;
-  align-items:flex-start;gap:40px;flex-wrap:wrap;margin-bottom:54px;
+  display:flex;justify-content:space-between;align-items:flex-start;
+  gap:40px;flex-wrap:wrap;margin-bottom:54px;
 }
 .foot-brand{max-width:360px}
 .foot-brand .logo{margin-bottom:18px}
 .foot-brand p{color:var(--text-mute);font-size:13.5px;line-height:1.7}
 .foot-brand .dev{
   display:inline-flex;align-items:center;gap:8px;
-  margin-top:14px;padding:7px 12px 7px 10px;
-  border-radius:100px;
-  background:rgba(255,255,255,0.04);
-  border:1px solid var(--border);
+  margin-top:14px;padding:7px 12px 7px 10px;border-radius:100px;
+  background:rgba(255,255,255,0.04);border:1px solid var(--border);
   font-family:'JetBrains Mono',monospace;
-  font-size:11px;letter-spacing:0.06em;
-  color:var(--text-dim);
+  font-size:11px;letter-spacing:0.06em;color:var(--text-dim);
   text-transform:uppercase;
 }
 .foot-brand .dev svg{width:12px;height:12px;color:var(--text-mute);display:block}
 .foot-brand .dev strong{color:#fff;font-weight:600}
-
 .foot-cols{display:flex;gap:80px;flex-wrap:wrap}
 .foot-col h4{
   font-family:'JetBrains Mono',monospace;font-size:11px;
@@ -889,17 +1037,14 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
   word-break:break-word;
 }
 .foot-col a:hover{color:#fff;padding-left:4px}
-
 .foot-bottom{
   display:flex;justify-content:space-between;align-items:center;
-  gap:24px;flex-wrap:wrap;
-  padding-top:30px;border-top:1px solid var(--border);
+  gap:24px;flex-wrap:wrap;padding-top:30px;border-top:1px solid var(--border);
   color:var(--text-mute);font-size:12.5px;
   font-family:'JetBrains Mono',monospace;letter-spacing:0.05em;
 }
 .foot-bottom .group{color:var(--text-dim)}
 .foot-bottom .group strong{color:#fff;font-weight:600}
-
 .foot-socials{display:flex;gap:8px;align-items:center}
 .foot-socials a{
   width:38px;height:38px;border-radius:11px;
@@ -909,22 +1054,15 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
   transition:background .3s, border-color .3s, color .3s;
   text-decoration:none;
 }
-.foot-socials a:hover{
-  background:var(--glass-hi);border-color:var(--border-3);
-  color:#fff;
-}
+.foot-socials a:hover{background:var(--glass-hi);border-color:var(--border-3);color:#fff;}
 .foot-socials svg{width:18px;height:18px;display:block}
 
 .reveal{
   opacity:0;
-  transition:
-    opacity .8s var(--ease),
-    transform .8s var(--ease),
-    filter .8s var(--ease);
-  will-change: opacity, transform, filter;
+  transition:opacity .8s var(--ease),transform .8s var(--ease),filter .8s var(--ease);
+  will-change:opacity,transform,filter;
 }
-.reveal.in{opacity:1;transform:none;filter:none}
-
+.reveal.in{opacity:1;transform:none;filter:none;}
 .reveal--up{transform:translateY(56px)}
 .reveal--down{transform:translateY(-48px)}
 .reveal--left{transform:translateX(-64px)}
@@ -948,33 +1086,21 @@ footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
 @media (max-width:1000px){.nav-links{display:none}}
 @media (max-width:720px){
   .wrap{padding:0 20px}
-
-  /* Мобильная шапка: раскрытое состояние */
-  body > nav.top-nav .top-nav-inner{
-    padding:16px 20px;
-    gap:12px;
-  }
-  body > nav.top-nav.scrolled{ padding:10px; }
-  body > nav.top-nav.scrolled .top-nav-inner{
-    padding:9px 10px 9px 14px;
-    border-radius:14px;
-  }
-
+  body > nav.top-nav .top-nav-inner{padding:16px 20px;gap:12px;}
+  body > nav.top-nav.scrolled{padding:10px;}
+  body > nav.top-nav.scrolled .top-nav-inner{padding:9px 10px 9px 14px;border-radius:14px;}
   .logo{font-size:13.5px;}
   .logo-mark{width:28px;height:28px;}
   .logo-mark svg{width:14px;height:14px;}
-
   body > nav.top-nav .logo{font-size:15px;}
   body > nav.top-nav .logo-mark{width:34px;height:34px;border-radius:10px;}
   body > nav.top-nav .logo-mark svg{width:17px;height:17px;}
   body > nav.top-nav .btn{height:44px;padding:0 18px;font-size:13px;}
   body > nav.top-nav .nav-extra{display:none;}
-
   body > nav.top-nav.scrolled .logo{font-size:13.5px;}
   body > nav.top-nav.scrolled .logo-mark{width:28px;height:28px;border-radius:8px;}
   body > nav.top-nav.scrolled .logo-mark svg{width:14px;height:14px;}
   body > nav.top-nav.scrolled .btn{height:38px;padding:0 14px;font-size:12.5px;}
-
   .foot-cols{gap:44px}
   .foot-bottom{justify-content:center;text-align:center;flex-direction:column;gap:16px}
 }
@@ -994,10 +1120,7 @@ SHELL_JS = r"""
     var cursorReady = false;
 
     addEventListener("mousemove", function(e){
-      if (!cursorReady) {
-        cursorReady = true;
-        document.body.classList.add("cursor-ready");
-      }
+      if (!cursorReady) { cursorReady = true; document.body.classList.add("cursor-ready"); }
       mx = e.clientX; my = e.clientY;
       document.documentElement.style.setProperty("--mx", mx + "px");
       document.documentElement.style.setProperty("--my", my + "px");
@@ -1040,30 +1163,20 @@ SHELL_JS = r"""
     else { addEventListener("load", function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
   }
 
-  /* ============================================================
-     МОРФ ШАПКИ: сверху — раскрыто, при скролле — компактная пилюля.
-     Порог 80px. Тогглим класс .scrolled; CSS делает всё сам.
-     ============================================================ */
   var nav = document.getElementById("nav");
   if (nav) {
     var ticking = false;
     var SCROLL_THRESHOLD = 80;
-
     var applyState = function(){
       nav.classList.toggle("scrolled", (window.scrollY || window.pageYOffset || 0) > SCROLL_THRESHOLD);
     };
-
-    // Выставляем сразу, чтобы при перезагрузке в середине страницы не мигало
     applyState();
-
     addEventListener("scroll", function(){
       if (!ticking) {
         requestAnimationFrame(function(){ applyState(); ticking = false; });
         ticking = true;
       }
     }, { passive: true });
-
-    // На всякий случай: если шрифты догрузились и высота поменялась
     addEventListener("resize", applyState, { passive: true });
   }
 
@@ -1205,7 +1318,7 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '</nav>\n'
         + body +
         FOOTER_HTML +
-        '<script>' + SHELL_JS + '</script>\n'
+        '<script>\n' + UI_FRAMEWORK_JS + '\n' + SHELL_JS + '\n</script>\n'
         '</body>\n</html>'
     )
 
@@ -1216,19 +1329,11 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
 
 LANDING_CSS = r"""
 .hero{padding:170px 0 0;position:relative;overflow:hidden}
-.hero-inner{
-  max-width:1080px;
-  margin:0 auto;
-  text-align:center;
-  position:relative;
-  z-index:1;
-  padding:0 8px;
-}
+.hero-inner{max-width:1080px;margin:0 auto;text-align:center;position:relative;z-index:1;padding:0 8px;}
 
 .badge{
   display:inline-flex;align-items:center;gap:10px;
-  padding:8px 16px 8px 9px;
-  border-radius:100px;
+  padding:8px 16px 8px 9px;border-radius:100px;
   background:rgba(255,255,255,0.055);
   border:1px solid rgba(255,255,255,0.2);
   backdrop-filter:blur(14px) saturate(160%);
@@ -1259,32 +1364,18 @@ LANDING_CSS = r"""
 
 .hero-title{
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:clamp(28px,5.2vw,60px);
-  line-height:1.08;
-  letter-spacing:-0.04em;
-  margin-bottom:28px;
-  display:flex;
-  flex-direction:column;
-  gap:8px;
-  position:relative;
-  z-index:1;
-  perspective:1000px;
-  text-wrap:balance;
-  max-width:100%;
-  overflow-wrap:break-word;
+  font-size:clamp(28px,5.2vw,60px);line-height:1.08;
+  letter-spacing:-0.04em;margin-bottom:28px;
+  display:flex;flex-direction:column;gap:8px;
+  position:relative;z-index:1;perspective:1000px;
+  text-wrap:balance;max-width:100%;overflow-wrap:break-word;
 }
-.h1-row{
-  display:block;
-  text-align:center;
-}
+.h1-row{display:block;text-align:center;}
 .h1-row.dim{color:var(--text-mute);font-weight:400}
-
 .hero-title .word{
-  display:inline-block;
-  opacity:0;
+  display:inline-block;opacity:0;
   transform:translateY(40%) rotateX(-55deg) scale(.96);
-  filter:blur(6px);
-  transform-origin:bottom center;
+  filter:blur(6px);transform-origin:bottom center;
   animation:wordIn .75s var(--ease) both;
   animation-delay:calc(var(--i,0) * 75ms + 140ms);
   will-change:transform,opacity,filter;
@@ -1389,8 +1480,7 @@ section{padding:110px 0;position:relative}
 h2{
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:clamp(26px,4.2vw,44px);line-height:1.08;
-  letter-spacing:-0.035em;margin-bottom:18px;
-  text-wrap:balance;
+  letter-spacing:-0.035em;margin-bottom:18px;text-wrap:balance;
 }
 h2 .dim{color:var(--text-mute);font-weight:400}
 .sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
@@ -1399,21 +1489,17 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 .tile-group{display:flex;flex-direction:column;gap:18px}
 .group-head{
   display:flex;align-items:baseline;justify-content:space-between;
-  gap:18px;flex-wrap:wrap;
-  padding-bottom:14px;
-  border-bottom:1px solid var(--border);
+  gap:18px;flex-wrap:wrap;padding-bottom:14px;border-bottom:1px solid var(--border);
 }
 .group-title{
   display:inline-flex;align-items:center;gap:12px;
   font-family:'Unbounded',sans-serif;font-weight:600;
-  font-size:clamp(18px,2.4vw,22px);
-  letter-spacing:-0.02em;color:#fff;
+  font-size:clamp(18px,2.4vw,22px);letter-spacing:-0.02em;color:#fff;
 }
 .group-title::before{
   content:'';width:10px;height:10px;border-radius:50%;
   background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.08);
-  flex-shrink:0;
-  animation:dotPulse 2.4s ease-in-out infinite;
+  flex-shrink:0;animation:dotPulse 2.4s ease-in-out infinite;
 }
 @keyframes dotPulse{
   0%,100%{box-shadow:0 0 0 4px rgba(255,255,255,0.08)}
@@ -1432,12 +1518,8 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   -webkit-backdrop-filter:blur(22px) saturate(150%);
   box-shadow:0 24px 60px -28px rgba(0,0,0,0.75),inset 0 1px 0 rgba(255,255,255,0.07);
   overflow:hidden;border:1px solid transparent;
-  transition:
-    transform .55s var(--ease),
-    box-shadow .55s var(--ease),
-    opacity .55s var(--ease),
-    filter .55s var(--ease),
-    border-color .3s;
+  transition:transform .55s var(--ease),box-shadow .55s var(--ease),
+             opacity .55s var(--ease),filter .55s var(--ease),border-color .3s;
   will-change:transform;
 }
 .glass::before{
@@ -1477,8 +1559,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
   display:grid;place-items:center;
   background:linear-gradient(150deg,rgba(255,255,255,0.1),rgba(255,255,255,0.02));
   border:1px solid var(--border-2);margin-bottom:22px;color:var(--text-dim);
-  transition:color .3s,border-color .3s;
-  flex-shrink:0;
+  transition:color .3s,border-color .3s;flex-shrink:0;
 }
 .icon-box svg{width:21px;height:21px;display:block}
 .glass:hover .icon-box{color:#fff;border-color:var(--border-3)}
@@ -1492,16 +1573,11 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 
 .feature-list{
   list-style:none;display:flex;flex-direction:column;gap:12px;
-  margin-top:22px;padding-top:20px;
-  border-top:1px solid var(--border);
+  margin-top:22px;padding-top:20px;border-top:1px solid var(--border);
 }
-.feature-list li{
-  display:flex;align-items:center;gap:12px;
-  font-size:13.5px;color:var(--text-dim);line-height:1.5;
-}
+.feature-list li{display:flex;align-items:center;gap:12px;font-size:13.5px;color:var(--text-dim);line-height:1.5;}
 .feature-list li::before{
-  content:'';flex-shrink:0;
-  width:6px;height:6px;border-radius:50%;
+  content:'';flex-shrink:0;width:6px;height:6px;border-radius:50%;
   background:#fff;box-shadow:0 0 0 3px rgba(255,255,255,0.08);
 }
 .feature-list li strong{color:#fff;font-weight:600}
@@ -1572,8 +1648,7 @@ h2 .dim{color:var(--text-mute);font-weight:400}
 }
 .stat-lbl{
   font-family:'JetBrains Mono',monospace;font-size:10.5px;
-  color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;
-  line-height:1.35;
+  color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;line-height:1.35;
 }
 
 .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
@@ -1741,7 +1816,6 @@ def build_landing() -> str:
     </div>
 
     <div class="tile-groups">
-
       <div class="tile-group">
         <div class="group-head reveal reveal--left" data-delay="0">
           <div class="group-title">Публикация</div>
@@ -1766,7 +1840,6 @@ def build_landing() -> str:
               <li><strong>5 фото</strong> · до 5 МБ каждое</li>
             </ul>
           </div>
-
           <div class="glass b-sm tile-tilt-l reveal reveal--right" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1801,20 +1874,16 @@ def build_landing() -> str:
             <h3>AES-256-GCM</h3>
             <p>Каждый пост и каждое фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
           </div>
-
           <div class="glass b-sm tile-float-l reveal reveal--left" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M8 3v5H3"/>
-                <path d="M16 3v5h5"/>
-                <path d="M8 21v-5H3"/>
-                <path d="M16 21v-5h5"/>
+                <path d="M8 3v5H3"/><path d="M16 3v5h5"/>
+                <path d="M8 21v-5H3"/><path d="M16 21v-5h5"/>
               </svg>
             </div>
             <h3>Сжатие zstd / gzip</h3>
             <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
           </div>
-
           <div class="glass b-sm tile-glow reveal reveal--blur" data-delay="220">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1841,14 +1910,12 @@ def build_landing() -> str:
                 <rect x="3" y="3" width="18" height="18" rx="2.5"/>
                 <rect x="6" y="6" width="12" height="7" rx="1"/>
                 <circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/>
-                <path d="M6 13l3-2 2 2 3-3 4 4"/>
-                <path d="M8 17h8"/>
+                <path d="M6 13l3-2 2 2 3-3 4 4"/><path d="M8 17h8"/>
               </svg>
             </div>
             <h3>OpenGraph-превью</h3>
             <p>Ссылка <code>/p/<span data-code>482163</span></code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
           </div>
-
           <div class="glass b-md tile-slide reveal reveal--right" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1871,35 +1938,28 @@ def build_landing() -> str:
           <div class="glass b-sm tile-zoom reveal reveal--elastic" data-delay="60">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="11" cy="11" r="7"/>
-                <path d="m20 20-3.5-3.5"/>
-                <path d="M11 8v3.5l2.5 1.5"/>
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3.5l2.5 1.5"/>
               </svg>
             </div>
             <h3>Мгновенный поиск</h3>
             <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
           </div>
-
           <div class="glass b-sm tile-float-r reveal reveal--up" data-delay="140">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 3v11"/>
-                <path d="M8 10l4 4 4-4"/>
-                <path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/>
+                <path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/>
               </svg>
             </div>
             <h3>Автосжатие до 60 КБ</h3>
             <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
           </div>
-
           <div class="glass b-sm tile-rotate reveal reveal--rotate" data-delay="220">
             <div class="icon-box">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="3" y="3" width="14" height="14" rx="2"/>
                 <circle cx="7.5" cy="7.5" r="1.2" fill="currentColor" stroke="none"/>
                 <path d="M3 13l3-3 3 3 3-3 5 5"/>
-                <circle cx="17.5" cy="17.5" r="3.5"/>
-                <path d="m21 21-1.8-1.8"/>
+                <circle cx="17.5" cy="17.5" r="3.5"/><path d="m21 21-1.8-1.8"/>
               </svg>
             </div>
             <h3>Галерея с зумом</h3>
@@ -1907,7 +1967,6 @@ def build_landing() -> str:
           </div>
         </div>
       </div>
-
     </div>
   </div>
 </section>
@@ -1926,7 +1985,6 @@ def build_landing() -> str:
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Кнопка «копировать ссылку»</strong> — рядом с каждым найденным постом</span></li>
         </ul>
       </div>
-
       <div class="mock reveal reveal--right" data-delay="120" aria-hidden="true">
         <div class="mock-head">
           <span class="mock-code">#<span data-code>482163</span></span>
@@ -1958,7 +2016,6 @@ def build_landing() -> str:
       <h2>Три шага от идеи <span class="dim">до кода</span></h2>
       <p>Никаких онбордингов и прогресс-баров. Заполнили, получили код, отправили.</p>
     </div>
-
     <div class="steps">
       <div class="glass step tile-pop reveal reveal--up" data-delay="60">
         <div class="step-num">Шаг 01</div>
@@ -1986,7 +2043,6 @@ def build_landing() -> str:
       <h2>Всё серьёзно</h2>
       <p>Шифрование, сжатие и мгновенный поиск — под капотом работают промышленные алгоритмы.</p>
     </div>
-
     <div class="stats reveal reveal--zoom">
       <div class="stat"><div class="stat-val">AES-256</div><div class="stat-lbl">GCM шифрование</div></div>
       <div class="stat"><div class="stat-val">zstd</div><div class="stat-lbl">Сжатие метаданных</div></div>
@@ -2019,7 +2075,7 @@ def build_landing() -> str:
 
 
 # ============================================================
-# РАБОЧАЯ ОБЛАСТЬ  (/app, /p/{code})
+# РАБОЧАЯ ОБЛАСТЬ
 # ============================================================
 
 APP_CSS = r"""
@@ -2079,9 +2135,36 @@ body.cursor-ready .cur-ring { opacity:1; }
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
+/* ============================================================
+   TOAST-контейнер для UI.toast()
+   ============================================================ */
+.ui-toast-container{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  z-index:9997;display:flex;flex-direction:column;gap:8px;
+  pointer-events:none;align-items:center;
+  padding:0 16px;max-width:100%;
+}
+.ui-toast{
+  background:rgba(20,20,20,0.92);
+  border:1px solid var(--border-2);
+  color:var(--text);
+  padding:10px 16px;border-radius:12px;
+  font-size:13px;font-weight:500;
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  box-shadow:0 12px 40px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08);
+  opacity:0;transform:translateY(10px);
+  transition:opacity .24s ease, transform .24s var(--ease);
+  white-space:nowrap;max-width:calc(100vw - 32px);
+  overflow:hidden;text-overflow:ellipsis;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+}
+.ui-toast.is-visible{opacity:1;transform:translateY(0);}
+.ui-toast--ok{border-color:rgba(126,200,153,0.4);}
+.ui-toast--err{border-color:rgba(224,128,128,0.4);}
+
 .page-loader{
-  position:fixed;inset:0;z-index:99998;
-  background:var(--bg);
+  position:fixed;inset:0;z-index:99998;background:var(--bg);
   display:grid;place-items:center;
   transition:opacity .45s ease,visibility .45s;
 }
@@ -2124,161 +2207,117 @@ body.cursor-ready .cur-ring { opacity:1; }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
 /* ============================================================
-   TOPBAR приложения — та же логика морфа, что и на лендинге:
-   сверху — полноширинная, при скролле — компактная пилюля.
+   TOPBAR приложения
+   Сетка 1fr auto 1fr: логотип слева, меню строго по центру,
+   третья колонка — пустая (балансир). Никаких absolute
+   и margin-костылей — ничего не может пересечься.
    ============================================================ */
 .topbar{
   position:fixed;top:0;left:0;right:0;
   z-index:100;
-  padding-top:env(safe-area-inset-top, 0px);
-  transition:padding .55s var(--ease);
+  padding:14px;
+  padding-top:max(14px, env(safe-area-inset-top, 0px) + 6px);
   pointer-events:none;
-}
-.topbar.scrolled{
-  padding:calc(env(safe-area-inset-top, 0px) + 14px) 14px 0;
 }
 .topbar-inner{
   pointer-events:auto;
-  position:relative;
-  display:flex;align-items:center;gap:14px;
-  max-width:100%;margin:0 auto;
-  min-height:60px;
-  padding:12px 26px;
-  background:rgba(10,10,10,0.72);
-  backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);
-  border:1px solid transparent;
-  border-bottom-color:var(--border);
-  border-radius:0;
-  box-shadow:0 6px 30px rgba(0,0,0,0.32);
-  transition:
-    max-width .55s var(--ease),
-    min-height .55s var(--ease),
-    padding .55s var(--ease),
-    border-radius .55s var(--ease),
-    background .4s ease,
-    box-shadow .4s ease,
-    border-color .4s ease;
-}
-.topbar.scrolled .topbar-inner{
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  align-items:center;
+  gap:14px;
   max-width:1160px;
-  min-height:44px;
-  padding:10px 12px 10px 18px;
+  margin:0 auto;
+  min-height:52px;
+  padding:8px 8px 8px 16px;
+  background:rgba(10,10,10,0.72);
+  backdrop-filter:blur(24px) saturate(160%);
+  -webkit-backdrop-filter:blur(24px) saturate(160%);
+  border:1px solid var(--border);
   border-radius:16px;
-  background:rgba(8,8,8,0.85);
-  border-color:var(--border-2);
-  box-shadow:0 16px 50px rgba(0,0,0,0.7),inset 0 1px 0 rgba(255,255,255,0.08);
+  box-shadow:0 12px 40px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.06);
 }
 
 .logo{
   display:inline-flex;align-items:center;gap:10px;
   font-family:'Unbounded',sans-serif;font-weight:700;
-  font-size:15px;letter-spacing:-0.01em;
+  font-size:13.5px;letter-spacing:-0.01em;
   text-decoration:none;color:#fff;white-space:nowrap;
-  transition:font-size .55s var(--ease);
   flex-shrink:0;
-  margin-right:auto;
 }
 .logo-mark{
-  width:34px;height:34px;border-radius:10px;
+  width:28px;height:28px;border-radius:8px;
   background:linear-gradient(140deg,#fff,#c4c4c8);
   display:grid;place-items:center;position:relative;overflow:hidden;
   box-shadow:0 4px 14px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.15);
-  transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease),border-radius .55s var(--ease);
+  transition:transform .35s var(--ease);
   flex-shrink:0;
 }
 .logo:hover .logo-mark{transform:rotate(-6deg) scale(1.05)}
 .logo-mark::after{content:'';position:absolute;inset:0;background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none}
-.logo-mark svg{width:17px;height:17px;position:relative;z-index:1;color:#08080a;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
+.logo-mark svg{width:14px;height:14px;position:relative;z-index:1;color:#08080a;display:block}
 .logo-word{display:inline-flex;align-items:baseline;gap:1px}
 .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
 .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-.topbar.scrolled .logo{ font-size:13.5px; }
-.topbar.scrolled .logo-mark{ width:28px; height:28px; border-radius:8px; }
-.topbar.scrolled .logo-mark svg{ width:14px; height:14px; }
-
+/* Меню: три таба в одном контейнере, единый стиль */
 .menu{
-  position:absolute;
-  left:50%;
-  top:50%;
-  transform:translate(-50%,-50%);
-  z-index:2;
-  display:inline-flex;gap:4px;padding:4px;
-  border-radius:12px;background:rgba(255,255,255,0.028);
+  display:inline-flex;
+  gap:4px;
+  padding:4px;
+  border-radius:12px;
+  background:rgba(255,255,255,0.028);
   border:1px solid var(--border);
   flex-shrink:0;
-  transition:padding .55s var(--ease), border-radius .55s var(--ease);
+  justify-self:center;
+}
+.menu-switch{
+  position:relative;
+  display:inline-flex;
+  gap:4px;
 }
 .menu-pill{
-  position:absolute;top:4px;bottom:4px;left:0;width:0;
-  border-radius:9px;background:rgba(255,255,255,0.09);
+  position:absolute;
+  top:0;bottom:0;left:0;
+  width:0;
+  border-radius:9px;
+  background:rgba(255,255,255,0.09);
   border:1px solid rgba(255,255,255,0.13);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.09);
   transform:translateX(0);
-  transition:transform .34s var(--ease),width .34s var(--ease);
+  transition:transform .34s var(--ease), width .34s var(--ease);
   z-index:0;pointer-events:none;
 }
 .tab{
   position:relative;z-index:1;
-  display:inline-flex;align-items:center;gap:8px;
-  padding:10px 18px;border-radius:10px;
-  background:transparent;border:1px solid transparent;
-  color:var(--text-dim);font:inherit;font-size:14px;font-weight:500;
-  cursor:pointer;transition:color .22s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);white-space:nowrap;
-  -webkit-tap-highlight-color:transparent;
-}
-.tab svg{width:16px;height:16px;flex-shrink:0;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
-.tab:hover{color:#fff}
-.tab.active{color:#fff}
-.topbar.scrolled .menu .tab{ padding:8px 15px; font-size:13px; border-radius:9px; }
-.topbar.scrolled .menu .tab svg{ width:15px; height:15px; }
-
-.back-btn{
   display:inline-flex;align-items:center;gap:7px;
-  color:var(--text-dim);text-decoration:none;
-  font-size:14px;font-weight:500;
-  padding:10px 14px;border-radius:11px;
-  transition:color .2s,background .2s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);white-space:nowrap;
-  flex-shrink:0;
-  margin-left:auto;
+  padding:9px 14px;
+  border-radius:9px;
+  background:transparent;
+  border:1px solid transparent;
+  color:var(--text-dim);
+  font:inherit;font-size:13px;font-weight:500;
+  cursor:pointer;
+  text-decoration:none;
+  white-space:nowrap;
+  -webkit-tap-highlight-color:transparent;
+  transition:color .22s, background .22s, border-color .22s;
 }
-.back-btn svg{width:15px;height:15px;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
-.back-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
-.topbar.scrolled .back-btn{ padding:8px 12px; font-size:13px; border-radius:10px; }
-.topbar.scrolled .back-btn svg{ width:14px; height:14px; }
-
-.exit-btn{
-  display:none;
-  align-items:center;gap:7px;
-  padding:11px 18px;border-radius:12px;
-  background:rgba(200,70,70,0.92);
-  border:1px solid rgba(240,110,110,0.9);
-  color:#fff;font:inherit;font-size:14px;font-weight:600;
-  cursor:pointer;text-decoration:none;white-space:nowrap;
-  transition:background .22s,border-color .22s,box-shadow .22s, padding .55s var(--ease), font-size .55s var(--ease), border-radius .55s var(--ease);
-  box-shadow:0 6px 18px -8px rgba(200,70,70,0.5),inset 0 1px 0 rgba(255,255,255,0.18);
-  flex-shrink:0;
-  margin-left:auto;
-}
-.exit-btn svg{width:15px;height:15px;display:block;transition:width .55s var(--ease),height .55s var(--ease)}
-.exit-btn:hover,.exit-btn:active{
-  background:rgba(220,80,80,1);border-color:rgba(255,130,130,1);
-  box-shadow:0 10px 24px -8px rgba(200,70,70,0.6),inset 0 1px 0 rgba(255,255,255,0.22);
-}
-.exit-btn:active{transform:scale(.98)}
-.topbar.scrolled .exit-btn{ padding:9px 14px; font-size:13px; border-radius:10px; }
-.topbar.scrolled .exit-btn svg{ width:14px; height:14px; }
+.tab svg{width:15px;height:15px;flex-shrink:0;display:block}
+.tab:hover{ color:#fff; }
+.tab:active{ transform:scale(.98); }
+.tab.active{ color:#fff; }
+.tab-exit{ color:var(--text-dim); }
+.tab-exit:hover{ color:#fff; background:rgba(224,128,128,0.06); }
 
 @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
-  .topbar .back-btn,
-  .topbar .exit-btn { display: none !important; }
-  .topbar .logo { pointer-events: none; }
+  .tab-exit { display:none !important; }
+  .logo { pointer-events:none; }
 }
 
 .app{
   min-height:100dvh;
   display:flex;flex-direction:column;align-items:center;
-  padding:calc(var(--topbar-h, 80px) + 28px) 20px 40px;
+  padding:calc(var(--topbar-h, 80px) + 24px) 20px 40px;
 }
 .stage{width:100%;max-width:560px;margin:auto 0}
 .stage[hidden]{display:none}
@@ -2306,6 +2345,9 @@ body.cursor-ready .cur-ring { opacity:1; }
 .input-wrap input.field + .iw-icon,.input-wrap textarea.field + .iw-icon{top:13px}
 .input-wrap.textarea-wrap .iw-icon{top:14px}
 .input-wrap:focus-within .iw-icon{color:var(--text)}
+.input-wrap.has-count input.field{padding-right:62px;}
+.input-wrap.textarea-wrap.has-count textarea.field{padding-right:62px;padding-bottom:24px;}
+
 .field{
   width:100%;background:var(--input);
   border:1px solid var(--border);border-radius:12px;
@@ -2316,6 +2358,23 @@ body.cursor-ready .cur-ring { opacity:1; }
 .field::placeholder{color:var(--text-mute)}
 .field:focus{border-color:var(--border-3);background:var(--input-focus);box-shadow:0 0 0 3px rgba(255,255,255,0.04)}
 textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit;scrollbar-width:thin}
+
+.input-count{
+  position:absolute;
+  right:14px;top:50%;
+  transform:translateY(-50%);
+  font-size:10.5px;
+  color:var(--text-mute);
+  font-family:'JetBrains Mono',monospace;
+  pointer-events:none;
+  letter-spacing:0.04em;
+  opacity:0;
+  transition:opacity .2s;
+}
+.input-wrap.textarea-wrap .input-count{top:auto;bottom:12px;transform:none;}
+.input-wrap:focus-within .input-count{opacity:1;}
+.input-wrap.has-count .input-count{opacity:.6;}
+.input-wrap:focus-within.has-count .input-count{opacity:1;}
 
 .checkbox-wrap{
   display:flex;align-items:flex-start;gap:11px;
@@ -2439,6 +2498,46 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .otp.shake{animation:shake .32s ease}
 .otp.shake .otp-cell{border-color:rgba(224,128,128,0.7);background:rgba(224,128,128,0.08)}
 
+/* === Недавние коды ============================================ */
+.recent{margin-top:10px;display:flex;flex-direction:column;gap:8px;}
+.recent-label{
+  font-size:10.5px;color:var(--text-mute);
+  font-family:'JetBrains Mono',monospace;
+  letter-spacing:0.14em;text-transform:uppercase;
+}
+.recent-chips{display:flex;gap:6px;flex-wrap:wrap;}
+.recent-chip{
+  padding:6px 12px;border-radius:8px;
+  background:rgba(255,255,255,0.03);
+  border:1px solid var(--border);
+  font-family:'JetBrains Mono',monospace;
+  font-size:12px;font-weight:500;
+  color:var(--text-dim);
+  cursor:pointer;
+  transition:background .18s, border-color .18s, color .18s;
+  -webkit-appearance:none;appearance:none;
+}
+.recent-chip:hover{background:rgba(255,255,255,0.06);border-color:var(--border-2);color:#fff;}
+
+/* === Подсказки клавиш ========================================== */
+.kbd-hints{
+  display:flex;gap:16px;flex-wrap:wrap;
+  margin-top:14px;padding-top:14px;
+  border-top:1px solid var(--border);
+  font-size:11.5px;color:var(--text-mute);
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+}
+.kbd-hints span{display:inline-flex;align-items:center;gap:6px;}
+kbd{
+  display:inline-block;
+  padding:2px 6px;border-radius:5px;
+  background:rgba(255,255,255,0.05);
+  border:1px solid var(--border);
+  font-family:'JetBrains Mono',monospace;
+  font-size:10px;color:var(--text-dim);
+  line-height:1.4;
+}
+
 .center{text-align:center;padding:8px 0}
 .spinner{width:22px;height:22px;border-radius:50%;border:2px solid var(--border-2);border-top-color:var(--text);animation:spin .7s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -2449,19 +2548,18 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 
 .msg{
   display:flex;align-items:flex-start;gap:10px;
-  border-radius:11px;
-  padding:12px 14px;
+  border-radius:11px;padding:12px 14px;
   font-size:13px;
   background:rgba(255,255,255,0.03);
-  color:var(--text);
-  line-height:1.5;
+  color:var(--text);line-height:1.5;
   border:1px solid var(--border);
   word-break:break-word;
   animation:msgIn .3s var(--ease);
   box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);
 }
-.msg svg{width:16px;height:16px;flex-shrink:0;margin-top:1px;display:block}
-.msg span{min-width:0;word-break:break-word}
+.msg-icon{flex-shrink:0;display:flex;}
+.msg-icon svg{width:16px;height:16px;display:block;margin-top:1px;}
+.msg-text{min-width:0;word-break:break-word;}
 .msg.err{background:rgba(224,128,128,0.08);border-color:rgba(224,128,128,0.32);color:#eab8b8}
 .msg.ok{background:rgba(126,200,153,0.08);border-color:rgba(126,200,153,0.3);color:#b1dfc2}
 @keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
@@ -2498,9 +2596,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .share-link-copy.copied .sl-copy{display:none}
 .share-link-copy.copied .sl-check{display:block}
 
-/* ============================================================
-   LIGHTBOX
-   ============================================================ */
+/* ============================================================ LIGHTBOX */
 .lightbox{
   position:fixed;inset:0;z-index:1000;
   display:flex;align-items:center;justify-content:center;
@@ -2533,10 +2629,8 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   width:30px;height:30px;margin:-15px 0 0 -15px;
   border:2px solid rgba(255,255,255,0.15);
   border-top-color:#fff;
-  border-radius:50%;
-  animation:spin .8s linear infinite;
-  z-index:3;pointer-events:none;
-  opacity:0;transition:opacity .18s ease;
+  border-radius:50%;animation:spin .8s linear infinite;
+  z-index:3;pointer-events:none;opacity:0;transition:opacity .18s ease;
 }
 .lightbox.loading .lb-loading{opacity:1}
 .lb-btn{position:absolute;width:42px;height:42px;border-radius:12px;border:1px solid var(--border-2);background:rgba(15,15,15,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;transition:background .18s,border-color .18s,transform .18s}
@@ -2562,9 +2656,9 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   background:linear-gradient(155deg,rgba(20,20,20,0.95),rgba(12,12,12,0.95));
   border:1px solid var(--border-2);
   box-shadow:0 30px 80px -20px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.06);
-  text-align:center;animation:popIn .32s var(--ease);
+  text-align:center;animation:modalPop .32s var(--ease);
 }
-@keyframes popIn{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+@keyframes modalPop{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
 .modal-icon{width:48px;height:48px;margin:0 auto 14px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(126,200,153,0.1);color:var(--ok);border:1px solid rgba(126,200,153,0.3)}
 .modal-icon svg{width:22px;height:22px;display:block}
 .modal-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-0.02em}
@@ -2576,7 +2670,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .modal-actions .btn{flex:1;height:42px;font-size:13px}
 
 @media (max-width:820px){
-  .topbar-inner{padding:10px 16px;}
+  .topbar-inner{padding:8px 8px 8px 14px;}
 }
 @media (max-width:640px){
   .card{padding:15px;border-radius:16px}
@@ -2589,61 +2683,32 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   .modal-card{padding:24px 18px 18px;border-radius:18px}
   .modal-code{font-size:32px;letter-spacing:9px;text-indent:9px}
 }
-@media (max-width:380px){
-  .tab span{display:none}
-  .tab{padding:9px 12px}
-  .tab svg{width:16px;height:16px}
-}
 
 @media (max-width: 720px){
   html, body {
-    height: 100%;
-    overflow: hidden;
-    overscroll-behavior: none;
+    height: 100%;overflow: hidden;overscroll-behavior: none;
     background: var(--bg);
   }
   .app {
-    position: fixed;
-    inset: 0;
-    height: 100dvh;
-    min-height: 0;
-    overflow: hidden;
+    position: fixed;inset: 0;height: 100dvh;min-height: 0;overflow: hidden;
     padding: calc(var(--topbar-h, 100px) + 12px) 14px calc(18px + env(safe-area-inset-bottom, 0px));
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+    display: flex;flex-direction: column;align-items: center;
   }
   .stage {
-    width: 100%;
-    max-width: 560px;
-    max-height: 100%;
-    overflow-y: auto;
-    overflow-x: hidden;
-    -webkit-overflow-scrolling: touch;
-    overscroll-behavior: contain;
+    width: 100%;max-width: 560px;max-height: 100%;
+    overflow-y: auto;overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;overscroll-behavior: contain;
     scrollbar-width: none;
-    margin: auto 0;
-    padding: 4px 0;
+    margin: auto 0;padding: 4px 0;
   }
   .stage::-webkit-scrollbar{ display:none; }
 
-  /* Мобильная шапка приложения */
-  .topbar { padding-top: env(safe-area-inset-top, 0px); }
-  .topbar.scrolled { padding: calc(env(safe-area-inset-top, 0px) + 10px) 10px 0; }
-  .topbar-inner { min-height: 54px; padding: 10px 16px; gap: 10px; }
-  .topbar.scrolled .topbar-inner { min-height: 42px; padding: 8px 8px 8px 10px; border-radius: 14px; }
+  .topbar{padding:10px;padding-top:max(10px, env(safe-area-inset-top, 0px) + 4px);}
+  .topbar-inner{min-height:48px;padding:6px 6px 6px 10px;gap:10px;border-radius:14px;}
+  .topbar .logo{display:none;}
 
-  .topbar .logo,
-  .topbar .back-btn{ display: none !important; }
-  .topbar .menu{ padding: 3px; }
-  .topbar .menu .tab{ padding: 10px 12px; font-size: 13px; }
-  .topbar.scrolled .menu .tab{ padding: 9px 10px; font-size: 12.5px; }
-  .topbar .exit-btn{ display: inline-flex; padding: 10px 15px; font-size: 13px; }
-  .topbar.scrolled .exit-btn{ padding: 8px 12px; font-size: 12.5px; }
-
-  @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
-    .topbar .exit-btn { display: none !important; }
-  }
+  .topbar-inner{grid-template-columns:1fr auto 1fr;}
+  .menu{justify-self:center;padding:3px;}
 
   .lb-btn{ width:44px; height:44px; }
   .lb-close{ top:12px; right:12px; }
@@ -2665,18 +2730,17 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     z-index: 2; pointer-events: none; white-space: nowrap;
     text-align: center; max-width: 92vw; padding: 0 12px;
   }
+  .kbd-hints{display:none;}
 }
 @media (max-width: 480px){
-  .topbar .tab span{ display: inline; }
-  .topbar .tab svg{ width: 14px; height: 14px; }
-  .topbar .tab{ padding: 9px 10px; font-size: 12.5px; }
-  .topbar.scrolled .tab{ padding: 9px 9px; font-size: 12px; }
-  .topbar .exit-btn{ padding: 9px 13px; font-size: 12.5px; }
+  .tab span{ display: inline; }
+  .tab svg{ width: 14px; height: 14px; }
+  .tab{ padding: 9px 10px; font-size: 12.5px; }
 }
-@media (max-width: 360px){
-  .topbar .tab span{ display: none; }
-  .topbar .tab{ padding: 10px 12px; }
-  .topbar .tab svg{ width: 16px; height: 16px; }
+@media (max-width: 380px){
+  .tab span{ display: none; }
+  .tab{ padding: 10px 11px; }
+  .tab svg{ width: 16px; height: 16px; }
 }
 """
 
@@ -2730,49 +2794,48 @@ APP = r"""<!DOCTYPE html>
     </a>
 
     <div class="menu" id="menu">
-      <span class="menu-pill" id="menuPill" aria-hidden="true"></span>
-      <button class="tab" id="btnCreate" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        <span>Создать</span>
-      </button>
-      <button class="tab" id="btnFind" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <span>Найти</span>
-      </button>
+      <div class="menu-switch" id="menuSwitch">
+        <span class="menu-pill" id="menuPill" aria-hidden="true"></span>
+        <button class="tab" id="btnCreate" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          <span>Создать</span>
+        </button>
+        <button class="tab" id="btnFind" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <span>Найти</span>
+        </button>
+      </div>
+      <a href="/" class="tab tab-exit" id="btnExit">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+        <span>Выйти</span>
+      </a>
     </div>
 
-    <a href="/" class="back-btn">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
-      <span>На главную</span>
-    </a>
-
-    <a href="/" class="exit-btn" aria-label="Выйти на главную">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
-      <span>Выйти</span>
-    </a>
+    <span aria-hidden="true"></span>
   </div>
 </nav>
 
 <main class="app">
-
   <div class="stage" id="stage" hidden>
 
     <div class="panel" id="createPanel">
       <section class="card">
-        <div class="input-wrap">
+        <div class="input-wrap" id="titleWrap">
           <input class="field" id="title" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Название">
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+          <span class="input-count" id="titleCount">0/120</span>
         </div>
 
-        <div class="input-wrap textarea-wrap">
+        <div class="input-wrap textarea-wrap" id="contentWrap">
           <textarea class="field" id="content" placeholder="Содержимое"></textarea>
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+          <span class="input-count" id="contentCount">0/20000</span>
         </div>
 
         <div class="drop" id="drop">
           <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="9" cy="9" r="1.6"/><path d="M21 15l-5-5L5 21"/></svg>
           <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
-          <div class="drop-hint">до 5 фото · до 5 МБ · сжатие до ~60 КБ · Ctrl+V</div>
+          <div class="drop-hint">до 5 фото · до 5 МБ · сжатие до ~60 КБ</div>
         </div>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
         <div class="previews" id="previews"></div>
@@ -2799,6 +2862,11 @@ APP = r"""<!DOCTYPE html>
         </div>
 
         <div id="createMsg"></div>
+
+        <div class="kbd-hints">
+          <span><kbd>Ctrl</kbd><kbd>V</kbd> вставить фото</span>
+          <span><kbd>Ctrl</kbd><kbd>Enter</kbd> опубликовать</span>
+        </div>
       </section>
     </div>
 
@@ -2817,6 +2885,11 @@ APP = r"""<!DOCTYPE html>
             <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
             <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
           </button>
+        </div>
+
+        <div class="recent" id="recentBox" hidden>
+          <div class="recent-label">Недавние</div>
+          <div class="recent-chips" id="recentChips"></div>
         </div>
       </section>
 
@@ -2868,6 +2941,7 @@ APP = r"""<!DOCTYPE html>
   <div class="lb-hint-mobile">свайп — листать · 2× тап — зум · свайп вниз — закрыть</div>
 </div>
 
+<script>__UI_FRAMEWORK__</script>
 <script>
 (function(){
   "use strict";
@@ -2884,19 +2958,12 @@ APP = r"""<!DOCTYPE html>
   }
 
   /* ============ PWA detection ============ */
-  var isStandalone = false;
   try {
-    isStandalone = window.matchMedia('(display-mode: standalone)').matches
-                || window.matchMedia('(display-mode: fullscreen)').matches
-                || window.navigator.standalone === true;
+    var standalone = window.matchMedia('(display-mode: standalone)').matches
+                  || window.matchMedia('(display-mode: fullscreen)').matches
+                  || window.navigator.standalone === true;
+    if (standalone) document.documentElement.classList.add('standalone');
   } catch(e) {}
-  if (isStandalone) {
-    document.documentElement.classList.add('standalone');
-    var eb = document.querySelector('.exit-btn');
-    if (eb) eb.setAttribute('tabindex', '-1');
-    var bb = document.querySelector('.back-btn');
-    if (bb) bb.setAttribute('tabindex', '-1');
-  }
 
   /* ============ CURSOR ============ */
   var dot  = document.querySelector('.cur-dot');
@@ -2916,94 +2983,57 @@ APP = r"""<!DOCTYPE html>
     dot.style.transform = 'translate3d(' + mx + 'px,' + my + 'px,0) translate(-50%,-50%)';
     rx += (mx - rx) * 0.26;
     ry += (my - ry) * 0.26;
-
     var dx = mx - lastX, dy = my - lastY;
     vel = Math.min(Math.hypot(dx, dy), 60);
     lastX = mx; lastY = my;
-
     var angle = Math.atan2(dy, dx) * 180 / Math.PI;
     var stretch = 1 + vel / 150;
     var squash  = 1 - vel / 220;
     var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
-
     ring.style.transform = 'translate3d(' + rx + 'px,' + ry + 'px,0) translate(-50%,-50%) rotate(' + angle + 'deg) scale(' + stretch + ',' + squash + ')';
-    if (!ring.classList.contains('hover')) {
-      ring.style.borderColor = 'rgba(255,255,255,' + borderOp.toFixed(2) + ')';
-    }
+    if (!ring.classList.contains('hover')) ring.style.borderColor = 'rgba(255,255,255,' + borderOp.toFixed(2) + ')';
     requestAnimationFrame(loop);
   })();
 
   addEventListener('mousedown', function(){ ring.classList.add('click'); });
   addEventListener('mouseup', function(){ ring.classList.remove('click'); });
-  document.querySelectorAll('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .share-link-copy').forEach(function(el){
-    el.addEventListener('mouseenter', function(){ ring.classList.add('hover'); });
-    el.addEventListener('mouseleave', function(){ ring.classList.remove('hover'); });
+  UI.qsa('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .share-link-copy, .recent-chip').forEach(function(el){
+    UI.on(el, 'mouseenter', function(){ ring.classList.add('hover'); });
+    UI.on(el, 'mouseleave', function(){ ring.classList.remove('hover'); });
   });
 
   /* ============ LOADER ============ */
-  var loader = document.getElementById('pageLoader');
+  var loader = $('pageLoader');
   if (loader) {
-    var hide = function(){ loader.classList.add('hidden'); };
-    if (document.readyState === 'complete') setTimeout(hide, 250);
-    else { addEventListener('load', function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
+    var hideLoader = function(){ loader.classList.add('hidden'); };
+    if (document.readyState === 'complete') setTimeout(hideLoader, 250);
+    else { addEventListener('load', function(){ setTimeout(hideLoader, 250); }); setTimeout(hideLoader, 2500); }
   }
 
-  /* ============================================================
-     TOPBAR: МОРФ ПРИ СКРОЛЛЕ
-     Сверху — раскрытое состояние, после 80px — компактное.
-     ============================================================ */
+  /* ============ TOPBAR HEIGHT ============ */
   var topbar = $('topbar');
-  var SCROLL_THRESHOLD = 80;
-
-  function applyTopbarState(){
-    topbar.classList.toggle('scrolled', (window.scrollY || window.pageYOffset || 0) > SCROLL_THRESHOLD);
-  }
-
   function measureTopbar(){
-    // Меряем раскрытое состояние — оно самое высокое. От него считаем
-    // отступ контента, чтобы ничего не пряталось за шапкой.
-    var wasScrolled = topbar.classList.contains('scrolled');
-    if (wasScrolled) topbar.classList.remove('scrolled');
-    var h = topbar.offsetHeight;
-    if (wasScrolled) topbar.classList.add('scrolled');
-    document.documentElement.style.setProperty('--topbar-h', h + 'px');
+    document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px');
   }
-
-  applyTopbarState();
   measureTopbar();
+  addEventListener('resize', measureTopbar, { passive: true });
+  addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
 
-  var ticking = false;
-  addEventListener('scroll', function(){
-    if (!ticking) {
-      requestAnimationFrame(function(){
-        applyTopbarState();
-        ticking = false;
-      });
-      ticking = true;
-    }
-  }, { passive: true });
-
-  addEventListener('resize', function(){
-    measureTopbar();
-    applyTopbarState();
-  }, { passive: true });
-  addEventListener('orientationchange', function(){
-    setTimeout(function(){ measureTopbar(); applyTopbarState(); }, 300);
-  });
-
-  /* ============ HELPERS ============ */
+  /* ============ ICONS (для переиспользования) ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
-    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
+    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
+    copy:  '<svg class="sl-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
+    check: '<svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
+    link:  '<svg class="share-link-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/></svg>'
   };
+
+  /* ============ HELPERS ============ */
   function makeMsg(kind, text){
-    var d = document.createElement("div");
-    d.className = "msg " + kind;
-    d.innerHTML = (kind === "err" ? ICONS.error : ICONS.ok);
-    var s = document.createElement("span");
-    s.textContent = String(text == null ? "" : text);
-    d.appendChild(s);
-    return d;
+    return UI.h('div', { class: 'msg ' + kind }, [
+      UI.h('span', { class: 'msg-icon', html: kind === 'err' ? ICONS.error : ICONS.ok }),
+      UI.h('span', { class: 'msg-text', text: String(text == null ? '' : text) })
+    ]);
   }
   async function readError(res){
     var ct = (res.headers.get("content-type") || "").toLowerCase();
@@ -3048,16 +3078,14 @@ APP = r"""<!DOCTYPE html>
   /* ============ TABS ============ */
   var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
   var btnCreate = $("btnCreate"), btnFind = $("btnFind");
-  var menuEl = $("menu"), menuPill = $("menuPill");
+  var menuEl = $("menu"), menuSwitch = $("menuSwitch"), menuPill = $("menuPill");
   var mode = null;
 
   function updateMenuPill(){
-    if (!menuPill || !menuEl) return;
+    if (!menuPill || !menuSwitch) return;
     var activeTab = mode === "find" ? btnFind : btnCreate;
-    var menuRect = menuEl.getBoundingClientRect();
-    var tabRect = activeTab.getBoundingClientRect();
-    menuPill.style.transform = "translateX(" + (tabRect.left - menuRect.left) + "px)";
-    menuPill.style.width = tabRect.width + "px";
+    menuPill.style.width = activeTab.offsetWidth + "px";
+    menuPill.style.transform = "translateX(" + activeTab.offsetLeft + "px)";
   }
 
   function setMode(next, instant){
@@ -3094,62 +3122,45 @@ APP = r"""<!DOCTYPE html>
       return c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
     } catch(e) { return false; }
   })();
-
   var OUT_MIME = SUPPORTS_WEBP ? 'image/webp' : 'image/jpeg';
   var OUT_EXT = SUPPORTS_WEBP ? '.webp' : '.jpg';
 
   async function compressImage(file, targetBytes){
     if (targetBytes === undefined) targetBytes = TARGET_PHOTO_BYTES;
     if (file.type.indexOf("image/") !== 0) return file;
-
     if (file.size <= targetBytes && (file.type === OUT_MIME)) return file;
-
     try {
       var bitmap = await createImageBitmap(file);
       var maxDim = 1600;
       var best = null;
-
       for (var attempt = 0; attempt < 3; attempt++) {
         var scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
         var w = Math.max(1, Math.round(bitmap.width * scale));
         var h = Math.max(1, Math.round(bitmap.height * scale));
-
         var canvas = document.createElement("canvas");
         canvas.width = w; canvas.height = h;
         var ctx = canvas.getContext("2d");
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = "high";
         ctx.drawImage(bitmap, 0, 0, w, h);
-
         var lo = SUPPORTS_WEBP ? 0.4 : 0.35;
         var hi = SUPPORTS_WEBP ? 0.95 : 0.92;
         var candidate = null;
-
         for (var i = 0; i < 7; i++) {
           var q = (lo + hi) / 2;
           var blob = await new Promise(function(r){ canvas.toBlob(r, OUT_MIME, q); });
           if (!blob) break;
-          if (blob.size <= targetBytes) {
-            candidate = blob; lo = q;
-          } else {
-            hi = q;
-          }
+          if (blob.size <= targetBytes) { candidate = blob; lo = q; }
+          else { hi = q; }
         }
-
         if (candidate) { best = candidate; break; }
-
-        var fallback = await new Promise(function(r){
-          canvas.toBlob(r, OUT_MIME, SUPPORTS_WEBP ? 0.55 : 0.5);
-        });
+        var fallback = await new Promise(function(r){ canvas.toBlob(r, OUT_MIME, SUPPORTS_WEBP ? 0.55 : 0.5); });
         if (fallback) best = fallback;
-
         maxDim = Math.round(maxDim * 0.72);
         if (maxDim < 500) break;
       }
-
       if (bitmap.close) bitmap.close();
       if (!best) return file;
-
       var newName = file.name.replace(/\.[^.]+$/, "") + OUT_EXT;
       return new File([best], newName, { type: OUT_MIME });
     } catch (e) {
@@ -3164,12 +3175,27 @@ APP = r"""<!DOCTYPE html>
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
   var previews = $("previews"), createMsg = $("createMsg"), submitBtn = $("submitBtn");
   var titleInput = $("title"), contentInput = $("content"), ogCheckbox = $("ogEnabled");
+  var titleWrap = $("titleWrap"), contentWrap = $("contentWrap");
+  var titleCount = $("titleCount"), contentCount = $("contentCount");
 
   function defaultDropLabel(){
     return selectedFiles.length
       ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
       : "Нажмите или перетащите фото";
   }
+
+  function updateCounts(){
+    var tl = titleInput.value.length;
+    var cl = contentInput.value.length;
+    titleCount.textContent = tl + "/120";
+    contentCount.textContent = cl + "/20000";
+    titleWrap.classList.toggle('has-count', tl > 0);
+    contentWrap.classList.toggle('has-count', cl > 0);
+  }
+  UI.on(titleInput, 'input', updateCounts);
+  UI.on(contentInput, 'input', updateCounts);
+  updateCounts();
+
   drop.addEventListener("click", function(){ fileInput.click(); });
   drop.addEventListener("dragover", function(e){ e.preventDefault(); drop.style.borderColor = "var(--border-3)"; });
   drop.addEventListener("dragleave", function(){ drop.style.borderColor = ""; });
@@ -3209,8 +3235,11 @@ APP = r"""<!DOCTYPE html>
       if (selectedFiles.length + accepted.length >= MAX_PHOTOS) { rejected++; continue; }
       accepted.push(f);
     }
-    if (rejected > 0) showCreateMsg("err", "Пропущено: " + rejected + ". Только изображения, не больше " + MAX_PHOTOS + " и не тяжелее 5 МБ.");
-    else clearCreateMsg();
+    if (rejected > 0) {
+      var msg = "Пропущено: " + rejected + ". Только изображения, не больше " + MAX_PHOTOS + " и не тяжелее 5 МБ.";
+      showCreateMsg("err", msg);
+      UI.toast(msg, { kind: 'err' });
+    } else clearCreateMsg();
     if (!accepted.length) return;
 
     drop.classList.add("busy");
@@ -3220,7 +3249,6 @@ APP = r"""<!DOCTYPE html>
       var CONCURRENCY = 3;
       var results = new Array(accepted.length);
       var idx = 0;
-
       async function worker(){
         while (true) {
           var i = idx++;
@@ -3228,12 +3256,10 @@ APP = r"""<!DOCTYPE html>
           results[i] = await compressImage(accepted[i]);
         }
       }
-
       var workers = [];
       var lim = Math.min(CONCURRENCY, accepted.length);
       for (var w = 0; w < lim; w++) workers.push(worker());
       await Promise.all(workers);
-
       for (var j = 0; j < results.length; j++) {
         if (results[j]) selectedFiles.push(results[j]);
       }
@@ -3248,22 +3274,18 @@ APP = r"""<!DOCTYPE html>
     previews.innerHTML = "";
     selectedFiles.forEach(function(file, index){
       var url = URL.createObjectURL(file);
-      var box = document.createElement("div");
-      box.className = "preview";
-      var img = document.createElement("img");
-      img.src = url; img.alt = file.name;
+      var img = UI.h('img', { src: url, alt: file.name });
       img.addEventListener("load", function(){ URL.revokeObjectURL(url); }, { once: true });
       var kb = Math.max(1, Math.round(file.size / 1024));
-      var badge = document.createElement("div");
-      badge.className = "pv-badge"; badge.textContent = kb + " КБ";
-      var rm = document.createElement("button");
-      rm.type = "button"; rm.textContent = "×"; rm.title = "×";
-      rm.addEventListener("click", function(){
-        selectedFiles.splice(index, 1);
-        renderPreviews();
+      var rm = UI.h('button', {
+        type: 'button', text: '×', title: '×',
+        on: { click: function(){ selectedFiles.splice(index, 1); renderPreviews(); } }
       });
-      box.append(img, badge, rm);
-      previews.appendChild(box);
+      previews.appendChild(UI.h('div', { class: 'preview' }, [
+        img,
+        UI.h('div', { class: 'pv-badge', text: kb + ' КБ' }),
+        rm
+      ]));
     });
     drop.classList.toggle("filled", selectedFiles.length > 0);
     dropLabel.textContent = defaultDropLabel();
@@ -3277,7 +3299,7 @@ APP = r"""<!DOCTYPE html>
 
   $("resetBtn").addEventListener("click", function(){
     titleInput.value = ""; contentInput.value = ""; selectedFiles = []; ogCheckbox.checked = true;
-    renderPreviews(); clearCreateMsg(); titleInput.focus();
+    renderPreviews(); clearCreateMsg(); updateCounts(); titleInput.focus();
   });
 
   async function postForm(fd, attempt){
@@ -3294,7 +3316,7 @@ APP = r"""<!DOCTYPE html>
     }
   }
 
-  submitBtn.addEventListener("click", async function(){
+  async function doPublish(){
     var title = titleInput.value.trim();
     var content = contentInput.value.trim();
     if (!title) { showCreateMsg("err", "Введите название поста."); titleInput.focus(); return; }
@@ -3319,7 +3341,7 @@ APP = r"""<!DOCTYPE html>
       if (!data || !data.code) { showCreateMsg("err", "Некорректный ответ сервера"); return; }
 
       titleInput.value = ""; contentInput.value = ""; ogCheckbox.checked = true;
-      selectedFiles = []; renderPreviews(); clearCreateMsg();
+      selectedFiles = []; renderPreviews(); clearCreateMsg(); updateCounts();
 
       var code = data.code;
       setUrlForCode(code);
@@ -3329,11 +3351,21 @@ APP = r"""<!DOCTYPE html>
       updateOtpCopyState();
       runSearch(code);
       showCreatedModal(code, data.compressed_bytes, data.share_url || postUrl(code));
+      pushRecent(code);
+      UI.toast("Пост создан · #" + code, { kind: 'ok' });
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
     } finally {
       submitBtn.disabled = false;
       if (label) label.textContent = oldLabel;
+    }
+  }
+
+  submitBtn.addEventListener("click", doPublish);
+  // Ctrl+Enter для публикации
+  document.addEventListener("keydown", function(e){
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && mode === "create") {
+      e.preventDefault(); doPublish();
     }
   });
 
@@ -3356,8 +3388,9 @@ APP = r"""<!DOCTYPE html>
 
   modalCopyBtn.addEventListener("click", async function(){
     var label = modalCopyBtn.querySelector("span");
-    try { await navigator.clipboard.writeText(modalShareUrl); if (label) label.textContent = "Скопировано"; }
-    catch { if (label) label.textContent = "Ошибка"; }
+    var ok = await UI.copy(modalShareUrl);
+    if (label) label.textContent = ok ? "Скопировано" : "Ошибка";
+    if (ok) UI.toast("Ссылка скопирована", { kind: 'ok', duration: 1400 });
     clearTimeout(modalCopyTimer);
     modalCopyTimer = setTimeout(function(){ if (label) label.textContent = "Копировать ссылку"; }, 1500);
   });
@@ -3370,9 +3403,44 @@ APP = r"""<!DOCTYPE html>
   var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
   var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
   var searchSeq = 0, lastSubmitted = "", otpCopyTimer = null;
-
   var postCache = new Map();
   var postCacheETag = new Map();
+
+  /* === Недавние коды ========================================= */
+  var RECENT_KEY = "sld_recent_codes";
+  var recentBox = $("recentBox"), recentChips = $("recentChips");
+
+  function loadRecent(){
+    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); }
+    catch(e){ return []; }
+  }
+  function saveRecent(arr){
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(arr.slice(0, 5))); } catch(e){}
+  }
+  function pushRecent(code){
+    var arr = loadRecent().filter(function(c){ return c !== code; });
+    arr.unshift(code);
+    saveRecent(arr);
+    renderRecent();
+  }
+  function fillOtp(code){
+    otpCells.forEach(function(c, i){ c.value = code[i] || ""; });
+    lastSubmitted = "";
+    updateOtpCopyState();
+    maybeSearch();
+  }
+  function renderRecent(){
+    var arr = loadRecent();
+    if (!arr.length) { recentBox.hidden = true; return; }
+    recentBox.hidden = false;
+    UI.clear(recentChips);
+    arr.forEach(function(code){
+      recentChips.appendChild(UI.h('button', {
+        type: 'button', class: 'recent-chip', text: code,
+        on: { click: function(){ fillOtp(code); } }
+      }));
+    });
+  }
 
   function getCode(){ return otpCells.map(function(c){ return c.value; }).join(""); }
   function updateOtpCopyState(){ otpCopyBtn.disabled = getCode().length !== 6; }
@@ -3405,12 +3473,13 @@ APP = r"""<!DOCTYPE html>
   otpCopyBtn.addEventListener("click", async function(){
     var code = getCode();
     if (code.length !== 6) return;
-    try {
-      await navigator.clipboard.writeText(code);
+    var ok = await UI.copy(code);
+    if (ok) {
       otpCopyBtn.classList.add("copied");
+      UI.toast("Код скопирован", { kind: 'ok', duration: 1200 });
       clearTimeout(otpCopyTimer);
       otpCopyTimer = setTimeout(function(){ otpCopyBtn.classList.remove("copied"); }, 1500);
-    } catch(e){}
+    }
   });
   otpCells.forEach(function(cell, i){
     cell.addEventListener("focus", function(){ cell.select(); });
@@ -3439,6 +3508,7 @@ APP = r"""<!DOCTYPE html>
     });
   });
   updateOtpCopyState();
+  renderRecent();
 
   function showSearchFrame(){ searchFrame.hidden = false; }
   function renderSpinner(){
@@ -3451,15 +3521,7 @@ APP = r"""<!DOCTYPE html>
     showSearchFrame();
   }
 
-  /* ============================================================
-     LIGHTBOX — улучшенный просмотр фото, особенно на телефоне.
-       • инерция панорамирования (после свайпа картинка «докатывается»)
-       • свайп вниз для закрытия с плавным затемнением фона
-       • быстрый и точный двойной тап (320 мс / 44 px)
-       • pinch с якорем в середине между пальцами
-       • анимированный snap-back, если зум ушёл ниже 1×
-       • спиннер загрузки фото поверх изображения
-     ============================================================ */
+  /* ============ LIGHTBOX ============ */
   var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
   var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
   var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
@@ -3473,8 +3535,8 @@ APP = r"""<!DOCTYPE html>
     clearTimeout(lbLoadTimer); lbLoadTimer = null;
     lightbox.classList.remove('loading');
   }
-  lbImg.addEventListener('load', function(){ lbStopLoading(); });
-  lbImg.addEventListener('error', function(){ lbStopLoading(); });
+  lbImg.addEventListener('load', lbStopLoading);
+  lbImg.addEventListener('error', lbStopLoading);
 
   function applyTransform(){
     var totalY = panY + swipeY;
@@ -3489,9 +3551,7 @@ APP = r"""<!DOCTYPE html>
       lbTransform.style.opacity = "";
     }
   }
-  function stopInertia(){
-    if (inertiaRaf) { cancelAnimationFrame(inertiaRaf); inertiaRaf = 0; }
-  }
+  function stopInertia(){ if (inertiaRaf) { cancelAnimationFrame(inertiaRaf); inertiaRaf = 0; } }
   function showZoomBadge(){
     lbZoomBadge.textContent = Math.round(zoom * 100) + "%";
     lbZoomBadge.classList.add("visible");
@@ -3514,11 +3574,8 @@ APP = r"""<!DOCTYPE html>
     requestAnimationFrame(step);
   }
   function resetZoom(animate){
-    if (animate) {
-      animateTransformTo(1, 0, 0, 220);
-    } else {
-      zoom = 1; panX = 0; panY = 0; swipeY = 0; applyTransform();
-    }
+    if (animate) animateTransformTo(1, 0, 0, 220);
+    else { zoom = 1; panX = 0; panY = 0; swipeY = 0; applyTransform(); }
     showZoomBadge();
   }
   function zoomAt(clientX, clientY, newZoom, animate){
@@ -3530,18 +3587,10 @@ APP = r"""<!DOCTYPE html>
     var ratio = newZoom / zoom;
     var targetPanX = dcx - (dcx - panX) * ratio;
     var targetPanY = dcy - (dcy - panY) * ratio;
-    if (animate) {
-      animateTransformTo(newZoom, targetPanX, targetPanY, 220);
-    } else {
-      panX = targetPanX;
-      panY = targetPanY;
-      zoom = newZoom;
-      lbTransform.style.transition = "";
-      applyTransform();
-    }
+    if (animate) animateTransformTo(newZoom, targetPanX, targetPanY, 220);
+    else { panX = targetPanX; panY = targetPanY; zoom = newZoom; lbTransform.style.transition = ""; applyTransform(); }
     showZoomBadge();
   }
-
   function openLightbox(code, photos, index){
     lbCode = code; lbPhotos = photos; lbIndex = index;
     zoom = 1; panX = 0; panY = 0; swipeY = 0;
@@ -3613,7 +3662,7 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* ============ TOUCH: улучшенный мобильный просмотр ============ */
+  /* === TOUCH ================================================ */
   var tMode = 'idle';
   var tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0;
   var tStartTime = 0, tLastFrameTime = 0;
@@ -3630,11 +3679,8 @@ APP = r"""<!DOCTYPE html>
       vx *= 0.94; vy *= 0.94;
       panX += vx; panY += vy;
       applyTransform();
-      if (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5) {
-        inertiaRaf = requestAnimationFrame(step);
-      } else {
-        inertiaRaf = 0;
-      }
+      if (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5) inertiaRaf = requestAnimationFrame(step);
+      else inertiaRaf = 0;
     }
     inertiaRaf = requestAnimationFrame(step);
   }
@@ -3642,7 +3688,6 @@ APP = r"""<!DOCTYPE html>
   lbViewport.addEventListener("touchstart", function(e){
     stopInertia();
     lbTransform.style.transition = "none";
-
     if (e.touches.length === 2) {
       tMode = 'pinch';
       tPinchStartDist = Math.hypot(
@@ -3670,7 +3715,6 @@ APP = r"""<!DOCTYPE html>
   lbViewport.addEventListener("touchmove", function(e){
     if (tMode === 'idle') return;
     e.preventDefault();
-
     if (tMode === 'pinch' && e.touches.length === 2) {
       var dist = Math.hypot(
         e.touches[0].clientX - e.touches[1].clientX,
@@ -3678,25 +3722,20 @@ APP = r"""<!DOCTYPE html>
       ) || 1;
       var scale = dist / tPinchStartDist;
       var newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, tPinchStartZoom * scale));
-
       var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-
       var vrect = lbViewport.getBoundingClientRect();
       var cx = vrect.left + vrect.width / 2;
       var cy = vrect.top + vrect.height / 2;
       var relX = tPinchMidX - cx - tPinchStartPanX;
       var relY = tPinchMidY - cy - tPinchStartPanY;
       var ratio = newZoom / tPinchStartZoom;
-
       panX = -relX * ratio + (midX - cx) + tPinchStartPanX;
       panY = -relY * ratio + (midY - cy) + tPinchStartPanY;
       zoom = newZoom;
-      applyTransform();
-      showZoomBadge();
+      applyTransform(); showZoomBadge();
       return;
     }
-
     if (e.touches.length === 1) {
       var tx = e.touches[0].clientX;
       var ty = e.touches[0].clientY;
@@ -3704,32 +3743,19 @@ APP = r"""<!DOCTYPE html>
       var dy = ty - tLastY;
       var totalDx = tx - tStartX;
       var totalDy = ty - tStartY;
-
       if (tMode === 'swipe-down') {
-        if (Math.abs(totalDx) > 12 && Math.abs(totalDx) > Math.abs(totalDy)) {
-          tMode = 'pan';
-        } else if (totalDy < -12 && Math.abs(totalDy) > Math.abs(totalDx)) {
-          tMode = 'pan';
-        }
+        if (Math.abs(totalDx) > 12 && Math.abs(totalDx) > Math.abs(totalDy)) tMode = 'pan';
+        else if (totalDy < -12 && Math.abs(totalDy) > Math.abs(totalDx)) tMode = 'pan';
       }
-
-      if (tMode === 'swipe-down' && zoom <= 1.05) {
-        swipeY = Math.max(0, totalDy);
-        applyTransform();
-      } else if (tMode === 'pan') {
-        panX += dx;
-        panY += dy;
-        applyTransform();
-      }
-
+      if (tMode === 'swipe-down' && zoom <= 1.05) { swipeY = Math.max(0, totalDy); applyTransform(); }
+      else if (tMode === 'pan') { panX += dx; panY += dy; applyTransform(); }
       var now = performance.now();
       var dt = now - tLastFrameTime;
       if (dt > 8) {
         tVelX = (tx - tLastX) / dt * 16;
         tVelY = (ty - tLastY) / dt * 16;
         tLastFrameTime = now;
-        tLastX = tx;
-        tLastY = ty;
+        tLastX = tx; tLastY = ty;
       }
     }
   }, { passive: false });
@@ -3738,38 +3764,25 @@ APP = r"""<!DOCTYPE html>
     var modeAtEnd = tMode;
     var wasPinch = (modeAtEnd === 'pinch');
     tMode = 'idle';
-
     if (wasPinch) {
-      if (zoom < 1) {
-        animateTransformTo(1, 0, 0, 220);
-        zoom = 1;
-      } else if (zoom > MAX_ZOOM) {
-        animateTransformTo(MAX_ZOOM, panX, panY, 180);
-      }
+      if (zoom < 1) { animateTransformTo(1, 0, 0, 220); zoom = 1; }
+      else if (zoom > MAX_ZOOM) animateTransformTo(MAX_ZOOM, panX, panY, 180);
       return;
     }
-
     var t = e.changedTouches[0];
     if (!t) return;
     var dx = t.clientX - tStartX;
     var dy = t.clientY - tStartY;
     var dt = performance.now() - tStartTime;
     var dist = Math.hypot(dx, dy);
-
     if (modeAtEnd === 'swipe-down' && swipeY > 0) {
       var velocity = dist / Math.max(1, dt) * 16;
-      if (swipeY > 120 || (dy > 60 && velocity > 12)) {
-        closeLightbox();
-        return;
-      }
+      if (swipeY > 120 || (dy > 60 && velocity > 12)) { closeLightbox(); return; }
       var startSwipe = swipeY;
       var t0 = performance.now();
       (function easeBack(){
         var t2 = (performance.now() - t0) / 220;
-        if (t2 >= 1) {
-          swipeY = 0; applyTransform();
-          return;
-        }
+        if (t2 >= 1) { swipeY = 0; applyTransform(); return; }
         var eased = 1 - Math.pow(1 - t2, 3);
         swipeY = startSwipe * (1 - eased);
         applyTransform();
@@ -3777,98 +3790,85 @@ APP = r"""<!DOCTYPE html>
       })();
       return;
     }
-
     if (dt < 300 && dist < 12) {
       var now = performance.now();
-      if (now - tTapTime < 320 &&
-          Math.hypot(t.clientX - tTapX, t.clientY - tTapY) < 44) {
-        if (zoom > 1.05) resetZoom(true);
-        else zoomAt(t.clientX, t.clientY, 2.4, true);
-        tTapTime = 0;
-        return;
+      if (now - tTapTime < 320 && Math.hypot(t.clientX - tTapX, t.clientY - tTapY) < 44) {
+        if (zoom > 1.05) resetZoom(true); else zoomAt(t.clientX, t.clientY, 2.4, true);
+        tTapTime = 0; return;
       }
       tTapTime = now;
-      tTapX = t.clientX;
-      tTapY = t.clientY;
+      tTapX = t.clientX; tTapY = t.clientY;
     }
-
     if (modeAtEnd === 'pan' && zoom <= 1.05 && dt < 600 && dist > 40) {
       if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
         if (dx < 0) lbStep(1); else lbStep(-1);
         return;
       }
     }
-
     if (modeAtEnd === 'pan' && zoom > 1.05 && (Math.abs(tVelX) > 1 || Math.abs(tVelY) > 1)) {
       startInertia(tVelX, tVelY);
     }
   }, { passive: true });
 
-  /* ============ POST RENDER ============ */
+  /* ============ POST RENDER (через UI) ============ */
   function renderPost(post){
-    searchFrame.innerHTML = "";
-    var title = document.createElement("h3");
-    title.className = "post-title"; title.textContent = post.title;
-    var meta = document.createElement("div");
-    meta.className = "post-meta";
-    var date = document.createElement("span");
-    try { date.textContent = new Date(post.created).toLocaleString("ru-RU"); } catch(e){}
-    meta.appendChild(date);
+    UI.clear(searchFrame);
+
+    var meta = UI.h('div', { class: 'post-meta' });
+    try {
+      meta.appendChild(UI.h('span', { text: new Date(post.created).toLocaleString("ru-RU") }));
+    } catch(e){}
     if (post.photos && post.photos.length) {
-      var cnt = document.createElement("span");
-      cnt.textContent = "Фото: " + post.photos.length;
-      meta.appendChild(cnt);
+      meta.appendChild(UI.h('span', { text: "Фото: " + post.photos.length }));
     }
-    searchFrame.append(title, meta);
+
+    searchFrame.appendChild(UI.h('h3', { class: 'post-title', text: post.title }));
+    searchFrame.appendChild(meta);
+
     if (post.content) {
-      var body = document.createElement("div");
-      body.className = "post-body"; body.textContent = post.content;
-      searchFrame.appendChild(body);
+      searchFrame.appendChild(UI.h('div', { class: 'post-body', text: post.content }));
     }
+
     if (post.photos && post.photos.length) {
-      var gallery = document.createElement("div");
-      gallery.className = "post-gallery";
+      var gallery = UI.h('div', { class: 'post-gallery' });
       post.photos.forEach(function(p, idx){
-        var img = document.createElement("img");
-        img.src = "/api/photos/" + encodeURIComponent(post.code) + "/" + idx;
-        img.alt = p.name || "photo"; img.title = p.name || "";
-        img.loading = "lazy"; img.decoding = "async";
-        img.addEventListener("click", function(){ openLightbox(post.code, post.photos, idx); });
+        var img = UI.h('img', {
+          src: "/api/photos/" + encodeURIComponent(post.code) + "/" + idx,
+          alt: p.name || "photo",
+          title: p.name || "",
+          loading: "lazy",
+          decoding: "async",
+          on: { click: function(){ openLightbox(post.code, post.photos, idx); } }
+        });
         gallery.appendChild(img);
       });
       searchFrame.appendChild(gallery);
     }
-    var shareBox = document.createElement("div");
-    shareBox.className = "share-link";
-    var shareIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    shareIcon.setAttribute("viewBox", "0 0 24 24");
-    shareIcon.setAttribute("fill", "none");
-    shareIcon.setAttribute("stroke", "currentColor");
-    shareIcon.setAttribute("stroke-width", "1.9");
-    shareIcon.setAttribute("stroke-linecap", "round");
-    shareIcon.setAttribute("stroke-linejoin", "round");
-    shareIcon.setAttribute("aria-hidden", "true");
-    shareIcon.setAttribute("class", "share-link-icon");
-    shareIcon.innerHTML = '<path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/>';
-    var shareSpan = document.createElement("span");
-    shareSpan.className = "share-link-url";
+
     var url = postUrl(post.code);
-    shareSpan.textContent = url; shareSpan.title = url;
-    var copyBtn = document.createElement("button");
-    copyBtn.type = "button"; copyBtn.className = "share-link-copy";
-    copyBtn.title = "Копировать ссылку";
-    copyBtn.setAttribute("aria-label", "Копировать ссылку");
-    copyBtn.innerHTML = '<svg class="sl-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg><svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>';
+    var shareUrl = UI.h('span', { class: 'share-link-url', text: url, title: url });
     var copyTimer = null;
-    copyBtn.addEventListener("click", async function(e){
-      e.stopPropagation();
-      try { await navigator.clipboard.writeText(url); copyBtn.classList.add("copied"); }
-      catch (err) { copyBtn.classList.remove("copied"); }
-      clearTimeout(copyTimer);
-      copyTimer = setTimeout(function(){ copyBtn.classList.remove("copied"); }, 1500);
+    var copyBtn = UI.h('button', {
+      type: 'button', class: 'share-link-copy',
+      title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку',
+      html: ICONS.copy + ICONS.check,
+      on: {
+        click: async function(e){
+          e.stopPropagation();
+          var ok = await UI.copy(url);
+          copyBtn.classList.toggle('copied', ok);
+          if (ok) UI.toast("Ссылка скопирована", { kind: 'ok', duration: 1400 });
+          clearTimeout(copyTimer);
+          copyTimer = setTimeout(function(){ copyBtn.classList.remove('copied'); }, 1500);
+        }
+      }
     });
-    shareBox.append(shareIcon, shareSpan, copyBtn);
-    searchFrame.appendChild(shareBox);
+    searchFrame.appendChild(UI.h('div', { class: 'share-link' }, [
+      UI.h('span', { class: 'share-link-icon', html: ICONS.link }),
+      shareUrl,
+      copyBtn
+    ]));
+
     showSearchFrame();
   }
 
@@ -3881,6 +3881,7 @@ APP = r"""<!DOCTYPE html>
     try {
       if (postCache.has(code)) {
         renderPost(postCache.get(code));
+        pushRecent(code);
         (async function(){
           try {
             var etag = postCacheETag.get(code);
@@ -3909,7 +3910,9 @@ APP = r"""<!DOCTYPE html>
       var res = await fetch("/api/posts/" + encodeURIComponent(code));
       if (mySeq !== searchSeq) return;
       if (!res.ok) {
-        renderError((await readError(res)) || "Пост не найден");
+        var errText = (await readError(res)) || "Пост не найден";
+        renderError(errText);
+        UI.toast(errText, { kind: 'err' });
         shakeOtp(); setTimeout(clearOtp, 320);
         return;
       }
@@ -3922,6 +3925,7 @@ APP = r"""<!DOCTYPE html>
       if (tag) postCacheETag.set(code, tag);
 
       renderPost(post);
+      pushRecent(code);
     } catch (e) {
       if (mySeq !== searchSeq) return;
       renderError("Ошибка сети: " + e.message);
@@ -3947,6 +3951,7 @@ APP = r"""<!DOCTYPE html>
     }
     requestAnimationFrame(updateMenuPill);
     setTimeout(updateMenuPill, 120);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
   }
   initFromUrl();
 
@@ -4001,6 +4006,21 @@ def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
     return "\n".join(lines)
 
 
+def _render_app(og_tags: str = "", title_override: Optional[str] = None) -> str:
+    html = (APP
+            .replace("__FAVICON__", FAVICON)
+            .replace("__LOGO_SVG__", LOGO_SVG)
+            .replace("__APP_CSS__", APP_CSS)
+            .replace("__UI_FRAMEWORK__", UI_FRAMEWORK_JS)
+            .replace("<!-- OG_TAGS -->", og_tags))
+    if title_override:
+        html = html.replace(
+            "<title>СЛД·NET — рабочая область</title>",
+            f"<title>{_html.escape(title_override, quote=True)} — СЛД·NET</title>",
+        )
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(build_landing())
@@ -4008,24 +4028,14 @@ async def index():
 
 @app.get("/app", response_class=HTMLResponse)
 async def app_page():
-    html = (APP
-            .replace("__FAVICON__", FAVICON)
-            .replace("__LOGO_SVG__", LOGO_SVG)
-            .replace("__APP_CSS__", APP_CSS)
-            .replace("<!-- OG_TAGS -->", ""))
-    return HTMLResponse(html)
+    return HTMLResponse(_render_app())
 
 
 @app.get("/p/{code}", response_class=HTMLResponse)
 async def post_page(code: str, request: Request):
     code = (code or "").strip()
     if not (len(code) == 6 and code.isdigit()):
-        html = (APP
-                .replace("__FAVICON__", FAVICON)
-                .replace("__LOGO_SVG__", LOGO_SVG)
-                .replace("__APP_CSS__", APP_CSS)
-                .replace("<!-- OG_TAGS -->", ""))
-        return HTMLResponse(html)
+        return HTMLResponse(_render_app())
 
     og_tags = ""
     title_override = None
@@ -4042,18 +4052,7 @@ async def post_page(code: str, request: Request):
         except Exception:
             pass
 
-    html = (APP
-            .replace("__FAVICON__", FAVICON)
-            .replace("__LOGO_SVG__", LOGO_SVG)
-            .replace("__APP_CSS__", APP_CSS)
-            .replace("<!-- OG_TAGS -->", og_tags))
-
-    if title_override:
-        html = html.replace(
-            "<title>СЛД·NET — рабочая область</title>",
-            f"<title>{_html.escape(title_override, quote=True)} — СЛД·NET</title>",
-        )
-    return HTMLResponse(html)
+    return HTMLResponse(_render_app(og_tags=og_tags, title_override=title_override))
 
 
 if __name__ == "__main__":
