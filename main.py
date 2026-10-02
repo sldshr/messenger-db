@@ -376,7 +376,7 @@ PWA_MANIFEST = {
 }
 
 PWA_SW = r"""
-const CACHE = 'sld-net-v6';
+const CACHE = 'sld-net-v7';
 const SHELL_URLS = ['/app', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -749,7 +749,8 @@ html,body{
   -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
   -webkit-tap-highlight-color:transparent;
 }
-input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.otp-cell,.share-link-url{
+/* Разрешено выделение только там, где это реально нужно (поля ввода и код в модалке) */
+input,textarea,[contenteditable],.modal-code{
   -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
 }
 [hidden]{display:none !important}
@@ -802,6 +803,37 @@ body.cursor-ready .cur-ring { opacity:1; }
 .ui-toast.is-visible{opacity:1;transform:translateY(0);}
 .ui-toast--ok{border-color:rgba(126,200,153,0.4);}
 .ui-toast--err{border-color:rgba(224,128,128,0.4);}
+
+/* ============================================================
+   КНОПКА «НАВЕРХ» — только иконка, появляется при скролле
+   ============================================================ */
+.scroll-top{
+  position:fixed;
+  right:20px;
+  bottom:20px;
+  bottom:max(20px, env(safe-area-inset-bottom, 0px) + 12px);
+  width:44px;height:44px;
+  border-radius:12px;
+  border:1px solid var(--border-2);
+  background:rgba(15,15,15,0.85);
+  backdrop-filter:blur(16px) saturate(160%);
+  -webkit-backdrop-filter:blur(16px) saturate(160%);
+  color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;
+  z-index:250;
+  opacity:0;
+  transform:translateY(10px);
+  pointer-events:none;
+  transition:opacity .25s ease, transform .25s var(--ease),
+             background .18s, border-color .18s, color .18s;
+  -webkit-appearance:none;appearance:none;
+  box-shadow:0 12px 32px -12px rgba(0,0,0,0.7), inset 0 1px 0 rgba(255,255,255,0.06);
+}
+.scroll-top.visible{ opacity:1; transform:translateY(0); pointer-events:auto; }
+.scroll-top:hover{ background:rgba(25,25,25,0.95); border-color:var(--border-3); }
+.scroll-top:active{ transform:scale(.94); }
+.scroll-top svg{ width:18px; height:18px; pointer-events:none; display:block; }
 
 .page-loader{
   position:fixed;inset:0;z-index:99998;background:var(--bg);
@@ -859,7 +891,6 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 .wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-/* --- Лендинг: морфящая шапка --- */
 body > nav.top-nav{
   position:fixed;top:0;left:0;right:0;
   z-index:100;padding:0;
@@ -1129,7 +1160,7 @@ SHELL_JS = r"""
     addEventListener("mousedown", function(){ ring.classList.add("click"); });
     addEventListener("mouseup", function(){ ring.classList.remove("click"); });
 
-    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop, .share-link-copy').forEach(function(el){
+    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop').forEach(function(el){
       el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
       el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
     });
@@ -1157,6 +1188,46 @@ SHELL_JS = r"""
       }
     }, { passive: true });
     addEventListener("resize", applyState, { passive: true });
+  }
+
+  /* ============================================================
+     КНОПКА «НАВЕРХ»
+     Работает и для window-скролла (десктоп), и для внутреннего
+     скролла .stage (мобильный).
+     ============================================================ */
+  var scrollTopBtn = document.getElementById("scrollTopBtn");
+  if (scrollTopBtn) {
+    var stageEl = document.getElementById("stage");
+    var SCROLL_SHOW_AT = 240;
+
+    function currentScrollTop(){
+      var a = window.scrollY || window.pageYOffset || 0;
+      var b = stageEl ? stageEl.scrollTop : 0;
+      return Math.max(a, b);
+    }
+    function applyScrollTopBtn(){
+      scrollTopBtn.classList.toggle("visible", currentScrollTop() > SCROLL_SHOW_AT);
+    }
+    applyScrollTopBtn();
+
+    var stTicking = false;
+    function onAnyScroll(){
+      if (stTicking) return;
+      stTicking = true;
+      requestAnimationFrame(function(){ applyScrollTopBtn(); stTicking = false; });
+    }
+    addEventListener("scroll", onAnyScroll, { passive: true });
+    if (stageEl) stageEl.addEventListener("scroll", onAnyScroll, { passive: true });
+    addEventListener("resize", applyScrollTopBtn, { passive: true });
+
+    scrollTopBtn.addEventListener("click", function(){
+      try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch(e){ window.scrollTo(0, 0); }
+      if (stageEl && stageEl.scrollTop > 0) {
+        try { stageEl.scrollTo({ top: 0, behavior: "smooth" }); } catch(e){ stageEl.scrollTop = 0; }
+      }
+      // Мгновенно пересчитать состояние (не ждать smooth-скролла)
+      setTimeout(applyScrollTopBtn, 60);
+    });
   }
 
   var io = new IntersectionObserver(function(es){
@@ -1297,6 +1368,11 @@ def render_shell(title: str, body: str, extra_css: str = "", og: str = "", activ
         '</nav>\n'
         + body +
         FOOTER_HTML +
+        '<button class="scroll-top" id="scrollTopBtn" type="button" aria-label="Наверх">\n'
+        '  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\n'
+        '    <path d="M12 19V5M5 12l7-7 7 7"/>\n'
+        '  </svg>\n'
+        '</button>\n'
         '<script>\n' + UI_FRAMEWORK_JS + '\n' + SHELL_JS + '\n</script>\n'
         '</body>\n</html>'
     )
@@ -1961,7 +2037,7 @@ def build_landing() -> str:
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Заголовок</strong> — до 120 символов, чтобы передать суть в одну строку</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Тело</strong> — до 20 000 символов, с сохранением переносов строк</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Галерея</strong> — до 5 фото с зумом и панорамированием</span></li>
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Кнопка «копировать ссылку»</strong> — рядом с каждым найденным постом</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Кнопка «копировать ссылку»</strong> — в шапке каждой карточки</span></li>
         </ul>
       </div>
       <div class="mock reveal reveal--right" data-delay="120" aria-hidden="true">
@@ -2086,7 +2162,7 @@ html,body{
   -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
   -webkit-tap-highlight-color:transparent;
 }
-input,textarea,[contenteditable],.modal-code,.otp-cell,.post-body,.post-title,.share-link-url{
+input,textarea,[contenteditable],.modal-code{
   -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
 }
 [hidden]{display:none !important}
@@ -2140,6 +2216,35 @@ body.cursor-ready .cur-ring { opacity:1; }
 .ui-toast--ok{border-color:rgba(126,200,153,0.4);}
 .ui-toast--err{border-color:rgba(224,128,128,0.4);}
 
+/* Кнопка «Наверх» */
+.scroll-top{
+  position:fixed;
+  right:20px;
+  bottom:20px;
+  bottom:max(20px, env(safe-area-inset-bottom, 0px) + 12px);
+  width:44px;height:44px;
+  border-radius:12px;
+  border:1px solid var(--border-2);
+  background:rgba(15,15,15,0.85);
+  backdrop-filter:blur(16px) saturate(160%);
+  -webkit-backdrop-filter:blur(16px) saturate(160%);
+  color:var(--text);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;
+  z-index:250;
+  opacity:0;
+  transform:translateY(10px);
+  pointer-events:none;
+  transition:opacity .25s ease, transform .25s var(--ease),
+             background .18s, border-color .18s, color .18s;
+  -webkit-appearance:none;appearance:none;
+  box-shadow:0 12px 32px -12px rgba(0,0,0,0.7), inset 0 1px 0 rgba(255,255,255,0.06);
+}
+.scroll-top.visible{ opacity:1; transform:translateY(0); pointer-events:auto; }
+.scroll-top:hover{ background:rgba(25,25,25,0.95); border-color:var(--border-3); }
+.scroll-top:active{ transform:scale(.94); }
+.scroll-top svg{ width:18px; height:18px; pointer-events:none; display:block; }
+
 .page-loader{
   position:fixed;inset:0;z-index:99998;background:var(--bg);
   display:grid;place-items:center;
@@ -2183,11 +2288,6 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 .grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
 
-/* ============================================================
-   TOPBAR приложения
-   Grid 1fr auto 1fr: logo (слева) | menu (центр) | back-btn (справа).
-   На мобильных back-btn скрыт, а его роль играет третий таб внутри меню.
-   ============================================================ */
 .topbar{
   position:fixed;top:0;left:0;right:0;
   z-index:100;
@@ -2284,10 +2384,8 @@ body.cursor-ready .cur-ring { opacity:1; }
 .tab:active{ transform:scale(.98); }
 .tab.active{ color:#fff; }
 
-/* Кнопка «Выйти» внутри меню — только для мобильных */
 .tab-exit-mobile{ display:none; }
 
-/* Отдельная кнопка «На главную» — только для ПК */
 .back-btn{
   grid-column:3;
   justify-self:end;
@@ -2337,9 +2435,6 @@ body.cursor-ready .cur-ring { opacity:1; }
   padding:18px;
 }
 
-/* ============================================================
-   Поля с счётчиком символов
-   ============================================================ */
 .input-wrap{position:relative;display:flex}
 .input-wrap + .input-wrap{margin-top:10px}
 .input-wrap .iw-icon{
@@ -2362,15 +2457,12 @@ body.cursor-ready .cur-ring { opacity:1; }
 .field:focus{border-color:var(--border-3);background:var(--input-focus);box-shadow:0 0 0 3px rgba(255,255,255,0.04)}
 textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit;scrollbar-width:thin}
 
-/* Резерв места под счётчик справа */
 .input-wrap input.field{ padding-right:76px; }
 .input-wrap textarea.field{ padding-right:76px; padding-bottom:32px; }
 
-/* Счётчик: базово зелёный, warn — тёмно-жёлтый, max — красный */
 .input-count{
   position:absolute;
-  right:14px;
-  top:50%;
+  right:14px;top:50%;
   transform:translateY(-50%);
   font-size:10.5px;
   font-family:'JetBrains Mono',monospace;
@@ -2382,11 +2474,7 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   font-variant-numeric:tabular-nums;
   z-index:1;
 }
-.input-wrap.textarea-wrap .input-count{
-  top:auto;
-  bottom:10px;
-  transform:none;
-}
+.input-wrap.textarea-wrap .input-count{ top:auto; bottom:10px; transform:none; }
 .input-wrap:focus-within .input-count{ opacity:1; }
 .input-wrap.warn .input-count{ color:var(--warn); }
 .input-wrap.max  .input-count{ color:var(--err); }
@@ -2513,26 +2601,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .otp.shake{animation:shake .32s ease}
 .otp.shake .otp-cell{border-color:rgba(224,128,128,0.7);background:rgba(224,128,128,0.08)}
 
-.recent{margin-top:10px;display:flex;flex-direction:column;gap:8px;}
-.recent-label{
-  font-size:10.5px;color:var(--text-mute);
-  font-family:'JetBrains Mono',monospace;
-  letter-spacing:0.14em;text-transform:uppercase;
-}
-.recent-chips{display:flex;gap:6px;flex-wrap:wrap;}
-.recent-chip{
-  padding:6px 12px;border-radius:8px;
-  background:rgba(255,255,255,0.03);
-  border:1px solid var(--border);
-  font-family:'JetBrains Mono',monospace;
-  font-size:12px;font-weight:500;
-  color:var(--text-dim);
-  cursor:pointer;
-  transition:background .18s, border-color .18s, color .18s;
-  -webkit-appearance:none;appearance:none;
-}
-.recent-chip:hover{background:rgba(255,255,255,0.06);border-color:var(--border-2);color:#fff;}
-
 .center{text-align:center;padding:8px 0}
 .spinner{width:22px;height:22px;border-radius:50%;border:2px solid var(--border-2);border-top-color:var(--text);animation:spin .7s linear infinite;margin:0 auto}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -2559,37 +2627,62 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .msg.ok{background:rgba(126,200,153,0.08);border-color:rgba(126,200,153,0.3);color:#b1dfc2}
 @keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
 
-.post-title{margin:0 0 8px;font-family:'Unbounded',sans-serif;font-size:17px;font-weight:600;line-height:1.3;color:#fff;word-break:break-word;letter-spacing:-0.02em}
-.post-meta{font-size:12px;color:var(--text-dim);margin-bottom:14px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.01em}
-.post-body{font-size:14px;line-height:1.65;color:var(--text);white-space:pre-wrap;word-break:break-word}
+/* ============================================================
+   ПОСТ (текст не выделяется)
+   ============================================================ */
+.post-header{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  margin-bottom:14px;
+}
+.post-code{
+  font-family:'JetBrains Mono',monospace;
+  font-size:11.5px;font-weight:600;
+  letter-spacing:0.14em;
+  color:var(--text-mute);
+  text-transform:uppercase;
+  padding:6px 10px;
+  border-radius:8px;
+  border:1px solid var(--border);
+  background:rgba(255,255,255,0.02);
+}
+.post-copy-btn{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:7px 12px;
+  border-radius:9px;
+  border:1px solid var(--border);
+  background:rgba(255,255,255,0.03);
+  color:var(--text-dim);
+  font:inherit;font-size:12px;font-weight:500;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+  transition:background .18s, border-color .18s, color .18s;
+  white-space:nowrap;
+  -webkit-appearance:none;appearance:none;
+}
+.post-copy-btn:hover{ background:rgba(255,255,255,0.06); border-color:var(--border-2); color:#fff; }
+.post-copy-btn.copied{ color:var(--ok); border-color:rgba(126,200,153,0.5); background:rgba(126,200,153,0.08); }
+.post-copy-btn svg{ width:13px; height:13px; display:block; pointer-events:none; }
+.post-copy-btn .sl-check{ display:none; }
+.post-copy-btn.copied .sl-copy{ display:none; }
+.post-copy-btn.copied .sl-check{ display:block; }
+
+.post-title{
+  margin:0 0 8px;
+  font-family:'Unbounded',sans-serif;font-size:17px;font-weight:600;
+  line-height:1.3;color:#fff;word-break:break-word;letter-spacing:-0.02em;
+}
+.post-meta{
+  font-size:12px;color:var(--text-dim);
+  margin-bottom:14px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.01em;
+}
+.post-body{
+  font-size:14px;line-height:1.65;color:var(--text);
+  white-space:pre-wrap;word-break:break-word;
+}
 .post-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;margin-top:16px}
 .post-gallery img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:10px;cursor:zoom-in;background:var(--input);border:1px solid var(--border);transition:border-color .18s,transform .35s var(--ease)}
 .post-gallery img:hover{border-color:var(--border-3);transform:translateY(-2px)}
-
-.share-link{
-  margin-top:14px;padding:10px 12px 10px 14px;border-radius:12px;
-  background:rgba(255,255,255,0.03);border:1px solid var(--border);
-  display:flex;align-items:center;gap:10px;
-  font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);
-  transition:border-color .2s,background .2s;
-}
-.share-link:hover{border-color:var(--border-2);background:rgba(255,255,255,0.045)}
-.share-link-icon{width:15px;height:15px;flex-shrink:0;color:var(--text-mute);display:block}
-.share-link-url{flex:1 1 auto;min-width:0;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.share-link-copy{
-  flex-shrink:0;width:34px;height:34px;border-radius:9px;
-  border:1px solid var(--border);background:var(--input);
-  color:var(--text-mute);
-  display:grid;place-items:center;cursor:pointer;
-  -webkit-appearance:none;appearance:none;
-  transition:background .18s,border-color .18s,color .18s;
-}
-.share-link-copy:hover{background:var(--input-focus);border-color:var(--border-3);color:#fff}
-.share-link-copy.copied{color:var(--ok);border-color:rgba(126,200,153,0.5);background:rgba(126,200,153,0.08)}
-.share-link-copy svg{width:14px;height:14px;pointer-events:none;display:block}
-.share-link-copy .sl-check{display:none}
-.share-link-copy.copied .sl-copy{display:none}
-.share-link-copy.copied .sl-check{display:block}
 
 /* LIGHTBOX */
 .lightbox{
@@ -2704,7 +2797,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     padding:6px 6px 6px 10px;
     gap:10px;
     border-radius:14px;
-    /* Мобильная сетка: одна колонка по центру */
     grid-template-columns: 1fr;
     justify-items: center;
   }
@@ -2732,6 +2824,13 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
     font-family:'JetBrains Mono',monospace; letter-spacing: 0.02em;
     z-index: 2; pointer-events: none; white-space: nowrap;
     text-align: center; max-width: 92vw; padding: 0 12px;
+  }
+
+  /* На мобильном кнопка наверх компактнее и над тостами */
+  .scroll-top{
+    right: 16px;
+    bottom: max(16px, env(safe-area-inset-bottom, 0px) + 12px);
+    width: 42px; height: 42px;
   }
 }
 @media (max-width: 480px){
@@ -2886,11 +2985,6 @@ APP = r"""<!DOCTYPE html>
             <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
           </button>
         </div>
-
-        <div class="recent" id="recentBox" hidden>
-          <div class="recent-label">Недавние</div>
-          <div class="recent-chips" id="recentChips"></div>
-        </div>
       </section>
 
       <section class="card" id="searchFrame" hidden></section>
@@ -2940,6 +3034,12 @@ APP = r"""<!DOCTYPE html>
   <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
   <div class="lb-hint-mobile">свайп — листать · 2× тап — зум · свайп вниз — закрыть</div>
 </div>
+
+<button class="scroll-top" id="scrollTopBtn" type="button" aria-label="Наверх">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 19V5M5 12l7-7 7 7"/>
+  </svg>
+</button>
 
 <script>__UI_FRAMEWORK__</script>
 <script>
@@ -2995,9 +3095,9 @@ APP = r"""<!DOCTYPE html>
     requestAnimationFrame(loop);
   })();
 
-  addEventListener('mousedown', function(){ ring.classList.add('click'); });
-  addEventListener('mouseup', function(){ ring.classList.remove('click'); });
-  UI.qsa('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .share-link-copy, .recent-chip').forEach(function(el){
+  addEventListener("mousedown", function(){ ring.classList.add("click"); });
+  addEventListener("mouseup", function(){ ring.classList.remove("click"); });
+  UI.qsa('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .post-copy-btn').forEach(function(el){
     UI.on(el, 'mouseenter', function(){ ring.classList.add('hover'); });
     UI.on(el, 'mouseleave', function(){ ring.classList.remove('hover'); });
   });
@@ -3019,13 +3119,45 @@ APP = r"""<!DOCTYPE html>
   addEventListener('resize', measureTopbar, { passive: true });
   addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
 
+  /* ============ КНОПКА «НАВЕРХ» ============ */
+  var scrollTopBtn = $('scrollTopBtn');
+  var stageEl = $('stage');
+  var SCROLL_SHOW_AT = 240;
+
+  function currentScrollTop(){
+    var a = window.scrollY || window.pageYOffset || 0;
+    var b = stageEl ? stageEl.scrollTop : 0;
+    return Math.max(a, b);
+  }
+  function applyScrollTopBtn(){
+    scrollTopBtn.classList.toggle('visible', currentScrollTop() > SCROLL_SHOW_AT);
+  }
+  applyScrollTopBtn();
+
+  var stTicking = false;
+  function onAnyScroll(){
+    if (stTicking) return;
+    stTicking = true;
+    requestAnimationFrame(function(){ applyScrollTopBtn(); stTicking = false; });
+  }
+  addEventListener('scroll', onAnyScroll, { passive: true });
+  if (stageEl) stageEl.addEventListener('scroll', onAnyScroll, { passive: true });
+  addEventListener('resize', applyScrollTopBtn, { passive: true });
+
+  scrollTopBtn.addEventListener('click', function(){
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e){ window.scrollTo(0, 0); }
+    if (stageEl && stageEl.scrollTop > 0) {
+      try { stageEl.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e){ stageEl.scrollTop = 0; }
+    }
+    setTimeout(applyScrollTopBtn, 60);
+  });
+
   /* ============ ICONS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
     copy:  '<svg class="sl-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
-    check: '<svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
-    link:  '<svg class="share-link-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/></svg>'
+    check: '<svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
   };
 
   /* ============ HELPERS ============ */
@@ -3180,7 +3312,6 @@ APP = r"""<!DOCTYPE html>
   var titleWrap = $("titleWrap"), contentWrap = $("contentWrap");
   var titleCount = $("titleCount"), contentCount = $("contentCount");
 
-  /* Счётчик: зелёный → тёмно-жёлтый (80%) → красный (100%). На красном ввод блокируется. */
   function updateCounter(input, countEl, wrapEl, max){
     var len = input.value.length;
     if (len > max) { input.value = input.value.slice(0, max); len = max; }
@@ -3358,7 +3489,6 @@ APP = r"""<!DOCTYPE html>
       updateOtpCopyState();
       runSearch(code);
       showCreatedModal(code, data.compressed_bytes, data.share_url || postUrl(code));
-      pushRecent(code);
       UI.toast("Пост создан · #" + code, { kind: 'ok' });
     } catch (e) {
       showCreateMsg("err", "Ошибка сети: " + e.message);
@@ -3412,41 +3542,6 @@ APP = r"""<!DOCTYPE html>
   var searchSeq = 0, lastSubmitted = "", otpCopyTimer = null;
   var postCache = new Map();
   var postCacheETag = new Map();
-
-  var RECENT_KEY = "sld_recent_codes";
-  var recentBox = $("recentBox"), recentChips = $("recentChips");
-
-  function loadRecent(){
-    try { return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]"); }
-    catch(e){ return []; }
-  }
-  function saveRecent(arr){
-    try { localStorage.setItem(RECENT_KEY, JSON.stringify(arr.slice(0, 5))); } catch(e){}
-  }
-  function pushRecent(code){
-    var arr = loadRecent().filter(function(c){ return c !== code; });
-    arr.unshift(code);
-    saveRecent(arr);
-    renderRecent();
-  }
-  function fillOtp(code){
-    otpCells.forEach(function(c, i){ c.value = code[i] || ""; });
-    lastSubmitted = "";
-    updateOtpCopyState();
-    maybeSearch();
-  }
-  function renderRecent(){
-    var arr = loadRecent();
-    if (!arr.length) { recentBox.hidden = true; return; }
-    recentBox.hidden = false;
-    UI.clear(recentChips);
-    arr.forEach(function(code){
-      recentChips.appendChild(UI.h('button', {
-        type: 'button', class: 'recent-chip', text: code,
-        on: { click: function(){ fillOtp(code); } }
-      }));
-    });
-  }
 
   function getCode(){ return otpCells.map(function(c){ return c.value; }).join(""); }
   function updateOtpCopyState(){ otpCopyBtn.disabled = getCode().length !== 6; }
@@ -3514,7 +3609,6 @@ APP = r"""<!DOCTYPE html>
     });
   });
   updateOtpCopyState();
-  renderRecent();
 
   function showSearchFrame(){ searchFrame.hidden = false; }
   function renderSpinner(){
@@ -3820,60 +3914,67 @@ APP = r"""<!DOCTYPE html>
   function renderPost(post){
     UI.clear(searchFrame);
 
+    var code = post.code;
+    var url = postUrl(code);
+
+    // --- Верхняя шапка: код + кнопка «Копировать ссылку» ---
+    var copyBtn = UI.h('button', {
+      type: 'button',
+      class: 'post-copy-btn',
+      title: 'Копировать ссылку на пост',
+      'aria-label': 'Копировать ссылку на пост',
+      html: ICONS.copy + ICONS.check
+    }, [ UI.h('span', { text: 'Копировать ссылку' }) ]);
+    var copyBtnTimer = null;
+    UI.on(copyBtn, 'click', async function(e){
+      e.stopPropagation();
+      var ok = await UI.copy(url);
+      copyBtn.classList.toggle('copied', ok);
+      if (ok) UI.toast('Ссылка скопирована', { kind: 'ok', duration: 1400 });
+      clearTimeout(copyBtnTimer);
+      copyBtnTimer = setTimeout(function(){ copyBtn.classList.remove('copied'); }, 1500);
+    });
+
+    var header = UI.h('div', { class: 'post-header' }, [
+      UI.h('span', { class: 'post-code', text: '#' + code }),
+      copyBtn
+    ]);
+    searchFrame.appendChild(header);
+
+    // --- Заголовок поста ---
+    searchFrame.appendChild(UI.h('h3', { class: 'post-title', text: post.title }));
+
+    // --- Метаданные ---
     var meta = UI.h('div', { class: 'post-meta' });
     try {
-      meta.appendChild(UI.h('span', { text: new Date(post.created).toLocaleString("ru-RU") }));
+      meta.appendChild(UI.h('span', { text: new Date(post.created).toLocaleString('ru-RU') }));
     } catch(e){}
     if (post.photos && post.photos.length) {
-      meta.appendChild(UI.h('span', { text: "Фото: " + post.photos.length }));
+      meta.appendChild(UI.h('span', { text: 'Фото: ' + post.photos.length }));
     }
-
-    searchFrame.appendChild(UI.h('h3', { class: 'post-title', text: post.title }));
     searchFrame.appendChild(meta);
 
+    // --- Тело ---
     if (post.content) {
       searchFrame.appendChild(UI.h('div', { class: 'post-body', text: post.content }));
     }
 
+    // --- Галерея ---
     if (post.photos && post.photos.length) {
       var gallery = UI.h('div', { class: 'post-gallery' });
       post.photos.forEach(function(p, idx){
         var img = UI.h('img', {
-          src: "/api/photos/" + encodeURIComponent(post.code) + "/" + idx,
-          alt: p.name || "photo",
-          title: p.name || "",
-          loading: "lazy",
-          decoding: "async",
-          on: { click: function(){ openLightbox(post.code, post.photos, idx); } }
+          src: '/api/photos/' + encodeURIComponent(code) + '/' + idx,
+          alt: p.name || 'photo',
+          title: p.name || '',
+          loading: 'lazy',
+          decoding: 'async',
+          on: { click: function(){ openLightbox(code, post.photos, idx); } }
         });
         gallery.appendChild(img);
       });
       searchFrame.appendChild(gallery);
     }
-
-    var url = postUrl(post.code);
-    var shareUrl = UI.h('span', { class: 'share-link-url', text: url, title: url });
-    var copyTimer = null;
-    var copyBtn = UI.h('button', {
-      type: 'button', class: 'share-link-copy',
-      title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку',
-      html: ICONS.copy + ICONS.check,
-      on: {
-        click: async function(e){
-          e.stopPropagation();
-          var ok = await UI.copy(url);
-          copyBtn.classList.toggle('copied', ok);
-          if (ok) UI.toast("Ссылка скопирована", { kind: 'ok', duration: 1400 });
-          clearTimeout(copyTimer);
-          copyTimer = setTimeout(function(){ copyBtn.classList.remove('copied'); }, 1500);
-        }
-      }
-    });
-    searchFrame.appendChild(UI.h('div', { class: 'share-link' }, [
-      UI.h('span', { class: 'share-link-icon', html: ICONS.link }),
-      shareUrl,
-      copyBtn
-    ]));
 
     showSearchFrame();
   }
@@ -3887,7 +3988,6 @@ APP = r"""<!DOCTYPE html>
     try {
       if (postCache.has(code)) {
         renderPost(postCache.get(code));
-        pushRecent(code);
         (async function(){
           try {
             var etag = postCacheETag.get(code);
@@ -3931,7 +4031,6 @@ APP = r"""<!DOCTYPE html>
       if (tag) postCacheETag.set(code, tag);
 
       renderPost(post);
-      pushRecent(code);
     } catch (e) {
       if (mySeq !== searchSeq) return;
       renderError("Ошибка сети: " + e.message);
