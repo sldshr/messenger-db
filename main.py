@@ -1,6 +1,5 @@
 # main.py
-# Мини-соцсеть: FastAPI + кастомный Material-подобный UI.
-# Тёмная/светлая тема, уведомления, упоминания @user, поиск, мобильная вёрстка.
+# Мини-соцнежь: FastAPI, всё в оперативной памяти, один файл.
 # Запуск:  pip install fastapi uvicorn
 #          uvicorn main:app --reload
 # Открыть: http://127.0.0.1:8000
@@ -14,12 +13,12 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import Cookie, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
 app = FastAPI(title="MiniNet")
 
 # --------------------------------------------------------------------------
-# ХРАНИЛИЩЕ В ОПЕРАТИВНОЙ ПАМЯТИ
+# ХРАНИЛИЩЕ
 # --------------------------------------------------------------------------
 USERS: dict = {}          # username -> {"salt", "hash", "created"}
 POSTS: list = []          # [{"id","author","text","ts","likes": set()}]
@@ -77,14 +76,14 @@ def back(request: Request) -> RedirectResponse:
 
 
 def render_text(text: str) -> str:
-    """Экранирует HTML и превращает @username в ссылки."""
     escaped = html.escape(text)
 
     def repl(m):
         name = m.group(1)
         actual = find_user(name)
         if actual:
-            return f'<a class="mention" href="/u/{html.escape(actual)}">@{html.escape(actual)}</a>'
+            return (f'<a class="mention" href="/u/{html.escape(actual)}">'
+                    f'@{html.escape(actual)}</a>')
         return m.group(0)
 
     return MENTION_RE.sub(repl, escaped)
@@ -95,314 +94,632 @@ def avatar(name: str, cls: str = "avatar") -> str:
 
 
 # --------------------------------------------------------------------------
-# ВЁРСТКА
+# СТИЛИ
 # --------------------------------------------------------------------------
 CSS = """
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+* { scrollbar-width: none; -ms-overflow-style: none; }
+*::-webkit-scrollbar { display: none; width: 0; height: 0; }
+
 :root {
-  --bg: #eceff1; --surface: #ffffff; --surface-2: #f5f7f9;
-  --text: #1c1c1c; --muted: #6b7785; --border: #e3e7eb;
-  --primary: #3f51b5; --primary-hover: #32408f; --on-primary: #ffffff;
-  --nav-bg: #3f51b5; --nav-text: #ffffff;
-  --like: #e91e63; --danger: #e53935;
-  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
-  --shadow-hover: 0 3px 10px rgba(0,0,0,.10);
+  --bg: #f1f3f5;
+  --surface: #ffffff;
+  --surface-2: #f5f7f9;
+  --surface-3: #e8ecf0;
+  --text: #1a1d23;
+  --muted: #6b7785;
+  --border: #e3e7eb;
+  --primary: #4f5fd0;
+  --primary-hover: #3f4fc0;
+  --on-primary: #ffffff;
+  --like: #e91e63;
+  --danger: #e53935;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
+  --shadow-md: 0 4px 16px rgba(0,0,0,.10);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.18);
+  --topbar-h: 56px;
+  --bottomnav-h: 62px;
+  --radius: 14px;
+  --radius-sm: 10px;
+  --radius-pill: 999px;
+  --icon-btn-size: 40px;
 }
 [data-theme="dark"] {
-  --bg: #0f1115; --surface: #1a1d23; --surface-2: #23272e;
-  --text: #e8eaed; --muted: #9aa3ad; --border: #2c3138;
-  --primary: #8b98e0; --primary-hover: #a3aee8; --on-primary: #12141a;
-  --nav-bg: #151821; --nav-text: #e8eaed;
-  --like: #f06292; --danger: #ef5350;
-  --shadow: 0 1px 3px rgba(0,0,0,.5);
-  --shadow-hover: 0 3px 12px rgba(0,0,0,.6);
+  --bg: #0f1115;
+  --surface: #1a1d23;
+  --surface-2: #23272e;
+  --surface-3: #2c3138;
+  --text: #e8eaed;
+  --muted: #9aa3ad;
+  --border: #2c3138;
+  --primary: #8b98e0;
+  --primary-hover: #a3aee8;
+  --on-primary: #10131a;
+  --like: #f06292;
+  --danger: #ef5350;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 4px 16px rgba(0,0,0,.5);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.7);
 }
+
 html, body { margin: 0; padding: 0; }
 body {
-  background: var(--bg); color: var(--text);
-  font-family: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-  font-size: 15px; line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
   min-height: 100vh;
-  transition: background .2s ease, color .2s ease;
   -webkit-font-smoothing: antialiased;
+  transition: background .2s, color .2s;
 }
 a { color: var(--primary); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .mention { color: var(--primary); font-weight: 500; }
 
-/* ------- Navbar ------- */
-.navbar {
-  background: var(--nav-bg); color: var(--nav-text);
-  position: sticky; top: 0; z-index: 100;
-  box-shadow: 0 2px 8px rgba(0,0,0,.15);
+/* ---------- TOPBAR ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 90;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  height: var(--topbar-h);
 }
-.nav-inner {
-  max-width: 1080px; margin: 0 auto;
-  padding: 0 12px; height: 56px;
-  display: flex; align-items: center; gap: 10px;
+.topbar-inner {
+  max-width: 720px; margin: 0 auto;
+  height: 100%; padding: 0 10px;
+  display: flex; align-items: center; gap: 8px;
 }
 .brand {
-  color: var(--nav-text); font-weight: 700; font-size: 1.2rem;
-  letter-spacing: -.4px; text-decoration: none; flex-shrink: 0;
+  font-weight: 700; font-size: 1.15rem;
+  color: var(--text);
+  letter-spacing: -.4px;
+  text-decoration: none;
+  margin-right: auto;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
 }
-.brand:hover { text-decoration: none; opacity: .9; }
-.search-form {
-  flex: 1; max-width: 420px; min-width: 0;
-  display: flex; align-items: center;
-  background: rgba(255,255,255,.14);
-  border-radius: 22px; height: 38px; padding: 0 12px;
-  transition: background .15s;
-}
-.search-form:focus-within { background: rgba(255,255,255,.24); }
-.search-form i { font-size: 20px; color: var(--nav-text); opacity: .85; margin-right: 6px; }
-.search-form input {
-  flex: 1; min-width: 0; background: none; border: none; outline: none;
-  color: var(--nav-text); font-family: inherit; font-size: .95rem;
-  height: 100%; padding: 0;
-}
-.search-form input::placeholder { color: var(--nav-text); opacity: .65; }
-.nav-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.brand:hover { text-decoration: none; }
+.topbar-actions { display: flex; align-items: center; gap: 4px; }
+
+/* ---------- ICON BUTTON ---------- */
 .icon-btn {
-  width: 42px; height: 42px;
-  display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 50%; border: none; background: none;
-  color: var(--nav-text); cursor: pointer; position: relative;
-  padding: 0; text-decoration: none; font-family: inherit;
-  transition: background .15s;
+  width: var(--icon-btn-size);
+  height: var(--icon-btn-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  text-decoration: none;
+  font-family: inherit;
+  position: relative;
+  transition: background .15s, color .15s;
+  flex-shrink: 0;
 }
-.icon-btn:hover { background: rgba(255,255,255,.14); text-decoration: none; }
-.icon-btn i { font-size: 24px; }
-.avatar-btn {
-  background: var(--primary); color: var(--on-primary);
-  font-weight: 700; font-size: 1rem;
+.icon-btn:hover { background: var(--surface-2); text-decoration: none; }
+.icon-btn:active { background: var(--surface-3); }
+.icon-btn .material-icons { font-size: 22px; }
+.icon-btn.liked { color: var(--like); }
+.icon-btn.danger:hover { color: var(--danger); }
+.icon-btn.avatar-btn {
+  background: var(--primary);
+  color: var(--on-primary);
+  font-weight: 700;
+  font-size: 1rem;
 }
-.avatar-btn:hover { background: var(--primary-hover); }
+.icon-btn.avatar-btn:hover { background: var(--primary-hover); }
+
+/* ---------- BADGE ---------- */
 .badge {
-  position: absolute; top: 6px; right: 6px;
+  position: absolute;
+  top: 3px; right: 3px;
   background: #f44336; color: #fff;
-  font-size: 10px; font-weight: 700; line-height: 1;
-  min-width: 16px; height: 16px; padding: 0 4px;
+  font-size: 10px; font-weight: 700;
+  min-width: 16px; height: 16px;
+  padding: 0 4px;
   border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
+  line-height: 1;
+  pointer-events: none;
 }
-.logout-form { display: inline-flex; }
 
-/* ------- Layout ------- */
-.container { max-width: 720px; margin: 0 auto; padding: 18px 12px 60px; }
-.page-title { font-size: 1.35rem; font-weight: 500; margin: 0 0 16px 4px; }
-.muted { color: var(--muted); }
-.small { font-size: .85rem; }
+/* ---------- PRIMARY BUTTON ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 20px;
+  min-height: 40px;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: var(--primary);
+  color: var(--on-primary);
+  font-family: inherit;
+  font-size: .92rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background .15s;
+}
+.btn:hover { background: var(--primary-hover); text-decoration: none; }
+.btn:active { transform: scale(.98); }
+.btn-block { width: 100%; }
+.btn .material-icons { font-size: 18px; }
 
-/* ------- Cards ------- */
+/* ---------- CONTAINER ---------- */
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px 12px 40px;
+}
+
+/* ---------- FEED SEARCH ---------- */
+.feed-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 16px;
+  height: 46px;
+  margin-bottom: 14px;
+  transition: border-color .15s, box-shadow .15s;
+}
+.feed-search:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.feed-search .material-icons { color: var(--muted); font-size: 20px; }
+.feed-search input {
+  flex: 1;
+  border: none;
+  background: none;
+  outline: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: .95rem;
+  height: 100%;
+  padding: 0;
+  min-width: 0;
+}
+.feed-search input::placeholder { color: var(--muted); }
+
+/* ---------- CARDS ---------- */
 .card {
-  background: var(--surface); border-radius: 14px;
-  box-shadow: var(--shadow); margin-bottom: 14px; overflow: hidden;
-  transition: box-shadow .15s;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border);
 }
 .card-body { padding: 16px; }
 .card-footer {
-  padding: 4px 8px; border-top: 1px solid var(--border);
-  display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
-.card-header-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.card-footer .spacer { flex: 1; }
+.likes-count {
+  font-size: .85rem;
+  color: var(--muted);
+  margin-left: 2px;
+  margin-right: 4px;
+}
+
+/* ---------- AVATAR ---------- */
 .avatar {
-  width: 46px; height: 46px; border-radius: 50%;
-  background: var(--primary); color: var(--on-primary);
-  display: flex; align-items: center; justify-content: center;
-  font-weight: 600; font-size: 20px; flex-shrink: 0;
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: var(--on-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 19px;
+  flex-shrink: 0;
   user-select: none;
 }
 .avatar-lg { width: 72px; height: 72px; font-size: 30px; }
+.avatar-sm { width: 36px; height: 36px; font-size: 15px; }
+
+/* ---------- POST ---------- */
+.card-header-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 .post-author { color: var(--text); font-weight: 600; }
 .post-author:hover { color: var(--primary); text-decoration: none; }
 .post-time { font-size: .82rem; color: var(--muted); }
 .post-text {
-  white-space: pre-wrap; word-wrap: break-word;
-  font-size: 1rem; line-height: 1.55;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 1rem;
+  line-height: 1.55;
 }
 
-/* ------- Buttons ------- */
-.btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  gap: 6px; padding: 9px 18px;
-  border-radius: 22px; border: none; cursor: pointer;
-  font-family: inherit; font-size: .92rem; font-weight: 500;
-  text-decoration: none; line-height: 1;
-  background: var(--primary); color: var(--on-primary);
-  transition: background .15s, opacity .15s;
+/* ---------- COMPOSER ---------- */
+.composer textarea {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-family: inherit;
+  font-size: .95rem;
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.5;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
 }
-.btn:hover { background: var(--primary-hover); text-decoration: none; }
-.btn:disabled { opacity: .6; cursor: default; }
-.btn-block { width: 100%; }
-.btn i { font-size: 18px; }
-.btn-icon {
-  width: 38px; height: 38px; padding: 0;
-  border-radius: 50%; background: none; color: var(--muted);
-  border: none; cursor: pointer;
-  display: inline-flex; align-items: center; justify-content: center;
-  transition: background .15s, color .15s;
-}
-.btn-icon:hover { background: var(--surface-2); }
-.btn-icon i { font-size: 20px; }
-.btn-icon.liked { color: var(--like); }
-.btn-icon.danger:hover { color: var(--danger); }
-.btn-flat {
-  background: none; color: var(--primary); padding: 8px 14px;
-}
-.btn-flat:hover { background: var(--surface-2); }
-
-/* ------- Inputs ------- */
-.input-field { margin-bottom: 14px; }
-.input-field label {
-  display: block; font-size: .82rem; color: var(--muted);
-  margin-bottom: 6px; font-weight: 500;
-}
-input[type="text"], input[type="password"], textarea {
-  width: 100%; background: var(--surface-2); color: var(--text);
-  border: 1px solid var(--border); border-radius: 10px;
-  padding: 12px 14px; font-family: inherit; font-size: .95rem;
-  outline: none; transition: border-color .15s, box-shadow .15s;
-}
-input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+.composer textarea:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
 }
-textarea { resize: vertical; min-height: 88px; line-height: 1.5; }
-.composer textarea { min-height: 68px; }
-
-/* ------- Composer ------- */
 .composer-footer {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; margin-top: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
 }
 .hint { font-size: .8rem; color: var(--muted); }
 .counter { font-size: .8rem; color: var(--muted); }
 
-/* ------- Notification item ------- */
-.notif {
-  display: flex; gap: 12px; align-items: flex-start;
-  padding: 14px 16px; border-bottom: 1px solid var(--border);
-  color: var(--text); text-decoration: none;
-  transition: background .15s;
+/* ---------- INPUTS ---------- */
+.input-field { margin-bottom: 14px; }
+.input-field label {
+  display: block;
+  font-size: .82rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+  font-weight: 500;
 }
-.notif:last-child { border-bottom: none; }
-.notif:hover { background: var(--surface-2); text-decoration: none; }
-.notif.unread { background: rgba(63,81,181,.07); }
-[data-theme="dark"] .notif.unread { background: rgba(139,152,224,.10); }
-.notif-icon {
-  width: 40px; height: 40px; border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--surface-2); flex-shrink: 0;
+.input-field input {
+  width: 100%;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-family: inherit;
+  font-size: .95rem;
+  outline: none;
+  transition: border-color .15s, box-shadow .15s;
 }
-.notif-icon i { font-size: 20px; color: var(--primary); }
-.notif-content { flex: 1; min-width: 0; }
-.notif-text { font-size: .95rem; }
-.notif-text b { color: var(--text); }
-.notif-time { font-size: .78rem; color: var(--muted); margin-top: 2px; }
+.input-field input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+}
 
-/* ------- Empty / 404 ------- */
-.empty {
-  padding: 44px 20px; text-align: center; color: var(--muted);
-}
-.empty i { font-size: 52px; opacity: .35; display: block; margin-bottom: 10px; }
-
-/* ------- Profile header ------- */
-.profile-header {
-  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-}
-.profile-name { margin: 0; font-weight: 500; font-size: 1.4rem; }
-.profile-stats { color: var(--muted); font-size: .9rem; margin-top: 4px; }
-.profile-actions { margin-left: auto; }
-
-/* ------- Auth ------- */
+/* ---------- AUTH ---------- */
 .auth-wrap { max-width: 420px; margin: 0 auto; }
 .auth-wrap h1 { font-weight: 300; font-size: 1.6rem; margin: 4px 0 20px; }
 .auth-alt { text-align: center; color: var(--muted); font-size: .9rem; margin-top: 14px; }
 .error-box {
-  background: rgba(229,57,53,.1); color: var(--danger);
+  background: rgba(229,57,53,.1);
+  color: var(--danger);
   border: 1px solid rgba(229,57,53,.25);
-  padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 14px;
   font-size: .9rem;
 }
 
-/* ------- Search result ------- */
+/* ---------- EMPTY ---------- */
+.empty { padding: 44px 20px; text-align: center; color: var(--muted); }
+.empty .material-icons {
+  font-size: 48px;
+  opacity: .35;
+  display: block;
+  margin: 0 auto 10px;
+}
+
+/* ---------- PROFILE ---------- */
+.profile-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.profile-name { margin: 0; font-weight: 500; font-size: 1.4rem; }
+.profile-stats { color: var(--muted); font-size: .9rem; margin-top: 4px; }
+.profile-actions { margin-left: auto; }
+
+/* ---------- SEARCH RESULTS ---------- */
 .user-chip {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px; border-bottom: 1px solid var(--border);
-  color: var(--text); text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
 }
 .user-chip:last-child { border-bottom: none; }
 .user-chip:hover { background: var(--surface-2); text-decoration: none; }
-.user-chip .avatar { width: 40px; height: 40px; font-size: 17px; }
 
-/* ------- Responsive ------- */
+/* ---------- NOTIFICATIONS DROPDOWN ---------- */
+.notif-dropdown {
+  position: fixed;
+  top: calc(var(--topbar-h) + 8px);
+  right: 12px;
+  width: 360px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - var(--topbar-h) - 24px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  z-index: 200;
+  display: none;
+  overflow: hidden;
+  flex-direction: column;
+}
+.notif-dropdown.open { display: flex; }
+.notif-head {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: .95rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+.notif-head .muted { font-weight: 400; font-size: .85rem; }
+.notif-list { overflow-y: auto; flex: 1; min-height: 0; }
+.notif-item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+  transition: background .15s;
+}
+.notif-item:last-child { border-bottom: none; }
+.notif-item:hover { background: var(--surface-2); text-decoration: none; }
+.notif-item.unread { background: rgba(79,95,208,.07); }
+[data-theme="dark"] .notif-item.unread { background: rgba(139,152,224,.10); }
+.notif-icon {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.notif-icon .material-icons { font-size: 19px; color: var(--primary); }
+.notif-body { flex: 1; min-width: 0; }
+.notif-text { font-size: .92rem; line-height: 1.4; }
+.notif-text b { color: var(--text); font-weight: 600; }
+.notif-time { font-size: .76rem; color: var(--muted); margin-top: 3px; }
+.notif-empty {
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+/* ---------- BOTTOM NAV ---------- */
+.bottomnav {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: calc(var(--bottomnav-h) + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  z-index: 95;
+}
+.bottomnav-inner {
+  height: var(--bottomnav-h);
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  align-items: stretch;
+}
+.bottomnav .icon-btn {
+  flex: 1;
+  width: auto;
+  height: 100%;
+  border-radius: 0;
+}
+.bottomnav .icon-btn .material-icons { font-size: 24px; }
+.bottomnav .icon-btn.avatar-btn {
+  background: none;
+  color: var(--primary);
+}
+.bottomnav .icon-btn.avatar-btn:hover { background: var(--surface-2); }
+
+/* ---------- UTILITY ---------- */
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.page-title { font-size: 1.3rem; font-weight: 500; margin: 0 0 14px 4px; }
+.section-title {
+  font-size: .8rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin: 18px 4px 8px;
+}
+
+/* ---------- RESPONSIVE ---------- */
+@media (min-width: 641px) {
+  .only-mobile { display: none !important; }
+}
 @media (max-width: 640px) {
-  .brand { display: none; }
-  .nav-inner { gap: 6px; padding: 0 8px; }
-  .icon-btn { width: 40px; height: 40px; }
-  .icon-btn i { font-size: 22px; }
-  .avatar-btn { font-size: .95rem; }
-  .search-form { height: 36px; }
-  .container { padding: 12px 8px 60px; }
+  .only-desktop { display: none !important; }
+  .bottomnav { display: block; }
+  .container {
+    padding: 12px 8px calc(var(--bottomnav-h) + env(safe-area-inset-bottom) + 20px);
+  }
+  .topbar-inner { padding: 0 8px; gap: 4px; }
+  .brand { font-size: 1.05rem; padding: 6px 4px; }
   .card-body { padding: 14px; }
   .post-text { font-size: .97rem; }
+  .notif-dropdown {
+    top: auto;
+    bottom: calc(var(--bottomnav-h) + env(safe-area-inset-bottom) + 8px);
+    left: 8px; right: 8px;
+    width: auto;
+    max-width: none;
+    max-height: 65vh;
+  }
   .profile-header { gap: 12px; }
   .profile-name { font-size: 1.2rem; }
-}
-@media (max-width: 380px) {
-  .nav-actions { gap: 0; }
-  .icon-btn { width: 36px; height: 36px; }
-  .icon-btn i { font-size: 20px; }
+  .avatar-lg { width: 60px; height: 60px; font-size: 24px; }
 }
 """
 
 
+# --------------------------------------------------------------------------
+# ФРАГМЕНТЫ
+# --------------------------------------------------------------------------
+def render_notif_item(n: dict) -> str:
+    if n["kind"] == "mention":
+        text = f'<b>{html.escape(n["from"])}</b> упомянул вас в посте'
+        icon = "alternate_email"
+    elif n["kind"] == "like":
+        text = f'<b>{html.escape(n["from"])}</b> оценил ваш пост'
+        icon = "favorite"
+    else:
+        text = html.escape(n["from"])
+        icon = "notifications"
+    href = f'/post/{n["post_id"]}' if n.get("post_id") else "/"
+    cls = "notif-item" + ("" if n["read"] else " unread")
+    return f"""
+<a class="{cls}" href="{href}">
+  <div class="notif-icon"><i class="material-icons">{icon}</i></div>
+  <div class="notif-body">
+    <div class="notif-text">{text}</div>
+    <div class="notif-time">{fmt_time(n['ts'])}</div>
+  </div>
+</a>"""
+
+
+def render_notif_dropdown(user: Optional[str]) -> str:
+    if not user:
+        return ""
+    mine = [n for n in NOTIFICATIONS if n["user"] == user][:40]
+    if mine:
+        items = "".join(render_notif_item(n) for n in mine)
+    else:
+        items = '<div class="notif-empty">Уведомлений пока нет</div>'
+    return f"""
+<div class="notif-dropdown" id="notifDropdown">
+  <div class="notif-head">
+    <span>Уведомления</span>
+    <span class="muted">последние {len(mine)}</span>
+  </div>
+  <div class="notif-list">{items}</div>
+</div>"""
+
+
+# --------------------------------------------------------------------------
+# LAYOUT
+# --------------------------------------------------------------------------
 def layout(title: str, content: str, user: Optional[str] = None,
            theme: str = "light") -> str:
     theme = "dark" if theme == "dark" else "light"
     unread = unread_count(user)
 
-    # ----- левая часть навбара + поиск -----
-    search = (
-        '<form class="search-form" action="/search" method="get">'
-        '<i class="material-icons">search</i>'
-        '<input type="text" name="q" placeholder="Поиск людей и постов" autocomplete="off">'
-        "</form>"
-    )
-
-    # ----- правые иконки -----
     bell_icon = "notifications" if unread else "notifications_none"
-    badge = f'<span class="badge">{unread if unread < 100 else "99+"}</span>' if unread else ""
+    badge = (f'<span class="badge">{unread if unread < 100 else "99+"}</span>'
+             if unread else "")
 
+    # ---- верхняя панель: справа иконки ----
     if user:
-        avatar_btn = (
-            f'<a href="/u/{html.escape(user)}" class="icon-btn avatar-btn" '
+        desktop_actions = (
+            f'<a href="/u/{html.escape(user)}" class="icon-btn avatar-btn only-desktop" '
             f'title="{html.escape(user)}">{html.escape(user[0].upper())}</a>'
-        )
-        logout = (
-            '<form class="logout-form" action="/logout" method="post">'
-            '<button class="icon-btn" type="submit" title="Выйти">'
-            '<i class="material-icons">logout</i></button></form>'
+            f'<form class="only-desktop" action="/logout" method="post" '
+            f'style="display:inline-flex;margin:0">'
+            f'<button class="icon-btn" type="submit" title="Выйти">'
+            f'<i class="material-icons">logout</i></button></form>'
         )
     else:
-        avatar_btn = (
-            '<a href="/login" class="icon-btn" title="Войти">'
+        desktop_actions = (
+            '<a href="/login" class="icon-btn only-desktop" title="Войти">'
             '<i class="material-icons">person_outline</i></a>'
         )
-        logout = ""
 
     theme_icon = "light_mode" if theme == "dark" else "dark_mode"
 
-    nav_actions = (
-        f'<a href="/#composer" class="icon-btn" title="Новый пост">'
-        f'<i class="material-icons">add</i></a>'
-        f'<a href="/notifications" class="icon-btn" title="Уведомления">'
-        f'<i class="material-icons">{bell_icon}</i>{badge}</a>'
-        f"{avatar_btn}"
-        f'<a href="/toggle-theme" class="icon-btn" title="Сменить тему">'
-        f'<i class="material-icons">{theme_icon}</i></a>'
-        f"{logout}"
-    )
+    notif_btn_top = ""
+    if user:
+        notif_btn_top = (
+            f'<button class="icon-btn only-desktop" data-notif-toggle '
+            f'onclick="toggleNotif(event)" title="Уведомления">'
+            f'<i class="material-icons">{bell_icon}</i>{badge}</button>'
+        )
+
+    topbar = f"""
+<nav class="topbar">
+  <div class="topbar-inner">
+    <a href="/" class="brand">MiniNet</a>
+    <div class="topbar-actions">
+      {notif_btn_top}
+      <a href="/toggle-theme" class="icon-btn" title="Сменить тему">
+        <i class="material-icons">{theme_icon}</i>
+      </a>
+      {desktop_actions}
+    </div>
+  </div>
+</nav>"""
+
+    # ---- нижняя навигация (только мобильные) ----
+    if user:
+        bottom_profile = (
+            f'<a href="/u/{html.escape(user)}" class="icon-btn avatar-btn only-mobile" '
+            f'title="Профиль">{html.escape(user[0].upper())}</a>'
+        )
+        notif_btn_bottom = (
+            f'<button class="icon-btn" data-notif-toggle '
+            f'onclick="toggleNotif(event)" title="Уведомления">'
+            f'<i class="material-icons">{bell_icon}</i>{badge}</button>'
+        )
+    else:
+        bottom_profile = (
+            '<a href="/login" class="icon-btn only-mobile" title="Войти">'
+            '<i class="material-icons">person_outline</i></a>'
+        )
+        notif_btn_bottom = (
+            '<a href="/login" class="icon-btn" title="Войти">'
+            '<i class="material-icons">notifications_none</i></a>'
+        )
+
+    bottomnav = f"""
+<nav class="bottomnav">
+  <div class="bottomnav-inner">
+    <a href="/" class="icon-btn" title="Главная">
+      <i class="material-icons">home</i>
+    </a>
+    <a href="/#feedSearch" class="icon-btn" onclick="return goSearch(event)" title="Поиск">
+      <i class="material-icons">search</i>
+    </a>
+    {notif_btn_bottom}
+    {bottom_profile}
+  </div>
+</nav>"""
+
+    notif_dropdown = render_notif_dropdown(user)
 
     return f"""<!DOCTYPE html>
 <html lang="ru" data-theme="{theme}">
@@ -415,22 +732,69 @@ def layout(title: str, content: str, user: Optional[str] = None,
 <style>{CSS}</style>
 </head>
 <body>
-<nav class="navbar">
-  <div class="nav-inner">
-    <a href="/" class="brand">MiniNet</a>
-    {search}
-    <div class="nav-actions">{nav_actions}</div>
-  </div>
-</nav>
+{topbar}
 <main class="container">{content}</main>
+{bottomnav}
+{notif_dropdown}
 <script>
-  // Счётчик символов в композере
-  document.querySelectorAll('textarea[maxlength]').forEach(function (ta) {{
-    var counter = ta.parentElement.querySelector('.counter');
-    if (!counter) return;
-    function upd() {{ counter.textContent = ta.value.length + ' / ' + ta.maxLength; }}
-    ta.addEventListener('input', upd); upd();
-  }});
+// Запрет контекстного меню
+document.addEventListener('contextmenu', function (e) {{
+  var t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+  e.preventDefault();
+}});
+
+// Счётчик символов
+document.querySelectorAll('textarea[maxlength]').forEach(function (ta) {{
+  var counter = ta.parentElement.querySelector('.counter');
+  if (!counter) return;
+  function upd() {{ counter.textContent = ta.value.length + ' / ' + ta.maxLength; }}
+  ta.addEventListener('input', upd); upd();
+}});
+
+// Уведомления
+function toggleNotif(e) {{
+  if (e) e.preventDefault();
+  var dd = document.getElementById('notifDropdown');
+  if (!dd) return;
+  var willOpen = !dd.classList.contains('open');
+  dd.classList.toggle('open');
+  if (willOpen) {{
+    fetch('/api/notifications/read', {{method: 'POST', credentials: 'same-origin'}})
+      .then(function () {{
+        document.querySelectorAll('.badge').forEach(function (b) {{ b.remove(); }});
+        document.querySelectorAll('.notif-item.unread').forEach(function (n) {{
+          n.classList.remove('unread');
+        }});
+      }})
+      .catch(function () {{}});
+  }}
+}}
+document.addEventListener('click', function (e) {{
+  var dd = document.getElementById('notifDropdown');
+  if (!dd || !dd.classList.contains('open')) return;
+  if (dd.contains(e.target)) return;
+  if (e.target.closest('[data-notif-toggle]')) return;
+  dd.classList.remove('open');
+}});
+document.addEventListener('keydown', function (e) {{
+  if (e.key === 'Escape') {{
+    var dd = document.getElementById('notifDropdown');
+    if (dd) dd.classList.remove('open');
+  }}
+}});
+
+// Поиск из нижней навигации
+function goSearch(e) {{
+  var inp = document.getElementById('feedSearch');
+  if (inp) {{
+    e.preventDefault();
+    inp.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+    setTimeout(function () {{ inp.focus(); }}, 250);
+    return false;
+  }}
+  return true;
+}}
 </script>
 </body>
 </html>"""
@@ -444,28 +808,26 @@ def render_post(post: dict, user: Optional[str], show_delete: bool = True) -> st
     likes_n = len(post["likes"])
 
     if user:
-        like_html = (
-            f'<form action="/like/{post["id"]}" method="post" style="display:inline">'
-            f'<button class="btn-icon {"liked" if liked else ""}" type="submit" '
+        like_btn = (
+            f'<form action="/like/{post["id"]}" method="post" style="display:inline;margin:0">'
+            f'<button class="icon-btn {"liked" if liked else ""}" type="submit" '
             f'title="{"Убрать лайк" if liked else "Нравится"}">'
             f'<i class="material-icons">{"favorite" if liked else "favorite_border"}</i>'
-            f"</button></form>"
+            f'</button></form>'
         )
     else:
-        like_html = (
-            f'<a href="/login" class="btn-icon" title="Войдите, чтобы лайкать">'
-            f'<i class="material-icons">favorite_border</i></a>'
+        like_btn = (
+            '<a href="/login" class="icon-btn" title="Войдите, чтобы лайкать">'
+            '<i class="material-icons">favorite_border</i></a>'
         )
-
-    likes_label = f'<span class="small muted" style="margin-left:2px">{likes_n}</span>'
 
     delete_html = ""
     if show_delete and user == post["author"]:
         delete_html = (
             f'<form action="/delete/{post["id"]}" method="post" '
-            f'style="display:inline;margin-left:auto" '
+            f'style="display:inline;margin:0" '
             f'onsubmit="return confirm(\'Удалить этот пост?\')">'
-            f'<button class="btn-icon danger" type="submit" title="Удалить">'
+            f'<button class="icon-btn danger" type="submit" title="Удалить">'
             f'<i class="material-icons">delete_outline</i></button></form>'
         )
 
@@ -482,10 +844,12 @@ def render_post(post: dict, user: Optional[str], show_delete: bool = True) -> st
     <div class="post-text">{render_text(post['text'])}</div>
   </div>
   <div class="card-footer">
-    {like_html}{likes_label}
-    <a class="btn-icon" href="/post/{post['id']}" title="Открыть пост">
+    {like_btn}
+    <span class="likes-count">{likes_n}</span>
+    <a class="icon-btn" href="/post/{post['id']}" title="Открыть пост">
       <i class="material-icons">chat_bubble_outline</i>
     </a>
+    <div class="spacer"></div>
     {delete_html}
   </div>
 </div>"""
@@ -493,8 +857,8 @@ def render_post(post: dict, user: Optional[str], show_delete: bool = True) -> st
 
 def composer_html(user: str) -> str:
     return f"""
-<div class="card" id="composer">
-  <div class="card-body composer">
+<div class="card composer">
+  <div class="card-body">
     <form action="/post" method="post">
       <textarea name="text" maxlength="{MAX_POST}" required
                 placeholder="Что нового, {html.escape(user)}?"></textarea>
@@ -517,13 +881,22 @@ def guest_composer() -> str:
 <div class="card"><div class="card-body" style="text-align:center">
   <p class="muted" style="margin:0 0 12px">Войдите или зарегистрируйтесь, чтобы публиковать.</p>
   <a class="btn" href="/login">Войти</a>
-  <a class="btn-flat" href="/register" style="margin-left:6px">Регистрация</a>
+  <a class="btn" href="/register" style="margin-left:6px">Регистрация</a>
 </div></div>"""
 
 
+def feed_search_html(q: str = "") -> str:
+    return f"""
+<form class="feed-search" action="/search" method="get">
+  <i class="material-icons">search</i>
+  <input id="feedSearch" type="text" name="q" placeholder="Поиск людей и постов"
+         autocomplete="off" value="{html.escape(q)}">
+</form>"""
+
+
 def empty_card(text: str, icon: str = "inbox") -> str:
-    return f'<div class="card"><div class="empty">' \
-           f'<i class="material-icons">{icon}</i>{html.escape(text)}</div></div>'
+    return (f'<div class="card"><div class="empty">'
+            f'<i class="material-icons">{icon}</i>{html.escape(text)}</div></div>')
 
 
 # --------------------------------------------------------------------------
@@ -533,7 +906,6 @@ def empty_card(text: str, icon: str = "inbox") -> str:
 def index(session: Optional[str] = Cookie(default=None),
           theme: Optional[str] = Cookie(default=None)):
     user = current_user(session)
-
     head = composer_html(user) if user else guest_composer()
 
     if POSTS:
@@ -544,7 +916,8 @@ def index(session: Optional[str] = Cookie(default=None),
     stats = (f'<p class="muted small" style="margin:0 0 12px 4px">'
              f'Постов: {len(POSTS)} · Пользователей: {len(USERS)}</p>')
 
-    return HTMLResponse(layout("Лента", head + stats + posts_html, user, theme or "light"))
+    content = feed_search_html() + head + stats + posts_html
+    return HTMLResponse(layout("Лента", content, user, theme or "light"))
 
 
 @app.get("/toggle-theme")
@@ -553,6 +926,17 @@ def toggle_theme(request: Request, theme: Optional[str] = Cookie(default=None)):
     resp = RedirectResponse(request.headers.get("referer") or "/", status_code=303)
     resp.set_cookie("theme", new_theme, max_age=365 * 24 * 3600, samesite="lax")
     return resp
+
+
+@app.post("/api/notifications/read")
+def mark_notifications_read(session: Optional[str] = Cookie(default=None)):
+    user = current_user(session)
+    if not user:
+        return JSONResponse({"ok": False}, status_code=401)
+    for n in NOTIFICATIONS:
+        if n["user"] == user:
+            n["read"] = True
+    return JSONResponse({"ok": True})
 
 
 # ------------------------------ Авторизация ------------------------------
@@ -623,7 +1007,6 @@ def register(username: str = Form(...),
         "hash": hash_password(password, salt),
         "created": datetime.now().timestamp(),
     }
-
     token = secrets.token_urlsafe(32)
     SESSIONS[token] = username
     resp = RedirectResponse("/", status_code=303)
@@ -700,7 +1083,6 @@ def create_post(request: Request,
         }
         POSTS.insert(0, post)
 
-        # уведомления об упоминаниях
         for name in set(MENTION_RE.findall(text)):
             actual = find_user(name)
             if actual:
@@ -752,10 +1134,11 @@ def post_page(post_id: str,
     if not post:
         return HTMLResponse(
             layout("Пост не найден",
-                   empty_card("Пост не найден или был удалён", "search_off"),
+                   empty_card("Пост не найден или удалён", "search_off"),
                    user, theme or "light"),
             status_code=404)
-    return HTMLResponse(layout("Пост", render_post(post, user), user, theme or "light"))
+    content = feed_search_html() + render_post(post, user)
+    return HTMLResponse(layout("Пост", content, user, theme or "light"))
 
 
 # ------------------------------ Профиль ------------------------------
@@ -767,8 +1150,10 @@ def profile(username: str,
     target = find_user(username)
 
     if not target:
-        body = empty_card("Пользователь не найден", "person_off")
-        return HTMLResponse(layout("404", body, user, theme or "light"), status_code=404)
+        return HTMLResponse(
+            layout("404", empty_card("Пользователь не найден", "person_off"),
+                   user, theme or "light"),
+            status_code=404)
 
     user_posts = [p for p in POSTS if p["author"] == target]
     likes_total = sum(len(p["likes"]) for p in user_posts)
@@ -776,8 +1161,8 @@ def profile(username: str,
     logout_btn = ""
     if user == target:
         logout_btn = (
-            '<form class="profile-actions" action="/logout" method="post">'
-            '<button class="btn-flat" type="submit">Выйти</button></form>'
+            '<form class="profile-actions" action="/logout" method="post" style="margin:0">'
+            '<button class="btn" type="submit">Выйти</button></form>'
         )
 
     header = f"""
@@ -795,50 +1180,8 @@ def profile(username: str,
     else:
         posts_html = empty_card("Постов пока нет", "article")
 
-    return HTMLResponse(layout(f"@{target}", header + posts_html, user, theme or "light"))
-
-
-# ------------------------------ Уведомления ------------------------------
-@app.get("/notifications", response_class=HTMLResponse)
-def notifications_page(session: Optional[str] = Cookie(default=None),
-                       theme: Optional[str] = Cookie(default=None)):
-    user = current_user(session)
-    if not user:
-        return RedirectResponse("/login", status_code=303)
-
-    mine = [n for n in NOTIFICATIONS if n["user"] == user]
-
-    # помечаем как прочитанные
-    for n in mine:
-        n["read"] = True
-
-    if not mine:
-        body = empty_card("Уведомлений пока нет", "notifications_none")
-    else:
-        items = []
-        for n in mine:
-            if n["kind"] == "mention":
-                text = f'<b>{html.escape(n["from"])}</b> упомянул вас в посте'
-                icon = "alternate_email"
-            elif n["kind"] == "like":
-                text = f'<b>{html.escape(n["from"])}</b> оценил ваш пост'
-                icon = "favorite"
-            else:
-                text = f'<b>{html.escape(n["from"])}</b>'
-                icon = "notifications"
-            href = f'/post/{n["post_id"]}' if n.get("post_id") else "/"
-            cls = "notif" + ("" if n["read"] else " unread")
-            items.append(f"""
-<a class="{cls}" href="{href}">
-  <div class="notif-icon"><i class="material-icons">{icon}</i></div>
-  <div class="notif-content">
-    <div class="notif-text">{text}</div>
-    <div class="notif-time">{fmt_time(n['ts'])}</div>
-  </div>
-</a>""")
-        body = '<div class="card">' + "".join(items) + "</div>"
-
-    return HTMLResponse(layout("Уведомления", body, user, theme or "light"))
+    content = feed_search_html() + header + posts_html
+    return HTMLResponse(layout(f"@{target}", content, user, theme or "light"))
 
 
 # ------------------------------ Поиск ------------------------------
@@ -849,31 +1192,35 @@ def search(q: str = "",
     user = current_user(session)
     q = q.strip()
 
+    parts = [feed_search_html(q)]
+
     if not q:
-        body = empty_card("Введите запрос в поле поиска", "search")
-        return HTMLResponse(layout("Поиск", body, user, theme or "light"))
+        parts.append(empty_card("Введите запрос", "search"))
+        return HTMLResponse(layout("Поиск", "".join(parts), user, theme or "light"))
 
     ql = q.lower()
     users_found = [u for u in USERS if ql in u.lower()]
-    posts_found = [p for p in POSTS if ql in p["text"].lower()
-                   or ql in p["author"].lower()]
+    posts_found = [p for p in POSTS
+                   if ql in p["text"].lower() or ql in p["author"].lower()]
 
-    parts = [f'<h2 class="page-title">Результаты: «{html.escape(q)}»</h2>']
+    parts.append(f'<h2 class="page-title">Результаты: «{html.escape(q)}»</h2>')
 
     if users_found:
         chips = "".join(
             f'<a class="user-chip" href="/u/{html.escape(u)}">'
-            f'{avatar(u)}<div><b>{html.escape(u)}</b>'
-            f'<div class="small muted">Постов: '
-            f'{sum(1 for p in POSTS if p["author"] == u)}</div></div></a>'
+            f'{avatar(u, "avatar avatar-sm")}'
+            f'<div><b>{html.escape(u)}</b>'
+            f'<div class="small muted">'
+            f'Постов: {sum(1 for p in POSTS if p["author"] == u)}</div></div></a>'
             for u in users_found
         )
-        parts.append(f'<h3 class="small muted" style="margin:8px 4px">Люди</h3>'
+        parts.append(f'<div class="section-title">Люди</div>'
                      f'<div class="card">{chips}</div>')
 
     if posts_found:
-        parts.append('<h3 class="small muted" style="margin:16px 4px 8px">Посты</h3>')
-        parts.append("".join(render_post(p, user, show_delete=False) for p in posts_found))
+        parts.append('<div class="section-title">Посты</div>')
+        parts.append("".join(render_post(p, user, show_delete=False)
+                             for p in posts_found))
 
     if not users_found and not posts_found:
         parts.append(empty_card("Ничего не найдено", "search_off"))
