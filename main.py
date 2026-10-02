@@ -1,6 +1,17 @@
 """
 Sld-Networking — посты с 6-значным кодом (без повторяющихся цифр).
 Хранение: оперативная память, AES-256-GCM + zstd/gzip.
+
+Маршруты:
+  /           — лендинг
+  /app        — рабочая область (SPA)
+  /p/{code}   — единая ссылка на пост (с OpenGraph-метатегами)
+  /api/*      — REST API
+  /manifest.json  — PWA-манифест
+  /sw.js          — service worker
+  /icon.svg       — иконка приложения
+
+Запуск: pip install fastapi uvicorn python-multipart cryptography zstandard && python main.py
 """
 
 from __future__ import annotations
@@ -345,7 +356,7 @@ PWA_ICON_SVG = (
 )
 
 PWA_MANIFEST = {
-    "name": "СЛД·NET — нетворкинг",
+    "name": "СЛД·NET",
     "short_name": "СЛД·NET",
     "description": "Посты по 6-значному коду. Без аккаунтов, с шифрованием.",
     "start_url": "/app",
@@ -365,7 +376,7 @@ PWA_MANIFEST = {
 }
 
 PWA_SW = r"""
-const CACHE = 'sld-net-v5';
+const CACHE = 'sld-net-v6';
 const SHELL_URLS = ['/app', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
@@ -470,15 +481,10 @@ async def icon():
 
 
 # ============================================================
-# UI-ФРЕЙМВОРК (используется и лендингом, и приложением)
+# UI-ФРЕЙМВОРК
 # ============================================================
 
 UI_FRAMEWORK_JS = r"""
-/* ============================================================
-   UI — мини-фреймворк
-   Хелперы для создания интерфейса: элементы, SVG, события,
-   классы, реактивное состояние, тосты, буфер обмена.
-   ============================================================ */
 var UI = (function(){
   "use strict";
 
@@ -541,27 +547,21 @@ var UI = (function(){
     append(f, Array.prototype.slice.call(arguments));
     return f;
   }
-
   function on(el, evt, fn, opts){ el.addEventListener(evt, fn, opts); return el; }
   function off(el, evt, fn, opts){ el.removeEventListener(evt, fn, opts); return el; }
-
   function addClass(el){ for (var i = 1; i < arguments.length; i++) el.classList.add(arguments[i]); return el; }
   function removeClass(el){ for (var i = 1; i < arguments.length; i++) el.classList.remove(arguments[i]); return el; }
   function toggle(el, cls, force){ el.classList.toggle(cls, force); return el; }
   function hasClass(el, cls){ return el.classList.contains(cls); }
-
   function attr(el, name, val){
     if (val === undefined) return el.getAttribute(name);
-    if (val == null) el.removeAttribute(name);
-    else el.setAttribute(name, val);
+    if (val == null) el.removeAttribute(name); else el.setAttribute(name, val);
     return el;
   }
   function text(el, t){ el.textContent = t == null ? '' : String(t); return el; }
   function clear(el){ while (el.firstChild) el.removeChild(el.firstChild); return el; }
-
   function show(el){ el.hidden = false; return el; }
   function hide(el){ el.hidden = true; return el; }
-
   function qs(sel, root){ return (root || document).querySelector(sel); }
   function qsa(sel, root){ return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
@@ -575,8 +575,7 @@ var UI = (function(){
         for (var i = 0; i < subs.length; i++) subs[i](value, old);
       },
       subscribe: function(fn){
-        subs.push(fn);
-        fn(value, undefined);
+        subs.push(fn); fn(value, undefined);
         return function(){
           var i = subs.indexOf(fn);
           if (i >= 0) subs.splice(i, 1);
@@ -605,9 +604,7 @@ var UI = (function(){
     var dur = opts.duration || 2400;
     setTimeout(function(){
       el.classList.remove('is-visible');
-      setTimeout(function(){
-        if (el.parentNode) el.parentNode.removeChild(el);
-      }, 320);
+      setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 320);
     }, dur);
     return el;
   }
@@ -739,6 +736,7 @@ SHELL_CSS = r"""
   --radius:22px;
   --ease:cubic-bezier(.2,.8,.2,1);
   --ok:#7ec899;
+  --warn:#c4a054;
   --err:#e08080;
 }
 html{scroll-behavior:smooth}
@@ -770,28 +768,16 @@ input,textarea,[contenteditable],pre,code,.post-body,.post-title,.modal-code,.ot
 }
 body.cursor-ready .cur-dot,
 body.cursor-ready .cur-ring { opacity:1; }
-.cur-dot{
-  width:7px;height:7px;background:#fff;
-  box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.35);
-}
+.cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.35)}
 .cur-ring{
-  width:34px;height:34px;
-  border:1.5px solid rgba(255,255,255,0.4);
+  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.4);
   transition:width .22s var(--ease),height .22s var(--ease),
              border-color .22s,background .22s,opacity .2s;
 }
-.cur-ring.hover{
-  width:60px;height:60px;
-  border-color:rgba(255,255,255,0.22);
-  background:rgba(255,255,255,0.05);
-  backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
-}
+.cur-ring.hover{width:60px;height:60px;border-color:rgba(255,255,255,0.22);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* ============================================================
-   UI TOAST (мини-фреймворк)
-   ============================================================ */
 .ui-toast-container{
   position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
   z-index:9997;display:flex;flex-direction:column;gap:8px;
@@ -802,8 +788,7 @@ body.cursor-ready .cur-ring { opacity:1; }
   background:rgba(20,20,20,0.92);
   border:1px solid var(--border-2);
   color:var(--text);
-  padding:10px 16px;
-  border-radius:12px;
+  padding:10px 16px;border-radius:12px;
   font-size:13px;font-weight:500;
   backdrop-filter:blur(20px) saturate(160%);
   -webkit-backdrop-filter:blur(20px) saturate(160%);
@@ -819,8 +804,7 @@ body.cursor-ready .cur-ring { opacity:1; }
 .ui-toast--err{border-color:rgba(224,128,128,0.4);}
 
 .page-loader{
-  position:fixed;inset:0;z-index:99998;
-  background:var(--bg);
+  position:fixed;inset:0;z-index:99998;background:var(--bg);
   display:grid;place-items:center;
   transition:opacity .45s ease,visibility .45s;
 }
@@ -1130,20 +1114,15 @@ SHELL_JS = r"""
       dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
       rx += (mx - rx) * 0.26;
       ry += (my - ry) * 0.26;
-
       var dx = mx - lx, dy = my - ly;
       vel = Math.min(Math.hypot(dx, dy), 60);
       lx = mx; ly = my;
-
       var angle = Math.atan2(dy, dx) * 180 / Math.PI;
       var stretch = 1 + vel / 150;
       var squash  = 1 - vel / 220;
       var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
-
       ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + angle + "deg) scale(" + stretch + "," + squash + ")";
-      if (!ring.classList.contains("hover")) {
-        ring.style.borderColor = "rgba(255,255,255," + borderOp.toFixed(2) + ")";
-      }
+      if (!ring.classList.contains("hover")) ring.style.borderColor = "rgba(255,255,255," + borderOp.toFixed(2) + ")";
       requestAnimationFrame(loop);
     })();
 
@@ -2020,7 +1999,7 @@ def build_landing() -> str:
       <div class="glass step tile-pop reveal reveal--up" data-delay="60">
         <div class="step-num">Шаг 01</div>
         <h3>Заполняете пост</h3>
-        <p>Заголовок, текст и до 5 фото. Перетащите файлы, выберите через диалог или вставьте из буфера по <code>Ctrl+V</code>.</p>
+        <p>Заголовок, текст и до 5 фото. Перетащите файлы, выберите через диалог или вставьте из буфера.</p>
       </div>
       <div class="glass step tile-tilt-l reveal reveal--up" data-delay="140">
         <div class="step-num">Шаг 02</div>
@@ -2093,6 +2072,7 @@ APP_CSS = r"""
   --glass:rgba(255,255,255,0.035);
   --glass-hi:rgba(255,255,255,0.07);
   --ok:#7ec899;
+  --warn:#c4a054;
   --err:#e08080;
   --ease:cubic-bezier(.2,.8,.2,1);
   --topbar-h:80px;
@@ -2135,9 +2115,6 @@ body.cursor-ready .cur-ring { opacity:1; }
 .cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.12)}
 @media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-/* ============================================================
-   TOAST-контейнер для UI.toast()
-   ============================================================ */
 .ui-toast-container{
   position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
   z-index:9997;display:flex;flex-direction:column;gap:8px;
@@ -2208,9 +2185,8 @@ body.cursor-ready .cur-ring { opacity:1; }
 
 /* ============================================================
    TOPBAR приложения
-   Сетка 1fr auto 1fr: логотип слева, меню строго по центру,
-   третья колонка — пустая (балансир). Никаких absolute
-   и margin-костылей — ничего не может пересечься.
+   Grid 1fr auto 1fr: logo (слева) | menu (центр) | back-btn (справа).
+   На мобильных back-btn скрыт, а его роль играет третий таб внутри меню.
    ============================================================ */
 .topbar{
   position:fixed;top:0;left:0;right:0;
@@ -2238,11 +2214,12 @@ body.cursor-ready .cur-ring { opacity:1; }
 }
 
 .logo{
+  grid-column:1;
+  justify-self:start;
   display:inline-flex;align-items:center;gap:10px;
   font-family:'Unbounded',sans-serif;font-weight:700;
   font-size:13.5px;letter-spacing:-0.01em;
   text-decoration:none;color:#fff;white-space:nowrap;
-  flex-shrink:0;
 }
 .logo-mark{
   width:28px;height:28px;border-radius:8px;
@@ -2259,8 +2236,9 @@ body.cursor-ready .cur-ring { opacity:1; }
 .logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
 .logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-/* Меню: три таба в одном контейнере, единый стиль */
 .menu{
+  grid-column:2;
+  justify-self:center;
   display:inline-flex;
   gap:4px;
   padding:4px;
@@ -2268,7 +2246,6 @@ body.cursor-ready .cur-ring { opacity:1; }
   background:rgba(255,255,255,0.028);
   border:1px solid var(--border);
   flex-shrink:0;
-  justify-self:center;
 }
 .menu-switch{
   position:relative;
@@ -2306,11 +2283,33 @@ body.cursor-ready .cur-ring { opacity:1; }
 .tab:hover{ color:#fff; }
 .tab:active{ transform:scale(.98); }
 .tab.active{ color:#fff; }
-.tab-exit{ color:var(--text-dim); }
-.tab-exit:hover{ color:#fff; background:rgba(224,128,128,0.06); }
+
+/* Кнопка «Выйти» внутри меню — только для мобильных */
+.tab-exit-mobile{ display:none; }
+
+/* Отдельная кнопка «На главную» — только для ПК */
+.back-btn{
+  grid-column:3;
+  justify-self:end;
+  display:inline-flex;align-items:center;gap:7px;
+  padding:9px 14px;
+  border-radius:10px;
+  border:1px solid var(--border-2);
+  background:var(--glass);
+  color:var(--text-dim);
+  font:inherit;font-size:13px;font-weight:500;
+  text-decoration:none;white-space:nowrap;
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  transition:color .2s, background .2s, border-color .2s;
+  -webkit-tap-highlight-color:transparent;
+}
+.back-btn svg{width:14px;height:14px;display:block}
+.back-btn:hover{ color:#fff; background:var(--glass-hi); border-color:var(--border-3); }
+.back-btn:active{ transform:scale(.98); }
 
 @media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
-  .tab-exit { display:none !important; }
+  .tab-exit-mobile { display:none !important; }
+  .back-btn { display:none !important; }
   .logo { pointer-events:none; }
 }
 
@@ -2338,15 +2337,19 @@ body.cursor-ready .cur-ring { opacity:1; }
   padding:18px;
 }
 
+/* ============================================================
+   Поля с счётчиком символов
+   ============================================================ */
 .input-wrap{position:relative;display:flex}
 .input-wrap + .input-wrap{margin-top:10px}
-.input-wrap .iw-icon{position:absolute;left:13px;width:16px;height:16px;color:var(--text-mute);pointer-events:none;transition:color .18s}
+.input-wrap .iw-icon{
+  position:absolute;left:13px;width:16px;height:16px;
+  color:var(--text-mute);pointer-events:none;transition:color .18s;
+}
 .input-wrap input.field,.input-wrap textarea.field{padding-left:40px}
 .input-wrap input.field + .iw-icon,.input-wrap textarea.field + .iw-icon{top:13px}
 .input-wrap.textarea-wrap .iw-icon{top:14px}
 .input-wrap:focus-within .iw-icon{color:var(--text)}
-.input-wrap.has-count input.field{padding-right:62px;}
-.input-wrap.textarea-wrap.has-count textarea.field{padding-right:62px;padding-bottom:24px;}
 
 .field{
   width:100%;background:var(--input);
@@ -2359,22 +2362,34 @@ body.cursor-ready .cur-ring { opacity:1; }
 .field:focus{border-color:var(--border-3);background:var(--input-focus);box-shadow:0 0 0 3px rgba(255,255,255,0.04)}
 textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit;scrollbar-width:thin}
 
+/* Резерв места под счётчик справа */
+.input-wrap input.field{ padding-right:76px; }
+.input-wrap textarea.field{ padding-right:76px; padding-bottom:32px; }
+
+/* Счётчик: базово зелёный, warn — тёмно-жёлтый, max — красный */
 .input-count{
   position:absolute;
-  right:14px;top:50%;
+  right:14px;
+  top:50%;
   transform:translateY(-50%);
   font-size:10.5px;
-  color:var(--text-mute);
   font-family:'JetBrains Mono',monospace;
-  pointer-events:none;
   letter-spacing:0.04em;
-  opacity:0;
-  transition:opacity .2s;
+  pointer-events:none;
+  color:var(--ok);
+  opacity:0.75;
+  transition:color .25s, opacity .2s;
+  font-variant-numeric:tabular-nums;
+  z-index:1;
 }
-.input-wrap.textarea-wrap .input-count{top:auto;bottom:12px;transform:none;}
-.input-wrap:focus-within .input-count{opacity:1;}
-.input-wrap.has-count .input-count{opacity:.6;}
-.input-wrap:focus-within.has-count .input-count{opacity:1;}
+.input-wrap.textarea-wrap .input-count{
+  top:auto;
+  bottom:10px;
+  transform:none;
+}
+.input-wrap:focus-within .input-count{ opacity:1; }
+.input-wrap.warn .input-count{ color:var(--warn); }
+.input-wrap.max  .input-count{ color:var(--err); }
 
 .checkbox-wrap{
   display:flex;align-items:flex-start;gap:11px;
@@ -2498,7 +2513,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
 .otp.shake{animation:shake .32s ease}
 .otp.shake .otp-cell{border-color:rgba(224,128,128,0.7);background:rgba(224,128,128,0.08)}
 
-/* === Недавние коды ============================================ */
 .recent{margin-top:10px;display:flex;flex-direction:column;gap:8px;}
 .recent-label{
   font-size:10.5px;color:var(--text-mute);
@@ -2518,25 +2532,6 @@ textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit
   -webkit-appearance:none;appearance:none;
 }
 .recent-chip:hover{background:rgba(255,255,255,0.06);border-color:var(--border-2);color:#fff;}
-
-/* === Подсказки клавиш ========================================== */
-.kbd-hints{
-  display:flex;gap:16px;flex-wrap:wrap;
-  margin-top:14px;padding-top:14px;
-  border-top:1px solid var(--border);
-  font-size:11.5px;color:var(--text-mute);
-  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
-}
-.kbd-hints span{display:inline-flex;align-items:center;gap:6px;}
-kbd{
-  display:inline-block;
-  padding:2px 6px;border-radius:5px;
-  background:rgba(255,255,255,0.05);
-  border:1px solid var(--border);
-  font-family:'JetBrains Mono',monospace;
-  font-size:10px;color:var(--text-dim);
-  line-height:1.4;
-}
 
 .center{text-align:center;padding:8px 0}
 .spinner{width:22px;height:22px;border-radius:50%;border:2px solid var(--border-2);border-top-color:var(--text);animation:spin .7s linear infinite;margin:0 auto}
@@ -2596,7 +2591,7 @@ kbd{
 .share-link-copy.copied .sl-copy{display:none}
 .share-link-copy.copied .sl-check{display:block}
 
-/* ============================================================ LIGHTBOX */
+/* LIGHTBOX */
 .lightbox{
   position:fixed;inset:0;z-index:1000;
   display:flex;align-items:center;justify-content:center;
@@ -2704,11 +2699,19 @@ kbd{
   .stage::-webkit-scrollbar{ display:none; }
 
   .topbar{padding:10px;padding-top:max(10px, env(safe-area-inset-top, 0px) + 4px);}
-  .topbar-inner{min-height:48px;padding:6px 6px 6px 10px;gap:10px;border-radius:14px;}
-  .topbar .logo{display:none;}
-
-  .topbar-inner{grid-template-columns:1fr auto 1fr;}
-  .menu{justify-self:center;padding:3px;}
+  .topbar-inner{
+    min-height:48px;
+    padding:6px 6px 6px 10px;
+    gap:10px;
+    border-radius:14px;
+    /* Мобильная сетка: одна колонка по центру */
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+  .topbar .logo { display: none; }
+  .topbar .menu { grid-column:1; justify-self:center; padding:3px; }
+  .topbar .back-btn { display: none; }
+  .tab-exit-mobile{ display: inline-flex; }
 
   .lb-btn{ width:44px; height:44px; }
   .lb-close{ top:12px; right:12px; }
@@ -2730,7 +2733,6 @@ kbd{
     z-index: 2; pointer-events: none; white-space: nowrap;
     text-align: center; max-width: 92vw; padding: 0 12px;
   }
-  .kbd-hints{display:none;}
 }
 @media (max-width: 480px){
   .tab span{ display: inline; }
@@ -2756,7 +2758,7 @@ APP = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="СЛД·NET">
 <meta name="mobile-web-app-capable" content="yes">
-<title>СЛД·NET — рабочая область</title>
+<title>СЛД·NET</title>
 <!-- OG_TAGS -->
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/icon.svg">
@@ -2805,13 +2807,16 @@ APP = r"""<!DOCTYPE html>
           <span>Найти</span>
         </button>
       </div>
-      <a href="/" class="tab tab-exit" id="btnExit">
+      <a href="/" class="tab tab-exit-mobile" aria-label="Выйти на главную">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
         <span>Выйти</span>
       </a>
     </div>
 
-    <span aria-hidden="true"></span>
+    <a href="/" class="back-btn" aria-label="На главную">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+      <span>На главную</span>
+    </a>
   </div>
 </nav>
 
@@ -2827,7 +2832,7 @@ APP = r"""<!DOCTYPE html>
         </div>
 
         <div class="input-wrap textarea-wrap" id="contentWrap">
-          <textarea class="field" id="content" placeholder="Содержимое"></textarea>
+          <textarea class="field" id="content" maxlength="20000" placeholder="Содержимое"></textarea>
           <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
           <span class="input-count" id="contentCount">0/20000</span>
         </div>
@@ -2862,11 +2867,6 @@ APP = r"""<!DOCTYPE html>
         </div>
 
         <div id="createMsg"></div>
-
-        <div class="kbd-hints">
-          <span><kbd>Ctrl</kbd><kbd>V</kbd> вставить фото</span>
-          <span><kbd>Ctrl</kbd><kbd>Enter</kbd> опубликовать</span>
-        </div>
       </section>
     </div>
 
@@ -3019,7 +3019,7 @@ APP = r"""<!DOCTYPE html>
   addEventListener('resize', measureTopbar, { passive: true });
   addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
 
-  /* ============ ICONS (для переиспользования) ============ */
+  /* ============ ICONS ============ */
   var ICONS = {
     error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
@@ -3171,6 +3171,8 @@ APP = r"""<!DOCTYPE html>
 
   /* ============ CREATE ============ */
   var MAX_PHOTOS = 5;
+  var MAX_TITLE = 120;
+  var MAX_CONTENT = 20000;
   var selectedFiles = [];
   var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
   var previews = $("previews"), createMsg = $("createMsg"), submitBtn = $("submitBtn");
@@ -3178,23 +3180,28 @@ APP = r"""<!DOCTYPE html>
   var titleWrap = $("titleWrap"), contentWrap = $("contentWrap");
   var titleCount = $("titleCount"), contentCount = $("contentCount");
 
+  /* Счётчик: зелёный → тёмно-жёлтый (80%) → красный (100%). На красном ввод блокируется. */
+  function updateCounter(input, countEl, wrapEl, max){
+    var len = input.value.length;
+    if (len > max) { input.value = input.value.slice(0, max); len = max; }
+    countEl.textContent = len + "/" + max;
+    var ratio = len / max;
+    wrapEl.classList.toggle('warn', ratio >= 0.8 && len < max);
+    wrapEl.classList.toggle('max',  len >= max);
+  }
+  function refreshCounters(){
+    updateCounter(titleInput, titleCount, titleWrap, MAX_TITLE);
+    updateCounter(contentInput, contentCount, contentWrap, MAX_CONTENT);
+  }
+  UI.on(titleInput, 'input', refreshCounters);
+  UI.on(contentInput, 'input', refreshCounters);
+  refreshCounters();
+
   function defaultDropLabel(){
     return selectedFiles.length
       ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
       : "Нажмите или перетащите фото";
   }
-
-  function updateCounts(){
-    var tl = titleInput.value.length;
-    var cl = contentInput.value.length;
-    titleCount.textContent = tl + "/120";
-    contentCount.textContent = cl + "/20000";
-    titleWrap.classList.toggle('has-count', tl > 0);
-    contentWrap.classList.toggle('has-count', cl > 0);
-  }
-  UI.on(titleInput, 'input', updateCounts);
-  UI.on(contentInput, 'input', updateCounts);
-  updateCounts();
 
   drop.addEventListener("click", function(){ fileInput.click(); });
   drop.addEventListener("dragover", function(e){ e.preventDefault(); drop.style.borderColor = "var(--border-3)"; });
@@ -3299,7 +3306,7 @@ APP = r"""<!DOCTYPE html>
 
   $("resetBtn").addEventListener("click", function(){
     titleInput.value = ""; contentInput.value = ""; selectedFiles = []; ogCheckbox.checked = true;
-    renderPreviews(); clearCreateMsg(); updateCounts(); titleInput.focus();
+    renderPreviews(); clearCreateMsg(); refreshCounters(); titleInput.focus();
   });
 
   async function postForm(fd, attempt){
@@ -3341,7 +3348,7 @@ APP = r"""<!DOCTYPE html>
       if (!data || !data.code) { showCreateMsg("err", "Некорректный ответ сервера"); return; }
 
       titleInput.value = ""; contentInput.value = ""; ogCheckbox.checked = true;
-      selectedFiles = []; renderPreviews(); clearCreateMsg(); updateCounts();
+      selectedFiles = []; renderPreviews(); clearCreateMsg(); refreshCounters();
 
       var code = data.code;
       setUrlForCode(code);
@@ -3362,7 +3369,7 @@ APP = r"""<!DOCTYPE html>
   }
 
   submitBtn.addEventListener("click", doPublish);
-  // Ctrl+Enter для публикации
+
   document.addEventListener("keydown", function(e){
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && mode === "create") {
       e.preventDefault(); doPublish();
@@ -3406,7 +3413,6 @@ APP = r"""<!DOCTYPE html>
   var postCache = new Map();
   var postCacheETag = new Map();
 
-  /* === Недавние коды ========================================= */
   var RECENT_KEY = "sld_recent_codes";
   var recentBox = $("recentBox"), recentChips = $("recentChips");
 
@@ -3662,7 +3668,7 @@ APP = r"""<!DOCTYPE html>
     }
   });
 
-  /* === TOUCH ================================================ */
+  /* TOUCH */
   var tMode = 'idle';
   var tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0;
   var tStartTime = 0, tLastFrameTime = 0;
@@ -3810,7 +3816,7 @@ APP = r"""<!DOCTYPE html>
     }
   }, { passive: true });
 
-  /* ============ POST RENDER (через UI) ============ */
+  /* ============ POST RENDER ============ */
   function renderPost(post){
     UI.clear(searchFrame);
 
@@ -4015,8 +4021,8 @@ def _render_app(og_tags: str = "", title_override: Optional[str] = None) -> str:
             .replace("<!-- OG_TAGS -->", og_tags))
     if title_override:
         html = html.replace(
-            "<title>СЛД·NET — рабочая область</title>",
-            f"<title>{_html.escape(title_override, quote=True)} — СЛД·NET</title>",
+            "<title>СЛД·NET</title>",
+            f"<title>{_html.escape(title_override, quote=True)}</title>",
         )
     return html
 
