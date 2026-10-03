@@ -1,2116 +1,4306 @@
-# -*- coding: utf-8 -*-
 """
-DSH Messenger — мессенджер с каналами в одном файле.
-Стек: Python 3.9+ / FastAPI / Uvicorn.
-Все данные хранятся В ОПЕРАТИВНОЙ ПАМЯТИ (теряются при перезапуске сервера).
-UI: тёмная тема в духе Twitter Bootstrap 1.4.0 (topbar, hero-unit,
-градиентные кнопки .btn.primary/.danger/..., alert-message, zebra-striped,
-pills-табы, modal) — без Bootstrap 5 и без Tailwind.
-
-Запуск:  python main.py   →  http://127.0.0.1:8000
+Sld-Networking — посты с 6-значным кодом (без повторяющихся цифр).
+Хранение: оперативная память, AES-256-GCM + zstd/gzip.
 """
 
+from __future__ import annotations
+
+import gzip
 import hashlib
+import html as _html
+import json
+import logging
 import os
-import re
+import re as _re
 import secrets
-import sys
+import string
+import threading
 import time
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from collections import deque
+from datetime import datetime, timezone
+from typing import Deque, Dict, List, Optional
 
 import uvicorn
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
-APP_VERSION = "1.0.0"
-START_TIME = time.time()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("sld")
 
-# ======================================================================
-#  ХРАНИЛИЩЕ В ОПЕРАТИВКЕ
-# ======================================================================
-STATE = {
-    "users": {},        # id -> user
-    "tokens": {},       # token -> user_id
-    "channels": {},     # id -> channel
-    "messages": {},     # channel_id -> [message]
-    "events": {},       # user_id -> [event]  (последние события для клиента)
-    "typing": {},       # channel_id -> {user_id: ts}
-    "bans": {},         # username_lower -> {"until": ts, "reason": str}
-    "rate": {},         # user_id -> [ts сообщений]
-    "seq_ch": 0,        # счётчик id каналов
-    "seq_msg": 0,       # счётчик id сообщений
-    "seq_evt": 0,       # счётчик id событий
-    "owner_id": None,
-    "settings": {
-        "name": "DSH Messenger",
-        "motd": "Добро пожаловать! Это мессенджер, живущий в оперативной памяти.",
-        "allow_registration": True,
-        "maintenance_mode": False,
-        "max_message_length": 2000,
-        "history_limit": 500,          # сколько сообщений хранить на канал
-        "rate_limit": 25,              # сообщений в минуту на пользователя
-        "allow_editing": True,
-        "allow_reactions": True,
-        "allow_dm": True,
-    },
+# ---------- сжатие ----------
+try:
+    import zstandard as _zstd_mod
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+
+_ZSTD_C = _zstd_mod.ZstdCompressor(level=3) if _HAS_ZSTD else None
+_ZSTD_D = _zstd_mod.ZstdDecompressor() if _HAS_ZSTD else None
+
+
+def _compress(b: bytes) -> bytes:
+    if _HAS_ZSTD:
+        return b"Z" + _ZSTD_C.compress(b)
+    return b"G" + gzip.compress(b, compresslevel=6)
+
+
+def _decompress(b: bytes) -> bytes:
+    marker, payload = b[:1], b[1:]
+    if marker == b"Z" and _HAS_ZSTD:
+        return _ZSTD_D.decompress(payload)
+    if marker == b"G":
+        return gzip.decompress(payload)
+    raise ValueError("unknown codec")
+
+
+# ---------- шифрование ----------
+_AES = AESGCM(AESGCM.generate_key(bit_length=256))
+_NONCE = 12
+
+
+def _encrypt(data: bytes) -> bytes:
+    nonce = os.urandom(_NONCE)
+    return nonce + _AES.encrypt(nonce, data, None)
+
+
+def _decrypt(blob: bytes) -> bytes:
+    if len(blob) < _NONCE + 16:
+        raise ValueError("too short")
+    return _AES.decrypt(blob[:_NONCE], blob[_NONCE:], None)
+
+
+def _pack_meta(meta: dict) -> bytes:
+    raw = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _encrypt(_compress(raw))
+
+
+def _unpack_meta(blob: bytes) -> dict:
+    return json.loads(_decompress(_decrypt(blob)).decode("utf-8"))
+
+
+# ---------- безопасность: MIME по magic bytes ----------
+_SAFE_MIMES = {
+    "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp",
 }
 
-ROLE_LEVEL = {"user": 0, "mod": 1, "admin": 2, "owner": 3}
-ROLE_NAMES = {"owner": "Владелец", "admin": "Админ", "mod": "Модер", "user": "Пользователь"}
-PALETTE = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#1abc9c", "#3498db",
-           "#9b59b6", "#e84393", "#fd79a8", "#00cec9", "#6c5ce7", "#fdcb6e"]
 
-# ======================================================================
-#  ХЕЛПЕРЫ
-# ======================================================================
-def now() -> float:
-    return time.time()
+def _sniff_image_mime(data: bytes) -> Optional[str]:
+    """Определяет MIME по содержимому. Возвращает None для неизвестных/опасных форматов.
+    Явно блокирует SVG (XSS-вектор) — он сюда не попадёт, т.к. не матчится."""
+    if not data or len(data) < 12:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    if data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+        return "image/avif"
+    return None
 
-def fmt_time(ts: float) -> str:
-    return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
 
-def sha256(text: str, salt: str = "") -> str:
-    return hashlib.sha256((salt + text).encode("utf-8")).hexdigest()
+_FILENAME_RE = _re.compile(r"[^A-Za-z0-9._-]+")
 
-def next_channel_id() -> int:
-    STATE["seq_ch"] += 1
-    return STATE["seq_ch"]
 
-def role_level(role: str) -> int:
-    return ROLE_LEVEL.get(role, 0)
+def _safe_filename(name: str, max_len: int = 80) -> str:
+    base = os.path.basename((name or "").strip()) or "photo"
+    base = _FILENAME_RE.sub("_", base)
+    if not base or base in (".", ".."):
+        base = "photo"
+    if len(base) > max_len:
+        root, ext = os.path.splitext(base)
+        ext = ext[:8]
+        base = root[: max_len - len(ext)] + ext
+    return base
 
-def is_online(u: dict) -> bool:
-    if u.get("banned_until", 0) > now():
-        return False
-    return (now() - u.get("last_seen", 0)) < 120
 
-def public_user(u: dict) -> dict:
-    return {
-        "id": u["id"], "username": u["username"], "name": u["name"],
-        "color": u["color"], "role": u["role"], "status": u["status"],
-        "online": is_online(u), "muted": u.get("muted_until", 0) > now(),
-        "banned": u.get("banned_until", 0) > now(),
-        "created": u["created"],
-    }
+# ---------- безопасность: rate limit ----------
+_rate_buckets: Dict[str, Deque[float]] = {}
+_rate_lock = threading.Lock()
+_RATE_WINDOW = 60.0
+_RATE_LIMIT_POST = 8
+_RATE_LIMIT_READ = 120
+_RATE_LIMIT_RANDOM = 30
+_RATE_BUCKETS_MAX = 50_000
 
-def all_user_ids():
-    return list(STATE["users"].keys())
 
-def get_channel(cid: int) -> dict:
-    ch = STATE["channels"].get(cid)
-    if not ch:
-        raise HTTPException(404, "Канал не найден")
-    return ch
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()[:64] or "unknown"
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
-def can_see(user: dict, ch: dict) -> bool:
-    if ch["type"] == "public":
+
+def _rate_ok(ip: str, limit: int, window: float = _RATE_WINDOW) -> bool:
+    now = time.monotonic()
+    with _rate_lock:
+        dq = _rate_buckets.get(ip)
+        if dq is None:
+            dq = deque()
+            _rate_buckets[ip] = dq
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        # Anti-growth: если IP стало слишком много, чистим самые старые половины
+        if len(_rate_buckets) > _RATE_BUCKETS_MAX:
+            for k in list(_rate_buckets.keys())[: _RATE_BUCKETS_MAX // 2]:
+                _rate_buckets.pop(k, None)
         return True
-    if ch["type"] == "dm":
-        # личные переписки видят только участники (даже админы не влезают)
-        return user["id"] in ch.get("members", [])
-    # приватные каналы: участники + админы/владелец (модерация)
-    return user["id"] in ch.get("members", []) or role_level(user["role"]) >= 2
 
-def can_read(user: dict, ch: dict) -> bool:
-    return can_see(user, ch)
 
-def can_manage_channel(user: dict, ch: dict) -> bool:
-    return user["id"] == ch.get("owner_id") or role_level(user["role"]) >= 2
+def _require_rate(request: Request, limit: int):
+    if not _rate_ok(_client_ip(request), limit):
+        raise HTTPException(429, "Слишком много запросов. Подождите минуту.")
 
-def channel_view(ch: dict, user: dict) -> dict:
-    v = {
-        "id": ch["id"], "name": ch["name"], "description": ch.get("description", ""),
-        "type": ch["type"], "owner_id": ch.get("owner_id"), "owner_name": ch.get("owner_name"),
-        "created": ch["created"], "pinned": ch.get("pinned", []),
-        "has_password": bool(ch.get("password")), "activity": ch.get("activity", 0),
-        "member_count": len(ch.get("members", [])),
-        "members": [public_user(STATE["users"][m]) for m in ch.get("members", []) if m in STATE["users"]],
-    }
-    if ch["type"] == "dm":
-        other = [m for m in ch.get("members", []) if m != user["id"]]
-        ou = STATE["users"].get(other[0]) if other else None
-        v["other_id"] = ou["id"] if ou else None
-        v["other_name"] = ou["name"] if ou else "?"
-        v["other_color"] = ou["color"] if ou else "#888"
-        v["other_online"] = is_online(ou) if ou else False
-    return v
 
-def server_info() -> dict:
-    s = STATE["settings"]
-    return {
-        "name": s["name"], "motd": s["motd"],
-        "maintenance": s["maintenance_mode"],
-        "allow_registration": s["allow_registration"],
-        "allow_editing": s["allow_editing"],
-        "allow_reactions": s["allow_reactions"],
-        "allow_dm": s["allow_dm"],
-        "max_message_length": s["max_message_length"],
-        "history_limit": s["history_limit"],
-        "rate_limit": s["rate_limit"],
-        "uptime": int(now() - START_TIME),
-        "users_total": len(STATE["users"]),
-        "users_online": len([u for u in STATE["users"].values() if is_online(u)]),
-        "channels_total": len(STATE["channels"]),
-        "messages_total": sum(len(v) for v in STATE["messages"].values()),
-        "version": APP_VERSION,
-    }
+# ---------- память ----------
+_store: Dict[str, dict] = {}
+_store_bytes = 0
+_lock = threading.Lock()
 
-def push_event(user_ids, etype: str, data: dict):
-    STATE["seq_evt"] += 1
-    ev = {"id": STATE["seq_evt"], "type": etype, "data": data, "ts": now()}
-    for u in user_ids:
-        lst = STATE["events"].setdefault(u, [])
-        lst.append(ev)
-        if len(lst) > 100:
-            del lst[: len(lst) - 100]
-    return ev
+MAX_PHOTOS = 5
+MAX_PHOTO_BYTES = 5 * 1024 * 1024
+MAX_TITLE_LEN = 120
+MAX_CONTENT_LEN = 20_000
+MAX_STORE_BYTES = 256 * 1024 * 1024  # 256 МБ — общий лимит хранилища
+MAX_UPLOAD_BODY = MAX_PHOTOS * MAX_PHOTO_BYTES + 1_000_000  # запас на multipart-обёртку
 
-def make_message(cid: int, user, text: str, kind: str = "user") -> dict:
-    STATE["seq_msg"] += 1
-    m = {
-        "id": STATE["seq_msg"],
-        "cid": cid,
-        "author_id": user["id"] if user else None,
-        "author": user["name"] if user else "SYSTEM",
-        "color": user["color"] if user else "#8a93a0",
-        "kind": kind,
-        "text": text,
-        "ts": now(),
-        "edited": False,
-        "reactions": {},
-    }
-    lst = STATE["messages"].setdefault(cid, [])
-    lst.append(m)
-    limit = STATE["settings"]["history_limit"]
-    if len(lst) > limit:
-        del lst[: len(lst) - limit]
-    STATE["channels"][cid]["activity"] = m["ts"]
-    return m
+PUBLIC_BASE_URL = os.environ.get("SLD_BASE_URL", "").rstrip("/")
 
-def system_message(cid: int, text: str) -> dict:
-    return make_message(cid, None, text, kind="system")
 
-def typing_users(cid: int, me: dict):
-    if not cid:
-        return []
-    res = []
-    for uid_, ts in list(STATE["typing"].get(cid, {}).items()):
-        if uid_ == me["id"]:
+def _gen_code() -> str:
+    digits = list(string.digits)
+    chars = []
+    for _ in range(6):
+        idx = secrets.randbelow(len(digits))
+        chars.append(digits.pop(idx))
+    return "".join(chars)
+
+
+def _new_code() -> str:
+    with _lock:
+        for _ in range(5000):
+            code = _gen_code()
+            if code not in _store:
+                return code
+    raise HTTPException(503, "Хранилище переполнено")
+
+
+def _base_url(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _etag_for_post(code: str, entry: dict) -> str:
+    h = hashlib.blake2b(digest_size=16)
+    h.update(code.encode("ascii"))
+    h.update(entry["meta"])
+    h.update(str(len(entry["photos"])).encode("ascii"))
+    for p in entry["photos"]:
+        h.update(p["name"].encode("utf-8", "ignore"))
+        h.update(str(p["size"]).encode("ascii"))
+    return '"' + h.hexdigest() + '"'
+
+
+def _etag_for_photo(code: str, idx: int, entry: dict) -> str:
+    h = hashlib.blake2b(digest_size=12)
+    h.update(code.encode("ascii"))
+    h.update(str(idx).encode("ascii"))
+    h.update(entry["photos"][idx]["enc"][:64])
+    return '"' + h.hexdigest() + '"'
+
+
+app = FastAPI(title="Sld-Networking", docs_url=None, redoc_url=None)
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+
+# ============================================================
+# MIDDLEWARE: security headers
+# ============================================================
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        h = response.headers
+        h.setdefault("X-Content-Type-Options", "nosniff")
+        h.setdefault("X-Frame-Options", "DENY")
+        h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        h.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=(), interest-cohort=()")
+        h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        h.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        if proto == "https":
+            h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+        ct = (h.get("content-type") or "").lower()
+        if "text/html" in ct:
+            h.setdefault(
+                "Content-Security-Policy",
+                "default-src 'self'; "
+                "img-src 'self' data: blob:; "
+                "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                "font-src 'self' https://fonts.gstatic.com; "
+                "script-src 'self' 'unsafe-inline'; "
+                "connect-src 'self'; "
+                "frame-ancestors 'none'; "
+                "base-uri 'self'; "
+                "form-action 'self'; "
+                "object-src 'none'",
+            )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Внутренняя ошибка: {type(exc).__name__}"},
+    )
+
+
+@app.post("/api/posts")
+async def create_post(
+    request: Request,
+    title: str = Form(...),
+    content: str = Form(""),
+    og_enabled: str = Form("true"),
+    files: Optional[List[UploadFile]] = File(None),
+):
+    global _store_bytes
+    _require_rate(request, _RATE_LIMIT_POST)
+
+    # Быстрая защита от гигантских body
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > MAX_UPLOAD_BODY:
+                raise HTTPException(413, "Слишком большой запрос")
+        except ValueError:
+            raise HTTPException(400, "Некорректный Content-Length")
+
+    title = (title or "").strip()
+    content = (content or "").strip()
+    og_flag = og_enabled.strip().lower() in ("1", "true", "on", "yes", "да")
+
+    if not title:
+        raise HTTPException(400, "Требуется название поста")
+    if len(title) > MAX_TITLE_LEN:
+        raise HTTPException(400, f"Название длиннее {MAX_TITLE_LEN} символов")
+    if len(content) > MAX_CONTENT_LEN:
+        raise HTTPException(400, f"Содержимое длиннее {MAX_CONTENT_LEN} символов")
+
+    files = [f for f in (files or []) if f and f.filename]
+    if len(files) > MAX_PHOTOS:
+        raise HTTPException(400, f"Максимум {MAX_PHOTOS} фото")
+
+    photos = []
+    total = 0
+    for f in files:
+        # Читаем с ограничением, чтобы не съесть всю RAM
+        chunks = []
+        chunk_size = 256 * 1024
+        read_bytes = 0
+        while True:
+            chunk = await f.read(chunk_size)
+            if not chunk:
+                break
+            read_bytes += len(chunk)
+            if read_bytes > MAX_PHOTO_BYTES:
+                raise HTTPException(
+                    400,
+                    f"Файл «{f.filename}» больше {MAX_PHOTO_BYTES // (1024 * 1024)} МБ",
+                )
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
             continue
-        if ts > now() - 4:
-            u = STATE["users"].get(uid_)
-            if u:
-                res.append(u["name"])
-    return res
 
-def rate_ok(user: dict) -> bool:
-    if role_level(user["role"]) >= 1:
-        return True
-    limit = STATE["settings"]["rate_limit"]
-    lst = [t for t in STATE["rate"].get(user["id"], []) if t > now() - 60]
-    STATE["rate"][user["id"]] = lst
-    return len(lst) < limit
+        # MIME по magic bytes; SVG и всё прочее мимо
+        real_mime = _sniff_image_mime(data)
+        if real_mime is None or real_mime not in _SAFE_MIMES:
+            raise HTTPException(400, f"Файл «{f.filename}» не поддерживается. Разрешены: JPEG, PNG, WebP, GIF, AVIF, BMP.")
 
-def bootstrap_channels():
-    cid = next_channel_id()
-    ch = {"id": cid, "name": "general", "description": "Общий канал",
-          "type": "public", "owner_id": None, "owner_name": "Сервер",
-          "created": now(), "pinned": [], "members": [],
-          "password": None, "password_salt": "", "activity": 0}
-    STATE["channels"][cid] = ch
-    STATE["messages"][cid] = []
-    system_message(cid, "Канал #general создан. Добро пожаловать на сервер!")
+        enc = _encrypt(data)
+        total += len(enc)
+        photos.append({
+            "name": _safe_filename(f.filename),
+            "mime": real_mime,
+            "size": len(data),
+            "enc": enc,
+        })
 
-bootstrap_channels()
-
-# ======================================================================
-#  АВТОРИЗАЦИЯ
-# ======================================================================
-def get_token(req: Request) -> str:
-    token = req.cookies.get("session") or ""
-    if not token:
-        h = req.headers.get("authorization", "")
-        if h.lower().startswith("bearer "):
-            token = h[7:].strip()
-    if not token:
-        token = str(req.query_params.get("token", ""))
-    return token
-
-def auth_user(req: Request) -> dict:
-    token = get_token(req)
-    uid_ = STATE["tokens"].get(token)
-    if uid_ is None:
-        raise HTTPException(401, "Требуется авторизация")
-    user = STATE["users"].get(uid_)
-    if user is None:
-        raise HTTPException(401, "Пользователь не найден")
-    if user.get("banned_until", 0) > now():
-        raise HTTPException(403, "BANNED: " + str(user.get("ban_reason", "нарушение правил")))
-    if user.get("kicked_at", 0) > user.get("last_login", 0):
-        raise HTTPException(401, "Сессия завершена администратором")
-    user["last_seen"] = now()
-    return user
-
-def require_role(user: dict, lvl: int):
-    if role_level(user["role"]) < lvl:
-        raise HTTPException(403, "Недостаточно прав")
-
-def guard_maintenance(user: dict):
-    if STATE["settings"]["maintenance_mode"] and role_level(user["role"]) < 2:
-        raise HTTPException(503, "Сервер на обслуживании. Зайдите позже.")
-
-# ======================================================================
-#  ПРИЛОЖЕНИЕ
-# ======================================================================
-app = FastAPI(title="DSH Messenger", version=APP_VERSION)
-
-# ------------------------------ АВТОРИЗАЦИЯ ------------------------------
-@app.post("/api/register")
-def api_register(req: Request, payload: dict):
-    s = STATE["settings"]
-    if not s["allow_registration"]:
-        raise HTTPException(403, "Регистрация отключена администратором")
-    if s["maintenance_mode"]:
-        raise HTTPException(503, "Сервер на обслуживании")
-    username = str(payload.get("username", "")).strip()
-    name = str(payload.get("name", "")).strip() or username
-    password = str(payload.get("password", ""))
-    if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
-        raise HTTPException(400, "Логин: 3–20 символов (латиница, цифры, _)")
-    if len(password) < 4:
-        raise HTTPException(400, "Пароль: минимум 4 символа")
-    if len(name) > 32:
-        raise HTTPException(400, "Имя слишком длинное")
-    low = username.lower()
-    ban = STATE["bans"].get(low)
-    if ban and ban["until"] > now():
-        raise HTTPException(403, "Этот логин забанен: " + ban["reason"])
-    for u in STATE["users"].values():
-        if u["username"].lower() == low:
-            raise HTTPException(409, "Логин уже занят")
-    first = not STATE["users"]
-    uid_ = STATE["seq_ch"] + 1000  # уникальный id (не пересекается с каналами)
-    while uid_ in STATE["users"]:
-        uid_ += 1
-    salt = secrets.token_hex(8)
-    user = {
-        "id": uid_, "username": username, "name": name,
-        "color": PALETTE[uid_ % len(PALETTE)],
-        "role": "owner" if first else "user",
-        "status": "online", "last_seen": now(), "created": now(),
-        "muted_until": 0, "banned_until": 0, "ban_reason": "",
-        "kicked_at": 0, "last_login": now(),
-        "salt": salt, "hash": sha256(password, salt),
-        "settings": {"sound": True, "compact": False, "show_system": True},
+    created = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "title": title,
+        "content": content,
+        "created": created,
+        "og_enabled": og_flag,
+        "photos": [{"name": p["name"], "mime": p["mime"], "size": p["size"]} for p in photos],
     }
-    STATE["users"][uid_] = user
-    if first:
-        STATE["owner_id"] = uid_
-        push_event([uid_], "broadcast",
-                   {"text": "Вы первый пользователь и стали владельцем сервера!"})
-    token = secrets.token_hex(24)
-    STATE["tokens"][token] = uid_
-    resp = JSONResponse({"token": token, "user": {**public_user(user), "settings": user["settings"]}})
-    resp.set_cookie("session", token, httponly=True, samesite="lax")
-    return resp
+    enc_meta = _pack_meta(meta)
+    total += len(enc_meta)
 
-@app.post("/api/login")
-def api_login(req: Request, payload: dict):
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-    low = username.lower()
-    user = None
-    for u in STATE["users"].values():
-        if u["username"].lower() == low:
-            user = u
-            break
-    if not user or sha256(password, user["salt"]) != user["hash"]:
-        raise HTTPException(401, "Неверный логин или пароль")
-    if user.get("banned_until", 0) > now():
-        raise HTTPException(403, "Аккаунт забанен: " + str(user.get("ban_reason", "")))
-    user["last_login"] = now()
-    user["last_seen"] = now()
-    if user["status"] == "offline":
-        user["status"] = "online"
-    token = secrets.token_hex(24)
-    STATE["tokens"][token] = user["id"]
-    resp = JSONResponse({"token": token, "user": {**public_user(user), "settings": user["settings"]}})
-    resp.set_cookie("session", token, httponly=True, samesite="lax")
-    return resp
+    with _lock:
+        if _store_bytes + total > MAX_STORE_BYTES:
+            raise HTTPException(503, "Хранилище переполнено, попробуйте позже")
+        code = _new_code()  # _new_code тоже берёт _lock — это RLock-совместимо?
+        # _new_code берёт _lock; мы уже держим его → будет deadlock.
+        # Поэтому выносим _new_code ДО взятия _lock ниже.
+        # (см. реализацию ниже)
 
-@app.post("/api/logout")
-def api_logout(req: Request):
-    token = get_token(req)
-    if token in STATE["tokens"]:
-        uid_ = STATE["tokens"].pop(token)
-        u = STATE["users"].get(uid_)
-        if u:
-            u["last_seen"] = now()
-            if not any(v == uid_ for v in STATE["tokens"].values()):
-                u["status"] = "offline"
-    return {"ok": True}
+    # Правильная последовательность без вложенного lock:
+    code = _new_code()
+    with _lock:
+        _store[code] = {
+            "meta": enc_meta,
+            "photos": photos,
+            "created": created,
+            "size": total,
+            "og_enabled": og_flag,
+        }
+        _store_bytes += total
 
-@app.get("/api/me")
-def api_me(req: Request):
-    user = auth_user(req)
-    return {**public_user(user), "settings": user["settings"]}
+    base = _base_url(request)
+    return JSONResponse(
+        content={
+            "code": code,
+            "compressed_bytes": total,
+            "photos": len(photos),
+            "share_url": f"{base}/p/{code}",
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
-# ------------------------------ СИНХРОНИЗАЦИЯ ------------------------------
-@app.get("/api/sync")
-def api_sync(req: Request, channel: str = "", after_msg: int = 0, after_evt: int = 0):
-    user = auth_user(req)
-    s = STATE["settings"]
-    if s["maintenance_mode"] and role_level(user["role"]) < 2:
-        return {"status": "maintenance", "server": server_info()}
-    cid = int(channel) if channel and channel.isdigit() else 0
-    msgs = []
-    ch = STATE["channels"].get(cid)
-    if ch and can_read(user, ch):
-        msgs = [m for m in STATE["messages"].get(cid, []) if m["id"] > after_msg][-100:]
-    events = [e for e in STATE["events"].get(user["id"], []) if e["id"] > after_evt]
-    return {
-        "status": "ok",
-        "server": server_info(),
-        "me": {**public_user(user), "settings": user["settings"]},
-        "users": [public_user(u) for u in STATE["users"].values()],
-        "channels": [channel_view(c, user) for c in STATE["channels"].values() if can_see(user, c)],
-        "messages": msgs,
-        "typing": typing_users(cid, user),
-        "events": events,
+
+@app.get("/api/posts/{code}")
+async def get_post(code: str, request: Request):
+    _require_rate(request, _RATE_LIMIT_READ)
+    code = code.strip()
+    if len(code) != 6 or not code.isdigit():
+        raise HTTPException(400, "Код должен содержать 6 цифр")
+
+    with _lock:
+        entry = _store.get(code)
+    if entry is None:
+        raise HTTPException(404, "Пост не найден")
+
+    etag = _etag_for_post(code, entry)
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=300, must-revalidate",
+            },
+        )
+
+    try:
+        meta = _unpack_meta(entry["meta"])
+    except (InvalidTag, ValueError, OSError) as e:
+        raise HTTPException(500, f"Ошибка расшифровки: {e}")
+
+    meta["code"] = code
+    meta["photos"] = [
+        {"idx": i, "name": p["name"], "mime": p["mime"], "size": p["size"]}
+        for i, p in enumerate(entry["photos"])
+    ]
+
+    return JSONResponse(
+        content=meta,
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=300, must-revalidate",
+        },
+    )
+
+
+@app.get("/api/photos/{code}/{idx}")
+async def get_photo(code: str, idx: int, request: Request):
+    _require_rate(request, _RATE_LIMIT_READ)
+    with _lock:
+        entry = _store.get(code)
+    if entry is None:
+        raise HTTPException(404, "Пост не найден")
+
+    photos = entry["photos"]
+    if idx < 0 or idx >= len(photos):
+        raise HTTPException(404, "Фото не найдено")
+
+    p = photos[idx]
+
+    etag = _etag_for_photo(code, idx, entry)
+    if request.headers.get("if-none-match") == etag:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "public, max-age=31536000, immutable",
+            },
+        )
+
+    try:
+        data = _decrypt(p["enc"])
+    except (InvalidTag, ValueError) as e:
+        raise HTTPException(500, f"Ошибка расшифровки: {e}")
+
+    return Response(
+        content=data,
+        media_type=p["mime"],
+        headers={
+            "ETag": etag,
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Length": str(len(data)),
+            "Content-Disposition": f'inline; filename="{p["name"]}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/api/random-code")
+async def random_code(request: Request):
+    _require_rate(request, _RATE_LIMIT_RANDOM)
+    with _lock:
+        for _ in range(5000):
+            code = _gen_code()
+            if code not in _store:
+                return JSONResponse(
+                    content={"code": code},
+                    headers={"Cache-Control": "no-store"},
+                )
+    raise HTTPException(503, "Хранилище переполнено")
+
+
+@app.get("/api/stats")
+async def stats():
+    with _lock:
+        return {"posts": len(_store), "bytes": _store_bytes}
+
+
+# ============================================================
+# PWA
+# ============================================================
+
+PWA_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    '<defs>'
+    '<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#ffffff"/>'
+    '<stop offset="1" stop-color="#c4c4c8"/>'
+    '</linearGradient>'
+    '</defs>'
+    '<rect width="512" height="512" rx="112" fill="#080808"/>'
+    '<rect x="96" y="96" width="320" height="320" rx="72" fill="url(#g)"/>'
+    '<g fill="none" stroke="#08080a" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="256" cy="186" r="34"/>'
+    '<circle cx="158" cy="336" r="34"/>'
+    '<circle cx="354" cy="336" r="34"/>'
+    '<path d="M232 208 178 314M280 208 334 314M192 336h128"/>'
+    '</g>'
+    '</svg>'
+)
+
+PWA_MANIFEST = {
+    "name": "СЛД·NET",
+    "short_name": "СЛД·NET",
+    "description": "Посты по 6-значному коду. Без аккаунтов, с шифрованием.",
+    "start_url": "/app",
+    "scope": "/",
+    "display": "standalone",
+    "display_override": ["standalone", "minimal-ui"],
+    "orientation": "any",
+    "background_color": "#080808",
+    "theme_color": "#080808",
+    "lang": "ru",
+    "dir": "ltr",
+    "categories": ["social", "productivity", "utilities"],
+    "icons": [
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"},
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"},
+    ],
+}
+
+PWA_SW = r"""
+const CACHE = 'sld-net-v8';
+const SHELL_URLS = ['/app', '/icon.svg'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((cache) => cache.addAll(SHELL_URLS).catch(() => {}))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  const url = new URL(req.url);
+  if (req.method !== 'GET') return;
+  if (url.pathname.startsWith('/api/')) return;
+
+  if (req.mode === 'navigate') {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+          return res;
+        })
+        .catch(() => caches.match(req).then((m) => m || caches.match('/app')))
+    );
+    return;
+  }
+  if (url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com') {
+    event.respondWith(
+      caches.match(req).then((cached) => {
+        if (cached) return cached;
+        return fetch(req).then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(req, copy));
+          }
+          return res;
+        }).catch(() => cached);
+      })
+    );
+    return;
+  }
+  if (url.pathname === '/icon.svg' || url.pathname === '/manifest.json') {
+    event.respondWith(
+      caches.match(req).then((cached) => cached || fetch(req).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }
+        return res;
+      }))
+    );
+    return;
+  }
+  event.respondWith(
+    fetch(req)
+      .then((res) => {
+        if (res.ok && res.type === 'basic') {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(req))
+  );
+});
+"""
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(content=PWA_MANIFEST, headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return PlainTextResponse(
+        content=PWA_SW,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
+@app.get("/icon.svg")
+async def icon():
+    return Response(
+        content=PWA_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ============================================================
+# UI-ФРЕЙМВОРК
+# ============================================================
+
+UI_FRAMEWORK_JS = r"""
+var UI = (function(){
+  "use strict";
+  function h(tag, attrs, children){
+    var el = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        var v = attrs[k];
+        if (v == null || v === false) continue;
+        if (k === 'class' || k === 'className') {
+          el.className = Array.isArray(v) ? v.filter(Boolean).join(' ') : v;
+        } else if (k === 'style' && typeof v === 'object') {
+          for (var s in v) el.style[s] = v[s];
+        } else if (k === 'dataset' && typeof v === 'object') {
+          for (var d in v) el.dataset[d] = v[d];
+        } else if (k === 'on' && typeof v === 'object') {
+          for (var e in v) el.addEventListener(e, v[e]);
+        } else if (k === 'html') {
+          el.innerHTML = v;
+        } else if (k === 'text') {
+          el.textContent = v;
+        } else if (v === true) {
+          el.setAttribute(k, '');
+        } else {
+          el.setAttribute(k, v);
+        }
+      }
     }
+    append(el, children);
+    return el;
+  }
+  function append(parent, children){
+    if (children == null) return parent;
+    if (!Array.isArray(children)) children = [children];
+    for (var i = 0; i < children.length; i++) {
+      var c = children[i];
+      if (c == null || c === false || c === true) continue;
+      if (typeof c === 'string' || typeof c === 'number') {
+        parent.appendChild(document.createTextNode(String(c)));
+      } else if (c instanceof Node) {
+        parent.appendChild(c);
+      } else if (Array.isArray(c)) {
+        append(parent, c);
+      }
+    }
+    return parent;
+  }
+  function html(str){ var t = document.createElement('template'); t.innerHTML = str.trim(); return t.content.firstElementChild; }
+  function svg(str){ return html(str); }
+  function on(el, evt, fn, opts){ el.addEventListener(evt, fn, opts); return el; }
+  function off(el, evt, fn, opts){ el.removeEventListener(evt, fn, opts); return el; }
+  function addClass(el){ for (var i=1;i<arguments.length;i++) el.classList.add(arguments[i]); return el; }
+  function removeClass(el){ for (var i=1;i<arguments.length;i++) el.classList.remove(arguments[i]); return el; }
+  function toggle(el, cls, force){ el.classList.toggle(cls, force); return el; }
+  function hasClass(el, cls){ return el.classList.contains(cls); }
+  function attr(el, name, val){ if (val===undefined) return el.getAttribute(name); if (val==null) el.removeAttribute(name); else el.setAttribute(name, val); return el; }
+  function text(el, t){ el.textContent = t == null ? '' : String(t); return el; }
+  function clear(el){ while (el.firstChild) el.removeChild(el.firstChild); return el; }
+  function qs(sel, root){ return (root || document).querySelector(sel); }
+  function qsa(sel, root){ return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
 
-# ------------------------------ КАНАЛЫ ------------------------------
-@app.get("/api/channels")
-def api_channels(req: Request):
-    user = auth_user(req)
-    return {"channels": [channel_view(c, user) for c in STATE["channels"].values() if can_see(user, c)]}
+  function ensureToastContainer(){
+    var c = document.getElementById('uiToastContainer');
+    if (c) return c;
+    c = document.createElement('div');
+    c.id = 'uiToastContainer';
+    c.className = 'ui-toast-container';
+    document.body.appendChild(c);
+    return c;
+  }
+  function toast(message, opts){
+    opts = opts || {};
+    var c = ensureToastContainer();
+    var el = document.createElement('div');
+    el.className = 'ui-toast' + (opts.kind ? ' ui-toast--' + opts.kind : '');
+    el.textContent = String(message);
+    c.appendChild(el);
+    requestAnimationFrame(function(){ el.classList.add('is-visible'); });
+    var dur = opts.duration || 2400;
+    setTimeout(function(){
+      el.classList.remove('is-visible');
+      setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 320);
+    }, dur);
+    return el;
+  }
 
-@app.post("/api/channels")
-def api_create_channel(req: Request, payload: dict):
-    user = auth_user(req)
-    guard_maintenance(user)
-    name = str(payload.get("name", "")).strip().lstrip("#")
-    if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 _\-\.]{2,40}", name):
-        raise HTTPException(400, "Имя канала: 2–40 символов (буквы, цифры, пробел, - _ .)")
-    if any(ch["name"].lower() == name.lower() for ch in STATE["channels"].values() if ch["type"] != "dm"):
-        raise HTTPException(409, "Канал с таким именем уже существует")
-    ctype = payload.get("type", "public")
-    if ctype not in ("public", "private"):
-        ctype = "public"
-    password = str(payload.get("password", ""))
-    ch = {"id": next_channel_id(), "name": name,
-          "description": str(payload.get("description", ""))[:200],
-          "type": ctype, "owner_id": user["id"], "owner_name": user["name"],
-          "created": now(), "pinned": [],
-          "members": [] if ctype == "public" else [user["id"]],
-          "password": None, "password_salt": "", "activity": 0}
-    if ctype == "private" and password:
-        if len(password) < 4:
-            raise HTTPException(400, "Пароль канала: минимум 4 символа")
-        ch["password_salt"] = secrets.token_hex(8)
-        ch["password"] = sha256(password, ch["password_salt"])
-    STATE["channels"][ch["id"]] = ch
-    STATE["messages"][ch["id"]] = []
-    push_event(all_user_ids(), "channel_new", {"channel_id": ch["id"], "name": name})
-    return {"channel": channel_view(ch, user)}
+  async function copy(value){
+    try { await navigator.clipboard.writeText(value); return true; }
+    catch(e){
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = value;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch(err){ return false; }
+    }
+  }
 
-@app.post("/api/channels/join")
-def api_join_by_name(req: Request, payload: dict):
-    user = auth_user(req)
-    guard_maintenance(user)
-    name = str(payload.get("name", "")).strip().lstrip("#").lower()
-    if not name:
-        raise HTTPException(400, "Укажите имя канала")
-    for ch in STATE["channels"].values():
-        if ch["type"] == "private" and ch["name"].lower() == name:
-            if user["id"] in ch["members"]:
-                return {"channel": channel_view(ch, user)}
-            if ch.get("password"):
-                given = str(payload.get("password", ""))
-                if sha256(given, ch["password_salt"]) != ch["password"]:
-                    raise HTTPException(403, "Неверный пароль канала")
-            ch["members"].append(user["id"])
-            push_event([m for m in ch["members"] if m != user["id"]],
-                       "member_joined",
-                       {"channel_id": ch["id"], "user_id": user["id"], "name": user["name"]})
-            system_message(ch["id"], f"{user['name']} присоединился к каналу")
-            return {"channel": channel_view(ch, user)}
-    raise HTTPException(404, "Приватный канал с таким именем не найден")
+  function debounce(fn, ms){
+    var t = 0;
+    return function(){ var ctx=this, args=arguments; clearTimeout(t); t=setTimeout(function(){ fn.apply(ctx,args); }, ms); };
+  }
+  function throttle(fn, ms){
+    var last=0, timer=0;
+    return function(){
+      var ctx=this, args=arguments, now=Date.now();
+      if (now - last >= ms) { last = now; fn.apply(ctx,args); }
+      else if (!timer) { timer = setTimeout(function(){ last = Date.now(); timer=0; fn.apply(ctx,args); }, ms - (now-last)); }
+    };
+  }
 
-@app.post("/api/channels/{cid}/leave")
-def api_leave_channel(req: Request, cid: int):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if user["id"] not in ch["members"]:
-        raise HTTPException(400, "Вы не участник этого канала")
-    ch["members"].remove(user["id"])
-    if not ch["members"]:
-        STATE["channels"].pop(cid, None)
-        STATE["messages"].pop(cid, None)
-        push_event(all_user_ids(), "channel_deleted", {"channel_id": cid, "name": ch["name"]})
-    else:
-        if ch["owner_id"] == user["id"]:
-            ch["owner_id"] = ch["members"][0]
-            ch["owner_name"] = STATE["users"][ch["members"][0]]["name"]
-        push_event(ch["members"], "member_left",
-                   {"channel_id": cid, "user_id": user["id"], "name": user["name"]})
-    return {"ok": True}
+  return {
+    h:h, svg:svg, html:html, append:append,
+    on:on, off:off,
+    addClass:addClass, removeClass:removeClass, toggle:toggle, hasClass:hasClass,
+    attr:attr, text:text, clear:clear,
+    qs:qs, qsa:qsa,
+    toast:toast, copy:copy,
+    debounce:debounce, throttle:throttle
+  };
+})();
+"""
 
-@app.patch("/api/channels/{cid}")
-def api_update_channel(req: Request, cid: int, payload: dict):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if not can_manage_channel(user, ch):
-        raise HTTPException(403, "Только владелец или администратор")
-    if "name" in payload:
-        name = str(payload["name"]).strip().lstrip("#")
-        if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 _\-\.]{2,40}", name):
-            raise HTTPException(400, "Некорректное имя канала")
-        ch["name"] = name
-    if "description" in payload:
-        ch["description"] = str(payload["description"])[:200]
-    push_event(all_user_ids(), "channel_updated", {"channel_id": cid})
-    return {"channel": channel_view(ch, user)}
 
-@app.delete("/api/channels/{cid}")
-def api_delete_channel(req: Request, cid: int):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if not can_manage_channel(user, ch):
-        raise HTTPException(403, "Только владелец или администратор")
-    STATE["channels"].pop(cid, None)
-    STATE["messages"].pop(cid, None)
-    push_event(all_user_ids(), "channel_deleted", {"channel_id": cid, "name": ch["name"]})
-    return {"ok": True}
+# ============================================================
+# ФРОНТЕНД
+# ============================================================
 
-@app.post("/api/channels/{cid}/clear")
-def api_clear_channel(req: Request, cid: int):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if role_level(user["role"]) < 1 and user["id"] != ch.get("owner_id"):
-        raise HTTPException(403, "Недостаточно прав")
-    STATE["messages"][cid] = []
-    ch["pinned"] = []
-    push_event(all_user_ids(), "channel_cleared", {"channel_id": cid})
-    return {"ok": True}
+FAVICON = (
+    "data:image/svg+xml,"
+    "%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+    "%3Crect width='32' height='32' rx='8' fill='%23080808'/%3E"
+    "%3Cg fill='none' stroke='%23f4f4f5' stroke-width='1.8' stroke-linecap='round'%3E"
+    "%3Ccircle cx='16' cy='10' r='3'/%3E"
+    "%3Ccircle cx='10' cy='22' r='3'/%3E"
+    "%3Ccircle cx='22' cy='22' r='3'/%3E"
+    "%3Cpath d='M14 12.5L11 19M18 12.5L21 19M13 22h6'/%3E"
+    "%3C/g%3E%3C/svg%3E"
+)
 
-@app.post("/api/channels/{cid}/pin")
-def api_toggle_pin(req: Request, cid: int, payload: dict):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if role_level(user["role"]) < 1 and user["id"] != ch.get("owner_id"):
-        raise HTTPException(403, "Недостаточно прав")
-    mid = int(payload.get("message_id", 0))
-    msg = next((m for m in STATE["messages"].get(cid, []) if m["id"] == mid), None)
-    if not msg:
-        raise HTTPException(404, "Сообщение не найдено")
-    if any(p["id"] == mid for p in ch["pinned"]):
-        ch["pinned"] = [p for p in ch["pinned"] if p["id"] != mid]
-        pinned = False
-    else:
-        ch["pinned"].append({"id": mid, "text": msg["text"][:80], "author": msg["author"]})
-        pinned = True
-    return {"pinned": pinned, "list": ch["pinned"]}
+LOGO_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="12" cy="5" r="2.4"/><circle cx="5" cy="19" r="2.4"/>'
+    '<circle cx="19" cy="19" r="2.4"/><path d="M12 7.4 6.4 16.6M12 7.4l5.6 9.2M7.4 19h9.2"/>'
+    '</svg>'
+)
 
-@app.post("/api/dm")
-def api_dm(req: Request, payload: dict):
-    user = auth_user(req)
-    guard_maintenance(user)
-    if not STATE["settings"]["allow_dm"]:
-        raise HTTPException(403, "Личные сообщения отключены")
-    other_id = int(payload.get("user_id", 0))
-    other = STATE["users"].get(other_id)
-    if not other:
-        raise HTTPException(404, "Пользователь не найден")
-    if other_id == user["id"]:
-        raise HTTPException(400, "Нельзя писать самому себе")
-    for ch in STATE["channels"].values():
-        if ch["type"] == "dm" and set(ch["members"]) == {user["id"], other_id}:
-            return {"channel": channel_view(ch, user)}
-    ch = {"id": next_channel_id(), "name": "dm", "description": "",
-          "type": "dm", "owner_id": user["id"], "owner_name": user["name"],
-          "created": now(), "pinned": [], "members": [user["id"], other_id],
-          "password": None, "password_salt": "", "activity": 0}
-    STATE["channels"][ch["id"]] = ch
-    STATE["messages"][ch["id"]] = []
-    return {"channel": channel_view(ch, user)}
+ARROW_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
+)
 
-# ------------------------------ СООБЩЕНИЯ ------------------------------
-@app.get("/api/channels/{cid}/messages")
-def api_messages(req: Request, cid: int, after: int = 0, before: int = 0, limit: int = 60):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if not can_read(user, ch):
-        raise HTTPException(403, "Нет доступа к каналу")
-    limit = max(1, min(limit, 200))
-    lst = STATE["messages"].get(cid, [])
-    if before:
-        lst = [m for m in lst if m["id"] < before][-limit:]
-    elif after:
-        lst = [m for m in lst if m["id"] > after][-limit:]
-    else:
-        lst = lst[-limit:]
-    return {"messages": lst}
+SEARCH_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>'
+)
 
-@app.post("/api/channels/{cid}/messages")
-def api_send_message(req: Request, cid: int, payload: dict):
-    user = auth_user(req)
-    guard_maintenance(user)
-    ch = get_channel(cid)
-    if not can_read(user, ch):
-        raise HTTPException(403, "Нет доступа к каналу")
-    if user.get("muted_until", 0) > now():
-        raise HTTPException(403, "Вы заглушены до " + fmt_time(user["muted_until"]))
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        raise HTTPException(400, "Пустое сообщение")
-    if len(text) > STATE["settings"]["max_message_length"]:
-        raise HTTPException(400, f"Сообщение длиннее {STATE['settings']['max_message_length']} символов")
-    if not rate_ok(user):
-        raise HTTPException(429, "Слишком часто. Лимит сообщений в минуту исчерпан.")
-    STATE["rate"].setdefault(user["id"], []).append(now())
-    msg = make_message(cid, user, text)
-    return {"message": msg}
+YOUTUBE_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545'
+    's-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814'
+    'a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505'
+    'a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814z'
+    'M9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>'
+)
 
-@app.patch("/api/messages/{mid}")
-def api_edit_message(req: Request, mid: int, payload: dict):
-    user = auth_user(req)
-    if not STATE["settings"]["allow_editing"]:
-        raise HTTPException(403, "Редактирование отключено")
-    for cid, lst in STATE["messages"].items():
-        msg = next((m for m in lst if m["id"] == mid), None)
-        if msg:
-            ch = STATE["channels"][cid]
-            if not can_read(user, ch):
-                raise HTTPException(403, "Нет доступа")
-            if msg["author_id"] != user["id"] and role_level(user["role"]) < 2:
-                raise HTTPException(403, "Можно редактировать только свои сообщения")
-            text = str(payload.get("text", "")).strip()
-            if not text:
-                raise HTTPException(400, "Пустое сообщение")
-            if len(text) > STATE["settings"]["max_message_length"]:
-                raise HTTPException(400, "Сообщение слишком длинное")
-            msg["text"] = text
-            msg["edited"] = True
-            return {"message": msg}
-    raise HTTPException(404, "Сообщение не найдено")
+MASTODON_SVG = (
+    '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+    '<path d="M23.268 5.313c-.35-2.578-2.617-4.61-5.304-5.004C17.51.242 15.792 0 11.813 0'
+    'h-.03c-3.98 0-4.835.242-5.288.309C3.882.692 1.496 2.518.917 5.127'
+    '.64 6.412.61 7.837.661 9.143c.074 1.874.088 3.745.26 5.611'
+    '.118 1.24.325 2.47.62 3.68.55 2.237 2.777 4.098 4.96 4.857'
+    '2.336.792 4.849.923 7.256.38.265-.061.527-.132.786-.213'
+    '.585-.184 1.27-.39 1.774-.753a.057.057 0 0 0 .023-.043v-1.809'
+    'a.052.052 0 0 0-.02-.041.053.053 0 0 0-.046-.01 20.282 20.282 0 0 1-4.709.545'
+    'c-2.73 0-3.463-1.284-3.674-1.818a5.593 5.593 0 0 1-.319-1.433'
+    '.053.053 0 0 1 .066-.054c1.517.363 3.072.546 4.632.546'
+    '.376 0 .75 0 1.125-.01 1.57-.044 3.224-.124 4.768-.422'
+    '.038-.008.077-.015.11-.024 2.435-.464 4.753-1.92 4.989-5.604'
+    '.008-.145.03-1.52.03-1.67.002-.512.167-3.63-.024-5.545z"/></svg>'
+)
 
-@app.delete("/api/messages/{mid}")
-def api_delete_message(req: Request, mid: int):
-    user = auth_user(req)
-    for cid, lst in STATE["messages"].items():
-        msg = next((m for m in lst if m["id"] == mid), None)
-        if msg:
-            ch = STATE["channels"][cid]
-            if not can_read(user, ch):
-                raise HTTPException(403, "Нет доступа")
-            if msg["author_id"] != user["id"] and role_level(user["role"]) < 1:
-                raise HTTPException(403, "Можно удалять только свои сообщения")
-            lst.remove(msg)
-            ch["pinned"] = [p for p in ch.get("pinned", []) if p["id"] != mid]
-            return {"ok": True}
-    raise HTTPException(404, "Сообщение не найдено")
+# ============================================================
+# ОБЩИЙ CSS — база + liquid glass
+# ============================================================
 
-@app.post("/api/messages/{mid}/react")
-def api_react(req: Request, mid: int, payload: dict):
-    user = auth_user(req)
-    guard_maintenance(user)
-    if not STATE["settings"]["allow_reactions"]:
-        raise HTTPException(403, "Реакции отключены")
-    emoji = str(payload.get("emoji", "")).strip()
-    if not emoji or len(emoji) > 8:
-        raise HTTPException(400, "Некорректная реакция")
-    for cid, lst in STATE["messages"].items():
-        msg = next((m for m in lst if m["id"] == mid), None)
-        if msg:
-            if not can_read(user, STATE["channels"][cid]):
-                raise HTTPException(403, "Нет доступа")
-            r = msg.setdefault("reactions", {})
-            ids = r.setdefault(emoji, [])
-            if user["id"] in ids:
-                ids.remove(user["id"])
-                if not ids:
-                    del r[emoji]
-            else:
-                ids.append(user["id"])
-            return {"reactions": msg["reactions"]}
-    raise HTTPException(404, "Сообщение не найдено")
+SHELL_CSS = r"""
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07070a;
+  --bg-2:#0a0a0e;
+  --border:rgba(255,255,255,0.08);
+  --border-2:rgba(255,255,255,0.14);
+  --border-3:rgba(255,255,255,0.24);
+  --text:#f5f5f7;
+  --text-dim:#a0a0a6;
+  --text-mute:#6c6c72;
+  --glass:rgba(255,255,255,0.04);
+  --glass-hi:rgba(255,255,255,0.08);
+  --radius:22px;
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --ok:#6fdc9c;
+  --warn:#e0b158;
+  --err:#ff7676;
+  --lg-blur:22px;
+  --lg-sat:180%;
+  --lg-bright:1.06;
+  --sheen-x:50vw;
+  --sheen-y:0vh;
+}
+html{scroll-behavior:smooth}
+html,body{
+  background:var(--bg);color:var(--text);
+  font-family:'Manrope',system-ui,-apple-system,sans-serif;
+  font-size:16px;line-height:1.6;
+  overflow-x:clip;min-height:100vh;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  -webkit-tap-highlight-color:transparent;
+}
+input,textarea,[contenteditable],.modal-code{
+  -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
+}
+[hidden]{display:none !important}
+::selection{background:#fff;color:#000}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:#0a0a0a}
+::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
+::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
 
-@app.post("/api/channels/{cid}/typing")
-def api_typing(req: Request, cid: int):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if not can_read(user, ch):
-        raise HTTPException(403, "Нет доступа")
-    STATE["typing"].setdefault(cid, {})[user["id"]] = now()
-    return {"ok": True}
+@media (hover:hover) and (pointer:fine){
+  *, *::before, *::after { cursor:none !important; }
+}
+.cur-dot,.cur-ring{
+  position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
+  border-radius:50%;will-change:transform;
+  opacity:0;transition:opacity .2s ease;
+}
+body.cursor-ready .cur-dot,
+body.cursor-ready .cur-ring { opacity:1; }
+.cur-dot{width:7px;height:7px;background:#fff;
+  box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.45);
+}
+.cur-ring{
+  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.4);
+  transition:width .22s var(--ease),height .22s var(--ease),
+             border-color .22s,background .22s,opacity .2s;
+}
+.cur-ring.hover{width:60px;height:60px;border-color:rgba(255,255,255,0.22);
+  background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.14)}
+@media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
 
-# ------------------------------ ПОИСК / ЭКСПОРТ ------------------------------
-@app.get("/api/search")
-def api_search(req: Request, q: str = ""):
-    user = auth_user(req)
-    q = q.strip().lower()
-    if len(q) < 2:
-        return {"results": []}
-    results = []
-    for ch in STATE["channels"].values():
-        if not can_read(user, ch):
-            continue
-        for m in STATE["messages"].get(ch["id"], []):
-            if q in m["text"].lower():
-                results.append({"id": m["id"], "cid": ch["id"], "channel": ch["name"],
-                                "author": m["author"], "text": m["text"][:200], "ts": m["ts"]})
-    results.sort(key=lambda r: r["ts"], reverse=True)
-    return {"results": results[:100]}
+.ui-toast-container{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  z-index:9997;display:flex;flex-direction:column;gap:8px;
+  pointer-events:none;align-items:center;padding:0 16px;max-width:100%;
+}
+.ui-toast{
+  background:rgba(18,18,22,0.72);
+  border:1px solid rgba(255,255,255,0.14);
+  color:var(--text);
+  padding:11px 18px;border-radius:14px;
+  font-size:13px;font-weight:500;
+  backdrop-filter:blur(20px) saturate(180%);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:
+    0 14px 40px rgba(0,0,0,0.55),
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05);
+  opacity:0;transform:translateY(10px);
+  transition:opacity .24s ease, transform .24s var(--ease);
+  white-space:nowrap;max-width:calc(100vw - 32px);
+  overflow:hidden;text-overflow:ellipsis;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+}
+.ui-toast.is-visible{opacity:1;transform:translateY(0);}
+.ui-toast--ok{border-color:rgba(111,220,156,0.5);
+  box-shadow:0 14px 40px rgba(0,0,0,0.55),inset 0 1px 0 rgba(255,255,255,0.24),0 0 0 1px rgba(111,220,156,0.15);}
+.ui-toast--err{border-color:rgba(255,118,118,0.5);
+  box-shadow:0 14px 40px rgba(0,0,0,0.55),inset 0 1px 0 rgba(255,255,255,0.24),0 0 0 1px rgba(255,118,118,0.15);}
 
-@app.get("/api/channels/{cid}/export")
-def api_export(req: Request, cid: int):
-    user = auth_user(req)
-    ch = get_channel(cid)
-    if not can_read(user, ch):
-        raise HTTPException(403, "Нет доступа")
-    data = {"channel": channel_view(ch, user), "messages": STATE["messages"].get(cid, [])}
-    resp = JSONResponse(data)
-    resp.headers["Content-Disposition"] = f'attachment; filename="channel_{cid}.json"'
-    return resp
+/* Кнопка «Наверх» — liquid glass */
+.scroll-top{
+  position:fixed;
+  right:22px;
+  bottom:22px;
+  bottom:max(22px, env(safe-area-inset-bottom, 0px) + 14px);
+  width:46px;height:46px;border-radius:14px;
+  border:1px solid rgba(255,255,255,0.15);
+  background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.08));
+  backdrop-filter:blur(20px) saturate(180%) brightness(1.05);
+  -webkit-backdrop-filter:blur(20px) saturate(180%) brightness(1.05);
+  color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;z-index:250;opacity:0;transform:translateY(10px);
+  pointer-events:none;
+  transition:opacity .25s ease, transform .25s var(--ease),
+             background .18s, border-color .18s, color .18s, box-shadow .25s;
+  -webkit-appearance:none;appearance:none;
+  box-shadow:
+    0 16px 42px -14px rgba(0,0,0,0.75),
+    0 0 0 0 rgba(255,255,255,0),
+    inset 0 1px 0 rgba(255,255,255,0.35),
+    inset 0 -1px 0 rgba(255,255,255,0.05);
+}
+.scroll-top.visible{ opacity:1; transform:translateY(0); pointer-events:auto; }
+.scroll-top:hover{ background:linear-gradient(135deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.12));
+  border-color:rgba(255,255,255,0.28); box-shadow:0 20px 46px -14px rgba(0,0,0,0.8),0 0 24px -6px rgba(255,255,255,0.2),inset 0 1px 0 rgba(255,255,255,0.4); }
+.scroll-top:active{ transform:scale(.94); }
+.scroll-top svg{ width:18px; height:18px; pointer-events:none; display:block; }
 
-# ------------------------------ НАСТРОЙКИ МЕНЯ ------------------------------
-@app.patch("/api/me")
-def api_update_me(req: Request, payload: dict):
-    user = auth_user(req)
-    if "name" in payload:
-        name = str(payload["name"]).strip()
-        if not name or len(name) > 32:
-            raise HTTPException(400, "Имя: 1–32 символа")
-        user["name"] = name
-    if "color" in payload and str(payload["color"]) in PALETTE:
-        user["color"] = payload["color"]
-    if "status" in payload and str(payload["status"]) in ("online", "away", "busy"):
-        user["status"] = payload["status"]
-    if isinstance(payload.get("settings"), dict):
-        st = user["settings"]
-        for key in ("sound", "compact", "show_system"):
-            if key in payload["settings"] and isinstance(payload["settings"][key], bool):
-                st[key] = payload["settings"][key]
-    return {**public_user(user), "settings": user["settings"]}
+/* ============================================================
+   LIQUID GLASS — общий класс для поверхностей
+   .lg получает: многослойный backdrop-filter + верхний highlight +
+   тонкую градиентную кромку + мягкую тень.
+   ============================================================ */
+.lg{
+  position:relative;isolation:isolate;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06) 100%);
+  backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  border:1px solid rgba(255,255,255,0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 22px 60px -28px rgba(0,0,0,0.8);
+}
+.lg::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,
+    rgba(255,255,255,0.55) 0%,
+    rgba(255,255,255,0.05) 22%,
+    rgba(255,255,255,0) 50%,
+    rgba(255,255,255,0.05) 78%,
+    rgba(255,255,255,0.4) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;
+  mask-composite:exclude;
+  pointer-events:none;z-index:0;
+}
 
-@app.post("/api/me/password")
-def api_change_password(req: Request, payload: dict):
-    user = auth_user(req)
-    old = str(payload.get("old_password", ""))
-    new = str(payload.get("new_password", ""))
-    if sha256(old, user["salt"]) != user["hash"]:
-        raise HTTPException(403, "Неверный текущий пароль")
-    if len(new) < 4:
-        raise HTTPException(400, "Новый пароль: минимум 4 символа")
-    user["salt"] = secrets.token_hex(8)
-    user["hash"] = sha256(new, user["salt"])
-    return {"ok": True}
+.page-loader{
+  position:fixed;inset:0;z-index:99998;background:var(--bg);
+  display:grid;place-items:center;
+  transition:opacity .45s ease,visibility .45s;
+}
+.page-loader.hidden{opacity:0;visibility:hidden;pointer-events:none}
+.loader-inner{display:flex;flex-direction:column;align-items:center;gap:22px}
+.loader-mark{
+  width:54px;height:54px;border-radius:16px;
+  background:linear-gradient(140deg,#fff,#c4c4c8);
+  display:grid;place-items:center;
+  box-shadow:0 8px 28px -8px rgba(255,255,255,0.45),inset 0 -1px 0 rgba(0,0,0,0.15);
+  animation:loaderPulse 1.3s ease-in-out infinite;
+}
+.loader-mark svg{width:24px;height:24px;color:#08080a;display:block}
+@keyframes loaderPulse{
+  0%,100%{transform:scale(1);box-shadow:0 8px 28px -8px rgba(255,255,255,0.35),0 0 0 0 rgba(255,255,255,0.35)}
+  50%{transform:scale(1.06);box-shadow:0 12px 34px -8px rgba(255,255,255,0.5),0 0 0 14px rgba(255,255,255,0)}
+}
+.loader-bar{width:140px;height:2px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;position:relative}
+.loader-bar::after{
+  content:'';position:absolute;left:0;top:0;bottom:0;
+  width:40%;background:#fff;border-radius:2px;
+  animation:loaderSlide 1.3s cubic-bezier(.5,0,.5,1) infinite;
+}
+@keyframes loaderSlide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
 
-# ------------------------------ АДМИНКА ------------------------------
-@app.get("/api/admin/stats")
-def api_admin_stats(req: Request):
-    user = auth_user(req)
-    require_role(user, 2)
-    return server_info()
+/* z-stack: halos(-5), cursor-glow(-4), grid-bg(-3), sheen(-2), content(0..) */
+.bg{position:fixed;inset:0;z-index:-5;overflow:hidden;background:var(--bg)}
+.halo{position:absolute;border-radius:50%;filter:blur(150px);opacity:.6}
+.halo-1{width:820px;height:820px;background:radial-gradient(circle,rgba(160,180,255,0.14),transparent 65%);top:-300px;left:-180px;animation:drift1 32s ease-in-out infinite}
+.halo-2{width:640px;height:640px;background:radial-gradient(circle,rgba(255,200,220,0.09),transparent 65%);top:40%;right:-220px;animation:drift2 38s ease-in-out infinite}
+.halo-3{width:720px;height:720px;background:radial-gradient(circle,rgba(180,255,220,0.07),transparent 65%);bottom:-260px;left:28%;animation:drift3 44s ease-in-out infinite}
+@keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(130px,110px) scale(1.12)}}
+@keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-150px,90px) scale(1.15)}}
+@keyframes drift3{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(100px,-120px) scale(.92)}}
 
-@app.get("/api/admin/users")
-def api_admin_users(req: Request):
-    user = auth_user(req)
-    require_role(user, 2)
-    return {"users": [
-        {**public_user(u), "muted_until": u.get("muted_until", 0),
-         "banned_until": u.get("banned_until", 0)} for u in STATE["users"].values()
-    ]}
+.cursor-glow{
+  position:fixed;inset:0;z-index:-4;pointer-events:none;
+  background:radial-gradient(700px circle at var(--mx,50%) var(--my,30%),rgba(255,255,255,0.035),transparent 60%);
+}
+.grid-bg{
+  position:fixed;inset:0;z-index:-3;pointer-events:none;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.025) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(255,255,255,0.025) 1px,transparent 1px);
+  background-size:80px 80px;
+  mask-image:radial-gradient(ellipse 95% 75% at 50% 0%,#000 15%,transparent 82%);
+  -webkit-mask-image:radial-gradient(ellipse 95% 75% at 50% 0%,#000 15%,transparent 82%);
+}
 
-@app.get("/api/admin/channels")
-def api_admin_channels(req: Request):
-    user = auth_user(req)
-    require_role(user, 2)
-    return {"channels": [
-        {"id": c["id"], "name": c["name"], "type": c["type"],
-         "owner_name": c.get("owner_name"), "created": c["created"],
-         "messages": len(STATE["messages"].get(c["id"], [])),
-         "members": len(c.get("members", []))}
-        for c in STATE["channels"].values()
-    ]}
+/* ЛИКВИДНЫЙ БЛИК — слой, который «подсвечивает» стеклянные панели изнутри */
+.sheen{
+  position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(
+      520px circle at var(--sheen-x,50vw) var(--sheen-y,0vh),
+      rgba(255,255,255,0.18) 0%,
+      rgba(255,255,255,0.05) 35%,
+      transparent 65%
+    );
+  transition:background .12s ease-out;
+  will-change:background;
+}
+@media (hover:none){ .sheen{ opacity:.55; } }
 
-@app.patch("/api/admin/users/{uid}")
-def api_admin_user_action(req: Request, uid: int, payload: dict):
-    admin = auth_user(req)
-    require_role(admin, 2)
-    target = STATE["users"].get(uid)
-    if not target:
-        raise HTTPException(404, "Пользователь не найден")
-    if target["id"] == STATE["owner_id"] and admin["id"] != target["id"]:
-        raise HTTPException(403, "Нельзя управлять владельцем")
-    if target["id"] != admin["id"] and role_level(target["role"]) >= role_level(admin["role"]):
-        raise HTTPException(403, "Нельзя управлять равным или выше по роли")
-    # роль
-    if "role" in payload:
-        new_role = str(payload["role"])
-        if new_role not in ROLE_LEVEL:
-            raise HTTPException(400, "Неизвестная роль")
-        if new_role in ("admin", "owner") and admin["role"] != "owner":
-            raise HTTPException(403, "Только владелец может выдавать эту роль")
-        target["role"] = new_role
-        push_event([uid], "role_changed", {"role": new_role})
-    # переименование
-    if "name" in payload:
-        name = str(payload["name"]).strip()
-        if name and len(name) <= 32:
-            target["name"] = name
-    # мут / размут
-    if "mute_minutes" in payload:
-        m = int(payload["mute_minutes"])
-        if m > 0:
-            target["muted_until"] = now() + m * 60
-            push_event([uid], "muted", {"until_str": fmt_time(target["muted_until"])})
-        else:
-            target["muted_until"] = 0
-            push_event([uid], "unmuted", {})
-    # бан / разбан
-    if "ban" in payload:
-        if payload["ban"]:
-            target["banned_until"] = 1e15  # «навсегда» (JSON не любит inf)
-            target["ban_reason"] = str(payload.get("reason", "нарушение правил"))
-            STATE["bans"][target["username"].lower()] = {
-                "until": target["banned_until"], "reason": target["ban_reason"]}
-            for tok, uid_ in list(STATE["tokens"].items()):
-                if uid_ == uid:
-                    STATE["tokens"].pop(tok, None)
-        else:
-            target["banned_until"] = 0
-            target["ban_reason"] = ""
-            STATE["bans"].pop(target["username"].lower(), None)
-    # кик (завершить сессии)
-    if "kick" in payload:
-        target["kicked_at"] = now()
-        push_event([uid], "kicked", {"reason": str(payload.get("reason", "вы исключены"))})
-    return {**public_user(target), "muted_until": target.get("muted_until", 0),
-            "banned_until": target.get("banned_until", 0)}
+.grain{
+  position:fixed;inset:0;z-index:9998;pointer-events:none;
+  opacity:.032;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
 
-@app.get("/api/admin/settings")
-def api_admin_get_settings(req: Request):
-    user = auth_user(req)
-    require_role(user, 2)
-    return {"settings": STATE["settings"]}
+.wrap{max-width:1220px;margin:0 auto;padding:0 32px}
 
-@app.patch("/api/admin/settings")
-def api_admin_set_settings(req: Request, payload: dict):
-    user = auth_user(req)
-    require_role(user, 2)
-    s = STATE["settings"]
-    if "name" in payload:
-        name = str(payload["name"]).strip()
-        if 1 <= len(name) <= 40:
-            s["name"] = name
-    if "motd" in payload:
-        s["motd"] = str(payload["motd"])[:300]
-    if "max_message_length" in payload:
-        s["max_message_length"] = max(10, min(int(payload["max_message_length"]), 10000))
-    if "history_limit" in payload:
-        s["history_limit"] = max(10, min(int(payload["history_limit"]), 5000))
-    if "rate_limit" in payload:
-        s["rate_limit"] = max(1, min(int(payload["rate_limit"]), 300))
-    for key in ("allow_registration", "maintenance_mode", "allow_editing",
-                "allow_reactions", "allow_dm"):
-        if key in payload and isinstance(payload[key], bool):
-            s[key] = payload[key]
-    push_event(all_user_ids(), "settings_changed", {})
-    return {"settings": s}
+/* --- Лендинг: шапка-морф --- */
+body > nav.top-nav{
+  position:fixed;top:0;left:0;right:0;
+  z-index:100;padding:0;
+  transition:padding .55s var(--ease);
+  pointer-events:none;
+}
+body > nav.top-nav.scrolled{ padding:20px; }
 
-@app.post("/api/admin/broadcast")
-def api_admin_broadcast(req: Request, payload: dict):
-    user = auth_user(req)
-    require_role(user, 2)
-    text = str(payload.get("text", "")).strip()
-    if not text:
-        raise HTTPException(400, "Пустой текст объявления")
-    for cid in STATE["channels"]:
-        system_message(cid, f"📢 {text}")
-    push_event(all_user_ids(), "broadcast", {"text": text})
-    return {"ok": True}
+body > nav.top-nav .top-nav-inner{
+  pointer-events:auto;
+  display:flex;align-items:center;justify-content:space-between;gap:24px;
+  max-width:100%;margin:0 auto;
+  padding:20px 40px;
+  border-radius:0;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+  background:linear-gradient(180deg,rgba(15,15,20,0.55),rgba(12,12,16,0.4));
+  backdrop-filter:blur(22px) saturate(180%) brightness(1.05);
+  -webkit-backdrop-filter:blur(22px) saturate(180%) brightness(1.05);
+  box-shadow:0 8px 30px rgba(0,0,0,0.35),inset 0 1px 0 rgba(255,255,255,0.12);
+  transition:
+    max-width .55s var(--ease),padding .55s var(--ease),
+    border-radius .55s var(--ease),background .4s ease,
+    box-shadow .4s ease,border-color .4s ease;
+}
+body > nav.top-nav.scrolled .top-nav-inner{
+  max-width:1180px;padding:12px 14px 12px 22px;border-radius:20px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:linear-gradient(135deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 18px 52px -20px rgba(0,0,0,0.8);
+}
 
-@app.post("/api/admin/reset")
-def api_admin_reset(req: Request):
-    user = auth_user(req)
-    require_role(user, 2)
-    my_id = user["id"]
-    token = get_token(req)
-    user["role"] = "owner"
-    user["muted_until"] = 0
-    user["banned_until"] = 0
-    user["kicked_at"] = 0
-    STATE["users"] = {my_id: user}
-    STATE["tokens"] = {token: my_id} if token else {}
-    STATE["channels"] = {}
-    STATE["messages"] = {}
-    STATE["events"] = {}
-    STATE["typing"] = {}
-    STATE["bans"] = {}
-    STATE["rate"] = {}
-    STATE["seq_ch"] = 0
-    STATE["seq_msg"] = 0
-    STATE["seq_evt"] = 0
-    STATE["owner_id"] = my_id
-    bootstrap_channels()
-    return {"ok": True, "message": "Сервер сброшен. Вы остались владельцем."}
+.logo{
+  display:inline-flex;align-items:center;gap:11px;
+  font-family:'Unbounded',sans-serif;font-weight:700;
+  font-size:15px;letter-spacing:-0.01em;
+  text-decoration:none;color:#fff;white-space:nowrap;flex-shrink:0;
+}
+.logo-mark{
+  width:32px;height:32px;border-radius:10px;
+  background:linear-gradient(140deg,#fff,#c4c4c8);
+  display:grid;place-items:center;position:relative;overflow:hidden;
+  box-shadow:0 4px 16px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.15);
+  transition:transform .35s var(--ease);flex-shrink:0;
+}
+.logo:hover .logo-mark{transform:rotate(-6deg) scale(1.06)}
+.logo-mark::after{content:'';position:absolute;inset:0;background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none}
+.logo-mark svg{width:16px;height:16px;position:relative;z-index:1;color:#08080a;display:block}
+.logo-word{display:inline-flex;align-items:baseline;gap:1px}
+.logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
+.logo-word .lnet{color:var(--text-dim);font-weight:500}
 
-# ------------------------------ СЛУЖЕБНОЕ ------------------------------
-@app.get("/api/ping")
-def api_ping():
-    return {"pong": True, "time": now(), "uptime": int(now() - START_TIME)}
+.nav-links{display:flex;gap:2px;align-items:center}
+.nav-links a{
+  color:var(--text-dim);text-decoration:none;
+  font-size:13.5px;font-weight:500;
+  padding:9px 15px;border-radius:11px;
+  transition:color .2s,background .2s;
+}
+.nav-links a:hover{color:#fff;background:rgba(255,255,255,0.06)}
+.nav-links a.active{color:#fff;background:rgba(255,255,255,0.08)}
 
-@app.get("/api/health")
-def api_health():
-    return {"status": "ok", **server_info()}
+.nav-right{display:flex;align-items:center;flex-shrink:0;}
+body > nav.top-nav .nav-extra{
+  max-width:220px;opacity:1;overflow:hidden;white-space:nowrap;margin-right:10px;
+  transition:max-width .55s var(--ease),margin-right .55s var(--ease),
+             opacity .3s ease,padding .55s var(--ease),height .55s var(--ease),
+             font-size .55s var(--ease),border-radius .55s var(--ease),
+             background .28s,border-color .28s,color .28s,box-shadow .28s;
+}
+body > nav.top-nav.scrolled .nav-extra{
+  max-width:0;margin-right:0;opacity:0;padding-left:0;padding-right:0;pointer-events:none;
+}
 
-@app.get("/api/version")
-def api_version():
-    return {"name": "DSH Messenger", "version": APP_VERSION,
-            "ui": "Twitter Bootstrap 1.4.0 style (dark)", "storage": "RAM only"}
+body > nav.top-nav .logo{font-size:17px;transition:font-size .55s var(--ease);}
+body > nav.top-nav .logo-mark{
+  width:40px;height:40px;border-radius:12px;
+  transition:width .55s var(--ease),height .55s var(--ease),border-radius .55s var(--ease),transform .35s var(--ease);
+}
+body > nav.top-nav .logo-mark svg{width:20px;height:20px;transition:width .55s var(--ease),height .55s var(--ease);}
+body > nav.top-nav .nav-links a{
+  padding:12px 20px;font-size:15px;border-radius:13px;
+  transition:color .2s,background .2s,padding .55s var(--ease),font-size .55s var(--ease),border-radius .55s var(--ease);
+}
+body > nav.top-nav .btn{
+  height:50px;padding:0 26px;font-size:14.5px;border-radius:14px;
+  transition:background .28s,border-color .28s,color .28s,box-shadow .28s,
+             height .55s var(--ease),padding .55s var(--ease),
+             font-size .55s var(--ease),border-radius .55s var(--ease);
+}
+body > nav.top-nav .btn svg{width:17px;height:17px;transition:transform .35s var(--ease),width .55s var(--ease),height .55s var(--ease);}
 
-@app.get("/favicon.ico")
-def favicon():
-    svg = ("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
-           "<text y='.9em' font-size='90'>💬</text></svg>")
-    return Response(content=svg, media_type="image/svg+xml")
+body > nav.top-nav.scrolled .logo{font-size:15px;}
+body > nav.top-nav.scrolled .logo-mark{width:32px;height:32px;border-radius:10px;}
+body > nav.top-nav.scrolled .logo-mark svg{width:16px;height:16px;}
+body > nav.top-nav.scrolled .nav-links a{padding:9px 15px;font-size:13.5px;border-radius:11px;}
+body > nav.top-nav.scrolled .btn{height:44px;padding:0 20px;font-size:13.5px;border-radius:12px;}
+body > nav.top-nav.scrolled .btn svg{width:15px;height:15px;}
 
-# ======================================================================
-#  HTML / CSS / JS  (тёмная тема в духе Twitter Bootstrap 1.4.0)
-# ======================================================================
-HTML = r"""<!DOCTYPE html>
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  font-family:'Manrope',sans-serif;font-weight:600;font-size:13.5px;
+  letter-spacing:-0.005em;
+  padding:11px 20px;height:44px;
+  border-radius:12px;border:1px solid transparent;
+  text-decoration:none;position:relative;overflow:hidden;white-space:nowrap;
+  transition:background .28s, border-color .28s, color .28s, box-shadow .28s;
+  -webkit-tap-highlight-color:transparent;user-select:none;
+}
+.btn svg{width:15px;height:15px;flex-shrink:0;display:block;transition:transform .35s var(--ease)}
+.btn-primary{
+  background:linear-gradient(180deg,#ffffff,#e9e9ec);
+  color:#08080a;
+  border:1px solid rgba(255,255,255,0.55);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.9) inset,
+    0 -1px 0 rgba(0,0,0,0.15) inset,
+    0 8px 22px -8px rgba(255,255,255,0.35);
+  isolation:isolate;
+}
+.btn-primary::before{
+  content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
+  background:linear-gradient(115deg,transparent 40%,rgba(255,255,255,0.75) 50%,transparent 60%);
+  transform:translateX(-110%);
+  transition:transform .8s var(--ease);
+  pointer-events:none;z-index:0;
+}
+.btn-primary:hover::before{ transform:translateX(110%); }
+.btn-primary:hover{
+  background:linear-gradient(180deg,#fff,#f0f0f3);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,1) inset,
+    0 -1px 0 rgba(0,0,0,0.18) inset,
+    0 14px 36px -10px rgba(255,255,255,0.5);
+}
+.btn-primary:active{transform:scale(.985)}
+.btn-primary > *{position:relative;z-index:1}
+.btn-primary:hover svg{transform:translateX(3px)}
+.btn-ghost{
+  background:linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.06));
+  color:#fff;border-color:rgba(255,255,255,0.16);
+  backdrop-filter:blur(14px) saturate(180%);
+  -webkit-backdrop-filter:blur(14px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.22),
+    inset 0 -1px 0 rgba(255,255,255,0.04),
+    0 6px 18px -8px rgba(0,0,0,0.6);
+}
+.btn-ghost:hover{
+  background:linear-gradient(135deg,rgba(255,255,255,0.14),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.10));
+  border-color:rgba(255,255,255,0.28);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.32),
+    inset 0 -1px 0 rgba(255,255,255,0.06),
+    0 10px 26px -8px rgba(0,0,0,0.7);
+}
+.btn-ghost:active{transform:scale(.985)}
+
+footer{padding:80px 0 50px;border-top:1px solid var(--border);margin-top:100px}
+.foot-top{display:flex;justify-content:space-between;align-items:flex-start;gap:40px;flex-wrap:wrap;margin-bottom:54px;}
+.foot-brand{max-width:360px}
+.foot-brand .logo{margin-bottom:18px}
+.foot-brand p{color:var(--text-mute);font-size:13.5px;line-height:1.7}
+.foot-brand .dev{
+  display:inline-flex;align-items:center;gap:8px;
+  margin-top:14px;padding:7px 12px 7px 10px;border-radius:100px;
+  background:rgba(255,255,255,0.04);border:1px solid var(--border);
+  font-family:'JetBrains Mono',monospace;
+  font-size:11px;letter-spacing:0.06em;color:var(--text-dim);text-transform:uppercase;
+}
+.foot-brand .dev svg{width:12px;height:12px;color:var(--text-mute);display:block}
+.foot-brand .dev strong{color:#fff;font-weight:600}
+.foot-cols{display:flex;gap:80px;flex-wrap:wrap}
+.foot-col h4{
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  letter-spacing:0.18em;text-transform:uppercase;
+  color:var(--text-mute);margin-bottom:20px;font-weight:500;
+}
+.foot-col a{display:block;color:var(--text-dim);text-decoration:none;font-size:14.5px;padding:6px 0;transition:color .25s,padding-left .25s;width:fit-content;word-break:break-word;}
+.foot-col a:hover{color:#fff;padding-left:4px}
+.foot-bottom{display:flex;justify-content:space-between;align-items:center;gap:24px;flex-wrap:wrap;padding-top:30px;border-top:1px solid var(--border);color:var(--text-mute);font-size:12.5px;font-family:'JetBrains Mono',monospace;letter-spacing:0.05em;}
+.foot-bottom .group{color:var(--text-dim)}
+.foot-bottom .group strong{color:#fff;font-weight:600}
+.foot-socials{display:flex;gap:8px;align-items:center}
+.foot-socials a{
+  width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
+  background:var(--glass);border:1px solid var(--border-2);color:var(--text-dim);
+  transition:background .3s, border-color .3s, color .3s;text-decoration:none;
+}
+.foot-socials a:hover{background:var(--glass-hi);border-color:var(--border-3);color:#fff;}
+.foot-socials svg{width:18px;height:18px;display:block}
+
+.reveal{
+  opacity:0;
+  transition:opacity .8s var(--ease),transform .8s var(--ease),filter .8s var(--ease);
+  will-change:opacity,transform,filter;
+}
+.reveal.in{opacity:1;transform:none;filter:none;}
+.reveal--up{transform:translateY(56px)}
+.reveal--down{transform:translateY(-48px)}
+.reveal--left{transform:translateX(-64px)}
+.reveal--right{transform:translateX(64px)}
+.reveal--zoom{transform:scale(.9)}
+.reveal--blur{filter:blur(14px)}
+.reveal--rotate{transform:rotate(-3deg) translateY(30px)}
+.reveal--flip{transform:perspective(1000px) rotateX(-28deg);transform-origin:center top}
+.reveal--elastic{transform:scale(.85);transition-timing-function:cubic-bezier(.34,1.56,.64,1)}
+.reveal--skew{transform:skewY(-2.5deg) translateY(40px)}
+
+.eyebrow{
+  display:inline-flex;align-items:center;gap:10px;
+  font-family:'JetBrains Mono',monospace;
+  font-size:11.5px;font-weight:500;
+  letter-spacing:0.16em;text-transform:uppercase;
+  color:var(--text-mute);margin-bottom:22px;
+}
+.eyebrow::before{content:'';width:26px;height:1px;background:linear-gradient(90deg,var(--text-mute),transparent)}
+
+@media (max-width:1000px){.nav-links{display:none}}
+@media (max-width:720px){
+  :root{ --lg-blur:16px; }
+  .wrap{padding:0 20px}
+  body > nav.top-nav .top-nav-inner{padding:16px 20px;gap:12px;}
+  body > nav.top-nav.scrolled{padding:10px;}
+  body > nav.top-nav.scrolled .top-nav-inner{padding:9px 10px 9px 14px;border-radius:16px;}
+  .logo{font-size:13.5px;}
+  .logo-mark{width:28px;height:28px;}
+  .logo-mark svg{width:14px;height:14px;}
+  body > nav.top-nav .logo{font-size:15px;}
+  body > nav.top-nav .logo-mark{width:34px;height:34px;border-radius:10px;}
+  body > nav.top-nav .logo-mark svg{width:17px;height:17px;}
+  body > nav.top-nav .btn{height:44px;padding:0 18px;font-size:13px;}
+  body > nav.top-nav .nav-extra{display:none;}
+  body > nav.top-nav.scrolled .logo{font-size:13.5px;}
+  body > nav.top-nav.scrolled .logo-mark{width:28px;height:28px;border-radius:8px;}
+  body > nav.top-nav.scrolled .logo-mark svg{width:14px;height:14px;}
+  body > nav.top-nav.scrolled .btn{height:38px;padding:0 14px;font-size:12.5px;}
+  .foot-cols{gap:44px}
+  .foot-bottom{justify-content:center;text-align:center;flex-direction:column;gap:16px}
+  .scroll-top{ right:14px; width:44px; height:44px; }
+}
+"""
+
+
+SHELL_JS = r"""
+(function(){
+  "use strict";
+
+  document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+
+  /* ---- Курсор ---- */
+  var dot = document.querySelector(".cur-dot");
+  var ring = document.querySelector(".cur-ring");
+  if (dot && ring) {
+    var mx = innerWidth/2, my = innerHeight/2;
+    var rx = mx, ry = my, lx = mx, ly = my, vel = 0;
+    var cursorReady = false;
+    addEventListener("mousemove", function(e){
+      if (!cursorReady) { cursorReady = true; document.body.classList.add("cursor-ready"); }
+      mx = e.clientX; my = e.clientY;
+      document.documentElement.style.setProperty("--mx", mx + "px");
+      document.documentElement.style.setProperty("--my", my + "px");
+    }, { passive: true });
+    (function loop(){
+      dot.style.transform = "translate3d(" + mx + "px," + my + "px,0) translate(-50%,-50%)";
+      rx += (mx - rx) * 0.26;
+      ry += (my - ry) * 0.26;
+      var dx = mx - lx, dy = my - ly;
+      vel = Math.min(Math.hypot(dx, dy), 60);
+      lx = mx; ly = my;
+      var angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      var stretch = 1 + vel / 150;
+      var squash  = 1 - vel / 220;
+      var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
+      ring.style.transform = "translate3d(" + rx + "px," + ry + "px,0) translate(-50%,-50%) rotate(" + angle + "deg) scale(" + stretch + "," + squash + ")";
+      if (!ring.classList.contains("hover")) ring.style.borderColor = "rgba(255,255,255," + borderOp.toFixed(2) + ")";
+      requestAnimationFrame(loop);
+    })();
+    addEventListener("mousedown", function(){ ring.classList.add("click"); });
+    addEventListener("mouseup", function(){ ring.classList.remove("click"); });
+    document.querySelectorAll('a, button, .glass, .code-cell, .stat, .mock, label.checkbox-wrap, input, textarea, .tab, .drop').forEach(function(el){
+      el.addEventListener("mouseenter", function(){ ring.classList.add("hover"); });
+      el.addEventListener("mouseleave", function(){ ring.classList.remove("hover"); });
+    });
+  }
+
+  /* ---- Liquid glass: блик следует за курсором ---- */
+  (function(){
+    var root = document.documentElement;
+    var raf = 0, tx = 0, ty = 0, cx = 0, cy = 0;
+    addEventListener("mousemove", function(e){
+      tx = e.clientX; ty = e.clientY;
+      if (!raf) {
+        raf = requestAnimationFrame(function(){
+          cx += (tx - cx) * 0.22;
+          cy += (ty - cy) * 0.22;
+          root.style.setProperty("--sheen-x", cx.toFixed(1) + "px");
+          root.style.setProperty("--sheen-y", cy.toFixed(1) + "px");
+          raf = 0;
+        });
+      }
+    }, { passive: true });
+  })();
+
+  var loader = document.getElementById("pageLoader");
+  if (loader) {
+    var hide = function(){ loader.classList.add("hidden"); };
+    if (document.readyState === "complete") setTimeout(hide, 250);
+    else { addEventListener("load", function(){ setTimeout(hide, 250); }); setTimeout(hide, 2500); }
+  }
+
+  /* ---- Шапка-морф ---- */
+  var nav = document.getElementById("nav");
+  if (nav) {
+    var ticking = false;
+    var SCROLL_THRESHOLD = 80;
+    var applyState = function(){
+      nav.classList.toggle("scrolled", (window.scrollY || window.pageYOffset || 0) > SCROLL_THRESHOLD);
+    };
+    applyState();
+    addEventListener("scroll", function(){
+      if (!ticking) {
+        requestAnimationFrame(function(){ applyState(); ticking = false; });
+        ticking = true;
+      }
+    }, { passive: true });
+    addEventListener("resize", applyState, { passive: true });
+  }
+
+  /* ---- Кнопка «Наверх» ---- */
+  var scrollTopBtn = document.getElementById("scrollTopBtn");
+  if (scrollTopBtn) {
+    var stageEl = document.getElementById("stage");
+    var SCROLL_SHOW_AT = 240;
+    var currentTop = function(){
+      var a = window.scrollY || window.pageYOffset || 0;
+      var b = stageEl ? stageEl.scrollTop : 0;
+      return Math.max(a, b);
+    };
+    var applyBtn = function(){
+      scrollTopBtn.classList.toggle("visible", currentTop() > SCROLL_SHOW_AT);
+    };
+    applyBtn();
+    var stTicking = false;
+    var onAny = function(){
+      if (stTicking) return;
+      stTicking = true;
+      requestAnimationFrame(function(){ applyBtn(); stTicking = false; });
+    };
+    addEventListener("scroll", onAny, { passive: true });
+    if (stageEl) stageEl.addEventListener("scroll", onAny, { passive: true });
+    addEventListener("resize", applyBtn, { passive: true });
+    scrollTopBtn.addEventListener("click", function(){
+      try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch(e){ window.scrollTo(0, 0); }
+      if (stageEl && stageEl.scrollTop > 0) {
+        try { stageEl.scrollTo({ top: 0, behavior: "smooth" }); } catch(e){ stageEl.scrollTop = 0; }
+      }
+      setTimeout(applyBtn, 60);
+    });
+  }
+
+  var io = new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if (e.isIntersecting) {
+        var el = e.target;
+        var delay = parseInt(el.getAttribute("data-delay") || "0", 10);
+        setTimeout(function(){ el.classList.add("in"); }, delay);
+        io.unobserve(el);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: "0px 0px -50px 0px" });
+  document.querySelectorAll(".reveal").forEach(function(el){ io.observe(el); });
+
+  document.querySelectorAll('a[href^="#"]').forEach(function(a){
+    a.addEventListener("click", function(e){
+      var h = a.getAttribute("href");
+      if (h === "#" || h.length < 2) return;
+      var tg = document.querySelector(h);
+      if (!tg) return;
+      e.preventDefault();
+      scrollTo({ top: tg.getBoundingClientRect().top + scrollY - 110, behavior: "smooth" });
+    });
+  });
+
+  var codeEls = document.querySelectorAll("[data-code]");
+  if (codeEls.length) {
+    fetch("/api/random-code", { cache: "no-store" })
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (!d || !/^\d{6}$/.test(d.code)) return;
+        codeEls.forEach(function(el){ el.textContent = d.code; });
+        var cells = document.querySelectorAll(".code-cell");
+        cells.forEach(function(c, i){
+          c.textContent = d.code[i] || "0";
+          c.classList.remove("flip"); void c.offsetWidth; c.classList.add("flip");
+          c.style.animationDelay = (i * 0.06) + "s";
+        });
+        setTimeout(function(){
+          cells.forEach(function(c){ c.style.animationDelay = ""; c.classList.remove("flip"); });
+        }, 1200);
+      }).catch(function(){});
+  }
+})();
+"""
+
+FOOTER_HTML = (
+    '\n<footer>\n  <div class="wrap">\n    <div class="foot-top">\n'
+    '      <div class="foot-brand">\n'
+    '        <a href="/" class="logo">\n'
+    '          <span class="logo-mark">' + LOGO_SVG + '</span>\n'
+    '          <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
+    '        </a>\n'
+    '        <p>Нетворкинг на шести цифрах. Без аккаунтов, без лишнего — публикуйте посты, находите людей, делитесь ссылкой.</p>\n'
+    '        <div class="dev">\n'
+    '          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>\n'
+    '          <span>Разработчик · <strong>слдшр</strong></span>\n'
+    '        </div>\n'
+    '      </div>\n'
+    '      <div class="foot-cols">\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Продукт</h4>\n'
+    '          <a href="/#features">Возможности</a>\n'
+    '          <a href="/#how">Как это работает</a>\n'
+    '          <a href="/#specs">Технологии</a>\n'
+    '        </div>\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Приложение</h4>\n'
+    '          <a href="/app?mode=create">Создать пост</a>\n'
+    '          <a href="/app?mode=find">Найти пост</a>\n'
+    '        </div>\n'
+    '        <div class="foot-col">\n'
+    '          <h4>Контакты</h4>\n'
+    '          <a href="mailto:sldshr.confirmation@gmail.com">sldshr.confirmation@gmail.com</a>\n'
+    '          <a rel="me" href="https://mastodon.social/@ru_sldshr" target="_blank">Mastodon</a>\n'
+    '        </div>\n'
+    '      </div>\n'
+    '    </div>\n'
+    '    <div class="foot-bottom">\n'
+    '      <span>© 2026 СЛД·NET. Все права защищены.</span>\n'
+    '      <div class="foot-socials">\n'
+    '        <a href="https://www.youtube.com/@слдшр" target="_blank" rel="noopener" aria-label="YouTube">' + YOUTUBE_SVG + '</a>\n'
+    '        <a rel="me" href="https://mastodon.social/@ru_sldshr" target="_blank" aria-label="Mastodon">' + MASTODON_SVG + '</a>\n'
+    '      </div>\n'
+    '      <span class="group">Сделано · <strong>слдшр</strong></span>\n'
+    '    </div>\n'
+    '  </div>\n</footer>\n'
+)
+
+
+def render_shell(title: str, body: str, extra_css: str = "", og: str = "", active: str = "") -> str:
+    nav_links = [
+        ("/", "Главная"),
+        ("/#features", "Возможности"),
+        ("/#how", "Как это работает"),
+    ]
+    links_html = "".join(
+        f'<a href="{href}"{" class=\"active\"" if active == href else ""}>{label}</a>'
+        for href, label in nav_links
+    )
+    return (
+        '<!DOCTYPE html>\n<html lang="ru">\n<head>\n'
+        '<meta charset="UTF-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+        f'<title>{title}</title>\n{og}'
+        f'<link rel="icon" href="{FAVICON}">\n'
+        '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+        '<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700;800&family=Manrope:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">\n'
+        '<style>\n' + SHELL_CSS + '\n/* PAGE CSS */\n' + extra_css + '\n</style>\n'
+        '</head>\n<body>\n'
+        '<div class="page-loader" id="pageLoader" aria-hidden="true">\n'
+        '  <div class="loader-inner">\n'
+        '    <div class="loader-mark">' + LOGO_SVG + '</div>\n'
+        '    <div class="loader-bar"></div>\n'
+        '  </div>\n'
+        '</div>\n'
+        '<div class="cur-dot"></div>\n<div class="cur-ring"></div>\n'
+        '<div class="bg"><div class="halo halo-1"></div><div class="halo halo-2"></div><div class="halo halo-3"></div></div>\n'
+        '<div class="cursor-glow"></div>\n<div class="grid-bg"></div>\n<div class="sheen" aria-hidden="true"></div>\n<div class="grain"></div>\n'
+        '<nav id="nav" class="top-nav">\n'
+        '  <div class="top-nav-inner">\n'
+        '    <a href="/" class="logo">\n'
+        '      <span class="logo-mark">' + LOGO_SVG + '</span>\n'
+        '      <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>\n'
+        '    </a>\n'
+        '    <div class="nav-links">' + links_html + '</div>\n'
+        '    <div class="nav-right">\n'
+        '      <a href="/app?mode=find" class="btn btn-ghost nav-extra">\n'
+        + SEARCH_SVG + '<span>Найти</span>\n'
+        '      </a>\n'
+        '      <a href="/app?mode=create" class="btn btn-primary">\n'
+        '        <span>Открыть приложение</span>' + ARROW_SVG + '\n'
+        '      </a>\n'
+        '    </div>\n'
+        '  </div>\n'
+        '</nav>\n'
+        + body +
+        FOOTER_HTML +
+        '<button class="scroll-top" id="scrollTopBtn" type="button" aria-label="Наверх">\n'
+        '  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\n'
+        '    <path d="M12 19V5M5 12l7-7 7 7"/>\n'
+        '  </svg>\n'
+        '</button>\n'
+        '<script>\n' + UI_FRAMEWORK_JS + '\n' + SHELL_JS + '\n</script>\n'
+        '</body>\n</html>'
+    )
+
+
+# ============================================================
+# ЛЕНДИНГ
+# ============================================================
+
+LANDING_CSS = r"""
+.hero{padding:170px 0 0;position:relative;overflow:hidden}
+.hero-inner{max-width:1080px;margin:0 auto;text-align:center;position:relative;z-index:1;padding:0 8px;}
+
+.badge{
+  display:inline-flex;align-items:center;gap:10px;
+  padding:8px 16px 8px 9px;border-radius:100px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  border:1px solid rgba(255,255,255,0.22);
+  backdrop-filter:blur(16px) saturate(180%);
+  -webkit-backdrop-filter:blur(16px) saturate(180%);
+  font-size:12.5px;font-weight:600;color:#fff;
+  letter-spacing:-0.005em;margin-bottom:34px;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.28),
+    0 10px 30px -14px rgba(0,0,0,0.7);
+  opacity:0;transform:translateY(-14px);
+  animation:badgeIn .75s var(--ease) .05s both;
+  position:relative;z-index:2;max-width:100%;
+}
+.badge-dot{
+  width:20px;height:20px;border-radius:50%;
+  background:linear-gradient(140deg,#fff,#c8c8cc);
+  display:grid;place-items:center;color:#0a0a0a;
+  position:relative;flex-shrink:0;
+  box-shadow:0 2px 8px rgba(0,0,0,0.5);
+}
+.badge-dot::after{content:'';position:absolute;inset:-3px;border-radius:50%;border:1px solid rgba(255,255,255,0.28);animation:ping 2.6s ease-out infinite;}
+@keyframes ping{0%{transform:scale(1);opacity:1}100%{transform:scale(1.55);opacity:0}}
+.badge-dot svg{width:10px;height:10px;display:block}
+.badge-sep{color:rgba(255,255,255,0.3);font-weight:400;margin:0 -1px}
+@keyframes badgeIn{from{opacity:0;transform:translateY(-14px);filter:blur(5px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
+
+.hero-title{
+  font-family:'Unbounded',sans-serif;font-weight:700;
+  font-size:clamp(28px,5.2vw,60px);line-height:1.08;
+  letter-spacing:-0.04em;margin-bottom:28px;
+  display:flex;flex-direction:column;gap:8px;
+  position:relative;z-index:1;perspective:1000px;text-wrap:balance;max-width:100%;overflow-wrap:break-word;
+}
+.h1-row{display:block;text-align:center;}
+.h1-row.dim{color:var(--text-mute);font-weight:400}
+.hero-title .word{
+  display:inline-block;opacity:0;
+  transform:translateY(40%) rotateX(-55deg) scale(.96);
+  filter:blur(6px);transform-origin:bottom center;
+  animation:wordIn .75s var(--ease) both;
+  animation-delay:calc(var(--i,0) * 75ms + 140ms);
+  will-change:transform,opacity,filter;
+  margin-right:0.24em;
+}
+.hero-title .word:last-child{margin-right:0}
+@keyframes wordIn{0%{opacity:0;transform:translateY(40%) rotateX(-55deg) scale(.96);filter:blur(6px)}55%{filter:blur(1.5px)}100%{opacity:1;transform:translateY(0) rotateX(0) scale(1);filter:blur(0)}}
+
+.lead{
+  font-size:clamp(15px,1.65vw,17px);line-height:1.65;
+  color:var(--text-dim);max-width:600px;margin:0 auto 40px;
+  opacity:0;transform:translateY(18px);
+  animation:leadIn .9s var(--ease) .75s both;
+  position:relative;z-index:1;
+}
+.lead strong{color:#e8e8ea;font-weight:600;white-space:nowrap}
+.lead code{
+  font-family:'JetBrains Mono',monospace;font-size:.92em;color:var(--text);
+  background:rgba(255,255,255,0.05);padding:3px 8px;border-radius:7px;
+  border:1px solid var(--border);white-space:nowrap;
+}
+@keyframes leadIn{from{opacity:0;transform:translateY(18px);filter:blur(4px)}to{opacity:1;transform:translateY(0);filter:blur(0)}}
+
+.hero-cta{
+  display:flex;gap:12px;justify-content:center;flex-wrap:wrap;
+  opacity:0;transform:translateY(18px);
+  animation:leadIn .9s var(--ease) .95s both;
+  position:relative;z-index:1;
+}
+.hero-cta .btn{padding:15px 28px;height:auto;font-size:14.5px;border-radius:14px}
+.hero-cta .btn svg{width:16px;height:16px}
+
+.code-show{
+  margin:64px auto 0;max-width:540px;
+  display:flex;gap:9px;justify-content:center;flex-wrap:nowrap;
+  opacity:0;transform:translateY(24px);
+  animation:leadIn .9s var(--ease) 1.1s both;
+  position:relative;z-index:1;
+}
+.code-show::before{
+  content:'';position:absolute;inset:-40px -60px;
+  background:radial-gradient(ellipse at center,rgba(255,255,255,0.1),transparent 70%);
+  filter:blur(40px);pointer-events:none;z-index:-1;
+}
+.code-cell{
+  flex:1 1 0;max-width:66px;aspect-ratio:2/3;border-radius:14px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 50%,rgba(255,255,255,0.06));
+  border:1px solid rgba(255,255,255,0.16);
+  backdrop-filter:blur(16px) saturate(180%) brightness(1.05);
+  -webkit-backdrop-filter:blur(16px) saturate(180%) brightness(1.05);
+  display:grid;place-items:center;
+  font-family:'JetBrains Mono',monospace;font-weight:600;
+  font-size:clamp(20px,3.2vw,25px);color:#fff;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.30),
+    inset 0 -1px 0 rgba(255,255,255,0.04),
+    0 14px 30px -14px rgba(0,0,0,0.8);
+  animation:cellIn .6s var(--ease) both;
+  transition:transform .35s var(--ease),border-color .3s,box-shadow .35s,color .25s;
+}
+.code-cell:nth-child(1){animation-delay:.4s}
+.code-cell:nth-child(2){animation-delay:.48s}
+.code-cell:nth-child(3){animation-delay:.56s}
+.code-cell:nth-child(4){animation-delay:.64s}
+.code-cell:nth-child(5){animation-delay:.72s}
+.code-cell:nth-child(6){animation-delay:.80s}
+.code-cell:hover{
+  transform:translateY(-5px);border-color:rgba(255,255,255,0.34);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.4),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 22px 40px -14px rgba(0,0,0,0.9),
+    0 0 30px -8px rgba(255,255,255,0.2);
+}
+.code-cell.flip{animation:flipIn .55s var(--ease) both}
+@keyframes flipIn{0%{opacity:.35;transform:translateY(-8px) rotateX(-70deg);color:transparent}100%{opacity:1;transform:translateY(0) rotateX(0);color:#fff}}
+@keyframes cellIn{from{opacity:0;transform:translateY(20px) scale(.88)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+.code-caption{
+  margin-top:20px;font-size:12.5px;color:var(--text-mute);letter-spacing:0.01em;
+  opacity:0;transform:translateY(12px);
+  animation:leadIn .8s var(--ease) 1.3s both;
+  display:inline-flex;align-items:center;gap:9px;
+  font-family:'JetBrains Mono',monospace;
+}
+.code-caption svg{width:13px;height:13px;opacity:.6;display:block}
+
+.marquee{
+  margin-top:100px;padding:22px 0;
+  border-top:1px solid var(--border);border-bottom:1px solid var(--border);
+  overflow:hidden;
+  mask-image:linear-gradient(90deg,transparent,#000 10%,#000 90%,transparent);
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 10%,#000 90%,transparent);
+}
+.marquee-track{display:flex;gap:56px;width:max-content;animation:scroll 46s linear infinite;will-change:transform}
+.marquee-track span{
+  font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  letter-spacing:0.14em;text-transform:uppercase;color:var(--text-mute);
+  display:inline-flex;align-items:center;gap:56px;white-space:nowrap;
+}
+.marquee-track span::after{content:'';width:5px;height:5px;border-radius:50%;background:var(--text-mute);display:inline-block;opacity:.6}
+@keyframes scroll{to{transform:translateX(-50%)}}
+
+section{padding:110px 0;position:relative}
+.sec-head{max-width:660px;margin-bottom:52px}
+h2{
+  font-family:'Unbounded',sans-serif;font-weight:700;
+  font-size:clamp(26px,4.2vw,44px);line-height:1.08;
+  letter-spacing:-0.035em;margin-bottom:18px;text-wrap:balance;
+}
+h2 .dim{color:var(--text-mute);font-weight:400}
+.sec-head p{color:var(--text-dim);font-size:15.5px;line-height:1.65}
+
+.tile-groups{display:flex;flex-direction:column;gap:56px}
+.tile-group{display:flex;flex-direction:column;gap:18px}
+.group-head{
+  display:flex;align-items:baseline;justify-content:space-between;
+  gap:18px;flex-wrap:wrap;padding-bottom:14px;border-bottom:1px solid var(--border);
+}
+.group-title{
+  display:inline-flex;align-items:center;gap:12px;
+  font-family:'Unbounded',sans-serif;font-weight:600;
+  font-size:clamp(18px,2.4vw,22px);letter-spacing:-0.02em;color:#fff;
+}
+.group-title::before{
+  content:'';width:10px;height:10px;border-radius:50%;
+  background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.08);
+  flex-shrink:0;animation:dotPulse 2.4s ease-in-out infinite;
+}
+@keyframes dotPulse{0%,100%{box-shadow:0 0 0 4px rgba(255,255,255,0.08)}50%{box-shadow:0 0 0 8px rgba(255,255,255,0.02)}}
+.group-meta{
+  font-family:'JetBrains Mono',monospace;
+  font-size:11.5px;letter-spacing:0.1em;text-transform:uppercase;
+  color:var(--text-mute);
+}
+
+/* Liquid glass для карточек лендинга */
+.glass{
+  position:relative;border-radius:var(--radius);overflow:hidden;
+  isolation:isolate;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06) 100%);
+  backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  border:1px solid rgba(255,255,255,0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 22px 60px -28px rgba(0,0,0,0.8);
+  transition:transform .55s var(--ease),box-shadow .55s var(--ease),
+             opacity .55s var(--ease),filter .55s var(--ease),border-color .3s;
+  will-change:transform;
+}
+.glass::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,
+    rgba(255,255,255,0.55) 0%,
+    rgba(255,255,255,0.05) 22%,
+    rgba(255,255,255,0) 50%,
+    rgba(255,255,255,0.05) 78%,
+    rgba(255,255,255,0.4) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;
+  mask-composite:exclude;pointer-events:none;z-index:0;
+}
+
+.tile-pop:hover{transform:translateY(-8px) scale(1.01);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-tilt-l:hover{transform:perspective(1000px) rotateY(-4deg) rotateX(2deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-tilt-r:hover{transform:perspective(1000px) rotateY(4deg) rotateX(-2deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-zoom:hover{transform:scale(1.03);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-float-l:hover{transform:translateY(-6px) rotate(-1.5deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-float-r:hover{transform:translateY(-6px) rotate(1.5deg);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-slide:hover{transform:translateX(10px);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-glow:hover{transform:translateY(-4px);box-shadow:0 0 44px -8px rgba(255,255,255,0.28),0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.4)}
+.tile-rotate:hover{transform:rotate(-1.8deg) scale(1.01);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+.tile-skew:hover{transform:perspective(1000px) rotateX(3deg) translateY(-3px);box-shadow:0 36px 80px -30px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.32)}
+
+.bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
+.bento .glass{padding:30px;display:flex;flex-direction:column}
+.b-lg{grid-column:span 4;min-height:290px}
+.b-md{grid-column:span 3;min-height:240px}
+.b-sm{grid-column:span 2;min-height:230px}
+.icon-box{
+  width:48px;height:48px;border-radius:14px;
+  display:grid;place-items:center;
+  background:linear-gradient(135deg,rgba(255,255,255,0.14),rgba(255,255,255,0.03) 55%,rgba(255,255,255,0.09));
+  border:1px solid rgba(255,255,255,0.16);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.28);
+  margin-bottom:22px;color:var(--text-dim);
+  transition:color .3s,border-color .3s,box-shadow .3s;
+  flex-shrink:0;
+}
+.icon-box svg{width:21px;height:21px;display:block}
+.glass:hover .icon-box{color:#fff;border-color:rgba(255,255,255,0.28);box-shadow:inset 0 1px 0 rgba(255,255,255,0.4),0 0 24px -8px rgba(255,255,255,0.15)}
+.bento h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:17px;letter-spacing:-0.02em;line-height:1.3;margin-bottom:10px}
+.bento p{color:var(--text-dim);font-size:14px;line-height:1.65;max-width:48ch}
+.bento p code,.step p code,.showcase-list code{
+  font-family:'JetBrains Mono',monospace;color:var(--text);font-size:.92em;
+  background:rgba(255,255,255,0.05);padding:2px 7px;border-radius:6px;
+  border:1px solid var(--border);white-space:nowrap;
+}
+
+.feature-list{list-style:none;display:flex;flex-direction:column;gap:12px;margin-top:22px;padding-top:20px;border-top:1px solid var(--border);}
+.feature-list li{display:flex;align-items:center;gap:12px;font-size:13.5px;color:var(--text-dim);line-height:1.5;}
+.feature-list li::before{content:'';flex-shrink:0;width:6px;height:6px;border-radius:50%;background:#fff;box-shadow:0 0 0 3px rgba(255,255,255,0.08);}
+.feature-list li strong{color:#fff;font-weight:600}
+
+.showcase{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center}
+.showcase-text h2{margin-bottom:20px}
+.showcase-text p{color:var(--text-dim);font-size:15.5px;line-height:1.7;margin-bottom:28px;max-width:48ch}
+.showcase-list{display:flex;flex-direction:column;gap:14px;list-style:none}
+.showcase-list li{display:flex;align-items:flex-start;gap:12px;color:var(--text-dim);font-size:14.5px;line-height:1.6}
+.showcase-list li svg{width:18px;height:18px;flex-shrink:0;margin-top:2px;color:#fff;display:block}
+.showcase-list li strong{color:#fff;font-weight:600}
+
+.mock{
+  position:relative;border-radius:24px;padding:26px;overflow:hidden;isolation:isolate;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  border:1px solid rgba(255,255,255,0.14);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.28),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 40px 90px -30px rgba(0,0,0,0.85);
+  transition:transform .8s var(--ease);will-change:transform;
+}
+.mock::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.6) 0%,rgba(255,255,255,0.05) 22%,rgba(255,255,255,0) 50%,rgba(255,255,255,0.05) 78%,rgba(255,255,255,0.4) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:0;
+}
+.mock:hover{transform:perspective(1200px) rotateY(2deg) rotateX(-1deg)}
+.mock-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.mock-code{
+  font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;letter-spacing:0.12em;
+  padding:5px 11px;border-radius:8px;background:rgba(255,255,255,0.06);
+  border:1px solid var(--border-2);color:var(--text);
+}
+.mock-dots{display:flex;gap:6px}
+.mock-dots span{width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,0.14)}
+.mock-title{font-family:'Unbounded',sans-serif;font-size:19px;font-weight:600;letter-spacing:-0.02em;color:#fff;margin-bottom:10px}
+.mock-body{font-size:13.5px;line-height:1.65;color:var(--text-dim);margin-bottom:18px}
+.mock-gallery{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.mock-thumb{
+  aspect-ratio:1/1;border-radius:10px;
+  background:linear-gradient(140deg,rgba(255,255,255,0.16),rgba(255,255,255,0.05));
+  border:1px solid var(--border);position:relative;overflow:hidden;
+}
+.mock-thumb::after{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,0.12),transparent 60%)}
+.mock-thumb:nth-child(2)::after{background:linear-gradient(45deg,rgba(255,255,255,0.10),transparent 60%)}
+.mock-thumb:nth-child(3)::after{background:linear-gradient(160deg,rgba(255,255,255,0.14),transparent 60%)}
+
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border-radius:var(--radius);overflow:hidden;background:var(--border);border:1px solid var(--border);}
+.stat{
+  background:linear-gradient(135deg,rgba(255,255,255,0.05),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.03));
+  backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+  padding:30px 20px;text-align:center;transition:background .35s;
+}
+.stat:hover{background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.06))}
+.stat-val{
+  font-family:'Unbounded',sans-serif;font-weight:700;
+  font-size:clamp(20px,2.4vw,30px);letter-spacing:-0.035em;
+  background:linear-gradient(160deg,#fff,rgba(255,255,255,0.55));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  line-height:1.1;margin-bottom:8px;font-variant-numeric:tabular-nums;
+}
+.stat-lbl{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text-mute);letter-spacing:0.08em;text-transform:uppercase;line-height:1.35;}
+
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
+.steps::before{content:'';position:absolute;top:80px;left:12%;right:12%;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.15) 20%,rgba(255,255,255,0.15) 80%,transparent);pointer-events:none;z-index:0;}
+.step{padding:30px;display:flex;flex-direction:column;position:relative;z-index:1}
+.step-num{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text-mute);letter-spacing:0.14em;margin-bottom:20px;text-transform:uppercase;display:inline-flex;align-items:center;gap:8px;}
+.step-num::before{content:'';width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:0 0 0 4px rgba(255,255,255,0.1);display:inline-block;flex-shrink:0}
+.step h3{font-family:'Unbounded',sans-serif;font-weight:600;font-size:17.5px;letter-spacing:-0.02em;margin-bottom:10px}
+.step p{color:var(--text-dim);font-size:14px;line-height:1.65}
+
+.cta{
+  position:relative;border-radius:36px;padding:80px 40px;
+  text-align:center;overflow:hidden;isolation:isolate;
+  background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  backdrop-filter:blur(26px) saturate(180%) brightness(1.06);
+  -webkit-backdrop-filter:blur(26px) saturate(180%) brightness(1.06);
+  border:1px solid rgba(255,255,255,0.16);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.30),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 40px 100px -50px rgba(0,0,0,0.9);
+}
+.cta::before{
+  content:'';position:absolute;width:900px;height:700px;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,255,255,0.14),transparent 65%);
+  top:-400px;left:50%;transform:translateX(-50%);filter:blur(60px);pointer-events:none;
+}
+.cta::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.65) 0%,rgba(255,255,255,0.05) 22%,rgba(255,255,255,0) 50%,rgba(255,255,255,0.05) 78%,rgba(255,255,255,0.45) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:0;
+}
+.cta > *{position:relative;z-index:1}
+.cta h2{font-size:clamp(28px,4.4vw,48px);margin-bottom:18px;letter-spacing:-0.04em}
+.cta p{color:var(--text-dim);font-size:16px;max-width:500px;margin:0 auto 34px;line-height:1.65}
+.cta .btn{padding:16px 34px;height:auto;font-size:15px;border-radius:14px}
+.cta .btn svg{width:17px;height:17px}
+.cta-note{font-size:12.5px;color:var(--text-mute);margin-top:22px;margin-bottom:0;font-family:'JetBrains Mono',monospace;letter-spacing:0.06em}
+
+@media (max-width:1080px){
+  .showcase{grid-template-columns:1fr;gap:44px}
+  .mock{max-width:520px;margin:0 auto}
+  .mock:hover{transform:none}
+}
+@media (max-width:1000px){
+  .bento{grid-template-columns:repeat(4,1fr)}
+  .b-lg{grid-column:span 4}
+  .b-md{grid-column:span 4}
+  .b-sm{grid-column:span 2}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .steps{grid-template-columns:1fr}
+  .steps::before{display:none}
+}
+@media (max-width:720px){
+  .hero{padding:140px 0 0}
+  section{padding:70px 0}
+  .hero-inner{padding:0}
+  .tile-groups{gap:36px}
+  .bento{grid-template-columns:1fr;gap:14px}
+  .bento .glass{grid-column:span 1 !important;padding:26px;min-height:auto}
+  .b-lg{min-height:auto}
+  .stats{grid-template-columns:1fr 1fr}
+  .stat{padding:24px 14px}
+  .stat-val{font-size:clamp(18px,4.4vw,24px)}
+  .cta{padding:56px 24px;border-radius:26px}
+  .cta .btn{padding:15px 28px;font-size:14px;width:100%}
+  .hero-cta{flex-direction:column;align-items:stretch}
+  .hero-cta .btn{justify-content:center;width:100%}
+  .marquee-track span{font-size:12px;gap:36px}
+  .marquee-track{gap:36px}
+  .marquee{margin-top:70px}
+  .code-show{margin-top:46px;gap:6px;max-width:100%}
+  .code-cell{max-width:42px;border-radius:12px}
+  .badge{font-size:11.5px;padding:7px 13px 7px 8px;margin-bottom:28px;gap:8px}
+  .badge-dot{width:18px;height:18px}
+  .badge-dot svg{width:9px;height:9px}
+  .group-head{flex-direction:column;gap:8px;align-items:flex-start}
+  .glass, .mock, .cta{ backdrop-filter:blur(14px) saturate(180%); -webkit-backdrop-filter:blur(14px) saturate(180%); }
+}
+@media (max-width:420px){
+  .stats{grid-template-columns:1fr}
+  .mock{padding:20px}
+  .mock-title{font-size:17px}
+  .mock-gallery{gap:5px}
+}
+"""
+
+
+def build_landing() -> str:
+    body = r"""
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-inner">
+      <div class="badge">
+        <span class="badge-dot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/>
+          </svg>
+        </span>
+        <span>Без регистрации</span>
+        <span class="badge-sep">·</span>
+        <span>до 5 фото</span>
+        <span class="badge-sep">·</span>
+        <span>код из 6 цифр</span>
+      </div>
+
+      <h1 class="hero-title">
+        <span class="h1-row">
+          <span class="word" style="--i:0">Публикуйте</span><span class="word" style="--i:1">посты.</span>
+        </span>
+        <span class="h1-row dim">
+          <span class="word" style="--i:2">Делитесь</span><span class="word" style="--i:3">шестью</span><span class="word" style="--i:4">цифрами.</span>
+        </span>
+      </h1>
+
+      <p class="lead">
+        Заголовок, текст, до 5 фотографий — сервер вернёт <strong>уникальный 6-значный&nbsp;код</strong>.
+        Отправьте код или ссылку — пост откроется с превью прямо в мессенджере.
+        Ни аккаунтов, ни паролей, ни подтверждений.
+      </p>
+
+      <div class="hero-cta">
+        <a href="/app?mode=create" class="btn btn-primary">
+          <span>Создать пост</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a href="#features" class="btn btn-ghost">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg>
+          Что внутри
+        </a>
+      </div>
+
+      <div class="code-show" id="codeShow" aria-hidden="true">
+        <div class="code-cell">4</div>
+        <div class="code-cell">8</div>
+        <div class="code-cell">1</div>
+        <div class="code-cell">6</div>
+        <div class="code-cell">3</div>
+        <div class="code-cell">9</div>
+      </div>
+      <div class="code-caption">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="4" y="10" width="16" height="10" rx="2"/>
+          <path d="M8 10V6a4 4 0 018 0v4"/>
+        </svg>
+        <span>151 200 комбинаций · цифры не повторяются</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="marquee">
+    <div class="marquee-track">
+      <span>OpenGraph-превью</span><span>AES-256-GCM</span><span>6-значные коды</span>
+      <span>Автосжатие фото</span><span>zstd / gzip</span><span>До 5 фото</span>
+      <span>OpenGraph-превью</span><span>AES-256-GCM</span><span>6-значные коды</span>
+      <span>Автосжатие фото</span><span>zstd / gzip</span><span>До 5 фото</span>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head reveal reveal--up">
+      <div class="eyebrow">Что умеет СЛД·NET</div>
+      <h2>Всё по разделам.<br><span class="dim">Ничего лишнего.</span></h2>
+      <p>Четыре группы — от публикации до технологий и экспорта. Всё, что действительно есть в сервисе.</p>
+    </div>
+
+    <div class="tile-groups">
+      <div class="tile-group">
+        <div class="group-head reveal reveal--left" data-delay="0">
+          <div class="group-title">Публикация</div>
+          <div class="group-meta">Без аккаунтов · без подтверждений</div>
+        </div>
+        <div class="bento">
+          <div class="glass b-lg tile-pop reveal reveal--up" data-delay="60">
+            <div>
+              <div class="icon-box">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 3v4a1 1 0 001 1h4"/>
+                  <path d="M17 21H7a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z"/>
+                  <path d="M12 12v6M9 15h6"/>
+                </svg>
+              </div>
+              <h3>Публикация без аккаунта</h3>
+              <p>Отправили — получили код. Ни почты, ни пароля, ни подтверждений. Всё, что нужно для поста — уже внутри формы.</p>
+            </div>
+            <ul class="feature-list">
+              <li><strong>120</strong> символов в заголовке</li>
+              <li><strong>20 000</strong> символов в теле поста</li>
+              <li><strong>5 фото</strong> · до 5 МБ каждое</li>
+            </ul>
+          </div>
+          <div class="glass b-sm tile-tilt-l reveal reveal--right" data-delay="140">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="3"/>
+                <circle cx="8.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/>
+                <circle cx="15.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/>
+                <circle cx="8.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/>
+                <circle cx="15.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/>
+                <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
+              </svg>
+            </div>
+            <h3>Коды без повторов</h3>
+            <p>Все шесть цифр кода — разные. Легко продиктовать голосом, трудно перепутать при наборе.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="tile-group">
+        <div class="group-head reveal reveal--right" data-delay="0">
+          <div class="group-title">Технологии и хранение</div>
+          <div class="group-meta">AES-256 · zstd · RAM</div>
+        </div>
+        <div class="bento">
+          <div class="glass b-sm tile-tilt-r reveal reveal--zoom" data-delay="60">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 2 4 6v6c0 5 3.4 9.3 8 10 4.6-.7 8-5 8-10V6l-8-4z"/>
+                <rect x="9" y="11" width="6" height="5" rx="1"/>
+                <path d="M10 11V9.5a2 2 0 0 1 4 0V11"/>
+              </svg>
+            </div>
+            <h3>AES-256-GCM</h3>
+            <p>Каждый пост и каждое фото шифруются уникальным nonce прямо в памяти сервера. Диск не используется вовсе.</p>
+          </div>
+          <div class="glass b-sm tile-float-l reveal reveal--left" data-delay="140">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M8 3v5H3"/><path d="M16 3v5h5"/>
+                <path d="M8 21v-5H3"/><path d="M16 21v-5h5"/>
+              </svg>
+            </div>
+            <h3>Сжатие zstd / gzip</h3>
+            <p>Метаданные сжимаются перед шифрованием. Экономия памяти без потерь данных.</p>
+          </div>
+          <div class="glass b-sm tile-glow reveal reveal--blur" data-delay="220">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="6" y="6" width="12" height="12" rx="2"/>
+                <rect x="9.5" y="9.5" width="5" height="5" rx="0.5"/>
+                <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>
+              </svg>
+            </div>
+            <h3>Хранение в RAM</h3>
+            <p>Данные живут только в оперативной памяти. Перезапуск сервера полностью очищает все посты.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="tile-group">
+        <div class="group-head reveal reveal--up" data-delay="0">
+          <div class="group-title">Ссылки и превью</div>
+          <div class="group-meta">OpenGraph · единый адрес</div>
+        </div>
+        <div class="bento">
+          <div class="glass b-md tile-tilt-l reveal reveal--flip" data-delay="60">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="2.5"/>
+                <rect x="6" y="6" width="12" height="7" rx="1"/>
+                <circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/>
+                <path d="M6 13l3-2 2 2 3-3 4 4"/><path d="M8 17h8"/>
+              </svg>
+            </div>
+            <h3>OpenGraph-превью</h3>
+            <p>Ссылка <code>/p/<span data-code>482163</span></code> разворачивается в Telegram и Discord: заголовок, краткое описание и первое фото.</p>
+          </div>
+          <div class="glass b-md tile-slide reveal reveal--right" data-delay="140">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M10 13a5 5 0 007.07 0l3-3a5 5 0 00-7.07-7.07l-1.5 1.5"/>
+                <path d="M14 11a5 5 0 00-7.07 0l-3 3a5 5 0 007.07 7.07l1.5-1.5"/>
+              </svg>
+            </div>
+            <h3>Единая ссылка на пост</h3>
+            <p>Каждый пост живёт по одному адресу — <code>/p/<span data-code>482163</span></code>. Одна ссылка и для копирования, и для мессенджеров, и для перехода.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="tile-group">
+        <div class="group-head reveal reveal--left" data-delay="0">
+          <div class="group-title">Удобство</div>
+          <div class="group-meta">Скорость · галерея · сжатие</div>
+        </div>
+        <div class="bento">
+          <div class="glass b-sm tile-zoom reveal reveal--elastic" data-delay="60">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3.5l2.5 1.5"/>
+              </svg>
+            </div>
+            <h3>Мгновенный поиск</h3>
+            <p>Пост подгружается по мере ввода кода. Ввели последнюю цифру — пост уже на экране.</p>
+          </div>
+          <div class="glass b-sm tile-float-r reveal reveal--up" data-delay="140">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v11"/><path d="M8 10l4 4 4-4"/><path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/>
+              </svg>
+            </div>
+            <h3>Автосжатие до 60 КБ</h3>
+            <p>Фото пережимаются прямо в браузере перед отправкой — читаемость сохраняется, вес падает до ~60 КБ.</p>
+          </div>
+          <div class="glass b-sm tile-rotate reveal reveal--rotate" data-delay="220">
+            <div class="icon-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="14" height="14" rx="2"/>
+                <circle cx="7.5" cy="7.5" r="1.2" fill="currentColor" stroke="none"/>
+                <path d="M3 13l3-3 3 3 3-3 5 5"/>
+                <circle cx="17.5" cy="17.5" r="3.5"/><path d="m21 21-1.8-1.8"/>
+              </svg>
+            </div>
+            <h3>Галерея с зумом</h3>
+            <p>Колесо мыши, двойной клик, правая кнопка мыши, панорама по левой — как в настоящем просмотрщике. На тач-экранах — pinch.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="showcase">
+  <div class="wrap">
+    <div class="showcase">
+      <div class="showcase-text reveal reveal--left">
+        <div class="eyebrow">Как выглядит пост</div>
+        <h2>Заголовок, текст <span class="dim">и до пяти фото</span></h2>
+        <p>Каждый пост — это карточка с названием, описанием и галереей. Ничего лишнего, ничего отвлекающего.</p>
+        <ul class="showcase-list">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Заголовок</strong> — до 120 символов, чтобы передать суть в одну строку</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Тело</strong> — до 20 000 символов, с сохранением переносов строк</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Галерея</strong> — до 5 фото с зумом и панорамированием</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg><span><strong>Кнопка «копировать ссылку»</strong> — в шапке каждой карточки</span></li>
+        </ul>
+      </div>
+      <div class="mock reveal reveal--right" data-delay="120" aria-hidden="true">
+        <div class="mock-head">
+          <span class="mock-code">#<span data-code>482163</span></span>
+          <div class="mock-dots"><span></span><span></span><span></span></div>
+        </div>
+        <div class="mock-title">Как подготовить питч за 5 минут</div>
+        <div class="mock-body">Если у вас есть всего одна минута на то, чтобы объяснить идею — используйте структуру «проблема → решение → результат». Работает в 9 из 10 случаев.</div>
+        <div class="mock-gallery"><div class="mock-thumb"></div><div class="mock-thumb"></div><div class="mock-thumb"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="stats" style="padding-top:0">
+  <div class="wrap">
+    <div class="stats reveal reveal--zoom">
+      <div class="stat"><div class="stat-val">151 200</div><div class="stat-lbl">Уникальных кодов</div></div>
+      <div class="stat"><div class="stat-val">20 000</div><div class="stat-lbl">Символов в теле</div></div>
+      <div class="stat"><div class="stat-val">5 МБ</div><div class="stat-lbl">Лимит на файл</div></div>
+      <div class="stat"><div class="stat-val">60 КБ</div><div class="stat-lbl">После сжатия</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head reveal reveal--up">
+      <div class="eyebrow">Как это работает</div>
+      <h2>Три шага от идеи <span class="dim">до кода</span></h2>
+      <p>Никаких онбордингов и прогресс-баров. Заполнили, получили код, отправили.</p>
+    </div>
+    <div class="steps">
+      <div class="glass step tile-pop reveal reveal--up" data-delay="60">
+        <div class="step-num">Шаг 01</div>
+        <h3>Заполняете пост</h3>
+        <p>Заголовок, текст и до 5 фото. Перетащите файлы, выберите через диалог или вставьте из буфера.</p>
+      </div>
+      <div class="glass step tile-tilt-l reveal reveal--up" data-delay="140">
+        <div class="step-num">Шаг 02</div>
+        <h3>Получаете код</h3>
+        <p>Сервер генерирует шесть уникальных цифр и показывает их в модальном окне. Копируется одной кнопкой.</p>
+      </div>
+      <div class="glass step tile-tilt-r reveal reveal--up" data-delay="220">
+        <div class="step-num">Шаг 03</div>
+        <h3>Делитесь ссылкой</h3>
+        <p>Отправьте ссылку <code>/p/<span data-code>482163</span></code> — она развернётся в превью, а переход откроет сам пост.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="specs" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-head reveal reveal--up">
+      <div class="eyebrow">Технологии</div>
+      <h2>Всё серьёзно</h2>
+      <p>Шифрование, сжатие и мгновенный поиск — под капотом работают промышленные алгоритмы.</p>
+    </div>
+    <div class="stats reveal reveal--zoom">
+      <div class="stat"><div class="stat-val">AES-256</div><div class="stat-lbl">GCM шифрование</div></div>
+      <div class="stat"><div class="stat-val">zstd</div><div class="stat-lbl">Сжатие метаданных</div></div>
+      <div class="stat"><div class="stat-val">RAM</div><div class="stat-lbl">Хранение в памяти</div></div>
+      <div class="stat"><div class="stat-val">OG</div><div class="stat-lbl">OpenGraph-превью</div></div>
+    </div>
+  </div>
+</section>
+
+<section id="join" style="padding-top:0">
+  <div class="wrap">
+    <div class="cta reveal reveal--skew">
+      <h2>Опубликовать первый пост</h2>
+      <p>Заголовок, текст, до пяти фото — и шесть цифр, чтобы поделиться результатом.</p>
+      <a href="/app?mode=create" class="btn btn-primary">
+        <span>Открыть приложение</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <div class="cta-note">/app</div>
+    </div>
+  </div>
+</section>
+"""
+    return render_shell(
+        title="СЛД·NET — посты по 6-значному коду",
+        body=body,
+        extra_css=LANDING_CSS,
+        og='<meta name="description" content="Публикуйте посты с фото, делитесь шестью цифрами. Без аккаунтов, с шифрованием и автосжатием.">',
+    )
+
+
+# ============================================================
+# РАБОЧАЯ ОБЛАСТЬ
+# ============================================================
+
+APP_CSS = r"""
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07070a;
+  --input:rgba(255,255,255,0.025);
+  --input-focus:rgba(255,255,255,0.05);
+  --border:rgba(255,255,255,0.08);
+  --border-2:rgba(255,255,255,0.14);
+  --border-3:rgba(255,255,255,0.24);
+  --text:#f5f5f7;
+  --text-dim:#a0a0a6;
+  --text-mute:#6c6c72;
+  --glass:rgba(255,255,255,0.04);
+  --glass-hi:rgba(255,255,255,0.08);
+  --ok:#6fdc9c;
+  --warn:#e0b158;
+  --err:#ff7676;
+  --ease:cubic-bezier(.2,.8,.2,1);
+  --topbar-h:80px;
+  --lg-blur:22px;
+  --lg-sat:180%;
+  --lg-bright:1.06;
+  --sheen-x:50vw;
+  --sheen-y:0vh;
+}
+html,body{
+  background:var(--bg);color:var(--text);
+  font-family:'Manrope',system-ui,-apple-system,sans-serif;
+  font-size:15px;line-height:1.55;
+  min-height:100%;overflow-x:clip;
+  -webkit-font-smoothing:antialiased;
+  -webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;
+  -webkit-tap-highlight-color:transparent;
+}
+input,textarea,[contenteditable],.modal-code{
+  -webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;
+}
+[hidden]{display:none !important}
+::selection{background:#fff;color:#000}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:#0a0a0a}
+::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px;border:2px solid #0a0a0a}
+
+@media (hover:hover) and (pointer:fine){
+  *, *::before, *::after { cursor:none !important; }
+}
+.cur-dot,.cur-ring{
+  position:fixed;top:0;left:0;pointer-events:none;z-index:99999;
+  border-radius:50%;will-change:transform;
+  opacity:0;transition:opacity .2s ease;
+}
+body.cursor-ready .cur-dot,
+body.cursor-ready .cur-ring { opacity:1; }
+.cur-dot{width:7px;height:7px;background:#fff;box-shadow:0 0 0 1px rgba(255,255,255,0.5),0 0 14px rgba(255,255,255,0.45)}
+.cur-ring{
+  width:34px;height:34px;border:1.5px solid rgba(255,255,255,0.4);
+  transition:width .22s var(--ease),height .22s var(--ease),
+             border-color .22s,background .22s,opacity .2s;
+}
+.cur-ring.hover{width:58px;height:58px;border-color:rgba(255,255,255,0.22);background:rgba(255,255,255,0.05);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.cur-ring.click{width:24px;height:24px;background:rgba(255,255,255,0.14)}
+@media (max-width:900px),(hover:none){.cur-dot,.cur-ring{display:none}}
+
+.ui-toast-container{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  z-index:9997;display:flex;flex-direction:column;gap:8px;
+  pointer-events:none;align-items:center;padding:0 16px;max-width:100%;
+}
+.ui-toast{
+  background:rgba(18,18,22,0.72);
+  border:1px solid rgba(255,255,255,0.14);
+  color:var(--text);
+  padding:11px 18px;border-radius:14px;
+  font-size:13px;font-weight:500;
+  backdrop-filter:blur(20px) saturate(180%);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:
+    0 14px 40px rgba(0,0,0,0.55),
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05);
+  opacity:0;transform:translateY(10px);
+  transition:opacity .24s ease, transform .24s var(--ease);
+  white-space:nowrap;max-width:calc(100vw - 32px);
+  overflow:hidden;text-overflow:ellipsis;
+  font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;
+}
+.ui-toast.is-visible{opacity:1;transform:translateY(0);}
+.ui-toast--ok{border-color:rgba(111,220,156,0.5);}
+.ui-toast--err{border-color:rgba(255,118,118,0.5);}
+
+.scroll-top{
+  position:fixed;
+  right:22px;
+  bottom:22px;
+  bottom:max(22px, env(safe-area-inset-bottom, 0px) + 14px);
+  width:46px;height:46px;border-radius:14px;
+  border:1px solid rgba(255,255,255,0.15);
+  background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.08));
+  backdrop-filter:blur(20px) saturate(180%) brightness(1.05);
+  -webkit-backdrop-filter:blur(20px) saturate(180%) brightness(1.05);
+  color:#fff;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;z-index:250;opacity:0;transform:translateY(10px);
+  pointer-events:none;
+  transition:opacity .25s ease, transform .25s var(--ease),
+             background .18s, border-color .18s, color .18s, box-shadow .25s;
+  -webkit-appearance:none;appearance:none;
+  box-shadow:
+    0 16px 42px -14px rgba(0,0,0,0.75),
+    inset 0 1px 0 rgba(255,255,255,0.35),
+    inset 0 -1px 0 rgba(255,255,255,0.05);
+}
+.scroll-top.visible{ opacity:1; transform:translateY(0); pointer-events:auto; }
+.scroll-top:hover{ background:linear-gradient(135deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.12));
+  border-color:rgba(255,255,255,0.28); }
+.scroll-top:active{ transform:scale(.94); }
+.scroll-top svg{ width:18px; height:18px; pointer-events:none; display:block; }
+
+.page-loader{position:fixed;inset:0;z-index:99998;background:var(--bg);display:grid;place-items:center;transition:opacity .45s ease,visibility .45s;}
+.page-loader.hidden{opacity:0;visibility:hidden;pointer-events:none}
+.loader-inner{display:flex;flex-direction:column;align-items:center;gap:22px}
+.loader-mark{width:54px;height:54px;border-radius:16px;background:linear-gradient(140deg,#fff,#c4c4c8);display:grid;place-items:center;
+  box-shadow:0 8px 28px -8px rgba(255,255,255,0.45),inset 0 -1px 0 rgba(0,0,0,0.15);
+  animation:loaderPulse 1.3s ease-in-out infinite;}
+.loader-mark svg{width:24px;height:24px;color:#08080a;display:block}
+@keyframes loaderPulse{0%,100%{transform:scale(1);box-shadow:0 8px 28px -8px rgba(255,255,255,0.35),0 0 0 0 rgba(255,255,255,0.35)}50%{transform:scale(1.06);box-shadow:0 12px 34px -8px rgba(255,255,255,0.5),0 0 0 14px rgba(255,255,255,0)}}
+.loader-bar{width:140px;height:2px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;position:relative}
+.loader-bar::after{content:'';position:absolute;left:0;top:0;bottom:0;width:40%;background:#fff;border-radius:2px;animation:loaderSlide 1.3s cubic-bezier(.5,0,.5,1) infinite;}
+@keyframes loaderSlide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+
+.bg{position:fixed;inset:0;z-index:-5;overflow:hidden;background:var(--bg)}
+.halo{position:absolute;border-radius:50%;filter:blur(150px);opacity:.6}
+.halo-1{width:700px;height:700px;background:radial-gradient(circle,rgba(160,180,255,0.13),transparent 65%);top:-280px;left:-180px;animation:drift1 32s ease-in-out infinite}
+.halo-2{width:600px;height:600px;background:radial-gradient(circle,rgba(255,200,220,0.08),transparent 65%);bottom:-220px;right:-200px;animation:drift2 38s ease-in-out infinite}
+@keyframes drift1{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(110px,90px) scale(1.1)}}
+@keyframes drift2{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(-120px,-90px) scale(1.12)}}
+.cursor-glow{position:fixed;inset:0;z-index:-4;pointer-events:none;background:radial-gradient(560px circle at var(--mx,50%) var(--my,50%),rgba(255,255,255,0.035),transparent 60%)}
+.grid-bg{
+  position:fixed;inset:0;z-index:-3;pointer-events:none;
+  background-image:linear-gradient(rgba(255,255,255,0.022) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,0.022) 1px,transparent 1px);
+  background-size:68px 68px;
+  mask-image:radial-gradient(ellipse 95% 85% at 50% 0%,#000 25%,transparent 85%);
+  -webkit-mask-image:radial-gradient(ellipse 95% 85% at 50% 0%,#000 25%,transparent 85%);
+}
+.sheen{
+  position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:radial-gradient(
+    500px circle at var(--sheen-x,50vw) var(--sheen-y,0vh),
+    rgba(255,255,255,0.18) 0%,
+    rgba(255,255,255,0.05) 35%,
+    transparent 65%
+  );
+  transition:background .12s ease-out;will-change:background;
+}
+@media (hover:none){ .sheen{ opacity:.55; } }
+.grain{position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.03;mix-blend-mode:overlay;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+
+/* Liquid glass helper */
+.lg{
+  position:relative;isolation:isolate;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09) 0%,rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06) 100%);
+  backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(var(--lg-bright));
+  border:1px solid rgba(255,255,255,0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 22px 60px -28px rgba(0,0,0,0.8);
+}
+
+.topbar{
+  position:fixed;top:0;left:0;right:0;z-index:100;
+  padding:14px;
+  padding-top:max(14px, env(safe-area-inset-top, 0px) + 6px);
+  pointer-events:none;
+}
+.topbar-inner{
+  pointer-events:auto;
+  display:grid;
+  grid-template-columns:1fr auto 1fr;
+  align-items:center;gap:14px;
+  max-width:1160px;margin:0 auto;
+  min-height:52px;
+  padding:8px 8px 8px 16px;
+  border-radius:16px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:linear-gradient(135deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  backdrop-filter:blur(22px) saturate(180%) brightness(1.06);
+  -webkit-backdrop-filter:blur(22px) saturate(180%) brightness(1.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 18px 50px -20px rgba(0,0,0,0.75);
+}
+
+.logo{
+  grid-column:1;justify-self:start;
+  display:inline-flex;align-items:center;gap:10px;
+  font-family:'Unbounded',sans-serif;font-weight:700;
+  font-size:13.5px;letter-spacing:-0.01em;
+  text-decoration:none;color:#fff;white-space:nowrap;
+}
+.logo-mark{
+  width:28px;height:28px;border-radius:8px;
+  background:linear-gradient(140deg,#fff,#c4c4c8);
+  display:grid;place-items:center;position:relative;overflow:hidden;
+  box-shadow:0 4px 14px rgba(0,0,0,0.5),inset 0 -1px 0 rgba(0,0,0,0.15);
+  transition:transform .35s var(--ease);flex-shrink:0;
+}
+.logo:hover .logo-mark{transform:rotate(-6deg) scale(1.05)}
+.logo-mark::after{content:'';position:absolute;inset:0;background:linear-gradient(150deg,rgba(255,255,255,0.9),transparent 55%);pointer-events:none}
+.logo-mark svg{width:14px;height:14px;position:relative;z-index:1;color:#08080a;display:block}
+.logo-word{display:inline-flex;align-items:baseline;gap:1px}
+.logo-word .ldot{color:var(--text-mute);font-weight:400;margin:0 2px}
+.logo-word .lnet{color:var(--text-dim);font-weight:500}
+
+.menu{
+  grid-column:2;justify-self:center;
+  display:inline-flex;gap:4px;padding:4px;
+  border-radius:12px;
+  border:1px solid rgba(255,255,255,0.10);
+  background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.04));
+  backdrop-filter:blur(16px) saturate(180%);
+  -webkit-backdrop-filter:blur(16px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.20),
+    0 6px 18px -10px rgba(0,0,0,0.6);
+  flex-shrink:0;
+}
+.menu-switch{position:relative;display:inline-flex;gap:4px;}
+.menu-pill{
+  position:absolute;top:0;bottom:0;left:0;width:0;
+  border-radius:9px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.10));
+  border:1px solid rgba(255,255,255,0.22);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.32),0 4px 14px -6px rgba(0,0,0,0.6);
+  transform:translateX(0);
+  transition:transform .34s var(--ease), width .34s var(--ease);
+  z-index:0;pointer-events:none;
+}
+.tab{
+  position:relative;z-index:1;
+  display:inline-flex;align-items:center;gap:7px;
+  padding:9px 14px;border-radius:9px;
+  background:transparent;border:1px solid transparent;
+  color:var(--text-dim);font:inherit;font-size:13px;font-weight:500;
+  cursor:pointer;text-decoration:none;white-space:nowrap;
+  -webkit-tap-highlight-color:transparent;
+  transition:color .22s, background .22s, border-color .22s;
+}
+.tab svg{width:15px;height:15px;flex-shrink:0;display:block}
+.tab:hover{ color:#fff; }
+.tab:active{ transform:scale(.98); }
+.tab.active{ color:#fff; }
+.tab-exit-mobile{ display:none; }
+
+.back-btn{
+  grid-column:3;justify-self:end;
+  display:inline-flex;align-items:center;gap:7px;
+  padding:9px 14px;border-radius:10px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:linear-gradient(135deg,rgba(255,255,255,0.07),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.05));
+  color:var(--text-dim);
+  font:inherit;font-size:13px;font-weight:500;
+  text-decoration:none;white-space:nowrap;
+  backdrop-filter:blur(14px) saturate(180%);
+  -webkit-backdrop-filter:blur(14px) saturate(180%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.20);
+  transition:color .2s, background .2s, border-color .2s, box-shadow .2s;
+  -webkit-tap-highlight-color:transparent;
+}
+.back-btn svg{width:14px;height:14px;display:block}
+.back-btn:hover{ color:#fff; border-color:rgba(255,255,255,0.26); box-shadow:inset 0 1px 0 rgba(255,255,255,0.32),0 0 20px -8px rgba(255,255,255,0.2); }
+.back-btn:active{ transform:scale(.98); }
+
+@media (display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui) {
+  .tab-exit-mobile { display:none !important; }
+  .back-btn { display:none !important; }
+  .logo { pointer-events:none; }
+}
+
+.app{
+  min-height:100dvh;display:flex;flex-direction:column;align-items:center;
+  padding:calc(var(--topbar-h, 80px) + 24px) 20px 40px;
+}
+.stage{width:100%;max-width:560px;margin:auto 0}
+.stage[hidden]{display:none}
+.panel{position:absolute;top:0;left:0;right:0;display:flex;flex-direction:column;gap:12px;opacity:0;pointer-events:none;visibility:hidden;transition:opacity .22s ease;}
+.panel.active{position:relative;opacity:1;pointer-events:auto;visibility:visible}
+
+.card{
+  position:relative;border-radius:18px;isolation:isolate;
+  padding:18px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.09),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.06));
+  backdrop-filter:blur(22px) saturate(180%) brightness(1.06);
+  -webkit-backdrop-filter:blur(22px) saturate(180%) brightness(1.06);
+  border:1px solid rgba(255,255,255,0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.24),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 22px 60px -28px rgba(0,0,0,0.8);
+}
+.card::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,
+    rgba(255,255,255,0.55) 0%,
+    rgba(255,255,255,0.05) 22%,
+    rgba(255,255,255,0) 50%,
+    rgba(255,255,255,0.05) 78%,
+    rgba(255,255,255,0.4) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:0;
+}
+
+.input-wrap{position:relative;display:flex}
+.input-wrap + .input-wrap{margin-top:10px}
+.input-wrap .iw-icon{position:absolute;left:13px;width:16px;height:16px;color:var(--text-mute);pointer-events:none;transition:color .18s;}
+.input-wrap input.field,.input-wrap textarea.field{padding-left:40px}
+.input-wrap input.field + .iw-icon,.input-wrap textarea.field + .iw-icon{top:13px}
+.input-wrap.textarea-wrap .iw-icon{top:14px}
+.input-wrap:focus-within .iw-icon{color:var(--text)}
+
+.field{
+  width:100%;
+  background:linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.025));
+  border:1px solid rgba(255,255,255,0.10);border-radius:12px;
+  padding:12px 15px;color:var(--text);font:inherit;font-size:14px;outline:none;
+  backdrop-filter:blur(12px) saturate(180%);
+  -webkit-backdrop-filter:blur(12px) saturate(180%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);
+  transition:border-color .18s,background .18s,box-shadow .18s;
+  -webkit-appearance:none;appearance:none;
+}
+.field::placeholder{color:var(--text-mute)}
+.field:focus{
+  border-color:rgba(255,255,255,0.24);
+  background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.015) 55%,rgba(255,255,255,0.04));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 0 0 3px rgba(255,255,255,0.05);
+}
+textarea.field{min-height:150px;resize:none;line-height:1.55;font-family:inherit;scrollbar-width:thin}
+
+.input-wrap input.field{ padding-right:76px; }
+.input-wrap textarea.field{ padding-right:76px; padding-bottom:32px; }
+
+.input-count{
+  position:absolute;right:14px;top:50%;transform:translateY(-50%);
+  font-size:10.5px;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em;
+  pointer-events:none;color:var(--ok);opacity:0.8;
+  transition:color .25s, opacity .2s;
+  font-variant-numeric:tabular-nums;z-index:1;
+}
+.input-wrap.textarea-wrap .input-count{ top:auto; bottom:10px; transform:none; }
+.input-wrap:focus-within .input-count{ opacity:1; }
+.input-wrap.warn .input-count{ color:var(--warn); }
+.input-wrap.max  .input-count{ color:var(--err); }
+
+.checkbox-wrap{
+  display:flex;align-items:flex-start;gap:11px;
+  margin-top:12px;padding:12px 14px;border-radius:12px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.025));
+  border:1px solid rgba(255,255,255,0.10);
+  cursor:pointer;user-select:none;transition:border-color .18s,background .18s;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);
+}
+.checkbox-wrap:hover{border-color:rgba(255,255,255,0.18);background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.015) 55%,rgba(255,255,255,0.04))}
+.checkbox-wrap input{position:absolute;opacity:0;pointer-events:none}
+.checkbox-box{
+  flex-shrink:0;width:20px;height:20px;border-radius:6px;
+  border:1.5px solid var(--border-3);background:transparent;
+  display:grid;place-items:center;margin-top:1px;
+  transition:background .2s,border-color .2s;
+}
+.checkbox-box svg{width:12px;height:12px;color:#08080a;opacity:0;transform:scale(.6);transition:opacity .18s,transform .18s;display:block}
+.checkbox-wrap input:checked + .checkbox-box{background:#fff;border-color:#fff}
+.checkbox-wrap input:checked + .checkbox-box svg{opacity:1;transform:scale(1)}
+.checkbox-label{font-size:13px;color:var(--text-dim);line-height:1.5;min-width:0}
+.checkbox-label strong{color:var(--text);font-weight:600}
+
+.drop{
+  margin-top:10px;border:1px dashed var(--border-2);border-radius:12px;
+  padding:20px 14px;text-align:center;color:var(--text-dim);cursor:pointer;
+  background:linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.025));
+  line-height:1.55;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);
+  transition:border-color .18s,color .18s,background .18s;
+  display:flex;flex-direction:column;align-items:center;gap:7px;
+}
+.drop .drop-icon{width:22px;height:22px;color:var(--text-mute);transition:color .18s;display:block}
+.drop .drop-label{font-size:13px;color:var(--text-dim);transition:color .18s}
+.drop .drop-hint{font-size:11.5px;color:var(--text-mute)}
+.drop:hover{border-color:var(--border-3);background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.015) 55%,rgba(255,255,255,0.04))}
+.drop:hover .drop-icon,.drop:hover .drop-label{color:var(--text)}
+.drop.filled{border-style:solid;border-color:var(--border-3)}
+.drop.filled .drop-icon,.drop.filled .drop-label{color:var(--text)}
+.drop.busy{pointer-events:none;opacity:.7}
+
+.previews{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:8px;margin-top:10px}
+.preview{position:relative;aspect-ratio:1/1;border-radius:10px;overflow:hidden;background:var(--input);border:1px solid var(--border);animation:popIn .35s var(--ease);}
+@keyframes popIn{from{opacity:0;transform:scale(.9)}to{opacity:1;transform:scale(1)}}
+.preview img{width:100%;height:100%;object-fit:cover;display:block}
+.preview .pv-badge{
+  position:absolute;bottom:5px;left:5px;
+  font-family:'JetBrains Mono',monospace;font-size:9.5px;
+  padding:2px 6px;border-radius:5px;
+  background:rgba(10,10,10,0.8);border:1px solid rgba(255,255,255,0.1);
+  color:var(--text-dim);letter-spacing:0.02em;
+}
+.preview button{
+  position:absolute;top:5px;right:5px;width:22px;height:22px;border-radius:7px;
+  border:1px solid rgba(255,255,255,0.18);
+  background:rgba(10,10,10,0.85);color:var(--text);
+  font-size:12px;line-height:1;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .18s,border-color .18s;
+}
+.preview button:hover{background:rgba(255,118,118,0.25);border-color:rgba(255,118,118,0.5)}
+
+.row{display:flex;gap:10px;margin-top:16px;flex-wrap:nowrap}
+.btn{
+  flex:1 1 0;min-width:0;height:46px;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:0 18px;border-radius:12px;border:1px solid transparent;
+  background:transparent;color:var(--text);
+  font:inherit;font-size:13.5px;font-weight:600;
+  cursor:pointer;user-select:none;position:relative;overflow:hidden;
+  -webkit-tap-highlight-color:transparent;
+  transition:background .25s, border-color .25s, color .25s, box-shadow .25s;
+  white-space:nowrap;isolation:isolate;
+}
+.btn svg{width:15px;height:15px;flex-shrink:0;display:block;transition:transform .3s var(--ease)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{
+  background:linear-gradient(180deg,#ffffff,#e9e9ec);
+  color:#08080a;
+  border:1px solid rgba(255,255,255,0.55);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,0.9) inset,
+    0 -1px 0 rgba(0,0,0,0.15) inset,
+    0 8px 22px -8px rgba(255,255,255,0.35);
+}
+.btn.primary::before{
+  content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;
+  background:linear-gradient(115deg,transparent 40%,rgba(255,255,255,0.75) 50%,transparent 60%);
+  transform:translateX(-110%);
+  transition:transform .8s var(--ease);pointer-events:none;z-index:0;
+}
+.btn.primary:hover::before{ transform:translateX(110%); }
+.btn.primary:hover:not(:disabled){
+  background:linear-gradient(180deg,#fff,#f0f0f3);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,1) inset,
+    0 -1px 0 rgba(0,0,0,0.18) inset,
+    0 14px 36px -10px rgba(255,255,255,0.5);
+}
+.btn.primary:active:not(:disabled){transform:scale(.985)}
+.btn.primary > *{position:relative;z-index:1}
+.btn.primary:hover:not(:disabled) svg{transform:translateX(3px)}
+.btn.ghost{
+  background:linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.06));
+  color:var(--text);border-color:rgba(255,255,255,0.16);
+  backdrop-filter:blur(14px) saturate(180%);
+  -webkit-backdrop-filter:blur(14px) saturate(180%);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.22),
+    inset 0 -1px 0 rgba(255,255,255,0.04),
+    0 6px 18px -8px rgba(0,0,0,0.6);
+}
+.btn.ghost:hover:not(:disabled){
+  background:linear-gradient(135deg,rgba(255,255,255,0.14),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.10));
+  border-color:rgba(255,255,255,0.28);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.32),
+    inset 0 -1px 0 rgba(255,255,255,0.06),
+    0 10px 26px -8px rgba(0,0,0,0.7);
+}
+.btn.ghost:active:not(:disabled){transform:scale(.985)}
+
+.otp-row{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:nowrap}
+.otp{display:flex;gap:6px;justify-content:center;align-items:center;margin:0}
+.otp-cell{
+  width:clamp(34px,9.5vw,46px);height:clamp(46px,12vw,56px);
+  padding:0;text-align:center;
+  font-family:'JetBrains Mono',monospace;font-size:clamp(17px,4.6vw,20px);font-weight:600;
+  color:var(--text);
+  background:linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.025));
+  border:1px solid rgba(255,255,255,0.10);border-radius:11px;
+  outline:none;caret-color:transparent;
+  -webkit-appearance:none;appearance:none;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);
+  transition:border-color .18s,background .18s,box-shadow .18s;
+}
+.otp-cell:hover{background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.015) 55%,rgba(255,255,255,0.04))}
+.otp-cell:focus{
+  background:linear-gradient(135deg,rgba(255,255,255,0.08),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.05));
+  border-color:rgba(255,255,255,0.24);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 0 0 3px rgba(255,255,255,0.05);
+}
+.otp-copy{
+  flex-shrink:0;width:clamp(46px,12vw,56px);height:clamp(46px,12vw,56px);
+  border-radius:11px;
+  border:1px solid rgba(255,255,255,0.10);
+  background:linear-gradient(135deg,rgba(255,255,255,0.035),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.025));
+  color:var(--text-mute);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;-webkit-appearance:none;appearance:none;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.08);
+  transition:background .18s,border-color .18s,color .18s;
+}
+.otp-copy svg{width:18px;height:18px;pointer-events:none;display:block}
+.otp-copy:hover:not(:disabled){background:linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.015) 55%,rgba(255,255,255,0.04));border-color:var(--border-3);color:var(--text)}
+.otp-copy:disabled{opacity:.35;cursor:not-allowed}
+.otp-copy.copied{color:var(--ok);border-color:rgba(111,220,156,0.5);background:rgba(111,220,156,0.08)}
+.otp-copy .icon-check{display:none}
+.otp-copy.copied .icon-copy{display:none}
+.otp-copy.copied .icon-check{display:block}
+@keyframes shake{0%,100%{transform:translateX(0)}20%{transform:translateX(-7px)}40%{transform:translateX(7px)}60%{transform:translateX(-4px)}80%{transform:translateX(4px)}}
+.otp.shake{animation:shake .32s ease}
+.otp.shake .otp-cell{border-color:rgba(255,118,118,0.7);background:rgba(255,118,118,0.08)}
+
+.center{text-align:center;padding:8px 0}
+.spinner{width:22px;height:22px;border-radius:50%;border:2px solid var(--border-2);border-top-color:var(--text);animation:spin .7s linear infinite;margin:0 auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner-label{margin-top:10px;font-size:12px;color:var(--text-dim);text-align:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.04em}
+
+#createMsg:not(:empty){margin-top:14px}
+#createMsg .msg{margin-top:0}
+
+.msg{
+  display:flex;align-items:flex-start;gap:10px;
+  border-radius:11px;padding:12px 14px;font-size:13px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.03));
+  color:var(--text);line-height:1.5;
+  border:1px solid var(--border);
+  word-break:break-word;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);
+  animation:msgIn .3s var(--ease);
+}
+.msg-icon{flex-shrink:0;display:flex;}
+.msg-icon svg{width:16px;height:16px;display:block;margin-top:1px;}
+.msg-text{min-width:0;word-break:break-word;}
+.msg.err{background:rgba(255,118,118,0.08);border-color:rgba(255,118,118,0.32);color:#ffb8b8}
+.msg.ok{background:rgba(111,220,156,0.08);border-color:rgba(111,220,156,0.3);color:#b1f0c8}
+@keyframes msgIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+
+/* --- Пост --- */
+.post-header{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;}
+.post-code{
+  font-family:'JetBrains Mono',monospace;font-size:11.5px;font-weight:600;
+  letter-spacing:0.14em;color:var(--text-mute);text-transform:uppercase;
+  padding:6px 10px;border-radius:8px;
+  border:1px solid rgba(255,255,255,0.12);
+  background:linear-gradient(135deg,rgba(255,255,255,0.05),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.03));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.10);
+}
+.post-copy-btn{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:7px 12px;border-radius:10px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:linear-gradient(135deg,rgba(255,255,255,0.07),rgba(255,255,255,0.01) 55%,rgba(255,255,255,0.05));
+  color:var(--text-dim);
+  font:inherit;font-size:12px;font-weight:500;
+  cursor:pointer;-webkit-tap-highlight-color:transparent;
+  backdrop-filter:blur(14px) saturate(180%);
+  -webkit-backdrop-filter:blur(14px) saturate(180%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.20);
+  transition:background .18s, border-color .18s, color .18s, box-shadow .2s;
+  white-space:nowrap;-webkit-appearance:none;appearance:none;
+}
+.post-copy-btn:hover{ background:linear-gradient(135deg,rgba(255,255,255,0.12),rgba(255,255,255,0.03) 55%,rgba(255,255,255,0.09)); border-color:rgba(255,255,255,0.26); color:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.30),0 0 20px -8px rgba(255,255,255,0.2); }
+.post-copy-btn.copied{ color:var(--ok); border-color:rgba(111,220,156,0.5); background:rgba(111,220,156,0.08); }
+.post-copy-btn svg{ width:13px; height:13px; display:block; pointer-events:none; }
+.post-copy-btn .sl-check{ display:none; }
+.post-copy-btn.copied .sl-copy{ display:none; }
+.post-copy-btn.copied .sl-check{ display:block; }
+
+.post-title{margin:0 0 8px;font-family:'Unbounded',sans-serif;font-size:17px;font-weight:600;line-height:1.3;color:#fff;word-break:break-word;letter-spacing:-0.02em;}
+.post-meta{font-size:12px;color:var(--text-dim);margin-bottom:14px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-family:'JetBrains Mono',monospace;letter-spacing:0.01em;}
+.post-body{font-size:14px;line-height:1.65;color:var(--text);white-space:pre-wrap;word-break:break-word;}
+.post-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;margin-top:16px}
+.post-gallery img{width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:10px;cursor:zoom-in;background:var(--input);border:1px solid var(--border);transition:border-color .18s,transform .35s var(--ease);}
+.post-gallery img:hover{border-color:var(--border-3);transform:translateY(-2px)}
+
+/* Lightbox */
+.lightbox{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.96);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);user-select:none;-webkit-user-select:none;touch-action:none;transition:background-color .2s ease;overscroll-behavior:contain;}
+.lightbox[hidden]{display:none}
+.lb-viewport{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:default;touch-action:none}
+.lb-transform{display:flex;align-items:center;justify-content:center;transform-origin:center center;will-change:transform}
+.lb-img{display:block;max-width:82vw;max-height:78vh;object-fit:contain;border-radius:8px;user-select:none;-webkit-user-select:none;-webkit-user-drag:none;background-color:#1a1a1a;
+  background-image:
+    linear-gradient(45deg,rgba(255,255,255,.04) 25%,transparent 25%),
+    linear-gradient(-45deg,rgba(255,255,255,.04) 25%,transparent 25%),
+    linear-gradient(45deg,transparent 75%,rgba(255,255,255,.04) 75%),
+    linear-gradient(-45deg,transparent 75%,rgba(255,255,255,.04) 75%);
+  background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0px;transition:opacity .18s ease;}
+.lb-img.loading{opacity:0.25}
+.lb-loading{position:absolute;top:50%;left:50%;width:30px;height:30px;margin:-15px 0 0 -15px;border:2px solid rgba(255,255,255,0.15);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;z-index:3;pointer-events:none;opacity:0;transition:opacity .18s ease;}
+.lightbox.loading .lb-loading{opacity:1}
+.lb-btn{position:absolute;width:42px;height:42px;border-radius:12px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 55%,rgba(255,255,255,0.08));backdrop-filter:blur(14px) saturate(180%);-webkit-backdrop-filter:blur(14px) saturate(180%);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:2;box-shadow:inset 0 1px 0 rgba(255,255,255,0.24);transition:background .18s,border-color .18s,transform .18s;}
+.lb-btn svg{width:18px;height:18px;pointer-events:none;display:block}
+.lb-btn:hover{background:linear-gradient(135deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04) 55%,rgba(255,255,255,0.12));border-color:rgba(255,255,255,0.28);}
+.lb-btn:active{transform:scale(.94)}
+.lb-btn[hidden]{display:none}
+.lb-close{top:16px;right:16px}
+.lb-prev{left:16px;top:50%;transform:translateY(-50%)}
+.lb-next{right:16px;top:50%;transform:translateY(-50%)}
+.lb-counter{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);padding:7px 16px;border-radius:11px;background:rgba(15,15,15,0.7);backdrop-filter:blur(12px) saturate(180%);-webkit-backdrop-filter:blur(12px) saturate(180%);border:1px solid rgba(255,255,255,0.14);font-size:12.5px;color:var(--text);font-family:'JetBrains Mono',monospace;letter-spacing:.06em;z-index:2;pointer-events:none;box-shadow:inset 0 1px 0 rgba(255,255,255,0.18);}
+.lb-zoom-badge{position:absolute;top:16px;left:16px;padding:5px 11px;border-radius:10px;background:rgba(15,15,15,0.7);backdrop-filter:blur(12px) saturate(180%);-webkit-backdrop-filter:blur(12px) saturate(180%);border:1px solid rgba(255,255,255,0.14);font-size:11.5px;color:var(--text);font-family:'JetBrains Mono',monospace;z-index:2;pointer-events:none;opacity:0;transition:opacity .18s ease;box-shadow:inset 0 1px 0 rgba(255,255,255,0.18);}
+.lb-zoom-badge.visible{opacity:1}
+.lb-hint{position:absolute;bottom:64px;left:50%;transform:translateX(-50%);font-size:11.5px;color:var(--text-mute);z-index:2;pointer-events:none;white-space:nowrap;font-family:'JetBrains Mono',monospace;letter-spacing:0.02em;text-align:center;padding:0 16px;}
+.lb-hint-mobile{display:none}
+
+.modal{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:20px;animation:fadeIn .22s ease;}
+.modal[hidden]{display:none}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.modal-card{
+  width:100%;max-width:400px;padding:28px 24px 22px;border-radius:22px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.10),rgba(255,255,255,0.02) 45%,rgba(255,255,255,0.07));
+  backdrop-filter:blur(28px) saturate(180%) brightness(1.06);
+  -webkit-backdrop-filter:blur(28px) saturate(180%) brightness(1.06);
+  border:1px solid rgba(255,255,255,0.16);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.30),
+    inset 0 -1px 0 rgba(255,255,255,0.05),
+    0 30px 80px -20px rgba(0,0,0,0.9);
+  text-align:center;animation:modalPop .32s var(--ease);
+  isolation:isolate;position:relative;
+}
+.modal-card::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,rgba(255,255,255,0.6) 0%,rgba(255,255,255,0.05) 22%,rgba(255,255,255,0) 50%,rgba(255,255,255,0.05) 78%,rgba(255,255,255,0.4) 100%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:0;
+}
+@keyframes modalPop{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+.modal-icon{width:48px;height:48px;margin:0 auto 14px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(111,220,156,0.12);color:var(--ok);border:1px solid rgba(111,220,156,0.32);box-shadow:inset 0 1px 0 rgba(255,255,255,0.20);}
+.modal-icon svg{width:22px;height:22px;display:block}
+.modal-title{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:600;margin:0 0 6px;color:#fff;letter-spacing:-0.02em}
+.modal-sub{font-size:12.5px;color:var(--text-dim);margin:0 0 18px;line-height:1.5}
+.modal-code{font-family:'JetBrains Mono',monospace;font-size:38px;font-weight:600;letter-spacing:12px;text-indent:12px;color:#fff;margin:8px 0 10px}
+.modal-url{font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text);padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid var(--border);word-break:break-all;margin-bottom:8px;-webkit-user-select:text;-moz-user-select:text;-ms-user-select:text;user-select:text;}
+.modal-hint{font-size:11.5px;color:var(--text-mute);margin-bottom:20px;font-family:'JetBrains Mono',monospace;letter-spacing:0.02em}
+.modal-actions{display:flex;gap:8px}
+.modal-actions .btn{flex:1;height:42px;font-size:13px}
+
+@media (max-width:820px){ .topbar-inner{padding:8px 8px 8px 14px;} }
+@media (max-width:640px){
+  .card{padding:15px;border-radius:16px}
+  .field{padding:11px 14px;font-size:14px}
+  .input-wrap input.field,.input-wrap textarea.field{padding-left:38px}
+  .btn{height:44px;font-size:13px;padding:0 14px}
+  .row{gap:8px;margin-top:14px}
+  .otp-row{gap:8px}
+  .otp{gap:5px}
+  .modal-card{padding:24px 18px 18px;border-radius:18px}
+  .modal-code{font-size:32px;letter-spacing:9px;text-indent:9px}
+}
+@media (max-width: 720px){
+  :root{ --lg-blur:16px; }
+  html, body { height: 100%;overflow: hidden;overscroll-behavior: none;background: var(--bg); }
+  .app {
+    position: fixed;inset: 0;height: 100dvh;min-height: 0;overflow: hidden;
+    padding: calc(var(--topbar-h, 100px) + 12px) 14px calc(18px + env(safe-area-inset-bottom, 0px));
+    display: flex;flex-direction: column;align-items: center;
+  }
+  .stage {
+    width: 100%;max-width: 560px;max-height: 100%;
+    overflow-y: auto;overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;overscroll-behavior: contain;
+    scrollbar-width: none;margin: auto 0;padding: 4px 0;
+  }
+  .stage::-webkit-scrollbar{ display:none; }
+  .topbar{padding:10px;padding-top:max(10px, env(safe-area-inset-top, 0px) + 4px);}
+  .topbar-inner{min-height:48px;padding:6px 6px 6px 10px;gap:10px;border-radius:14px;grid-template-columns: 1fr;justify-items: center;}
+  .topbar .logo { display: none; }
+  .topbar .menu { grid-column:1; justify-self:center; padding:3px; }
+  .topbar .back-btn { display: none; }
+  .tab-exit-mobile{ display: inline-flex; }
+  .lb-btn{ width:44px; height:44px; }
+  .lb-close{ top:12px; right:12px; }
+  .lb-prev, .lb-next{ top: auto; bottom: 84px; transform: none; width: 48px; height: 48px; opacity: .92; }
+  .lb-prev{ left: 20px; }
+  .lb-next{ right: 20px; }
+  .lb-counter{ bottom: calc(20px + env(safe-area-inset-bottom, 0px)); font-size: 12px; padding: 6px 14px; }
+  .lb-zoom-badge{ top:12px; left:12px; }
+  .lb-img{ max-width: 96vw; max-height: 72vh; }
+  .lb-hint{ display: none; }
+  .lb-hint-mobile{ display: block; position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--text-mute); font-family:'JetBrains Mono',monospace; letter-spacing: 0.02em; z-index: 2; pointer-events: none; white-space: nowrap; text-align: center; max-width: 92vw; padding: 0 12px; }
+  .scroll-top{ right:14px; width:44px; height:44px; }
+  .card{ backdrop-filter:blur(16px) saturate(180%); -webkit-backdrop-filter:blur(16px) saturate(180%); }
+}
+@media (max-width: 480px){
+  .tab span{ display: inline; }
+  .tab svg{ width: 14px; height: 14px; }
+  .tab{ padding: 9px 10px; font-size: 12.5px; }
+}
+@media (max-width: 380px){
+  .tab span{ display: none; }
+  .tab{ padding: 10px 11px; }
+  .tab svg{ width: 16px; height: 16px; }
+}
+"""
+
+
+APP = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>__SERVER_NAME__</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>">
-<style>
-/* ===== база (Bootstrap 1.4.0 dark) ===== */
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body {
-  background: #101216;
-  color: #c8cdd3;
-  font: 13px/18px "Helvetica Neue", Helvetica, Arial, sans-serif;
-  padding-top: 40px;
-}
-a { color: #5aa9e6; text-decoration: none; }
-a:hover { color: #8cc4f0; }
-h1, h2, h3, h4 { color: #fff; text-rendering: optimizelegibility; }
-h2 { font-size: 22px; line-height: 30px; }
-h3 { font-size: 18px; line-height: 27px; }
-h4 { font-size: 14px; }
-.muted-text { color: #6b7683; font-size: 12px; }
-.container { width: 940px; margin: 0 auto; }
-
-/* сетка 16 колонок как в 1.4.0: 40px колонка + 20px отступ */
-.row { margin-left: -20px; zoom: 1; }
-.row:after { display: block; clear: both; content: ""; }
-.span1{width:40px}.span2{width:100px}.span3{width:160px}.span4{width:220px}
-.span5{width:280px}.span6{width:340px}.span7{width:400px}.span8{width:460px}
-.span9{width:520px}.span10{width:580px}.span11{width:640px}.span12{width:700px}
-.span13{width:760px}.span14{width:820px}.span15{width:880px}.span16{width:940px}
-[class*="span"] { float: left; margin-left: 20px; }
-
-/* ===== topbar (чёрная шапка 1.4.0) ===== */
-.topbar { position: fixed; top: 0; left: 0; right: 0; height: 40px; z-index: 1000;
-  background-color: #000; background-image: linear-gradient(#181818, #050505);
-  background-repeat: repeat-x; border-bottom: 1px solid #000;
-  box-shadow: 0 1px 3px rgba(0,0,0,.6); }
-.topbar-inner { padding: 0 20px; }
-.topbar h3 a, .topbar .brand { float: left; display: block; padding: 8px 20px 8px 0;
-  color: #fff; font-size: 18px; font-weight: bold; line-height: 24px; text-decoration: none; }
-.topbar .nav { float: right; margin: 0; padding: 0; list-style: none; }
-.topbar ul.nav li { float: left; display: block; }
-.topbar ul.nav a { display: block; padding: 9px 12px; color: #bfbfbf; text-decoration: none; font-size: 13px; }
-.topbar ul.nav a:hover { color: #fff; }
-.topbar ul.nav li.active a { color: #fff; background: rgba(255,255,255,.15); border-radius: 4px; }
-.topbar form { float: right; margin: 0; padding: 5px 0 5px 10px; }
-.topbar form input[type=text] { background: #26292e; border: 1px solid #000; color: #ccc;
-  border-radius: 4px; padding: 4px 8px; width: 150px; font-size: 13px; }
-.topbar form input[type=text]:focus { background: #33383f; color: #fff; outline: none; }
-
-/* ===== кнопки (градиенты 1.4.0) ===== */
-.btn { display: inline-block; padding: 4px 12px; font-size: 13px; line-height: 18px;
-  color: #ddd; text-shadow: 0 1px 1px rgba(0,0,0,.6); text-decoration: none;
-  background-color: #3a3f46; background-image: linear-gradient(#4a5058, #2f343a);
-  background-repeat: repeat-x; border: 1px solid #1b1e22; border-radius: 4px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.12), 0 1px 2px rgba(0,0,0,.4);
-  cursor: pointer; vertical-align: middle; }
-.btn:hover { background-image: linear-gradient(#555c65, #383e45); color: #fff; }
-.btn:active { box-shadow: inset 0 2px 4px rgba(0,0,0,.5); }
-.btn.primary { background-color: #0064cd; background-image: linear-gradient(#049cdb, #0064cd);
-  border-color: #004b9a; color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
-.btn.primary:hover { background-image: linear-gradient(#0aa8e8, #006fe0); }
-.btn.danger { background-color: #c43c35; background-image: linear-gradient(#ee5f5b, #c43c35);
-  border-color: #8f2924; color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
-.btn.danger:hover { background-image: linear-gradient(#f47a76, #d14a44); }
-.btn.success { background-color: #51a351; background-image: linear-gradient(#62c462, #51a351);
-  border-color: #3c7c3c; color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
-.btn.success:hover { background-image: linear-gradient(#71cf71, #5caf5c); }
-.btn.warning { background-color: #f89406; background-image: linear-gradient(#fbb450, #f89406);
-  border-color: #b56e04; color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
-.btn.info { background-color: #2f96b4; background-image: linear-gradient(#5bc0de, #2f96b4);
-  border-color: #226f86; color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.3); }
-.btn.small { padding: 2px 8px; font-size: 11px; }
-.btn.mini { padding: 1px 6px; font-size: 10px; }
-.btn:disabled, .btn.disabled { opacity: .5; cursor: default; }
-.mini-btn { color: #7f8c98; text-decoration: none; margin-left: 6px; font-size: 13px; }
-.mini-btn:hover { color: #049cdb; }
-
-/* ===== alert-message (1.4.0) ===== */
-#alerts { position: fixed; top: 48px; right: 12px; z-index: 1200; width: 340px; }
-.alert-message { position: relative; padding: 7px 30px 7px 15px; margin-bottom: 10px;
-  color: #fff; text-shadow: 0 -1px 0 rgba(0,0,0,.35); border-radius: 4px;
-  border: 1px solid rgba(0,0,0,.4); box-shadow: inset 0 1px 0 rgba(255,255,255,.2), 0 2px 6px rgba(0,0,0,.5); }
-.alert-message.error { background-color: #a9322b; background-image: linear-gradient(#d14a44, #8f2924); }
-.alert-message.success { background-color: #3f7a3a; background-image: linear-gradient(#57a957, #356e30); }
-.alert-message.info { background-color: #28748e; background-image: linear-gradient(#339bb9, #1f6078); }
-.alert-message.warning { background-color: #b56e04; background-image: linear-gradient(#d98a10, #8f5704); }
-.alert-close { position: absolute; top: 6px; right: 8px; color: rgba(255,255,255,.7);
-  font-size: 16px; font-weight: bold; text-decoration: none; }
-.alert-close:hover { color: #fff; }
-
-/* ===== label-бейджи (1.4.0) ===== */
-.label { padding: 1px 3px 2px; font-size: 10.5px; font-weight: bold; color: #fff;
-  text-shadow: 0 -1px 0 rgba(0,0,0,.3); background-color: #8a93a0; border-radius: 3px;
-  text-transform: uppercase; }
-.label.important { background-color: #c43c35; }
-.label.warning { background-color: #f89406; }
-.label.success { background-color: #468847; }
-.label.notice { background-color: #62cffc; color: #0a2233; text-shadow: none; }
-
-/* ===== well / side-панели ===== */
-.well { background: #171a1f; border: 1px solid #2a2e35; border-radius: 4px; padding: 10px; margin-bottom: 10px; }
-.side { background: #171a1f; border: 1px solid #2a2e35; border-radius: 6px;
-  box-shadow: 0 1px 3px rgba(0,0,0,.5); margin-bottom: 12px; }
-.panel-head { padding: 8px 12px; background: #1c2026; border-bottom: 1px solid #2a2e35;
-  border-radius: 6px 6px 0 0; font-weight: bold; color: #fff; }
-.panel-body { padding: 10px; }
-.chat-panel { display: flex; flex-direction: column; }
-
-/* ===== списки каналов и пользователей ===== */
-.chan-list, .user-list { max-height: 340px; overflow-y: auto; }
-.chan-item, .user-item { padding: 6px 10px; cursor: pointer; color: #c8cdd3;
-  border-bottom: 1px solid #22262c; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.chan-item:hover, .user-item:hover { background: #1e232a; }
-.chan-item.active { background: #2a3038; color: #fff; box-shadow: inset 3px 0 0 #049cdb; }
-.chan-icon { margin-right: 6px; color: #7f8c98; }
-.chan-item.active .chan-icon { color: #049cdb; }
-.chan-item .label { float: right; margin-top: 2px; }
-.u-color { font-weight: bold; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 8px; margin-right: 6px; vertical-align: middle; }
-.dot.online { background: #46a546; box-shadow: 0 0 4px #46a546; }
-.dot.away { background: #f89406; }
-.dot.busy { background: #c43c35; }
-.dot.offline { background: #4a5158; }
-
-/* ===== область сообщений ===== */
-#msgs { flex: 1; overflow-y: auto; height: calc(100vh - 295px); min-height: 280px;
-  padding: 8px; background: #101318; }
-.msg { padding: 6px 8px; border-radius: 4px; }
-.msg:hover { background: #1a1f26; }
-.avatar { display: inline-block; width: 32px; height: 32px; line-height: 32px; text-align: center;
-  border-radius: 4px; color: #fff; font-weight: bold; margin-right: 8px; float: left;
-  text-shadow: 0 1px 1px rgba(0,0,0,.4); }
-.msg-body { margin-left: 40px; }
-.m-name { font-weight: bold; }
-.m-time { color: #6b7683; font-size: 11px; margin-left: 6px; }
-.m-text { white-space: pre-wrap; word-wrap: break-word; color: #d5dae0; }
-.m-actions { float: right; opacity: 0; }
-.msg:hover .m-actions { opacity: 1; }
-.m-act { margin-left: 8px; color: #8a93a0; text-decoration: none; }
-.m-act:hover { color: #049cdb; }
-.msys { text-align: center; color: #8a93a0; font-style: italic; padding: 3px; }
-.react-chip { display: inline-block; padding: 1px 7px; margin: 4px 4px 0 0; background: #232830;
-  border: 1px solid #333a44; border-radius: 10px; font-size: 12px; cursor: pointer; }
-.react-chip.mine { border-color: #049cdb; background: #0e2c3f; }
-.react-add { color: #8a93a0; cursor: pointer; font-weight: bold; padding: 0 4px; }
-.emoji-picker { margin-top: 4px; }
-.emoji-picker span { cursor: pointer; font-size: 16px; margin-right: 6px; padding: 2px 4px; border-radius: 3px; }
-.emoji-picker span:hover { background: #2a3038; }
-
-/* ===== композер ===== */
-.composer { padding: 8px; background: #171a1f; border-top: 1px solid #2a2e35; border-radius: 0 0 6px 6px; }
-.composer textarea { width: 100%; resize: vertical; min-height: 46px; }
-.emoji-row { margin-right: 8px; }
-.emoji-row span { cursor: pointer; font-size: 16px; margin-right: 6px; padding: 2px 4px; border-radius: 3px; }
-.emoji-row span:hover { background: #2a3038; }
-
-/* ===== закреплённые ===== */
-#pinnedBox { border-bottom: 1px solid #173a52; }
-.pin-item { padding: 4px 10px; background: #0e2c3f; border-bottom: 1px solid #173a52;
-  cursor: pointer; font-size: 12px; color: #9cc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pin-item:hover { background: #123b52; }
-
-/* ===== формы (1.4.0) ===== */
-label { display: block; margin-bottom: 5px; font-weight: bold; color: #aab3bd; }
-.input { width: 220px; background: #121418; border: 1px solid #33383f; color: #dde1e6;
-  border-radius: 4px; padding: 4px 6px; font-size: 13px; margin-bottom: 12px; }
-.input:focus { border-color: rgba(82,168,236,.8); box-shadow: 0 0 8px rgba(82,168,236,.35); outline: none; }
-textarea.input { width: 100%; height: auto; }
-.input.xlarge { width: 270px; }
-select.input { width: 220px; }
-.clearfix { zoom: 1; margin-bottom: 18px; }
-.clearfix:after { display: block; clear: both; content: ""; }
-.actions { padding: 17px 0 0; margin-bottom: 0; }
-input[type=checkbox] { vertical-align: middle; }
-.checkbox-line { margin-bottom: 8px; color: #c8cdd3; }
-.checkbox-line input { margin-right: 6px; }
-
-/* ===== таблицы zebra (1.4.0) ===== */
-table { width: 100%; border-collapse: collapse; margin-bottom: 18px; }
-th, td { padding: 8px; line-height: 18px; text-align: left; border-top: 1px solid #2a2e34; }
-th { font-weight: bold; color: #aab3bd; }
-.zebra-striped tbody tr:nth-child(odd) td { background: #1a1d22; }
-.zebra-striped tbody tr:hover td { background: #20252c; }
-
-/* ===== pills-табы (1.4.0) ===== */
-.pills { margin: 0 0 14px; padding: 0; list-style: none; zoom: 1; border-bottom: 1px solid #2a2e35; }
-.pills:after { display: block; clear: both; content: ""; }
-.pills li { float: left; }
-.pills a { display: block; padding: 8px 12px; color: #aab3bd; text-decoration: none;
-  border: 1px solid transparent; margin-bottom: -1px; }
-.pills a:hover { color: #fff; }
-.pills li.active a { color: #fff; background: #1b1e24; border: 1px solid #2a2e35;
-  border-bottom-color: #1b1e24; border-radius: 4px 4px 0 0; }
-.pill-content > div { display: none; }
-.pill-content > div.active { display: block; }
-
-/* ===== модалки (1.4.0) ===== */
-.modal-backdrop { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #000;
-  opacity: .6; z-index: 1040; }
-.modal { display: none; position: fixed; top: 50%; left: 50%; width: 560px;
-  margin: -250px 0 0 -280px; background: #1b1e24; border: 1px solid #333a44;
-  border-radius: 6px; box-shadow: 0 3px 7px rgba(0,0,0,.6); z-index: 1050;
-  animation: modalIn .18s ease-out; }
-@keyframes modalIn { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: none; } }
-.modal-header { padding: 9px 15px; border-bottom: 1px solid #2a2e35; }
-.modal-header h3 { margin: 0; font-size: 18px; line-height: 27px; color: #fff; }
-.modal-header .close { float: right; color: #8a93a0; font-size: 20px; font-weight: bold;
-  text-decoration: none; margin-top: 2px; }
-.modal-header .close:hover { color: #fff; }
-.modal-body { padding: 15px; max-height: 68vh; overflow-y: auto; }
-.modal-footer { padding: 14px 15px 15px; border-top: 1px solid #2a2e35; background: #171a1f;
-  border-radius: 0 0 6px 6px; text-align: right; }
-.modal-footer .btn { margin-left: 6px; }
-#mAdmin { width: 860px; margin-left: -430px; }
-
-/* ===== hero-unit (экран входа) ===== */
-.hero-unit { padding: 50px 60px; background: #171a1f; border: 1px solid #2a2e35;
-  border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.5); margin: 40px 0 20px; }
-.hero-unit h1 { font-size: 38px; line-height: 1; letter-spacing: -1px; margin-bottom: 14px; color: #fff; }
-.hero-unit p { font-size: 15px; line-height: 22px; color: #aab3bd; }
-
-/* ===== прочее ===== */
-.swatch { display: inline-block; width: 22px; height: 22px; border-radius: 4px; margin: 0 4px 4px 0;
-  cursor: pointer; border: 2px solid transparent; vertical-align: middle; }
-.swatch.sel { border-color: #fff; }
-.stat-card { background: #1c2026; border: 1px solid #2a2e35; border-radius: 6px;
-  padding: 12px; text-align: center; }
-.stat-card .num { font-size: 26px; font-weight: bold; color: #049cdb; }
-.stat-card .cap { color: #8a93a0; font-size: 11px; text-transform: uppercase; }
-.search-item { padding: 8px 10px; border-bottom: 1px solid #22262c; cursor: pointer; }
-.search-item:hover { background: #1e232a; }
-.fade { opacity: 0; transition: opacity .35s ease-in; }
-.fade.in { opacity: 1; }
-body.compact .msg { padding: 2px 8px; }
-body.compact .avatar { width: 24px; height: 24px; line-height: 24px; font-size: 11px; }
-body.compact .msg-body { margin-left: 30px; }
-::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: #33383f; border-radius: 5px; }
-::-webkit-scrollbar-track { background: #12151a; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#07070a">
+<meta name="application-name" content="СЛД·NET">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="СЛД·NET">
+<meta name="mobile-web-app-capable" content="yes">
+<title>СЛД·NET</title>
+<!-- OG_TAGS -->
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="icon" href="__FAVICON__">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>__APP_CSS__</style>
 </head>
 <body>
 
-<div class="topbar"><div class="topbar-inner container">
-  <a class="brand" href="#" onclick="location.reload();return false">💬 <span id="brandName">__SERVER_NAME__</span></a>
-  <form onsubmit="doSearch();return false"><input type="text" id="qSearch" placeholder="Поиск сообщений…"></form>
-  <ul class="nav">
-    <li><a href="#" id="topAdmin" style="display:none" onclick="openAdmin();return false">⚙ Админка</a></li>
-    <li><a href="#" onclick="openSettings();return false">👤 <span id="meName"></span> <span class="dot offline" id="meDot"></span></a></li>
-    <li><a href="#" onclick="logout();return false">Выйти</a></li>
-  </ul>
-</div></div>
-
-<div id="alerts"></div>
-
-<!-- ================= ЭКРАН ВХОДА ================= -->
-<div id="screenAuth" class="container" style="display:none">
-  <div class="hero-unit">
-    <div style="text-align:center">
-      <h1>💬 <span id="authName">__SERVER_NAME__</span></h1>
-      <p id="authMotd">__MOTD__</p>
-    </div>
-    <div class="row" style="margin-top:26px">
-      <div class="span7">
-        <h2>Вход</h2>
-        <form onsubmit="doLogin(event)">
-          <div class="clearfix">
-            <label for="lUser">Логин</label>
-            <input class="input xlarge" id="lUser" type="text" autocomplete="username" required>
-          </div>
-          <div class="clearfix">
-            <label for="lPass">Пароль</label>
-            <input class="input xlarge" id="lPass" type="password" autocomplete="current-password" required>
-          </div>
-          <div class="actions"><button class="btn primary" type="submit">Войти</button></div>
-        </form>
-      </div>
-      <div class="span7">
-        <h2>Регистрация</h2>
-        <form onsubmit="doRegister(event)">
-          <div class="clearfix">
-            <label for="rUser">Логин (3–20: латиница, цифры, _)</label>
-            <input class="input xlarge" id="rUser" type="text" autocomplete="username" required>
-          </div>
-          <div class="clearfix">
-            <label for="rName">Отображаемое имя</label>
-            <input class="input xlarge" id="rName" type="text" placeholder="Как вас звать в чате">
-          </div>
-          <div class="clearfix">
-            <label for="rPass">Пароль (минимум 4 символа)</label>
-            <input class="input xlarge" id="rPass" type="password" autocomplete="new-password" required>
-          </div>
-          <div class="clearfix">
-            <label for="rPass2">Пароль ещё раз</label>
-            <input class="input xlarge" id="rPass2" type="password" autocomplete="new-password" required>
-          </div>
-          <div class="actions"><button class="btn success" type="submit">Создать аккаунт</button></div>
-        </form>
-      </div>
-    </div>
-    <p class="muted-text" style="text-align:center;margin-top:24px">
-      Первый зарегистрированный становится <b>владельцем</b> сервера. Все данные живут в оперативной памяти и сбрасываются при перезапуске.
-    </p>
+<div class="page-loader" id="pageLoader" aria-hidden="true">
+  <div class="loader-inner">
+    <div class="loader-mark">__LOGO_SVG__</div>
+    <div class="loader-bar"></div>
   </div>
 </div>
 
-<!-- ================= ОСНОВНОЙ ЭКРАН ================= -->
-<div id="screenApp" class="container" style="display:none">
-  <div class="row" style="margin-top:14px">
-    <div class="span4">
-      <div class="side">
-        <div class="panel-head">Каналы
-          <span style="float:right">
-            <a href="#" class="mini-btn" title="Создать канал" onclick="openNewChannel();return false">＋</a>
-            <a href="#" class="mini-btn" title="Присоединиться по имени" onclick="openJoinByName();return false">➜</a>
+<div class="cur-dot"></div>
+<div class="cur-ring"></div>
+
+<div class="bg">
+  <div class="halo halo-1"></div>
+  <div class="halo halo-2"></div>
+</div>
+<div class="cursor-glow"></div>
+<div class="grid-bg"></div>
+<div class="sheen" aria-hidden="true"></div>
+<div class="grain"></div>
+
+<nav class="topbar" id="topbar">
+  <div class="topbar-inner">
+    <a href="/" class="logo">
+      <span class="logo-mark">__LOGO_SVG__</span>
+      <span class="logo-word">СЛД<span class="ldot">·</span><span class="lnet">NET</span></span>
+    </a>
+
+    <div class="menu" id="menu">
+      <div class="menu-switch" id="menuSwitch">
+        <span class="menu-pill" id="menuPill" aria-hidden="true"></span>
+        <button class="tab" id="btnCreate" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          <span>Создать</span>
+        </button>
+        <button class="tab" id="btnFind" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <span>Найти</span>
+        </button>
+      </div>
+      <a href="/" class="tab tab-exit-mobile" aria-label="Выйти на главную">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+        <span>Выйти</span>
+      </a>
+    </div>
+
+    <a href="/" class="back-btn" aria-label="На главную">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+      <span>На главную</span>
+    </a>
+  </div>
+</nav>
+
+<main class="app">
+  <div class="stage" id="stage" hidden>
+
+    <div class="panel" id="createPanel">
+      <section class="card">
+        <div class="input-wrap" id="titleWrap">
+          <input class="field" id="title" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Название">
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7V5a1 1 0 011-1h14a1 1 0 011 1v2"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+          <span class="input-count" id="titleCount">0/120</span>
+        </div>
+
+        <div class="input-wrap textarea-wrap" id="contentWrap">
+          <textarea class="field" id="content" maxlength="20000" placeholder="Содержимое"></textarea>
+          <svg class="iw-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+          <span class="input-count" id="contentCount">0/20000</span>
+        </div>
+
+        <div class="drop" id="drop">
+          <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2.5"/><circle cx="9" cy="9" r="1.6"/><path d="M21 15l-5-5L5 21"/></svg>
+          <div class="drop-label" id="dropLabel">Нажмите или перетащите фото</div>
+          <div class="drop-hint">до 5 фото · JPEG/PNG/WebP/GIF/AVIF/BMP · до 5 МБ</div>
+        </div>
+        <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp,image/gif,image/avif,image/bmp" multiple hidden>
+        <div class="previews" id="previews"></div>
+
+        <label class="checkbox-wrap" for="ogEnabled">
+          <input type="checkbox" id="ogEnabled" checked>
+          <span class="checkbox-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
           </span>
+          <span class="checkbox-label">
+            <strong>Превью для ссылок (OpenGraph)</strong> — при отправке в Telegram или Discord покажет заголовок, краткое описание и первое фото.
+          </span>
+        </label>
+
+        <div class="row">
+          <button class="btn ghost" id="resetBtn" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
+            <span>Очистить</span>
+          </button>
+          <button class="btn primary" id="submitBtn" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+            <span>Опубликовать</span>
+          </button>
         </div>
-        <div id="chanList" class="chan-list"></div>
-      </div>
+
+        <div id="createMsg"></div>
+      </section>
     </div>
-    <div class="span9">
-      <div class="side chat-panel">
-        <div class="panel-head" id="chatHead">…</div>
-        <div id="pinnedBox" style="display:none"></div>
-        <div id="msgs"></div>
-        <div class="composer">
-          <div id="typing" class="muted-text" style="height:16px"></div>
-          <textarea class="input" id="composerText" rows="3" style="margin-bottom:4px"
-            placeholder="Сообщение… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
-          <div class="clearfix" style="margin-bottom:0">
-            <div class="emoji-row" style="float:left;padding-top:3px">
-              <span onclick="insEmoji('👍')">👍</span><span onclick="insEmoji('❤️')">❤️</span>
-              <span onclick="insEmoji('😂')">😂</span><span onclick="insEmoji('😮')">😮</span>
-              <span onclick="insEmoji('😢')">😢</span><span onclick="insEmoji('🔥')">🔥</span>
-              <span onclick="insEmoji('👌')">👌</span><span onclick="insEmoji('✅')">✅</span>
-              <span onclick="insEmoji('🤝')">🤝</span><span onclick="insEmoji('🎉')">🎉</span>
-            </div>
-            <button class="btn primary" style="float:right" onclick="sendMsg()">Отправить</button>
+
+    <div class="panel" id="findPanel">
+      <section class="card">
+        <div class="otp-row">
+          <div class="otp" id="otp" autocomplete="off">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="1">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="2">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="3">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="4">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="5">
+            <input class="otp-cell" inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="6">
           </div>
+          <button class="otp-copy" id="otpCopyBtn" type="button" disabled title="Скопировать код" aria-label="Скопировать код">
+            <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+            <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
+          </button>
         </div>
-      </div>
+      </section>
+
+      <section class="card" id="searchFrame" hidden></section>
     </div>
-    <div class="span3">
-      <div class="side">
-        <div class="panel-head">Пользователи <span id="onlineCount" class="muted-text"></span></div>
-        <div style="padding:8px"><input class="input" id="uSearch" style="width:100%;margin-bottom:0" placeholder="Фильтр…" oninput="renderUsers()"></div>
-        <div id="userList" class="user-list"></div>
-      </div>
-      <div class="side">
-        <div class="panel-head">Сервер</div>
-        <div id="svInfo" class="panel-body muted-text"></div>
-      </div>
+
+  </div>
+</main>
+
+<div class="modal" id="createdModal" hidden>
+  <div class="modal-card" id="modalCard">
+    <div class="modal-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
+    </div>
+    <h3 class="modal-title">Пост создан</h3>
+    <p class="modal-sub">Скопируйте ссылку — она развернётся в превью и откроет пост в приложении</p>
+    <div class="modal-code" id="modalCode">000000</div>
+    <div class="modal-url" id="modalUrl">https://.../p/000000</div>
+    <div class="modal-hint" id="modalHint"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="modalCopyBtn" type="button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        <span>Копировать ссылку</span>
+      </button>
+      <button class="btn primary" id="modalCloseBtn" type="button">Готово</button>
     </div>
   </div>
 </div>
 
-<div id="backdrop" class="modal-backdrop" style="display:none"></div>
-
-<!-- ================= МОДАЛКИ ================= -->
-<div class="modal" id="mSettings">
-  <div class="modal-header"><h3>Настройки профиля</h3><a class="close" href="#" onclick="hideModal('mSettings')">×</a></div>
-  <div class="modal-body">
-    <div class="clearfix"><label>Отображаемое имя</label><input class="input xlarge" id="sName"></div>
-    <div class="clearfix">
-      <label>Статус</label>
-      <select class="input" id="sStatus">
-        <option value="online">В сети</option><option value="away">Отошёл</option><option value="busy">Занят</option>
-      </select>
-    </div>
-    <div class="clearfix"><label>Цвет аватара</label><div id="colorSwatches"></div></div>
-    <div class="clearfix">
-      <div class="checkbox-line"><input type="checkbox" id="sSound"> Звук новых сообщений</div>
-      <div class="checkbox-line"><input type="checkbox" id="sCompact"> Компактный режим</div>
-      <div class="checkbox-line"><input type="checkbox" id="sSys"> Показывать системные сообщения</div>
-    </div>
-    <div class="well">
-      <label>Сменить пароль</label>
-      <input class="input" id="sOldPass" type="password" placeholder="Текущий пароль">
-      <input class="input" id="sNewPass" type="password" placeholder="Новый пароль" style="margin-bottom:0">
-      <div class="actions" style="padding-top:10px"><button class="btn small" onclick="changePassword()">Сменить</button></div>
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lb-viewport" id="lbViewport">
+    <div class="lb-transform" id="lbTransform">
+      <img class="lb-img" id="lbImg" alt="" draggable="false">
     </div>
   </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mSettings')">Отмена</button>
-    <button class="btn primary" onclick="saveSettings()">Сохранить</button></div>
+  <div class="lb-loading" aria-hidden="true"></div>
+  <div class="lb-zoom-badge" id="lbZoomBadge">100%</div>
+  <button class="lb-btn lb-close" id="lbClose" type="button" aria-label="Закрыть">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+  <button class="lb-btn lb-prev" id="lbPrev" type="button" aria-label="Предыдущее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>
+  </button>
+  <button class="lb-btn lb-next" id="lbNext" type="button" aria-label="Следующее">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+  </button>
+  <div class="lb-counter" id="lbCounter">1 / 1</div>
+  <div class="lb-hint">колесо — зум · ПКМ — 1×/2× · 2× клик — сброс · ЛКМ — панорама</div>
+  <div class="lb-hint-mobile">свайп — листать · 2× тап — зум · свайп вниз — закрыть</div>
 </div>
 
-<div class="modal" id="mNewChan">
-  <div class="modal-header"><h3>Создать канал</h3><a class="close" href="#" onclick="hideModal('mNewChan')">×</a></div>
-  <div class="modal-body">
-    <div class="clearfix"><label>Имя канала</label><input class="input xlarge" id="cName" placeholder="например: новости"></div>
-    <div class="clearfix"><label>Описание</label><input class="input xlarge" id="cDesc"></div>
-    <div class="clearfix">
-      <label>Тип</label>
-      <select class="input" id="cType" onchange="document.getElementById('cPassWrap').style.display=this.value==='private'?'block':'none'">
-        <option value="public">Публичный — виден всем</option>
-        <option value="private">Приватный — вход по имени (и паролю)</option>
-      </select>
-    </div>
-    <div class="clearfix" id="cPassWrap" style="display:none">
-      <label>Пароль канала (необязательно)</label>
-      <input class="input xlarge" id="cPass" type="password" placeholder="минимум 4 символа">
-    </div>
-  </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mNewChan')">Отмена</button>
-    <button class="btn primary" onclick="createChannel()">Создать</button></div>
-</div>
+<button class="scroll-top" id="scrollTopBtn" type="button" aria-label="Наверх">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 19V5M5 12l7-7 7 7"/>
+  </svg>
+</button>
 
-<div class="modal" id="mJoin">
-  <div class="modal-header"><h3>Присоединиться к приватному каналу</h3><a class="close" href="#" onclick="hideModal('mJoin')">×</a></div>
-  <div class="modal-body">
-    <div class="clearfix"><label>Имя канала</label><input class="input xlarge" id="jName"></div>
-    <div class="clearfix"><label>Пароль (если есть)</label><input class="input xlarge" id="jPass" type="password"></div>
-  </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mJoin')">Отмена</button>
-    <button class="btn primary" onclick="joinByName()">Войти в канал</button></div>
-</div>
-
-<div class="modal" id="mProfile">
-  <div class="modal-header"><h3>Профиль</h3><a class="close" href="#" onclick="hideModal('mProfile')">×</a></div>
-  <div class="modal-body">
-    <div class="avatar" id="pAvatar" style="width:48px;height:48px;line-height:48px;font-size:20px;margin:0 auto;float:none;display:block">?</div>
-    <div style="text-align:center;margin-top:8px">
-      <b id="pName" style="font-size:16px;color:#fff"></b>
-      <div id="pUser" class="muted-text"></div>
-    </div>
-    <div id="pInfo" class="well" style="margin-top:12px"></div>
-    <div id="pAdminBox" style="display:none;margin-top:12px">
-      <h4>Действия администратора</h4>
-      <div id="pAdminButtons" style="margin-bottom:8px"></div>
-      <div class="clearfix" style="margin-bottom:0">
-        <label>Роль</label>
-        <select class="input" id="pRole" onchange="adminUserAction(profileUid,{role:this.value})">
-          <option value="user">Пользователь</option><option value="mod">Модер</option>
-          <option value="admin">Админ</option>
-        </select>
-      </div>
-    </div>
-  </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mProfile')">Закрыть</button>
-    <button class="btn primary" id="btnDm" onclick="startDm()">Написать ЛС</button></div>
-</div>
-
-<div class="modal" id="mChanSettings">
-  <div class="modal-header"><h3>Настройки канала</h3><a class="close" href="#" onclick="hideModal('mChanSettings')">×</a></div>
-  <div class="modal-body">
-    <div class="clearfix"><label>Имя</label><input class="input xlarge" id="csName"></div>
-    <div class="clearfix"><label>Описание</label><input class="input xlarge" id="csDesc"></div>
-    <div class="actions">
-      <button class="btn small warning" onclick="clearActiveChannel()">Очистить историю</button>
-      <button class="btn small danger" onclick="deleteActiveChannel()">Удалить канал</button>
-    </div>
-  </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mChanSettings')">Отмена</button>
-    <button class="btn primary" onclick="saveChanSettings()">Сохранить</button></div>
-</div>
-
-<div class="modal" id="mSearch">
-  <div class="modal-header"><h3>Результаты поиска</h3><a class="close" href="#" onclick="hideModal('mSearch')">×</a></div>
-  <div class="modal-body" id="searchResults"></div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mSearch')">Закрыть</button></div>
-</div>
-
-<div class="modal" id="mAdmin">
-  <div class="modal-header"><h3>Панель администратора</h3><a class="close" href="#" onclick="hideModal('mAdmin')">×</a></div>
-  <div class="modal-body">
-    <ul class="pills">
-      <li class="active" data-tab="Server"><a href="#" onclick="switchAdminTab('Server');return false">Сервер</a></li>
-      <li data-tab="Users"><a href="#" onclick="switchAdminTab('Users');return false">Пользователи</a></li>
-      <li data-tab="Channels"><a href="#" onclick="switchAdminTab('Channels');return false">Каналы</a></li>
-      <li data-tab="Stats"><a href="#" onclick="switchAdminTab('Stats');return false">Статистика</a></li>
-      <li data-tab="Danger"><a href="#" onclick="switchAdminTab('Danger');return false">Опасная зона</a></li>
-    </ul>
-    <div class="pill-content">
-      <div id="tabServer" class="active">
-        <div class="clearfix"><label>Название сервера</label><input class="input xlarge" id="asName"></div>
-        <div class="clearfix"><label>MOTD (приветствие)</label><textarea class="input" id="asMotd" rows="2"></textarea></div>
-        <div class="row" style="margin-left:0">
-          <div style="float:left;width:220px;margin-right:20px">
-            <label>Макс. длина сообщения</label><input class="input" id="asMaxLen" type="number" style="width:100%">
-          </div>
-          <div style="float:left;width:220px;margin-right:20px">
-            <label>История на канал</label><input class="input" id="asHistory" type="number" style="width:100%">
-          </div>
-          <div style="float:left;width:220px">
-            <label>Лимит сообщений/мин</label><input class="input" id="asRate" type="number" style="width:100%">
-          </div>
-        </div>
-        <div class="clearfix" style="margin-top:8px">
-          <div class="checkbox-line"><input type="checkbox" id="asReg"> Разрешить регистрацию</div>
-          <div class="checkbox-line"><input type="checkbox" id="asMaint"> Режим обслуживания</div>
-          <div class="checkbox-line"><input type="checkbox" id="asEdit"> Разрешить редактирование</div>
-          <div class="checkbox-line"><input type="checkbox" id="asReact"> Разрешить реакции</div>
-          <div class="checkbox-line"><input type="checkbox" id="asDm"> Разрешить личные сообщения</div>
-        </div>
-        <div class="actions"><button class="btn primary" onclick="saveServerSettings()">Сохранить настройки</button></div>
-        <div class="well">
-          <label>📢 Объявление на весь сервер</label>
-          <input class="input" id="asBroadcast" style="width:100%;margin-bottom:8px" placeholder="Текст объявления…">
-          <button class="btn warning" onclick="broadcast()">Отправить</button>
-        </div>
-      </div>
-      <div id="tabUsers">
-        <table class="zebra-striped">
-          <thead><tr><th>Пользователь</th><th>Роль</th><th>Статус</th><th>Действия</th></tr></thead>
-          <tbody id="adminUsers"></tbody>
-        </table>
-      </div>
-      <div id="tabChannels">
-        <table class="zebra-striped">
-          <thead><tr><th>Канал</th><th>Тип</th><th>Сообщений</th><th>Участников</th><th>Владелец</th><th>Действия</th></tr></thead>
-          <tbody id="adminChannels"></tbody>
-        </table>
-      </div>
-      <div id="tabStats"><div class="row" id="adminStats" style="margin-left:0"></div></div>
-      <div id="tabDanger">
-        <div class="alert-message error">Внимание! Эти действия необратимы.</div>
-        <div class="well">
-          <b>Полный сброс сервера</b> — удаляются все пользователи, каналы и сообщения.
-          Ваш аккаунт останется, вы станете владельцем.
-          <div class="actions"><button class="btn danger" onclick="resetServer()">Сбросить всё</button></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="modal-footer"><button class="btn" onclick="hideModal('mAdmin')">Закрыть</button></div>
-</div>
-
+<script>__UI_FRAMEWORK__</script>
 <script>
-"use strict";
-var $ = function(s){ return document.querySelector(s); };
-var $$ = function(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); };
+(function(){
+  "use strict";
+  var $ = function(id){ return document.getElementById(id); };
 
-var TOKEN = localStorage.getItem('dshtm_token') || '';
-var ME = null, USERS = [], CHANNELS = [], MESSAGES = [];
-var activeCid = null, lastMsgId = 0, lastEvtId = 0, SERVER = {};
-var unread = {}, msgEls = {}, MSG_IDS = {}, typingSent = 0, pollTimer = null, profileUid = null;
+  document.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 
-var ROLE_NAMES = {owner:'Владелец', admin:'Админ', mod:'Модер', user:'Пользователь'};
-var PALETTE = ['#e74c3c','#e67e22','#f1c40f','#2ecc71','#1abc9c','#3498db','#9b59b6','#e84393','#fd79a8','#00cec9','#6c5ce7','#fdcb6e'];
-var QUICK_EMOJI = ['👍','❤️','😂','😮','😢','🔥','👌','✅'];
+  /* SW */
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function(){
+      navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        .catch(function(err){ console.warn('SW register failed:', err); });
+    });
+  }
 
-var lastSeen = {};
-try { lastSeen = JSON.parse(localStorage.getItem('dshtm_seen')||'{}') || {}; } catch(e) { lastSeen = {}; }
-
-function esc(s){
-  return String(s==null?'':s).replace(/[&<>"']/g, function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-  });
-}
-function fmtTime(ts){ var d=new Date(ts*1000), p=function(n){return String(n).padStart(2,'0');}; return p(d.getHours())+':'+p(d.getMinutes()); }
-function fmtDate(ts){ var d=new Date(ts*1000), p=function(n){return String(n).padStart(2,'0');}; return p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear(); }
-function fmtDur(sec){ sec=Math.max(0,Math.floor(sec)); var h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
-  return (h?h+'ч ':'')+(m?m+'м ':'')+s+'с'; }
-
-function showAlert(type, text, ms){
-  var box=$('#alerts'), el=document.createElement('div');
-  el.className='alert-message '+type+' fade';
-  el.innerHTML=esc(text)+'<a class="alert-close" href="#" onclick="this.parentNode.remove()">×</a>';
-  box.appendChild(el);
-  setTimeout(function(){ el.classList.add('in'); }, 10);
-  setTimeout(function(){ el.classList.remove('in'); setTimeout(function(){ el.remove(); }, 400); }, ms||5000);
-}
-
-var AC=null;
-function beep(freq){
-  if(!ME || !ME.settings || !ME.settings.sound) return;
+  /* PWA detect */
   try {
-    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
-    if(AC.state==='suspended') AC.resume();
-    var o=AC.createOscillator(), g=AC.createGain();
-    o.type='sine'; o.frequency.value=freq||880;
-    g.gain.setValueAtTime(0.05, AC.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime+0.28);
-    o.connect(g); g.connect(AC.destination);
-    o.start(); o.stop(AC.currentTime+0.3);
+    var standalone = window.matchMedia('(display-mode: standalone)').matches
+                  || window.matchMedia('(display-mode: fullscreen)').matches
+                  || window.navigator.standalone === true;
+    if (standalone) document.documentElement.classList.add('standalone');
   } catch(e) {}
-}
 
-function api(path, method, body){
-  method = method || 'GET';
-  var opt = {method: method, headers: {'Content-Type':'application/json', 'Authorization':'Bearer '+TOKEN}};
-  if(body) opt.body = JSON.stringify(body);
-  return fetch('/api'+path, opt).then(function(res){
-    return res.json().catch(function(){ return null; }).then(function(data){
-      if(res.status===401){ doLogout(); throw new Error('session'); }
-      if(res.status===403 && data && String(data.detail||'').indexOf('BANNED')===0){
-        doLogout('Вы забанены: '+String(data.detail).slice(7));
-        throw new Error('session');
+  /* CURSOR */
+  var dot  = document.querySelector('.cur-dot');
+  var ring = document.querySelector('.cur-ring');
+  var mx = innerWidth/2, my = innerHeight/2;
+  var rx = mx, ry = my, lastX = mx, lastY = my, vel = 0;
+  var cursorReady = false;
+  addEventListener('mousemove', function(e){
+    if (!cursorReady) { cursorReady = true; document.body.classList.add('cursor-ready'); }
+    mx = e.clientX; my = e.clientY;
+    document.documentElement.style.setProperty('--mx', e.clientX + 'px');
+    document.documentElement.style.setProperty('--my', e.clientY + 'px');
+  }, { passive: true });
+  (function loop(){
+    dot.style.transform = 'translate3d(' + mx + 'px,' + my + 'px,0) translate(-50%,-50%)';
+    rx += (mx - rx) * 0.26;
+    ry += (my - ry) * 0.26;
+    var dx = mx - lastX, dy = my - lastY;
+    vel = Math.min(Math.hypot(dx, dy), 60);
+    lastX = mx; lastY = my;
+    var angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    var stretch = 1 + vel / 150;
+    var squash  = 1 - vel / 220;
+    var borderOp = Math.max(0.15, 0.4 - (vel / 60) * 0.25);
+    ring.style.transform = 'translate3d(' + rx + 'px,' + ry + 'px,0) translate(-50%,-50%) rotate(' + angle + 'deg) scale(' + stretch + ',' + squash + ')';
+    if (!ring.classList.contains('hover')) ring.style.borderColor = 'rgba(255,255,255,' + borderOp.toFixed(2) + ')';
+    requestAnimationFrame(loop);
+  })();
+  addEventListener("mousedown", function(){ ring.classList.add("click"); });
+  addEventListener("mouseup", function(){ ring.classList.remove("click"); });
+  UI.qsa('a, button, input, textarea, label, .tab, .drop, .post-gallery img, .post-copy-btn').forEach(function(el){
+    UI.on(el, 'mouseenter', function(){ ring.classList.add('hover'); });
+    UI.on(el, 'mouseleave', function(){ ring.classList.remove('hover'); });
+  });
+
+  /* LIQUID GLASS: блик следует за курсором (плавно, rAF) */
+  (function(){
+    var root = document.documentElement;
+    var raf = 0, tx = innerWidth/2, ty = 0, cx = innerWidth/2, cy = 0;
+    root.style.setProperty("--sheen-x", cx + "px");
+    root.style.setProperty("--sheen-y", cy + "px");
+    addEventListener("mousemove", function(e){
+      tx = e.clientX; ty = e.clientY;
+      if (!raf) {
+        raf = requestAnimationFrame(function(){
+          cx += (tx - cx) * 0.22;
+          cy += (ty - cy) * 0.22;
+          root.style.setProperty("--sheen-x", cx.toFixed(1) + "px");
+          root.style.setProperty("--sheen-y", cy.toFixed(1) + "px");
+          raf = 0;
+        });
       }
-      if(!res.ok){ throw new Error((data&&(data.detail||data.error))||('Ошибка '+res.status)); }
-      return data;
-    });
-  }).catch(function(e){
-    if(e.message!=='session') showAlert('error', e.message, 6000);
-    throw e;
-  });
-}
+    }, { passive: true });
+  })();
 
-function showScreen(which){
-  $('#screenAuth').style.display = which==='auth' ? 'block' : 'none';
-  $('#screenApp').style.display = which==='app' ? 'block' : 'none';
-}
+  /* LOADER */
+  var loader = $('pageLoader');
+  if (loader) {
+    var hideLoader = function(){ loader.classList.add('hidden'); };
+    if (document.readyState === 'complete') setTimeout(hideLoader, 250);
+    else { addEventListener('load', function(){ setTimeout(hideLoader, 250); }); setTimeout(hideLoader, 2500); }
+  }
 
-function doLogout(msg){
-  TOKEN=''; localStorage.removeItem('dshtm_token');
-  ME=null; CHANNELS=[]; MESSAGES=[]; activeCid=null; msgEls={}; MSG_IDS={};
-  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
-  showScreen('auth');
-  if(msg) showAlert('error', msg, 8000);
-}
+  /* TOPBAR HEIGHT */
+  var topbar = $('topbar');
+  function measureTopbar(){ document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px'); }
+  measureTopbar();
+  addEventListener('resize', measureTopbar, { passive: true });
+  addEventListener('orientationchange', function(){ setTimeout(measureTopbar, 300); });
 
-function logout(){ try { api('/logout','POST'); } catch(e){} doLogout(); }
-
-/* ---------- вход / регистрация ---------- */
-function doLogin(ev){
-  ev.preventDefault();
-  api('/login','POST',{username:$('#lUser').value.trim(), password:$('#lPass').value})
-    .then(function(d){ TOKEN=d.token; localStorage.setItem('dshtm_token',TOKEN); ME=d.user;
-      showScreen('app'); startApp(); })
-    .catch(function(){});
-}
-function doRegister(ev){
-  ev.preventDefault();
-  if($('#rPass').value!==$('#rPass2').value){ showAlert('error','Пароли не совпадают'); return; }
-  api('/register','POST',{username:$('#rUser').value.trim(), name:$('#rName').value.trim(),
-      password:$('#rPass').value})
-    .then(function(d){ TOKEN=d.token; localStorage.setItem('dshtm_token',TOKEN); ME=d.user;
-      showScreen('app'); startApp(); })
-    .catch(function(){});
-}
-
-/* ---------- основной цикл ---------- */
-function startApp(){
-  if(pollTimer) clearInterval(pollTimer);
-  poll();
-  pollTimer = setInterval(poll, 2000);
-}
-function poll(){
-  if(!TOKEN) return;
-  api('/sync?channel='+(activeCid||'')+'&after_msg='+lastMsgId+'&after_evt='+lastEvtId)
-    .then(function(d){
-      if(d.status==='maintenance'){ showAlert('warning','Сервер на обслуживании. Данные не обновляются.', 0); return; }
-      SERVER=d.server; ME=d.me; USERS=d.users; CHANNELS=d.channels;
-      $('#brandName').textContent=SERVER.name;
-      $('#meName').textContent=ME.name;
-      var dot=$('#meDot'); dot.className='dot '+(ME.status==='busy'?'busy':(ME.status==='away'?'away':'online'));
-      $('#topAdmin').style.display=(ME.role==='admin'||ME.role==='owner')?'':'none';
-      document.body.classList.toggle('compact', !!ME.settings.compact);
-      document.title=SERVER.name;
-      handleEvents(d.events||[]);
-      computeUnread(); renderChannels(); renderUsers(); renderServerInfo();
-      if(d.messages && d.messages.length) appendMessages(d.messages);
-      renderTyping(d.typing||[]);
-      if(activeCid===null && CHANNELS.length) switchChannel(CHANNELS[0].id);
-      renderChatHeader();
-    }).catch(function(){});
-}
-function handleEvents(events){
-  if(!events || !events.length) return;
-  var maxId=0; events.forEach(function(e){ if(e.id>maxId) maxId=e.id; });
-  lastEvtId=Math.max(lastEvtId, maxId);
-  events.forEach(function(ev){
-    var d=ev.data||{};
-    if(ev.type==='channel_deleted'){
-      if(d.channel_id===activeCid){ activeCid=null; $('#msgs').innerHTML=''; }
+  /* SCROLL-TOP */
+  var scrollTopBtn = $('scrollTopBtn');
+  var stageEl = $('stage');
+  var SCROLL_SHOW_AT = 240;
+  function currentScrollTop(){
+    var a = window.scrollY || window.pageYOffset || 0;
+    var b = stageEl ? stageEl.scrollTop : 0;
+    return Math.max(a, b);
+  }
+  function applyScrollTopBtn(){ scrollTopBtn.classList.toggle('visible', currentScrollTop() > SCROLL_SHOW_AT); }
+  applyScrollTopBtn();
+  var stTicking = false;
+  function onAnyScroll(){
+    if (stTicking) return;
+    stTicking = true;
+    requestAnimationFrame(function(){ applyScrollTopBtn(); stTicking = false; });
+  }
+  addEventListener('scroll', onAnyScroll, { passive: true });
+  if (stageEl) stageEl.addEventListener('scroll', onAnyScroll, { passive: true });
+  addEventListener('resize', applyScrollTopBtn, { passive: true });
+  scrollTopBtn.addEventListener('click', function(){
+    try { window.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e){ window.scrollTo(0, 0); }
+    if (stageEl && stageEl.scrollTop > 0) {
+      try { stageEl.scrollTo({ top: 0, behavior: 'smooth' }); } catch(e){ stageEl.scrollTop = 0; }
     }
-    if(ev.type==='channel_cleared' && d.channel_id===activeCid){
-      MESSAGES=[]; MSG_IDS={}; msgEls={}; $('#msgs').innerHTML='<div class="muted-text" style="text-align:center;padding:20px">История очищена</div>';
+    setTimeout(applyScrollTopBtn, 60);
+  });
+
+  /* ICONS */
+  var ICONS = {
+    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    ok:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>',
+    copy:  '<svg class="sl-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
+    check: '<svg class="sl-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>'
+  };
+
+  function makeMsg(kind, text){
+    return UI.h('div', { class: 'msg ' + kind }, [
+      UI.h('span', { class: 'msg-icon', html: kind === 'err' ? ICONS.error : ICONS.ok }),
+      UI.h('span', { class: 'msg-text', text: String(text == null ? '' : text) })
+    ]);
+  }
+  async function readError(res){
+    var ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.indexOf("application/json") >= 0) {
+      var data = await res.json().catch(function(){ return null; });
+      if (data) {
+        if (typeof data.detail === "string" && data.detail.trim()) return data.detail;
+        if (Array.isArray(data.detail) && data.detail.length) return (data.detail[0] || {}).msg || "Некорректные данные";
+        if (typeof data.message === "string" && data.message.trim()) return data.message;
+      }
     }
-    if(ev.type==='kicked') doLogout('Вас исключили: '+(d.reason||''));
-    if(ev.type==='banned') doLogout('Вы забанены: '+(d.reason||''));
-    if(ev.type==='muted') showAlert('warning','Вы заглушены до '+d.until_str);
-    if(ev.type==='unmuted') showAlert('success','Заглушение снято');
-    if(ev.type==='broadcast') showAlert('info','📢 '+d.text);
-    if(ev.type==='role_changed') showAlert('info','Ваша роль изменена на '+ROLE_NAMES[d.role]);
-  });
-}
-
-/* ---------- каналы ---------- */
-function displayName(ch){ return ch.type==='dm' ? ('ЛС: '+esc(ch.other_name||'?')) : ch.name; }
-function computeUnread(){
-  var nowTs=Math.floor(Date.now()/1000), seen={};
-  CHANNELS.forEach(function(ch){
-    if(ch.id===activeCid){ lastSeen[ch.id]=nowTs; }
-    else if(ch.activity && ch.activity > (lastSeen[ch.id]||0)) seen[ch.id]=1;
-  });
-  unread=seen;
-  localStorage.setItem('dshtm_seen', JSON.stringify(lastSeen));
-}
-function renderChannels(){
-  var box=$('#chanList'); box.innerHTML='';
-  CHANNELS.forEach(function(ch){
-    var el=document.createElement('div');
-    el.className='chan-item'+(ch.id===activeCid?' active':'');
-    var icon = ch.type==='dm' ? '✉' : (ch.type==='private' ? '🔒' : '#');
-    el.innerHTML='<span class="chan-icon">'+icon+'</span><span class="chan-name">'+displayName(ch)+'</span>'+
-      (unread[ch.id]?'<span class="label important">'+unread[ch.id]+'</span>':'')+
-      (ch.type==='private'&&ch.has_password?' <span class="muted-text">🔑</span>':'');
-    el.onclick=function(){ switchChannel(ch.id); };
-    box.appendChild(el);
-  });
-  if(!CHANNELS.length) box.innerHTML='<div class="muted-text" style="padding:8px">Каналов нет</div>';
-}
-function switchChannel(cid){
-  if(cid===activeCid) return;
-  activeCid=cid;
-  MESSAGES=[]; MSG_IDS={}; msgEls={}; lastMsgId=0;
-  $('#msgs').innerHTML='<div class="muted-text" style="text-align:center;padding:20px">Загрузка…</div>';
-  lastSeen[cid]=Math.floor(Date.now()/1000);
-  localStorage.setItem('dshtm_seen', JSON.stringify(lastSeen));
-  computeUnread(); renderChannels(); renderChatHeader();
-  api('/channels/'+cid+'/messages?limit=60').then(function(d){
-    if(activeCid!==cid) return;
-    MESSAGES=d.messages||[]; MSG_IDS={};
-    MESSAGES.forEach(function(m){ MSG_IDS[m.id]=true; });
-    lastMsgId = MESSAGES.length ? MESSAGES[MESSAGES.length-1].id : 0;
-    renderAllMessages();
-    var ta=$('#composerText'); if(ta) ta.focus();
-  }).catch(function(){});
-}
-function renderChatHeader(){
-  if(activeCid===null) return;
-  var ch=null; CHANNELS.forEach(function(c){ if(c.id===activeCid) ch=c; });
-  if(!ch){ $('#chatHead').innerHTML='…'; return; }
-  var btns='';
-  var canMan = (ME.role==='admin'||ME.role==='owner'||ch.owner_id===ME.id);
-  if(canMan) btns+='<a href="#" class="mini-btn" title="Настройки канала" onclick="openChanSettings()">⚙</a>';
-  btns+='<a href="#" class="mini-btn" title="Экспорт истории" onclick="exportChan()">⇩</a>';
-  if(ch.type==='private' && canMan && ME.role!=='admin' && ME.role!=='owner') btns+='<a href="#" class="mini-btn" title="Покинуть канал" onclick="leaveActive()">🚪</a>';
-  var typeName = ch.type==='public' ? 'публичный' : (ch.type==='private' ? 'приватный' : 'личные сообщения');
-  var lbl = ch.type==='private' ? ' <span class="label warning">приватный</span>' : (ch.type==='dm'?' <span class="label notice">ЛС</span>':'');
-  var title = ch.type==='dm' ? ('✉ '+displayName(ch)) : ('#'+ch.name);
-  $('#chatHead').innerHTML='<span style="float:right">'+btns+'</span>'+esc(title)+lbl+
-    '<div class="muted-text" style="font-weight:normal;font-size:11px">'+
-    esc(ch.description||'')+' · '+ch.member_count+' уч. · '+typeName+'</div>';
-  renderPinned(ch);
-}
-function renderPinned(ch){
-  var box=$('#pinnedBox'), pins=ch.pinned||[];
-  if(!pins.length){ box.style.display='none'; return; }
-  box.style.display='block';
-  var html='<div class="panel-head" style="border-radius:0">📌 Закреплено ('+pins.length+')</div>';
-  pins.forEach(function(p){
-    html+='<div class="pin-item" onclick="jumpToMsg('+activeCid+','+p.id+')"><b>'+esc(p.author)+':</b> '+esc(p.text)+'</div>';
-  });
-  box.innerHTML=html;
-}
-function openNewChannel(){ $('#cName').value=''; $('#cDesc').value=''; $('#cPass').value=''; showModal('mNewChan'); }
-function createChannel(){
-  var type=$('#cType').value;
-  api('/channels','POST',{name:$('#cName').value, description:$('#cDesc').value, type:type, password:$('#cPass').value})
-    .then(function(d){
-      hideModal('mNewChan');
-      showAlert('success','Канал создан');
-      switchChannel(d.channel.id);
-    }).catch(function(){});
-}
-function openJoinByName(){ $('#jName').value=''; $('#jPass').value=''; showModal('mJoin'); }
-function joinByName(){
-  api('/channels/join','POST',{name:$('#jName').value, password:$('#jPass').value})
-    .then(function(d){ hideModal('mJoin'); switchChannel(d.channel.id); })
-    .catch(function(){});
-}
-function openChanSettings(){
-  var ch=null; CHANNELS.forEach(function(c){ if(c.id===activeCid) ch=c; });
-  if(!ch) return;
-  $('#csName').value=ch.name; $('#csDesc').value=ch.description||'';
-  showModal('mChanSettings');
-}
-function saveChanSettings(){
-  api('/channels/'+activeCid,'PATCH',{name:$('#csName').value, description:$('#csDesc').value})
-    .then(function(){ hideModal('mChanSettings'); showAlert('success','Канал обновлён'); })
-    .catch(function(){});
-}
-function clearActiveChannel(){
-  if(!confirm('Очистить всю историю канала?')) return;
-  api('/channels/'+activeCid+'/clear','POST')
-    .then(function(){ hideModal('mChanSettings'); showAlert('success','История очищена'); })
-    .catch(function(){});
-}
-function deleteActiveChannel(){
-  if(!confirm('Удалить канал навсегда?')) return;
-  api('/channels/'+activeCid,'DELETE')
-    .then(function(){ hideModal('mChanSettings'); activeCid=null; showAlert('success','Канал удалён'); })
-    .catch(function(){});
-}
-function leaveActive(){
-  if(!confirm('Покинуть канал?')) return;
-  api('/channels/'+activeCid+'/leave','POST')
-    .then(function(){ activeCid=null; showAlert('info','Вы покинули канал'); })
-    .catch(function(){});
-}
-function exportChan(){
-  window.open('/api/channels/'+activeCid+'/export?token='+encodeURIComponent(TOKEN), '_blank');
-}
-
-/* ---------- сообщения ---------- */
-function appendMessages(list){
-  var added=false, needBeep=false;
-  list.forEach(function(m){
-    if(MSG_IDS[m.id]){ updateReacts(m); return; }
-    MSG_IDS[m.id]=true; MESSAGES.push(m); added=true;
-    if(m.author_id!==ME.id && m.kind!=='system') needBeep=true;
-  });
-  if(!added) return;
-  MESSAGES.sort(function(a,b){ return a.id-b.id; });
-  lastMsgId = Math.max(lastMsgId, MESSAGES[MESSAGES.length-1].id);
-  renderAllMessages();
-  if(needBeep) beep(880);
-}
-function updateReacts(m){
-  var el=msgEls[m.id]; if(!el) return;
-  var box=el.querySelector('.m-reacts'); if(!box) return;
-  renderReacts(box, m);
-}
-function renderAllMessages(){
-  var box=$('#msgs');
-  var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
-  box.innerHTML=''; msgEls={};
-  MESSAGES.forEach(function(m){
-    if(m.kind==='system' && ME.settings && !ME.settings.show_system) return;
-    var el=msgEl(m); box.appendChild(el); msgEls[m.id]=el;
-  });
-  if(box.children.length===0) box.innerHTML='<div class="muted-text" style="text-align:center;padding:20px">Сообщений пока нет</div>';
-  if(nearBottom || MESSAGES.length<2) box.scrollTop=box.scrollHeight;
-}
-function msgEl(m){
-  var div=document.createElement('div');
-  if(m.kind==='system'){
-    div.className='msg msys';
-    div.innerHTML='<span>📢 '+esc(m.text)+'</span>';
-    return div;
+    var txt = await res.text().catch(function(){ return ""; });
+    if (txt && txt.trim() && txt.length < 400) return txt.trim();
+    return "Ошибка " + res.status;
   }
-  div.className='msg'; div.dataset.id=m.id;
-  var mine = m.author_id===ME.id;
-  var canMod = (ME.role==='admin'||ME.role==='owner'||ME.role==='mod');
-  var acts = '';
-  if(mine || canMod){
-    acts='<span class="m-actions">';
-    if(mine) acts+='<a href="#" class="m-act" data-act="edit" title="Редактировать">✏</a>';
-    acts+='<a href="#" class="m-act" data-act="del" title="Удалить">✕</a>';
-    if(canMod) acts+='<a href="#" class="m-act" data-act="pin" title="Закрепить">📌</a>';
-    acts+='</span>';
+  function formatBytes(b){
+    if (b < 1024) return b + " Б";
+    if (b < 1024*1024) return (b/1024).toFixed(1).replace(".", ",") + " КБ";
+    if (b < 1024*1024*1024) return (b/(1024*1024)).toFixed(2).replace(".", ",") + " МБ";
+    return (b/(1024*1024*1024)).toFixed(2).replace(".", ",") + " ГБ";
   }
-  div.innerHTML=
-    '<div class="avatar" style="background:'+esc(m.color)+'">'+esc((m.author||'?').charAt(0).toUpperCase())+'</div>'+
-    '<div class="msg-body">'+
-      '<div class="m-head"><b class="m-name" style="color:'+esc(m.color)+'">'+esc(m.author)+'</b>'+
-      '<span class="m-time">'+fmtTime(m.ts)+(m.edited?' · изм.':'')+'</span>'+acts+'</div>'+
-      '<div class="m-text">'+esc(m.text).replace(/\n/g,'<br>')+'</div>'+
-      '<div class="m-reacts"></div>'+
-    '</div>';
-  renderReacts(div.querySelector('.m-reacts'), m);
-  wireActions(div, m);
-  return div;
-}
-function renderReacts(box, m){
-  box.innerHTML='';
-  var reacts=m.reactions||{};
-  Object.keys(reacts).forEach(function(emo){
-    var ids=reacts[emo]||[];
-    if(!ids.length) return;
-    var chip=document.createElement('span');
-    chip.className='react-chip'+(ids.indexOf(ME.id)>=0?' mine':'');
-    chip.textContent=emo+' '+ids.length;
-    chip.title=ids.map(function(id){ var u=null; USERS.forEach(function(x){ if(x.id===id) u=x; }); return u?u.name:'?'; }).join(', ');
-    chip.onclick=function(){ toggleReaction(m.id, emo); };
-    box.appendChild(chip);
-  });
-  var add=document.createElement('span');
-  add.className='react-add'; add.textContent='+';
-  add.onclick=function(ev){
-    ev.stopPropagation();
-    var pick=document.createElement('span');
-    pick.className='emoji-picker';
-    QUICK_EMOJI.forEach(function(emo){
-      var s=document.createElement('span'); s.textContent=emo;
-      s.onclick=function(){ toggleReaction(m.id, emo); pick.remove(); };
-      pick.appendChild(s);
-    });
-    box.appendChild(pick);
-  };
-  box.appendChild(add);
-}
-function toggleReaction(mid, emoji){
-  api('/messages/'+mid+'/react','POST',{emoji:emoji}).catch(function(){});
-}
-function wireActions(div, m){
-  div.querySelectorAll('.m-act').forEach(function(a){
-    a.onclick=function(ev){
-      ev.preventDefault();
-      if(a.dataset.act==='edit') startEdit(div, m);
-      if(a.dataset.act==='del') delMsg(m);
-      if(a.dataset.act==='pin') pinMsg(m);
-    };
-  });
-}
-function startEdit(div, m){
-  var textEl=div.querySelector('.m-text');
-  var ta=document.createElement('textarea');
-  ta.className='input'; ta.value=m.text; ta.style.width='100%'; ta.style.marginBottom='4px';
-  textEl.replaceWith(ta); ta.focus();
-  var done=false;
-  function save(){
-    if(done) return; done=true;
-    var text=ta.value.trim();
-    if(!text || text===m.text){ renderAllMessages(); return; }
-    api('/messages/'+m.id,'PATCH',{text:text}).then(function(){ renderAllMessages(); }).catch(function(){ renderAllMessages(); });
+  function postUrl(code){ return location.origin + "/p/" + code; }
+
+  function parseLocation(){
+    var m = location.pathname.match(/^\/p\/(\d{6})\/?$/);
+    if (m) return { code: m[1] };
+    var params = new URLSearchParams(location.search);
+    var mp = params.get("mode");
+    return { code: null, mode: (mp === "find" || mp === "create") ? mp : null };
   }
-  ta.onkeydown=function(ev){
-    if(ev.key==='Enter' && !ev.shiftKey){ ev.preventDefault(); save(); }
-    if(ev.key==='Escape'){ done=true; renderAllMessages(); }
-  };
-  ta.onblur=save;
-}
-function delMsg(m){
-  if(!confirm('Удалить сообщение?')) return;
-  api('/messages/'+m.id,'DELETE').then(function(){
-    var i=MESSAGES.indexOf(m); if(i>=0) MESSAGES.splice(i,1);
-    delete MSG_IDS[m.id];
-    renderAllMessages();
-  }).catch(function(){});
-}
-function pinMsg(m){
-  api('/channels/'+activeCid+'/pin','POST',{message_id:m.id}).catch(function(){});
-}
-function sendMsg(){
-  var ta=$('#composerText'); var text=ta.value.trim();
-  if(!text || !activeCid) return;
-  ta.value='';
-  api('/channels/'+activeCid+'/messages','POST',{text:text})
-    .then(function(){})
-    .catch(function(){ ta.value=text; });
-}
-function insEmoji(e){ var ta=$('#composerText'); ta.value+=e; ta.focus(); }
-var lastTypingTs=0;
-function onTyping(){
-  if(!activeCid) return;
-  var t=Date.now();
-  if(t-lastTypingTs<2500) return;
-  lastTypingTs=t;
-  api('/channels/'+activeCid+'/typing','POST').catch(function(){});
-}
-function renderTyping(names){
-  $('#typing').textContent = names.length ? (names.join(', ')+' печатает…') : '';
-}
-function jumpToMsg(cid, mid){
-  hideModal('mSearch');
-  var then=function(){
-    api('/channels/'+cid+'/messages?before='+(mid+1)+'&limit=50').then(function(d){
-      if(activeCid!==cid) return;
-      MESSAGES=d.messages||[]; MSG_IDS={};
-      MESSAGES.forEach(function(m){ MSG_IDS[m.id]=true; });
-      lastMsgId=Math.max(lastMsgId, mid);
-      renderAllMessages();
-      var el=msgEls[mid];
-      if(el) el.scrollIntoView({block:'center'});
-    }).catch(function(){});
-  };
-  if(cid!==activeCid){ var old=activeCid; activeCid=cid; switchChannel(cid); }
-  then();
-}
+  function setUrlForCode(code){
+    var t = "/p/" + code;
+    if (location.pathname !== t) history.replaceState(null, "", t);
+  }
+  function setUrlForApp(mode){
+    var target = "/app" + (mode ? ("?mode=" + mode) : "");
+    if (location.pathname + location.search !== target) {
+      history.replaceState(null, "", target);
+    }
+  }
 
-/* ---------- пользователи ---------- */
-function renderUsers(){
-  var f=($('#uSearch').value||'').toLowerCase();
-  var list=USERS.filter(function(u){
-    return u.name.toLowerCase().indexOf(f)>=0 || u.username.toLowerCase().indexOf(f)>=0;
+  var stage = $("stage"), createPanel = $("createPanel"), findPanel = $("findPanel");
+  var btnCreate = $("btnCreate"), btnFind = $("btnFind");
+  var menuSwitch = $("menuSwitch"), menuPill = $("menuPill");
+  var mode = null;
+
+  function updateMenuPill(){
+    if (!menuPill || !menuSwitch) return;
+    var activeTab = mode === "find" ? btnFind : btnCreate;
+    menuPill.style.width = activeTab.offsetWidth + "px";
+    menuPill.style.transform = "translateX(" + activeTab.offsetLeft + "px)";
+  }
+  function setMode(next, instant){
+    if (next === mode && !instant) return;
+    var incoming = next === "create" ? createPanel : findPanel;
+    var outgoing = next === "create" ? findPanel : createPanel;
+    stage.hidden = false;
+    outgoing.classList.remove("active");
+    incoming.classList.add("active");
+    mode = next;
+    btnCreate.classList.toggle("active", next === "create");
+    btnFind.classList.toggle("active", next === "find");
+    requestAnimationFrame(updateMenuPill);
+    setTimeout(updateMenuPill, 60);
+    if (next === "create") setTimeout(function(){ $("title").focus(); }, 80);
+    else setTimeout(function(){ otpCells[0].focus(); }, 80);
+  }
+  btnCreate.addEventListener("click", function(){ setUrlForApp("create"); setMode("create"); });
+  btnFind.addEventListener("click", function(){ setUrlForApp("find"); setMode("find"); });
+  addEventListener("resize", updateMenuPill, { passive: true });
+  addEventListener("orientationchange", function(){ setTimeout(updateMenuPill, 300); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
+
+  /* IMAGE COMPRESSION */
+  var TARGET_PHOTO_BYTES = 60 * 1024;
+  var SOURCE_MAX_BYTES = 5 * 1024 * 1024;
+  var SUPPORTS_WEBP = (function(){
+    try { var c = document.createElement('canvas'); c.width=c.height=1; return c.toDataURL('image/webp').indexOf('data:image/webp') === 0; }
+    catch(e){ return false; }
+  })();
+  var OUT_MIME = SUPPORTS_WEBP ? 'image/webp' : 'image/jpeg';
+  var OUT_EXT = SUPPORTS_WEBP ? '.webp' : '.jpg';
+
+  async function compressImage(file, targetBytes){
+    if (targetBytes === undefined) targetBytes = TARGET_PHOTO_BYTES;
+    if (file.type.indexOf("image/") !== 0) return file;
+    if (file.size <= targetBytes && (file.type === OUT_MIME)) return file;
+    try {
+      var bitmap = await createImageBitmap(file);
+      var maxDim = 1600;
+      var best = null;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        var scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+        var w = Math.max(1, Math.round(bitmap.width * scale));
+        var h = Math.max(1, Math.round(bitmap.height * scale));
+        var canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        var lo = SUPPORTS_WEBP ? 0.4 : 0.35;
+        var hi = SUPPORTS_WEBP ? 0.95 : 0.92;
+        var candidate = null;
+        for (var i = 0; i < 7; i++) {
+          var q = (lo + hi) / 2;
+          var blob = await new Promise(function(r){ canvas.toBlob(r, OUT_MIME, q); });
+          if (!blob) break;
+          if (blob.size <= targetBytes) { candidate = blob; lo = q; }
+          else { hi = q; }
+        }
+        if (candidate) { best = candidate; break; }
+        var fallback = await new Promise(function(r){ canvas.toBlob(r, OUT_MIME, SUPPORTS_WEBP ? 0.55 : 0.5); });
+        if (fallback) best = fallback;
+        maxDim = Math.round(maxDim * 0.72);
+        if (maxDim < 500) break;
+      }
+      if (bitmap.close) bitmap.close();
+      if (!best) return file;
+      var newName = file.name.replace(/\.[^.]+$/, "") + OUT_EXT;
+      return new File([best], newName, { type: OUT_MIME });
+    } catch (e) { console.warn("compress failed:", e); return file; }
+  }
+
+  /* CREATE */
+  var MAX_PHOTOS = 5;
+  var MAX_TITLE = 120;
+  var MAX_CONTENT = 20000;
+  var selectedFiles = [];
+  var drop = $("drop"), dropLabel = $("dropLabel"), fileInput = $("fileInput");
+  var previews = $("previews"), createMsg = $("createMsg"), submitBtn = $("submitBtn");
+  var titleInput = $("title"), contentInput = $("content"), ogCheckbox = $("ogEnabled");
+  var titleWrap = $("titleWrap"), contentWrap = $("contentWrap");
+  var titleCount = $("titleCount"), contentCount = $("contentCount");
+
+  function updateCounter(input, countEl, wrapEl, max){
+    var len = input.value.length;
+    if (len > max) { input.value = input.value.slice(0, max); len = max; }
+    countEl.textContent = len + "/" + max;
+    var ratio = len / max;
+    wrapEl.classList.toggle('warn', ratio >= 0.8 && len < max);
+    wrapEl.classList.toggle('max',  len >= max);
+  }
+  function refreshCounters(){
+    updateCounter(titleInput, titleCount, titleWrap, MAX_TITLE);
+    updateCounter(contentInput, contentCount, contentWrap, MAX_CONTENT);
+  }
+  UI.on(titleInput, 'input', refreshCounters);
+  UI.on(contentInput, 'input', refreshCounters);
+  refreshCounters();
+
+  function defaultDropLabel(){
+    return selectedFiles.length
+      ? "Выбрано: " + selectedFiles.length + " / " + MAX_PHOTOS
+      : "Нажмите или перетащите фото";
+  }
+
+  drop.addEventListener("click", function(){ fileInput.click(); });
+  drop.addEventListener("dragover", function(e){ e.preventDefault(); drop.style.borderColor = "var(--border-3)"; });
+  drop.addEventListener("dragleave", function(){ drop.style.borderColor = ""; });
+  drop.addEventListener("drop", function(e){
+    e.preventDefault();
+    drop.style.borderColor = "";
+    addFiles(Array.from(e.dataTransfer.files || []));
   });
-  list.sort(function(a,b){ return (b.online-a.online) || a.name.localeCompare(b.name); });
-  var box=$('#userList'); box.innerHTML='';
-  list.forEach(function(u){
-    var el=document.createElement('div'); el.className='user-item';
-    var dot = u.banned ? 'offline' : (u.online ? (u.status==='busy'?'busy':(u.status==='away'?'away':'online')) : 'offline');
-    el.innerHTML='<span class="dot '+dot+'"></span><span class="u-color" style="color:'+u.color+'">'+esc(u.name)+'</span>'+
-      (u.role!=='user'?' <span class="label notice">'+ROLE_NAMES[u.role]+'</span>':'')+
-      (u.muted?' <span class="label warning">mute</span>':'');
-    el.onclick=function(){ openProfile(u.id); };
-    box.appendChild(el);
+  fileInput.addEventListener("change", function(){
+    addFiles(Array.from(fileInput.files || []));
+    fileInput.value = "";
   });
-  var online=USERS.filter(function(u){ return u.online; }).length;
-  $('#onlineCount').textContent='('+online+'/'+USERS.length+')';
-}
-function openProfile(uid){
-  var u=null; USERS.forEach(function(x){ if(x.id===uid) u=x; });
-  if(!u) return;
-  profileUid=uid;
-  $('#pAvatar').style.background=u.color;
-  $('#pAvatar').textContent=u.name.charAt(0).toUpperCase();
-  $('#pName').textContent=u.name;
-  $('#pUser').textContent='@'+u.username;
-  $('#pInfo').innerHTML='<b>Роль:</b> '+ROLE_NAMES[u.role]+'<br>'+
-    '<b>Статус:</b> '+({online:'В сети',away:'Отошёл',busy:'Занят',offline:'Не в сети'}[u.status]||u.status)+'<br>'+
-    '<b>В сети:</b> '+(u.online?'да':'нет')+'<br>'+
-    '<b>Регистрация:</b> '+fmtDate(u.created)+' '+(fmtTime(u.created));
-  $('#btnDm').style.display = (uid!==ME.id && SERVER.allow_dm!==false) ? '' : 'none';
-  $('#pAdminBox').style.display = (ME.role==='admin'||ME.role==='owner') ? '' : 'none';
-  $('#pRole').value = (u.role==='owner') ? 'admin' : u.role;
-  $('#pRole').disabled = (u.role==='owner');
-  var btns='';
-  btns+='<button class="btn small warning" onclick="adminUserAction(profileUid,{mute_minutes:5})">Мут 5м</button> ';
-  btns+='<button class="btn small warning" onclick="adminUserAction(profileUid,{mute_minutes:30})">Мут 30м</button> ';
-  btns+='<button class="btn small" onclick="adminUserAction(profileUid,{mute_minutes:0})">Размут</button> ';
-  if(!u.banned) btns+='<button class="btn small danger" onclick="adminUserAction(profileUid,{ban:true})">Бан</button> ';
-  else btns+='<button class="btn small success" onclick="adminUserAction(profileUid,{ban:false})">Разбан</button> ';
-  btns+='<button class="btn small info" onclick="adminUserAction(profileUid,{kick:true})">Кик</button> ';
-  $('#pAdminButtons').innerHTML=btns;
-  showModal('mProfile');
-}
-function adminUserAction(uid, patch){
-  api('/admin/users/'+uid,'PATCH',patch).then(function(){
-    showAlert('success','Готово');
-    if(uid===ME.id && patch.kick) doLogout('Сессия завершена');
-    loadAdminUsers();
-  }).catch(function(){});
-}
-function startDm(){
-  api('/dm','POST',{user_id:profileUid}).then(function(d){
-    hideModal('mProfile');
-    switchChannel(d.channel.id);
-  }).catch(function(){});
-}
-
-/* ---------- профиль ---------- */
-function openSettings(){
-  $('#sName').value=ME.name;
-  $('#sStatus').value=ME.status;
-  $('#sSound').checked=ME.settings.sound;
-  $('#sCompact').checked=ME.settings.compact;
-  $('#sSys').checked=ME.settings.show_system;
-  $('#sOldPass').value=''; $('#sNewPass').value='';
-  var box=$('#colorSwatches'); box.innerHTML='';
-  PALETTE.forEach(function(c){
-    var el=document.createElement('span');
-    el.className='swatch'+(c===ME.color?' sel':'');
-    el.style.background=c;
-    el.onclick=function(){ $$('#colorSwatches .swatch').forEach(function(x){ x.classList.remove('sel'); }); el.classList.add('sel'); };
-    box.appendChild(el);
+  document.addEventListener("paste", function(e){
+    if (mode !== "create") return;
+    var items = (e.clipboardData || window.clipboardData) && (e.clipboardData || window.clipboardData).items;
+    if (!items) return;
+    var files = [];
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (item.kind === "file" && item.type.indexOf("image/") === 0) {
+        var f = item.getAsFile();
+        if (f) {
+          var ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg");
+          files.push(new File([f], "pasted_" + Date.now() + "_" + (files.length + 1) + "." + ext, { type: f.type }));
+        }
+      }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
   });
-  showModal('mSettings');
-}
-function saveSettings(){
-  var sel=$('#colorSwatches .swatch.sel');
-  var color=sel?sel.style.background:ME.color;
-  api('/me','PATCH',{name:$('#sName').value.trim()||ME.name, status:$('#sStatus').value, color:color,
-      settings:{sound:$('#sSound').checked, compact:$('#sCompact').checked, show_system:$('#sSys').checked}})
-    .then(function(){ hideModal('mSettings'); showAlert('success','Настройки сохранены'); })
-    .catch(function(){});
-}
-function changePassword(){
-  api('/me/password','POST',{old_password:$('#sOldPass').value, new_password:$('#sNewPass').value})
-    .then(function(){ showAlert('success','Пароль изменён'); $('#sOldPass').value=''; $('#sNewPass').value=''; })
-    .catch(function(){});
-}
 
-/* ---------- серверная панель ---------- */
-function renderServerInfo(){
-  var html='<div><b>'+esc(SERVER.name)+'</b></div>';
-  html+='<div style="margin-top:4px">'+esc(SERVER.motd||'')+'</div>';
-  html+='<div style="margin-top:8px">⏱ Аптайм: <b>'+fmtDur(SERVER.uptime)+'</b></div>';
-  html+='<div>👥 Онлайн: <b>'+SERVER.users_online+'</b> из '+SERVER.users_total+'</div>';
-  html+='<div>💬 Сообщений: <b>'+SERVER.messages_total+'</b> · каналов: <b>'+SERVER.channels_total+'</b></div>';
-  html+='<div>v'+SERVER.version+(SERVER.maintenance?' · <span class="label warning">обслуживание</span>':'')+'</div>';
-  $('#svInfo').innerHTML=html;
-}
+  async function addFiles(list){
+    var rejected = 0, accepted = [];
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
+      if (f.type.indexOf("image/") !== 0) { rejected++; continue; }
+      if (f.size > SOURCE_MAX_BYTES) { rejected++; continue; }
+      if (selectedFiles.length + accepted.length >= MAX_PHOTOS) { rejected++; continue; }
+      accepted.push(f);
+    }
+    if (rejected > 0) {
+      var msg = "Пропущено: " + rejected + ". Только изображения, не больше " + MAX_PHOTOS + " и не тяжелее 5 МБ.";
+      showCreateMsg("err", msg);
+      UI.toast(msg, { kind: 'err' });
+    } else clearCreateMsg();
+    if (!accepted.length) return;
 
-/* ---------- поиск ---------- */
-function doSearch(){
-  var q=$('#qSearch').value.trim();
-  if(q.length<2){ showAlert('warning','Минимум 2 символа'); return; }
-  api('/search?q='+encodeURIComponent(q)).then(function(d){
-    var box=$('#searchResults'); box.innerHTML='';
-    if(!d.results.length){ box.innerHTML='<div class="muted-text" style="padding:10px">Ничего не найдено</div>'; }
-    d.results.forEach(function(r){
-      var el=document.createElement('div'); el.className='search-item';
-      el.innerHTML='<b>#'+esc(r.channel)+'</b> <span class="muted-text">'+esc(r.author)+' · '+fmtDate(r.ts)+' '+fmtTime(r.ts)+'</span>'+
-        '<div style="margin-top:2px">'+esc(r.text)+'</div>';
-      el.onclick=function(){ jumpToMsg(r.cid, r.id); };
-      box.appendChild(el);
-    });
-    showModal('mSearch');
-  }).catch(function(){});
-}
+    drop.classList.add("busy");
+    dropLabel.textContent = "Сжимаем фото...";
 
-/* ---------- админка ---------- */
-function openAdmin(){ if(ME.role==='admin'||ME.role==='owner'){ showModal('mAdmin'); loadAdminAll(); } }
-function switchAdminTab(name){
-  $$('#mAdmin .pills li').forEach(function(li){ li.classList.toggle('active', li.dataset.tab===name); });
-  $$('#mAdmin .pill-content > div').forEach(function(d){ d.classList.toggle('active', d.id===('tab'+name)); });
-}
-function loadAdminAll(){ loadServerSettings(); loadAdminUsers(); loadAdminChannels(); loadAdminStats(); }
+    try {
+      var CONCURRENCY = 3;
+      var results = new Array(accepted.length);
+      var idx = 0;
+      async function worker(){
+        while (true) {
+          var i = idx++;
+          if (i >= accepted.length) return;
+          results[i] = await compressImage(accepted[i]);
+        }
+      }
+      var workers = [];
+      var lim = Math.min(CONCURRENCY, accepted.length);
+      for (var w = 0; w < lim; w++) workers.push(worker());
+      await Promise.all(workers);
+      for (var j = 0; j < results.length; j++) {
+        if (results[j]) selectedFiles.push(results[j]);
+      }
+      renderPreviews();
+    } finally {
+      drop.classList.remove("busy");
+      dropLabel.textContent = defaultDropLabel();
+    }
+  }
 
-function loadServerSettings(){
-  api('/admin/settings').then(function(d){
-    var s=d.settings;
-    $('#asName').value=s.name; $('#asMotd').value=s.motd;
-    $('#asMaxLen').value=s.max_message_length; $('#asHistory').value=s.history_limit; $('#asRate').value=s.rate_limit;
-    $('#asReg').checked=s.allow_registration; $('#asMaint').checked=s.maintenance_mode;
-    $('#asEdit').checked=s.allow_editing; $('#asReact').checked=s.allow_reactions; $('#asDm').checked=s.allow_dm;
-  }).catch(function(){});
-}
-function saveServerSettings(){
-  api('/admin/settings','PATCH',{
-    name:$('#asName').value, motd:$('#asMotd').value,
-    max_message_length:parseInt($('#asMaxLen').value,10)||2000,
-    history_limit:parseInt($('#asHistory').value,10)||500,
-    rate_limit:parseInt($('#asRate').value,10)||25,
-    allow_registration:$('#asReg').checked, maintenance_mode:$('#asMaint').checked,
-    allow_editing:$('#asEdit').checked, allow_reactions:$('#asReact').checked, allow_dm:$('#asDm').checked
-  }).then(function(){ showAlert('success','Настройки сервера сохранены'); }).catch(function(){});
-}
-function broadcast(){
-  api('/admin/broadcast','POST',{text:$('#asBroadcast').value}).then(function(){
-    $('#asBroadcast').value=''; showAlert('success','Объявление отправлено');
-  }).catch(function(){});
-}
-function loadAdminUsers(){
-  api('/admin/users').then(function(d){
-    var box=$('#adminUsers'); box.innerHTML='';
-    d.users.forEach(function(u){
-      var tr=document.createElement('tr');
-      var status = u.banned ? '<span class="label important">бан</span>' :
-        (u.online ? (u.status==='busy'?'<span class="label notice">занят</span>':(u.status==='away'?'<span class="label warning">отошёл</span>':'<span class="label success">онлайн</span>'))
-                  : '<span class="label">офлайн</span>');
-      var roleSel='<select class="input" style="width:auto;margin-bottom:0" onchange="adminUserAction('+u.id+',{role:this.value})">';
-      ['user','mod','admin'].forEach(function(r){
-        roleSel+='<option value="'+r+'"'+(u.role===r||(u.role==='owner'&&r==='admin')?' selected':'')+'>'+ROLE_NAMES[r]+'</option>';
+  function renderPreviews(){
+    previews.innerHTML = "";
+    selectedFiles.forEach(function(file, index){
+      var url = URL.createObjectURL(file);
+      var img = UI.h('img', { src: url, alt: file.name });
+      img.addEventListener("load", function(){ URL.revokeObjectURL(url); }, { once: true });
+      var kb = Math.max(1, Math.round(file.size / 1024));
+      var rm = UI.h('button', {
+        type: 'button', text: '×', title: '×',
+        on: { click: function(){ selectedFiles.splice(index, 1); renderPreviews(); } }
       });
-      roleSel+='</select>';
-      tr.innerHTML='<td><span class="dot '+(u.online?'online':'offline')+'"></span><b style="color:'+u.color+'">'+esc(u.name)+'</b><br><span class="muted-text">@'+esc(u.username)+'</span></td>'+
-        '<td>'+roleSel+'</td><td>'+status+(u.muted?' <span class="label warning">mute</span>':'')+'</td>'+
-        '<td><button class="btn mini warning" onclick="adminUserAction('+u.id+',{mute_minutes:5})">мут5м</button> '+
-        '<button class="btn mini warning" onclick="adminUserAction('+u.id+',{mute_minutes:30})">мут30м</button> '+
-        (u.banned?'<button class="btn mini success" onclick="adminUserAction('+u.id+',{ban:false})">разбан</button>'
-                 :'<button class="btn mini danger" onclick="adminUserAction('+u.id+',{ban:true})">бан</button>')+
-        ' <button class="btn mini info" onclick="adminUserAction('+u.id+',{kick:true})">кик</button></td>';
-      box.appendChild(tr);
+      previews.appendChild(UI.h('div', { class: 'preview' }, [
+        img,
+        UI.h('div', { class: 'pv-badge', text: kb + ' КБ' }),
+        rm
+      ]));
     });
-  }).catch(function(){});
-}
-function loadAdminChannels(){
-  api('/admin/channels').then(function(d){
-    var box=$('#adminChannels'); box.innerHTML='';
-    d.channels.forEach(function(c){
-      var tr=document.createElement('tr');
-      tr.innerHTML='<td>#'+esc(c.name)+'</td>'+
-        '<td>'+(c.type==='public'?'публичный':(c.type==='private'?'приватный':'ЛС'))+'</td>'+
-        '<td>'+c.messages+'</td><td>'+c.members+'</td><td>'+esc(c.owner_name||'—')+'</td>'+
-        '<td><button class="btn mini warning" onclick="adminClearChan('+c.id+')">очистить</button> '+
-        '<button class="btn mini danger" onclick="adminDelChan('+c.id+')">удалить</button></td>';
-      box.appendChild(tr);
-    });
-  }).catch(function(){});
-}
-function adminClearChan(cid){
-  if(!confirm('Очистить историю канала #'+cid+'?')) return;
-  api('/channels/'+cid+'/clear','POST').then(function(){ showAlert('success','Очищено'); loadAdminChannels(); }).catch(function(){});
-}
-function adminDelChan(cid){
-  if(!confirm('Удалить канал #'+cid+'?')) return;
-  api('/channels/'+cid,'DELETE').then(function(){ showAlert('success','Удалён'); loadAdminChannels(); }).catch(function(){});
-}
-function loadAdminStats(){
-  api('/admin/stats').then(function(s){
-    var cards=[
-      ['Аптайм', fmtDur(s.uptime)], ['Онлайн', s.users_online+' / '+s.users_total],
-      ['Каналы', s.channels_total], ['Сообщения', s.messages_total],
-      ['Версия', s.version], ['Лимит ист.', s.history_limit]
-    ];
-    var html='';
-    cards.forEach(function(c){
-      html+='<div style="float:left;width:130px;margin:0 8px 8px 0"><div class="stat-card"><div class="num">'+c[1]+'</div><div class="cap">'+c[0]+'</div></div></div>';
-    });
-    $('#adminStats').innerHTML=html;
-  }).catch(function(){});
-}
-function resetServer(){
-  if(!confirm('Сбросить ВСЁ? Пользователи, каналы и сообщения будут удалены.')) return;
-  if(!confirm('Точно? Это необратимо!')) return;
-  api('/admin/reset','POST').then(function(d){
-    doLogout(d.message||'Сервер сброшен. Войдите заново.');
-  }).catch(function(){});
-}
-
-/* ---------- модалки ---------- */
-function showModal(id){ $('#backdrop').style.display='block'; $('#'+id).style.display='block'; }
-function hideModal(id){ $('#'+id).style.display='none'; $('#backdrop').style.display='none'; }
-
-/* ---------- старт ---------- */
-$('#composerText').addEventListener('keydown', function(ev){
-  if(ev.key==='Enter' && !ev.shiftKey){ ev.preventDefault(); sendMsg(); }
-  else onTyping();
-});
-$('#composerText').addEventListener('input', onTyping);
-document.addEventListener('keydown', function(ev){
-  if(ev.key==='Escape'){
-    $$('.modal').forEach(function(m){ m.style.display='none'; });
-    $('#backdrop').style.display='none';
+    drop.classList.toggle("filled", selectedFiles.length > 0);
+    dropLabel.textContent = defaultDropLabel();
   }
-});
-fetch('/api/health').then(function(r){ return r.json(); }).then(function(h){
-  $('#authName').textContent=h.name; $('#authMotd').textContent=h.motd;
-}).catch(function(){});
-if(TOKEN){ showScreen('app'); startApp(); } else { showScreen('auth'); }
+
+  function showCreateMsg(kind, text){
+    createMsg.innerHTML = "";
+    createMsg.appendChild(makeMsg(kind, text));
+  }
+  function clearCreateMsg(){ createMsg.innerHTML = ""; }
+
+  $("resetBtn").addEventListener("click", function(){
+    titleInput.value = ""; contentInput.value = ""; selectedFiles = []; ogCheckbox.checked = true;
+    renderPreviews(); clearCreateMsg(); refreshCounters(); titleInput.focus();
+  });
+
+  async function postForm(fd, attempt){
+    if (attempt === undefined) attempt = 0;
+    try { return await fetch("/api/posts", { method: "POST", body: fd }); }
+    catch (e) {
+      if (attempt < 1) { await new Promise(function(r){ setTimeout(r, 400); }); return postForm(fd, attempt + 1); }
+      throw e;
+    }
+  }
+
+  async function doPublish(){
+    var title = titleInput.value.trim();
+    var content = contentInput.value.trim();
+    if (!title) { showCreateMsg("err", "Введите название поста."); titleInput.focus(); return; }
+    var fd = new FormData();
+    fd.append("title", title);
+    fd.append("content", content);
+    fd.append("og_enabled", ogCheckbox.checked ? "true" : "false");
+    selectedFiles.forEach(function(f){ fd.append("files", f, f.name); });
+
+    var label = submitBtn.querySelector("span");
+    submitBtn.disabled = true;
+    var oldLabel = label ? label.textContent : "";
+    if (label) label.textContent = "Публикация...";
+    clearCreateMsg();
+
+    try {
+      var res = await postForm(fd, 0);
+      if (!res.ok) { showCreateMsg("err", await readError(res)); return; }
+      var data = await res.json().catch(function(){ return null; });
+      if (!data || !data.code) { showCreateMsg("err", "Некорректный ответ сервера"); return; }
+      titleInput.value = ""; contentInput.value = ""; ogCheckbox.checked = true;
+      selectedFiles = []; renderPreviews(); clearCreateMsg(); refreshCounters();
+      var code = data.code;
+      setUrlForCode(code);
+      setMode("find");
+      otpCells.forEach(function(c, i){ c.value = code[i] || ""; });
+      lastSubmitted = code;
+      updateOtpCopyState();
+      runSearch(code);
+      showCreatedModal(code, data.compressed_bytes, data.share_url || postUrl(code));
+      UI.toast("Пост создан · #" + code, { kind: 'ok' });
+    } catch (e) {
+      showCreateMsg("err", "Ошибка сети: " + e.message);
+    } finally {
+      submitBtn.disabled = false;
+      if (label) label.textContent = oldLabel;
+    }
+  }
+  submitBtn.addEventListener("click", doPublish);
+  document.addEventListener("keydown", function(e){
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && mode === "create") { e.preventDefault(); doPublish(); }
+  });
+
+  /* MODAL */
+  var createdModal = $("createdModal"), modalCard = $("modalCard"), modalCode = $("modalCode");
+  var modalUrl = $("modalUrl"), modalHint = $("modalHint"), modalCopyBtn = $("modalCopyBtn");
+  var modalCloseBtn = $("modalCloseBtn");
+  var modalCopyTimer = null, modalShareUrl = "";
+
+  function showCreatedModal(code, bytes, shareUrl){
+    modalCode.textContent = code;
+    modalShareUrl = shareUrl || postUrl(code);
+    modalUrl.textContent = modalShareUrl;
+    modalHint.textContent = "Занято в памяти: " + formatBytes(bytes);
+    var label = modalCopyBtn.querySelector("span");
+    if (label) label.textContent = "Копировать ссылку";
+    createdModal.hidden = false;
+  }
+  function closeCreatedModal(){ createdModal.hidden = true; }
+  modalCopyBtn.addEventListener("click", async function(){
+    var label = modalCopyBtn.querySelector("span");
+    var ok = await UI.copy(modalShareUrl);
+    if (label) label.textContent = ok ? "Скопировано" : "Ошибка";
+    if (ok) UI.toast("Ссылка скопирована", { kind: 'ok', duration: 1400 });
+    clearTimeout(modalCopyTimer);
+    modalCopyTimer = setTimeout(function(){ if (label) label.textContent = "Копировать ссылку"; }, 1500);
+  });
+  modalCloseBtn.addEventListener("click", closeCreatedModal);
+  createdModal.addEventListener("click", function(e){ if (e.target === createdModal) closeCreatedModal(); });
+  modalCard.addEventListener("click", function(e){ e.stopPropagation(); });
+
+  /* SEARCH */
+  var otp = $("otp");
+  var otpCells = Array.prototype.slice.call(document.querySelectorAll(".otp-cell"));
+  var otpCopyBtn = $("otpCopyBtn"), searchFrame = $("searchFrame");
+  var searchSeq = 0, lastSubmitted = "", otpCopyTimer = null;
+  var postCache = new Map();
+  var postCacheETag = new Map();
+
+  function getCode(){ return otpCells.map(function(c){ return c.value; }).join(""); }
+  function updateOtpCopyState(){ otpCopyBtn.disabled = getCode().length !== 6; }
+  function clearOtp(){
+    otpCells.forEach(function(c){ c.value = ""; });
+    otpCells[0].focus();
+    lastSubmitted = "";
+    updateOtpCopyState();
+  }
+  function shakeOtp(){
+    otp.classList.remove("shake"); void otp.offsetWidth; otp.classList.add("shake");
+    setTimeout(function(){ otp.classList.remove("shake"); }, 400);
+  }
+  function hideSearchFrame(){ searchFrame.hidden = true; searchFrame.innerHTML = ""; }
+  function maybeSearch(){
+    var code = getCode();
+    if (code.length === 6) {
+      setUrlForCode(code);
+      if (code === lastSubmitted) return;
+      lastSubmitted = code;
+      runSearch(code);
+    } else {
+      searchSeq++;
+      hideSearchFrame();
+      lastSubmitted = "";
+      if (location.pathname !== "/app") setUrlForApp(mode || "find");
+    }
+    updateOtpCopyState();
+  }
+  otpCopyBtn.addEventListener("click", async function(){
+    var code = getCode();
+    if (code.length !== 6) return;
+    var ok = await UI.copy(code);
+    if (ok) {
+      otpCopyBtn.classList.add("copied");
+      UI.toast("Код скопирован", { kind: 'ok', duration: 1200 });
+      clearTimeout(otpCopyTimer);
+      otpCopyTimer = setTimeout(function(){ otpCopyBtn.classList.remove("copied"); }, 1500);
+    }
+  });
+  otpCells.forEach(function(cell, i){
+    cell.addEventListener("focus", function(){ cell.select(); });
+    cell.addEventListener("input", function(e){
+      var v = (e.target.value || "").replace(/\D/g, "");
+      if (!v) { e.target.value = ""; maybeSearch(); return; }
+      e.target.value = v.slice(-1);
+      if (i < otpCells.length - 1) otpCells[i + 1].focus();
+      maybeSearch();
+    });
+    cell.addEventListener("keydown", function(e){
+      if (e.key === "Backspace") {
+        if (!cell.value && i > 0) { otpCells[i - 1].value = ""; otpCells[i - 1].focus(); e.preventDefault(); }
+        setTimeout(maybeSearch, 0);
+      } else if (e.key === "ArrowLeft" && i > 0) { otpCells[i - 1].focus(); e.preventDefault(); }
+      else if (e.key === "ArrowRight" && i < otpCells.length - 1) { otpCells[i + 1].focus(); e.preventDefault(); }
+      else if (e.key === "Enter") { var c = getCode(); if (c.length === 6) { lastSubmitted = c; runSearch(c); } }
+    });
+    cell.addEventListener("paste", function(e){
+      e.preventDefault();
+      var text = (e.clipboardData || window.clipboardData).getData("text") || "";
+      var digits = text.replace(/\D/g, "").slice(0, 6).split("");
+      digits.forEach(function(d, j){ if (otpCells[j]) otpCells[j].value = d; });
+      otpCells[Math.min(digits.length, otpCells.length - 1)].focus();
+      maybeSearch();
+    });
+  });
+  updateOtpCopyState();
+
+  function showSearchFrame(){ searchFrame.hidden = false; }
+  function renderSpinner(){
+    searchFrame.innerHTML = '<div class="center"><div class="spinner"></div><div class="spinner-label">Ищем пост...</div></div>';
+    showSearchFrame();
+  }
+  function renderError(text){
+    searchFrame.innerHTML = "";
+    searchFrame.appendChild(makeMsg("err", text));
+    showSearchFrame();
+  }
+
+  /* LIGHTBOX */
+  var lightbox = $("lightbox"), lbViewport = $("lbViewport"), lbTransform = $("lbTransform");
+  var lbImg = $("lbImg"), lbCounter = $("lbCounter"), lbPrev = $("lbPrev"), lbNext = $("lbNext");
+  var lbClose = $("lbClose"), lbZoomBadge = $("lbZoomBadge");
+  var lbCode = null, lbPhotos = [], lbIndex = 0;
+  var zoom = 1, panX = 0, panY = 0, swipeY = 0;
+  var MIN_ZOOM = 1, MAX_ZOOM = 8;
+  var isPanning = false, panStartX = 0, panStartY = 0, badgeTimer = null;
+  var inertiaRaf = 0, lbLoadTimer = null;
+
+  function lbStopLoading(){ clearTimeout(lbLoadTimer); lbLoadTimer = null; lightbox.classList.remove('loading'); }
+  lbImg.addEventListener('load', lbStopLoading);
+  lbImg.addEventListener('error', lbStopLoading);
+
+  function applyTransform(){
+    var totalY = panY + swipeY;
+    lbTransform.style.transform = "translate(" + panX + "px," + totalY + "px) scale(" + zoom + ")";
+    lbViewport.style.cursor = (zoom > 1.001) ? (isPanning ? "grabbing" : "grab") : "default";
+    if (swipeY > 0) {
+      var fade = Math.max(0.15, 1 - swipeY / 420);
+      lightbox.style.background = "rgba(0,0,0," + (0.96 * fade).toFixed(3) + ")";
+      lbTransform.style.opacity = Math.max(0.35, fade).toFixed(3);
+    } else {
+      lightbox.style.background = "";
+      lbTransform.style.opacity = "";
+    }
+  }
+  function stopInertia(){ if (inertiaRaf) { cancelAnimationFrame(inertiaRaf); inertiaRaf = 0; } }
+  function showZoomBadge(){
+    lbZoomBadge.textContent = Math.round(zoom * 100) + "%";
+    lbZoomBadge.classList.add("visible");
+    clearTimeout(badgeTimer);
+    badgeTimer = setTimeout(function(){ lbZoomBadge.classList.remove("visible"); }, 900);
+  }
+  function animateTransformTo(targetZoom, targetPanX, targetPanY, duration){
+    duration = duration || 220;
+    var sZ = zoom, sX = panX, sY = panY;
+    var t0 = performance.now();
+    function step(){
+      var t = Math.min(1, (performance.now() - t0) / duration);
+      var eased = 1 - Math.pow(1 - t, 3);
+      zoom = sZ + (targetZoom - sZ) * eased;
+      panX = sX + (targetPanX - sX) * eased;
+      panY = sY + (targetPanY - sY) * eased;
+      applyTransform();
+      if (t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  function resetZoom(animate){
+    if (animate) animateTransformTo(1, 0, 0, 220);
+    else { zoom = 1; panX = 0; panY = 0; swipeY = 0; applyTransform(); }
+    showZoomBadge();
+  }
+  function zoomAt(clientX, clientY, newZoom, animate){
+    newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+    if (Math.abs(newZoom - zoom) < 1e-4) return;
+    var vrect = lbViewport.getBoundingClientRect();
+    var Cx = vrect.left + vrect.width / 2, Cy = vrect.top + vrect.height / 2;
+    var dcx = clientX - Cx, dcy = clientY - Cy;
+    var ratio = newZoom / zoom;
+    var targetPanX = dcx - (dcx - panX) * ratio;
+    var targetPanY = dcy - (dcy - panY) * ratio;
+    if (animate) animateTransformTo(newZoom, targetPanX, targetPanY, 220);
+    else { panX = targetPanX; panY = targetPanY; zoom = newZoom; lbTransform.style.transition = ""; applyTransform(); }
+    showZoomBadge();
+  }
+  function openLightbox(code, photos, index){
+    lbCode = code; lbPhotos = photos; lbIndex = index;
+    zoom = 1; panX = 0; panY = 0; swipeY = 0;
+    lbTransform.style.transition = ""; applyTransform();
+    lightbox.classList.add('loading');
+    clearTimeout(lbLoadTimer);
+    lbLoadTimer = setTimeout(lbStopLoading, 8000);
+    lbImg.src = "/api/photos/" + encodeURIComponent(code) + "/" + index;
+    lbImg.alt = (photos[index] && photos[index].name) || "";
+    lbCounter.textContent = (index + 1) + " / " + photos.length;
+    lbPrev.hidden = photos.length < 2; lbNext.hidden = photos.length < 2;
+    lightbox.hidden = false;
+  }
+  function closeLightbox(){
+    stopInertia();
+    lightbox.hidden = true;
+    lbImg.removeAttribute("src");
+    lbPhotos = []; lbCode = null;
+    swipeY = 0; panX = 0; panY = 0; zoom = 1;
+    lbTransform.style.transform = "";
+    lbTransform.style.opacity = "";
+    lightbox.style.background = "";
+    lightbox.classList.remove('loading');
+  }
+  function lbStep(dir){
+    if (lbPhotos.length < 2) return;
+    lbIndex = (lbIndex + dir + lbPhotos.length) % lbPhotos.length;
+    zoom = 1; panX = 0; panY = 0; swipeY = 0;
+    lbTransform.style.transition = ""; applyTransform();
+    lightbox.classList.add('loading');
+    clearTimeout(lbLoadTimer);
+    lbLoadTimer = setTimeout(lbStopLoading, 8000);
+    lbImg.src = "/api/photos/" + encodeURIComponent(lbCode) + "/" + lbIndex;
+    lbImg.alt = (lbPhotos[lbIndex] && lbPhotos[lbIndex].name) || "";
+    lbCounter.textContent = (lbIndex + 1) + " / " + lbPhotos.length;
+  }
+  lbPrev.addEventListener("click", function(e){ e.stopPropagation(); lbStep(-1); });
+  lbNext.addEventListener("click", function(e){ e.stopPropagation(); lbStep(1); });
+  lbClose.addEventListener("click", function(e){ e.stopPropagation(); closeLightbox(); });
+  lbViewport.addEventListener("click", function(e){ if (e.target === lbViewport && zoom <= 1.001 && swipeY === 0) closeLightbox(); });
+  lbViewport.addEventListener("wheel", function(e){
+    e.preventDefault();
+    var factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+    zoomAt(e.clientX, e.clientY, zoom * factor);
+  }, { passive: false });
+  lbViewport.addEventListener("mousedown", function(e){
+    if (e.button === 2) { e.preventDefault(); if (zoom > 1.05) resetZoom(true); else zoomAt(e.clientX, e.clientY, 2); return; }
+    if (e.button === 0 && zoom > 1.001) {
+      e.preventDefault(); stopInertia();
+      isPanning = true;
+      panStartX = e.clientX - panX; panStartY = e.clientY - panY;
+      lbTransform.style.transition = "none";
+      lbViewport.style.cursor = "grabbing";
+    }
+  });
+  lbViewport.addEventListener("dblclick", function(e){
+    e.preventDefault();
+    if (zoom > 1.05) resetZoom(true); else zoomAt(e.clientX, e.clientY, 2, true);
+  });
+  addEventListener("mousemove", function(e){
+    if (!isPanning) return;
+    panX = e.clientX - panStartX; panY = e.clientY - panStartY; applyTransform();
+  });
+  addEventListener("mouseup", function(e){
+    if (e.button === 0 && isPanning) {
+      isPanning = false; lbTransform.style.transition = "";
+      lbViewport.style.cursor = zoom > 1.001 ? "grab" : "default";
+    }
+  });
+
+  /* TOUCH */
+  var tMode = 'idle';
+  var tStartX = 0, tStartY = 0, tLastX = 0, tLastY = 0;
+  var tStartTime = 0, tLastFrameTime = 0;
+  var tPinchStartDist = 0, tPinchStartZoom = 1;
+  var tPinchMidX = 0, tPinchMidY = 0;
+  var tPinchStartPanX = 0, tPinchStartPanY = 0;
+  var tVelX = 0, tVelY = 0;
+  var tTapTime = 0, tTapX = 0, tTapY = 0;
+
+  function startInertia(vx, vy){
+    stopInertia();
+    function step(){
+      vx *= 0.94; vy *= 0.94;
+      panX += vx; panY += vy;
+      applyTransform();
+      if (Math.abs(vx) > 0.5 || Math.abs(vy) > 0.5) inertiaRaf = requestAnimationFrame(step);
+      else inertiaRaf = 0;
+    }
+    inertiaRaf = requestAnimationFrame(step);
+  }
+
+  lbViewport.addEventListener("touchstart", function(e){
+    stopInertia();
+    lbTransform.style.transition = "none";
+    if (e.touches.length === 2) {
+      tMode = 'pinch';
+      tPinchStartDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      ) || 1;
+      tPinchStartZoom = zoom;
+      tPinchMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      tPinchMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      tPinchStartPanX = panX;
+      tPinchStartPanY = panY;
+    } else if (e.touches.length === 1) {
+      tStartX = e.touches[0].clientX;
+      tStartY = e.touches[0].clientY;
+      tLastX = tStartX; tLastY = tStartY;
+      tStartTime = performance.now();
+      tLastFrameTime = tStartTime;
+      tVelX = 0; tVelY = 0;
+      swipeY = 0;
+      tMode = (zoom <= 1.05) ? 'swipe-down' : 'pan';
+    }
+  }, { passive: true });
+
+  lbViewport.addEventListener("touchmove", function(e){
+    if (tMode === 'idle') return;
+    e.preventDefault();
+    if (tMode === 'pinch' && e.touches.length === 2) {
+      var dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      ) || 1;
+      var scale = dist / tPinchStartDist;
+      var newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, tPinchStartZoom * scale));
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      var vrect = lbViewport.getBoundingClientRect();
+      var cx = vrect.left + vrect.width / 2;
+      var cy = vrect.top + vrect.height / 2;
+      var relX = tPinchMidX - cx - tPinchStartPanX;
+      var relY = tPinchMidY - cy - tPinchStartPanY;
+      var ratio = newZoom / tPinchStartZoom;
+      panX = -relX * ratio + (midX - cx) + tPinchStartPanX;
+      panY = -relY * ratio + (midY - cy) + tPinchStartPanY;
+      zoom = newZoom;
+      applyTransform(); showZoomBadge();
+      return;
+    }
+    if (e.touches.length === 1) {
+      var tx = e.touches[0].clientX;
+      var ty = e.touches[0].clientY;
+      var dx = tx - tLastX;
+      var dy = ty - tLastY;
+      var totalDx = tx - tStartX;
+      var totalDy = ty - tStartY;
+      if (tMode === 'swipe-down') {
+        if (Math.abs(totalDx) > 12 && Math.abs(totalDx) > Math.abs(totalDy)) tMode = 'pan';
+        else if (totalDy < -12 && Math.abs(totalDy) > Math.abs(totalDx)) tMode = 'pan';
+      }
+      if (tMode === 'swipe-down' && zoom <= 1.05) { swipeY = Math.max(0, totalDy); applyTransform(); }
+      else if (tMode === 'pan') { panX += dx; panY += dy; applyTransform(); }
+      var now = performance.now();
+      var dt = now - tLastFrameTime;
+      if (dt > 8) {
+        tVelX = (tx - tLastX) / dt * 16;
+        tVelY = (ty - tLastY) / dt * 16;
+        tLastFrameTime = now;
+        tLastX = tx; tLastY = ty;
+      }
+    }
+  }, { passive: false });
+
+  lbViewport.addEventListener("touchend", function(e){
+    var modeAtEnd = tMode;
+    var wasPinch = (modeAtEnd === 'pinch');
+    tMode = 'idle';
+    if (wasPinch) {
+      if (zoom < 1) { animateTransformTo(1, 0, 0, 220); zoom = 1; }
+      else if (zoom > MAX_ZOOM) animateTransformTo(MAX_ZOOM, panX, panY, 180);
+      return;
+    }
+    var t = e.changedTouches[0];
+    if (!t) return;
+    var dx = t.clientX - tStartX;
+    var dy = t.clientY - tStartY;
+    var dt = performance.now() - tStartTime;
+    var dist = Math.hypot(dx, dy);
+    if (modeAtEnd === 'swipe-down' && swipeY > 0) {
+      var velocity = dist / Math.max(1, dt) * 16;
+      if (swipeY > 120 || (dy > 60 && velocity > 12)) { closeLightbox(); return; }
+      var startSwipe = swipeY;
+      var t0 = performance.now();
+      (function easeBack(){
+        var t2 = (performance.now() - t0) / 220;
+        if (t2 >= 1) { swipeY = 0; applyTransform(); return; }
+        var eased = 1 - Math.pow(1 - t2, 3);
+        swipeY = startSwipe * (1 - eased);
+        applyTransform();
+        requestAnimationFrame(easeBack);
+      })();
+      return;
+    }
+    if (dt < 300 && dist < 12) {
+      var now = performance.now();
+      if (now - tTapTime < 320 && Math.hypot(t.clientX - tTapX, t.clientY - tTapY) < 44) {
+        if (zoom > 1.05) resetZoom(true); else zoomAt(t.clientX, t.clientY, 2.4, true);
+        tTapTime = 0; return;
+      }
+      tTapTime = now;
+      tTapX = t.clientX; tTapY = t.clientY;
+    }
+    if (modeAtEnd === 'pan' && zoom <= 1.05 && dt < 600 && dist > 40) {
+      if (Math.abs(dx) > Math.abs(dy) * 1.2 && Math.abs(dx) > 55) {
+        if (dx < 0) lbStep(1); else lbStep(-1);
+        return;
+      }
+    }
+    if (modeAtEnd === 'pan' && zoom > 1.05 && (Math.abs(tVelX) > 1 || Math.abs(tVelY) > 1)) {
+      startInertia(tVelX, tVelY);
+    }
+  }, { passive: true });
+
+  /* POST RENDER */
+  function renderPost(post){
+    UI.clear(searchFrame);
+    var code = post.code;
+    var url = postUrl(code);
+
+    var copyBtn = UI.h('button', {
+      type: 'button', class: 'post-copy-btn',
+      title: 'Копировать ссылку на пост',
+      'aria-label': 'Копировать ссылку на пост',
+      html: ICONS.copy + ICONS.check
+    }, [ UI.h('span', { text: 'Копировать ссылку' }) ]);
+    var copyBtnTimer = null;
+    UI.on(copyBtn, 'click', async function(e){
+      e.stopPropagation();
+      var ok = await UI.copy(url);
+      copyBtn.classList.toggle('copied', ok);
+      if (ok) UI.toast('Ссылка скопирована', { kind: 'ok', duration: 1400 });
+      clearTimeout(copyBtnTimer);
+      copyBtnTimer = setTimeout(function(){ copyBtn.classList.remove('copied'); }, 1500);
+    });
+
+    var header = UI.h('div', { class: 'post-header' }, [
+      UI.h('span', { class: 'post-code', text: '#' + code }),
+      copyBtn
+    ]);
+    searchFrame.appendChild(header);
+
+    searchFrame.appendChild(UI.h('h3', { class: 'post-title', text: post.title }));
+
+    var meta = UI.h('div', { class: 'post-meta' });
+    try { meta.appendChild(UI.h('span', { text: new Date(post.created).toLocaleString('ru-RU') })); } catch(e){}
+    if (post.photos && post.photos.length) meta.appendChild(UI.h('span', { text: 'Фото: ' + post.photos.length }));
+    searchFrame.appendChild(meta);
+
+    if (post.content) searchFrame.appendChild(UI.h('div', { class: 'post-body', text: post.content }));
+
+    if (post.photos && post.photos.length) {
+      var gallery = UI.h('div', { class: 'post-gallery' });
+      post.photos.forEach(function(p, idx){
+        var img = UI.h('img', {
+          src: '/api/photos/' + encodeURIComponent(code) + '/' + idx,
+          alt: p.name || 'photo', title: p.name || '',
+          loading: 'lazy', decoding: 'async',
+          on: { click: function(){ openLightbox(code, post.photos, idx); } }
+        });
+        gallery.appendChild(img);
+      });
+      searchFrame.appendChild(gallery);
+    }
+    showSearchFrame();
+  }
+
+  async function runSearch(code){
+    var mySeq = ++searchSeq;
+    renderSpinner();
+    await new Promise(function(r){ setTimeout(r, 300); });
+    if (mySeq !== searchSeq) return;
+    try {
+      if (postCache.has(code)) {
+        renderPost(postCache.get(code));
+        (async function(){
+          try {
+            var etag = postCacheETag.get(code);
+            var h = {};
+            if (etag) h["If-None-Match"] = etag;
+            var r = await fetch("/api/posts/" + encodeURIComponent(code), { headers: h });
+            if (r.status === 304) return;
+            if (r.ok) {
+              var fresh = await r.json();
+              if (fresh && fresh.code) {
+                postCache.set(code, fresh);
+                var newTag = r.headers.get("etag");
+                if (newTag) postCacheETag.set(code, newTag);
+                if (mySeq === searchSeq) renderPost(fresh);
+              }
+            } else if (r.status === 404) {
+              postCache.delete(code);
+              postCacheETag.delete(code);
+              if (mySeq === searchSeq) renderError("Пост не найден");
+            }
+          } catch(e){}
+        })();
+        return;
+      }
+      var res = await fetch("/api/posts/" + encodeURIComponent(code));
+      if (mySeq !== searchSeq) return;
+      if (!res.ok) {
+        var errText = (await readError(res)) || "Пост не найден";
+        renderError(errText);
+        UI.toast(errText, { kind: 'err' });
+        shakeOtp(); setTimeout(clearOtp, 320);
+        return;
+      }
+      var post = await res.json().catch(function(){ return null; });
+      if (mySeq !== searchSeq) return;
+      if (!post) { renderError("Пост не найден"); return; }
+      postCache.set(code, post);
+      var tag = res.headers.get("etag");
+      if (tag) postCacheETag.set(code, tag);
+      renderPost(post);
+    } catch (e) {
+      if (mySeq !== searchSeq) return;
+      renderError("Ошибка сети: " + e.message);
+      shakeOtp(); setTimeout(clearOtp, 320);
+    }
+  }
+
+  /* INIT */
+  function initFromUrl(){
+    var r = parseLocation();
+    if (r.code) {
+      setMode("find", true);
+      otpCells.forEach(function(c, i){ c.value = r.code[i] || ""; });
+      lastSubmitted = r.code;
+      updateOtpCopyState();
+      runSearch(r.code);
+    } else if (r.mode === "find") setMode("find", true);
+    else if (r.mode === "create") setMode("create", true);
+    else setMode("create", true);
+    requestAnimationFrame(updateMenuPill);
+    setTimeout(updateMenuPill, 120);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(updateMenuPill);
+  }
+  initFromUrl();
+
+  document.addEventListener("keydown", function(e){
+    if (!lightbox.hidden) {
+      if (e.key === "Escape") { closeLightbox(); return; }
+      if (e.key === "ArrowLeft")  { lbStep(-1); return; }
+      if (e.key === "ArrowRight") { lbStep(1);  return; }
+      if (e.key === "0") { resetZoom(true); return; }
+      return;
+    }
+    if (!createdModal.hidden && e.key === "Escape") { closeCreatedModal(); return; }
+  });
+})();
 </script>
 </body>
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    def esc(s: str) -> str:
-        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                 .replace('"', "&quot;").replace("'", "&#39;"))
-    s = STATE["settings"]
-    return HTML.replace("__SERVER_NAME__", esc(s["name"])).replace("__MOTD__", esc(s["motd"]))
 
-# ======================================================================
-#  ЗАПУСК
-# ======================================================================
+def _build_og_tags(code: str, meta: dict, photos_count: int, base: str) -> str:
+    title = str(meta.get("title", "")).strip() or f"Пост #{code}"
+    content_raw = str(meta.get("content", "")).strip()
+    if content_raw:
+        desc = content_raw.replace("\n", " ").strip()
+        if len(desc) > 180:
+            desc = desc[:177].rstrip() + "…"
+    else:
+        desc = f"Пост #{code} в СЛД·NET. Откройте, чтобы прочитать полностью."
+
+    title_esc = _html.escape(title, quote=True)
+    desc_esc = _html.escape(desc, quote=True)
+    url = f"{base}/p/{code}"
+
+    lines = [
+        '<meta property="og:type" content="article">',
+        '<meta property="og:site_name" content="СЛД·NET">',
+        f'<meta property="og:title" content="{title_esc}">',
+        f'<meta property="og:description" content="{desc_esc}">',
+        f'<meta property="og:url" content="{_html.escape(url, quote=True)}">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{title_esc}">',
+        f'<meta name="twitter:description" content="{desc_esc}">',
+    ]
+    if photos_count > 0:
+        img = f"{base}/api/photos/{code}/0"
+        img_esc = _html.escape(img, quote=True)
+        lines.append(f'<meta property="og:image" content="{img_esc}">')
+        lines.append(f'<meta property="og:image:alt" content="{title_esc}">')
+        lines.append(f'<meta name="twitter:image" content="{img_esc}">')
+    lines.append(f'<link rel="canonical" href="{_html.escape(url, quote=True)}">')
+    return "\n".join(lines)
+
+
+def _render_app(og_tags: str = "", title_override: Optional[str] = None) -> str:
+    html = (APP
+            .replace("__FAVICON__", FAVICON)
+            .replace("__LOGO_SVG__", LOGO_SVG)
+            .replace("__APP_CSS__", APP_CSS)
+            .replace("__UI_FRAMEWORK__", UI_FRAMEWORK_JS)
+            .replace("<!-- OG_TAGS -->", og_tags))
+    if title_override:
+        html = html.replace(
+            "<title>СЛД·NET</title>",
+            f"<title>{_html.escape(title_override, quote=True)}</title>",
+        )
+    return html
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(build_landing())
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_page():
+    return HTMLResponse(_render_app())
+
+
+@app.get("/p/{code}", response_class=HTMLResponse)
+async def post_page(code: str, request: Request):
+    code = (code or "").strip()
+    if not (len(code) == 6 and code.isdigit()):
+        return HTMLResponse(_render_app())
+
+    og_tags = ""
+    title_override = None
+    with _lock:
+        entry = _store.get(code)
+    if entry is not None:
+        try:
+            meta = _unpack_meta(entry["meta"])
+            if meta.get("og_enabled", True):
+                og_tags = _build_og_tags(code, meta, len(entry["photos"]), _base_url(request))
+                t = str(meta.get("title", "")).strip()
+                if t:
+                    title_override = t
+        except Exception:
+            pass
+
+    return HTMLResponse(_render_app(og_tags=og_tags, title_override=title_override))
+
+
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8000"))
-    print("=" * 62)
-    print("  DSH Messenger  v" + APP_VERSION)
-    print("  UI: тёмная тема в духе Twitter Bootstrap 1.4.0")
-    print("  Хранилище: оперативная память (сброс при перезапуске)")
-    print("  Адрес:   http://" + host + ":" + str(port))
-    print("  Остановить: Ctrl+C")
-    print("=" * 62)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
